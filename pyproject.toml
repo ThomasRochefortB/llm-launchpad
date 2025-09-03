@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llm-launchpad"
+version = "0.0.1"
+description = "One-click personal LLM deployment with coding agent + chat UI."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "Thomas Rochefort-Bedard" }]
+keywords = ["llm", "deployment", "modal", "agent", "chat"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: GNU Affero General Public License v3",
+  "Operating System :: OS Independent",
+]
+
+[project.urls]
+Homepage = "https://github.com/ThomasRochefortB/llm-launchpad"
+Issues = "https://github.com/ThomasRochefortB/llm-launchpad/issues"
+
+[tool.setuptools]
+packages = ["llm_launchpad"]
