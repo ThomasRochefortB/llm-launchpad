@@ -1,6 +1,10 @@
-## Qwen3-Coder GGUF on Modal via llama.cpp
+# llm-launchpad
 
-Run `unsloth/Qwen3-Coder-480B-A35B-Instruct-1M-GGUF:Q4_K_M` on Modal using llama.cpp's HTTP server.
+One-click personal LLM deployment with coding agent + chat UI.
+
+## Qwen3‑Coder GGUF on Modal (llama.cpp)
+
+Run `unsloth/Qwen3-Coder-480B-A35B-Instruct-1M-GGUF` on Modal using llama.cpp's HTTP server.
 
 ### Prerequisites
 - Python 3.11+ and Modal CLI installed: `pip install modal`
@@ -8,42 +12,41 @@ Run `unsloth/Qwen3-Coder-480B-A35B-Instruct-1M-GGUF:Q4_K_M` on Modal using llama
 - Optional (if HF rate-limited/private): `huggingface-cli login` or set `HUGGINGFACE_HUB_TOKEN`
 
 ### Files
-- Server: `/Users/thomas.rochefort-be/GitHub/modal_exp/llama_qwen_server.py`
+- Server entrypoint: `qwen3-coder-llamacpp.py`
 
 ### 1) Preload/download model weights (optional, recommended)
-This downloads the GGUF once into a persistent Volume (`llamacpp-cache`).
+This downloads GGUF weights into a persistent Volume (`llamacpp-cache`).
 
 ```bash
-modal run /Users/thomas.rochefort-be/GitHub/modal_exp/llama_qwen_server.py
+modal run qwen3-coder-llamacpp.py
 ```
 
-Flags you can pass (defaults shown):
-- `--preload=True`
-- `--repo-id="unsloth/Qwen3-Coder-480B-A35B-Instruct-1M-GGUF"`
-- `--quant="Q4_K_M"`
-- `--revision=None`
+Common flags (defaults shown):
+- `--preload True`
+- `--repo-id "unsloth/Qwen3-Coder-480B-A35B-Instruct-1M-GGUF"`
+- `--quant "Q4_K_M"`
+- `--revision None`
 
 Example without preloading:
 ```bash
-modal run /Users/thomas.rochefort-be/GitHub/modal_exp/llama_qwen_server.py --preload=False
+modal run qwen3-coder-llamacpp.py --preload False
 ```
 
 ### 2) Deploy the HTTP server
 Builds llama.cpp with CUDA and serves an OpenAI-compatible API on port 8080.
 
 ```bash
-modal deploy /Users/thomas.rochefort-be/GitHub/modal_exp/llama_qwen_server.py
+modal deploy qwen3-coder-llamacpp.py
 ```
 
-Notes on cold start & timeouts:
-- Initial load can take a long time (tens of minutes). The function uses `startup_timeout=1800s`, `timeout=3600s`, and `scaledown_window=3600s` to allow long warmups and keep the container hot.
-- During warmup you may see 503 responses. Retry after a few minutes or poll `/health`-like endpoints if added.
+Notes:
+- First cold start can take many minutes; long timeouts are configured.
+- During warmup you may see 503 responses; retry after a few minutes.
 
 Get the public URL:
-- Copy the web function URL printed by `modal deploy` (e.g., `https://<user>--qwen3-coder-llamacpp-serve.modal.run`).
-  - From your log example: `https://thomasrochefortb--qwen3-coder-llamacpp-serve.modal.run`
+- Copy the web function URL printed by `modal deploy` (e.g. `https://<user>--qwen3-coder-llamacpp-serve.modal.run`).
 
-Tail logs (replace with your app/function if needed):
+Tail logs:
 ```bash
 modal logs -f qwen3-coder-llamacpp.serve
 ```
@@ -51,7 +54,7 @@ modal logs -f qwen3-coder-llamacpp.serve
 ### 3) Call the API
 Set the server URL (replace with yours):
 ```bash
-export SERVER_URL="https://thomasrochefortb--qwen3-coder-llamacpp-serve.modal.run"
+export SERVER_URL="https://<user>--qwen3-coder-llamacpp-serve.modal.run"
 ```
 Completions endpoint:
 ```bash
@@ -75,19 +78,17 @@ curl -s -X POST \
 ```
 
 ### Tuning and configuration
-- GPU type: edit `GPU_CONFIG` in `llama_qwen_server.py` (default: `"L40S:1"`).
+- GPU type: edit `GPU_CONFIG` in `qwen3-coder-llamacpp.py`.
 - Quantization: edit `QUANT` (default: `"Q4_K_M"`).
 - Server args: edit `DEFAULT_SERVER_ARGS` (e.g., `--ctx-size`, `--threads`).
-- If VRAM is insufficient, reduce GPU offload by passing fewer layers (edit code to add `"--n-gpu-layers", "<n>"` in the command) or switch to CPU by setting `GPU_CONFIG = None`.
+- If VRAM is insufficient, reduce GPU offload by lowering `--n-gpu-layers` or set `GPU_CONFIG = None` for CPU.
 
 ### Volumes
 - Weights cache volume: `llamacpp-cache`
-    - List files: `modal volume ls llamacpp-cache`
-    - Explore: `modal shell --volume llamacpp-cache` (then `cd /mnt`)
+  - List files: `modal volume ls llamacpp-cache`
+  - Explore: `modal shell --volume llamacpp-cache` (then `cd /mnt`)
 
 ### Troubleshooting
-- Slow downloads: ensure `HF_HUB_ENABLE_HF_TRANSFER=1` (already set in downloader image).
+- Slow downloads: ensure `HF_HUB_ENABLE_HF_TRANSFER=1`.
 - HF auth errors: login with `huggingface-cli login`.
-- Build errors: ensure host has CUDA >= 12.4 or reduce to CPU by setting `GPU_CONFIG = None`.
-
-
+- Build errors: ensure host CUDA >= 12.4, or switch to CPU.
