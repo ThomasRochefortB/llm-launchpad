@@ -2,6 +2,18 @@
 
 One-click personal LLM deployment with coding agent + chat UI.
 
+## Install
+
+Using uv (recommended):
+```bash
+uv pip install llm-launchpad
+```
+
+Standard pip:
+```bash
+pip install llm-launchpad
+```
+
 ## Qwen3‑Coder GGUF on Modal (llama.cpp)
 
 Run `unsloth/Qwen3-Coder-480B-A35B-Instruct-1M-GGUF` on Modal using llama.cpp's HTTP server.
