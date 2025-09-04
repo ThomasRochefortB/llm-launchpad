@@ -14,9 +14,9 @@ Standard pip:
 pip install llm-launchpad
 ```
 
-## Qwen3‑Coder GGUF on Modal (llama.cpp)
+## GGUF on Modal with llama.cpp
 
-Run `unsloth/Qwen3-Coder-480B-A35B-Instruct-1M-GGUF` on Modal using llama.cpp's HTTP server.
+Deploy any GGUF model on Modal using llama.cpp's HTTP server. Includes presets for popular coding models.
 
 ### Prerequisites
 - Python 3.11+ and Modal CLI installed: `pip install modal`
@@ -24,31 +24,46 @@ Run `unsloth/Qwen3-Coder-480B-A35B-Instruct-1M-GGUF` on Modal using llama.cpp's 
 - Optional (if HF rate-limited/private): `huggingface-cli login` or set `HUGGINGFACE_HUB_TOKEN`
 
 ### Files
-- Server entrypoint: `qwen3-coder-llamacpp.py`
+- Server entrypoint: `modal-llamacpp.py`
 
 ### 1) Preload/download model weights (optional, recommended)
 This downloads GGUF weights into a persistent Volume (`llamacpp-cache`).
 
+Presets (recommended):
 ```bash
-modal run qwen3-coder-llamacpp.py
+modal run modal-llamacpp.py::main --preset qwen2.5-coder-7b --preload True
 ```
 
-Common flags (defaults shown):
-- `--preload True`
-- `--repo-id "unsloth/Qwen3-Coder-480B-A35B-Instruct-1M-GGUF"`
-- `--quant "Q4_K_M"`
-- `--revision None`
-
-Example without preloading:
+Custom repo/quant:
 ```bash
-modal run qwen3-coder-llamacpp.py --preload False
+modal run modal-llamacpp.py::main \
+  --repo-id Qwen/Qwen2.5-Coder-7B-Instruct-GGUF \
+  --quant Q4_K_M --preload True
 ```
+
+Common flags:
+- `--preload True|False`
+- `--preset <name>` (see Presets below)
+- `--repo-id <org/model>`
+- `--quant <pattern>` (e.g., `Q4_K_M`)
+- `--revision <hf-revision>`
+- `--server_args "--ctx-size 65536 --threads 24"`
+- `--host 0.0.0.0` `--port 8080`
+- `--n_gpu_layers <int>`
 
 ### 2) Deploy the HTTP server
 Builds llama.cpp with CUDA and serves an OpenAI-compatible API on port 8080.
 
 ```bash
-modal deploy qwen3-coder-llamacpp.py
+modal deploy modal-llamacpp.py
+```
+
+Alternatively, one-click deploy directly from CLI (configure, preload, deploy):
+```bash
+modal run modal-llamacpp.py::main \
+  --preset qwen2.5-coder-7b \
+  --preload True \
+  --deploy True
 ```
 
 Notes:
@@ -56,23 +71,23 @@ Notes:
 - During warmup you may see 503 responses; retry after a few minutes.
 
 Get the public URL:
-- Copy the web function URL printed by `modal deploy` (e.g. `https://<user>--qwen3-coder-llamacpp-serve.modal.run`).
+- Copy the web function URL printed by `modal deploy` (e.g. `https://<user>--llamacpp-server-serve.modal.run`).
 
 Tail logs:
 ```bash
-modal logs -f qwen3-coder-llamacpp.serve
+modal logs -f llamacpp-server.serve
 ```
 
 ### 3) Call the API
 Set the server URL (replace with yours):
 ```bash
-export SERVER_URL="https://<user>--qwen3-coder-llamacpp-serve.modal.run"
+export SERVER_URL="https://<user>--llamacpp-server-serve.modal.run"
 ```
 Completions endpoint:
 ```bash
 curl -s -X POST \
   -H 'Content-Type: application/json' \
-  -d '{"model": "default", "prompt": "Hello Qwen!"}' \
+  -d '{"model": "default", "prompt": "Hello!"}' \
   "$SERVER_URL"/v1/completions
 ```
 
@@ -90,10 +105,17 @@ curl -s -X POST \
 ```
 
 ### Tuning and configuration
-- GPU type: edit `GPU_CONFIG` in `qwen3-coder-llamacpp.py`.
-- Quantization: edit `QUANT` (default: `"Q4_K_M"`).
-- Server args: edit `DEFAULT_SERVER_ARGS` (e.g., `--ctx-size`, `--threads`).
-- If VRAM is insufficient, reduce GPU offload by lowering `--n-gpu-layers` or set `GPU_CONFIG = None` for CPU.
+- **GPU shape**: set environment variable before deploy/run, e.g. `export GPU_CONFIG="A100-80GB:2"`.
+- **Quantization**: pass `--quant` (default: `Q4_K_M`) or adjust presets.
+- **Server args**: pass `--server_args "--ctx-size 65536 --threads 24"`.
+- **GPU offload**: override with `--n_gpu_layers <int>` or rely on auto (all layers if GPU provided).
+- **Persisted config**: settings are saved to `/root/.cache/llama.cpp/serve_config.json` and read by the server.
+
+### Presets
+Built-in examples (adjust as needed):
+- `qwen3-coder-480b` → `unsloth/Qwen3-Coder-480B-A35B-Instruct-1M-GGUF`
+- `qwen2.5-coder-7b` → `Qwen/Qwen2.5-Coder-7B-Instruct-GGUF`
+- `deepseek-coder-lite` → `TheBloke/deepseek-coder-6.7b-instruct-GGUF`
 
 ### Volumes
 - Weights cache volume: `llamacpp-cache`
