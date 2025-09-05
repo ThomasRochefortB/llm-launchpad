@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
 from contextlib import contextmanager
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
+from pathlib import Path
+import json
 
 import typer
 
@@ -23,6 +26,43 @@ from .presets import PRESETS
 app = typer.Typer(help="llm-launchpad CLI - configure, preload, and deploy llama.cpp on Modal.")
 
 
+# --- Settings persistence (local)
+SETTINGS_DIR = Path.home() / ".llm_launchpad"
+SETTINGS_PATH = SETTINGS_DIR / "settings.json"
+
+# --- ASCII banner placeholder (replace the contents to customize)
+ASCII_BANNER = r"""
+                                                                 
+▗▖   ▗▖   ▗▄ ▄▖     ▗▖     ▄  ▗▖ ▗▖▗▄ ▗▖  ▄▄ ▗▖ ▗▖▗▄▄▖   ▄  ▗▄▄  
+▐▌   ▐▌   ▐█ █▌     ▐▌    ▐█▌ ▐▌ ▐▌▐█ ▐▌ █▀▀▌▐▌ ▐▌▐▛▀▜▖ ▐█▌ ▐▛▀█ 
+▐▌   ▐▌   ▐███▌     ▐▌    ▐█▌ ▐▌ ▐▌▐▛▌▐▌▐▛   ▐▌ ▐▌▐▌ ▐▌ ▐█▌ ▐▌ ▐▌
+▐▌   ▐▌   ▐▌█▐▌     ▐▌    █ █ ▐▌ ▐▌▐▌█▐▌▐▌   ▐███▌▐██▛  █ █ ▐▌ ▐▌
+▐▌   ▐▌   ▐▌▀▐▌     ▐▌    ███ ▐▌ ▐▌▐▌▐▟▌▐▙   ▐▌ ▐▌▐▌    ███ ▐▌ ▐▌
+▐▙▄▄▖▐▙▄▄▖▐▌ ▐▌     ▐▙▄▄▖▗█ █▖▝█▄█▘▐▌ █▌ █▄▄▌▐▌ ▐▌▐▌   ▗█ █▖▐▙▄█ 
+▝▀▀▀▘▝▀▀▀▘▝▘ ▝▘     ▝▀▀▀▘▝▘ ▝▘ ▝▀▘ ▝▘ ▀▘  ▀▀ ▝▘ ▝▘▝▘   ▝▘ ▝▘▝▀▀  
+                                                                 
+               ▀▀▀▀▀        
+----------------------------------------------------------------                                     
+"""
+
+
+def _load_settings() -> Dict[str, Any]:
+    if SETTINGS_PATH.exists():
+        try:
+            return json.loads(SETTINGS_PATH.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def _save_settings(settings: Dict[str, Any]) -> None:
+    try:
+        SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+        SETTINGS_PATH.write_text(json.dumps(settings, indent=2))
+    except Exception:
+        pass
+
+
 def _ensure_modal_cli_available() -> None:
     if shutil.which("modal") is None:
         typer.echo("Error: Modal CLI not found. Install with: pip install modal && modal setup", err=True)
@@ -32,6 +72,8 @@ def _ensure_modal_cli_available() -> None:
 def _print_banner() -> None:
     """Render a simple banner using rich if available, else plain text."""
     if not Console:
+        if ASCII_BANNER.strip():
+            typer.echo(ASCII_BANNER)
         typer.echo("llm-launchpad")
         return
     try:
@@ -39,6 +81,8 @@ def _print_banner() -> None:
         from rich.panel import Panel  # type: ignore
         from importlib.metadata import version  # type: ignore
     except Exception:
+        if ASCII_BANNER.strip():
+            typer.echo(ASCII_BANNER)
         typer.echo("llm-launchpad")
         return
 
@@ -49,13 +93,9 @@ def _print_banner() -> None:
         subtitle = "Modal + llama.cpp"
 
     console = Console()
-    console.print(
-        Panel.fit(
-            "🧠  llm-launchpad",
-            subtitle=subtitle,
-            border_style="cyan",
-        )
-    )
+    if ASCII_BANNER.strip():
+        console.print(ASCII_BANNER)
+    console.print(Panel.fit("🧠  llm-launchpad", subtitle=subtitle, border_style="cyan"))
 
 
 @contextmanager
@@ -123,15 +163,49 @@ def _build_modal_run_args(
     return args
 
 
-def _run_command(command: List[str]) -> int:
-    process = subprocess.run(command, text=True)
+def _run_command(command: List[str], env: Optional[Dict[str, str]] = None) -> int:
+    merged_env = None
+    if env is not None:
+        merged_env = {**os.environ, **env}
+    process = subprocess.run(command, text=True, env=merged_env)
     return process.returncode
+
+
+def _env_for_modal(settings: Dict[str, Any]) -> Dict[str, str]:
+    env: Dict[str, str] = {}
+    gpu_cfg = settings.get("GPU_CONFIG")
+    if isinstance(gpu_cfg, str) and gpu_cfg.strip():
+        env["GPU_CONFIG"] = gpu_cfg.strip()
+    scaledown = settings.get("SCALEDOWN_WINDOW")
+    if isinstance(scaledown, int) and scaledown > 0:
+        env["SCALEDOWN_WINDOW"] = str(scaledown)
+    return env
+
+
+def _ensure_modal_authenticated() -> str:
+    """Verify Modal auth by checking current profile. Warn and exit if missing. Returns username."""
+    try:
+        res = subprocess.run(
+            ["modal", "profile", "current"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except Exception:
+        typer.echo("Failed to invoke Modal CLI. Run: modal setup", err=True)
+        raise typer.Exit(code=1)
+    username = (res.stdout or "").strip()
+    if res.returncode != 0 or not username:
+        typer.echo("Modal authentication missing. Run: modal setup", err=True)
+        raise typer.Exit(code=1)
+    return username
 
 
 @app.command()
 def wizard() -> None:
     """Interactive setup: choose a preset or custom model, preload, and deploy."""
     _ensure_modal_cli_available()
+    username = _ensure_modal_authenticated()
     # Variables to share across alternate screen scope
     preset: Optional[str] = None
     repo_id: Optional[str] = None
@@ -154,6 +228,38 @@ def wizard() -> None:
             typer.echo("Error: InquirerPy is required for interactive mode. Install with: uv pip install InquirerPy", err=True)
             raise typer.Exit(code=1)
 
+        # First menu: choose between deploy flow and settings
+        auth_status = f"Authenticated on Modal as {username}"
+        action = inquirer.select(
+            message="Choose action",
+            choices=[
+                {"name": "🚀 deploy", "value": "deploy"},
+                {"name": "⚙️  settings", "value": "settings"},
+                {"name": "─" * 50, "value": "__separator__", "disabled": True},
+                {"name": f"✓ {auth_status}", "value": "__auth_status__", "disabled": True},
+            ],
+            default="deploy",
+            cycle=True,
+        ).execute()
+
+        if action == "settings":
+            settings = _load_settings()
+            current_gpu = settings.get("GPU_CONFIG", "A100-80GB:1")
+            current_scaledown = str(settings.get("SCALEDOWN_WINDOW", 30 * 60))
+            new_gpu = inquirer.text(message="GPU_CONFIG (e.g., A100-80GB:1)", default=str(current_gpu)).execute()
+            new_scaledown = inquirer.text(message="scaledown_window seconds", default=current_scaledown).execute()
+            try:
+                new_scaledown_int = int(new_scaledown)
+            except ValueError:
+                typer.echo("scaledown_window must be an integer (seconds).", err=True)
+                raise typer.Exit(code=1)
+            settings["GPU_CONFIG"] = new_gpu
+            settings["SCALEDOWN_WINDOW"] = new_scaledown_int
+            _save_settings(settings)
+            # After saving, go back to first menu
+            return wizard()
+
+        # Deploy flow: choose preset or custom
         preset_names = list(PRESETS.keys())
         choices = []
         for name in preset_names:
@@ -183,6 +289,12 @@ def wizard() -> None:
 
         preload = inquirer.confirm(message="Preload/download weights now?", default=True).execute()
         deploy = inquirer.confirm(message="Deploy the server when finished?", default=True).execute()
+        warm_up = False
+        if deploy:
+            warm_up = inquirer.confirm(
+                message="Warm up after deploy (tail logs until ready)?",
+                default=True,
+            ).execute()
 
         tweak = inquirer.confirm(message="Advanced options (server args, host/port, n_gpu_layers)?", default=False).execute()
         if tweak:
@@ -212,23 +324,52 @@ def wizard() -> None:
         n_gpu_layers=n_gpu_layers,
     )
 
+    settings = _load_settings()
+    env = _env_for_modal(settings)
+
     typer.echo("\nRunning:")
     typer.echo(" "+" ".join(args))
-    code = _run_command(args)
+    if env:
+        typer.echo(" with env: " + ", ".join([f"{k}={v}" for k, v in env.items()]))
+    code = _run_command(args, env=env)
     if code != 0:
         raise typer.Exit(code=code)
 
     if not deploy:
         typer.echo("\nNext: Deploy with 'modal deploy modal-llamacpp.py' when ready.")
+    else:
+        # Optionally warm up the server by probing the public URL and tailing logs
+        try:
+            # Reuse the warmup command implementation
+            if warm_up:
+                typer.echo("\nStarting warmup...")
+                # Defer URL prompt to warmup command if not provided
+                warmup(server_url=None, timeout=1800, tail_logs=True)  # type: ignore
+        except Exception:
+            pass
 
 
 @app.command()
-def deploy() -> None:
+def deploy(
+    do_warmup: bool = typer.Option(False, help="After deploy, warm up and tail logs until ready"),
+    server_url: Optional[str] = typer.Option(
+        None, help="Deployed web URL, e.g., https://<user>--llamacpp-server-serve.modal.run"
+    ),
+    timeout: int = typer.Option(1800, help="Seconds to wait for readiness during warmup"),
+    tail_logs: bool = typer.Option(True, help="Tail serve logs during warmup"),
+) -> None:
     """Deploy the server to Modal."""
     _ensure_modal_cli_available()
+    _ensure_modal_authenticated()
     _print_banner()
-    code = _run_command(["modal", "deploy", "modal-llamacpp.py"])
-    raise typer.Exit(code=code)
+    settings = _load_settings()
+    env = _env_for_modal(settings)
+    code = _run_command(["modal", "deploy", "modal-llamacpp.py"], env=env)
+    if code != 0:
+        raise typer.Exit(code=code)
+    if do_warmup:
+        warmup(server_url=server_url, timeout=timeout, tail_logs=tail_logs)
+    raise typer.Exit(code=0)
 
 
 @app.command()
@@ -239,9 +380,16 @@ def switch(
     revision: Optional[str] = typer.Option(None, help="HF revision"),
     preload: bool = typer.Option(True, help="Preload/download weights immediately"),
     redeploy: bool = typer.Option(True, help="Redeploy after switching"),
+    do_warmup: bool = typer.Option(True, help="Warm up after redeploy and tail logs until ready"),
+    server_url: Optional[str] = typer.Option(
+        None, help="Deployed web URL, e.g., https://<user>--llamacpp-server-serve.modal.run"
+    ),
+    timeout: int = typer.Option(1800, help="Seconds to wait for readiness during warmup"),
+    tail_logs: bool = typer.Option(True, help="Tail serve logs during warmup"),
 ) -> None:
     """Switch model (preset or custom), optionally preload and redeploy."""
     _ensure_modal_cli_available()
+    _ensure_modal_authenticated()
     _print_banner()
 
     if not any([preset, repo_id]):
@@ -265,9 +413,107 @@ def switch(
         raise typer.Exit(code=code)
 
     if redeploy:
-        code = _run_command(["modal", "deploy", "modal-llamacpp.py"])
-        raise typer.Exit(code=code)
+        settings = _load_settings()
+        env = _env_for_modal(settings)
+        code = _run_command(["modal", "deploy", "modal-llamacpp.py"], env=env)
+        if code != 0:
+            raise typer.Exit(code=code)
+        if do_warmup:
+            warmup(server_url=server_url, timeout=timeout, tail_logs=tail_logs)
+    raise typer.Exit(code=0)
 
+
+@app.command()
+def warmup(
+    server_url: Optional[str] = typer.Option(
+        None, help="Deployed web URL, e.g., https://<user>--llamacpp-server-serve.modal.run"
+    ),
+    timeout: int = typer.Option(1800, help="Seconds to wait for readiness (default 30m)"),
+    tail_logs: bool = typer.Option(True, help="Tail serve logs during warmup"),
+) -> None:
+    """Cold start the container by probing the server and tail logs until ready."""
+    _ensure_modal_cli_available()
+    _ensure_modal_authenticated()
+
+    _print_banner()
+
+    # Resolve server URL
+    if not server_url:
+        # Try environment variable first for convenience
+        server_url = typer.prompt(
+            "Server URL (e.g., https://<user>--llamacpp-server-serve.modal.run)",
+        )
+
+    probe_url = server_url.rstrip("/") + "/v1/completions"
+
+    # Tail logs from Modal in background
+    logs_process: Optional[subprocess.Popen] = None
+    if tail_logs:
+        try:
+            logs_process = subprocess.Popen(
+                ["modal", "app", "logs", "-f", "llamacpp-server.serve"],
+            )
+        except Exception as exc:
+            typer.echo(f"Warning: failed to start log tailing: {exc}")
+
+    # Probe readiness by calling the OpenAI-compatible completions endpoint
+    try:
+        import time
+        import json as _json
+        import requests  # type: ignore
+    except Exception:
+        typer.echo("Error: 'requests' is required. Install with: uv pip install requests", err=True)
+        if logs_process:
+            try:
+                logs_process.terminate()
+            except Exception:
+                pass
+        raise typer.Exit(code=1)
+
+    start_time = time.time()
+    backoff_seconds = 2.0
+    max_backoff_seconds = 30.0
+    last_error_message: Optional[str] = None
+
+    payload = {
+        "model": "default",
+        "prompt": "ping",
+        "max_tokens": 1,
+        "temperature": 0,
+    }
+    headers = {"Content-Type": "application/json"}
+
+    typer.echo(f"Probing readiness at: {probe_url}")
+
+    while True:
+        elapsed = time.time() - start_time
+        if elapsed > timeout:
+            typer.echo("Timed out waiting for readiness.", err=True)
+            if last_error_message:
+                typer.echo(f"Last error: {last_error_message}", err=True)
+            if logs_process:
+                try:
+                    logs_process.terminate()
+                except Exception:
+                    pass
+            raise typer.Exit(code=1)
+        try:
+            response = requests.post(probe_url, headers=headers, data=_json.dumps(payload), timeout=10)
+            if 200 <= response.status_code < 300:
+                typer.echo("\n✅ Server is ready.")
+                if logs_process:
+                    try:
+                        logs_process.terminate()
+                    except Exception:
+                        pass
+                return
+            else:
+                last_error_message = f"HTTP {response.status_code}: {response.text[:200]}"
+        except Exception as exc:
+            last_error_message = str(exc)
+
+        time.sleep(backoff_seconds)
+        backoff_seconds = min(max_backoff_seconds, backoff_seconds * 1.5)
 
 def main() -> None:  # console script entrypoint
     app()

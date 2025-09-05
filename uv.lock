@@ -572,6 +572,7 @@ source = { editable = "." }
 dependencies = [
     { name = "inquirerpy" },
     { name = "modal" },
+    { name = "requests" },
     { name = "rich" },
     { name = "typer" },
 ]
@@ -586,6 +587,7 @@ requires-dist = [
     { name = "huggingface-hub", extras = ["hf-transfer"], marker = "extra == 'hf'", specifier = ">=0.26.2" },
     { name = "inquirerpy", specifier = ">=0.3.4" },
     { name = "modal", specifier = ">=0.60.0" },
+    { name = "requests", specifier = ">=2.32.0" },
     { name = "rich", specifier = ">=13.7.1" },
     { name = "typer", specifier = ">=0.12.3" },
 ]

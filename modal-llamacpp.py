@@ -146,12 +146,19 @@ def _resolve_model_entrypoint(quant: Optional[str]) -> Path:
     return candidates[0]
 
 
+try:
+    SCALEDOWN_WINDOW = int(os.environ.get("SCALEDOWN_WINDOW", str(30 * MINUTES)))
+except Exception:
+    SCALEDOWN_WINDOW = 30 * MINUTES
+
+
 @app.function(
     image=image,
     volumes={cache_dir: model_cache},
     gpu=GPU_CONFIG,
     timeout=60 * MINUTES,  # allow long cold starts
-    scaledown_window=30 * MINUTES,  # keep container warm after requests
+    scaledown_window=SCALEDOWN_WINDOW,  # keep container warm after requests (overridable via env)
+    max_containers=1,  # cap number of containers (replicas) to 1
 )
 @modal.web_server(8080, startup_timeout=30 * 60)
 def serve():
