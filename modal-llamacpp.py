@@ -30,8 +30,7 @@ model_cache = modal.Volume.from_name("llamacpp-cache", create_if_missing=True)
 CONFIG_PATH = f"{cache_dir}/serve_config.json"
 
 # --- Simple presets for convenience (model-agnostic)
-# Note: You can always supply --repo-id and --quant directly instead of using a preset
-from llm_launchpad.presets import PRESETS
+# Note: Import presets lazily inside the local entrypoint to avoid container import issues.
 
 
 def _save_config(config: Dict[str, Any]) -> None:
@@ -201,6 +200,18 @@ def serve():
     subprocess.Popen(command)
 
 
+@app.function(image=download_image, volumes={cache_dir: model_cache})
+def save_config_remote(config: Dict[str, Any]) -> None:
+    """Persist configuration inside the Modal Volume so web server can read it.
+
+    This avoids attempting to write to /root locally when running the local entrypoint.
+    """
+    Path(cache_dir).mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(config, f)
+    model_cache.commit()
+
+
 @app.local_entrypoint()
 def main(
     preload: bool = True,
@@ -220,6 +231,9 @@ def main(
       modal run modal-llamacpp.py::main --preset qwen2.5-coder-7b --preload True --deploy True
       modal run modal-llamacpp.py::main --repo-id Qwen/Qwen2.5-Coder-7B-Instruct-GGUF --quant Q4_K_M --deploy True
     """
+    # Lazy import here so containers importing this module don't need the package
+    from llm_launchpad.presets import PRESETS
+
     # Merge preset with explicit arguments
     cfg: Dict[str, Any] = {}
     if preset:
@@ -247,8 +261,9 @@ def main(
         # Tokenize simple space-separated string to list
         cfg["server_args"] = [arg for arg in server_args.split(" ") if arg]
 
-    _save_config(cfg)
-    print(f"📝 Saved config: {json.dumps(cfg, indent=2)}")
+    # Save the config inside the Modal Volume (remote) to avoid local filesystem issues
+    save_config_remote.remote(cfg)
+    print(f"📝 Saved config (remote volume): {json.dumps(cfg, indent=2)}")
 
     if preload:
         allow_patterns = [f"*{cfg['quant']}*.gguf"] if cfg.get("quant") else ["*.gguf"]

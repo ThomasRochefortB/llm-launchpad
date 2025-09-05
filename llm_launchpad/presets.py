@@ -16,15 +16,15 @@ PRESETS: Dict[str, Dict[str, Any]] = {
         "quant": "Q4_K_M",
         "revision": None,
     },
-    # Lighter coding preset examples (adjust to available repos in your HF account)
-    # These are illustrative and may need to be updated to match available GGUF repos
-    "qwen2.5-coder-7b": {
-        "repo_id": "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+    # Mid-size coding preset
+    "qwen3-coder-30b": {
+        "repo_id": "unsloth/Qwen3-Coder-30B-A3B-Instruct-1M-GGUF",
         "quant": "Q4_K_M",
         "revision": None,
     },
-    "deepseek-coder-lite": {
-        "repo_id": "TheBloke/deepseek-coder-6.7b-instruct-GGUF",
+    # General-purpose 20B model
+    "gpt-oss-20b": {
+        "repo_id": "unsloth/gpt-oss-20b-GGUF",
         "quant": "Q4_K_M",
         "revision": None,
     },

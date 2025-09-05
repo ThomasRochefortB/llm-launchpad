@@ -31,18 +31,18 @@ This downloads GGUF weights into a persistent Volume (`llamacpp-cache`).
 
 Presets (recommended):
 ```bash
-modal run modal-llamacpp.py::main --preset qwen2.5-coder-7b --preload True
+modal run modal-llamacpp.py::main --preset qwen3-coder-30b --preload
 ```
 
 Custom repo/quant:
 ```bash
 modal run modal-llamacpp.py::main \
   --repo-id Qwen/Qwen2.5-Coder-7B-Instruct-GGUF \
-  --quant Q4_K_M --preload True
+  --quant Q4_K_M --preload
 ```
 
 Common flags:
-- `--preload True|False`
+- `--preload` (use `--no-preload` to disable)
 - `--preset <name>` (see Presets below)
 - `--repo-id <org/model>`
 - `--quant <pattern>` (e.g., `Q4_K_M`)
@@ -61,9 +61,9 @@ modal deploy modal-llamacpp.py
 Alternatively, one-click deploy directly from CLI (configure, preload, deploy):
 ```bash
 modal run modal-llamacpp.py::main \
-  --preset qwen2.5-coder-7b \
-  --preload True \
-  --deploy True
+  --preset qwen3-coder-30b \
+  --preload \
+  --deploy
 ```
 
 Notes:
@@ -75,7 +75,7 @@ Get the public URL:
 
 Tail logs:
 ```bash
-modal logs -f llamacpp-server.serve
+modal app logs -f llamacpp-server.serve
 ```
 
 ### 3) Call the API
