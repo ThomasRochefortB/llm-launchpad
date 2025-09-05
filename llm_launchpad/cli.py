@@ -13,12 +13,9 @@ import typer
 
 try:
     # Pretty output if rich is available
-    from rich import box
     from rich.console import Console
-    from rich.table import Table
 except Exception:  # pragma: no cover - rich is optional
     Console = None  # type: ignore
-    box = None  # type: ignore
 
 from .presets import PRESETS
 
@@ -47,6 +44,10 @@ ASCII_BANNER = r"""
 
 
 def _load_settings() -> Dict[str, Any]:
+    """Load persisted settings from the user's home directory.
+
+    Returns an empty dict if the settings file is missing or invalid.
+    """
     if SETTINGS_PATH.exists():
         try:
             return json.loads(SETTINGS_PATH.read_text())
@@ -56,6 +57,7 @@ def _load_settings() -> Dict[str, Any]:
 
 
 def _save_settings(settings: Dict[str, Any]) -> None:
+    """Persist settings to the user's home directory. Failures are ignored."""
     try:
         SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
         SETTINGS_PATH.write_text(json.dumps(settings, indent=2))
@@ -64,6 +66,7 @@ def _save_settings(settings: Dict[str, Any]) -> None:
 
 
 def _ensure_modal_cli_available() -> None:
+    """Exit with error if the Modal CLI is not installed on PATH."""
     if shutil.which("modal") is None:
         typer.echo("Error: Modal CLI not found. Install with: pip install modal && modal setup", err=True)
         raise typer.Exit(code=1)
@@ -131,6 +134,7 @@ def _build_modal_run_args(
     port: Optional[int],
     n_gpu_layers: Optional[int],
 ) -> List[str]:
+    """Translate CLI options into a `modal run` command invocation list."""
     args: List[str] = [
         "modal",
         "run",
@@ -164,6 +168,10 @@ def _build_modal_run_args(
 
 
 def _run_command(command: List[str], env: Optional[Dict[str, str]] = None) -> int:
+    """Run a subprocess command with optional environment overrides.
+
+    Returns the process return code.
+    """
     merged_env = None
     if env is not None:
         merged_env = {**os.environ, **env}
@@ -172,6 +180,7 @@ def _run_command(command: List[str], env: Optional[Dict[str, str]] = None) -> in
 
 
 def _env_for_modal(settings: Dict[str, Any]) -> Dict[str, str]:
+    """Derive environment variables for Modal from saved settings."""
     env: Dict[str, str] = {}
     gpu_cfg = settings.get("GPU_CONFIG")
     if isinstance(gpu_cfg, str) and gpu_cfg.strip():
@@ -440,9 +449,13 @@ def warmup(
     # Resolve server URL
     if not server_url:
         # Try environment variable first for convenience
-        server_url = typer.prompt(
-            "Server URL (e.g., https://<user>--llamacpp-server-serve.modal.run)",
-        )
+        env_url = os.environ.get("SERVER_URL")
+        if env_url:
+            server_url = env_url
+        else:
+            server_url = typer.prompt(
+                "Server URL (e.g., https://<user>--llamacpp-server-serve.modal.run)",
+            )
 
     probe_url = server_url.rstrip("/") + "/v1/completions"
 

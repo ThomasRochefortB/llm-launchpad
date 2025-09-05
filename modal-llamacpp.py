@@ -15,7 +15,6 @@ app = modal.App(APP_NAME)
 # You can override this at deploy time with environment variable GPU_CONFIG
 GPU_CONFIG = os.environ.get("GPU_CONFIG", "A100-80GB:1")
 MINUTES = 60
-LLAMA_CPP_RELEASE = None  # build from latest HEAD for newer arch support (e.g., qwen3moe)
 
 
 # --- Model configuration (from Hugging Face)
@@ -34,6 +33,11 @@ CONFIG_PATH = f"{cache_dir}/serve_config.json"
 
 
 def _save_config(config: Dict[str, Any]) -> None:
+    """Persist configuration JSON inside the mounted volume.
+
+    Note: This is only used within container functions. For local entrypoints
+    prefer `save_config_remote` which writes remotely.
+    """
     Path(cache_dir).mkdir(parents=True, exist_ok=True)
     with open(CONFIG_PATH, "w") as f:
         json.dump(config, f)
@@ -42,6 +46,7 @@ def _save_config(config: Dict[str, Any]) -> None:
 
 
 def _load_config() -> Dict[str, Any]:
+    """Load configuration from the volume, with sane defaults."""
     if Path(CONFIG_PATH).exists():
         with open(CONFIG_PATH) as f:
             return json.load(f)
@@ -99,7 +104,7 @@ def download_model(
 
     Returns a list of relative paths of GGUF files matching the quantization.
     """
-    from huggingface_hub import snapshot_download
+    from huggingface_hub import snapshot_download  # type: ignore
 
     if allow_patterns is None:
         allow_patterns = [f"*{QUANT}*.gguf"] if QUANT else ["*.gguf"]
@@ -265,8 +270,9 @@ def main(
     cfg["n_gpu_layers"] = n_gpu_layers if n_gpu_layers is not None else None
 
     if server_args:
-        # Tokenize simple space-separated string to list
-        cfg["server_args"] = [arg for arg in server_args.split(" ") if arg]
+        # Tokenize simple space-separated string to list; respect quotes
+        import shlex
+        cfg["server_args"] = shlex.split(server_args)
 
     # Save the config inside the Modal Volume (remote) to avoid local filesystem issues
     save_config_remote.remote(cfg)

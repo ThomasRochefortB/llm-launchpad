@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llm-launchpad"
-version = "0.0.1"
+version = "0.0.2"
 description = "One-click personal LLM deployment with coding agent + chat UI."
 readme = "README.md"
 requires-python = ">=3.9"
