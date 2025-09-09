@@ -87,7 +87,7 @@ Completions endpoint:
 ```bash
 curl -s -X POST \
   -H 'Content-Type: application/json' \
-  -d '{"model": "default", "prompt": "Hello!"}' \
+  -d '{"model": "default", "prompt": "Hello! How are you?"}' \
   "$SERVER_URL"/v1/completions
 ```
 
@@ -102,6 +102,11 @@ curl -s -X POST \
         ]
       }' \
   "$SERVER_URL"/v1/chat/completions
+```
+
+Metrics endpoint:
+```bash
+curl -s "$SERVER_URL"/metrics
 ```
 
 ### Tuning and configuration
@@ -126,3 +131,21 @@ Built-in examples (adjust as needed):
 - Slow downloads: ensure `HF_HUB_ENABLE_HF_TRANSFER=1`.
 - HF auth errors: login with `huggingface-cli login`.
 - Build errors: ensure host CUDA >= 12.4, or switch to CPU.
+
+## OpenHands CLI integration
+
+Generate an OpenHands `config.toml` that points to your deployed server:
+
+```bash
+llm-launchpad openhands --server-url "https://<user>--llamacpp-server-serve.modal.run" --output ./config.toml
+```
+
+Then run OpenHands CLI with that config:
+
+```bash
+openhands --config-file ./config.toml
+```
+
+Notes:
+- Set `OPENAI_API_KEY` in your environment to have it written to `config.toml`, or pass `--api-key`.
+- The generated config sets `[llm] base_url` to `<SERVER_URL>/v1` and `model` to `default` (change with `--model`).

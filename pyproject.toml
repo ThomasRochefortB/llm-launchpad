@@ -7,7 +7,7 @@ name = "llm-launchpad"
 version = "0.0.2"
 description = "One-click personal LLM deployment with coding agent + chat UI."
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.12"
 license = { file = "LICENSE" }
 authors = [{ name = "Thomas Rochefort-Bedard" }]
 keywords = ["llm", "deployment", "modal", "agent", "chat"]
@@ -24,6 +24,7 @@ dependencies = [
   "rich>=13.7.1",
   "InquirerPy>=0.3.4",
   "requests>=2.32.0",
+  "openhands-ai",
 ]
 
 [project.optional-dependencies]

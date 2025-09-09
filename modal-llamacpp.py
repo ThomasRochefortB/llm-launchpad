@@ -203,6 +203,7 @@ def serve():
         host,
         "--port",
         str(port),
+        "--metrics",  # Enable metrics endpoint
     ] + (extra_server_args or DEFAULT_SERVER_ARGS)
 
     print("🦙 starting llama-server:")
