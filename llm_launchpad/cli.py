@@ -247,11 +247,10 @@ def wizard() -> None:
                 {"name": "🚀 deploy", "value": "deploy"},
                 {"name": "🧩 openhands", "value": "openhands"},
                 {"name": "⚙️  settings", "value": "settings"},
-                {"name": "─" * 50, "value": "__separator__", "disabled": True},
-                {"name": f"✓ {auth_status}", "value": "__auth_status__", "disabled": True},
             ],
             default="deploy",
             cycle=True,
+            instruction=f"✓ {auth_status}",
         ).execute()
 
         if action == "settings":
@@ -366,57 +365,57 @@ def wizard() -> None:
                 raise typer.Exit(code=code)
         return
 
-        # Deploy flow: choose preset or custom
-        preset_names = list(PRESETS.keys())
-        choices = []
-        for name in preset_names:
-            entry = PRESETS[name]
-            label = f"{name}  →  {entry.get('repo_id','')}  [{entry.get('quant','')}]"
-            choices.append({"name": label, "value": name})
-        choices.append({"name": "custom (enter repo-id and quant)", "value": "__custom__"})
+    # Deploy flow: choose preset or custom
+    preset_names = list(PRESETS.keys())
+    choices = []
+    for name in preset_names:
+        entry = PRESETS[name]
+        label = f"{name}  →  {entry.get('repo_id','')}  [{entry.get('quant','')}]"
+        choices.append({"name": label, "value": name})
+    choices.append({"name": "custom (enter repo-id and quant)", "value": "__custom__"})
 
-        selection = inquirer.select(
-            message="Choose a preset",
-            choices=choices,
-            default=preset_names[0] if preset_names else "__custom__",
-            cycle=True,
+    selection = inquirer.select(
+        message="Choose a preset",
+        choices=choices,
+        default=preset_names[0] if preset_names else "__custom__",
+        cycle=True,
+    ).execute()
+
+    if selection == "__custom__":
+        repo_id = inquirer.text(
+            message="Hugging Face repo-id (e.g., Qwen/Qwen2.5-Coder-7B-Instruct-GGUF)",
+            validate=lambda x: len(x.strip()) > 0,
+            invalid_message="Repo-id is required.",
+        ).execute()
+        quant = inquirer.text(message="Quant pattern (e.g., Q4_K_M)", default="Q4_K_M").execute()
+        rev_in = inquirer.text(message="HF revision (optional)", default="").execute()
+        revision = rev_in or None
+    else:
+        preset = str(selection)
+
+    preload = inquirer.confirm(message="Preload/download weights now?", default=True).execute()
+    deploy = inquirer.confirm(message="Deploy the server when finished?", default=True).execute()
+    warm_up = False
+    if deploy:
+        warm_up = inquirer.confirm(
+            message="Warm up after deploy (tail logs until ready)?",
+            default=True,
         ).execute()
 
-        if selection == "__custom__":
-            repo_id = inquirer.text(
-                message="Hugging Face repo-id (e.g., Qwen/Qwen2.5-Coder-7B-Instruct-GGUF)",
-                validate=lambda x: len(x.strip()) > 0,
-                invalid_message="Repo-id is required.",
-            ).execute()
-            quant = inquirer.text(message="Quant pattern (e.g., Q4_K_M)", default="Q4_K_M").execute()
-            rev_in = inquirer.text(message="HF revision (optional)", default="").execute()
-            revision = rev_in or None
-        else:
-            preset = str(selection)
-
-        preload = inquirer.confirm(message="Preload/download weights now?", default=True).execute()
-        deploy = inquirer.confirm(message="Deploy the server when finished?", default=True).execute()
-        warm_up = False
-        if deploy:
-            warm_up = inquirer.confirm(
-                message="Warm up after deploy (tail logs until ready)?",
-                default=True,
-            ).execute()
-
-        tweak = inquirer.confirm(message="Advanced options (server args, host/port, n_gpu_layers)?", default=False).execute()
-        if tweak:
-            server_args_in = inquirer.text(message="Server args (e.g., --ctx-size 65536 --threads 24)", default="").execute()
-            server_args = server_args_in or None
-            host_in = inquirer.text(message="Host", default="0.0.0.0").execute()
-            host = host_in or None
-            port_in = inquirer.text(message="Port", default="8080").execute()
-            try:
-                port = int(port_in)
-            except ValueError:
-                typer.echo("Port must be an integer.", err=True)
-                raise typer.Exit(code=1)
-            n_gpu_layers_in = inquirer.text(message="n_gpu_layers (press Enter for auto)", default="").execute()
-            n_gpu_layers = int(n_gpu_layers_in) if n_gpu_layers_in.strip() else None
+    tweak = inquirer.confirm(message="Advanced options (server args, host/port, n_gpu_layers)?", default=False).execute()
+    if tweak:
+        server_args_in = inquirer.text(message="Server args (e.g., --ctx-size 65536 --threads 24)", default="").execute()
+        server_args = server_args_in or None
+        host_in = inquirer.text(message="Host", default="0.0.0.0").execute()
+        host = host_in or None
+        port_in = inquirer.text(message="Port", default="8080").execute()
+        try:
+            port = int(port_in)
+        except ValueError:
+            typer.echo("Port must be an integer.", err=True)
+            raise typer.Exit(code=1)
+        n_gpu_layers_in = inquirer.text(message="n_gpu_layers (press Enter for auto)", default="").execute()
+        n_gpu_layers = int(n_gpu_layers_in) if n_gpu_layers_in.strip() else None
 
     args = _build_modal_run_args(
         preset=preset,
