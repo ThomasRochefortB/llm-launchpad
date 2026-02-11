@@ -9,18 +9,46 @@ import modal
 APP_NAME = "vllm-server"
 app = modal.App(APP_NAME)
 
-N_GPU = int(os.environ.get("N_GPU", "1"))
-GPU_CONFIG = os.environ.get("GPU_CONFIG", f"H100:{N_GPU}")
 MINUTES = 60
-VLLM_PORT = int(os.environ.get("VLLM_PORT", "8000"))
+VLLM_PORT = 8000
 
-MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-4B-Thinking-2507-FP8")
-MODEL_REVISION = os.environ.get(
-    "MODEL_REVISION",
-    "953532f942706930ec4bb870569932ef63038fdf",
-)
-SERVED_MODEL_NAME = os.environ.get("SERVED_MODEL_NAME", "llm")
-FAST_BOOT = os.environ.get("FAST_BOOT", "true").lower() in {"1", "true", "yes", "on"}
+
+def _read_required_str_env(name: str) -> str:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return raw
+
+
+def _read_required_int_env(name: str) -> int:
+    raw = _read_required_str_env(name)
+    try:
+        return int(raw)
+    except ValueError:
+        raise RuntimeError(f"Environment variable {name} must be an integer, got: {raw!r}") from None
+
+
+def _read_required_bool_env(name: str) -> bool:
+    raw = _read_required_str_env(name)
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+# These values are captured at deploy/run time by the Modal CLI process.
+DEPLOY_N_GPU = _read_required_int_env("N_GPU")
+DEPLOY_GPU_CONFIG = _read_required_str_env("GPU_CONFIG")
+DEPLOY_MODEL_NAME = _read_required_str_env("MODEL_NAME")
+DEPLOY_MODEL_REVISION = os.environ.get("MODEL_REVISION", "").strip() or None
+DEPLOY_SERVED_MODEL_NAME = _read_required_str_env("SERVED_MODEL_NAME")
+DEPLOY_FAST_BOOT = _read_required_bool_env("FAST_BOOT")
+
+RUNTIME_ENV = {
+    "MODEL_NAME": DEPLOY_MODEL_NAME,
+    "SERVED_MODEL_NAME": DEPLOY_SERVED_MODEL_NAME,
+    "FAST_BOOT": "true" if DEPLOY_FAST_BOOT else "false",
+    "N_GPU": str(DEPLOY_N_GPU),
+}
+if DEPLOY_MODEL_REVISION:
+    RUNTIME_ENV["MODEL_REVISION"] = DEPLOY_MODEL_REVISION
 
 
 hf_cache_vol = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
@@ -40,9 +68,10 @@ vllm_image = (
 
 @app.function(
     image=vllm_image,
-    gpu=GPU_CONFIG,
+    gpu=DEPLOY_GPU_CONFIG,
     scaledown_window=15 * MINUTES,
     timeout=10 * MINUTES,
+    secrets=[modal.Secret.from_dict(RUNTIME_ENV)],
     volumes={
         "/root/.cache/huggingface": hf_cache_vol,
         "/root/.cache/vllm": vllm_cache_vol,
@@ -54,24 +83,30 @@ def serve() -> None:
     import shlex
     import subprocess
 
+    model_name = os.environ.get("MODEL_NAME", DEPLOY_MODEL_NAME).strip() or DEPLOY_MODEL_NAME
+    model_revision = os.environ.get("MODEL_REVISION", "").strip() or None
+    served_model_name = os.environ.get("SERVED_MODEL_NAME", DEPLOY_SERVED_MODEL_NAME).strip() or DEPLOY_SERVED_MODEL_NAME
+    fast_boot = _read_required_bool_env("FAST_BOOT")
+    n_gpu = _read_required_int_env("N_GPU")
+
     cmd = [
         "vllm",
         "serve",
-        MODEL_NAME,
+        model_name,
         "--uvicorn-log-level=info",
-        "--revision",
-        MODEL_REVISION,
         "--served-model-name",
-        SERVED_MODEL_NAME,
+        served_model_name,
         "--host",
         "0.0.0.0",
         "--port",
         str(VLLM_PORT),
         "--tensor-parallel-size",
-        str(N_GPU),
+        str(n_gpu),
     ]
 
-    cmd += ["--enforce-eager" if FAST_BOOT else "--no-enforce-eager"]
+    if model_revision:
+        cmd += ["--revision", model_revision]
+    cmd += ["--enforce-eager" if fast_boot else "--no-enforce-eager"]
 
     print("Starting vLLM command:")
     print(" ", shlex.join(cmd))
@@ -85,6 +120,7 @@ async def test(
     twice: bool = True,
 ) -> None:
     url = serve.get_web_url()
+    served_model_name = os.environ.get("SERVED_MODEL_NAME", DEPLOY_SERVED_MODEL_NAME).strip() or DEPLOY_SERVED_MODEL_NAME
 
     system_prompt = {
         "role": "system",
@@ -106,11 +142,11 @@ async def test(
         print(f"Successful health check for server at {url}")
 
         print(f"Sending messages to {url}:", *messages, sep="\n\t")
-        await _send_request(session, SERVED_MODEL_NAME, messages)
+        await _send_request(session, served_model_name, messages)
         if twice:
             messages[0]["content"] = "You are Jar Jar Binks."
             print(f"Sending messages to {url}:", *messages, sep="\n\t")
-            await _send_request(session, SERVED_MODEL_NAME, messages)
+            await _send_request(session, served_model_name, messages)
 
 
 async def _send_request(

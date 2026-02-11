@@ -150,6 +150,15 @@ Input:focus {
     border: tall $primary;
 }
 
+Select {
+    border: tall $primary-background;
+    background: $surface;
+}
+
+Select:focus {
+    border: tall $primary;
+}
+
 /* ---- Buttons ---- */
 
 Button {
@@ -247,6 +256,26 @@ Button:focus {
     height: auto;
     padding: 1 2;
     border: solid $primary-background;
+}
+
+#gpu-config-row {
+    width: 100%;
+    height: auto;
+}
+
+#gpu-type-group {
+    width: 2fr;
+    height: auto;
+    padding: 0 1 0 0;
+}
+
+#gpu-count-group {
+    width: 1fr;
+    height: auto;
+}
+
+#gpu-count {
+    height: 5;
 }
 
 /* ---- Utility classes ---- */

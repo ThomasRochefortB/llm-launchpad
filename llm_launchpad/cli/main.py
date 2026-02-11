@@ -19,6 +19,7 @@ except Exception:
 
 from ..core.backend import ModalBackend
 from ..core.config import ConfigStore
+from ..core.modal_gpu import fetch_modal_gpu_types
 from ..core.orchestrator import Orchestrator
 from ..protocol.enums import BackendType, OperationType
 from ..protocol.events import ErrorEvent, LogEvent, OperationCompleteEvent, StateChangeEvent
@@ -112,6 +113,20 @@ def wizard() -> None:
 # -----------------------------------------------------------------------
 # Headless commands
 # -----------------------------------------------------------------------
+
+
+@app.command("gpu-types")
+def gpu_types(
+    timeout: int = typer.Option(10, min=1, help="Modal docs request timeout in seconds"),
+) -> None:
+    """Fetch Modal GPU type values from the Modal docs page."""
+    try:
+        values = fetch_modal_gpu_types(timeout=float(timeout))
+    except Exception as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1)
+    for value in values:
+        typer.echo(value)
 
 
 @app.command()

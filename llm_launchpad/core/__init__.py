@@ -7,6 +7,7 @@ only and has zero UI dependencies.
 
 from .config import ConfigStore
 from .backend import ModalBackend
+from .modal_gpu import fetch_modal_gpu_types
 from .orchestrator import Orchestrator
 
-__all__ = ["ConfigStore", "ModalBackend", "Orchestrator"]
+__all__ = ["ConfigStore", "ModalBackend", "Orchestrator", "fetch_modal_gpu_types"]
