@@ -7,9 +7,9 @@ as Textual messages to the app/screen.
 from __future__ import annotations
 
 from textual.message import Message
-from textual.worker import Worker
+from ..core.hf_models import ModelCandidate
 
-from ..protocol.enums import BackendType, DeploymentState, OperationType
+from ..protocol.enums import DeploymentState, OperationType
 from ..protocol.events import (
     BaseEvent,
     ErrorEvent,
@@ -17,7 +17,6 @@ from ..protocol.events import (
     OperationCompleteEvent,
     StateChangeEvent,
 )
-from ..protocol.models import DeploymentConfig
 
 
 # -----------------------------------------------------------------------
@@ -75,6 +74,24 @@ class OperationError(Message):
         super().__init__()
         self.message = message
         self.recoverable = recoverable
+
+
+class VllmModelsLoaded(Message):
+    """Top ranked vLLM-capable models were loaded."""
+
+    def __init__(self, mode: str, models: list[ModelCandidate]) -> None:
+        super().__init__()
+        self.mode = mode
+        self.models = models
+
+
+class VllmModelsFailed(Message):
+    """Model discovery failed for a ranking mode."""
+
+    def __init__(self, mode: str, error: str) -> None:
+        super().__init__()
+        self.mode = mode
+        self.error = error
 
 
 # -----------------------------------------------------------------------

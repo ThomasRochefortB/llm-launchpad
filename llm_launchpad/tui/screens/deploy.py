@@ -20,9 +20,11 @@ from textual.widgets import (
 )
 from textual.widgets.option_list import Option
 
+from ...core.hf_models import ModelCandidate
 from ...protocol.enums import BackendType
 from ...protocol.models import DeploymentConfig
 from ...presets import PRESETS
+from ..workers import VllmModelsFailed, VllmModelsLoaded
 from ..widgets.input_form import FormField, ToggleField
 
 
@@ -189,15 +191,25 @@ class VllmDeployScreen(Screen):
             yield Static("[bold cyan]Deploy vLLM[/bold cyan]  [dim]Step 2: Model & options[/dim]")
             yield Static("")
 
+            yield Static("[bold]Model ranking[/bold]  [dim](Top 10 text-generation models)[/dim]")
+            yield OptionList(
+                Option("  Most downloaded", id="rank-downloads"),
+                Option("  Trending", id="rank-trending"),
+                id="vllm-rank-mode",
+            )
+            yield Static("[dim]Loading model suggestions...[/dim]", id="vllm-model-status")
+            yield OptionList(id="vllm-model-list")
+            yield Static("")
+
             yield FormField(
                 "Model name",
                 "model-name",
                 default="Qwen/Qwen3-4B-Thinking-2507-FP8",
             )
             yield FormField(
-                "Model revision (recommended pin)",
+                "Model revision (optional)",
                 "model-revision",
-                default="953532f942706930ec4bb870569932ef63038fdf",
+                hint="Leave blank to use default branch",
             )
             yield FormField(
                 "Served model alias",
@@ -220,12 +232,80 @@ class VllmDeployScreen(Screen):
             yield Button("Deploy", id="deploy-vllm-btn", variant="primary")
         yield Footer()
 
+    def on_mount(self) -> None:
+        self._rank_mode = "downloads"
+        self._ranked_models: list[ModelCandidate] = []
+        self.app.begin_fetch_vllm_models(self._rank_mode, self)  # type: ignore[attr-defined]
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_list.id == "vllm-rank-mode":
+            selected_mode = "downloads" if event.option.id == "rank-downloads" else "trending"
+            if selected_mode == self._rank_mode:
+                return
+            self._rank_mode = selected_mode
+            self._ranked_models = []
+            self._set_model_status("[dim]Loading model suggestions...[/dim]")
+            self.query_one("#vllm-model-list", OptionList).set_options([])
+            self.app.begin_fetch_vllm_models(self._rank_mode, self)  # type: ignore[attr-defined]
+            return
+
+        if event.option_list.id == "vllm-model-list":
+            self._apply_ranked_model_selection(event.option.id or "")
+
+    def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
+        """Mirror highlighted model into the input for keyboard-first flow."""
+        if event.option_list.id != "vllm-model-list":
+            return
+        self._apply_ranked_model_selection(event.option.id or "")
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "deploy-vllm-btn":
             self._do_deploy()
 
+    def on_vllm_models_loaded(self, message: VllmModelsLoaded) -> None:
+        if message.mode != self._rank_mode:
+            return
+        self._ranked_models = message.models
+        model_list = self.query_one("#vllm-model-list", OptionList)
+        options = []
+        for idx, model in enumerate(message.models):
+            downloads = f"{model.downloads:,}" if model.downloads is not None else "-"
+            likes = f"{model.likes:,}" if model.likes is not None else "-"
+            label = f"  {model.repo_id:<38} downloads={downloads:<10} likes={likes}"
+            options.append(Option(label, id=f"model-{idx}"))
+        model_list.set_options(options)
+
+        if message.models:
+            mode_label = "Most downloaded" if self._rank_mode == "downloads" else "Trending"
+            self._set_model_status(f"[dim]{mode_label} models loaded. Select one to prefill Model name.[/dim]")
+        else:
+            self._set_model_status("[yellow]No matching text-generation models found.[/yellow]")
+
+    def on_vllm_models_failed(self, message: VllmModelsFailed) -> None:
+        if message.mode != self._rank_mode:
+            return
+        self._ranked_models = []
+        self.query_one("#vllm-model-list", OptionList).set_options([])
+        self._set_model_status(
+            f"[yellow]Could not load model suggestions:[/yellow] {message.error} [dim](manual input still works)[/dim]"
+        )
+
     def action_do_deploy(self) -> None:
         self._do_deploy()
+
+    def _set_model_status(self, text: str) -> None:
+        self.query_one("#vllm-model-status", Static).update(text)
+
+    def _apply_ranked_model_selection(self, option_id: str) -> None:
+        if not option_id.startswith("model-"):
+            return
+        try:
+            idx = int(option_id.split("-", 1)[1])
+        except ValueError:
+            return
+        if idx < 0 or idx >= len(self._ranked_models):
+            return
+        self.query_one("#model-name", Input).value = self._ranked_models[idx].repo_id
 
     def _do_deploy(self) -> None:
         config = DeploymentConfig(backend=BackendType.VLLM)

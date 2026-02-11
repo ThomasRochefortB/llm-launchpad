@@ -6,17 +6,15 @@ screen stack and bridges user actions to Core via threaded workers.
 
 from __future__ import annotations
 
-import sys
 from typing import Optional
 
 from textual.app import App
 from textual.binding import Binding
-from textual.worker import Worker, WorkerState
 
 from ..core.backend import ModalBackend
-from ..core.config import ConfigStore
+from ..core.hf_models import list_vllm_candidates
 from ..core.orchestrator import Orchestrator
-from ..protocol.enums import BackendType, OperationType
+from ..protocol.enums import BackendType
 from ..protocol.models import DeploymentConfig
 
 from .screens.main_menu import MainMenuScreen
@@ -24,7 +22,7 @@ from .screens.deploy import BackendSelectScreen
 from .screens.manage import ManageScreen
 from .screens.monitor import MonitorScreen
 from .screens.settings import SettingsScreen
-from .workers import _dispatch_event
+from .workers import VllmModelsFailed, VllmModelsLoaded, _dispatch_event
 
 
 class WizardApp(App):
@@ -181,3 +179,26 @@ class WizardApp(App):
     def _run_stop(self, backend: BackendType, monitor: MonitorScreen):  # type: ignore[return]
         for event in self._orchestrator.stop_app(backend):
             _dispatch_event(monitor, event)
+
+    # ------------------------------------------------------------------
+    # vLLM model discovery
+    # ------------------------------------------------------------------
+
+    def begin_fetch_vllm_models(self, mode: str, receiver: object) -> None:
+        """Load ranked HF model candidates for vLLM without blocking the UI."""
+        self.run_worker(
+            lambda: self._run_fetch_vllm_models(mode, receiver),
+            name=f"fetch-vllm-models-{mode}",
+            thread=True,
+        )
+
+    def _run_fetch_vllm_models(self, mode: str, receiver: object) -> None:
+        poster = getattr(receiver, "post_message", None)
+        if poster is None:
+            return
+        try:
+            models = list_vllm_candidates(mode=mode if mode in {"downloads", "trending"} else "downloads")
+        except Exception as exc:
+            poster(VllmModelsFailed(mode=mode, error=str(exc)))
+            return
+        poster(VllmModelsLoaded(mode=mode, models=models))

@@ -24,6 +24,7 @@ dependencies = [
   "rich>=13.7.1",
   "textual>=3.0.0",
   "requests>=2.32.0",
+  "huggingface_hub>=0.26.2",
 ]
 
 [project.optional-dependencies]

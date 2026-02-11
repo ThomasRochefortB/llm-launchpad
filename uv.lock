@@ -394,6 +394,7 @@ name = "llm-launchpad"
 version = "0.0.2"
 source = { editable = "." }
 dependencies = [
+    { name = "huggingface-hub" },
     { name = "modal" },
     { name = "requests" },
     { name = "rich" },
@@ -408,6 +409,7 @@ hf = [
 
 [package.metadata]
 requires-dist = [
+    { name = "huggingface-hub", specifier = ">=0.26.2" },
     { name = "huggingface-hub", extras = ["hf-transfer"], marker = "extra == 'hf'", specifier = ">=0.26.2" },
     { name = "modal", specifier = ">=0.60.0" },
     { name = "requests", specifier = ">=2.32.0" },
