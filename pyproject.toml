@@ -22,7 +22,7 @@ dependencies = [
   "modal>=0.60.0",
   "typer>=0.12.3",
   "rich>=13.7.1",
-  "InquirerPy>=0.3.4",
+  "textual>=3.0.0",
   "requests>=2.32.0",
 ]
 
@@ -31,11 +31,11 @@ dependencies = [
 hf = ["huggingface_hub[hf_transfer]>=0.26.2"]
 
 [project.scripts]
-llm-launchpad = "llm_launchpad.cli:main"
+llm-launchpad = "llm_launchpad.cli.main:main"
 
 [project.urls]
 Homepage = "https://github.com/ThomasRochefortB/llm-launchpad"
 Issues = "https://github.com/ThomasRochefortB/llm-launchpad/issues"
 
 [tool.setuptools]
-packages = ["llm_launchpad"]
+packages = ["llm_launchpad", "llm_launchpad.cli", "llm_launchpad.core", "llm_launchpad.protocol", "llm_launchpad.tui", "llm_launchpad.tui.screens", "llm_launchpad.tui.widgets"]
