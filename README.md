@@ -4,14 +4,36 @@ One-click personal LLM deployment with coding agent + chat UI.
 
 ## Install
 
-Using uv (recommended):
+Using uv (recommended for CLI usage):
 ```bash
-uv pip install llm-launchpad
+uv tool install llm-launchpad
 ```
 
-Standard pip:
+## Endpoint Management From CLI
+
+Manage deployed launchpad endpoints directly from `llm-launchpad` (scoped to `llamacpp-server` and `vllm-server`).
+
+List launchpad deployments:
 ```bash
-pip install llm-launchpad
+llm-launchpad list
+```
+
+Check endpoint readiness:
+```bash
+llm-launchpad status --backend llamacpp
+llm-launchpad status --backend vllm
+```
+
+Tail backend logs:
+```bash
+llm-launchpad logs --backend llamacpp
+llm-launchpad logs --backend vllm
+```
+
+Stop a deployed backend:
+```bash
+llm-launchpad stop --backend llamacpp
+llm-launchpad stop --backend vllm
 ```
 
 ## GGUF on Modal with llama.cpp
@@ -78,6 +100,14 @@ Tail logs:
 modal app logs -f llamacpp-server.serve
 ```
 
+Shutdown / stop:
+- If you run any streaming/local dev command (for example `modal app logs -f ...` or `modal serve ...`), stop it with `Ctrl+C`.
+- To fully stop the deployed app (destructive, cannot be resumed), run:
+  ```bash
+  modal app stop llamacpp-server
+  ```
+- If needed, discover the exact app identifier first with `modal app list`.
+
 ### 3) Call the API
 Set the server URL (replace with yours):
 ```bash
@@ -132,20 +162,63 @@ Built-in examples (adjust as needed):
 - HF auth errors: login with `huggingface-cli login`.
 - Build errors: ensure host CUDA >= 12.4, or switch to CPU.
 
-## OpenHands CLI integration
+## vLLM on Modal (OpenAI-compatible)
 
-Generate an OpenHands `config.toml` that points to your deployed server:
+Deploy a vLLM server on Modal using an OpenAI-compatible API, based on Modal's `vllm_inference` example.
 
+### Files
+- Server entrypoint: `modal-vllm.py`
+
+### 1) Deploy the server
 ```bash
-llm-launchpad openhands --server-url "https://<user>--llamacpp-server-serve.modal.run" --output ./config.toml
+modal deploy modal-vllm.py
 ```
 
-Then run OpenHands CLI with that config:
+Get the public URL:
+- Copy the web function URL printed by `modal deploy`, e.g. `https://<user>--vllm-server-serve.modal.run`.
+
+### 2) Optional: run local smoke test against a fresh replica
+This starts a replica, checks `/health`, then streams a chat completion.
 
 ```bash
-openhands --config-file ./config.toml
+modal run modal-vllm.py
 ```
 
-Notes:
-- Set `OPENAI_API_KEY` in your environment to have it written to `config.toml`, or pass `--api-key`.
-- The generated config sets `[llm] base_url` to `<SERVER_URL>/v1` and `model` to `default` (change with `--model`).
+### 3) Call the API
+Set the server URL (replace with yours):
+```bash
+export SERVER_URL="https://<user>--vllm-server-serve.modal.run"
+```
+
+Chat completions endpoint:
+```bash
+curl -s -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "model": "llm",
+        "messages": [
+          {"role": "user", "content": "Write a Python function that reverses a string."}
+        ]
+      }' \
+  "$SERVER_URL"/v1/chat/completions
+```
+
+Swagger docs:
+```bash
+open "$SERVER_URL"/docs
+```
+
+### Configuration
+Adjust behavior with environment variables before running `modal deploy`:
+- `GPU_CONFIG` (default: `H100:1`)
+- `N_GPU` (default: `1`, used for tensor parallel size)
+- `MODEL_NAME` (default: `Qwen/Qwen3-4B-Thinking-2507-FP8`)
+- `MODEL_REVISION` (default pinned revision in `modal-vllm.py`)
+- `SERVED_MODEL_NAME` (default: `llm`)
+- `FAST_BOOT` (`true`/`false`, default: `true`)
+- `VLLM_PORT` (default: `8000`)
+
+Cached Modal volumes used by this backend:
+- `huggingface-cache`
+- `vllm-cache`
+

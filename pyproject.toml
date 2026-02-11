@@ -24,7 +24,6 @@ dependencies = [
   "rich>=13.7.1",
   "InquirerPy>=0.3.4",
   "requests>=2.32.0",
-  "openhands-ai",
 ]
 
 [project.optional-dependencies]
