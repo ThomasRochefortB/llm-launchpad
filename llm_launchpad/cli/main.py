@@ -20,9 +20,16 @@ except Exception:
 from ..core.backend import ModalBackend
 from ..core.config import ConfigStore
 from ..core.modal_gpu import fetch_modal_gpu_types
+from ..core.naming import (
+    auto_instance_name_for_backend,
+    build_app_name,
+    legacy_app_name,
+    slugify_instance_name,
+)
 from ..core.orchestrator import Orchestrator
 from ..protocol.enums import BackendType, OperationType
 from ..protocol.events import ErrorEvent, LogEvent, OperationCompleteEvent, StateChangeEvent
+from ..protocol.models import EndpointInfo
 
 app = typer.Typer(
     help="llm-launchpad CLI - configure and deploy LLM backends on Modal.",
@@ -68,6 +75,57 @@ def _preflight() -> tuple[Orchestrator, str]:
     ok, username, err = orch.preflight()
     _ensure(ok, err)
     return orch, username
+
+
+def _resolve_deploy_target(
+    backend: BackendType,
+    model_hint: Optional[str],
+    instance_name: Optional[str],
+    app_name: Optional[str],
+) -> tuple[str, str]:
+    """Resolve (instance_name, app_name) for deployment."""
+    explicit_app = (app_name or "").strip()
+    if explicit_app:
+        explicit_instance = (instance_name or "").strip() or slugify_instance_name(explicit_app)
+        return explicit_instance, explicit_app
+
+    explicit_instance = (instance_name or "").strip()
+    if explicit_instance:
+        slug = slugify_instance_name(explicit_instance)
+        return slug, build_app_name(backend, slug)
+
+    auto = auto_instance_name_for_backend(backend, model_hint)
+    return auto, build_app_name(backend, auto)
+
+
+def _backend_instances(backend: BackendType) -> list[EndpointInfo]:
+    rows = ModalBackend.list_apps() or []
+    return [row for row in rows if row.backend == backend]
+
+
+def _resolve_manage_app_name(
+    backend: BackendType,
+    app_name: Optional[str],
+    instance_name: Optional[str],
+) -> str:
+    explicit_app = (app_name or "").strip()
+    if explicit_app:
+        return explicit_app
+    explicit_instance = (instance_name or "").strip()
+    if explicit_instance:
+        return build_app_name(backend, explicit_instance)
+
+    matches = _backend_instances(backend)
+    if len(matches) == 1:
+        return matches[0].name
+    if len(matches) > 1:
+        typer.echo(
+            f"Multiple '{backend.value}' instances found. "
+            "Specify --instance-name or --app-name. Use `llm-launchpad list` to inspect instances.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    return legacy_app_name(backend)
 
 
 def _print_banner() -> None:
@@ -138,6 +196,21 @@ def deploy(
     served_model_name: Optional[str] = typer.Option(None, help="vLLM SERVED_MODEL_NAME"),
     fast_boot: Optional[bool] = typer.Option(None, help="vLLM FAST_BOOT"),
     n_gpu: Optional[int] = typer.Option(None, help="vLLM N_GPU"),
+    reasoning_parser: Optional[str] = typer.Option(
+        None,
+        help="vLLM reasoning parser (e.g. qwen3, deepseek_r1, granite)",
+    ),
+    default_chat_template_kwargs: Optional[str] = typer.Option(
+        None,
+        help=(
+            "vLLM default chat template kwargs JSON "
+            "(e.g. '{\"enable_thinking\": false}' or '{\"thinking\": true}')"
+        ),
+    ),
+    instance_name: Optional[str] = typer.Option(
+        None, help="Instance name (auto-generated from model when omitted)"
+    ),
+    app_name: Optional[str] = typer.Option(None, help="Explicit Modal app name override"),
     server_url: Optional[str] = typer.Option(None, help="Deployed web URL"),
     timeout: int = typer.Option(1800, help="Warmup timeout seconds"),
     tail_logs: bool = typer.Option(True, help="Tail logs during warmup"),
@@ -149,6 +222,11 @@ def deploy(
     from ..protocol.models import DeploymentConfig
 
     bt = BackendType(backend)
+    model_hint = model_name if bt == BackendType.VLLM else None
+    resolved_instance, resolved_app_name = _resolve_deploy_target(
+        bt, model_hint=model_hint, instance_name=instance_name, app_name=app_name
+    )
+
     config = DeploymentConfig(
         backend=bt,
         do_deploy=True,
@@ -157,6 +235,13 @@ def deploy(
         served_model_name=served_model_name,
         fast_boot=fast_boot,
         n_gpu=n_gpu,
+        reasoning_parser=reasoning_parser,
+        default_chat_template_kwargs=default_chat_template_kwargs,
+        instance_name=resolved_instance,
+        app_name=resolved_app_name,
+    )
+    typer.echo(
+        f"Deploy target: backend={bt.value} instance={resolved_instance} app={resolved_app_name}"
     )
 
     for event in orch.deploy(config):
@@ -165,8 +250,8 @@ def deploy(
             raise typer.Exit(code=event.exit_code or 1)
 
     if do_warmup:
-        url = server_url or ModalBackend.default_server_url(username, bt)
-        for event in orch.warmup(bt, url, timeout, tail_logs):
+        url = server_url or ModalBackend.default_server_url(username, app_name=resolved_app_name)
+        for event in orch.warmup(bt, url, timeout, tail_logs, app_name=resolved_app_name):
             _print_event(event)
 
     raise typer.Exit(code=0)
@@ -178,13 +263,20 @@ def warmup(
     server_url: Optional[str] = typer.Option(None, help="Deployed web URL"),
     timeout: int = typer.Option(1800, help="Seconds to wait"),
     tail_logs: bool = typer.Option(True, help="Tail logs during warmup"),
+    instance_name: Optional[str] = typer.Option(None, help="Target instance name"),
+    app_name: Optional[str] = typer.Option(None, help="Target Modal app name"),
 ) -> None:
     """Cold start the container by probing the server."""
     orch, username = _preflight()
     _print_banner()
     bt = BackendType(backend)
-    url = server_url or os.environ.get("SERVER_URL") or ModalBackend.default_server_url(username, bt)
-    for event in orch.warmup(bt, url, timeout, tail_logs):
+    target_app_name = _resolve_manage_app_name(bt, app_name, instance_name)
+    url = (
+        server_url
+        or os.environ.get("SERVER_URL")
+        or ModalBackend.default_server_url(username, app_name=target_app_name)
+    )
+    for event in orch.warmup(bt, url, timeout, tail_logs, app_name=target_app_name):
         _print_event(event)
 
 
@@ -202,12 +294,19 @@ def status(
     backend: str = typer.Option("llamacpp", help="Backend: llamacpp or vllm"),
     server_url: Optional[str] = typer.Option(None, help="Deployed web URL"),
     timeout: int = typer.Option(60, help="Timeout seconds"),
+    instance_name: Optional[str] = typer.Option(None, help="Target instance name"),
+    app_name: Optional[str] = typer.Option(None, help="Target Modal app name"),
 ) -> None:
     """Check endpoint readiness."""
     orch, username = _preflight()
     _print_banner()
     bt = BackendType(backend)
-    url = server_url or os.environ.get("SERVER_URL") or ModalBackend.default_server_url(username, bt)
+    target_app_name = _resolve_manage_app_name(bt, app_name, instance_name)
+    url = (
+        server_url
+        or os.environ.get("SERVER_URL")
+        or ModalBackend.default_server_url(username, app_name=target_app_name)
+    )
     for event in orch.check_status(bt, url, timeout):
         _print_event(event)
         if isinstance(event, OperationCompleteEvent) and not event.success:
@@ -218,12 +317,15 @@ def status(
 def logs(
     backend: str = typer.Option("llamacpp", help="Backend: llamacpp or vllm"),
     follow: bool = typer.Option(True, help="Follow log stream"),
+    instance_name: Optional[str] = typer.Option(None, help="Target instance name"),
+    app_name: Optional[str] = typer.Option(None, help="Target Modal app name"),
 ) -> None:
     """Show logs for a deployed backend."""
     orch, _ = _preflight()
     _print_banner()
     bt = BackendType(backend)
-    for event in orch.tail_logs(bt, follow):
+    target_app_name = _resolve_manage_app_name(bt, app_name, instance_name)
+    for event in orch.tail_logs(bt, follow, app_name=target_app_name):
         _print_event(event)
 
 
@@ -231,17 +333,20 @@ def logs(
 def stop(
     backend: str = typer.Option("llamacpp", help="Backend: llamacpp or vllm"),
     yes: bool = typer.Option(False, "--yes", help="Skip confirmation"),
+    instance_name: Optional[str] = typer.Option(None, help="Target instance name"),
+    app_name: Optional[str] = typer.Option(None, help="Target Modal app name"),
 ) -> None:
     """Stop a deployed backend app."""
     orch, _ = _preflight()
     _print_banner()
     bt = BackendType(backend)
+    target_app_name = _resolve_manage_app_name(bt, app_name, instance_name)
     if not yes:
-        confirmed = typer.confirm(f"Stop deployed app '{bt.app_name}'?")
+        confirmed = typer.confirm(f"Stop deployed app '{target_app_name}'?")
         if not confirmed:
             typer.echo("Aborted.")
             raise typer.Exit(code=1)
-    for event in orch.stop_app(bt):
+    for event in orch.stop_app(bt, app_name=target_app_name):
         _print_event(event)
 
 
@@ -257,6 +362,21 @@ def switch(
     served_model_name: Optional[str] = typer.Option(None, help="vLLM SERVED_MODEL_NAME"),
     fast_boot: Optional[bool] = typer.Option(None, help="vLLM FAST_BOOT"),
     n_gpu: Optional[int] = typer.Option(None, help="vLLM N_GPU"),
+    reasoning_parser: Optional[str] = typer.Option(
+        None,
+        help="vLLM reasoning parser (e.g. qwen3, deepseek_r1, granite)",
+    ),
+    default_chat_template_kwargs: Optional[str] = typer.Option(
+        None,
+        help=(
+            "vLLM default chat template kwargs JSON "
+            "(e.g. '{\"enable_thinking\": false}' or '{\"thinking\": true}')"
+        ),
+    ),
+    instance_name: Optional[str] = typer.Option(
+        None, help="Instance name (auto-generated from model when omitted)"
+    ),
+    app_name: Optional[str] = typer.Option(None, help="Explicit Modal app name override"),
     preload: bool = typer.Option(True, help="Preload weights"),
     redeploy: bool = typer.Option(True, help="Redeploy after switching"),
     do_warmup: bool = typer.Option(True, help="Warm up after redeploy"),
@@ -284,7 +404,15 @@ def switch(
         served_model_name=served_model_name,
         fast_boot=fast_boot,
         n_gpu=n_gpu,
+        reasoning_parser=reasoning_parser,
+        default_chat_template_kwargs=default_chat_template_kwargs,
     )
+    model_hint = model_name if bt == BackendType.VLLM else (repo_id or preset)
+    resolved_instance, resolved_app_name = _resolve_deploy_target(
+        bt, model_hint=model_hint, instance_name=instance_name, app_name=app_name
+    )
+    config.instance_name = resolved_instance
+    config.app_name = resolved_app_name
 
     if bt == BackendType.VLLM:
         if preload:
@@ -296,8 +424,10 @@ def switch(
                 if isinstance(event, OperationCompleteEvent) and not event.success:
                     raise typer.Exit(code=event.exit_code or 1)
             if do_warmup:
-                url = server_url or ModalBackend.default_server_url(username, bt)
-                for event in orch.warmup(bt, url, timeout, tail_logs):
+                url = server_url or ModalBackend.default_server_url(
+                    username, app_name=resolved_app_name
+                )
+                for event in orch.warmup(bt, url, timeout, tail_logs, app_name=resolved_app_name):
                     _print_event(event)
         else:
             typer.echo("No deploy performed. Use --redeploy to apply vLLM model changes.")
@@ -317,12 +447,15 @@ def switch(
         deploy_config = DeploymentConfig(backend=bt, do_deploy=True)
         settings = ConfigStore().load()
         env = settings.to_env()
-        code = ModalBackend.run_blocking(ModalBackend.build_deploy_command(bt), env=env)
+        env["MODAL_APP_NAME"] = resolved_app_name
+        code = ModalBackend.run_blocking(
+            ModalBackend.build_deploy_command(bt, app_name=resolved_app_name), env=env
+        )
         if code != 0:
             raise typer.Exit(code=code)
         if do_warmup:
-            url = server_url or ModalBackend.default_server_url(username, bt)
-            for event in orch.warmup(bt, url, timeout, tail_logs):
+            url = server_url or ModalBackend.default_server_url(username, app_name=resolved_app_name)
+            for event in orch.warmup(bt, url, timeout, tail_logs, app_name=resolved_app_name):
                 _print_event(event)
 
     raise typer.Exit(code=0)

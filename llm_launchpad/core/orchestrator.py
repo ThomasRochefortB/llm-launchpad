@@ -23,6 +23,7 @@ from ..protocol.models import DeploymentConfig, EndpointInfo, LaunchpadSettings
 
 from .backend import ModalBackend
 from .config import ConfigStore
+from .naming import legacy_app_name
 
 # Type alias for event generators
 EventStream = Generator[BaseEvent, None, None]
@@ -77,7 +78,7 @@ class Orchestrator:
         self, config: DeploymentConfig, env: dict[str, str]
     ) -> EventStream:
         if config.do_deploy:
-            cmd = ModalBackend.build_deploy_command(config.backend)
+            cmd = ModalBackend.build_deploy_command(config.backend, app_name=config.app_name)
             yield StateChangeEvent(
                 current=DeploymentState.DEPLOYING,
                 operation=OperationType.DEPLOY,
@@ -121,6 +122,7 @@ class Orchestrator:
         server_url: str,
         timeout: int = 1800,
         tail_logs: bool = True,
+        app_name: Optional[str] = None,
     ) -> EventStream:
         """Probe endpoint readiness and optionally tail logs."""
         yield StateChangeEvent(
@@ -138,8 +140,9 @@ class Orchestrator:
         if tail_logs:
             try:
                 follow = ModalBackend.logs_follow_args()
+                target_app_name = app_name or legacy_app_name(backend)
                 logs_proc = subprocess.Popen(
-                    ["modal", "app", "logs", *follow, backend.app_name],
+                    ["modal", "app", "logs", *follow, target_app_name],
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
                     text=True,
@@ -235,12 +238,14 @@ class Orchestrator:
         self,
         backend: BackendType,
         follow: bool = True,
+        app_name: Optional[str] = None,
     ) -> EventStream:
         """Tail Modal logs for the given backend."""
+        target_app_name = app_name or legacy_app_name(backend)
         cmd: List[str] = ["modal", "app", "logs"]
         if follow:
             cmd.extend(ModalBackend.logs_follow_args())
-        cmd.append(backend.app_name)
+        cmd.append(target_app_name)
 
         yield StateChangeEvent(
             current=DeploymentState.RUNNING,
@@ -345,8 +350,9 @@ class Orchestrator:
                 for info in launchpad:
                     suffix = f" ({info.app_id})" if info.app_id else ""
                     bk = info.backend.value if info.backend else "unknown"
+                    inst = info.instance_name or "-"
                     yield LogEvent(
-                        line=f"  backend={bk}  app={info.name}  state={info.state}{suffix}"
+                        line=f"  backend={bk}  instance={inst}  app={info.name}  state={info.state}{suffix}"
                     )
             yield OperationCompleteEvent(
                 operation=OperationType.LIST, success=True, data=launchpad
@@ -356,9 +362,9 @@ class Orchestrator:
         # Fallback to raw text
         raw = ModalBackend.list_apps_raw()
         if raw:
-            names = {bt.app_name for bt in BackendType}
+            names = {legacy_app_name(bt) for bt in BackendType}
             lines = raw.splitlines()
-            matches = [l for l in lines if any(n in l for n in names)]
+            matches = [l for l in lines if any(n in l for n in names) or "vllm-" in l or "llamacpp-" in l]
             if matches:
                 yield LogEvent(line="Launchpad deployments:")
                 for line in matches:
@@ -379,14 +385,14 @@ class Orchestrator:
     # Stop
     # ------------------------------------------------------------------
 
-    def stop_app(self, backend: BackendType) -> EventStream:
+    def stop_app(self, backend: BackendType, app_name: Optional[str] = None) -> EventStream:
         """Stop a deployed app."""
-        app_name = backend.app_name
-        cmd = ["modal", "app", "stop", app_name]
+        target_app_name = app_name or legacy_app_name(backend)
+        cmd = ["modal", "app", "stop", target_app_name]
         yield StateChangeEvent(
             current=DeploymentState.RUNNING,
             operation=OperationType.STOP,
-            detail=f"Stopping {app_name}",
+            detail=f"Stopping {target_app_name}",
         )
-        yield LogEvent(line=f"Stopping app: {app_name}")
+        yield LogEvent(line=f"Stopping app: {target_app_name}")
         yield from ModalBackend.run_streaming(cmd)

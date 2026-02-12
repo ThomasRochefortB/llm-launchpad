@@ -61,11 +61,17 @@ class DeploymentConfig:
     served_model_name: Optional[str] = None
     fast_boot: Optional[bool] = None
     n_gpu: Optional[int] = None
+    reasoning_parser: Optional[str] = None
+    default_chat_template_kwargs: Optional[str] = None
 
     # Deployment options
     do_deploy: bool = True
     run_smoke: bool = False
     do_warmup: bool = True
+
+    # Instance identity
+    instance_name: Optional[str] = None
+    app_name: Optional[str] = None
 
 
 @dataclass
@@ -76,6 +82,7 @@ class EndpointInfo:
     app_id: str = ""
     state: str = "unknown"
     backend: Optional[BackendType] = None
+    instance_name: Optional[str] = None
 
 
 @dataclass

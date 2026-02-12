@@ -13,8 +13,11 @@ from textual.binding import Binding
 
 from ..core.backend import ModalBackend
 from ..core.hf_models import list_vllm_candidates
+from ..core.naming import build_app_name, legacy_app_name
 from ..core.orchestrator import Orchestrator
 from ..protocol.enums import BackendType
+from ..protocol.events import LogEvent
+from ..protocol.models import EndpointInfo
 from ..protocol.models import DeploymentConfig
 
 from .screens.main_menu import MainMenuScreen
@@ -78,6 +81,8 @@ class WizardApp(App):
 
     def begin_deploy(self, config: DeploymentConfig) -> None:
         """Start a deploy operation via a threaded worker."""
+        if not config.app_name:
+            config.app_name = build_app_name(config.backend, config.instance_name)
         monitor = MonitorScreen(title="Deploy")
         self.push_screen(monitor)
         self.run_worker(
@@ -93,12 +98,14 @@ class WizardApp(App):
 
         # Warmup if requested and deploy was successful
         if config.do_warmup and config.do_deploy:
-            url = ModalBackend.default_server_url(self._username, config.backend)
+            target_app_name = config.app_name or legacy_app_name(config.backend)
+            url = ModalBackend.default_server_url(self._username, app_name=target_app_name)
             for event in self._orchestrator.warmup(
                 backend=config.backend,
                 server_url=url,
                 timeout=1800,
                 tail_logs=True,
+                app_name=target_app_name,
             ):
                 _dispatch_event(monitor, event)
 
@@ -128,19 +135,27 @@ class WizardApp(App):
         backend: BackendType,
         server_url: Optional[str] = None,
         timeout: int = 60,
+        app_name: Optional[str] = None,
     ) -> None:
-        url = server_url or ModalBackend.default_server_url(self._username, backend)
+        target_app_name = app_name or legacy_app_name(backend)
+        url = server_url or ModalBackend.default_server_url(self._username, app_name=target_app_name)
         monitor = MonitorScreen(title="Status Check")
         self.push_screen(monitor)
         self.run_worker(
-            lambda: self._run_status(backend, url, timeout, monitor),
+            lambda: self._run_status(backend, url, timeout, target_app_name, monitor),
             name="status-worker",
             thread=True,
         )
 
     def _run_status(
-        self, backend: BackendType, url: str, timeout: int, monitor: MonitorScreen
+        self,
+        backend: BackendType,
+        url: str,
+        timeout: int,
+        app_name: str,
+        monitor: MonitorScreen,
     ):  # type: ignore[return]
+        _dispatch_event(monitor, LogEvent(line=f"Target app: {app_name}"))
         for event in self._orchestrator.check_status(backend, url, timeout):
             _dispatch_event(monitor, event)
 
@@ -148,37 +163,56 @@ class WizardApp(App):
     # Manage: logs
     # ------------------------------------------------------------------
 
-    def begin_logs(self, backend: BackendType, follow: bool = True) -> None:
+    def begin_logs(
+        self,
+        backend: BackendType,
+        follow: bool = True,
+        app_name: Optional[str] = None,
+    ) -> None:
         monitor = MonitorScreen(title="Logs")
         self.push_screen(monitor)
+        target_app_name = app_name or legacy_app_name(backend)
         self.run_worker(
-            lambda: self._run_logs(backend, follow, monitor),
+            lambda: self._run_logs(backend, follow, target_app_name, monitor),
             name="logs-worker",
             thread=True,
         )
 
     def _run_logs(
-        self, backend: BackendType, follow: bool, monitor: MonitorScreen
+        self,
+        backend: BackendType,
+        follow: bool,
+        app_name: str,
+        monitor: MonitorScreen,
     ):  # type: ignore[return]
-        for event in self._orchestrator.tail_logs(backend, follow):
+        _dispatch_event(monitor, LogEvent(line=f"Target app: {app_name}"))
+        for event in self._orchestrator.tail_logs(backend, follow, app_name=app_name):
             _dispatch_event(monitor, event)
 
     # ------------------------------------------------------------------
     # Manage: stop
     # ------------------------------------------------------------------
 
-    def begin_stop(self, backend: BackendType) -> None:
+    def begin_stop(self, backend: BackendType, app_name: Optional[str] = None) -> None:
         monitor = MonitorScreen(title="Stop")
         self.push_screen(monitor)
+        target_app_name = app_name or legacy_app_name(backend)
         self.run_worker(
-            lambda: self._run_stop(backend, monitor),
+            lambda: self._run_stop(backend, target_app_name, monitor),
             name="stop-worker",
             thread=True,
         )
 
-    def _run_stop(self, backend: BackendType, monitor: MonitorScreen):  # type: ignore[return]
-        for event in self._orchestrator.stop_app(backend):
+    def _run_stop(
+        self, backend: BackendType, app_name: str, monitor: MonitorScreen
+    ):  # type: ignore[return]
+        _dispatch_event(monitor, LogEvent(line=f"Target app: {app_name}"))
+        for event in self._orchestrator.stop_app(backend, app_name=app_name):
             _dispatch_event(monitor, event)
+
+    def list_instances(self, backend: BackendType) -> list[EndpointInfo]:
+        rows = ModalBackend.list_apps() or []
+        return [row for row in rows if row.backend == backend]
 
     # ------------------------------------------------------------------
     # vLLM model discovery

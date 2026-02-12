@@ -12,6 +12,7 @@ from ..protocol.enums import BackendType
 from ..protocol.events import ErrorEvent, LogEvent, OperationCompleteEvent
 from ..protocol.models import DeploymentConfig, EndpointInfo, LaunchpadSettings
 from ..presets import PRESETS
+from .naming import infer_backend_from_app_name, infer_instance_from_app_name, legacy_app_name
 
 
 class ModalBackend:
@@ -47,12 +48,21 @@ class ModalBackend:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def default_server_url(username: str, backend: BackendType) -> str:
-        return f"https://{username}--{backend.app_name}-serve.modal.run"
+    def default_server_url(
+        username: str,
+        backend: Optional[BackendType] = None,
+        app_name: Optional[str] = None,
+    ) -> str:
+        resolved = app_name or legacy_app_name(backend or BackendType.LLAMACPP)
+        return f"https://{username}--{resolved}-serve.modal.run"
 
     @staticmethod
-    def server_example_url(backend: BackendType) -> str:
-        return f"https://<user>--{backend.app_name}-serve.modal.run"
+    def server_example_url(
+        backend: Optional[BackendType] = None,
+        app_name: Optional[str] = None,
+    ) -> str:
+        resolved = app_name or legacy_app_name(backend or BackendType.LLAMACPP)
+        return f"https://<user>--{resolved}-serve.modal.run"
 
     @staticmethod
     def test_curl_command(backend: BackendType, server_url: str) -> str:
@@ -80,6 +90,8 @@ class ModalBackend:
     def env_for_backend(config: DeploymentConfig) -> Dict[str, str]:
         """Derive backend-specific env vars from a deployment config."""
         env: Dict[str, str] = {}
+        if config.app_name:
+            env["MODAL_APP_NAME"] = config.app_name
         if config.backend != BackendType.VLLM:
             return env
         if config.model_name:
@@ -92,6 +104,10 @@ class ModalBackend:
             env["FAST_BOOT"] = "true" if config.fast_boot else "false"
         if config.n_gpu is not None and config.n_gpu > 0:
             env["N_GPU"] = str(config.n_gpu)
+        if config.reasoning_parser:
+            env["REASONING_PARSER"] = config.reasoning_parser
+        if config.default_chat_template_kwargs:
+            env["DEFAULT_CHAT_TEMPLATE_KWARGS"] = config.default_chat_template_kwargs
         return env
 
     @staticmethod
@@ -108,8 +124,11 @@ class ModalBackend:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def build_deploy_command(backend: BackendType) -> List[str]:
-        return ["modal", "deploy", backend.script]
+    def build_deploy_command(backend: BackendType, app_name: Optional[str] = None) -> List[str]:
+        cmd = ["modal", "deploy", backend.script]
+        if app_name:
+            cmd += ["--name", app_name]
+        return cmd
 
     @staticmethod
     def build_run_command(config: DeploymentConfig) -> List[str]:
@@ -261,14 +280,6 @@ class ModalBackend:
 # Internal helpers
 # ------------------------------------------------------------------
 
-_LAUNCHPAD_APPS = {
-    BackendType.LLAMACPP: BackendType.LLAMACPP.app_name,
-    BackendType.VLLM: BackendType.VLLM.app_name,
-}
-
-_APP_NAME_TO_BACKEND = {v: k for k, v in _LAUNCHPAD_APPS.items()}
-
-
 def _extract_modal_app_rows(payload: Any) -> List[EndpointInfo]:
     rows: List[EndpointInfo] = []
     if isinstance(payload, dict):
@@ -305,6 +316,15 @@ def _extract_modal_app_rows(payload: Any) -> List[EndpointInfo]:
             or item.get("State")
             or "unknown"
         ).strip()
-        backend = _APP_NAME_TO_BACKEND.get(name)
-        rows.append(EndpointInfo(name=name, app_id=app_id, state=state, backend=backend))
+        backend = infer_backend_from_app_name(name)
+        instance = infer_instance_from_app_name(name, backend)
+        rows.append(
+            EndpointInfo(
+                name=name,
+                app_id=app_id,
+                state=state,
+                backend=backend,
+                instance_name=instance,
+            )
+        )
     return rows

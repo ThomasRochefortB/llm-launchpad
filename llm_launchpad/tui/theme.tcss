@@ -69,7 +69,7 @@ LogViewer {
     padding: 0 1;
 }
 
-LogViewer RichLog {
+LogViewer Log {
     scrollbar-size: 1 1;
 }
 

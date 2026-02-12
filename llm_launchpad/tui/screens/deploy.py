@@ -6,6 +6,8 @@ Keyboard-driven form navigation with enter-to-proceed.
 
 from __future__ import annotations
 
+import json
+
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
@@ -21,6 +23,7 @@ from textual.widgets import (
 from textual.widgets.option_list import Option
 
 from ...core.hf_models import ModelCandidate
+from ...core.naming import auto_instance_name_for_backend, build_app_name, slugify_instance_name
 from ...protocol.enums import BackendType
 from ...protocol.models import DeploymentConfig
 from ...presets import PRESETS
@@ -106,12 +109,25 @@ class LlamaCppDeployScreen(Screen):
                 yield FormField("n_gpu_layers (blank=auto)", "n-gpu-layers")
 
             yield Static("")
+            yield FormField(
+                "Instance name (optional)",
+                "instance-name-llama",
+                hint="Auto-derived from preset/repo if blank",
+            )
+            yield FormField(
+                "App name override (optional)",
+                "app-name-llama",
+                hint="Advanced: explicit Modal app name",
+            )
+            yield Static("[dim]App name preview: auto[/dim]", id="llama-app-preview")
+            yield Static("")
             yield Button("Deploy", id="deploy-btn", variant="primary")
         yield Footer()
 
     def on_mount(self) -> None:
         self._selected_preset: str | None = None
         self._is_custom = False
+        self._refresh_app_preview()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option_list.id != "preset-list":
@@ -126,6 +142,7 @@ class LlamaCppDeployScreen(Screen):
             self._is_custom = False
             self._selected_preset = opt_id.removeprefix("preset-")
             custom_fields.add_class("hidden")
+        self._refresh_app_preview()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "toggle-advanced":
@@ -133,6 +150,10 @@ class LlamaCppDeployScreen(Screen):
             adv.toggle_class("hidden")
         elif event.button.id == "deploy-btn":
             self._do_deploy()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id in {"repo-id", "instance-name-llama", "app-name-llama"}:
+            self._refresh_app_preview()
 
     def action_do_deploy(self) -> None:
         self._do_deploy()
@@ -172,7 +193,36 @@ class LlamaCppDeployScreen(Screen):
                 except ValueError:
                     pass
 
+        model_hint = config.repo_id or config.preset
+        instance_override = self.query_one("#instance-name-llama", Input).value.strip()
+        app_override = self.query_one("#app-name-llama", Input).value.strip()
+        if app_override:
+            config.app_name = app_override
+            config.instance_name = slugify_instance_name(instance_override or app_override)
+        elif instance_override:
+            config.instance_name = slugify_instance_name(instance_override)
+            config.app_name = build_app_name(config.backend, config.instance_name)
+        else:
+            config.instance_name = auto_instance_name_for_backend(config.backend, model_hint)
+            config.app_name = build_app_name(config.backend, config.instance_name)
+
         self.app.begin_deploy(config)  # type: ignore[attr-defined]
+
+    def _refresh_app_preview(self) -> None:
+        repo_id = self.query_one("#repo-id", Input).value.strip() if self._is_custom else ""
+        model_hint = repo_id or self._selected_preset or "default"
+        instance_override = self.query_one("#instance-name-llama", Input).value.strip()
+        app_override = self.query_one("#app-name-llama", Input).value.strip()
+        if app_override:
+            preview = app_override
+        elif instance_override:
+            preview = build_app_name(BackendType.LLAMACPP, instance_override)
+        else:
+            preview = build_app_name(
+                BackendType.LLAMACPP,
+                auto_instance_name_for_backend(BackendType.LLAMACPP, model_hint),
+            )
+        self.query_one("#llama-app-preview", Static).update(f"[dim]App name preview: {preview}[/dim]")
 
     def action_pop_screen(self) -> None:
         self.app.pop_screen()
@@ -222,6 +272,32 @@ class VllmDeployScreen(Screen):
                 "n-gpu",
                 default="1",
             )
+            yield Button("Advanced options...", id="toggle-advanced-vllm", variant="default")
+            yield FormField(
+                "Reasoning parser (optional)",
+                "reasoning-parser",
+                hint="e.g., qwen3, deepseek_r1, granite",
+                classes="vllm-advanced",
+            )
+            yield FormField(
+                "Default chat template kwargs (JSON, optional)",
+                "chat-template-kwargs",
+                hint='e.g., {"enable_thinking": false}',
+                classes="vllm-advanced",
+            )
+            yield FormField(
+                "Instance name (optional)",
+                "instance-name-vllm",
+                hint="Auto-derived from model if blank",
+                classes="vllm-advanced",
+            )
+            yield FormField(
+                "App name override (optional)",
+                "app-name-vllm",
+                hint="Advanced: explicit Modal app name",
+                classes="vllm-advanced",
+            )
+            yield Static("[dim]App name preview: auto[/dim]", id="vllm-app-preview")
 
             yield Static("")
             yield ToggleField("Deploy the server", "do-deploy-vllm", default=True)
@@ -235,7 +311,10 @@ class VllmDeployScreen(Screen):
     def on_mount(self) -> None:
         self._rank_mode = "downloads"
         self._ranked_models: list[ModelCandidate] = []
+        for widget in self.query(".vllm-advanced"):
+            widget.add_class("hidden")
         self.app.begin_fetch_vllm_models(self._rank_mode, self)  # type: ignore[attr-defined]
+        self._refresh_app_preview()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option_list.id == "vllm-rank-mode":
@@ -251,16 +330,25 @@ class VllmDeployScreen(Screen):
 
         if event.option_list.id == "vllm-model-list":
             self._apply_ranked_model_selection(event.option.id or "")
+            self._refresh_app_preview()
 
     def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
         """Mirror highlighted model into the input for keyboard-first flow."""
         if event.option_list.id != "vllm-model-list":
             return
         self._apply_ranked_model_selection(event.option.id or "")
+        self._refresh_app_preview()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "deploy-vllm-btn":
+        if event.button.id == "toggle-advanced-vllm":
+            for widget in self.query(".vllm-advanced"):
+                widget.toggle_class("hidden")
+        elif event.button.id == "deploy-vllm-btn":
             self._do_deploy()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id in {"model-name", "instance-name-vllm", "app-name-vllm"}:
+            self._refresh_app_preview()
 
     def on_vllm_models_loaded(self, message: VllmModelsLoaded) -> None:
         if message.mode != self._rank_mode:
@@ -306,6 +394,22 @@ class VllmDeployScreen(Screen):
         if idx < 0 or idx >= len(self._ranked_models):
             return
         self.query_one("#model-name", Input).value = self._ranked_models[idx].repo_id
+        self._refresh_app_preview()
+
+    def _refresh_app_preview(self) -> None:
+        model_name = self.query_one("#model-name", Input).value.strip()
+        instance_override = self.query_one("#instance-name-vllm", Input).value.strip()
+        app_override = self.query_one("#app-name-vllm", Input).value.strip()
+        if app_override:
+            preview = app_override
+        elif instance_override:
+            preview = build_app_name(BackendType.VLLM, instance_override)
+        else:
+            preview = build_app_name(
+                BackendType.VLLM,
+                auto_instance_name_for_backend(BackendType.VLLM, model_name),
+            )
+        self.query_one("#vllm-app-preview", Static).update(f"[dim]App name preview: {preview}[/dim]")
 
     def _do_deploy(self) -> None:
         config = DeploymentConfig(backend=BackendType.VLLM)
@@ -318,9 +422,42 @@ class VllmDeployScreen(Screen):
             config.n_gpu = int(n_gpu_str) if n_gpu_str else 1
         except ValueError:
             config.n_gpu = 1
+        adv_visible = not self.query(".vllm-advanced").first().has_class("hidden")
+        if adv_visible:
+            config.reasoning_parser = self.query_one("#reasoning-parser", Input).value.strip() or None
+        kwargs_raw = self.query_one("#chat-template-kwargs", Input).value.strip() if adv_visible else ""
+        if kwargs_raw:
+            try:
+                parsed = json.loads(kwargs_raw)
+            except json.JSONDecodeError:
+                self.app.notify(
+                    "Default chat template kwargs must be valid JSON.",
+                    severity="error",
+                    timeout=6,
+                )
+                return
+            if not isinstance(parsed, dict):
+                self.app.notify(
+                    "Default chat template kwargs must be a JSON object.",
+                    severity="error",
+                    timeout=6,
+                )
+                return
+            config.default_chat_template_kwargs = kwargs_raw
         config.do_deploy = self.query_one("#do-deploy-vllm", Switch).value
         config.run_smoke = self.query_one("#run-smoke", Switch).value
         config.do_warmup = self.query_one("#warmup-vllm", Switch).value
+        instance_override = self.query_one("#instance-name-vllm", Input).value.strip()
+        app_override = self.query_one("#app-name-vllm", Input).value.strip()
+        if app_override:
+            config.app_name = app_override
+            config.instance_name = slugify_instance_name(instance_override or app_override)
+        elif instance_override:
+            config.instance_name = slugify_instance_name(instance_override)
+            config.app_name = build_app_name(config.backend, config.instance_name)
+        else:
+            config.instance_name = auto_instance_name_for_backend(config.backend, config.model_name)
+            config.app_name = build_app_name(config.backend, config.instance_name)
 
         self.app.begin_deploy(config)  # type: ignore[attr-defined]
 

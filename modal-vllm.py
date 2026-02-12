@@ -6,40 +6,44 @@ import aiohttp
 import modal
 
 
-APP_NAME = "vllm-server"
+APP_NAME = os.environ.get("MODAL_APP_NAME", "vllm-server").strip() or "vllm-server"
 app = modal.App(APP_NAME)
 
 MINUTES = 60
 VLLM_PORT = 8000
 
 
-def _read_required_str_env(name: str) -> str:
+def _read_str_env(name: str, default: str) -> str:
+    raw = os.environ.get(name, "").strip()
+    return raw or default
+
+
+def _read_int_env(name: str, default: int) -> int:
     raw = os.environ.get(name, "").strip()
     if not raw:
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return raw
-
-
-def _read_required_int_env(name: str) -> int:
-    raw = _read_required_str_env(name)
+        return default
     try:
         return int(raw)
     except ValueError:
         raise RuntimeError(f"Environment variable {name} must be an integer, got: {raw!r}") from None
 
 
-def _read_required_bool_env(name: str) -> bool:
-    raw = _read_required_str_env(name)
+def _read_bool_env(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 # These values are captured at deploy/run time by the Modal CLI process.
-DEPLOY_N_GPU = _read_required_int_env("N_GPU")
-DEPLOY_GPU_CONFIG = _read_required_str_env("GPU_CONFIG")
-DEPLOY_MODEL_NAME = _read_required_str_env("MODEL_NAME")
+DEPLOY_N_GPU = _read_int_env("N_GPU", 1)
+DEPLOY_GPU_CONFIG = _read_str_env("GPU_CONFIG", "A100-80GB:1")
+DEPLOY_MODEL_NAME = _read_str_env("MODEL_NAME", "Qwen/Qwen3-4B-Thinking-2507-FP8")
 DEPLOY_MODEL_REVISION = os.environ.get("MODEL_REVISION", "").strip() or None
-DEPLOY_SERVED_MODEL_NAME = _read_required_str_env("SERVED_MODEL_NAME")
-DEPLOY_FAST_BOOT = _read_required_bool_env("FAST_BOOT")
+DEPLOY_SERVED_MODEL_NAME = _read_str_env("SERVED_MODEL_NAME", "llm")
+DEPLOY_FAST_BOOT = _read_bool_env("FAST_BOOT", True)
+DEPLOY_REASONING_PARSER = os.environ.get("REASONING_PARSER", "").strip() or None
+DEPLOY_DEFAULT_CHAT_TEMPLATE_KWARGS = os.environ.get("DEFAULT_CHAT_TEMPLATE_KWARGS", "").strip() or None
 
 RUNTIME_ENV = {
     "MODEL_NAME": DEPLOY_MODEL_NAME,
@@ -49,6 +53,10 @@ RUNTIME_ENV = {
 }
 if DEPLOY_MODEL_REVISION:
     RUNTIME_ENV["MODEL_REVISION"] = DEPLOY_MODEL_REVISION
+if DEPLOY_REASONING_PARSER:
+    RUNTIME_ENV["REASONING_PARSER"] = DEPLOY_REASONING_PARSER
+if DEPLOY_DEFAULT_CHAT_TEMPLATE_KWARGS:
+    RUNTIME_ENV["DEFAULT_CHAT_TEMPLATE_KWARGS"] = DEPLOY_DEFAULT_CHAT_TEMPLATE_KWARGS
 
 
 hf_cache_vol = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
@@ -86,8 +94,12 @@ def serve() -> None:
     model_name = os.environ.get("MODEL_NAME", DEPLOY_MODEL_NAME).strip() or DEPLOY_MODEL_NAME
     model_revision = os.environ.get("MODEL_REVISION", "").strip() or None
     served_model_name = os.environ.get("SERVED_MODEL_NAME", DEPLOY_SERVED_MODEL_NAME).strip() or DEPLOY_SERVED_MODEL_NAME
-    fast_boot = _read_required_bool_env("FAST_BOOT")
-    n_gpu = _read_required_int_env("N_GPU")
+    fast_boot = _read_bool_env("FAST_BOOT", DEPLOY_FAST_BOOT)
+    n_gpu = _read_int_env("N_GPU", DEPLOY_N_GPU)
+    reasoning_parser = os.environ.get("REASONING_PARSER", "").strip() or DEPLOY_REASONING_PARSER
+    default_chat_template_kwargs = (
+        os.environ.get("DEFAULT_CHAT_TEMPLATE_KWARGS", "").strip() or DEPLOY_DEFAULT_CHAT_TEMPLATE_KWARGS
+    )
 
     cmd = [
         "vllm",
@@ -106,6 +118,10 @@ def serve() -> None:
 
     if model_revision:
         cmd += ["--revision", model_revision]
+    if reasoning_parser:
+        cmd += ["--reasoning-parser", reasoning_parser]
+    if default_chat_template_kwargs:
+        cmd += ["--default-chat-template-kwargs", default_chat_template_kwargs]
     cmd += ["--enforce-eager" if fast_boot else "--no-enforce-eager"]
 
     print("Starting vLLM command:")
