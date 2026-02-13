@@ -9,6 +9,7 @@ from __future__ import annotations
 import subprocess
 import sys
 
+from textual import events
 from textual.actions import SkipAction
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -27,7 +28,14 @@ class MonitorScreen(Screen):
     BINDINGS = [
         Binding("escape", "go_back", "Back", show=True),
         Binding("q", "go_back", "Back"),
-        Binding("c", "clear_log", "Clear log", show=True),
+        Binding(
+            "c,ctrl+c,ctrl+shift+c,meta+c,super+c",
+            "copy_text",
+            "Copy",
+            key_display="cmd+c",
+            show=True,
+        ),
+        Binding("ctrl+l", "clear_log", "Clear log", show=True),
     ]
 
     def __init__(self, title: str = "Operation") -> None:
@@ -42,7 +50,7 @@ class MonitorScreen(Screen):
                 (
                     f"[bold cyan]{self._title}[/bold cyan]  "
                     "[dim]drag to select, dbl-click for line  "
-                    "ctrl+c to copy  esc to return[/dim]"
+                    "cmd+c/ctrl+c/c to copy  ctrl+l clear  esc to return[/dim]"
                 ),
                 id="monitor-title",
             )
@@ -88,17 +96,54 @@ class MonitorScreen(Screen):
     def on_operation_error(self, message: OperationError) -> None:
         self.log_viewer.write_line(f"Error: {message.message}")
 
+    def on_key(self, event: events.Key) -> None:
+        """Handle additional copy aliases across terminal implementations."""
+        key_forms = {event.key, event.name, *event.aliases}
+        if key_forms.intersection(
+            {
+                "c",
+                "ctrl+c",
+                "ctrl+shift+c",
+                "meta+c",
+                "super+c",
+                "cmd+c",
+                "command+c",
+            }
+        ):
+            self.action_copy_text()
+            event.stop()
+            event.prevent_default()
+
+    def on_mouse_up(self, event: events.MouseUp) -> None:
+        """Fallback: copy selected text when drag selection ends in log view.
+
+        Some terminals reserve Cmd+C and never forward it to Textual. In that
+        case, copying on mouse release keeps log copying usable with Cmd-based
+        workflows.
+        """
+        if event.button in (1, "left"):
+            self.call_after_refresh(
+                lambda: self._copy_selected_text(notify=False, raise_on_empty=False)
+            )
+
     # -- Actions --
 
-    def action_copy_text(self) -> None:
-        """Copy selected log text to clipboard.
-
-        Uses OSC 52 (built-in) **and** ``pbcopy`` on macOS as a fallback so
-        the copy works even in terminals that don't support OSC 52.
-        """
-        text = self.get_selected_text()
-        if text is None:
-            raise SkipAction()
+    def _copy_selected_text(
+        self, *, notify: bool = True, raise_on_empty: bool = True
+    ) -> bool:
+        text = None
+        log_widget = self.log_viewer.log_widget
+        getter = getattr(log_widget, "get_selected_text", None)
+        if callable(getter):
+            text = getter()
+        if not text:
+            text = self.get_selected_text()
+        if not text:
+            if notify:
+                self.notify("No text selected to copy", timeout=2)
+            if raise_on_empty:
+                raise SkipAction()
+            return False
 
         # OSC 52 (works in iTerm2, Kitty, WezTerm, Ghostty, etc.)
         self.app.copy_to_clipboard(text)
@@ -115,8 +160,18 @@ class MonitorScreen(Screen):
             except Exception:
                 pass
 
-        lines = text.count("\n") + 1
-        self.notify(f"Copied {lines} line{'s' if lines != 1 else ''}", timeout=2)
+        if notify:
+            lines = text.count("\n") + 1
+            self.notify(f"Copied {lines} line{'s' if lines != 1 else ''}", timeout=2)
+        return True
+
+    def action_copy_text(self) -> None:
+        """Copy selected log text to clipboard.
+
+        Uses OSC 52 (built-in) **and** ``pbcopy`` on macOS as a fallback so
+        the copy works even in terminals that don't support OSC 52.
+        """
+        self._copy_selected_text(notify=True, raise_on_empty=True)
 
     def action_go_back(self) -> None:
         self.app.pop_screen()

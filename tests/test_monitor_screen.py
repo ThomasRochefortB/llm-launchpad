@@ -33,7 +33,7 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("first line", content)
             self.assertIn("stderr | stderr line", content)
             title = screen.query_one("#monitor-title", Static)
-            self.assertIn("ctrl+c to copy", str(title.content))
+            self.assertIn("cmd+c/ctrl+c/c to copy  ctrl+l clear", str(title.content))
 
     async def test_clear_action_empties_log(self) -> None:
         app = _TestApp()
@@ -89,6 +89,12 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             screen = app.screen
             assert isinstance(screen, MonitorScreen)
             self.assertIsInstance(screen.log_viewer.log_widget, SelectableLog)
+
+    def test_copy_binding_includes_ctrl_and_cmd_variants(self) -> None:
+        copy_binding = next(b for b in MonitorScreen.BINDINGS if b.action == "copy_text")
+        self.assertIn("ctrl+c", copy_binding.key)
+        self.assertIn("meta+c", copy_binding.key)
+        self.assertIn("super+c", copy_binding.key)
 
 
 if __name__ == "__main__":
