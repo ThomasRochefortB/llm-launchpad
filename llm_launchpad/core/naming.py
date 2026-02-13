@@ -43,6 +43,15 @@ def auto_instance_name_for_backend(backend: BackendType, model_hint: Optional[st
     return slugify_instance_name(model_hint or "default")
 
 
+def default_served_model_name(model_name: Optional[str], default: str = "llm") -> str:
+    """Return the default served model alias for a vLLM model id."""
+    candidate = (model_name or "").strip()
+    if not candidate:
+        return default
+    tail = candidate.rsplit("/", 1)[-1].strip()
+    return tail or default
+
+
 def build_app_name(backend: BackendType, instance_name: Optional[str]) -> str:
     """Compose a launchpad app name from backend + instance name."""
     if not instance_name:

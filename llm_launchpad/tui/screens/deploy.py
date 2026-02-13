@@ -23,7 +23,12 @@ from textual.widgets import (
 from textual.widgets.option_list import Option
 
 from ...core.hf_models import ModelCandidate
-from ...core.naming import auto_instance_name_for_backend, build_app_name, slugify_instance_name
+from ...core.naming import (
+    auto_instance_name_for_backend,
+    build_app_name,
+    default_served_model_name,
+    slugify_instance_name,
+)
 from ...protocol.enums import BackendType
 from ...protocol.models import DeploymentConfig
 from ...presets import PRESETS
@@ -262,17 +267,30 @@ class VllmDeployScreen(Screen):
                 hint="Leave blank to use default branch",
             )
             yield FormField(
-                "Served model alias",
-                "served-model-name",
-                default="llm",
-            )
-            yield ToggleField("Fast boot (enforce eager)", "fast-boot", default=True)
-            yield FormField(
                 "Number of GPUs (tensor parallel)",
                 "n-gpu",
                 default="1",
             )
             yield Button("Advanced options...", id="toggle-advanced-vllm", variant="default")
+            yield ToggleField(
+                "Smoke test only (no deploy)",
+                "smoke-only-vllm",
+                default=False,
+                classes="vllm-advanced",
+            )
+            yield ToggleField(
+                "Verify readiness after deploy",
+                "warmup-vllm",
+                default=True,
+                classes="vllm-advanced",
+            )
+            yield ToggleField("Enforce eager startup", "fast-boot", default=False, classes="vllm-advanced")
+            yield FormField(
+                "Served model alias",
+                "served-model-name",
+                hint="Defaults to the model id suffix (e.g., Qwen3-0.6B)",
+                classes="vllm-advanced",
+            )
             yield FormField(
                 "Reasoning parser (optional)",
                 "reasoning-parser",
@@ -300,19 +318,18 @@ class VllmDeployScreen(Screen):
             yield Static("[dim]App name preview: auto[/dim]", id="vllm-app-preview")
 
             yield Static("")
-            yield ToggleField("Deploy the server", "do-deploy-vllm", default=True)
-            yield ToggleField("Run smoke test (if not deploying)", "run-smoke", default=False)
-            yield ToggleField("Warm up after deploy", "warmup-vllm", default=True)
-
-            yield Static("")
             yield Button("Deploy", id="deploy-vllm-btn", variant="primary")
         yield Footer()
 
     def on_mount(self) -> None:
         self._rank_mode = "downloads"
         self._ranked_models: list[ModelCandidate] = []
+        self._served_alias_touched = False
+        self._updating_served_alias = False
+        self._last_auto_served_alias = ""
         for widget in self.query(".vllm-advanced"):
             widget.add_class("hidden")
+        self._sync_served_alias_from_model(force=True)
         self.app.begin_fetch_vllm_models(self._rank_mode, self)  # type: ignore[attr-defined]
         self._refresh_app_preview()
 
@@ -331,6 +348,7 @@ class VllmDeployScreen(Screen):
         if event.option_list.id == "vllm-model-list":
             self._apply_ranked_model_selection(event.option.id or "")
             self._refresh_app_preview()
+            return
 
     def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
         """Mirror highlighted model into the input for keyboard-first flow."""
@@ -347,8 +365,27 @@ class VllmDeployScreen(Screen):
             self._do_deploy()
 
     def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "model-name":
+            self._sync_served_alias_from_model()
+        elif event.input.id == "served-model-name" and not self._updating_served_alias:
+            self._served_alias_touched = event.input.value.strip() != self._last_auto_served_alias
         if event.input.id in {"model-name", "instance-name-vllm", "app-name-vllm"}:
             self._refresh_app_preview()
+
+    def _sync_served_alias_from_model(self, force: bool = False) -> None:
+        alias_input = self.query_one("#served-model-name", Input)
+        next_alias = default_served_model_name(self.query_one("#model-name", Input).value)
+        current_alias = alias_input.value.strip()
+        should_update = force or (not self._served_alias_touched) or (current_alias == self._last_auto_served_alias)
+        if not should_update or current_alias == next_alias:
+            self._last_auto_served_alias = next_alias
+            return
+        self._updating_served_alias = True
+        try:
+            alias_input.value = next_alias
+        finally:
+            self._updating_served_alias = False
+        self._last_auto_served_alias = next_alias
 
     def on_vllm_models_loaded(self, message: VllmModelsLoaded) -> None:
         if message.mode != self._rank_mode:
@@ -415,7 +452,8 @@ class VllmDeployScreen(Screen):
         config = DeploymentConfig(backend=BackendType.VLLM)
         config.model_name = self.query_one("#model-name", Input).value.strip() or None
         config.model_revision = self.query_one("#model-revision", Input).value.strip() or None
-        config.served_model_name = self.query_one("#served-model-name", Input).value.strip() or None
+        alias = self.query_one("#served-model-name", Input).value.strip()
+        config.served_model_name = alias or default_served_model_name(config.model_name)
         config.fast_boot = self.query_one("#fast-boot", Switch).value
         n_gpu_str = self.query_one("#n-gpu", Input).value.strip()
         try:
@@ -444,9 +482,10 @@ class VllmDeployScreen(Screen):
                 )
                 return
             config.default_chat_template_kwargs = kwargs_raw
-        config.do_deploy = self.query_one("#do-deploy-vllm", Switch).value
-        config.run_smoke = self.query_one("#run-smoke", Switch).value
-        config.do_warmup = self.query_one("#warmup-vllm", Switch).value
+        smoke_only = self.query_one("#smoke-only-vllm", Switch).value
+        config.do_deploy = not smoke_only
+        config.run_smoke = smoke_only
+        config.do_warmup = self.query_one("#warmup-vllm", Switch).value if config.do_deploy else False
         instance_override = self.query_one("#instance-name-vllm", Input).value.strip()
         app_override = self.query_one("#app-name-vllm", Input).value.strip()
         if app_override:

@@ -5,6 +5,8 @@ from typing import Any
 import aiohttp
 import modal
 
+from llm_launchpad.core.naming import default_served_model_name
+
 
 APP_NAME = os.environ.get("MODAL_APP_NAME", "vllm-server").strip() or "vllm-server"
 app = modal.App(APP_NAME)
@@ -40,8 +42,8 @@ DEPLOY_N_GPU = _read_int_env("N_GPU", 1)
 DEPLOY_GPU_CONFIG = _read_str_env("GPU_CONFIG", "A100-80GB:1")
 DEPLOY_MODEL_NAME = _read_str_env("MODEL_NAME", "Qwen/Qwen3-4B-Thinking-2507-FP8")
 DEPLOY_MODEL_REVISION = os.environ.get("MODEL_REVISION", "").strip() or None
-DEPLOY_SERVED_MODEL_NAME = _read_str_env("SERVED_MODEL_NAME", "llm")
-DEPLOY_FAST_BOOT = _read_bool_env("FAST_BOOT", True)
+DEPLOY_SERVED_MODEL_NAME = _read_str_env("SERVED_MODEL_NAME", default_served_model_name(DEPLOY_MODEL_NAME))
+DEPLOY_FAST_BOOT = _read_bool_env("FAST_BOOT", False)
 DEPLOY_REASONING_PARSER = os.environ.get("REASONING_PARSER", "").strip() or None
 DEPLOY_DEFAULT_CHAT_TEMPLATE_KWARGS = os.environ.get("DEFAULT_CHAT_TEMPLATE_KWARGS", "").strip() or None
 

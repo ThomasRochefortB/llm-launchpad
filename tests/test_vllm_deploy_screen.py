@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 from textual.app import App
-from textual.widgets import Input, OptionList
+from textual.widgets import Input, OptionList, Switch
 
 from llm_launchpad.core.hf_models import ModelCandidate
 from llm_launchpad.tui.screens.deploy import VllmDeployScreen
@@ -29,6 +29,96 @@ class _TestApp(App[None]):
 
 
 class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
+    async def test_served_model_alias_defaults_to_model_suffix(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+            alias = screen.query_one("#served-model-name", Input).value
+            self.assertEqual(alias, "Qwen3-4B-Thinking-2507-FP8")
+
+            screen.query_one("#model-name", Input).value = "Qwen/Qwen3-0.6B"
+            await pilot.pause()
+            alias = screen.query_one("#served-model-name", Input).value
+            self.assertEqual(alias, "Qwen3-0.6B")
+
+    async def test_served_model_alias_respects_manual_override(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+            screen.query_one("#served-model-name", Input).value = "my-alias"
+            await pilot.pause()
+            screen.query_one("#model-name", Input).value = "meta-llama/Llama-3.1-8B-Instruct"
+            await pilot.pause()
+            alias = screen.query_one("#served-model-name", Input).value
+            self.assertEqual(alias, "my-alias")
+
+    async def test_deploy_uses_default_alias_when_blank(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+            screen.query_one("#model-name", Input).value = "Qwen/Qwen3-0.6B"
+            screen.query_one("#served-model-name", Input).value = ""
+
+            screen._do_deploy()
+            self.assertIsNotNone(app.deployed_config)
+            self.assertEqual(app.deployed_config.served_model_name, "Qwen3-0.6B")
+
+    async def test_enforce_eager_defaults_to_false(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+            self.assertFalse(screen.query_one("#fast-boot", Switch).value)
+            screen._do_deploy()
+            self.assertIsNotNone(app.deployed_config)
+            self.assertFalse(app.deployed_config.fast_boot)
+
+    async def test_smoke_only_defaults_to_deploy(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+            screen._do_deploy()
+            self.assertIsNotNone(app.deployed_config)
+            self.assertTrue(app.deployed_config.do_deploy)
+            self.assertFalse(app.deployed_config.run_smoke)
+
+    async def test_smoke_only_toggle_disables_deploy_and_warmup(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+            for w in screen.query(".vllm-advanced"):
+                w.remove_class("hidden")
+            screen.query_one("#smoke-only-vllm", Switch).value = True
+            screen.query_one("#warmup-vllm", Switch).value = True
+            screen._do_deploy()
+            self.assertIsNotNone(app.deployed_config)
+            self.assertFalse(app.deployed_config.do_deploy)
+            self.assertTrue(app.deployed_config.run_smoke)
+            self.assertFalse(app.deployed_config.do_warmup)
+
     async def test_model_selection_prefills_model_input(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:
@@ -98,12 +188,14 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             screen.query_one("#model-name", Input).value = "Qwen/Qwen3-8B"
             screen.query_one("#reasoning-parser", Input).value = "qwen3"
             screen.query_one("#chat-template-kwargs", Input).value = '{"enable_thinking": false}'
+            screen.query_one("#fast-boot", Switch).value = True
             # Expand advanced fields
             for w in screen.query(".vllm-advanced"):
                 w.remove_class("hidden")
 
             screen._do_deploy()
             self.assertIsNotNone(app.deployed_config)
+            self.assertTrue(app.deployed_config.fast_boot)
             self.assertEqual(app.deployed_config.reasoning_parser, "qwen3")
             self.assertEqual(
                 app.deployed_config.default_chat_template_kwargs,

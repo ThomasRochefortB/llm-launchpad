@@ -11,6 +11,7 @@ from typing import Any, Dict, Generator, List, Optional
 from ..protocol.enums import BackendType
 from ..protocol.events import ErrorEvent, LogEvent, OperationCompleteEvent
 from ..protocol.models import DeploymentConfig, EndpointInfo, LaunchpadSettings
+from .naming import default_served_model_name
 from .naming import infer_backend_from_app_name, infer_instance_from_app_name, legacy_app_name
 
 
@@ -59,7 +60,10 @@ class ModalBackend:
     def test_curl_command(backend: BackendType, server_url: str) -> str:
         base = server_url.rstrip("/")
         if backend == BackendType.VLLM:
-            model = os.environ.get("SERVED_MODEL_NAME", "llm")
+            model = os.environ.get(
+                "SERVED_MODEL_NAME",
+                default_served_model_name(os.environ.get("MODEL_NAME")),
+            )
             return (
                 f"curl -s -X POST {base}/v1/chat/completions "
                 "-H 'Content-Type: application/json' "

@@ -5,6 +5,7 @@ import unittest
 from llm_launchpad.core.naming import (
     auto_instance_name_for_backend,
     build_app_name,
+    default_served_model_name,
     infer_backend_from_app_name,
     infer_instance_from_app_name,
     legacy_app_name,
@@ -21,6 +22,14 @@ class NamingTests(unittest.TestCase):
     def test_auto_instance_name_uses_model_hint(self) -> None:
         name = auto_instance_name_for_backend(BackendType.VLLM, "meta-llama/Llama-3.1-8B-Instruct")
         self.assertEqual(name, "meta-llama-llama-3-1-8b-instruct")
+
+    def test_default_served_model_name_uses_model_id_suffix(self) -> None:
+        alias = default_served_model_name("Qwen/Qwen3-0.6B")
+        self.assertEqual(alias, "Qwen3-0.6B")
+
+    def test_default_served_model_name_falls_back_to_default(self) -> None:
+        self.assertEqual(default_served_model_name(""), "llm")
+        self.assertEqual(default_served_model_name(None), "llm")
 
     def test_build_app_name(self) -> None:
         self.assertEqual(build_app_name(BackendType.VLLM, "qwen3"), "vllm-qwen3")

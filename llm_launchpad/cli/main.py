@@ -190,7 +190,7 @@ def gpu_types(
 @app.command()
 def deploy(
     backend: str = typer.Option("llamacpp", help="Backend: llamacpp or vllm"),
-    do_warmup: bool = typer.Option(False, help="Warm up after deploy"),
+    do_warmup: bool = typer.Option(False, help="Verify readiness after deploy"),
     model_name: Optional[str] = typer.Option(None, help="vLLM MODEL_NAME"),
     model_revision: Optional[str] = typer.Option(None, help="vLLM MODEL_REVISION"),
     served_model_name: Optional[str] = typer.Option(None, help="vLLM SERVED_MODEL_NAME"),
@@ -379,7 +379,7 @@ def switch(
     app_name: Optional[str] = typer.Option(None, help="Explicit Modal app name override"),
     preload: bool = typer.Option(True, help="Preload weights"),
     redeploy: bool = typer.Option(True, help="Redeploy after switching"),
-    do_warmup: bool = typer.Option(True, help="Warm up after redeploy"),
+    do_warmup: bool = typer.Option(True, help="Verify readiness after redeploy"),
     server_url: Optional[str] = typer.Option(None, help="Deployed web URL"),
     timeout: int = typer.Option(1800, help="Warmup timeout"),
     tail_logs: bool = typer.Option(True, help="Tail logs during warmup"),
