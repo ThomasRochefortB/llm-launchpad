@@ -7,7 +7,7 @@ import modal
 
 
 # --- App configuration
-APP_NAME = "llamacpp-server"
+APP_NAME = os.environ.get("MODAL_APP_NAME", "llamacpp-server").strip() or "llamacpp-server"
 app = modal.App(APP_NAME)
 
 

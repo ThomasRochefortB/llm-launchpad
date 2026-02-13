@@ -1,0 +1,305 @@
+/* ==========================================================
+   llm-launchpad Textual theme
+   Inspired by Codex TUI aesthetics: dark bg, cyan accents,
+   prominent keyboard hints, minimal chrome.
+   ========================================================== */
+
+/* ---- Global ---- */
+
+Screen {
+    background: $surface;
+}
+
+/* ---- Header / Footer bars ---- */
+
+#header-bar {
+    dock: top;
+    height: 3;
+    background: $surface;
+    color: $text;
+    padding: 0 2;
+    border-bottom: solid $primary;
+}
+
+#header-bar .app-title {
+    text-style: bold;
+    color: $primary;
+}
+
+#header-bar .app-meta {
+    color: $text-muted;
+}
+
+#footer-bar {
+    dock: bottom;
+    height: 1;
+    background: $surface;
+    color: $text-muted;
+    padding: 0 2;
+}
+
+Footer {
+    background: $surface;
+    color: $text-muted;
+}
+
+/* ---- Status header widget ---- */
+
+StatusHeader {
+    height: 4;
+    padding: 0 2;
+    background: $surface;
+    border-bottom: solid $primary-background;
+}
+
+StatusHeader .status-label {
+    text-style: bold;
+    color: $primary;
+}
+
+StatusHeader .status-value {
+    color: $text;
+}
+
+/* ---- Log viewer ---- */
+
+LogViewer {
+    height: 1fr;
+    border: solid $primary-background;
+    padding: 0 1;
+}
+
+LogViewer Log {
+    scrollbar-size: 1 1;
+}
+
+/* ---- Main menu ---- */
+
+#main-menu {
+    align: center middle;
+    width: 100%;
+    height: 100%;
+}
+
+#menu-container {
+    width: 72;
+    height: auto;
+    max-height: 80%;
+    padding: 1 2;
+}
+
+#banner-text {
+    text-align: center;
+    color: $primary;
+    padding: 0 0 1 0;
+}
+
+#auth-status {
+    text-align: center;
+    color: $success;
+    padding: 0 0 1 0;
+}
+
+/* ---- Option / Selection Lists ---- */
+
+OptionList {
+    background: $surface;
+    border: solid $primary-background;
+    padding: 0;
+    height: auto;
+    max-height: 20;
+}
+
+OptionList > .option-list--option-highlighted {
+    background: $primary 20%;
+    color: $text;
+    text-style: bold;
+}
+
+OptionList > .option-list--option-hover-highlighted {
+    background: $primary 20%;
+    color: $text;
+    text-style: bold;
+}
+
+SelectionList {
+    background: $surface;
+    height: auto;
+    max-height: 20;
+}
+
+ListView {
+    background: $surface;
+    height: auto;
+    max-height: 20;
+}
+
+ListView > ListItem.--highlight {
+    background: $primary 20%;
+}
+
+/* ---- Inputs ---- */
+
+Input {
+    border: tall $primary-background;
+    background: $surface;
+    padding: 0 1;
+}
+
+Input:focus {
+    border: tall $primary;
+}
+
+Select {
+    border: tall $primary-background;
+    background: $surface;
+}
+
+Select:focus {
+    border: tall $primary;
+}
+
+/* ---- Buttons ---- */
+
+Button {
+    min-width: 16;
+    background: $primary-background;
+    color: $text;
+    border: none;
+}
+
+Button:hover {
+    background: $primary 40%;
+}
+
+Button.-primary {
+    background: $primary;
+    color: $text;
+    text-style: bold;
+}
+
+Button:focus {
+    text-style: bold reverse;
+}
+
+/* ---- Dialogs / Modals ---- */
+
+#dialog-overlay {
+    align: center middle;
+    background: $surface 80%;
+}
+
+#dialog-box {
+    width: 60;
+    height: auto;
+    max-height: 70%;
+    padding: 1 2;
+    border: solid $primary;
+    background: $surface;
+}
+
+/* ---- Deploy form ---- */
+
+.form-group {
+    height: auto;
+    padding: 0 0 1 0;
+}
+
+.form-label {
+    color: $text-muted;
+    padding: 0 0 0 0;
+    height: 1;
+}
+
+.form-hint {
+    color: $text-disabled;
+    height: 1;
+}
+
+/* ---- Monitor screen ---- */
+
+#monitor-layout {
+    height: 100%;
+}
+
+#monitor-log {
+    height: 1fr;
+    border: solid $primary-background;
+    padding: 0 1;
+}
+
+#monitor-status {
+    dock: top;
+    height: 3;
+    padding: 0 2;
+    background: $surface;
+    border-bottom: solid $primary-background;
+}
+
+/* ---- Manage screen ---- */
+
+#manage-layout {
+    height: 100%;
+    padding: 1 2;
+}
+
+/* ---- Settings screen ---- */
+
+#settings-layout {
+    align: center middle;
+    width: 100%;
+    height: 100%;
+}
+
+#settings-form {
+    width: 60;
+    height: auto;
+    padding: 1 2;
+    border: solid $primary-background;
+}
+
+#gpu-config-row {
+    width: 100%;
+    height: auto;
+}
+
+#gpu-type-group {
+    width: 2fr;
+    height: auto;
+    padding: 0 1 0 0;
+}
+
+#gpu-count-group {
+    width: 1fr;
+    height: auto;
+}
+
+#gpu-count {
+    height: 5;
+}
+
+/* ---- Utility classes ---- */
+
+.hidden {
+    display: none;
+}
+
+.centered {
+    text-align: center;
+}
+
+.bold {
+    text-style: bold;
+}
+
+.accent {
+    color: $primary;
+}
+
+.muted {
+    color: $text-muted;
+}
+
+.spacer {
+    height: 1;
+}

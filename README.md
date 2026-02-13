@@ -11,30 +11,50 @@ uv tool install llm-launchpad
 
 ## Endpoint Management From CLI
 
-Manage deployed launchpad endpoints directly from `llm-launchpad` (scoped to `llamacpp-server` and `vllm-server`).
+Manage deployed launchpad endpoints directly from `llm-launchpad`.
+Launchpad now supports multi-instance deployments per backend. By default,
+instance names are auto-derived from the model identifier.
 
 List launchpad deployments:
 ```bash
 llm-launchpad list
 ```
 
+Deploy independent instances:
+```bash
+llm-launchpad deploy --backend vllm --model-name Qwen/Qwen3-4B-Thinking-2507-FP8
+llm-launchpad deploy --backend vllm --model-name Qwen/Qwen2.5-7B-Instruct
+```
+
+Use explicit names when needed:
+```bash
+llm-launchpad deploy --backend vllm --model-name Qwen/Qwen3-4B-Thinking-2507-FP8 --instance-name qwen3
+llm-launchpad deploy --backend llamacpp --app-name llamacpp-prod-coder
+```
+
 Check endpoint readiness:
 ```bash
 llm-launchpad status --backend llamacpp
 llm-launchpad status --backend vllm
+llm-launchpad status --backend vllm --instance-name qwen3
 ```
 
 Tail backend logs:
 ```bash
 llm-launchpad logs --backend llamacpp
 llm-launchpad logs --backend vllm
+llm-launchpad logs --backend vllm --app-name vllm-qwen3
 ```
 
 Stop a deployed backend:
 ```bash
 llm-launchpad stop --backend llamacpp
 llm-launchpad stop --backend vllm
+llm-launchpad stop --backend vllm --instance-name qwen2-5
 ```
+
+When multiple instances exist for one backend, `status`, `logs`, `stop`, and
+`warmup` require `--instance-name` or `--app-name` to avoid ambiguous targeting.
 
 ## GGUF on Modal with llama.cpp
 
@@ -93,7 +113,7 @@ Notes:
 - During warmup you may see 503 responses; retry after a few minutes.
 
 Get the public URL:
-- Copy the web function URL printed by `modal deploy` (e.g. `https://<user>--llamacpp-server-serve.modal.run`).
+- Copy the web function URL printed by `modal deploy` (e.g. `https://<user>--llamacpp-qwen3-coder-serve.modal.run`).
 
 Tail logs:
 ```bash
@@ -111,7 +131,7 @@ Shutdown / stop:
 ### 3) Call the API
 Set the server URL (replace with yours):
 ```bash
-export SERVER_URL="https://<user>--llamacpp-server-serve.modal.run"
+export SERVER_URL="https://<user>--llamacpp-qwen3-coder-serve.modal.run"
 ```
 Completions endpoint:
 ```bash
@@ -174,8 +194,16 @@ Deploy a vLLM server on Modal using an OpenAI-compatible API, based on Modal's `
 modal deploy modal-vllm.py
 ```
 
+Or deploy via launchpad CLI with an explicit reasoning parser:
+```bash
+llm-launchpad deploy \
+  --backend vllm \
+  --model-name Qwen/Qwen3-8B \
+  --reasoning-parser qwen3
+```
+
 Get the public URL:
-- Copy the web function URL printed by `modal deploy`, e.g. `https://<user>--vllm-server-serve.modal.run`.
+- Copy the web function URL printed by `modal deploy`, e.g. `https://<user>--vllm-qwen3-4b-thinking-2507-fp8-serve.modal.run`.
 
 ### 2) Optional: run local smoke test against a fresh replica
 This starts a replica, checks `/health`, then streams a chat completion.
@@ -187,7 +215,7 @@ modal run modal-vllm.py
 ### 3) Call the API
 Set the server URL (replace with yours):
 ```bash
-export SERVER_URL="https://<user>--vllm-server-serve.modal.run"
+export SERVER_URL="https://<user>--vllm-qwen3-4b-thinking-2507-fp8-serve.modal.run"
 ```
 
 Chat completions endpoint:
@@ -216,7 +244,21 @@ Adjust behavior with environment variables before running `modal deploy`:
 - `MODEL_REVISION` (default pinned revision in `modal-vllm.py`)
 - `SERVED_MODEL_NAME` (default: `llm`)
 - `FAST_BOOT` (`true`/`false`, default: `true`)
+- `REASONING_PARSER` (optional, e.g. `qwen3`, `deepseek_r1`, `granite`)
+- `DEFAULT_CHAT_TEMPLATE_KWARGS` (optional JSON object passed to `--default-chat-template-kwargs`)
 - `VLLM_PORT` (default: `8000`)
+
+Model-specific thinking defaults:
+- Qwen3 reasoning is enabled by default; disable server-wide with:
+  ```bash
+  export DEFAULT_CHAT_TEMPLATE_KWARGS='{"enable_thinking": false}'
+  ```
+- Granite and DeepSeek-V3.1 reasoning are disabled by default; enable with:
+  ```bash
+  export DEFAULT_CHAT_TEMPLATE_KWARGS='{"thinking": true}'
+  ```
+
+Request-level `chat_template_kwargs` continue to override server defaults.
 
 Cached Modal volumes used by this backend:
 - `huggingface-cache`
