@@ -241,8 +241,8 @@ def main(
     """Configure, optionally preload weights, and optionally deploy the server.
 
     Usage examples:
-      modal run modal-llamacpp.py::main --preset qwen2.5-coder-7b --preload True --deploy True
-      modal run modal-llamacpp.py::main --repo-id Qwen/Qwen2.5-Coder-7B-Instruct-GGUF --quant Q4_K_M --deploy True
+      modal run llm_launchpad/backends/modal_llamacpp_app.py::main --preset qwen2.5-coder-7b --preload True --deploy True
+      modal run llm_launchpad/backends/modal_llamacpp_app.py::main --repo-id Qwen/Qwen2.5-Coder-7B-Instruct-GGUF --quant Q4_K_M --deploy True
     """
     # Lazy import here so containers importing this module don't need the package
     from llm_launchpad.presets import PRESETS
@@ -304,5 +304,4 @@ def main(
             print("✅ Deploy triggered. Check the Modal dashboard for status.")
         except Exception as e:
             print(f"⚠️ Failed to deploy automatically: {e}")
-
 

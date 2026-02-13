@@ -66,19 +66,19 @@ Deploy any GGUF model on Modal using llama.cpp's HTTP server. Includes presets f
 - Optional (if HF rate-limited/private): `huggingface-cli login` or set `HUGGINGFACE_HUB_TOKEN`
 
 ### Files
-- Server entrypoint: `modal-llamacpp.py`
+- Server entrypoint: `llm_launchpad/backends/modal_llamacpp_app.py`
 
 ### 1) Preload/download model weights (optional, recommended)
 This downloads GGUF weights into a persistent Volume (`llamacpp-cache`).
 
 Presets (recommended):
 ```bash
-modal run modal-llamacpp.py::main --preset qwen3-coder-30b --preload
+modal run llm_launchpad/backends/modal_llamacpp_app.py::main --preset qwen3-coder-30b --preload
 ```
 
 Custom repo/quant:
 ```bash
-modal run modal-llamacpp.py::main \
+modal run llm_launchpad/backends/modal_llamacpp_app.py::main \
   --repo-id Qwen/Qwen2.5-Coder-7B-Instruct-GGUF \
   --quant Q4_K_M --preload
 ```
@@ -97,12 +97,12 @@ Common flags:
 Builds llama.cpp with CUDA and serves an OpenAI-compatible API on port 8080.
 
 ```bash
-modal deploy modal-llamacpp.py
+modal deploy llm_launchpad/backends/modal_llamacpp_app.py
 ```
 
 Alternatively, one-click deploy directly from CLI (configure, preload, deploy):
 ```bash
-modal run modal-llamacpp.py::main \
+modal run llm_launchpad/backends/modal_llamacpp_app.py::main \
   --preset qwen3-coder-30b \
   --preload \
   --deploy
@@ -187,11 +187,11 @@ Built-in examples (adjust as needed):
 Deploy a vLLM server on Modal using an OpenAI-compatible API, based on Modal's `vllm_inference` example.
 
 ### Files
-- Server entrypoint: `modal-vllm.py`
+- Server entrypoint: `llm_launchpad/backends/modal_vllm_app.py`
 
 ### 1) Deploy the server
 ```bash
-modal deploy modal-vllm.py
+modal deploy llm_launchpad/backends/modal_vllm_app.py
 ```
 
 Or deploy via launchpad CLI with an explicit reasoning parser:
@@ -209,7 +209,7 @@ Get the public URL:
 This starts a replica, checks `/health`, then streams a chat completion.
 
 ```bash
-modal run modal-vllm.py
+modal run llm_launchpad/backends/modal_vllm_app.py
 ```
 
 ### 3) Call the API
@@ -241,7 +241,7 @@ Adjust behavior with environment variables before running `modal deploy`:
 - `GPU_CONFIG` (default: `H100:1`)
 - `N_GPU` (default: `1`, used for tensor parallel size)
 - `MODEL_NAME` (default: `Qwen/Qwen3-4B-Thinking-2507-FP8`)
-- `MODEL_REVISION` (default pinned revision in `modal-vllm.py`)
+- `MODEL_REVISION` (default pinned revision in `llm_launchpad/backends/modal_vllm_app.py`)
 - `SERVED_MODEL_NAME` (default: `llm`)
 - `FAST_BOOT` (`true`/`false`, default: `true`)
 - `REASONING_PARSER` (optional, e.g. `qwen3`, `deepseek_r1`, `granite`)
@@ -263,4 +263,3 @@ Request-level `chat_template_kwargs` continue to override server defaults.
 Cached Modal volumes used by this backend:
 - `huggingface-cache`
 - `vllm-cache`
-
