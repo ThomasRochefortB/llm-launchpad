@@ -18,6 +18,7 @@ except Exception:  # pragma: no cover - rich is optional
     Console = None  # type: ignore
 
 from .presets import PRESETS
+from .core.paths import MODAL_LLAMACPP_SCRIPT, MODAL_VLLM_SCRIPT
 
 
 app = typer.Typer(help="llm-launchpad CLI - configure and deploy LLM backends on Modal.")
@@ -127,8 +128,8 @@ def _app_screen():
 
 def _backend_script(backend: str) -> str:
     if backend == BACKEND_VLLM:
-        return "modal-vllm.py"
-    return "modal-llamacpp.py"
+        return MODAL_VLLM_SCRIPT
+    return MODAL_LLAMACPP_SCRIPT
 
 
 def _backend_app_name(backend: str) -> str:
@@ -573,7 +574,7 @@ def wizard() -> None:
         run_smoke = False
         if not deploy:
             run_smoke = inquirer.confirm(
-                message="Run smoke test now (modal run modal-vllm.py)?",
+                message=f"Run smoke test now (modal run {MODAL_VLLM_SCRIPT})?",
                 default=True,
             ).execute()
         warm_up = False
@@ -1141,5 +1142,4 @@ def main() -> None:  # console script entrypoint
 
 if __name__ == "__main__":  # pragma: no cover
     main()
-
 

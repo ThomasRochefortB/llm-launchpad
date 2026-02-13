@@ -39,4 +39,4 @@ Homepage = "https://github.com/ThomasRochefortB/llm-launchpad"
 Issues = "https://github.com/ThomasRochefortB/llm-launchpad/issues"
 
 [tool.setuptools]
-packages = ["llm_launchpad", "llm_launchpad.cli", "llm_launchpad.core", "llm_launchpad.protocol", "llm_launchpad.tui", "llm_launchpad.tui.screens", "llm_launchpad.tui.widgets"]
+packages = ["llm_launchpad", "llm_launchpad.backends", "llm_launchpad.cli", "llm_launchpad.core", "llm_launchpad.protocol", "llm_launchpad.tui", "llm_launchpad.tui.screens", "llm_launchpad.tui.widgets"]
