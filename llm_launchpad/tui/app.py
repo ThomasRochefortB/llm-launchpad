@@ -12,7 +12,7 @@ from textual.app import App
 from textual.binding import Binding
 
 from ..core.backend import ModalBackend
-from ..core.hf_models import list_vllm_candidates
+from ..core.hf_models import fetch_gguf_quantizations, list_llamacpp_candidates, list_vllm_candidates
 from ..core.naming import build_app_name, legacy_app_name
 from ..core.orchestrator import Orchestrator
 from ..protocol.enums import BackendType
@@ -25,7 +25,15 @@ from .screens.deploy import BackendSelectScreen
 from .screens.manage import ManageScreen
 from .screens.monitor import MonitorScreen
 from .screens.settings import SettingsScreen
-from .workers import VllmModelsFailed, VllmModelsLoaded, _dispatch_event
+from .workers import (
+    LlamaCppModelsFailed,
+    LlamaCppModelsLoaded,
+    LlamaCppQuantsFailed,
+    LlamaCppQuantsLoaded,
+    VllmModelsFailed,
+    VllmModelsLoaded,
+    _dispatch_event,
+)
 
 
 class WizardApp(App):
@@ -246,3 +254,45 @@ class WizardApp(App):
             poster(VllmModelsFailed(mode=mode, error=str(exc)))
             return
         poster(VllmModelsLoaded(mode=mode, models=models))
+
+    # ------------------------------------------------------------------
+    # llama.cpp model discovery
+    # ------------------------------------------------------------------
+
+    def begin_fetch_llamacpp_models(self, mode: str, receiver: object) -> None:
+        """Load ranked HF model candidates for llama.cpp without blocking UI."""
+        self.run_worker(
+            lambda: self._run_fetch_llamacpp_models(mode, receiver),
+            name=f"fetch-llamacpp-models-{mode}",
+            thread=True,
+        )
+
+    def _run_fetch_llamacpp_models(self, mode: str, receiver: object) -> None:
+        poster = getattr(receiver, "post_message", None)
+        if poster is None:
+            return
+        try:
+            models = list_llamacpp_candidates(mode=mode if mode in {"downloads", "trending"} else "downloads")
+        except Exception as exc:
+            poster(LlamaCppModelsFailed(mode=mode, error=str(exc)))
+            return
+        poster(LlamaCppModelsLoaded(mode=mode, models=models))
+
+    def begin_fetch_llamacpp_quants(self, repo_id: str, revision: str | None, receiver: object) -> None:
+        """Load GGUF quant variants for a llama.cpp model repo."""
+        self.run_worker(
+            lambda: self._run_fetch_llamacpp_quants(repo_id, revision, receiver),
+            name=f"fetch-llamacpp-quants-{repo_id}",
+            thread=True,
+        )
+
+    def _run_fetch_llamacpp_quants(self, repo_id: str, revision: str | None, receiver: object) -> None:
+        poster = getattr(receiver, "post_message", None)
+        if poster is None:
+            return
+        try:
+            quantizations = fetch_gguf_quantizations(repo_id=repo_id, revision=revision)
+        except Exception as exc:
+            poster(LlamaCppQuantsFailed(repo_id=repo_id, revision=revision, error=str(exc)))
+            return
+        poster(LlamaCppQuantsLoaded(repo_id=repo_id, revision=revision, quantizations=quantizations))

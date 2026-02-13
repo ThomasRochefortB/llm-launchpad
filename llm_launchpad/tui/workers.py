@@ -94,6 +94,44 @@ class VllmModelsFailed(Message):
         self.error = error
 
 
+class LlamaCppModelsLoaded(Message):
+    """Top ranked llama.cpp-compatible models were loaded."""
+
+    def __init__(self, mode: str, models: list[ModelCandidate]) -> None:
+        super().__init__()
+        self.mode = mode
+        self.models = models
+
+
+class LlamaCppModelsFailed(Message):
+    """llama.cpp model discovery failed for a ranking mode."""
+
+    def __init__(self, mode: str, error: str) -> None:
+        super().__init__()
+        self.mode = mode
+        self.error = error
+
+
+class LlamaCppQuantsLoaded(Message):
+    """Detected GGUF quantizations for a llama.cpp repo."""
+
+    def __init__(self, repo_id: str, revision: str | None, quantizations: list[str]) -> None:
+        super().__init__()
+        self.repo_id = repo_id
+        self.revision = revision
+        self.quantizations = quantizations
+
+
+class LlamaCppQuantsFailed(Message):
+    """GGUF quantization discovery failed for a llama.cpp repo."""
+
+    def __init__(self, repo_id: str, revision: str | None, error: str) -> None:
+        super().__init__()
+        self.repo_id = repo_id
+        self.revision = revision
+        self.error = error
+
+
 # -----------------------------------------------------------------------
 # Event dispatcher: protocol event -> Textual message
 # -----------------------------------------------------------------------

@@ -1,6 +1,6 @@
 """Deploy screen: backend selection, model config, deploy options.
 
-Two sub-flows: llama.cpp (preset/custom GGUF) and vLLM (model params).
+Two sub-flows: llama.cpp (ranked GGUF/custom) and vLLM (model params).
 Keyboard-driven form navigation with enter-to-proceed.
 """
 
@@ -34,7 +34,6 @@ from ...core.naming import (
 )
 from ...protocol.enums import BackendType
 from ...protocol.models import DeploymentConfig
-from ...presets import PRESETS
 from ..gpu_config import (
     DEFAULT_GPU_COUNT,
     DEFAULT_GPU_TYPE,
@@ -42,7 +41,14 @@ from ..gpu_config import (
     normalize_gpu_type,
     parse_gpu_count,
 )
-from ..workers import VllmModelsFailed, VllmModelsLoaded
+from ..workers import (
+    LlamaCppModelsFailed,
+    LlamaCppModelsLoaded,
+    LlamaCppQuantsFailed,
+    LlamaCppQuantsLoaded,
+    VllmModelsFailed,
+    VllmModelsLoaded,
+)
 from ..widgets.input_form import FormField, ToggleField
 
 
@@ -91,7 +97,7 @@ class BackendSelectScreen(Screen):
 
 
 class LlamaCppDeployScreen(Screen):
-    """llama.cpp deploy form: preset selection + options."""
+    """llama.cpp deploy form."""
 
     BINDINGS = [
         Binding("escape", "pop_screen", "Back", show=True),
@@ -103,25 +109,23 @@ class LlamaCppDeployScreen(Screen):
             yield Static("[bold cyan]Deploy llama.cpp[/bold cyan]  [dim]Step 2: Model & options[/dim]")
             yield Static("")
 
-            # Preset selection
-            yield Static("[bold]Select a preset[/bold]  [dim](or choose custom)[/dim]")
-            options = []
-            for name, entry in PRESETS.items():
-                label = f"  {name:<24} {entry.get('repo_id', '')}  [{entry.get('quant', '')}]"
-                options.append(Option(label, id=f"preset-{name}"))
-            options.append(Option("  custom                     Enter repo-id and quant manually", id="preset-custom"))
-            yield OptionList(*options, id="preset-list")
+            yield Static("[bold]Model ranking[/bold]  [dim](Top 10 GGUF text-generation models)[/dim]")
+            yield OptionList(
+                Option("  Most downloaded", id="rank-downloads"),
+                Option("  Trending", id="rank-trending"),
+                id="llama-rank-mode",
+            )
+            yield Static("[dim]Loading model suggestions...[/dim]", id="llama-model-status")
+            yield OptionList(id="llama-model-list")
 
-            # Custom fields (hidden by default, shown when custom selected)
-            with Vertical(id="custom-fields", classes="hidden"):
-                yield FormField(
-                    "Hugging Face repo-id",
-                    "repo-id",
-                    hint="e.g., Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
-                )
-                yield FormField("Quant pattern", "quant", default="Q4_K_M")
-                yield FormField("HF revision (optional)", "revision")
-
+            yield FormField(
+                "Hugging Face repo-id",
+                "repo-id",
+                hint="e.g., Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+            )
+            yield FormField("Quant pattern", "quant", default="Q4_K_M")
+            yield Static("[dim]Quantizations: enter repo-id to detect GGUF variants[/dim]", id="llama-quant-status")
+            yield OptionList(id="llama-quant-list")
             yield Static("")
 
             # Options
@@ -150,61 +154,100 @@ class LlamaCppDeployScreen(Screen):
             yield Static("")
 
             # Advanced options (collapsed by default)
-            yield Button("Advanced options...", id="toggle-advanced", variant="default")
-            with Vertical(id="advanced-fields", classes="hidden"):
-                yield FormField("Server args", "server-args", hint="e.g., --ctx-size 65536")
-                yield FormField("Host", "host-input", default="0.0.0.0")
-                yield FormField("Port", "port-input", default="8080")
-                yield FormField("n_gpu_layers (blank=auto)", "n-gpu-layers")
+            yield Button("Advanced options...", id="toggle-advanced-llama", variant="default")
+            yield FormField("HF revision (optional)", "revision", classes="llama-advanced")
+            yield FormField(
+                "Server args",
+                "server-args",
+                hint="e.g., --ctx-size 65536",
+                classes="llama-advanced",
+            )
+            yield FormField("Host", "host-input", default="0.0.0.0", classes="llama-advanced")
+            yield FormField("Port", "port-input", default="8080", classes="llama-advanced")
+            yield FormField(
+                "n_gpu_layers (blank=auto)",
+                "n-gpu-layers",
+                classes="llama-advanced",
+            )
 
             yield Static("")
             yield FormField(
                 "Instance name (optional)",
                 "instance-name-llama",
-                hint="Auto-derived from preset/repo if blank",
+                hint="Auto-derived from repo if blank",
+                classes="llama-advanced",
             )
             yield FormField(
                 "App name override (optional)",
                 "app-name-llama",
                 hint="Advanced: explicit Modal app name",
+                classes="llama-advanced",
             )
-            yield Static("[dim]App name preview: auto[/dim]", id="llama-app-preview")
+            yield Static(
+                "[dim]App name preview: auto[/dim]",
+                id="llama-app-preview",
+                classes="llama-advanced",
+            )
             yield Static("")
             yield Button("Deploy", id="deploy-btn", variant="primary")
         yield Footer()
 
     def on_mount(self) -> None:
-        self._selected_preset: str | None = None
-        self._is_custom = False
+        self._rank_mode = "downloads"
+        self._ranked_models: list[ModelCandidate] = []
+        self._repo_to_quants: dict[str, tuple[str, ...]] = {}
+        self._last_quant_lookup: tuple[str, str] | None = None
+        self._updating_quant_input = False
+        self._quant_touched = False
         self._selected_gpu_type = DEFAULT_GPU_TYPE
+        for widget in self.query(".llama-advanced"):
+            widget.add_class("hidden")
         self._refresh_gpu_types()
+        self.app.begin_fetch_llamacpp_models(self._rank_mode, self)  # type: ignore[attr-defined]
         self._refresh_app_preview()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
-        if event.option_list.id != "preset-list":
+        if event.option_list.id == "llama-rank-mode":
+            selected_mode = "downloads" if event.option.id == "rank-downloads" else "trending"
+            if selected_mode == self._rank_mode:
+                return
+            self._rank_mode = selected_mode
+            self._ranked_models = []
+            self._set_model_status("[dim]Loading model suggestions...[/dim]")
+            self.query_one("#llama-model-list", OptionList).set_options([])
+            self.app.begin_fetch_llamacpp_models(self._rank_mode, self)  # type: ignore[attr-defined]
             return
-        opt_id = event.option.id or ""
-        custom_fields = self.query_one("#custom-fields")
-        if opt_id == "preset-custom":
-            self._is_custom = True
-            self._selected_preset = None
-            custom_fields.remove_class("hidden")
-        else:
-            self._is_custom = False
-            self._selected_preset = opt_id.removeprefix("preset-")
-            custom_fields.add_class("hidden")
+
+        if event.option_list.id == "llama-model-list":
+            self._apply_ranked_model_selection(event.option.id or "")
+            self._refresh_app_preview()
+            return
+
+        if event.option_list.id == "llama-quant-list":
+            self._apply_quant_selection(event.option.id or "")
+            return
+
+    def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
+        """Mirror highlighted model into repo-id for keyboard-first flow."""
+        if event.option_list.id != "llama-model-list":
+            return
+        self._apply_ranked_model_selection(event.option.id or "")
         self._refresh_app_preview()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "toggle-advanced":
-            adv = self.query_one("#advanced-fields")
-            adv.toggle_class("hidden")
+        if event.button.id == "toggle-advanced-llama":
+            for widget in self.query(".llama-advanced"):
+                widget.toggle_class("hidden")
         elif event.button.id == "deploy-btn":
             self._do_deploy()
 
     def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "quant" and not self._updating_quant_input:
+            self._quant_touched = True
         if event.input.id in {"repo-id", "instance-name-llama", "app-name-llama"}:
             self._refresh_app_preview()
+        if event.input.id in {"repo-id", "revision"}:
+            self._lookup_quantizations_for_current_repo()
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id != "gpu-type-llama":
@@ -246,19 +289,68 @@ class LlamaCppDeployScreen(Screen):
         # Keep default value if Modal docs fetch fails.
         return
 
+    def on_llama_cpp_models_loaded(self, message: LlamaCppModelsLoaded) -> None:
+        if message.mode != self._rank_mode:
+            return
+        self._ranked_models = message.models
+        self._repo_to_quants = {model.repo_id.casefold(): model.quantizations for model in message.models}
+        model_list = self.query_one("#llama-model-list", OptionList)
+        options = []
+        for idx, model in enumerate(message.models):
+            downloads = f"{model.downloads:,}" if model.downloads is not None else "-"
+            likes = f"{model.likes:,}" if model.likes is not None else "-"
+            label = f"  {model.repo_id:<38} downloads={downloads:<10} likes={likes}"
+            options.append(Option(label, id=f"model-{idx}"))
+        model_list.set_options(options)
+
+        if message.models:
+            mode_label = "Most downloaded" if self._rank_mode == "downloads" else "Trending"
+            self._set_model_status(f"[dim]{mode_label} models loaded. Select one to prefill repo-id.[/dim]")
+        else:
+            self._set_model_status("[yellow]No matching GGUF text-generation models found.[/yellow]")
+            self._repo_to_quants = {}
+
+    def on_llama_cpp_models_failed(self, message: LlamaCppModelsFailed) -> None:
+        if message.mode != self._rank_mode:
+            return
+        self._ranked_models = []
+        self._repo_to_quants = {}
+        self.query_one("#llama-model-list", OptionList).set_options([])
+        self._set_model_status(
+            f"[yellow]Could not load model suggestions:[/yellow] {message.error} [dim](manual input still works)[/dim]"
+        )
+
+    def on_llama_cpp_quants_loaded(self, message: LlamaCppQuantsLoaded) -> None:
+        current_repo = self.query_one("#repo-id", Input).value.strip()
+        current_revision = self.query_one("#revision", Input).value.strip()
+        if message.repo_id.strip().casefold() != current_repo.casefold():
+            return
+        if (message.revision or "").strip() != current_revision:
+            return
+        self._repo_to_quants[current_repo.casefold()] = tuple(message.quantizations)
+        self._apply_quantizations(message.quantizations, auto_select=not self._quant_touched)
+
+    def on_llama_cpp_quants_failed(self, message: LlamaCppQuantsFailed) -> None:
+        current_repo = self.query_one("#repo-id", Input).value.strip()
+        current_revision = self.query_one("#revision", Input).value.strip()
+        if message.repo_id.strip().casefold() != current_repo.casefold():
+            return
+        if (message.revision or "").strip() != current_revision:
+            return
+        self.query_one("#llama-quant-list", OptionList).set_options([])
+        self._set_quant_status(
+            f"[yellow]Could not load quantizations:[/yellow] {message.error} [dim](manual quant still works)[/dim]"
+        )
+
     def action_do_deploy(self) -> None:
         self._do_deploy()
 
     def _do_deploy(self) -> None:
         config = DeploymentConfig(backend=BackendType.LLAMACPP)
-
-        if self._is_custom:
-            config.repo_id = self.query_one("#repo-id", Input).value.strip() or None
-            config.quant = self.query_one("#quant", Input).value.strip() or None
-            rev = self.query_one("#revision", Input).value.strip()
-            config.revision = rev or None
-        else:
-            config.preset = self._selected_preset
+        config.repo_id = self.query_one("#repo-id", Input).value.strip() or None
+        config.quant = self.query_one("#quant", Input).value.strip() or None
+        rev = self.query_one("#revision", Input).value.strip()
+        config.revision = rev or None
 
         config.preload = self.query_one("#preload", Switch).value
         config.do_deploy = self.query_one("#do-deploy", Switch).value
@@ -276,8 +368,8 @@ class LlamaCppDeployScreen(Screen):
         config.gpu_count = gpu_count
 
         # Advanced
-        adv = self.query_one("#advanced-fields")
-        if not adv.has_class("hidden"):
+        adv_visible = not self.query(".llama-advanced").first().has_class("hidden")
+        if adv_visible:
             sa = self.query_one("#server-args", Input).value.strip()
             config.server_args = sa or None
             h = self.query_one("#host-input", Input).value.strip()
@@ -295,7 +387,7 @@ class LlamaCppDeployScreen(Screen):
                 except ValueError:
                     pass
 
-        model_hint = config.repo_id or config.preset
+        model_hint = config.repo_id
         instance_override = self.query_one("#instance-name-llama", Input).value.strip()
         app_override = self.query_one("#app-name-llama", Input).value.strip()
         if app_override:
@@ -310,9 +402,93 @@ class LlamaCppDeployScreen(Screen):
 
         self.app.begin_deploy(config)  # type: ignore[attr-defined]
 
+    def _set_model_status(self, text: str) -> None:
+        self.query_one("#llama-model-status", Static).update(text)
+
+    def _set_quant_status(self, text: str) -> None:
+        self.query_one("#llama-quant-status", Static).update(text)
+
+    def _apply_ranked_model_selection(self, option_id: str) -> None:
+        if not option_id.startswith("model-"):
+            return
+        try:
+            idx = int(option_id.split("-", 1)[1])
+        except ValueError:
+            return
+        if idx < 0 or idx >= len(self._ranked_models):
+            return
+        selected = self._ranked_models[idx]
+        self.query_one("#repo-id", Input).value = selected.repo_id
+        self._quant_touched = False
+        if selected.quantizations:
+            self._apply_quantizations(list(selected.quantizations), auto_select=True)
+        else:
+            self._lookup_quantizations_for_current_repo(force_refresh=True)
+        self._refresh_app_preview()
+
+    def _lookup_quantizations_for_current_repo(self, force_refresh: bool = False) -> None:
+        repo_id = self.query_one("#repo-id", Input).value.strip()
+        revision = self.query_one("#revision", Input).value.strip()
+        if not repo_id:
+            self.query_one("#llama-quant-list", OptionList).set_options([])
+            self._set_quant_status("[dim]Quantizations: enter repo-id to detect GGUF variants[/dim]")
+            self._last_quant_lookup = None
+            return
+
+        cache_key = (repo_id.casefold(), revision)
+        if not force_refresh and cache_key == self._last_quant_lookup:
+            return
+        self._last_quant_lookup = cache_key
+
+        cached_quants = self._repo_to_quants.get(repo_id.casefold())
+        if cached_quants is not None and not force_refresh:
+            self._apply_quantizations(list(cached_quants), auto_select=not self._quant_touched)
+            return
+
+        self._set_quant_status("[dim]Loading quantizations...[/dim]")
+        self.app.begin_fetch_llamacpp_quants(repo_id, revision or None, self)  # type: ignore[attr-defined]
+
+    def _apply_quantizations(self, quantizations: list[str], auto_select: bool) -> None:
+        quant_list = self.query_one("#llama-quant-list", OptionList)
+        options = [Option(f"  {quant}", id=f"quant-{quant}") for quant in quantizations]
+        quant_list.set_options(options)
+        if quantizations:
+            preview = ", ".join(quantizations[:6])
+            suffix = "..." if len(quantizations) > 6 else ""
+            self._set_quant_status(f"[dim]Quantizations: {preview}{suffix}[/dim]")
+        else:
+            self._set_quant_status("[yellow]No GGUF quantizations detected.[/yellow]")
+
+        quant_input = self.query_one("#quant", Input)
+        current_quant = quant_input.value.strip().upper()
+        if not auto_select:
+            return
+        if current_quant and current_quant in {q.upper() for q in quantizations}:
+            return
+        preferred = "Q4_K_M" if "Q4_K_M" in quantizations else (quantizations[0] if quantizations else "")
+        if preferred:
+            self._updating_quant_input = True
+            try:
+                quant_input.value = preferred
+            finally:
+                self._updating_quant_input = False
+
+    def _apply_quant_selection(self, option_id: str) -> None:
+        if not option_id.startswith("quant-"):
+            return
+        quant = option_id.removeprefix("quant-").strip()
+        if not quant:
+            return
+        self._updating_quant_input = True
+        try:
+            self.query_one("#quant", Input).value = quant
+        finally:
+            self._updating_quant_input = False
+        self._quant_touched = True
+
     def _refresh_app_preview(self) -> None:
-        repo_id = self.query_one("#repo-id", Input).value.strip() if self._is_custom else ""
-        model_hint = repo_id or self._selected_preset or "default"
+        repo_id = self.query_one("#repo-id", Input).value.strip()
+        model_hint = repo_id or "default"
         instance_override = self.query_one("#instance-name-llama", Input).value.strip()
         app_override = self.query_one("#app-name-llama", Input).value.strip()
         if app_override:
