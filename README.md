@@ -160,7 +160,7 @@ curl -s "$SERVER_URL"/metrics
 ```
 
 ### Tuning and configuration
-- **GPU shape**: set environment variable before deploy/run, e.g. `export GPU_CONFIG="A100-80GB:2"`.
+- **GPU shape**: in `llm-launchpad wizard`, choose GPU type/count on each deploy screen so each instance can use its own shape. For raw `modal deploy/run`, set `GPU_CONFIG` manually.
 - **Quantization**: pass `--quant` (default: `Q4_K_M`) or adjust presets.
 - **Server args**: pass `--server_args "--ctx-size 65536 --threads 24"`.
 - **GPU offload**: override with `--n_gpu_layers <int>` or rely on auto (all layers if GPU provided).
@@ -237,9 +237,9 @@ open "$SERVER_URL"/docs
 ```
 
 ### Configuration
-Adjust behavior with environment variables before running `modal deploy`:
-- `GPU_CONFIG` (default: `H100:1`)
-- `N_GPU` (default: `1`, used for tensor parallel size)
+In `llm-launchpad wizard`, these are set from deployment form fields (per deployment). If you use raw `modal deploy`, you can still set them via environment variables:
+- `GPU_CONFIG` (default: `A100-80GB:1`)
+- `N_GPU` (default: `1`, tensor parallel size; intentionally separate from `GPU_CONFIG` count)
 - `MODEL_NAME` (default: `Qwen/Qwen3-4B-Thinking-2507-FP8`)
 - `MODEL_REVISION` (default pinned revision in `llm_launchpad/backends/modal_vllm_app.py`)
 - `SERVED_MODEL_NAME` (default: model id suffix, e.g. `Qwen3-4B-Thinking-2507-FP8`)

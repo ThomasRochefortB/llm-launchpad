@@ -10,19 +10,16 @@ from llm_launchpad.protocol.models import LaunchpadSettings
 class LaunchpadSettingsTests(unittest.TestCase):
     def test_to_env_defaults(self) -> None:
         env = LaunchpadSettings().to_env()
-        self.assertEqual(env["GPU_CONFIG"], "A100-80GB:1")
         self.assertEqual(env["SCALEDOWN_WINDOW"], "1800")
 
     def test_to_dict_from_dict_roundtrip(self) -> None:
-        original = LaunchpadSettings(gpu_config="H100:4", scaledown_window=600)
+        original = LaunchpadSettings(scaledown_window=600)
         serialized = original.to_dict()
         restored = LaunchpadSettings.from_dict(serialized)
-        self.assertEqual(restored.gpu_config, "H100:4")
         self.assertEqual(restored.scaledown_window, 600)
 
-    def test_to_env_omits_blank_gpu_and_non_positive_scaledown(self) -> None:
-        env = LaunchpadSettings(gpu_config="  ", scaledown_window=0).to_env()
-        self.assertNotIn("GPU_CONFIG", env)
+    def test_to_env_omits_non_positive_scaledown(self) -> None:
+        env = LaunchpadSettings(scaledown_window=0).to_env()
         self.assertNotIn("SCALEDOWN_WINDOW", env)
 
 

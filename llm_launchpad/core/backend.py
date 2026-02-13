@@ -57,10 +57,14 @@ class ModalBackend:
         return f"https://{username}--{resolved}-serve.modal.run"
 
     @staticmethod
-    def test_curl_command(backend: BackendType, server_url: str) -> str:
+    def test_curl_command(
+        backend: BackendType,
+        server_url: str,
+        served_model_name: Optional[str] = None,
+    ) -> str:
         base = server_url.rstrip("/")
         if backend == BackendType.VLLM:
-            model = os.environ.get(
+            model = (served_model_name or "").strip() or os.environ.get(
                 "SERVED_MODEL_NAME",
                 default_served_model_name(os.environ.get("MODEL_NAME")),
             )
@@ -111,6 +115,8 @@ class ModalBackend:
         config: DeploymentConfig,
     ) -> Dict[str, str]:
         env = settings.to_env()
+        if config.gpu_type and config.gpu_count is not None and config.gpu_count > 0:
+            env["GPU_CONFIG"] = f"{config.gpu_type.strip().upper()}:{config.gpu_count}"
         env.update(ModalBackend.env_for_backend(config))
         return env
 

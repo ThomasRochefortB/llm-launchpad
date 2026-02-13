@@ -106,6 +106,7 @@ class WizardApp(App):
                 timeout=1800,
                 tail_logs=True,
                 app_name=target_app_name,
+                served_model_name=config.served_model_name,
             ):
                 _dispatch_event(monitor, event)
 

@@ -10,19 +10,22 @@ import json
 
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.message import Message
 from textual.screen import Screen
 from textual.widgets import (
     Button,
     Footer,
     Input,
     OptionList,
+    Select,
     Static,
     Switch,
 )
 from textual.widgets.option_list import Option
 
 from ...core.hf_models import ModelCandidate
+from ...core.modal_gpu import fetch_modal_gpu_types
 from ...core.naming import (
     auto_instance_name_for_backend,
     build_app_name,
@@ -32,8 +35,31 @@ from ...core.naming import (
 from ...protocol.enums import BackendType
 from ...protocol.models import DeploymentConfig
 from ...presets import PRESETS
+from ..gpu_config import (
+    DEFAULT_GPU_COUNT,
+    DEFAULT_GPU_TYPE,
+    build_gpu_type_options,
+    normalize_gpu_type,
+    parse_gpu_count,
+)
 from ..workers import VllmModelsFailed, VllmModelsLoaded
 from ..widgets.input_form import FormField, ToggleField
+
+
+class GpuTypesLoaded(Message):
+    """GPU type options were fetched successfully."""
+
+    def __init__(self, gpu_types: list[str]) -> None:
+        super().__init__()
+        self.gpu_types = gpu_types
+
+
+class GpuTypesFailed(Message):
+    """GPU type option fetch failed."""
+
+    def __init__(self, error: str) -> None:
+        super().__init__()
+        self.error = error
 
 
 class BackendSelectScreen(Screen):
@@ -99,6 +125,24 @@ class LlamaCppDeployScreen(Screen):
             yield Static("")
 
             # Options
+            yield Static("GPU configuration", classes="form-label")
+            with Horizontal(id="gpu-config-row-llama"):
+                with Vertical(id="gpu-type-group-llama"):
+                    yield Static("GPU type", classes="form-label")
+                    yield Select(
+                        options=[(DEFAULT_GPU_TYPE, DEFAULT_GPU_TYPE)],
+                        prompt="Select GPU type",
+                        value=DEFAULT_GPU_TYPE,
+                        id="gpu-type-llama",
+                    )
+                with Vertical(id="gpu-count-group-llama"):
+                    yield Static("GPU count", classes="form-label")
+                    yield Input(
+                        value=str(DEFAULT_GPU_COUNT),
+                        placeholder="1",
+                        id="gpu-count-llama",
+                        type="integer",
+                    )
             yield ToggleField("Preload/download weights now", "preload", default=True)
             yield ToggleField("Deploy the server", "do-deploy", default=True)
             yield ToggleField("Warm up after deploy", "warmup", default=True)
@@ -132,6 +176,8 @@ class LlamaCppDeployScreen(Screen):
     def on_mount(self) -> None:
         self._selected_preset: str | None = None
         self._is_custom = False
+        self._selected_gpu_type = DEFAULT_GPU_TYPE
+        self._refresh_gpu_types()
         self._refresh_app_preview()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
@@ -160,6 +206,46 @@ class LlamaCppDeployScreen(Screen):
         if event.input.id in {"repo-id", "instance-name-llama", "app-name-llama"}:
             self._refresh_app_preview()
 
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id != "gpu-type-llama":
+            return
+        if isinstance(event.value, str) and event.value.strip():
+            self._selected_gpu_type = normalize_gpu_type(event.value)
+
+    def _refresh_gpu_types(self) -> None:
+        self.run_worker(
+            lambda: self._run_fetch_gpu_types(),
+            name="llama-fetch-gpu-types",
+            thread=True,
+        )
+
+    def _run_fetch_gpu_types(self) -> None:
+        poster = getattr(self, "post_message", None)
+        if poster is None:
+            return
+        try:
+            gpu_types = fetch_modal_gpu_types()
+        except Exception as exc:
+            poster(GpuTypesFailed(error=str(exc)))
+            return
+        poster(GpuTypesLoaded(gpu_types=gpu_types))
+
+    def on_gpu_types_loaded(self, message: GpuTypesLoaded) -> None:
+        dropdown = self.query_one("#gpu-type-llama", Select)
+        options = build_gpu_type_options(message.gpu_types)
+        if self._selected_gpu_type and self._selected_gpu_type not in options:
+            options.insert(0, self._selected_gpu_type)
+        if not options:
+            return
+        dropdown.set_options([(value, value) for value in options])
+        selected = self._selected_gpu_type if self._selected_gpu_type in options else options[0]
+        dropdown.value = selected
+        self._selected_gpu_type = selected
+
+    def on_gpu_types_failed(self, _: GpuTypesFailed) -> None:
+        # Keep default value if Modal docs fetch fails.
+        return
+
     def action_do_deploy(self) -> None:
         self._do_deploy()
 
@@ -177,6 +263,17 @@ class LlamaCppDeployScreen(Screen):
         config.preload = self.query_one("#preload", Switch).value
         config.do_deploy = self.query_one("#do-deploy", Switch).value
         config.do_warmup = self.query_one("#warmup", Switch).value
+
+        gpu_type = normalize_gpu_type(self._selected_gpu_type)
+        if not gpu_type:
+            self.app.notify("GPU type is required.", severity="error", timeout=5)
+            return
+        gpu_count = parse_gpu_count(self.query_one("#gpu-count-llama", Input).value, default=0)
+        if gpu_count <= 0:
+            self.app.notify("GPU count must be an integer >= 1.", severity="error", timeout=5)
+            return
+        config.gpu_type = gpu_type
+        config.gpu_count = gpu_count
 
         # Advanced
         adv = self.query_one("#advanced-fields")
@@ -261,17 +358,37 @@ class VllmDeployScreen(Screen):
                 "model-name",
                 default="Qwen/Qwen3-4B-Thinking-2507-FP8",
             )
+            yield Static("GPU configuration", classes="form-label")
+            with Horizontal(id="gpu-config-row-vllm"):
+                with Vertical(id="gpu-type-group-vllm"):
+                    yield Static("GPU type", classes="form-label")
+                    yield Select(
+                        options=[(DEFAULT_GPU_TYPE, DEFAULT_GPU_TYPE)],
+                        prompt="Select GPU type",
+                        value=DEFAULT_GPU_TYPE,
+                        id="gpu-type-vllm",
+                    )
+                with Vertical(id="gpu-count-group-vllm"):
+                    yield Static("Deployment GPU count", classes="form-label")
+                    yield Input(
+                        value=str(DEFAULT_GPU_COUNT),
+                        placeholder="1",
+                        id="gpu-count-vllm",
+                        type="integer",
+                    )
+            yield FormField(
+                "Tensor parallel size",
+                "n-gpu",
+                default="1",
+                hint="vLLM --tensor-parallel-size (separate from deployment GPU count)",
+            )
+            yield Button("Advanced options...", id="toggle-advanced-vllm", variant="default")
             yield FormField(
                 "Model revision (optional)",
                 "model-revision",
                 hint="Leave blank to use default branch",
+                classes="vllm-advanced",
             )
-            yield FormField(
-                "Number of GPUs (tensor parallel)",
-                "n-gpu",
-                default="1",
-            )
-            yield Button("Advanced options...", id="toggle-advanced-vllm", variant="default")
             yield ToggleField(
                 "Smoke test only (no deploy)",
                 "smoke-only-vllm",
@@ -324,11 +441,13 @@ class VllmDeployScreen(Screen):
     def on_mount(self) -> None:
         self._rank_mode = "downloads"
         self._ranked_models: list[ModelCandidate] = []
+        self._selected_gpu_type = DEFAULT_GPU_TYPE
         self._served_alias_touched = False
         self._updating_served_alias = False
         self._last_auto_served_alias = ""
         for widget in self.query(".vllm-advanced"):
             widget.add_class("hidden")
+        self._refresh_gpu_types()
         self._sync_served_alias_from_model(force=True)
         self.app.begin_fetch_vllm_models(self._rank_mode, self)  # type: ignore[attr-defined]
         self._refresh_app_preview()
@@ -371,6 +490,46 @@ class VllmDeployScreen(Screen):
             self._served_alias_touched = event.input.value.strip() != self._last_auto_served_alias
         if event.input.id in {"model-name", "instance-name-vllm", "app-name-vllm"}:
             self._refresh_app_preview()
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id != "gpu-type-vllm":
+            return
+        if isinstance(event.value, str) and event.value.strip():
+            self._selected_gpu_type = normalize_gpu_type(event.value)
+
+    def _refresh_gpu_types(self) -> None:
+        self.run_worker(
+            lambda: self._run_fetch_gpu_types(),
+            name="vllm-fetch-gpu-types",
+            thread=True,
+        )
+
+    def _run_fetch_gpu_types(self) -> None:
+        poster = getattr(self, "post_message", None)
+        if poster is None:
+            return
+        try:
+            gpu_types = fetch_modal_gpu_types()
+        except Exception as exc:
+            poster(GpuTypesFailed(error=str(exc)))
+            return
+        poster(GpuTypesLoaded(gpu_types=gpu_types))
+
+    def on_gpu_types_loaded(self, message: GpuTypesLoaded) -> None:
+        dropdown = self.query_one("#gpu-type-vllm", Select)
+        options = build_gpu_type_options(message.gpu_types)
+        if self._selected_gpu_type and self._selected_gpu_type not in options:
+            options.insert(0, self._selected_gpu_type)
+        if not options:
+            return
+        dropdown.set_options([(value, value) for value in options])
+        selected = self._selected_gpu_type if self._selected_gpu_type in options else options[0]
+        dropdown.value = selected
+        self._selected_gpu_type = selected
+
+    def on_gpu_types_failed(self, _: GpuTypesFailed) -> None:
+        # Keep default value if Modal docs fetch fails.
+        return
 
     def _sync_served_alias_from_model(self, force: bool = False) -> None:
         alias_input = self.query_one("#served-model-name", Input)
@@ -452,6 +611,16 @@ class VllmDeployScreen(Screen):
         config = DeploymentConfig(backend=BackendType.VLLM)
         config.model_name = self.query_one("#model-name", Input).value.strip() or None
         config.model_revision = self.query_one("#model-revision", Input).value.strip() or None
+        gpu_type = normalize_gpu_type(self._selected_gpu_type)
+        if not gpu_type:
+            self.app.notify("GPU type is required.", severity="error", timeout=5)
+            return
+        gpu_count = parse_gpu_count(self.query_one("#gpu-count-vllm", Input).value, default=0)
+        if gpu_count <= 0:
+            self.app.notify("Deployment GPU count must be an integer >= 1.", severity="error", timeout=5)
+            return
+        config.gpu_type = gpu_type
+        config.gpu_count = gpu_count
         alias = self.query_one("#served-model-name", Input).value.strip()
         config.served_model_name = alias or default_served_model_name(config.model_name)
         config.fast_boot = self.query_one("#fast-boot", Switch).value

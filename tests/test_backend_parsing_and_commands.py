@@ -77,6 +77,14 @@ class BackendParsingAndCommandTests(unittest.TestCase):
         env = ModalBackend.env_for_backend(config)
         self.assertEqual(env, {"MODAL_APP_NAME": "llamacpp-prod"})
 
+    def test_test_curl_command_vllm_prefers_provided_served_model_name(self) -> None:
+        cmd = ModalBackend.test_curl_command(
+            BackendType.VLLM,
+            "https://example.modal.run",
+            served_model_name="Qwen3-0.6B",
+        )
+        self.assertIn('"model":"Qwen3-0.6B"', cmd)
+
 
 if __name__ == "__main__":
     unittest.main()

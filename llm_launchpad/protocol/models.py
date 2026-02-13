@@ -10,32 +10,23 @@ from .enums import BackendType
 
 @dataclass
 class LaunchpadSettings:
-    """Persisted user settings (GPU config, scaledown, etc.)."""
+    """Persisted user settings (scaledown, etc.)."""
 
-    gpu_config: str = "A100-80GB:1"
     scaledown_window: int = 1800  # seconds (30 minutes)
 
     def to_env(self) -> Dict[str, str]:
         """Derive Modal environment variables from settings."""
         env: Dict[str, str] = {}
-        if self.gpu_config.strip():
-            env["GPU_CONFIG"] = self.gpu_config.strip()
         if self.scaledown_window > 0:
             env["SCALEDOWN_WINDOW"] = str(self.scaledown_window)
         return env
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
-            "GPU_CONFIG": self.gpu_config,
-            "SCALEDOWN_WINDOW": self.scaledown_window,
-        }
+        return {"SCALEDOWN_WINDOW": self.scaledown_window}
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> LaunchpadSettings:
-        return cls(
-            gpu_config=str(data.get("GPU_CONFIG", "A100-80GB:1")),
-            scaledown_window=int(data.get("SCALEDOWN_WINDOW", 1800)),
-        )
+        return cls(scaledown_window=int(data.get("SCALEDOWN_WINDOW", 1800)))
 
 
 @dataclass
@@ -54,6 +45,8 @@ class DeploymentConfig:
     host: Optional[str] = None
     port: Optional[int] = None
     n_gpu_layers: Optional[int] = None
+    gpu_type: Optional[str] = None
+    gpu_count: Optional[int] = None
 
     # vLLM specific
     model_name: Optional[str] = None

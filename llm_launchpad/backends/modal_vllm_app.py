@@ -5,7 +5,14 @@ from typing import Any
 import aiohttp
 import modal
 
-from llm_launchpad.core.naming import default_served_model_name
+
+def default_served_model_name(model_name: str | None, default: str = "llm") -> str:
+    """Local helper so this file is self-contained in Modal runtimes."""
+    candidate = (model_name or "").strip()
+    if not candidate:
+        return default
+    tail = candidate.rsplit("/", 1)[-1].strip()
+    return tail or default
 
 
 APP_NAME = os.environ.get("MODAL_APP_NAME", "vllm-server").strip() or "vllm-server"

@@ -251,7 +251,14 @@ def deploy(
 
     if do_warmup:
         url = server_url or ModalBackend.default_server_url(username, app_name=resolved_app_name)
-        for event in orch.warmup(bt, url, timeout, tail_logs, app_name=resolved_app_name):
+        for event in orch.warmup(
+            bt,
+            url,
+            timeout,
+            tail_logs,
+            app_name=resolved_app_name,
+            served_model_name=config.served_model_name,
+        ):
             _print_event(event)
 
     raise typer.Exit(code=0)
@@ -427,7 +434,14 @@ def switch(
                 url = server_url or ModalBackend.default_server_url(
                     username, app_name=resolved_app_name
                 )
-                for event in orch.warmup(bt, url, timeout, tail_logs, app_name=resolved_app_name):
+                for event in orch.warmup(
+                    bt,
+                    url,
+                    timeout,
+                    tail_logs,
+                    app_name=resolved_app_name,
+                    served_model_name=config.served_model_name,
+                ):
                     _print_event(event)
         else:
             typer.echo("No deploy performed. Use --redeploy to apply vLLM model changes.")
@@ -446,8 +460,8 @@ def switch(
     if redeploy:
         deploy_config = DeploymentConfig(backend=bt, do_deploy=True)
         settings = ConfigStore().load()
-        env = settings.to_env()
-        env["MODAL_APP_NAME"] = resolved_app_name
+        deploy_config.app_name = resolved_app_name
+        env = ModalBackend.build_full_env(settings, deploy_config)
         code = ModalBackend.run_blocking(
             ModalBackend.build_deploy_command(bt, app_name=resolved_app_name), env=env
         )

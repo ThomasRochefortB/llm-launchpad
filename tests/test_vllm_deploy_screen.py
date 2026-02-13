@@ -74,6 +74,8 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             screen._do_deploy()
             self.assertIsNotNone(app.deployed_config)
             self.assertEqual(app.deployed_config.served_model_name, "Qwen3-0.6B")
+            self.assertEqual(app.deployed_config.gpu_type, "A100-80GB")
+            self.assertEqual(app.deployed_config.gpu_count, 1)
 
     async def test_enforce_eager_defaults_to_false(self) -> None:
         app = _TestApp()
@@ -201,6 +203,46 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 app.deployed_config.default_chat_template_kwargs,
                 '{"enable_thinking": false}',
             )
+
+    async def test_model_revision_is_hidden_with_advanced_fields_and_maps_to_config(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+            revision_input = screen.query_one("#model-revision", Input)
+            parent = revision_input.parent
+            self.assertIsNotNone(parent)
+            assert parent is not None
+            self.assertTrue(parent.has_class("vllm-advanced"))
+            self.assertTrue(parent.has_class("hidden"))
+
+            for w in screen.query(".vllm-advanced"):
+                w.remove_class("hidden")
+
+            revision_input.value = "main"
+            screen._do_deploy()
+
+            self.assertIsNotNone(app.deployed_config)
+            self.assertEqual(app.deployed_config.model_revision, "main")
+
+    async def test_deployment_gpu_shape_is_independent_from_tensor_parallel(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+            screen.query_one("#gpu-count-vllm", Input).value = "2"
+            screen.query_one("#n-gpu", Input).value = "4"
+            screen._do_deploy()
+
+            self.assertIsNotNone(app.deployed_config)
+            self.assertEqual(app.deployed_config.gpu_count, 2)
+            self.assertEqual(app.deployed_config.n_gpu, 4)
 
     async def test_invalid_chat_template_kwargs_json_blocks_deploy(self) -> None:
         app = _TestApp()

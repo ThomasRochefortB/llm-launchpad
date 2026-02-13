@@ -58,7 +58,7 @@ class MainMenuScreen(Screen):
                 yield OptionList(
                     Option("  Deploy                  Launch a new LLM backend", id="deploy"),
                     Option("  Manage endpoints        List, status, logs, stop", id="manage"),
-                    Option("  Settings                GPU config, scaledown", id="settings"),
+                    Option("  Settings                Scaledown defaults", id="settings"),
                     id="action-list",
                 )
         yield Footer()
