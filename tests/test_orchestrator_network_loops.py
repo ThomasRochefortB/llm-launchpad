@@ -39,15 +39,24 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
         fake_requests = types.SimpleNamespace(get=lambda *_args, **_kwargs: _Response(200, "ok"))
         with patch.dict("sys.modules", {"requests": fake_requests}):
             with patch("llm_launchpad.core.orchestrator.time.sleep", return_value=None):
-                with patch("llm_launchpad.core.orchestrator.ModalBackend.test_curl_command", return_value="curl ok"):
+                with patch(
+                    "llm_launchpad.core.orchestrator.ModalBackend.test_curl_command",
+                    return_value="curl ok",
+                ) as curl_mock:
                     events = list(
                         Orchestrator().warmup(
                             backend=BackendType.VLLM,
                             server_url="https://example.modal.run",
                             timeout=10,
                             tail_logs=False,
+                            served_model_name="Qwen3-0.6B",
                         )
                     )
+        curl_mock.assert_called_once_with(
+            BackendType.VLLM,
+            "https://example.modal.run",
+            served_model_name="Qwen3-0.6B",
+        )
 
         self.assertTrue(any(isinstance(e, StateChangeEvent) and e.current == DeploymentState.HEALTHY for e in events))
         self.assertTrue(

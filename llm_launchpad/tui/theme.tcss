@@ -258,23 +258,29 @@ Button:focus {
     border: solid $primary-background;
 }
 
-#gpu-config-row {
+/* ---- Deploy screen GPU row ---- */
+
+#gpu-config-row-llama,
+#gpu-config-row-vllm {
     width: 100%;
     height: auto;
 }
 
-#gpu-type-group {
+#gpu-type-group-llama,
+#gpu-type-group-vllm {
     width: 2fr;
     height: auto;
     padding: 0 1 0 0;
 }
 
-#gpu-count-group {
+#gpu-count-group-llama,
+#gpu-count-group-vllm {
     width: 1fr;
     height: auto;
 }
 
-#gpu-count {
+#gpu-count-llama,
+#gpu-count-vllm {
     height: 5;
 }
 

@@ -35,6 +35,8 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNotNone(app.deployed_config)
         self.assertEqual(app.deployed_config.preset, "qwen3-coder-480b")
+        self.assertEqual(app.deployed_config.gpu_type, "A100-80GB")
+        self.assertEqual(app.deployed_config.gpu_count, 1)
 
     async def test_custom_mode_and_advanced_fields_map_into_config(self) -> None:
         app = _TestApp()
@@ -56,6 +58,7 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             screen.query_one("#host-input", Input).value = "0.0.0.0"
             screen.query_one("#port-input", Input).value = "8088"
             screen.query_one("#n-gpu-layers", Input).value = "99"
+            screen.query_one("#gpu-count-llama", Input).value = "3"
 
             screen._do_deploy()
 
@@ -67,6 +70,7 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app.deployed_config.host, "0.0.0.0")
         self.assertEqual(app.deployed_config.port, 8088)
         self.assertEqual(app.deployed_config.n_gpu_layers, 99)
+        self.assertEqual(app.deployed_config.gpu_count, 3)
 
     async def test_instance_and_app_override_behavior(self) -> None:
         app = _TestApp()

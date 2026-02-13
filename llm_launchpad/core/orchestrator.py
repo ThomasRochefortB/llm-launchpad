@@ -123,6 +123,7 @@ class Orchestrator:
         timeout: int = 1800,
         tail_logs: bool = True,
         app_name: Optional[str] = None,
+        served_model_name: Optional[str] = None,
     ) -> EventStream:
         """Probe endpoint readiness and optionally tail logs."""
         yield StateChangeEvent(
@@ -214,7 +215,11 @@ class Orchestrator:
                         except Exception:
                             pass
                     yield LogEvent(line="Server is ready!")
-                    curl_cmd = ModalBackend.test_curl_command(backend, server_url)
+                    curl_cmd = ModalBackend.test_curl_command(
+                        backend,
+                        server_url,
+                        served_model_name=served_model_name,
+                    )
                     yield LogEvent(line=f"Test command:\n{curl_cmd}")
                     yield StateChangeEvent(
                         current=DeploymentState.HEALTHY, operation=OperationType.WARMUP
