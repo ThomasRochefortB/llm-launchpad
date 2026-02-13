@@ -5,11 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "llm-launchpad"
 version = "0.0.2"
-description = "One-click personal LLM deployment with coding agent + chat UI."
+description = "Personal LLM deployments made simple."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { file = "LICENSE" }
-authors = [{ name = "Thomas Rochefort-Bedard" }]
+authors = [{ name = "Thomas Rochefort-Beaudoin" }]
 keywords = ["llm", "deployment", "modal", "agent", "chat"]
 classifiers = [
   "Programming Language :: Python :: 3",
@@ -27,10 +27,6 @@ dependencies = [
   "huggingface_hub>=0.26.2",
 ]
 
-[project.optional-dependencies]
-# Optional extras for faster/model downloads and utilities
-hf = ["huggingface_hub[hf_transfer]>=0.26.2"]
-
 [project.scripts]
 llm-launchpad = "llm_launchpad.cli.main:main"
 
@@ -40,3 +36,12 @@ Issues = "https://github.com/ThomasRochefortB/llm-launchpad/issues"
 
 [tool.setuptools]
 packages = ["llm_launchpad", "llm_launchpad.backends", "llm_launchpad.cli", "llm_launchpad.core", "llm_launchpad.protocol", "llm_launchpad.tui", "llm_launchpad.tui.screens", "llm_launchpad.tui.widgets"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]

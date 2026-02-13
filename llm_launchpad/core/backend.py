@@ -73,7 +73,7 @@ class ModalBackend:
                 f"curl -s -X POST {base}/v1/chat/completions "
                 "-H 'Content-Type: application/json' "
                 f"-d '{{\"model\":\"{model}\",\"messages\":[{{\"role\":\"user\","
-                "\"content\":\"Say hello in one short sentence.\"}}]}}'"
+                "\"content\":\"Say hello in one short sentence.\"}]}'"
             )
         return (
             f"curl -s -X POST {base}/v1/completions "
