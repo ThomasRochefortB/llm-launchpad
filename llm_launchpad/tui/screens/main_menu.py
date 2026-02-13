@@ -47,21 +47,23 @@ class MainMenuScreen(Screen):
                     f"[bold]{version_text}[/bold][dim]Modal LLM backends[/dim]",
                     classes="centered",
                 )
-                yield Static("")  # spacer
                 if self.username:
                     yield Static(
                         f"[green]  Authenticated as {self.username}[/green]",
                         id="auth-status",
                     )
                 yield Static("")  # spacer
-                yield Static("[bold]Choose action[/bold]  [dim](use arrow keys, enter to select)[/dim]")
                 yield OptionList(
-                    Option("  Deploy                  Launch a new LLM backend", id="deploy"),
-                    Option("  Manage endpoints        List, status, logs, stop", id="manage"),
-                    Option("  Settings                Scaledown defaults", id="settings"),
+                    Option("  Deploy            Launch a new LLM backend", id="deploy"),
+                    Option("  Manage            List, status, logs, stop", id="manage"),
+                    Option("  Settings          Scaledown defaults", id="settings"),
                     id="action-list",
                 )
         yield Footer()
+
+    def on_mount(self) -> None:
+        """Focus the option list so arrow-key navigation works immediately."""
+        self.query_one("#action-list", OptionList).focus()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         option_id = event.option.id
