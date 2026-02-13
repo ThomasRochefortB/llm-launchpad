@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 import json
 import os
+import time
 
 import modal
 
@@ -27,6 +28,8 @@ QUANT = "Q4_K_M"
 cache_dir = "/root/.cache/llama.cpp"
 model_cache = modal.Volume.from_name("llamacpp-cache", create_if_missing=True)
 CONFIG_PATH = f"{cache_dir}/serve_config.json"
+MODELS_ROOT = Path(cache_dir) / "models"
+INDEX_PATH = Path(cache_dir) / "model_index.json"
 
 # --- Simple presets for convenience (model-agnostic)
 # Note: Import presets lazily inside the local entrypoint to avoid container import issues.
@@ -60,6 +63,84 @@ def _load_config() -> Dict[str, Any]:
         "host": "0.0.0.0",
         "n_gpu_layers": None,
     }
+
+
+def _repo_slug(repo_id: str) -> str:
+    return repo_id.strip().replace("/", "__")
+
+
+def _revision_slug(revision: Optional[str]) -> str:
+    value = (revision or "").strip()
+    return value if value else "main"
+
+
+def _model_dir(repo_id: str, revision: Optional[str]) -> Path:
+    return MODELS_ROOT / _repo_slug(repo_id) / _revision_slug(revision)
+
+
+def _load_index() -> list[dict[str, Any]]:
+    if not INDEX_PATH.exists():
+        return []
+    try:
+        with open(INDEX_PATH) as handle:
+            payload = json.load(handle)
+    except Exception:
+        return []
+    if isinstance(payload, list):
+        return [entry for entry in payload if isinstance(entry, dict)]
+    return []
+
+
+def _save_index(rows: list[dict[str, Any]]) -> None:
+    Path(cache_dir).mkdir(parents=True, exist_ok=True)
+    with open(INDEX_PATH, "w") as handle:
+        json.dump(rows, handle)
+    model_cache.commit()
+
+
+def _upsert_index_entry(
+    repo_id: str,
+    revision: Optional[str],
+    allow_patterns: list[str],
+    relative_matches: list[str],
+) -> None:
+    rows = _load_index()
+    key_repo = repo_id.strip()
+    key_revision = (revision or "").strip() or None
+    others: list[dict[str, Any]] = []
+    for row in rows:
+        if (
+            str(row.get("repo_id", "")).strip() == key_repo
+            and ((row.get("revision") or None) == key_revision)
+        ):
+            continue
+        others.append(row)
+
+    size_bytes = 0
+    for rel in relative_matches:
+        candidate = Path(cache_dir) / rel
+        if candidate.exists():
+            size_bytes += candidate.stat().st_size
+
+    quant_hint = None
+    for pat in allow_patterns:
+        stripped = pat.strip("*").strip()
+        if stripped and "gguf" not in stripped.lower():
+            quant_hint = stripped
+            break
+
+    others.append(
+        {
+            "repo_id": key_repo,
+            "revision": key_revision,
+            "quant": quant_hint,
+            "size_bytes": size_bytes,
+            "file_count": len(relative_matches),
+            "paths": relative_matches,
+            "updated_at_unix": int(time.time()),
+        }
+    )
+    _save_index(others)
 
 
 # --- Build llama.cpp with CUDA support
@@ -104,17 +185,31 @@ def download_model(
 
     Returns a list of relative paths of GGUF files matching the quantization.
     """
+    return _download_model_files(repo_id, allow_patterns, revision)
+
+
+def _download_model_files(
+    repo_id: str,
+    allow_patterns: Optional[List[str]],
+    revision: Optional[str],
+) -> List[str]:
     from huggingface_hub import snapshot_download  # type: ignore
 
     if allow_patterns is None:
         allow_patterns = [f"*{QUANT}*.gguf"] if QUANT else ["*.gguf"]
 
-    print(f"🦙 downloading {repo_id} (patterns: {allow_patterns}, revision: {revision})")
+    target_dir = _model_dir(repo_id, revision)
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    print(
+        f"🦙 downloading {repo_id} (patterns: {allow_patterns}, revision: {revision}) "
+        f"into {target_dir}"
+    )
 
     snapshot_download(
         repo_id=repo_id,
         revision=revision,
-        local_dir=cache_dir,
+        local_dir=str(target_dir),
         allow_patterns=allow_patterns,
     )
 
@@ -123,12 +218,70 @@ def download_model(
 
     # Discover matching GGUF files
     matches: List[str] = []
-    for gguf in Path(cache_dir).glob("**/*.gguf"):
+    for gguf in target_dir.glob("**/*.gguf"):
         if any(gguf.name.find(pat.strip("*")) != -1 for pat in allow_patterns):
             matches.append(str(gguf.relative_to(cache_dir)))
 
+    _upsert_index_entry(repo_id, revision, allow_patterns, matches)
+
     print(f"🦙 found GGUF entries: {matches}")
     return matches
+
+
+@app.function(image=download_image, volumes={cache_dir: model_cache}, timeout=30 * MINUTES)
+def predownload_model(
+    repo_id: str,
+    quant: Optional[str] = None,
+    revision: Optional[str] = None,
+) -> List[str]:
+    """Pre-download model files for storage management workflows."""
+    allow_patterns = [f"*{quant}*.gguf"] if quant else ["*.gguf"]
+    return _download_model_files(repo_id, allow_patterns, revision)
+
+
+@app.function(image=download_image, volumes={cache_dir: model_cache})
+def list_downloaded_models() -> List[Dict[str, Any]]:
+    """List cached llama.cpp models with lightweight metadata."""
+    rows = _load_index()
+    items: List[Dict[str, Any]] = []
+    for row in rows:
+        items.append(
+            {
+                "backend": "llamacpp",
+                "model_id": str(row.get("repo_id", "")).strip(),
+                "revision": row.get("revision"),
+                "quant": row.get("quant"),
+                "size_bytes": int(row.get("size_bytes", 0) or 0),
+                "file_count": int(row.get("file_count", 0) or 0),
+                "source_volume": "llamacpp-cache",
+                "paths": list(row.get("paths", []) or []),
+            }
+        )
+
+    # Compatibility: detect legacy flat-cache GGUF files not indexed yet.
+    known_paths = {path for entry in items for path in entry.get("paths", [])}
+    for gguf in Path(cache_dir).glob("**/*.gguf"):
+        try:
+            gguf.relative_to(MODELS_ROOT)
+            continue
+        except ValueError:
+            pass
+        rel = str(gguf.relative_to(cache_dir))
+        if rel in known_paths:
+            continue
+        items.append(
+            {
+                "backend": "llamacpp",
+                "model_id": f"legacy:{gguf.stem}",
+                "revision": None,
+                "quant": None,
+                "size_bytes": int(gguf.stat().st_size),
+                "file_count": 1,
+                "source_volume": "llamacpp-cache",
+                "paths": [rel],
+            }
+        )
+    return items
 
 
 DEFAULT_SERVER_ARGS = [
@@ -139,9 +292,23 @@ DEFAULT_SERVER_ARGS = [
 ]
 
 
-def _resolve_model_entrypoint(quant: Optional[str]) -> Path:
-    """Pick a GGUF file, optionally filtered by quant, preferring the largest file."""
+def _resolve_model_entrypoint(
+    repo_id: Optional[str],
+    revision: Optional[str],
+    quant: Optional[str],
+) -> Path:
+    """Pick a GGUF file, preferring model-specific cache directories."""
     pattern = f"**/*{quant}*.gguf" if quant else "**/*.gguf"
+
+    # Primary: per-model multi-cache layout.
+    if repo_id:
+        scoped_dir = _model_dir(repo_id, revision)
+        scoped_candidates = list(scoped_dir.glob(pattern))
+        if scoped_candidates:
+            scoped_candidates.sort(key=lambda p: p.stat().st_size, reverse=True)
+            return scoped_candidates[0]
+
+    # Compatibility: legacy flat layout in cache root.
     candidates = list(Path(cache_dir).glob(pattern))
     if not candidates:
         if quant:
@@ -186,7 +353,7 @@ def serve():
     allow_patterns = [f"*{quant}*.gguf"] if quant else ["*.gguf"]
     download_model.remote(model_repo_id, allow_patterns, revision)
 
-    model_path = _resolve_model_entrypoint(quant)
+    model_path = _resolve_model_entrypoint(model_repo_id, revision, quant)
     print(f"🦙 using model file: {model_path}")
 
     # offload all layers to GPU if configured, or use explicit override

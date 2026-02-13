@@ -30,6 +30,7 @@ class MainMenuScreen(Screen):
         Binding("q", "quit", "Quit", show=True),
         Binding("d", "select_deploy", "Deploy", show=True),
         Binding("m", "select_manage", "Manage", show=True),
+        Binding("t", "select_storage", "Storage", show=True),
         Binding("s", "select_settings", "Settings", show=True),
     ]
 
@@ -56,6 +57,7 @@ class MainMenuScreen(Screen):
                 yield OptionList(
                     Option("  Deploy            Launch a new LLM backend", id="deploy"),
                     Option("  Manage            List, status, logs, stop", id="manage"),
+                    Option("  Storage           Cached models and pre-download", id="storage"),
                     Option("  Settings          Scaledown defaults", id="settings"),
                     id="action-list",
                 )
@@ -71,6 +73,8 @@ class MainMenuScreen(Screen):
             self.app.action_push_deploy()  # type: ignore[attr-defined]
         elif option_id == "manage":
             self.app.action_push_manage()  # type: ignore[attr-defined]
+        elif option_id == "storage":
+            self.app.action_push_storage()  # type: ignore[attr-defined]
         elif option_id == "settings":
             self.app.action_push_settings()  # type: ignore[attr-defined]
 
@@ -79,6 +83,9 @@ class MainMenuScreen(Screen):
 
     def action_select_manage(self) -> None:
         self.app.action_push_manage()  # type: ignore[attr-defined]
+
+    def action_select_storage(self) -> None:
+        self.app.action_push_storage()  # type: ignore[attr-defined]
 
     def action_select_settings(self) -> None:
         self.app.action_push_settings()  # type: ignore[attr-defined]

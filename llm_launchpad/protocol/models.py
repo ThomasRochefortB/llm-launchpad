@@ -79,3 +79,33 @@ class EndpointInfo:
     instance_name: Optional[str] = None
 
 
+@dataclass
+class StoredModelInfo:
+    """Single cached model entry in Modal storage."""
+
+    backend: BackendType
+    model_id: str
+    revision: Optional[str] = None
+    quant: Optional[str] = None
+    size_bytes: int = 0
+    file_count: int = 0
+    source_volume: str = ""
+    paths: list[str] | None = None
+
+
+@dataclass
+class StorageSnapshot:
+    """Cached model inventory grouped by backend."""
+
+    llamacpp_models: list[StoredModelInfo]
+    vllm_models: list[StoredModelInfo]
+
+    @property
+    def total_size_bytes(self) -> int:
+        return sum(row.size_bytes for row in self.llamacpp_models + self.vllm_models)
+
+    @property
+    def total_models(self) -> int:
+        return len(self.llamacpp_models) + len(self.vllm_models)
+
+

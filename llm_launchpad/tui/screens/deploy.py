@@ -102,6 +102,7 @@ class LlamaCppDeployScreen(Screen):
     BINDINGS = [
         Binding("escape", "pop_screen", "Back", show=True),
         Binding("ctrl+d", "do_deploy", "Deploy", show=True),
+        Binding("ctrl+s", "open_storage", "Storage", show=True),
     ]
 
     def compose(self) -> ComposeResult:
@@ -505,6 +506,9 @@ class LlamaCppDeployScreen(Screen):
     def action_pop_screen(self) -> None:
         self.app.pop_screen()
 
+    def action_open_storage(self) -> None:
+        self.app.action_push_storage(BackendType.LLAMACPP)  # type: ignore[attr-defined]
+
 
 class VllmDeployScreen(Screen):
     """vLLM deploy form."""
@@ -512,6 +516,7 @@ class VllmDeployScreen(Screen):
     BINDINGS = [
         Binding("escape", "pop_screen", "Back", show=True),
         Binding("ctrl+d", "do_deploy", "Deploy", show=True),
+        Binding("ctrl+s", "open_storage", "Storage", show=True),
     ]
 
     def compose(self) -> ComposeResult:
@@ -854,3 +859,6 @@ class VllmDeployScreen(Screen):
 
     def action_pop_screen(self) -> None:
         self.app.pop_screen()
+
+    def action_open_storage(self) -> None:
+        self.app.action_push_storage(BackendType.VLLM)  # type: ignore[attr-defined]

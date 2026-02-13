@@ -13,7 +13,7 @@ import re
 import subprocess
 import threading
 import time
-from typing import Generator, List, Optional, Union
+from typing import Any, Generator, List, Optional, Union
 
 from ..protocol.enums import BackendType, DeploymentState, OperationType
 from ..protocol.events import (
@@ -24,10 +24,12 @@ from ..protocol.events import (
     StateChangeEvent,
 )
 from ..protocol.models import DeploymentConfig, EndpointInfo, LaunchpadSettings
+from ..protocol.models import StoredModelInfo, StorageSnapshot
 
 from .backend import ModalBackend
 from .config import ConfigStore
 from .naming import legacy_app_name
+from .paths import MODAL_LLAMACPP_SCRIPT, MODAL_VLLM_SCRIPT
 
 # Type alias for event generators
 EventStream = Generator[BaseEvent, None, None]
@@ -37,6 +39,9 @@ _MODAL_GPU_WAIT_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _MODAL_RELAX_RE = re.compile(r"Relaxing requirements \((?P<requirements>[^)]+)\)", flags=re.IGNORECASE)
+_GGUF_QUANT_RE = re.compile(r"(Q\d(?:_[A-Z0-9]+)+|IQ\d+_[A-Z0-9_]+)", flags=re.IGNORECASE)
+_SIZE_TOKEN_RE = re.compile(r"^\s*(?P<num>\d+(?:\.\d+)?)\s*(?P<unit>[A-Za-z]+)?\s*$")
+_LEGACY_SHARD_RE = re.compile(r"[-_](?:\d{2,6})[-_]of[-_](?:\d{2,6})$", flags=re.IGNORECASE)
 
 
 def _modal_gpu_scheduling_hint(response_text: str) -> str | None:
@@ -608,6 +613,423 @@ class Orchestrator:
             yield OperationCompleteEvent(
                 operation=OperationType.LIST, success=False, exit_code=1
             )
+
+    # ------------------------------------------------------------------
+    # Storage
+    # ------------------------------------------------------------------
+
+    def list_storage(self) -> EventStream:
+        """List cached model artifacts for both backends."""
+        yield StateChangeEvent(
+            current=DeploymentState.RUNNING,
+            operation=OperationType.STORAGE_LIST,
+            detail="Scanning Modal volumes for cached models",
+        )
+        try:
+            snapshot = StorageSnapshot(
+                llamacpp_models=self._list_llamacpp_models(),
+                vllm_models=self._list_vllm_models(),
+            )
+        except Exception as exc:
+            yield ErrorEvent(
+                message=f"Failed to list storage: {exc}",
+                operation=OperationType.STORAGE_LIST,
+                recoverable=True,
+            )
+            yield OperationCompleteEvent(
+                operation=OperationType.STORAGE_LIST,
+                success=False,
+                exit_code=1,
+                detail=str(exc),
+            )
+            return
+
+        yield LogEvent(
+            line=(
+                f"Storage snapshot: llama.cpp={len(snapshot.llamacpp_models)} models, "
+                f"vLLM={len(snapshot.vllm_models)} models, "
+                f"total={snapshot.total_models}, bytes={snapshot.total_size_bytes}"
+            ),
+            operation=OperationType.STORAGE_LIST,
+        )
+        yield OperationCompleteEvent(
+            operation=OperationType.STORAGE_LIST,
+            success=True,
+            data=snapshot,
+        )
+
+    def predownload_model(
+        self,
+        backend: BackendType,
+        model_id: str,
+        quant: Optional[str] = None,
+        revision: Optional[str] = None,
+    ) -> EventStream:
+        """Pre-download a model for a backend without deploying."""
+        if backend == BackendType.LLAMACPP:
+            script = MODAL_LLAMACPP_SCRIPT
+            entrypoint = "predownload_model"
+            args = ["--repo-id", model_id]
+            if quant:
+                args.extend(["--quant", quant])
+            if revision:
+                args.extend(["--revision", revision])
+        else:
+            script = MODAL_VLLM_SCRIPT
+            entrypoint = "predownload_model"
+            args = ["--repo-id", model_id]
+            if revision:
+                args.extend(["--revision", revision])
+
+        cmd = ModalBackend.build_modal_entrypoint_command(script, entrypoint, args)
+        yield StateChangeEvent(
+            current=DeploymentState.RUNNING,
+            operation=OperationType.STORAGE_PREDOWNLOAD,
+            detail=" ".join(cmd),
+        )
+        yield LogEvent(
+            line=f"Running: {' '.join(cmd)}",
+            operation=OperationType.STORAGE_PREDOWNLOAD,
+        )
+
+        for event in ModalBackend.run_modal_script_entrypoint(script, entrypoint, args=args):
+            if isinstance(event, OperationCompleteEvent):
+                yield OperationCompleteEvent(
+                    operation=OperationType.STORAGE_PREDOWNLOAD,
+                    success=event.success,
+                    exit_code=event.exit_code,
+                    detail=event.detail,
+                    data=event.data,
+                )
+            elif isinstance(event, ErrorEvent):
+                yield ErrorEvent(
+                    message=event.message,
+                    operation=OperationType.STORAGE_PREDOWNLOAD,
+                    exit_code=event.exit_code,
+                    recoverable=event.recoverable,
+                )
+            elif isinstance(event, LogEvent):
+                yield LogEvent(
+                    line=event.line,
+                    stream=event.stream,
+                    operation=OperationType.STORAGE_PREDOWNLOAD,
+                )
+            else:
+                yield event
+
+    def delete_stored_model(self, model: StoredModelInfo) -> EventStream:
+        """Delete cached storage artifacts for a selected model."""
+        targets = self._storage_delete_targets(model)
+        if not targets:
+            yield ErrorEvent(
+                message=f"No removable paths found for {model.model_id}",
+                operation=OperationType.STORAGE_DELETE,
+                recoverable=True,
+            )
+            yield OperationCompleteEvent(
+                operation=OperationType.STORAGE_DELETE,
+                success=False,
+                exit_code=1,
+                detail="No paths resolved for deletion.",
+            )
+            return
+
+        yield StateChangeEvent(
+            current=DeploymentState.RUNNING,
+            operation=OperationType.STORAGE_DELETE,
+            detail=f"Deleting {model.model_id}",
+        )
+        for volume_name, remote_path, recursive in targets:
+            yield LogEvent(
+                line=f"Deleting {remote_path} from {volume_name}",
+                operation=OperationType.STORAGE_DELETE,
+            )
+            for event in ModalBackend.run_volume_remove(volume_name, remote_path, recursive=recursive):
+                if isinstance(event, OperationCompleteEvent):
+                    if not event.success:
+                        yield OperationCompleteEvent(
+                            operation=OperationType.STORAGE_DELETE,
+                            success=False,
+                            exit_code=event.exit_code,
+                            detail=event.detail or f"Failed removing {remote_path}",
+                        )
+                        return
+                    continue
+                if isinstance(event, ErrorEvent):
+                    yield ErrorEvent(
+                        message=event.message,
+                        operation=OperationType.STORAGE_DELETE,
+                        exit_code=event.exit_code,
+                        recoverable=event.recoverable,
+                    )
+                    yield OperationCompleteEvent(
+                        operation=OperationType.STORAGE_DELETE,
+                        success=False,
+                        exit_code=event.exit_code or 1,
+                        detail=event.message,
+                    )
+                    return
+                if isinstance(event, LogEvent):
+                    yield LogEvent(
+                        line=event.line,
+                        stream=event.stream,
+                        operation=OperationType.STORAGE_DELETE,
+                    )
+                else:
+                    yield event
+
+        yield OperationCompleteEvent(
+            operation=OperationType.STORAGE_DELETE,
+            success=True,
+            detail=f"Deleted storage for {model.model_id}",
+        )
+
+    def _list_llamacpp_models(self) -> list[StoredModelInfo]:
+        files = self._walk_volume_files("llamacpp-cache", "/models")
+        grouped: dict[tuple[str, Optional[str]], StoredModelInfo] = {}
+        for row in files:
+            path = str(row.get("path", "")).strip()
+            if not path.lower().endswith(".gguf"):
+                continue
+            size = int(row.get("size_bytes", 0) or 0)
+            rel = path.removeprefix("/models/").strip("/")
+            parts = rel.split("/")
+            if len(parts) < 3:
+                continue
+            model_id = parts[0].replace("__", "/")
+            revision = parts[1]
+            key = (model_id, None if revision == "main" else revision)
+            entry = grouped.get(key)
+            if entry is None:
+                entry = StoredModelInfo(
+                    backend=BackendType.LLAMACPP,
+                    model_id=model_id,
+                    revision=key[1],
+                    quant=None,
+                    size_bytes=0,
+                    file_count=0,
+                    source_volume="llamacpp-cache",
+                    paths=[],
+                )
+                grouped[key] = entry
+            entry.size_bytes += size
+            entry.file_count += 1
+            if entry.paths is not None:
+                entry.paths.append(path)
+            if entry.quant is None:
+                quant_match = _GGUF_QUANT_RE.search(path.upper())
+                if quant_match:
+                    entry.quant = quant_match.group(1).upper()
+
+        # Compatibility: legacy flat cache files.
+        legacy_files = self._walk_volume_files("llamacpp-cache", "/")
+        for row in legacy_files:
+            path = str(row.get("path", "")).strip()
+            if not path.lower().endswith(".gguf"):
+                continue
+            if path.startswith("/models/"):
+                continue
+            size = int(row.get("size_bytes", 0) or 0)
+            stem = path.split("/")[-1].rsplit(".", 1)[0]
+            stem = _LEGACY_SHARD_RE.sub("", stem)
+            model_id = f"legacy:{stem}"
+            key = (model_id, None)
+            entry = grouped.get(key)
+            if entry is None:
+                entry = StoredModelInfo(
+                    backend=BackendType.LLAMACPP,
+                    model_id=model_id,
+                    revision=None,
+                    quant=None,
+                    size_bytes=0,
+                    file_count=0,
+                    source_volume="llamacpp-cache",
+                    paths=[],
+                )
+                grouped[key] = entry
+            entry.size_bytes += size
+            entry.file_count += 1
+            if entry.paths is not None:
+                entry.paths.append(path)
+            if entry.quant is None:
+                quant_match = _GGUF_QUANT_RE.search(path.upper())
+                if quant_match:
+                    entry.quant = quant_match.group(1).upper()
+
+        return sorted(grouped.values(), key=lambda row: (row.model_id, row.revision or ""))
+
+    def _list_vllm_models(self) -> list[StoredModelInfo]:
+        files = self._walk_volume_files("huggingface-cache", "/hub")
+        grouped: dict[str, StoredModelInfo] = {}
+        for row in files:
+            path = str(row.get("path", "")).strip()
+            size = int(row.get("size_bytes", 0) or 0)
+            rel = path.removeprefix("/hub/").strip("/")
+            if not rel.startswith("models--"):
+                continue
+            parts = rel.split("/")
+            if not parts:
+                continue
+            model_dir = parts[0]
+            encoded = model_dir[len("models--") :]
+            model_id = encoded.replace("--", "/")
+            entry = grouped.get(model_id)
+            if entry is None:
+                entry = StoredModelInfo(
+                    backend=BackendType.VLLM,
+                    model_id=model_id,
+                    revision=None,
+                    quant=None,
+                    size_bytes=0,
+                    file_count=0,
+                    source_volume="huggingface-cache",
+                    paths=[],
+                )
+                grouped[model_id] = entry
+            if row.get("is_file", False):
+                entry.size_bytes += size
+                entry.file_count += 1
+            if entry.paths is not None and path not in entry.paths:
+                entry.paths.append(path)
+        return sorted(grouped.values(), key=lambda row: row.model_id)
+
+    def _walk_volume_files(self, volume_name: str, root: str) -> list[dict[str, Any]]:
+        pending = [root]
+        files: list[dict[str, Any]] = []
+        visited: set[str] = set()
+        while pending:
+            current = pending.pop()
+            if current in visited:
+                continue
+            visited.add(current)
+            rows = ModalBackend.list_volume(volume_name, current) or []
+            for row in rows:
+                path = self._volume_entry_path(current, row)
+                if not path:
+                    continue
+                is_dir = self._volume_entry_is_dir(row, path)
+                if is_dir:
+                    if path == current:
+                        continue
+                    pending.append(path)
+                else:
+                    files.append(
+                        {
+                            "path": path,
+                            "size_bytes": Orchestrator._parse_size_bytes(
+                                Orchestrator._entry_value(
+                                    row, "size", "size_bytes", "bytes", "filesize"
+                                )
+                            ),
+                            "is_file": True,
+                        }
+                    )
+        return files
+
+    def _storage_delete_targets(
+        self, model: StoredModelInfo
+    ) -> list[tuple[str, str, bool]]:
+        targets: list[tuple[str, str, bool]] = []
+        if model.backend == BackendType.LLAMACPP:
+            if model.model_id.startswith("legacy:"):
+                for path in sorted(set(model.paths or [])):
+                    targets.append((model.source_volume or "llamacpp-cache", path, False))
+            else:
+                revision = model.revision or "main"
+                repo_slug = model.model_id.replace("/", "__")
+                targets.append(
+                    (
+                        model.source_volume or "llamacpp-cache",
+                        f"/models/{repo_slug}/{revision}",
+                        True,
+                    )
+                )
+            return targets
+
+        if model.backend == BackendType.VLLM:
+            encoded = model.model_id.replace("/", "--")
+            targets.append(
+                (
+                    model.source_volume or "huggingface-cache",
+                    f"/hub/models--{encoded}",
+                    True,
+                )
+            )
+        return targets
+
+    @staticmethod
+    def _entry_value(row: dict[str, Any], *keys: str) -> Any:
+        """Case-insensitive lookup for JSON fields from Modal CLI."""
+        lowered = {str(key).strip().lower(): value for key, value in row.items()}
+        for key in keys:
+            needle = key.strip().lower()
+            if needle in lowered:
+                return lowered[needle]
+        return None
+
+    @staticmethod
+    def _volume_entry_path(parent: str, row: dict[str, Any]) -> str:
+        for key in ("path", "name", "file", "filename", "entry"):
+            value = Orchestrator._entry_value(row, key)
+            if isinstance(value, str) and value.strip():
+                candidate = value.strip()
+                if candidate.startswith("/"):
+                    return candidate
+                parent_clean = parent.strip("/")
+                if parent_clean and candidate.startswith(f"{parent_clean}/"):
+                    return f"/{candidate.lstrip('/')}"
+                if parent == "/" and candidate:
+                    return f"/{candidate.lstrip('/')}"
+                if parent.endswith("/"):
+                    return f"{parent}{candidate}"
+                return f"{parent}/{candidate}"
+        return ""
+
+    @staticmethod
+    def _volume_entry_is_dir(row: dict[str, Any], path: str) -> bool:
+        is_dir = Orchestrator._entry_value(row, "is_dir", "isdir", "directory")
+        if isinstance(is_dir, bool):
+            return is_dir
+        entry_type = str(Orchestrator._entry_value(row, "type", "kind") or "").strip().lower()
+        if entry_type in {"dir", "directory", "folder"}:
+            return True
+        size_hint = Orchestrator._entry_value(row, "size", "size_bytes", "bytes")
+        if size_hint in (None, "", 0, "0"):
+            # If no file-size signal is present, treat slash-terminated entries as directories.
+            if path.endswith("/"):
+                return True
+        return path.endswith("/")
+
+    @staticmethod
+    def _parse_size_bytes(value: Any) -> int:
+        if value is None:
+            return 0
+        if isinstance(value, (int, float)):
+            return int(value)
+        text = str(value).strip()
+        if not text:
+            return 0
+        clean = text.replace(",", "")
+        if clean.isdigit():
+            return int(clean)
+        match = _SIZE_TOKEN_RE.match(clean)
+        if not match:
+            return 0
+        number = float(match.group("num"))
+        unit = (match.group("unit") or "B").upper()
+        factors = {
+            "B": 1,
+            "KB": 1024,
+            "MB": 1024**2,
+            "GB": 1024**3,
+            "TB": 1024**4,
+            "KIB": 1024,
+            "MIB": 1024**2,
+            "GIB": 1024**3,
+            "TIB": 1024**4,
+        }
+        factor = factors.get(unit, 1)
+        return int(number * factor)
 
     # ------------------------------------------------------------------
     # Stop

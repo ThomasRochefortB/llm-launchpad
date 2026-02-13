@@ -206,6 +206,17 @@ class ModalBackend:
             args += ["--n_gpu_layers", str(config.n_gpu_layers)]
         return args
 
+    @staticmethod
+    def build_modal_entrypoint_command(
+        script: str,
+        entrypoint: str,
+        args: Optional[List[str]] = None,
+    ) -> List[str]:
+        cmd = ["modal", "run", f"{script}::{entrypoint}"]
+        if args:
+            cmd.extend(args)
+        return cmd
+
     # ------------------------------------------------------------------
     # Log follow helper
     # ------------------------------------------------------------------
@@ -271,6 +282,32 @@ class ModalBackend:
             pass
         return None
 
+    @staticmethod
+    def list_volume(volume_name: str, path: str = "/") -> Optional[List[Dict[str, Any]]]:
+        """List files/directories in a Modal Volume path."""
+        try:
+            result = subprocess.run(
+                ["modal", "volume", "ls", volume_name, path, "--json"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except Exception:
+            return None
+        if result.returncode != 0:
+            return None
+        try:
+            payload = json.loads(result.stdout or "[]")
+        except Exception:
+            return None
+        if isinstance(payload, list):
+            return [entry for entry in payload if isinstance(entry, dict)]
+        if isinstance(payload, dict):
+            nested = payload.get("entries") or payload.get("items") or []
+            if isinstance(nested, list):
+                return [entry for entry in nested if isinstance(entry, dict)]
+        return None
+
     # ------------------------------------------------------------------
     # Streaming subprocess execution
     # ------------------------------------------------------------------
@@ -312,6 +349,29 @@ class ModalBackend:
                 )
         finally:
             ModalBackend.unregister_proc(proc)
+
+    @staticmethod
+    def run_modal_script_entrypoint(
+        script: str,
+        entrypoint: str,
+        args: Optional[List[str]] = None,
+        env: Optional[Dict[str, str]] = None,
+    ) -> Generator[LogEvent | OperationCompleteEvent | ErrorEvent, None, None]:
+        """Run `modal run <script>::<entrypoint>` and stream output."""
+        cmd = ModalBackend.build_modal_entrypoint_command(script, entrypoint, args=args)
+        yield from ModalBackend.run_streaming(cmd, env=env)
+
+    @staticmethod
+    def run_volume_remove(
+        volume_name: str,
+        remote_path: str,
+        recursive: bool = True,
+    ) -> Generator[LogEvent | OperationCompleteEvent | ErrorEvent, None, None]:
+        """Delete a file/directory from a Modal Volume."""
+        cmd = ["modal", "volume", "rm", volume_name, remote_path]
+        if recursive:
+            cmd.append("--recursive")
+        yield from ModalBackend.run_streaming(cmd)
 
     @staticmethod
     def run_blocking(

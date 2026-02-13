@@ -1,5 +1,6 @@
 import json
 import os
+from pathlib import Path
 from typing import Any
 
 import aiohttp
@@ -20,6 +21,8 @@ app = modal.App(APP_NAME)
 
 MINUTES = 60
 VLLM_PORT = 8000
+HF_CACHE_DIR = "/root/.cache/huggingface"
+HF_HUB_DIR = Path(HF_CACHE_DIR) / "hub"
 
 
 def _read_str_env(name: str, default: str) -> str:
@@ -83,6 +86,74 @@ vllm_image = (
     )
     .env({"HF_XET_HIGH_PERFORMANCE": "1"})
 )
+
+
+@app.function(
+    image=vllm_image,
+    timeout=30 * MINUTES,
+    volumes={
+        "/root/.cache/huggingface": hf_cache_vol,
+        "/root/.cache/vllm": vllm_cache_vol,
+    },
+)
+def predownload_model(
+    repo_id: str,
+    revision: str | None = None,
+    allow_patterns: list[str] | None = None,
+) -> dict[str, Any]:
+    """Download model weights into the shared HF cache volume."""
+    from huggingface_hub import snapshot_download  # type: ignore
+
+    path = snapshot_download(
+        repo_id=repo_id,
+        revision=revision,
+        cache_dir=HF_CACHE_DIR,
+        allow_patterns=allow_patterns,
+    )
+    hf_cache_vol.commit()
+    return {"repo_id": repo_id, "revision": revision, "path": path}
+
+
+@app.function(
+    image=vllm_image,
+    timeout=10 * MINUTES,
+    volumes={
+        "/root/.cache/huggingface": hf_cache_vol,
+        "/root/.cache/vllm": vllm_cache_vol,
+    },
+)
+def list_downloaded_models() -> list[dict[str, Any]]:
+    """List model repos present in the huggingface-cache volume."""
+    if not HF_HUB_DIR.exists():
+        return []
+
+    items: list[dict[str, Any]] = []
+    for model_dir in sorted(HF_HUB_DIR.glob("models--*")):
+        if not model_dir.is_dir():
+            continue
+        encoded = model_dir.name[len("models--") :]
+        model_id = encoded.replace("--", "/")
+
+        file_count = 0
+        size_bytes = 0
+        for file_path in model_dir.glob("snapshots/**/*"):
+            if file_path.is_file():
+                file_count += 1
+                size_bytes += file_path.stat().st_size
+
+        items.append(
+            {
+                "backend": "vllm",
+                "model_id": model_id,
+                "revision": None,
+                "quant": None,
+                "size_bytes": size_bytes,
+                "file_count": file_count,
+                "source_volume": "huggingface-cache",
+                "paths": [str(model_dir.relative_to(HF_CACHE_DIR))],
+            }
+        )
+    return items
 
 
 @app.function(

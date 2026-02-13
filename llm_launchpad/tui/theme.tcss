@@ -125,6 +125,16 @@ OptionList > .option-list--option-hover-highlighted {
     text-style: bold;
 }
 
+DataTable {
+    background: $surface;
+    border: solid $primary-background;
+    height: 20;
+}
+
+DataTable:focus {
+    border: solid $primary;
+}
+
 SelectionList {
     background: $surface;
     height: auto;

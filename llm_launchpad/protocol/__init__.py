@@ -12,7 +12,13 @@ from .events import (
     OperationCompleteEvent,
     StateChangeEvent,
 )
-from .models import DeploymentConfig, EndpointInfo, LaunchpadSettings
+from .models import (
+    DeploymentConfig,
+    EndpointInfo,
+    LaunchpadSettings,
+    StoredModelInfo,
+    StorageSnapshot,
+)
 
 __all__ = [
     "BackendType",
@@ -26,4 +32,6 @@ __all__ = [
     "OperationCompleteEvent",
     "OperationType",
     "StateChangeEvent",
+    "StoredModelInfo",
+    "StorageSnapshot",
 ]

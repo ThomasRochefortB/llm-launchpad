@@ -4,10 +4,13 @@ import unittest
 
 from llm_launchpad.protocol.enums import DeploymentState, OperationType
 from llm_launchpad.protocol.events import ErrorEvent, LogEvent, OperationCompleteEvent, StateChangeEvent
+from llm_launchpad.protocol.models import StorageSnapshot
 from llm_launchpad.tui.workers import (
     LogMessage,
     OperationDone,
     OperationError,
+    StorageFailed,
+    StorageLoaded,
     StateChanged,
     _dispatch_event,
 )
@@ -75,6 +78,13 @@ class TuiWorkersDispatchTests(unittest.TestCase):
             pass
 
         _dispatch_event(_NoPoster(), LogEvent(line="ignored"))
+
+    def test_storage_messages_store_payload(self) -> None:
+        snapshot = StorageSnapshot(llamacpp_models=[], vllm_models=[])
+        loaded = StorageLoaded(snapshot=snapshot)
+        failed = StorageFailed(error="boom")
+        self.assertIs(loaded.snapshot, snapshot)
+        self.assertEqual(failed.error, "boom")
 
 
 if __name__ == "__main__":

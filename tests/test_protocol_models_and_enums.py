@@ -3,8 +3,8 @@ from __future__ import annotations
 import unittest
 
 from llm_launchpad.core.paths import MODAL_LLAMACPP_SCRIPT, MODAL_VLLM_SCRIPT
-from llm_launchpad.protocol.enums import BackendType, DeploymentState
-from llm_launchpad.protocol.models import LaunchpadSettings
+from llm_launchpad.protocol.enums import BackendType, DeploymentState, OperationType
+from llm_launchpad.protocol.models import LaunchpadSettings, StorageSnapshot, StoredModelInfo
 
 
 class LaunchpadSettingsTests(unittest.TestCase):
@@ -35,6 +35,32 @@ class ProtocolEnumsTests(unittest.TestCase):
         self.assertTrue(DeploymentState.ERROR.is_terminal)
         self.assertFalse(DeploymentState.DEPLOYING.is_terminal)
         self.assertFalse(DeploymentState.WARMING_UP.is_terminal)
+
+    def test_storage_operation_types_exist(self) -> None:
+        self.assertEqual(OperationType.STORAGE_LIST.value, "storage_list")
+        self.assertEqual(OperationType.STORAGE_PREDOWNLOAD.value, "storage_predownload")
+        self.assertEqual(OperationType.STORAGE_DELETE.value, "storage_delete")
+
+
+class StorageModelsTests(unittest.TestCase):
+    def test_storage_snapshot_totals(self) -> None:
+        llamacpp = StoredModelInfo(
+            backend=BackendType.LLAMACPP,
+            model_id="Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+            size_bytes=2_000,
+            file_count=2,
+            source_volume="llamacpp-cache",
+        )
+        vllm = StoredModelInfo(
+            backend=BackendType.VLLM,
+            model_id="Qwen/Qwen3-4B-Thinking-2507-FP8",
+            size_bytes=3_000,
+            file_count=5,
+            source_volume="huggingface-cache",
+        )
+        snapshot = StorageSnapshot(llamacpp_models=[llamacpp], vllm_models=[vllm])
+        self.assertEqual(snapshot.total_models, 2)
+        self.assertEqual(snapshot.total_size_bytes, 5_000)
 
 
 if __name__ == "__main__":

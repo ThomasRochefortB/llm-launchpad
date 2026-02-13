@@ -17,6 +17,7 @@ from ..protocol.events import (
     OperationCompleteEvent,
     StateChangeEvent,
 )
+from ..protocol.models import StorageSnapshot
 
 
 # -----------------------------------------------------------------------
@@ -129,6 +130,22 @@ class LlamaCppQuantsFailed(Message):
         super().__init__()
         self.repo_id = repo_id
         self.revision = revision
+        self.error = error
+
+
+class StorageLoaded(Message):
+    """Storage snapshot loaded successfully."""
+
+    def __init__(self, snapshot: StorageSnapshot) -> None:
+        super().__init__()
+        self.snapshot = snapshot
+
+
+class StorageFailed(Message):
+    """Storage listing failed."""
+
+    def __init__(self, error: str) -> None:
+        super().__init__()
         self.error = error
 
 

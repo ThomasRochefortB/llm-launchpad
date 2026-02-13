@@ -16,20 +16,24 @@ from ..core.hf_models import fetch_gguf_quantizations, list_llamacpp_candidates,
 from ..core.naming import build_app_name, legacy_app_name
 from ..core.orchestrator import Orchestrator
 from ..protocol.enums import BackendType
-from ..protocol.events import LogEvent
+from ..protocol.events import ErrorEvent, LogEvent, OperationCompleteEvent
 from ..protocol.models import EndpointInfo
 from ..protocol.models import DeploymentConfig
+from ..protocol.models import StorageSnapshot
 
 from .screens.main_menu import MainMenuScreen
 from .screens.deploy import BackendSelectScreen
 from .screens.manage import ManageScreen
 from .screens.monitor import MonitorScreen
+from .screens.storage import StorageScreen
 from .screens.settings import SettingsScreen
 from .workers import (
     LlamaCppModelsFailed,
     LlamaCppModelsLoaded,
     LlamaCppQuantsFailed,
     LlamaCppQuantsLoaded,
+    StorageFailed,
+    StorageLoaded,
     VllmModelsFailed,
     VllmModelsLoaded,
     _dispatch_event,
@@ -91,6 +95,9 @@ class WizardApp(App):
 
     def action_push_settings(self) -> None:
         self.push_screen(SettingsScreen())
+
+    def action_push_storage(self, backend: BackendType | None = None) -> None:
+        self.push_screen(StorageScreen(initial_backend=backend))
 
     # ------------------------------------------------------------------
     # Deploy
@@ -231,6 +238,95 @@ class WizardApp(App):
     def list_instances(self, backend: BackendType) -> list[EndpointInfo]:
         rows = ModalBackend.list_apps() or []
         return [row for row in rows if row.backend == backend]
+
+    # ------------------------------------------------------------------
+    # Storage: list
+    # ------------------------------------------------------------------
+
+    def begin_storage_refresh(self, receiver: object) -> None:
+        self.run_worker(
+            lambda: self._run_storage_refresh(receiver),
+            name="storage-refresh-worker",
+            thread=True,
+        )
+
+    def _run_storage_refresh(self, receiver: object) -> None:
+        poster = getattr(receiver, "post_message", None)
+        if poster is None:
+            return
+        result_snapshot: StorageSnapshot | None = None
+        for event in self._orchestrator.list_storage():
+            if isinstance(event, OperationCompleteEvent):
+                if event.success and isinstance(event.data, StorageSnapshot):
+                    result_snapshot = event.data
+                elif not event.success:
+                    poster(StorageFailed(error=event.detail or "Storage listing failed."))
+                    return
+            elif isinstance(event, ErrorEvent):
+                poster(StorageFailed(error=event.message))
+                return
+        if result_snapshot is not None:
+            poster(StorageLoaded(snapshot=result_snapshot))
+        else:
+            poster(StorageFailed(error="No storage data returned by backend."))
+
+    # ------------------------------------------------------------------
+    # Storage: predownload
+    # ------------------------------------------------------------------
+
+    def begin_storage_predownload(
+        self,
+        backend: BackendType,
+        model_id: str,
+        quant: str | None = None,
+        revision: str | None = None,
+    ) -> None:
+        monitor = MonitorScreen(title="Pre-download")
+        self.push_screen(monitor)
+        self.run_worker(
+            lambda: self._run_storage_predownload(
+                backend=backend,
+                model_id=model_id,
+                quant=quant,
+                revision=revision,
+                monitor=monitor,
+            ),
+            name="storage-predownload-worker",
+            thread=True,
+        )
+
+    def _run_storage_predownload(
+        self,
+        backend: BackendType,
+        model_id: str,
+        quant: str | None,
+        revision: str | None,
+        monitor: MonitorScreen,
+    ):  # type: ignore[return]
+        for event in self._orchestrator.predownload_model(
+            backend=backend,
+            model_id=model_id,
+            quant=quant,
+            revision=revision,
+        ):
+            _dispatch_event(monitor, event)
+
+    def begin_storage_delete(self, model: StoredModelInfo) -> None:
+        monitor = MonitorScreen(title="Delete model")
+        self.push_screen(monitor)
+        self.run_worker(
+            lambda: self._run_storage_delete(model=model, monitor=monitor),
+            name="storage-delete-worker",
+            thread=True,
+        )
+
+    def _run_storage_delete(
+        self,
+        model: StoredModelInfo,
+        monitor: MonitorScreen,
+    ):  # type: ignore[return]
+        for event in self._orchestrator.delete_stored_model(model):
+            _dispatch_event(monitor, event)
 
     # ------------------------------------------------------------------
     # vLLM model discovery
