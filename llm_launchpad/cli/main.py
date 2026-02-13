@@ -196,6 +196,10 @@ def deploy(
     served_model_name: Optional[str] = typer.Option(None, help="vLLM SERVED_MODEL_NAME"),
     fast_boot: Optional[bool] = typer.Option(None, help="vLLM FAST_BOOT"),
     n_gpu: Optional[int] = typer.Option(None, help="vLLM N_GPU"),
+    trust_remote_code: Optional[bool] = typer.Option(
+        None,
+        help="vLLM TRUST_REMOTE_CODE (allow model custom code from Hugging Face)",
+    ),
     reasoning_parser: Optional[str] = typer.Option(
         None,
         help="vLLM reasoning parser (e.g. qwen3, deepseek_r1, granite)",
@@ -235,6 +239,7 @@ def deploy(
         served_model_name=served_model_name,
         fast_boot=fast_boot,
         n_gpu=n_gpu,
+        trust_remote_code=trust_remote_code,
         reasoning_parser=reasoning_parser,
         default_chat_template_kwargs=default_chat_template_kwargs,
         instance_name=resolved_instance,
@@ -369,6 +374,10 @@ def switch(
     served_model_name: Optional[str] = typer.Option(None, help="vLLM SERVED_MODEL_NAME"),
     fast_boot: Optional[bool] = typer.Option(None, help="vLLM FAST_BOOT"),
     n_gpu: Optional[int] = typer.Option(None, help="vLLM N_GPU"),
+    trust_remote_code: Optional[bool] = typer.Option(
+        None,
+        help="vLLM TRUST_REMOTE_CODE (allow model custom code from Hugging Face)",
+    ),
     reasoning_parser: Optional[str] = typer.Option(
         None,
         help="vLLM reasoning parser (e.g. qwen3, deepseek_r1, granite)",
@@ -411,6 +420,7 @@ def switch(
         served_model_name=served_model_name,
         fast_boot=fast_boot,
         n_gpu=n_gpu,
+        trust_remote_code=trust_remote_code,
         reasoning_parser=reasoning_parser,
         default_chat_template_kwargs=default_chat_template_kwargs,
     )

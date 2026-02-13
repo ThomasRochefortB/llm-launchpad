@@ -35,6 +35,22 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             title = screen.query_one("#monitor-title", Static)
             self.assertIn("cmd+c/ctrl+c/c to copy  ctrl+l clear", str(title.content))
 
+    async def test_log_lines_strip_ansi_escape_sequences(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(MonitorScreen(title="Logs"))
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, MonitorScreen)
+            screen.on_log_message(LogMessage("\x1b[0;36m(APIServer pid=4)\x1b[0;0m INFO booted"))
+            await pilot.pause()
+
+            content = "\n".join(screen.log_viewer.log_widget.lines)
+            self.assertIn("(APIServer pid=4) INFO booted", content)
+            self.assertNotIn("\x1b[0;36m", content)
+            self.assertNotIn("\x1b[0;0m", content)
+
     async def test_clear_action_empties_log(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:

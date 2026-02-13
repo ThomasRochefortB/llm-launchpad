@@ -111,6 +111,30 @@ class CliMainCommandTests(unittest.TestCase):
                 result = self.runner.invoke(cli_main.app, ["deploy", "--backend", "vllm"])
         self.assertEqual(result.exit_code, 9)
 
+    def test_deploy_vllm_maps_trust_remote_code_flag(self) -> None:
+        captured = {}
+
+        def _deploy(config):  # type: ignore[no-untyped-def]
+            captured["config"] = config
+            return [OperationCompleteEvent(operation=OperationType.DEPLOY, success=True, exit_code=0)]
+
+        orch = SimpleNamespace(deploy=_deploy)
+        with patch("llm_launchpad.cli.main._preflight", return_value=(orch, "alice")):
+            with patch("llm_launchpad.cli.main._print_banner", return_value=None):
+                result = self.runner.invoke(
+                    cli_main.app,
+                    [
+                        "deploy",
+                        "--backend",
+                        "vllm",
+                        "--model-name",
+                        "MiniMaxAI/MiniMax-M2.5",
+                        "--trust-remote-code",
+                    ],
+                )
+        self.assertEqual(result.exit_code, 0)
+        self.assertTrue(captured["config"].trust_remote_code)
+
     def test_status_failure_returns_exit_code_1(self) -> None:
         orch = SimpleNamespace(
             check_status=lambda *_args, **_kwargs: [

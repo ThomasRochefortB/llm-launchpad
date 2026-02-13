@@ -86,9 +86,11 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             screen = app.screen
             assert isinstance(screen, VllmDeployScreen)
             self.assertFalse(screen.query_one("#fast-boot", Switch).value)
+            self.assertFalse(screen.query_one("#trust-remote-code", Switch).value)
             screen._do_deploy()
             self.assertIsNotNone(app.deployed_config)
             self.assertFalse(app.deployed_config.fast_boot)
+            self.assertFalse(app.deployed_config.trust_remote_code)
 
     async def test_smoke_only_defaults_to_deploy(self) -> None:
         app = _TestApp()
@@ -191,6 +193,7 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             screen.query_one("#reasoning-parser", Input).value = "qwen3"
             screen.query_one("#chat-template-kwargs", Input).value = '{"enable_thinking": false}'
             screen.query_one("#fast-boot", Switch).value = True
+            screen.query_one("#trust-remote-code", Switch).value = True
             # Expand advanced fields
             for w in screen.query(".vllm-advanced"):
                 w.remove_class("hidden")
@@ -198,6 +201,7 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             screen._do_deploy()
             self.assertIsNotNone(app.deployed_config)
             self.assertTrue(app.deployed_config.fast_boot)
+            self.assertTrue(app.deployed_config.trust_remote_code)
             self.assertEqual(app.deployed_config.reasoning_parser, "qwen3")
             self.assertEqual(
                 app.deployed_config.default_chat_template_kwargs,

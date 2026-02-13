@@ -402,6 +402,12 @@ class VllmDeployScreen(Screen):
                 classes="vllm-advanced",
             )
             yield ToggleField("Enforce eager startup", "fast-boot", default=False, classes="vllm-advanced")
+            yield ToggleField(
+                "Trust remote model code",
+                "trust-remote-code",
+                default=False,
+                classes="vllm-advanced",
+            )
             yield FormField(
                 "Served model alias",
                 "served-model-name",
@@ -624,6 +630,7 @@ class VllmDeployScreen(Screen):
         alias = self.query_one("#served-model-name", Input).value.strip()
         config.served_model_name = alias or default_served_model_name(config.model_name)
         config.fast_boot = self.query_one("#fast-boot", Switch).value
+        config.trust_remote_code = self.query_one("#trust-remote-code", Switch).value
         n_gpu_str = self.query_one("#n-gpu", Input).value.strip()
         try:
             config.n_gpu = int(n_gpu_str) if n_gpu_str else 1

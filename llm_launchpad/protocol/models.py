@@ -54,6 +54,7 @@ class DeploymentConfig:
     served_model_name: Optional[str] = None
     fast_boot: Optional[bool] = None
     n_gpu: Optional[int] = None
+    trust_remote_code: Optional[bool] = None
     reasoning_parser: Optional[str] = None
     default_chat_template_kwargs: Optional[str] = None
 

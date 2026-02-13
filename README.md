@@ -244,6 +244,7 @@ In `llm-launchpad wizard`, these are set from deployment form fields (per deploy
 - `MODEL_REVISION` (default pinned revision in `llm_launchpad/backends/modal_vllm_app.py`)
 - `SERVED_MODEL_NAME` (default: model id suffix, e.g. `Qwen3-4B-Thinking-2507-FP8`)
 - `FAST_BOOT` (`true`/`false`, default: `false`)
+- `TRUST_REMOTE_CODE` (`true`/`false`, default: `false`; required for some HF repos with custom modeling code)
 - `REASONING_PARSER` (optional, e.g. `qwen3`, `deepseek_r1`, `granite`)
 - `DEFAULT_CHAT_TEMPLATE_KWARGS` (optional JSON object passed to `--default-chat-template-kwargs`)
 - `VLLM_PORT` (default: `8000`)

@@ -12,12 +12,14 @@ class BackendEnvTests(unittest.TestCase):
         config = DeploymentConfig(
             backend=BackendType.VLLM,
             model_name="Qwen/Qwen3-8B",
+            trust_remote_code=True,
             reasoning_parser="qwen3",
             default_chat_template_kwargs='{"enable_thinking": false}',
         )
 
         env = ModalBackend.env_for_backend(config)
         self.assertEqual(env["MODEL_NAME"], "Qwen/Qwen3-8B")
+        self.assertEqual(env["TRUST_REMOTE_CODE"], "true")
         self.assertEqual(env["REASONING_PARSER"], "qwen3")
         self.assertEqual(env["DEFAULT_CHAT_TEMPLATE_KWARGS"], '{"enable_thinking": false}')
 
@@ -25,11 +27,13 @@ class BackendEnvTests(unittest.TestCase):
         config = DeploymentConfig(
             backend=BackendType.VLLM,
             model_name="Qwen/Qwen3-8B",
+            trust_remote_code=None,
             reasoning_parser=None,
             default_chat_template_kwargs="",
         )
 
         env = ModalBackend.env_for_backend(config)
+        self.assertNotIn("TRUST_REMOTE_CODE", env)
         self.assertNotIn("REASONING_PARSER", env)
         self.assertNotIn("DEFAULT_CHAT_TEMPLATE_KWARGS", env)
 

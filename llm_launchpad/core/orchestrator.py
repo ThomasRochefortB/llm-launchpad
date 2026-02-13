@@ -7,7 +7,11 @@ CLI both consume these generators.
 
 from __future__ import annotations
 
+import os
+import queue
+import re
 import subprocess
+import threading
 import time
 from typing import Generator, List, Optional, Union
 
@@ -27,6 +31,40 @@ from .naming import legacy_app_name
 
 # Type alias for event generators
 EventStream = Generator[BaseEvent, None, None]
+
+_MODAL_GPU_WAIT_RE = re.compile(
+    r"waiting to be scheduled on a (?P<worker>[A-Za-z0-9_:\-]+) worker",
+    flags=re.IGNORECASE,
+)
+_MODAL_RELAX_RE = re.compile(r"Relaxing requirements \((?P<requirements>[^)]+)\)", flags=re.IGNORECASE)
+
+
+def _modal_gpu_scheduling_hint(response_text: str) -> str | None:
+    """Extract a concise queueing status from Modal's scheduling message."""
+    text = (response_text or "").strip()
+    if not text:
+        return None
+    if "waiting to be scheduled" not in text.lower():
+        return None
+
+    worker = ""
+    requirements = ""
+    worker_match = _MODAL_GPU_WAIT_RE.search(text)
+    if worker_match:
+        worker = worker_match.group("worker").strip()
+    requirements_match = _MODAL_RELAX_RE.search(text)
+    if requirements_match:
+        requirements = requirements_match.group("requirements").strip()
+
+    parts: list[str] = []
+    if worker:
+        parts.append(worker)
+    if requirements:
+        parts.append(requirements)
+
+    if not parts:
+        return "Waiting for GPU scheduling"
+    return f"Waiting for GPU scheduling ({', '.join(parts)})"
 
 
 class Orchestrator:
@@ -136,21 +174,55 @@ class Orchestrator:
         probe_url = server_url.rstrip("/") + ("/health" if is_vllm else "/v1/completions")
         yield LogEvent(line=f"Probing readiness at: {probe_url}")
 
-        # Start log tailing in background
+        # Start log tailing in background.
+        # We use a dedicated reader thread + queue.Queue so that every
+        # line the subprocess emits is captured immediately, regardless
+        # of Python's internal TextIOWrapper read-ahead buffering.
+        # (select() only checks the kernel pipe buffer, but readline()
+        # can consume up to 2 KB into an internal buffer in a single
+        # call — a mismatch that causes lines to be "stuck" until the
+        # next kernel-buffer read.)
+        target_app_name = app_name or legacy_app_name(backend)
         logs_proc: Optional[subprocess.Popen[str]] = None
+        log_queue: Optional[queue.Queue[Optional[str]]] = None
+        logs_retry_at = 0.0
+
+        def _start_logs_tail() -> subprocess.Popen[str]:
+            nonlocal log_queue
+            follow = ModalBackend.logs_follow_args()
+            # PYTHONUNBUFFERED forces the modal CLI (a Python program) to
+            # flush each write immediately when stdout is a pipe.
+            unbuf_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+            proc = subprocess.Popen(
+                ["modal", "app", "logs", *follow, target_app_name],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                env=unbuf_env,
+            )
+            q: queue.Queue[Optional[str]] = queue.Queue()
+            log_queue = q
+
+            def _reader() -> None:
+                try:
+                    assert proc.stdout is not None
+                    for raw_line in proc.stdout:
+                        q.put(raw_line.rstrip("\n"))
+                except Exception:
+                    pass
+                finally:
+                    q.put(None)  # sentinel: reader finished
+
+            threading.Thread(target=_reader, daemon=True).start()
+            return proc
+
         if tail_logs:
             try:
-                follow = ModalBackend.logs_follow_args()
-                target_app_name = app_name or legacy_app_name(backend)
-                logs_proc = subprocess.Popen(
-                    ["modal", "app", "logs", *follow, target_app_name],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                )
+                logs_proc = _start_logs_tail()
             except Exception as exc:
                 yield LogEvent(line=f"Warning: failed to start log tailing: {exc}")
+                logs_retry_at = time.time() + 5.0
 
         try:
             import requests  # type: ignore
@@ -168,20 +240,61 @@ class Orchestrator:
         backoff = 2.0
         max_backoff = 30.0
         last_err: Optional[str] = None
+        last_scheduling_hint: Optional[str] = None
+        # Track displayed log lines so the historical-fetch fallback can
+        # avoid duplicating output already shown by the live stream.
+        seen_log_lines: set[str] = set()
+
+        def _drain_queue() -> Generator[LogEvent, None, None]:
+            """Yield log events from the reader-thread queue (non-blocking)."""
+            nonlocal logs_proc, log_queue, logs_retry_at
+            if log_queue is None:
+                return
+            while True:
+                try:
+                    line = log_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if line is None:
+                    # Reader thread finished — subprocess exited.
+                    logs_proc = None
+                    log_queue = None
+                    logs_retry_at = time.time() + 5.0
+                    break
+                seen_log_lines.add(line)
+                yield LogEvent(line=line, operation=OperationType.WARMUP)
 
         while True:
-            # Drain any log lines from the background process
-            if logs_proc and logs_proc.stdout:
-                import select
+            # Exit promptly if the app is shutting down.
+            if ModalBackend.is_shutting_down():
+                if logs_proc:
+                    try:
+                        logs_proc.terminate()
+                    except Exception:
+                        pass
+                return
 
-                while True:
-                    ready, _, _ = select.select([logs_proc.stdout], [], [], 0)
-                    if not ready:
-                        break
-                    raw_line = logs_proc.stdout.readline()
-                    if not raw_line:
-                        break
-                    yield LogEvent(line=raw_line.rstrip("\n"), operation=OperationType.WARMUP)
+            if tail_logs and logs_proc is None and time.time() >= logs_retry_at:
+                # ── Historical-fetch fallback ──
+                # The live stream (`modal app logs`) may not deliver the
+                # final output of a crashing container before the stream
+                # closes.  The Modal dashboard shows those logs because it
+                # reads *persisted* logs.  Re-running `modal app logs`
+                # after a short delay retrieves the same persisted data,
+                # letting us display crash tracebacks the live stream
+                # missed.
+                yield from self._fetch_historical_logs(
+                    target_app_name, seen_log_lines
+                )
+                # Re-attach live stream for further output.
+                try:
+                    logs_proc = _start_logs_tail()
+                except Exception as exc:
+                    yield LogEvent(line=f"Warning: failed to start log tailing: {exc}")
+                    logs_retry_at = time.time() + 5.0
+
+            # Drain log lines delivered by the reader thread.
+            yield from _drain_queue()
 
             elapsed = time.time() - start
             if elapsed > timeout:
@@ -228,12 +341,94 @@ class Orchestrator:
                         operation=OperationType.WARMUP, success=True, data={"url": server_url}
                     )
                     return
-                last_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                body = resp.text or ""
+                last_err = f"HTTP {resp.status_code}: {body[:200]}"
+                scheduling_hint = _modal_gpu_scheduling_hint(body)
+                if scheduling_hint:
+                    if scheduling_hint != last_scheduling_hint:
+                        yield StateChangeEvent(
+                            current=DeploymentState.QUEUED,
+                            operation=OperationType.WARMUP,
+                            detail=scheduling_hint,
+                        )
+                        yield LogEvent(line=scheduling_hint, operation=OperationType.WARMUP)
+                        last_scheduling_hint = scheduling_hint
+                elif last_scheduling_hint is not None:
+                    yield StateChangeEvent(
+                        current=DeploymentState.WARMING_UP,
+                        operation=OperationType.WARMUP,
+                        detail="GPU allocated; continuing readiness probe",
+                    )
+                    yield LogEvent(
+                        line="GPU allocated; continuing readiness probe.",
+                        operation=OperationType.WARMUP,
+                    )
+                    last_scheduling_hint = None
             except Exception as exc:
                 last_err = str(exc)
 
-            time.sleep(backoff)
+            # Sleep in small increments, draining the log queue between
+            # each chunk so that lines appear in the TUI promptly.
+            sleep_end = time.time() + backoff
+            while time.time() < sleep_end:
+                if ModalBackend.is_shutting_down():
+                    break
+                chunk = min(0.5, sleep_end - time.time())
+                if chunk > 0:
+                    ModalBackend._shutdown_event.wait(timeout=chunk)
+                yield from _drain_queue()
             backoff = min(max_backoff, backoff * 1.5)
+
+    # ------------------------------------------------------------------
+    # Historical log fetch (fallback for crash output)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _fetch_historical_logs(
+        app_name: str,
+        seen: set[str],
+    ) -> EventStream:
+        """Re-run ``modal app logs`` to capture persisted crash output.
+
+        The live log stream may not deliver the tail end of a crashing
+        container's output.  Modal persists those logs server-side and
+        the dashboard reads them.  By re-running the CLI command after a
+        short delay we retrieve the same data, then yield only the lines
+        the live stream missed (tracked via *seen*).
+        """
+        try:
+            unbuf_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+            hist = subprocess.run(
+                ["modal", "app", "logs", app_name],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                env=unbuf_env,
+            )
+            hist_output = hist.stdout or ""
+        except subprocess.TimeoutExpired as te:
+            # Use whatever output was captured before the timeout.
+            hist_output = te.stdout if isinstance(te.stdout, str) else ""
+        except Exception:
+            hist_output = ""
+
+        if not hist_output:
+            return
+
+        new_lines: list[str] = []
+        for raw_line in hist_output.splitlines():
+            line = raw_line.rstrip()
+            if line and line not in seen:
+                new_lines.append(line)
+                seen.add(line)
+
+        if new_lines:
+            yield LogEvent(
+                line="── Fetched historical container logs ──",
+                operation=OperationType.WARMUP,
+            )
+            for line in new_lines:
+                yield LogEvent(line=line, operation=OperationType.WARMUP)
 
     # ------------------------------------------------------------------
     # Logs
@@ -296,8 +491,12 @@ class Orchestrator:
         backoff = 2.0
         max_backoff = 15.0
         last_err: Optional[str] = None
+        last_scheduling_hint: Optional[str] = None
 
         while True:
+            if ModalBackend.is_shutting_down():
+                return
+
             if time.time() - start > timeout:
                 yield ErrorEvent(
                     message=f"Unhealthy (timed out). Last: {last_err}",
@@ -328,11 +527,35 @@ class Orchestrator:
                         operation=OperationType.STATUS, success=True
                     )
                     return
-                last_err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+                body = resp.text or ""
+                last_err = f"HTTP {resp.status_code}: {body[:200]}"
+                scheduling_hint = _modal_gpu_scheduling_hint(body)
+                if scheduling_hint:
+                    if scheduling_hint != last_scheduling_hint:
+                        yield StateChangeEvent(
+                            current=DeploymentState.QUEUED,
+                            operation=OperationType.STATUS,
+                            detail=scheduling_hint,
+                        )
+                        yield LogEvent(line=scheduling_hint, operation=OperationType.STATUS)
+                        last_scheduling_hint = scheduling_hint
+                elif last_scheduling_hint is not None:
+                    yield StateChangeEvent(
+                        current=DeploymentState.RUNNING,
+                        operation=OperationType.STATUS,
+                        detail="GPU allocated; continuing health check",
+                    )
+                    yield LogEvent(
+                        line="GPU allocated; continuing health check.",
+                        operation=OperationType.STATUS,
+                    )
+                    last_scheduling_hint = None
             except Exception as exc:
                 last_err = str(exc)
 
-            time.sleep(backoff)
+            # Interruptible sleep: wakes immediately on shutdown.
+            if ModalBackend._shutdown_event.wait(timeout=backoff):
+                return
             backoff = min(max_backoff, backoff * 1.5)
 
     # ------------------------------------------------------------------

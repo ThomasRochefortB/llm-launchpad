@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import threading
 from typing import Any, Dict, Generator, List, Optional
 
 from ..protocol.enums import BackendType
@@ -17,6 +18,48 @@ from .naming import infer_backend_from_app_name, infer_instance_from_app_name, l
 
 class ModalBackend:
     """Wrapper around Modal CLI subprocess calls."""
+
+    # ------------------------------------------------------------------
+    # Subprocess lifecycle tracking
+    # ------------------------------------------------------------------
+
+    _active_procs: set[subprocess.Popen] = set()
+    _active_procs_lock = threading.Lock()
+    _shutdown_event = threading.Event()
+
+    @classmethod
+    def register_proc(cls, proc: subprocess.Popen) -> None:
+        """Track a subprocess so it can be terminated on shutdown."""
+        with cls._active_procs_lock:
+            cls._active_procs.add(proc)
+
+    @classmethod
+    def unregister_proc(cls, proc: subprocess.Popen) -> None:
+        """Remove a subprocess from tracking."""
+        with cls._active_procs_lock:
+            cls._active_procs.discard(proc)
+
+    @classmethod
+    def terminate_all(cls) -> None:
+        """Signal shutdown and terminate all tracked subprocesses.
+
+        Called on app exit to unblock any worker threads that are waiting
+        on subprocess I/O so Python can shut down cleanly.
+        """
+        cls._shutdown_event.set()
+        with cls._active_procs_lock:
+            procs = list(cls._active_procs)
+            cls._active_procs.clear()
+        for proc in procs:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+    @classmethod
+    def is_shutting_down(cls) -> bool:
+        """Return True if a shutdown has been requested."""
+        return cls._shutdown_event.is_set()
 
     # ------------------------------------------------------------------
     # Pre-flight checks
@@ -103,6 +146,8 @@ class ModalBackend:
             env["FAST_BOOT"] = "true" if config.fast_boot else "false"
         if config.n_gpu is not None and config.n_gpu > 0:
             env["N_GPU"] = str(config.n_gpu)
+        if config.trust_remote_code is not None:
+            env["TRUST_REMOTE_CODE"] = "true" if config.trust_remote_code else "false"
         if config.reasoning_parser:
             env["REASONING_PARSER"] = config.reasoning_parser
         if config.default_chat_template_kwargs:
@@ -250,19 +295,23 @@ class ModalBackend:
             yield ErrorEvent(message=str(exc), exit_code=1, recoverable=False)
             return
 
-        assert proc.stdout is not None
-        for raw_line in proc.stdout:
-            yield LogEvent(line=raw_line.rstrip("\n"))
+        ModalBackend.register_proc(proc)
+        try:
+            assert proc.stdout is not None
+            for raw_line in proc.stdout:
+                yield LogEvent(line=raw_line.rstrip("\n"))
 
-        proc.wait()
-        if proc.returncode == 0:
-            yield OperationCompleteEvent(success=True, exit_code=0)
-        else:
-            yield OperationCompleteEvent(
-                success=False,
-                exit_code=proc.returncode,
-                detail=f"Process exited with code {proc.returncode}",
-            )
+            proc.wait()
+            if proc.returncode == 0:
+                yield OperationCompleteEvent(success=True, exit_code=0)
+            else:
+                yield OperationCompleteEvent(
+                    success=False,
+                    exit_code=proc.returncode,
+                    detail=f"Process exited with code {proc.returncode}",
+                )
+        finally:
+            ModalBackend.unregister_proc(proc)
 
     @staticmethod
     def run_blocking(

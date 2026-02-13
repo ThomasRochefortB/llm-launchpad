@@ -51,6 +51,7 @@ DEPLOY_MODEL_NAME = _read_str_env("MODEL_NAME", "Qwen/Qwen3-4B-Thinking-2507-FP8
 DEPLOY_MODEL_REVISION = os.environ.get("MODEL_REVISION", "").strip() or None
 DEPLOY_SERVED_MODEL_NAME = _read_str_env("SERVED_MODEL_NAME", default_served_model_name(DEPLOY_MODEL_NAME))
 DEPLOY_FAST_BOOT = _read_bool_env("FAST_BOOT", False)
+DEPLOY_TRUST_REMOTE_CODE = _read_bool_env("TRUST_REMOTE_CODE", False)
 DEPLOY_REASONING_PARSER = os.environ.get("REASONING_PARSER", "").strip() or None
 DEPLOY_DEFAULT_CHAT_TEMPLATE_KWARGS = os.environ.get("DEFAULT_CHAT_TEMPLATE_KWARGS", "").strip() or None
 
@@ -59,6 +60,7 @@ RUNTIME_ENV = {
     "SERVED_MODEL_NAME": DEPLOY_SERVED_MODEL_NAME,
     "FAST_BOOT": "true" if DEPLOY_FAST_BOOT else "false",
     "N_GPU": str(DEPLOY_N_GPU),
+    "TRUST_REMOTE_CODE": "true" if DEPLOY_TRUST_REMOTE_CODE else "false",
 }
 if DEPLOY_MODEL_REVISION:
     RUNTIME_ENV["MODEL_REVISION"] = DEPLOY_MODEL_REVISION
@@ -105,6 +107,7 @@ def serve() -> None:
     served_model_name = os.environ.get("SERVED_MODEL_NAME", DEPLOY_SERVED_MODEL_NAME).strip() or DEPLOY_SERVED_MODEL_NAME
     fast_boot = _read_bool_env("FAST_BOOT", DEPLOY_FAST_BOOT)
     n_gpu = _read_int_env("N_GPU", DEPLOY_N_GPU)
+    trust_remote_code = _read_bool_env("TRUST_REMOTE_CODE", DEPLOY_TRUST_REMOTE_CODE)
     reasoning_parser = os.environ.get("REASONING_PARSER", "").strip() or DEPLOY_REASONING_PARSER
     default_chat_template_kwargs = (
         os.environ.get("DEFAULT_CHAT_TEMPLATE_KWARGS", "").strip() or DEPLOY_DEFAULT_CHAT_TEMPLATE_KWARGS
@@ -131,6 +134,8 @@ def serve() -> None:
         cmd += ["--reasoning-parser", reasoning_parser]
     if default_chat_template_kwargs:
         cmd += ["--default-chat-template-kwargs", default_chat_template_kwargs]
+    if trust_remote_code:
+        cmd += ["--trust-remote-code"]
     cmd += ["--enforce-eager" if fast_boot else "--no-enforce-eager"]
 
     print("Starting vLLM command:")

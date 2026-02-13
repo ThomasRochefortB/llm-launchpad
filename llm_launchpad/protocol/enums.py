@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from enum import Enum
 
-from ..core.paths import MODAL_LLAMACPP_SCRIPT, MODAL_VLLM_SCRIPT
-
 
 class BackendType(str, Enum):
     """Supported serving backends."""
@@ -22,6 +20,8 @@ class BackendType(str, Enum):
 
     @property
     def script(self) -> str:
+        from ..core.paths import MODAL_LLAMACPP_SCRIPT, MODAL_VLLM_SCRIPT
+
         return {
             BackendType.LLAMACPP: MODAL_LLAMACPP_SCRIPT,
             BackendType.VLLM: MODAL_VLLM_SCRIPT,

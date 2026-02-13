@@ -6,6 +6,7 @@ operation (deploy, warmup, logs, status, stop).
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 
@@ -20,6 +21,12 @@ from textual.widgets import Footer, Static
 from ..widgets.log_viewer import LogViewer
 from ..widgets.status_header import StatusHeader
 from ..workers import LogMessage, OperationDone, OperationError, StateChanged
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_ESCAPE_RE.sub("", text or "")
 
 
 class MonitorScreen(Screen):
@@ -69,7 +76,7 @@ class MonitorScreen(Screen):
 
     def on_log_message(self, message: LogMessage) -> None:
         prefix = "stderr | " if message.stream == "stderr" else ""
-        self.log_viewer.write_line(f"{prefix}{message.line}")
+        self.log_viewer.write_line(f"{prefix}{_strip_ansi(message.line)}")
 
     def on_state_changed(self, message: StateChanged) -> None:
         self.status_header.update_from_event(
