@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from dataclasses import dataclass
+from typing import Any, Dict, Optional
 
 from .enums import BackendType
 
@@ -85,12 +85,3 @@ class EndpointInfo:
     instance_name: Optional[str] = None
 
 
-@dataclass
-class EndpointStatus:
-    """Result of a health/status check."""
-
-    backend: BackendType = BackendType.LLAMACPP
-    url: str = ""
-    healthy: bool = False
-    detail: str = ""
-    test_command: str = ""

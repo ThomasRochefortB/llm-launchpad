@@ -11,31 +11,7 @@ from textual.widgets.option_list import Option
 
 from ...protocol.enums import BackendType
 from ...protocol.models import EndpointInfo
-from ...core.naming import legacy_app_name
 from ..widgets.input_form import FormField, ToggleField
-
-
-def _build_instance_options(
-    instances: list[EndpointInfo], fallback: str
-) -> tuple[list[Option], dict[str, str]]:
-    """Build unique option IDs and map them back to app names."""
-    options: list[Option] = []
-    option_to_app_name: dict[str, str] = {}
-
-    if instances:
-        for index, row in enumerate(instances):
-            app_name = row.name
-            state = row.state
-            app_id = row.app_id
-            option_id = f"app-id:{app_id}" if app_id else f"app-name:{app_name}:{index}"
-            label = f"  {app_name}  ({state})"
-            options.append(Option(label, id=option_id))
-            option_to_app_name[option_id] = app_name
-        return options, option_to_app_name
-
-    options.append(Option(f"  {fallback}  (legacy default)", id=fallback))
-    option_to_app_name[fallback] = fallback
-    return options, option_to_app_name
 
 
 def _is_stoppable_state(state: str) -> bool:
@@ -94,12 +70,6 @@ class ManageScreen(Screen):
 
     def action_pop_screen(self) -> None:
         self.app.pop_screen()
-
-
-class BackendPickMixin:
-    """Shared backend selection for manage sub-screens."""
-
-    pass
 
 
 class StatusParamsScreen(Screen):
@@ -187,13 +157,7 @@ class LogsParamsScreen(Screen):
         with Vertical(id="menu-container"):
             yield Static("[bold cyan]Tail Logs[/bold cyan]")
             yield Static("")
-            yield Static("[bold]Choose backend[/bold]")
-            yield OptionList(
-                Option("  llama.cpp (llamacpp-server)", id="log-be-llamacpp"),
-                Option("  vLLM (vllm-server)", id="log-be-vllm"),
-                id="logs-backend-list",
-            )
-            yield Static("[bold]Choose instance[/bold]")
+            yield Static("[bold]Choose running instance[/bold]")
             yield OptionList(id="logs-instance-list")
             yield ToggleField("Follow log stream", "logs-follow", default=True)
         yield Footer()
@@ -201,19 +165,16 @@ class LogsParamsScreen(Screen):
     def on_mount(self) -> None:
         self._backend: BackendType | None = None
         self._instance_app_name: str | None = None
-        self._instance_by_option_id: dict[str, str] = {}
+        self._target_by_option_id: dict[str, tuple[BackendType, str]] = {}
+        self._load_instances()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
-        if event.option_list.id == "logs-backend-list":
-            if event.option.id == "log-be-llamacpp":
-                self._backend = BackendType.LLAMACPP
-            elif event.option.id == "log-be-vllm":
-                self._backend = BackendType.VLLM
-            self._load_instances()
-            return
         if event.option_list.id == "logs-instance-list":
             selected = str(event.option.id)
-            self._instance_app_name = self._instance_by_option_id.get(selected, selected)
+            target = self._target_by_option_id.get(selected)
+            if target is None:
+                return
+            self._backend, self._instance_app_name = target
             self._submit()
 
     def _submit(self) -> None:
@@ -223,12 +184,16 @@ class LogsParamsScreen(Screen):
         self.app.begin_logs(self._backend, follow, app_name=self._instance_app_name)  # type: ignore[attr-defined]
 
     def _load_instances(self) -> None:
-        if self._backend is None:
-            return
         instance_list = self.query_one("#logs-instance-list", OptionList)
-        instances = self.app.list_instances(self._backend)  # type: ignore[attr-defined]
-        fallback = legacy_app_name(self._backend)
-        options, self._instance_by_option_id = _build_instance_options(instances, fallback)
+        instances: list[EndpointInfo] = []
+        for backend in (BackendType.LLAMACPP, BackendType.VLLM):
+            instances.extend(self.app.list_instances(backend))  # type: ignore[attr-defined]
+        loggable_instances = [row for row in instances if _is_stoppable_state(row.state)]
+        if not loggable_instances:
+            self._target_by_option_id = {}
+            instance_list.set_options([Option("  No running deployments found")])
+            return
+        options, self._target_by_option_id = _build_backend_app_options(loggable_instances)
         instance_list.set_options(options)
 
     def action_pop_screen(self) -> None:

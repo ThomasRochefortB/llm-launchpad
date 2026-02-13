@@ -12,7 +12,7 @@ from .events import (
     OperationCompleteEvent,
     StateChangeEvent,
 )
-from .models import DeploymentConfig, EndpointInfo, EndpointStatus, LaunchpadSettings
+from .models import DeploymentConfig, EndpointInfo, LaunchpadSettings
 
 __all__ = [
     "BackendType",
@@ -20,7 +20,6 @@ __all__ = [
     "DeploymentConfig",
     "DeploymentState",
     "EndpointInfo",
-    "EndpointStatus",
     "ErrorEvent",
     "LaunchpadSettings",
     "LogEvent",

@@ -11,7 +11,6 @@ from typing import Any, Dict, Generator, List, Optional
 from ..protocol.enums import BackendType
 from ..protocol.events import ErrorEvent, LogEvent, OperationCompleteEvent
 from ..protocol.models import DeploymentConfig, EndpointInfo, LaunchpadSettings
-from ..presets import PRESETS
 from .naming import infer_backend_from_app_name, infer_instance_from_app_name, legacy_app_name
 
 
@@ -55,14 +54,6 @@ class ModalBackend:
     ) -> str:
         resolved = app_name or legacy_app_name(backend or BackendType.LLAMACPP)
         return f"https://{username}--{resolved}-serve.modal.run"
-
-    @staticmethod
-    def server_example_url(
-        backend: Optional[BackendType] = None,
-        app_name: Optional[str] = None,
-    ) -> str:
-        resolved = app_name or legacy_app_name(backend or BackendType.LLAMACPP)
-        return f"https://<user>--{resolved}-serve.modal.run"
 
     @staticmethod
     def test_curl_command(backend: BackendType, server_url: str) -> str:

@@ -21,13 +21,6 @@ class BackendType(str, Enum):
         }[self]
 
     @property
-    def app_name(self) -> str:
-        return {
-            BackendType.LLAMACPP: "llamacpp-server",
-            BackendType.VLLM: "vllm-server",
-        }[self]
-
-    @property
     def script(self) -> str:
         return {
             BackendType.LLAMACPP: MODAL_LLAMACPP_SCRIPT,
