@@ -66,6 +66,7 @@ class DeploymentConfig:
     # Instance identity
     instance_name: Optional[str] = None
     app_name: Optional[str] = None
+    function_slug: Optional[str] = None
 
 
 @dataclass
@@ -91,6 +92,7 @@ class StoredModelInfo:
     file_count: int = 0
     source_volume: str = ""
     paths: list[str] | None = None
+    incomplete: bool = False
 
 
 @dataclass
@@ -107,5 +109,3 @@ class StorageSnapshot:
     @property
     def total_models(self) -> int:
         return len(self.llamacpp_models) + len(self.vllm_models)
-
-

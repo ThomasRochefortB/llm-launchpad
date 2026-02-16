@@ -49,7 +49,7 @@ class StorageModelsTests(unittest.TestCase):
             model_id="Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
             size_bytes=2_000,
             file_count=2,
-            source_volume="llamacpp-cache",
+            source_volume="huggingface-cache",
         )
         vllm = StoredModelInfo(
             backend=BackendType.VLLM,
@@ -61,6 +61,8 @@ class StorageModelsTests(unittest.TestCase):
         snapshot = StorageSnapshot(llamacpp_models=[llamacpp], vllm_models=[vllm])
         self.assertEqual(snapshot.total_models, 2)
         self.assertEqual(snapshot.total_size_bytes, 5_000)
+        self.assertFalse(llamacpp.incomplete)
+        self.assertFalse(vllm.incomplete)
 
 
 if __name__ == "__main__":

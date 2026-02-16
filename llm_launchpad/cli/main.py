@@ -7,7 +7,6 @@ all non-interactive commands available for automation.
 from __future__ import annotations
 
 import os
-import sys
 from typing import Optional
 
 import typer
@@ -24,10 +23,11 @@ from ..core.naming import (
     auto_instance_name_for_backend,
     build_app_name,
     legacy_app_name,
+    random_function_slug,
     slugify_instance_name,
 )
 from ..core.orchestrator import Orchestrator
-from ..protocol.enums import BackendType, OperationType
+from ..protocol.enums import BackendType
 from ..protocol.events import ErrorEvent, LogEvent, OperationCompleteEvent, StateChangeEvent
 from ..protocol.models import EndpointInfo
 
@@ -255,7 +255,11 @@ def deploy(
             raise typer.Exit(code=event.exit_code or 1)
 
     if do_warmup:
-        url = server_url or ModalBackend.default_server_url(username, app_name=resolved_app_name)
+        url = server_url or ModalBackend.default_server_url(
+            username,
+            app_name=resolved_app_name,
+            function_slug=config.function_slug,
+        )
         for event in orch.warmup(
             bt,
             url,
@@ -273,6 +277,9 @@ def deploy(
 def warmup(
     backend: str = typer.Option("llamacpp", help="Backend: llamacpp or vllm"),
     server_url: Optional[str] = typer.Option(None, help="Deployed web URL"),
+    function_slug: Optional[str] = typer.Option(
+        None, help="Modal function slug suffix used in endpoint URL"
+    ),
     timeout: int = typer.Option(1800, help="Seconds to wait"),
     tail_logs: bool = typer.Option(True, help="Tail logs during warmup"),
     instance_name: Optional[str] = typer.Option(None, help="Target instance name"),
@@ -286,7 +293,11 @@ def warmup(
     url = (
         server_url
         or os.environ.get("SERVER_URL")
-        or ModalBackend.default_server_url(username, app_name=target_app_name)
+        or ModalBackend.default_server_url(
+            username,
+            app_name=target_app_name,
+            function_slug=function_slug or os.environ.get("MODAL_FUNCTION_SLUG"),
+        )
     )
     for event in orch.warmup(bt, url, timeout, tail_logs, app_name=target_app_name):
         _print_event(event)
@@ -305,6 +316,9 @@ def list_apps() -> None:
 def status(
     backend: str = typer.Option("llamacpp", help="Backend: llamacpp or vllm"),
     server_url: Optional[str] = typer.Option(None, help="Deployed web URL"),
+    function_slug: Optional[str] = typer.Option(
+        None, help="Modal function slug suffix used in endpoint URL"
+    ),
     timeout: int = typer.Option(60, help="Timeout seconds"),
     instance_name: Optional[str] = typer.Option(None, help="Target instance name"),
     app_name: Optional[str] = typer.Option(None, help="Target Modal app name"),
@@ -317,7 +331,11 @@ def status(
     url = (
         server_url
         or os.environ.get("SERVER_URL")
-        or ModalBackend.default_server_url(username, app_name=target_app_name)
+        or ModalBackend.default_server_url(
+            username,
+            app_name=target_app_name,
+            function_slug=function_slug or os.environ.get("MODAL_FUNCTION_SLUG"),
+        )
     )
     for event in orch.check_status(bt, url, timeout):
         _print_event(event)
@@ -442,7 +460,9 @@ def switch(
                     raise typer.Exit(code=event.exit_code or 1)
             if do_warmup:
                 url = server_url or ModalBackend.default_server_url(
-                    username, app_name=resolved_app_name
+                    username,
+                    app_name=resolved_app_name,
+                    function_slug=config.function_slug,
                 )
                 for event in orch.warmup(
                     bt,
@@ -469,6 +489,7 @@ def switch(
 
     if redeploy:
         deploy_config = DeploymentConfig(backend=bt, do_deploy=True)
+        deploy_config.function_slug = random_function_slug()
         settings = ConfigStore().load()
         deploy_config.app_name = resolved_app_name
         env = ModalBackend.build_full_env(settings, deploy_config)
@@ -478,7 +499,11 @@ def switch(
         if code != 0:
             raise typer.Exit(code=code)
         if do_warmup:
-            url = server_url or ModalBackend.default_server_url(username, app_name=resolved_app_name)
+            url = server_url or ModalBackend.default_server_url(
+                username,
+                app_name=resolved_app_name,
+                function_slug=deploy_config.function_slug,
+            )
             for event in orch.warmup(bt, url, timeout, tail_logs, app_name=resolved_app_name):
                 _print_event(event)
 

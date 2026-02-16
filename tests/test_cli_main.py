@@ -148,6 +148,76 @@ class CliMainCommandTests(unittest.TestCase):
                 )
         self.assertEqual(result.exit_code, 1)
 
+    def test_status_uses_function_slug_for_default_url(self) -> None:
+        calls: list[tuple[BackendType, str, int]] = []
+
+        def _check_status(backend: BackendType, url: str, timeout: int):
+            calls.append((backend, url, timeout))
+            return [OperationCompleteEvent(operation=OperationType.STATUS, success=True, exit_code=0)]
+
+        orch = SimpleNamespace(check_status=_check_status)
+        with patch("llm_launchpad.cli.main._preflight", return_value=(orch, "alice")):
+            with patch("llm_launchpad.cli.main._print_banner", return_value=None):
+                result = self.runner.invoke(
+                    cli_main.app,
+                    [
+                        "status",
+                        "--backend",
+                        "vllm",
+                        "--app-name",
+                        "vllm-test",
+                        "--function-slug",
+                        "alpha-bravo",
+                    ],
+                )
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(
+            calls,
+            [(BackendType.VLLM, "https://alice--vllm-test-serve-alpha-bravo.modal.run", 60)],
+        )
+
+    def test_warmup_uses_function_slug_for_default_url(self) -> None:
+        calls: list[tuple[BackendType, str, int, bool, str | None]] = []
+
+        def _warmup(
+            backend: BackendType,
+            url: str,
+            timeout: int,
+            tail_logs: bool,
+            app_name: str | None = None,
+        ):
+            calls.append((backend, url, timeout, tail_logs, app_name))
+            return []
+
+        orch = SimpleNamespace(warmup=_warmup)
+        with patch("llm_launchpad.cli.main._preflight", return_value=(orch, "alice")):
+            with patch("llm_launchpad.cli.main._print_banner", return_value=None):
+                result = self.runner.invoke(
+                    cli_main.app,
+                    [
+                        "warmup",
+                        "--backend",
+                        "vllm",
+                        "--app-name",
+                        "vllm-test",
+                        "--function-slug",
+                        "alpha-bravo",
+                    ],
+                )
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(
+            calls,
+            [
+                (
+                    BackendType.VLLM,
+                    "https://alice--vllm-test-serve-alpha-bravo.modal.run",
+                    1800,
+                    True,
+                    "vllm-test",
+                )
+            ],
+        )
+
     def test_logs_passes_follow_and_app_name(self) -> None:
         calls: list[tuple[BackendType, bool, str | None]] = []
 
