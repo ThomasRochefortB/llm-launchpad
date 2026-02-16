@@ -7,19 +7,25 @@ from textual.app import App
 from textual.widgets import Input, OptionList, Switch
 
 from llm_launchpad.core.hf_models import ModelCandidate
+from llm_launchpad.protocol.enums import BackendType
+from llm_launchpad.protocol.models import StorageSnapshot, StoredModelInfo
 from llm_launchpad.tui.screens.deploy import VllmDeployScreen
-from llm_launchpad.tui.workers import VllmModelsLoaded
+from llm_launchpad.tui.workers import StorageLoaded, VllmModelsLoaded
 
 
 class _TestApp(App[None]):
     def __init__(self) -> None:
         super().__init__()
         self.fetch_calls: list[str] = []
+        self.storage_refresh_calls: list[bool] = []
         self.deployed_config = None
         self.notifications: list[tuple[str, str]] = []
 
     def begin_fetch_vllm_models(self, mode: str, receiver: object) -> None:
         self.fetch_calls.append(mode)
+
+    def begin_storage_refresh(self, receiver: object, force: bool = False) -> None:
+        self.storage_refresh_calls.append(force)
 
     def begin_deploy(self, config) -> None:  # type: ignore[no-untyped-def]
         self.deployed_config = config
@@ -29,6 +35,22 @@ class _TestApp(App[None]):
 
 
 class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
+    async def test_default_rank_mode_highlight_matches_cached(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+            self.assertEqual(app.fetch_calls, [])
+            self.assertEqual(app.storage_refresh_calls, [False])
+
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+            rank_mode_list = screen.query_one("#vllm-rank-mode", OptionList)
+            highlighted = rank_mode_list.highlighted_option
+            self.assertIsNotNone(highlighted)
+            assert highlighted is not None
+            self.assertEqual(highlighted.id, "rank-cached")
+
     async def test_served_model_alias_defaults_to_model_suffix(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:
@@ -37,8 +59,9 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
             screen = app.screen
             assert isinstance(screen, VllmDeployScreen)
+            self.assertEqual(screen.query_one("#model-name", Input).value, "")
             alias = screen.query_one("#served-model-name", Input).value
-            self.assertEqual(alias, "Qwen3-4B-Thinking-2507-FP8")
+            self.assertEqual(alias, "llm")
 
             screen.query_one("#model-name", Input).value = "Qwen/Qwen3-0.6B"
             await pilot.pause()
@@ -128,10 +151,13 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test() as pilot:
             app.push_screen(VllmDeployScreen())
             await pilot.pause()
-            self.assertEqual(app.fetch_calls, ["downloads"])
 
             screen = app.screen
             assert isinstance(screen, VllmDeployScreen)
+            rank_mode_list = screen.query_one("#vllm-rank-mode", OptionList)
+            downloads_option = rank_mode_list.get_option_at_index(1)
+            screen.on_option_list_option_selected(SimpleNamespace(option_list=rank_mode_list, option=downloads_option))
+            self.assertEqual(app.fetch_calls, ["downloads"])
 
             screen.on_vllm_models_loaded(
                 VllmModelsLoaded(
@@ -153,6 +179,44 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             model_name = screen.query_one("#model-name", Input).value
             self.assertEqual(model_name, "meta-llama/Llama-3.1-8B-Instruct")
 
+    async def test_cached_mode_prefills_model_name_from_storage(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+
+            rank_mode_list = screen.query_one("#vllm-rank-mode", OptionList)
+            self.assertEqual(rank_mode_list.get_option_at_index(0).id, "rank-cached")
+
+            screen.on_storage_loaded(
+                StorageLoaded(
+                    snapshot=StorageSnapshot(
+                        llamacpp_models=[],
+                        vllm_models=[
+                            StoredModelInfo(
+                                backend=BackendType.VLLM,
+                                model_id="Qwen/Qwen3-4B-Thinking-2507-FP8",
+                                size_bytes=8192,
+                            )
+                        ],
+                    )
+                )
+            )
+
+            cached_option = rank_mode_list.get_option_at_index(0)
+            screen.on_option_list_option_selected(SimpleNamespace(option_list=rank_mode_list, option=cached_option))
+
+            model_list = screen.query_one("#vllm-model-list", OptionList)
+            selected_option = model_list.get_option_at_index(0)
+            screen.on_option_list_option_selected(SimpleNamespace(option_list=model_list, option=selected_option))
+
+            model_name = screen.query_one("#model-name", Input).value
+            self.assertEqual(model_name, "Qwen/Qwen3-4B-Thinking-2507-FP8")
+            self.assertEqual(app.fetch_calls, [])
+
     async def test_model_highlight_prefills_model_input(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:
@@ -161,6 +225,9 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
             screen = app.screen
             assert isinstance(screen, VllmDeployScreen)
+            rank_mode_list = screen.query_one("#vllm-rank-mode", OptionList)
+            downloads_option = rank_mode_list.get_option_at_index(1)
+            screen.on_option_list_option_selected(SimpleNamespace(option_list=rank_mode_list, option=downloads_option))
             screen.on_vllm_models_loaded(
                 VllmModelsLoaded(
                     mode="downloads",
@@ -268,4 +335,3 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

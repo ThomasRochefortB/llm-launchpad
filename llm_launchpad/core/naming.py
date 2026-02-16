@@ -6,6 +6,8 @@ import re
 import unicodedata
 from typing import Optional
 
+from coolname import generate_slug
+
 from ..protocol.enums import BackendType
 
 
@@ -80,3 +82,15 @@ def infer_instance_from_app_name(app_name: str, backend: Optional[BackendType]) 
         return app_name[len(prefix) :] or "default"
     return None
 
+
+def random_function_slug() -> str:
+    """Generate a random, URL-safe two-word slug for Modal function names."""
+    return slugify_instance_name(generate_slug(2))
+
+
+def modal_function_name(base_name: str, function_slug: Optional[str]) -> str:
+    """Return a Modal function name with optional deployment slug suffix."""
+    slug = slugify_instance_name(function_slug or "", default="")
+    if not slug:
+        return base_name
+    return f"{base_name}-{slug}"

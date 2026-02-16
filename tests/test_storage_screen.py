@@ -3,21 +3,26 @@ from __future__ import annotations
 import unittest
 
 from textual.app import App
+from textual.screen import Screen
 from textual.widgets import DataTable, Input
 
 from llm_launchpad.protocol.enums import BackendType
 from llm_launchpad.protocol.models import StorageSnapshot, StoredModelInfo
-from llm_launchpad.tui.screens.storage import StorageScreen
+from llm_launchpad.tui.screens.storage import StorageScreen, _model_label
 from llm_launchpad.tui.workers import StorageLoaded
 
 
 class _TestApp(App[None]):
     def __init__(self) -> None:
         super().__init__()
+        self.refresh_calls = 0
+        self.refresh_force_flags: list[bool] = []
         self.predownload_calls: list[tuple[BackendType, str, str | None, str | None]] = []
         self.delete_calls: list[str] = []
 
-    def begin_storage_refresh(self, receiver: object) -> None:
+    def begin_storage_refresh(self, receiver: object, force: bool = False) -> None:
+        self.refresh_calls += 1
+        self.refresh_force_flags.append(force)
         poster = getattr(receiver, "post_message")
         snapshot = StorageSnapshot(
             llamacpp_models=[
@@ -28,7 +33,8 @@ class _TestApp(App[None]):
                     quant="Q4_K_M",
                     size_bytes=1024,
                     file_count=1,
-                    source_volume="llamacpp-cache",
+                    source_volume="huggingface-cache",
+                    incomplete=True,
                 )
             ],
             vllm_models=[
@@ -59,6 +65,18 @@ class _TestApp(App[None]):
 
 
 class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
+    def test_model_label_appends_incomplete_suffix(self) -> None:
+        row = StoredModelInfo(
+            backend=BackendType.LLAMACPP,
+            model_id="Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+            source_volume="huggingface-cache",
+            incomplete=True,
+        )
+        self.assertEqual(
+            _model_label(row),
+            "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF (INCOMPLETE)",
+        )
+
     async def test_mount_loads_snapshot_into_table(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:
@@ -99,6 +117,29 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
             screen._selected_model = first_model
             screen.action_delete_selected_model()
             self.assertEqual(app.delete_calls, [first_model.model_id])
+
+    async def test_resume_triggers_storage_refresh(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(StorageScreen())
+            await pilot.pause()
+            self.assertEqual(app.refresh_calls, 1)
+            app.push_screen(Screen())
+            await pilot.pause()
+            app.pop_screen()
+            await pilot.pause()
+            self.assertEqual(app.refresh_calls, 2)
+
+    async def test_manual_refresh_uses_force_refresh(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(StorageScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, StorageScreen)
+            screen.action_refresh_storage()
+            await pilot.pause()
+            self.assertEqual(app.refresh_force_flags, [False, True])
 
 
 if __name__ == "__main__":

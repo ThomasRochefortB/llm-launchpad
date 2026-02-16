@@ -4,6 +4,7 @@ import json
 import os
 import time
 
+from coolname import generate_slug
 import modal
 
 
@@ -18,34 +19,54 @@ GPU_CONFIG = os.environ.get("GPU_CONFIG", "A100-80GB:1")
 MINUTES = 60
 
 
+def _slugify_name(raw: str) -> str:
+    return "".join(ch if ch.isalnum() or ch == "-" else "-" for ch in raw.lower()).strip("-")
+
+
+def _read_function_slug() -> str:
+    raw = os.environ.get("MODAL_FUNCTION_SLUG", "").strip()
+    if raw:
+        slug = _slugify_name(raw)
+        if slug:
+            return slug
+    return _slugify_name(generate_slug(2))
+
+
+FUNCTION_SLUG = _read_function_slug()
+
+
+def _function_name(base_name: str) -> str:
+    return f"{base_name}-{FUNCTION_SLUG}"
+
+
+def _read_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise RuntimeError(f"Environment variable {name} must be an integer, got: {raw!r}") from None
+
+
+PREDOWNLOAD_TIMEOUT_MINUTES = _read_int_env("PREDOWNLOAD_TIMEOUT_MINUTES", 6 * 60)
+
+
 # --- Model configuration (from Hugging Face)
 # Defaults can be overridden via the CLI local entrypoint or by writing config
 REPO_ID = "unsloth/Qwen3-Coder-480B-A35B-Instruct-1M-GGUF"
 QUANT = "Q4_K_M"
 
 
-# --- Persistent cache for model weights
-cache_dir = "/root/.cache/llama.cpp"
-model_cache = modal.Volume.from_name("llamacpp-cache", create_if_missing=True)
+# --- Persistent cache for model weights (shared with vLLM)
+cache_dir = "/root/.cache/huggingface"
+model_cache = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
 CONFIG_PATH = f"{cache_dir}/serve_config.json"
 MODELS_ROOT = Path(cache_dir) / "models"
 INDEX_PATH = Path(cache_dir) / "model_index.json"
 
 # --- Simple presets for convenience (model-agnostic)
 # Note: Import presets lazily inside the local entrypoint to avoid container import issues.
-
-
-def _save_config(config: Dict[str, Any]) -> None:
-    """Persist configuration JSON inside the mounted volume.
-
-    Note: This is only used within container functions. For local entrypoints
-    prefer `save_config_remote` which writes remotely.
-    """
-    Path(cache_dir).mkdir(parents=True, exist_ok=True)
-    with open(CONFIG_PATH, "w") as f:
-        json.dump(config, f)
-    # Ensure other functions can see the writes before we quit
-    model_cache.commit()
 
 
 def _load_config() -> Dict[str, Any]:
@@ -170,12 +191,18 @@ image = (
 # --- Separate lightweight image for downloading models
 download_image = (
     modal.Image.debian_slim(python_version="3.11")
-    .pip_install("huggingface_hub[hf_transfer]==0.26.2")
-    .env({"HF_HUB_ENABLE_HF_TRANSFER": "1"})
+    .pip_install("huggingface-hub==0.36.0")
+    .env({"HF_XET_HIGH_PERFORMANCE": "1"})
 )
 
 
-@app.function(image=download_image, volumes={cache_dir: model_cache}, timeout=30 * MINUTES)
+@app.function(
+    name=_function_name("download-model"),
+    serialized=True,
+    image=download_image,
+    volumes={cache_dir: model_cache},
+    timeout=PREDOWNLOAD_TIMEOUT_MINUTES * MINUTES,
+)
 def download_model(
     repo_id: str = REPO_ID,
     allow_patterns: Optional[List[str]] = None,
@@ -228,7 +255,13 @@ def _download_model_files(
     return matches
 
 
-@app.function(image=download_image, volumes={cache_dir: model_cache}, timeout=30 * MINUTES)
+@app.function(
+    name=_function_name("predownload-model"),
+    serialized=True,
+    image=download_image,
+    volumes={cache_dir: model_cache},
+    timeout=PREDOWNLOAD_TIMEOUT_MINUTES * MINUTES,
+)
 def predownload_model(
     repo_id: str,
     quant: Optional[str] = None,
@@ -239,7 +272,12 @@ def predownload_model(
     return _download_model_files(repo_id, allow_patterns, revision)
 
 
-@app.function(image=download_image, volumes={cache_dir: model_cache})
+@app.function(
+    name=_function_name("list-downloaded-models"),
+    serialized=True,
+    image=download_image,
+    volumes={cache_dir: model_cache},
+)
 def list_downloaded_models() -> List[Dict[str, Any]]:
     """List cached llama.cpp models with lightweight metadata."""
     rows = _load_index()
@@ -253,7 +291,7 @@ def list_downloaded_models() -> List[Dict[str, Any]]:
                 "quant": row.get("quant"),
                 "size_bytes": int(row.get("size_bytes", 0) or 0),
                 "file_count": int(row.get("file_count", 0) or 0),
-                "source_volume": "llamacpp-cache",
+                "source_volume": "huggingface-cache",
                 "paths": list(row.get("paths", []) or []),
             }
         )
@@ -277,7 +315,7 @@ def list_downloaded_models() -> List[Dict[str, Any]]:
                 "quant": None,
                 "size_bytes": int(gguf.stat().st_size),
                 "file_count": 1,
-                "source_volume": "llamacpp-cache",
+                "source_volume": "huggingface-cache",
                 "paths": [rel],
             }
         )
@@ -325,6 +363,8 @@ except Exception:
 
 
 @app.function(
+    name=_function_name("serve"),
+    serialized=True,
     image=image,
     volumes={cache_dir: model_cache},
     gpu=GPU_CONFIG,
@@ -380,7 +420,12 @@ def serve():
     subprocess.Popen(command)
 
 
-@app.function(image=download_image, volumes={cache_dir: model_cache})
+@app.function(
+    name=_function_name("save-config-remote"),
+    serialized=True,
+    image=download_image,
+    volumes={cache_dir: model_cache},
+)
 def save_config_remote(config: Dict[str, Any]) -> None:
     """Persist configuration inside the Modal Volume so web server can read it.
 
@@ -471,4 +516,3 @@ def main(
             print("✅ Deploy triggered. Check the Modal dashboard for status.")
         except Exception as e:
             print(f"⚠️ Failed to deploy automatically: {e}")
-

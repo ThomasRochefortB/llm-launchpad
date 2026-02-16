@@ -60,6 +60,16 @@ class BackendEnvTests(unittest.TestCase):
         self.assertEqual(env["GPU_CONFIG"], "A100-80GB:2")
         self.assertEqual(env["N_GPU"], "4")
 
+    def test_env_for_backend_includes_function_slug(self) -> None:
+        config = DeploymentConfig(
+            backend=BackendType.LLAMACPP,
+            app_name="llamacpp-prod",
+            function_slug="alpha-bravo",
+        )
+        env = ModalBackend.env_for_backend(config)
+        self.assertEqual(env["MODAL_APP_NAME"], "llamacpp-prod")
+        self.assertEqual(env["MODAL_FUNCTION_SLUG"], "alpha-bravo")
+
 
 if __name__ == "__main__":
     unittest.main()

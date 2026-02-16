@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 import aiohttp
+from coolname import generate_slug
 import modal
 
 
@@ -23,6 +24,26 @@ MINUTES = 60
 VLLM_PORT = 8000
 HF_CACHE_DIR = "/root/.cache/huggingface"
 HF_HUB_DIR = Path(HF_CACHE_DIR) / "hub"
+
+
+def _slugify_name(raw: str) -> str:
+    return "".join(ch if ch.isalnum() or ch == "-" else "-" for ch in raw.lower()).strip("-")
+
+
+def _read_function_slug() -> str:
+    raw = os.environ.get("MODAL_FUNCTION_SLUG", "").strip()
+    if raw:
+        slug = _slugify_name(raw)
+        if slug:
+            return slug
+    return _slugify_name(generate_slug(2))
+
+
+FUNCTION_SLUG = _read_function_slug()
+
+
+def _function_name(base_name: str) -> str:
+    return f"{base_name}-{FUNCTION_SLUG}"
 
 
 def _read_str_env(name: str, default: str) -> str:
@@ -57,6 +78,7 @@ DEPLOY_FAST_BOOT = _read_bool_env("FAST_BOOT", False)
 DEPLOY_TRUST_REMOTE_CODE = _read_bool_env("TRUST_REMOTE_CODE", False)
 DEPLOY_REASONING_PARSER = os.environ.get("REASONING_PARSER", "").strip() or None
 DEPLOY_DEFAULT_CHAT_TEMPLATE_KWARGS = os.environ.get("DEFAULT_CHAT_TEMPLATE_KWARGS", "").strip() or None
+PREDOWNLOAD_TIMEOUT_MINUTES = _read_int_env("PREDOWNLOAD_TIMEOUT_MINUTES", 6 * 60)
 
 RUNTIME_ENV = {
     "MODEL_NAME": DEPLOY_MODEL_NAME,
@@ -89,8 +111,10 @@ vllm_image = (
 
 
 @app.function(
+    name=_function_name("predownload-model"),
+    serialized=True,
     image=vllm_image,
-    timeout=30 * MINUTES,
+    timeout=PREDOWNLOAD_TIMEOUT_MINUTES * MINUTES,
     volumes={
         "/root/.cache/huggingface": hf_cache_vol,
         "/root/.cache/vllm": vllm_cache_vol,
@@ -99,7 +123,6 @@ vllm_image = (
 def predownload_model(
     repo_id: str,
     revision: str | None = None,
-    allow_patterns: list[str] | None = None,
 ) -> dict[str, Any]:
     """Download model weights into the shared HF cache volume."""
     from huggingface_hub import snapshot_download  # type: ignore
@@ -108,13 +131,15 @@ def predownload_model(
         repo_id=repo_id,
         revision=revision,
         cache_dir=HF_CACHE_DIR,
-        allow_patterns=allow_patterns,
+        allow_patterns=None,
     )
     hf_cache_vol.commit()
     return {"repo_id": repo_id, "revision": revision, "path": path}
 
 
 @app.function(
+    name=_function_name("list-downloaded-models"),
+    serialized=True,
     image=vllm_image,
     timeout=10 * MINUTES,
     volumes={
@@ -157,6 +182,8 @@ def list_downloaded_models() -> list[dict[str, Any]]:
 
 
 @app.function(
+    name=_function_name("serve"),
+    serialized=True,
     image=vllm_image,
     gpu=DEPLOY_GPU_CONFIG,
     scaledown_window=15 * MINUTES,

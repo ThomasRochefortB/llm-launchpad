@@ -7,6 +7,7 @@ CLI both consume these generators.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import os
 import queue
 import re
@@ -29,6 +30,7 @@ from ..protocol.models import StoredModelInfo, StorageSnapshot
 from .backend import ModalBackend
 from .config import ConfigStore
 from .naming import legacy_app_name
+from .naming import random_function_slug
 from .paths import MODAL_LLAMACPP_SCRIPT, MODAL_VLLM_SCRIPT
 
 # Type alias for event generators
@@ -109,6 +111,8 @@ class Orchestrator:
 
     def deploy(self, config: DeploymentConfig) -> EventStream:
         """Run a full deploy workflow (optional preload + deploy + warmup)."""
+        if config.do_deploy and not config.function_slug:
+            config.function_slug = random_function_slug()
         settings = self.config_store.load()
         env = ModalBackend.build_full_env(settings, config)
 
@@ -625,11 +629,15 @@ class Orchestrator:
             operation=OperationType.STORAGE_LIST,
             detail="Scanning Modal volumes for cached models",
         )
+        scan_started = time.perf_counter()
         try:
-            snapshot = StorageSnapshot(
-                llamacpp_models=self._list_llamacpp_models(),
-                vllm_models=self._list_vllm_models(),
-            )
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                llamacpp_future = executor.submit(self._list_llamacpp_models)
+                vllm_future = executor.submit(self._list_vllm_models)
+                snapshot = StorageSnapshot(
+                    llamacpp_models=llamacpp_future.result(),
+                    vllm_models=vllm_future.result(),
+                )
         except Exception as exc:
             yield ErrorEvent(
                 message=f"Failed to list storage: {exc}",
@@ -644,11 +652,13 @@ class Orchestrator:
             )
             return
 
+        scan_elapsed_ms = int((time.perf_counter() - scan_started) * 1000)
         yield LogEvent(
             line=(
                 f"Storage snapshot: llama.cpp={len(snapshot.llamacpp_models)} models, "
                 f"vLLM={len(snapshot.vllm_models)} models, "
-                f"total={snapshot.total_models}, bytes={snapshot.total_size_bytes}"
+                f"total={snapshot.total_models}, bytes={snapshot.total_size_bytes}, "
+                f"scan_ms={scan_elapsed_ms}"
             ),
             operation=OperationType.STORAGE_LIST,
         )
@@ -785,20 +795,49 @@ class Orchestrator:
         )
 
     def _list_llamacpp_models(self) -> list[StoredModelInfo]:
-        files = self._walk_volume_files("llamacpp-cache", "/models")
+        files = self._walk_volume_files(self._LLAMACPP_STORAGE_VOLUME, "/models")
         grouped: dict[tuple[str, Optional[str]], StoredModelInfo] = {}
+        incomplete_keys: set[tuple[str, Optional[str]]] = set()
+        keys_with_any_files: set[tuple[str, Optional[str]]] = set()
+        keys_with_gguf_files: set[tuple[str, Optional[str]]] = set()
         for row in files:
             path = str(row.get("path", "")).strip()
-            if not path.lower().endswith(".gguf"):
-                continue
             size = int(row.get("size_bytes", 0) or 0)
             rel = path.removeprefix("/models/").strip("/")
             parts = rel.split("/")
-            if len(parts) < 3:
+            if len(parts) < 2:
                 continue
             model_id = parts[0].replace("__", "/")
             revision = parts[1]
             key = (model_id, None if revision == "main" else revision)
+            keys_with_any_files.add(key)
+            is_incomplete = path.lower().endswith(".incomplete")
+            if is_incomplete:
+                incomplete_keys.add(key)
+                entry = grouped.get(key)
+                if entry is None:
+                    entry = StoredModelInfo(
+                        backend=BackendType.LLAMACPP,
+                        model_id=model_id,
+                        revision=key[1],
+                        quant=None,
+                        size_bytes=0,
+                        file_count=0,
+                        source_volume=self._LLAMACPP_STORAGE_VOLUME,
+                        paths=[],
+                        incomplete=True,
+                    )
+                    grouped[key] = entry
+                entry.size_bytes += size
+                entry.file_count += 1
+                if entry.paths is not None and path not in entry.paths:
+                    entry.paths.append(path)
+                continue
+            if not path.lower().endswith(".gguf"):
+                continue
+            if len(parts) < 3:
+                continue
+            keys_with_gguf_files.add(key)
             entry = grouped.get(key)
             if entry is None:
                 entry = StoredModelInfo(
@@ -808,7 +847,7 @@ class Orchestrator:
                     quant=None,
                     size_bytes=0,
                     file_count=0,
-                    source_volume="llamacpp-cache",
+                    source_volume=self._LLAMACPP_STORAGE_VOLUME,
                     paths=[],
                 )
                 grouped[key] = entry
@@ -822,7 +861,7 @@ class Orchestrator:
                     entry.quant = quant_match.group(1).upper()
 
         # Compatibility: legacy flat cache files.
-        legacy_files = self._walk_volume_files("llamacpp-cache", "/")
+        legacy_files = self._walk_volume_files(self._LLAMACPP_STORAGE_VOLUME, "/", recursive=False)
         for row in legacy_files:
             path = str(row.get("path", "")).strip()
             if not path.lower().endswith(".gguf"):
@@ -843,7 +882,7 @@ class Orchestrator:
                     quant=None,
                     size_bytes=0,
                     file_count=0,
-                    source_volume="llamacpp-cache",
+                    source_volume=self._LLAMACPP_STORAGE_VOLUME,
                     paths=[],
                 )
                 grouped[key] = entry
@@ -856,11 +895,39 @@ class Orchestrator:
                 if quant_match:
                     entry.quant = quant_match.group(1).upper()
 
+        # If a model revision has cache metadata/files but no GGUF payload yet,
+        # treat it as incomplete so it is visible and recoverable in the UI.
+        for key in sorted(keys_with_any_files - keys_with_gguf_files):
+            entry = grouped.get(key)
+            if entry is None:
+                entry = StoredModelInfo(
+                    backend=BackendType.LLAMACPP,
+                    model_id=key[0],
+                    revision=key[1],
+                    quant=None,
+                    size_bytes=0,
+                    file_count=0,
+                    source_volume=self._LLAMACPP_STORAGE_VOLUME,
+                    paths=[],
+                    incomplete=True,
+                )
+                grouped[key] = entry
+            entry.incomplete = True
+
+        for key in incomplete_keys:
+            entry = grouped.get(key)
+            if entry is not None:
+                entry.incomplete = True
+
         return sorted(grouped.values(), key=lambda row: (row.model_id, row.revision or ""))
 
     def _list_vllm_models(self) -> list[StoredModelInfo]:
-        files = self._walk_volume_files("huggingface-cache", "/hub")
+        files = self._walk_volume_files(self._VLLM_STORAGE_VOLUME, "/hub")
         grouped: dict[str, StoredModelInfo] = {}
+        blob_files: dict[str, set[str]] = {}
+        incomplete_blob_files: dict[str, set[str]] = {}
+        snapshot_file_counts: dict[str, int] = {}
+        ref_file_counts: dict[str, int] = {}
         for row in files:
             path = str(row.get("path", "")).strip()
             size = int(row.get("size_bytes", 0) or 0)
@@ -882,18 +949,54 @@ class Orchestrator:
                     quant=None,
                     size_bytes=0,
                     file_count=0,
-                    source_volume="huggingface-cache",
+                    source_volume=self._VLLM_STORAGE_VOLUME,
                     paths=[],
                 )
                 grouped[model_id] = entry
             if row.get("is_file", False):
                 entry.size_bytes += size
                 entry.file_count += 1
+                lower_path = path.lower()
+                if "/snapshots/" in lower_path:
+                    snapshot_file_counts[model_id] = snapshot_file_counts.get(model_id, 0) + 1
+                if "/refs/" in lower_path:
+                    ref_file_counts[model_id] = ref_file_counts.get(model_id, 0) + 1
+                if "/blobs/" in lower_path:
+                    blob_name = path.rsplit("/", 1)[-1].strip()
+                    if blob_name.endswith(".incomplete"):
+                        final_blob_name = blob_name[: -len(".incomplete")]
+                        if final_blob_name:
+                            incomplete_blob_files.setdefault(model_id, set()).add(final_blob_name)
+                    elif blob_name:
+                        blob_files.setdefault(model_id, set()).add(blob_name)
             if entry.paths is not None and path not in entry.paths:
                 entry.paths.append(path)
+
+        for model_id, entry in grouped.items():
+            known_blobs = blob_files.get(model_id, set())
+            pending_blobs = incomplete_blob_files.get(model_id, set())
+            snapshot_count = snapshot_file_counts.get(model_id, 0)
+            ref_count = ref_file_counts.get(model_id, 0)
+            # Align with huggingface_hub cache semantics:
+            # incomplete blobs are resumable partial downloads, but once the
+            # final blob exists, download logic treats that file as complete.
+            # Keep stale orphan .incomplete blobs from old attempts from marking
+            # a model incomplete when a usable snapshot already exists.
+            unresolved_incomplete = any(blob_name not in known_blobs for blob_name in pending_blobs)
+            if unresolved_incomplete and snapshot_count == 0:
+                entry.incomplete = True
+            # Refs without snapshots indicate metadata without an accessible
+            # snapshot payload for this repo.
+            if ref_count > 0 and snapshot_count == 0:
+                entry.incomplete = True
         return sorted(grouped.values(), key=lambda row: row.model_id)
 
-    def _walk_volume_files(self, volume_name: str, root: str) -> list[dict[str, Any]]:
+    def _walk_volume_files(
+        self,
+        volume_name: str,
+        root: str,
+        recursive: bool = True,
+    ) -> list[dict[str, Any]]:
         pending = [root]
         files: list[dict[str, Any]] = []
         visited: set[str] = set()
@@ -909,7 +1012,7 @@ class Orchestrator:
                     continue
                 is_dir = self._volume_entry_is_dir(row, path)
                 if is_dir:
-                    if path == current:
+                    if path == current or not recursive:
                         continue
                     pending.append(path)
                 else:
@@ -933,13 +1036,13 @@ class Orchestrator:
         if model.backend == BackendType.LLAMACPP:
             if model.model_id.startswith("legacy:"):
                 for path in sorted(set(model.paths or [])):
-                    targets.append((model.source_volume or "llamacpp-cache", path, False))
+                    targets.append((model.source_volume or self._LLAMACPP_STORAGE_VOLUME, path, False))
             else:
                 revision = model.revision or "main"
                 repo_slug = model.model_id.replace("/", "__")
                 targets.append(
                     (
-                        model.source_volume or "llamacpp-cache",
+                        model.source_volume or self._LLAMACPP_STORAGE_VOLUME,
                         f"/models/{repo_slug}/{revision}",
                         True,
                     )
@@ -950,7 +1053,7 @@ class Orchestrator:
             encoded = model.model_id.replace("/", "--")
             targets.append(
                 (
-                    model.source_volume or "huggingface-cache",
+                    model.source_volume or self._VLLM_STORAGE_VOLUME,
                     f"/hub/models--{encoded}",
                     True,
                 )
@@ -1046,3 +1149,5 @@ class Orchestrator:
         )
         yield LogEvent(line=f"Stopping app: {target_app_name}")
         yield from ModalBackend.run_streaming(cmd)
+    _LLAMACPP_STORAGE_VOLUME = "huggingface-cache"
+    _VLLM_STORAGE_VOLUME = "huggingface-cache"

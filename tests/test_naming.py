@@ -9,6 +9,7 @@ from llm_launchpad.core.naming import (
     infer_backend_from_app_name,
     infer_instance_from_app_name,
     legacy_app_name,
+    modal_function_name,
     slugify_instance_name,
 )
 from llm_launchpad.protocol.enums import BackendType
@@ -47,7 +48,10 @@ class NamingTests(unittest.TestCase):
         self.assertEqual(backend, BackendType.LLAMACPP)
         self.assertEqual(infer_instance_from_app_name(app_name, backend), "default")
 
+    def test_modal_function_name_appends_slug(self) -> None:
+        self.assertEqual(modal_function_name("serve", "alpha-bravo"), "serve-alpha-bravo")
+        self.assertEqual(modal_function_name("serve", None), "serve")
+
 
 if __name__ == "__main__":
     unittest.main()
-

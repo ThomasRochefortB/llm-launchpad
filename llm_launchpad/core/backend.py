@@ -14,6 +14,7 @@ from ..protocol.events import ErrorEvent, LogEvent, OperationCompleteEvent
 from ..protocol.models import DeploymentConfig, EndpointInfo, LaunchpadSettings
 from .naming import default_served_model_name
 from .naming import infer_backend_from_app_name, infer_instance_from_app_name, legacy_app_name
+from .naming import modal_function_name
 
 
 class ModalBackend:
@@ -95,9 +96,11 @@ class ModalBackend:
         username: str,
         backend: Optional[BackendType] = None,
         app_name: Optional[str] = None,
+        function_slug: Optional[str] = None,
     ) -> str:
         resolved = app_name or legacy_app_name(backend or BackendType.LLAMACPP)
-        return f"https://{username}--{resolved}-serve.modal.run"
+        serve_name = modal_function_name("serve", function_slug)
+        return f"https://{username}--{resolved}-{serve_name}.modal.run"
 
     @staticmethod
     def test_curl_command(
@@ -134,6 +137,8 @@ class ModalBackend:
         env: Dict[str, str] = {}
         if config.app_name:
             env["MODAL_APP_NAME"] = config.app_name
+        if config.function_slug:
+            env["MODAL_FUNCTION_SLUG"] = config.function_slug
         if config.backend != BackendType.VLLM:
             return env
         if config.model_name:

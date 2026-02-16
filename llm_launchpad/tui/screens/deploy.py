@@ -33,7 +33,7 @@ from ...core.naming import (
     slugify_instance_name,
 )
 from ...protocol.enums import BackendType
-from ...protocol.models import DeploymentConfig
+from ...protocol.models import DeploymentConfig, StorageSnapshot
 from ..gpu_config import (
     DEFAULT_GPU_COUNT,
     DEFAULT_GPU_TYPE,
@@ -46,6 +46,8 @@ from ..workers import (
     LlamaCppModelsLoaded,
     LlamaCppQuantsFailed,
     LlamaCppQuantsLoaded,
+    StorageFailed,
+    StorageLoaded,
     VllmModelsFailed,
     VllmModelsLoaded,
 )
@@ -66,6 +68,35 @@ class GpuTypesFailed(Message):
     def __init__(self, error: str) -> None:
         super().__init__()
         self.error = error
+
+
+def _cached_models_from_snapshot(snapshot: StorageSnapshot, backend: BackendType) -> list[ModelCandidate]:
+    rows = snapshot.llamacpp_models if backend == BackendType.LLAMACPP else snapshot.vllm_models
+    repo_by_key: dict[str, str] = {}
+    size_by_key: dict[str, int] = {}
+    quants_by_key: dict[str, set[str]] = {}
+
+    for row in rows:
+        repo_id = row.model_id.strip()
+        if not repo_id:
+            continue
+        key = repo_id.casefold()
+        if key not in repo_by_key:
+            repo_by_key[key] = repo_id
+        size_by_key[key] = size_by_key.get(key, 0) + max(0, row.size_bytes)
+        if backend == BackendType.LLAMACPP:
+            quant = (row.quant or "").strip().upper()
+            if quant:
+                quants_by_key.setdefault(key, set()).add(quant)
+
+    sorted_keys = sorted(repo_by_key, key=lambda key: (-size_by_key.get(key, 0), repo_by_key[key].casefold()))
+    return [
+        ModelCandidate(
+            repo_id=repo_by_key[key],
+            quantizations=tuple(sorted(quants_by_key.get(key, set()))) if backend == BackendType.LLAMACPP else (),
+        )
+        for key in sorted_keys
+    ]
 
 
 class BackendSelectScreen(Screen):
@@ -112,6 +143,7 @@ class LlamaCppDeployScreen(Screen):
 
             yield Static("[bold]Model ranking[/bold]  [dim](Top 10 GGUF text-generation models)[/dim]")
             yield OptionList(
+                Option("  Cached in storage", id="rank-cached"),
                 Option("  Most downloaded", id="rank-downloads"),
                 Option("  Trending", id="rank-trending"),
                 id="llama-rank-mode",
@@ -194,8 +226,10 @@ class LlamaCppDeployScreen(Screen):
         yield Footer()
 
     def on_mount(self) -> None:
-        self._rank_mode = "downloads"
+        self._rank_mode = "cached"
         self._ranked_models: list[ModelCandidate] = []
+        self._cached_models: list[ModelCandidate] = []
+        self._has_cached_snapshot = False
         self._repo_to_quants: dict[str, tuple[str, ...]] = {}
         self._last_quant_lookup: tuple[str, str] | None = None
         self._updating_quant_input = False
@@ -203,20 +237,32 @@ class LlamaCppDeployScreen(Screen):
         self._selected_gpu_type = DEFAULT_GPU_TYPE
         for widget in self.query(".llama-advanced"):
             widget.add_class("hidden")
+        rank_mode_list = self.query_one("#llama-rank-mode", OptionList)
+        if rank_mode_list.option_count > 0:
+            rank_mode_list.highlighted = 0
         self._refresh_gpu_types()
-        self.app.begin_fetch_llamacpp_models(self._rank_mode, self)  # type: ignore[attr-defined]
+        self._set_model_status("[dim]Loading cached models from storage...[/dim]")
+        self._refresh_cached_models_from_storage()
         self._refresh_app_preview()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option_list.id == "llama-rank-mode":
-            selected_mode = "downloads" if event.option.id == "rank-downloads" else "trending"
+            selected_mode = self._resolve_rank_mode(event.option.id or "")
+            if selected_mode is None:
+                return
             if selected_mode == self._rank_mode:
                 return
             self._rank_mode = selected_mode
             self._ranked_models = []
             self._set_model_status("[dim]Loading model suggestions...[/dim]")
             self.query_one("#llama-model-list", OptionList).set_options([])
-            self.app.begin_fetch_llamacpp_models(self._rank_mode, self)  # type: ignore[attr-defined]
+            if self._rank_mode == "cached":
+                self._set_model_status("[dim]Loading cached models from storage...[/dim]")
+                if self._has_cached_snapshot:
+                    self._show_cached_models()
+                self._refresh_cached_models_from_storage()
+            else:
+                self.app.begin_fetch_llamacpp_models(self._rank_mode, self)  # type: ignore[attr-defined]
             return
 
         if event.option_list.id == "llama-model-list":
@@ -310,6 +356,19 @@ class LlamaCppDeployScreen(Screen):
         else:
             self._set_model_status("[yellow]No matching GGUF text-generation models found.[/yellow]")
             self._repo_to_quants = {}
+
+    def on_storage_loaded(self, message: StorageLoaded) -> None:
+        self._cached_models = _cached_models_from_snapshot(message.snapshot, BackendType.LLAMACPP)
+        self._has_cached_snapshot = True
+        if self._rank_mode == "cached":
+            self._show_cached_models()
+
+    def on_storage_failed(self, message: StorageFailed) -> None:
+        if self._rank_mode != "cached":
+            return
+        self._ranked_models = []
+        self.query_one("#llama-model-list", OptionList).set_options([])
+        self._set_model_status(f"[yellow]Could not load cached models:[/yellow] {message.error}")
 
     def on_llama_cpp_models_failed(self, message: LlamaCppModelsFailed) -> None:
         if message.mode != self._rank_mode:
@@ -408,6 +467,37 @@ class LlamaCppDeployScreen(Screen):
 
     def _set_quant_status(self, text: str) -> None:
         self.query_one("#llama-quant-status", Static).update(text)
+
+    def _resolve_rank_mode(self, option_id: str) -> str | None:
+        if option_id == "rank-cached":
+            return "cached"
+        if option_id == "rank-downloads":
+            return "downloads"
+        if option_id == "rank-trending":
+            return "trending"
+        return None
+
+    def _refresh_cached_models_from_storage(self, force: bool = False) -> None:
+        refresher = getattr(self.app, "begin_storage_refresh", None)
+        if callable(refresher):
+            refresher(self, force=force)
+
+    def _show_cached_models(self) -> None:
+        self._ranked_models = list(self._cached_models)
+        self._repo_to_quants = {model.repo_id.casefold(): model.quantizations for model in self._ranked_models}
+        model_list = self.query_one("#llama-model-list", OptionList)
+        options = []
+        for idx, model in enumerate(self._ranked_models):
+            quant_preview = ", ".join(model.quantizations[:3]) if model.quantizations else "-"
+            if len(model.quantizations) > 3:
+                quant_preview = f"{quant_preview}, ..."
+            label = f"  {model.repo_id:<38} quants={quant_preview}"
+            options.append(Option(label, id=f"model-{idx}"))
+        model_list.set_options(options)
+        if self._ranked_models:
+            self._set_model_status("[dim]Cached models loaded. Select one to prefill repo-id.[/dim]")
+        else:
+            self._set_model_status("[yellow]No cached llama.cpp models found in storage.[/yellow]")
 
     def _apply_ranked_model_selection(self, option_id: str) -> None:
         if not option_id.startswith("model-"):
@@ -526,6 +616,7 @@ class VllmDeployScreen(Screen):
 
             yield Static("[bold]Model ranking[/bold]  [dim](Top 10 text-generation models)[/dim]")
             yield OptionList(
+                Option("  Cached in storage", id="rank-cached"),
                 Option("  Most downloaded", id="rank-downloads"),
                 Option("  Trending", id="rank-trending"),
                 id="vllm-rank-mode",
@@ -537,7 +628,6 @@ class VllmDeployScreen(Screen):
             yield FormField(
                 "Model name",
                 "model-name",
-                default="Qwen/Qwen3-4B-Thinking-2507-FP8",
             )
             yield Static("GPU configuration", classes="form-label")
             with Horizontal(id="gpu-config-row-vllm"):
@@ -626,29 +716,43 @@ class VllmDeployScreen(Screen):
         yield Footer()
 
     def on_mount(self) -> None:
-        self._rank_mode = "downloads"
+        self._rank_mode = "cached"
         self._ranked_models: list[ModelCandidate] = []
+        self._cached_models: list[ModelCandidate] = []
+        self._has_cached_snapshot = False
         self._selected_gpu_type = DEFAULT_GPU_TYPE
         self._served_alias_touched = False
         self._updating_served_alias = False
         self._last_auto_served_alias = ""
         for widget in self.query(".vllm-advanced"):
             widget.add_class("hidden")
+        rank_mode_list = self.query_one("#vllm-rank-mode", OptionList)
+        if rank_mode_list.option_count > 0:
+            rank_mode_list.highlighted = 0
         self._refresh_gpu_types()
+        self._set_model_status("[dim]Loading cached models from storage...[/dim]")
+        self._refresh_cached_models_from_storage()
         self._sync_served_alias_from_model(force=True)
-        self.app.begin_fetch_vllm_models(self._rank_mode, self)  # type: ignore[attr-defined]
         self._refresh_app_preview()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option_list.id == "vllm-rank-mode":
-            selected_mode = "downloads" if event.option.id == "rank-downloads" else "trending"
+            selected_mode = self._resolve_rank_mode(event.option.id or "")
+            if selected_mode is None:
+                return
             if selected_mode == self._rank_mode:
                 return
             self._rank_mode = selected_mode
             self._ranked_models = []
             self._set_model_status("[dim]Loading model suggestions...[/dim]")
             self.query_one("#vllm-model-list", OptionList).set_options([])
-            self.app.begin_fetch_vllm_models(self._rank_mode, self)  # type: ignore[attr-defined]
+            if self._rank_mode == "cached":
+                self._set_model_status("[dim]Loading cached models from storage...[/dim]")
+                if self._has_cached_snapshot:
+                    self._show_cached_models()
+                self._refresh_cached_models_from_storage()
+            else:
+                self.app.begin_fetch_vllm_models(self._rank_mode, self)  # type: ignore[attr-defined]
             return
 
         if event.option_list.id == "vllm-model-list":
@@ -752,6 +856,19 @@ class VllmDeployScreen(Screen):
         else:
             self._set_model_status("[yellow]No matching text-generation models found.[/yellow]")
 
+    def on_storage_loaded(self, message: StorageLoaded) -> None:
+        self._cached_models = _cached_models_from_snapshot(message.snapshot, BackendType.VLLM)
+        self._has_cached_snapshot = True
+        if self._rank_mode == "cached":
+            self._show_cached_models()
+
+    def on_storage_failed(self, message: StorageFailed) -> None:
+        if self._rank_mode != "cached":
+            return
+        self._ranked_models = []
+        self.query_one("#vllm-model-list", OptionList).set_options([])
+        self._set_model_status(f"[yellow]Could not load cached models:[/yellow] {message.error}")
+
     def on_vllm_models_failed(self, message: VllmModelsFailed) -> None:
         if message.mode != self._rank_mode:
             return
@@ -766,6 +883,30 @@ class VllmDeployScreen(Screen):
 
     def _set_model_status(self, text: str) -> None:
         self.query_one("#vllm-model-status", Static).update(text)
+
+    def _resolve_rank_mode(self, option_id: str) -> str | None:
+        if option_id == "rank-cached":
+            return "cached"
+        if option_id == "rank-downloads":
+            return "downloads"
+        if option_id == "rank-trending":
+            return "trending"
+        return None
+
+    def _refresh_cached_models_from_storage(self, force: bool = False) -> None:
+        refresher = getattr(self.app, "begin_storage_refresh", None)
+        if callable(refresher):
+            refresher(self, force=force)
+
+    def _show_cached_models(self) -> None:
+        self._ranked_models = list(self._cached_models)
+        model_list = self.query_one("#vllm-model-list", OptionList)
+        options = [Option(f"  {model.repo_id}", id=f"model-{idx}") for idx, model in enumerate(self._ranked_models)]
+        model_list.set_options(options)
+        if self._ranked_models:
+            self._set_model_status("[dim]Cached models loaded. Select one to prefill Model name.[/dim]")
+        else:
+            self._set_model_status("[yellow]No cached vLLM models found in storage.[/yellow]")
 
     def _apply_ranked_model_selection(self, option_id: str) -> None:
         if not option_id.startswith("model-"):

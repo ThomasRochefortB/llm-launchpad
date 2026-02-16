@@ -176,6 +176,15 @@ wheels = [
 ]
 
 [[package]]
+name = "coolname"
+version = "3.0.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/24/49/89681dae5d3fe5a2c8cbf108d12e3c10a5778b393ed5c3c2803faf49057b/coolname-3.0.0.tar.gz", hash = "sha256:01eb22437f77a904d5cb993842b3cd07e182e707014a82f3dfa31881968ecee1", size = 61161, upload-time = "2026-01-28T19:15:25.561Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/18/45/bd4b563055b87ccf007ec8b510d5a8cf963f3119951ab495b95a856364ec/coolname-3.0.0-py2.py3-none-any.whl", hash = "sha256:64fd6bc9dac1ef566eaa94e2829360c8dae8d63eb97d8853d39622d169849cbf", size = 39485, upload-time = "2026-01-28T19:15:24.205Z" },
+]
+
+[[package]]
 name = "coverage"
 version = "7.13.4"
 source = { registry = "https://pypi.org/simple" }
@@ -450,6 +459,7 @@ name = "llm-launchpad"
 version = "0.0.2"
 source = { editable = "." }
 dependencies = [
+    { name = "coolname" },
     { name = "huggingface-hub" },
     { name = "modal" },
     { name = "requests" },
@@ -466,6 +476,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "coolname", specifier = ">=2.2.0" },
     { name = "huggingface-hub", specifier = ">=0.26.2" },
     { name = "modal", specifier = ">=0.60.0" },
     { name = "requests", specifier = ">=2.32.0" },

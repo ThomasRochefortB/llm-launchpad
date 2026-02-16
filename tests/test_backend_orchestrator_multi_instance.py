@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from llm_launchpad.core.backend import ModalBackend, _extract_modal_app_rows
 from llm_launchpad.core.orchestrator import Orchestrator
 from llm_launchpad.protocol.enums import BackendType
-from llm_launchpad.protocol.events import LogEvent
+from llm_launchpad.protocol.events import LogEvent, OperationCompleteEvent
+from llm_launchpad.protocol.models import DeploymentConfig, LaunchpadSettings
 
 
 class BackendMultiInstanceTests(unittest.TestCase):
@@ -26,8 +28,36 @@ class BackendMultiInstanceTests(unittest.TestCase):
         url = ModalBackend.default_server_url("alice", app_name="vllm-qwen3")
         self.assertEqual(url, "https://alice--vllm-qwen3-serve.modal.run")
 
+    def test_default_server_url_accepts_function_slug(self) -> None:
+        url = ModalBackend.default_server_url(
+            "alice",
+            app_name="vllm-qwen3",
+            function_slug="alpha-bravo",
+        )
+        self.assertEqual(url, "https://alice--vllm-qwen3-serve-alpha-bravo.modal.run")
+
 
 class OrchestratorMultiInstanceTests(unittest.TestCase):
+    def test_deploy_assigns_and_forwards_function_slug(self) -> None:
+        orch = Orchestrator(config_store=SimpleNamespace(load=lambda: LaunchpadSettings()))
+        captured_env: list[dict[str, str] | None] = []
+
+        def _fake_run_streaming(command: list[str], env=None):  # type: ignore[no-untyped-def]
+            captured_env.append(env)
+            yield OperationCompleteEvent(success=True, exit_code=0)
+
+        config = DeploymentConfig(
+            backend=BackendType.VLLM,
+            app_name="vllm-qwen3",
+            do_deploy=True,
+        )
+        with patch("llm_launchpad.core.orchestrator.random_function_slug", return_value="alpha-bravo"):
+            with patch("llm_launchpad.core.backend.ModalBackend.run_streaming", side_effect=_fake_run_streaming):
+                list(orch.deploy(config))
+        self.assertEqual(config.function_slug, "alpha-bravo")
+        self.assertTrue(captured_env)
+        self.assertEqual(captured_env[0]["MODAL_FUNCTION_SLUG"], "alpha-bravo")
+
     def test_tail_logs_targets_explicit_app_name(self) -> None:
         orch = Orchestrator()
         captured: list[list[str]] = []
@@ -65,4 +95,3 @@ class OrchestratorMultiInstanceTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

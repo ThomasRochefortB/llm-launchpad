@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
@@ -24,6 +25,12 @@ def _human_bytes(size_bytes: int) -> str:
     return f"{size_bytes} B"
 
 
+def _model_label(row: StoredModelInfo) -> str:
+    if row.incomplete:
+        return f"{row.model_id} (INCOMPLETE)"
+    return row.model_id
+
+
 class StorageScreen(Screen):
     """View and pre-download backend model caches."""
 
@@ -41,6 +48,7 @@ class StorageScreen(Screen):
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="menu-container"):
             yield Static("[bold cyan]Storage[/bold cyan]  [dim]Cached models and pre-download[/dim]")
+            yield Static("[dim]Storage status appears here.[/dim]", id="storage-status")
             yield Static("")
             with Vertical(id="storage-controls"):
                 yield Static("[bold]Backend filter[/bold]")
@@ -70,7 +78,7 @@ class StorageScreen(Screen):
             )
             yield Input(placeholder="Quant pattern (llama.cpp only, optional)", id="storage-model-quant")
             yield Input(placeholder="Revision (optional)", id="storage-model-revision")
-            yield Static("[dim]Press p to pre-download using these values.[/dim]", id="storage-status")
+            yield Static("[dim]Press p to pre-download using these values.[/dim]")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -78,13 +86,23 @@ class StorageScreen(Screen):
         self._selected_filter: BackendType | None = self._initial_backend
         self._rows_by_key: dict[str, StoredModelInfo] = {}
         self._selected_model: StoredModelInfo | None = None
+        self._was_suspended = False
         table = self.query_one("#storage-table", DataTable)
         table.cursor_type = "row"
         table.zebra_stripes = True
         table.add_columns("backend", "model", "revision", "quant", "files", "size")
         if self._initial_backend is not None:
             self.query_one("#storage-model-backend", Input).value = self._initial_backend.value
-        self.app.begin_storage_refresh(self)  # type: ignore[attr-defined]
+        self._refresh_storage_snapshot()
+
+    def on_screen_suspend(self, _: events.ScreenSuspend) -> None:
+        self._was_suspended = True
+
+    def on_screen_resume(self, _: events.ScreenResume) -> None:
+        """Refresh storage when returning to this screen."""
+        if self._was_suspended:
+            self._was_suspended = False
+            self._refresh_storage_snapshot()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option_list.id == "storage-backend-filter":
@@ -142,7 +160,7 @@ class StorageScreen(Screen):
             self._rows_by_key[row_key] = row
             table.add_row(
                 row.backend.value,
-                row.model_id,
+                _model_label(row),
                 row.revision or "-",
                 row.quant or "-",
                 str(row.file_count),
@@ -151,8 +169,11 @@ class StorageScreen(Screen):
             )
 
     def action_refresh_storage(self) -> None:
+        self._refresh_storage_snapshot(force=True)
+
+    def _refresh_storage_snapshot(self, force: bool = False) -> None:
         self.query_one("#storage-status", Static).update("[dim]Refreshing storage snapshot...[/dim]")
-        self.app.begin_storage_refresh(self)  # type: ignore[attr-defined]
+        self.app.begin_storage_refresh(self, force=force)  # type: ignore[attr-defined]
 
     def action_predownload_selected(self) -> None:
         model_id = self.query_one("#storage-model-id", Input).value.strip()

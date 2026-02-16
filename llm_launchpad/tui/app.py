@@ -6,12 +6,17 @@ screen stack and bridges user actions to Core via threaded workers.
 
 from __future__ import annotations
 
+import json
+import threading
+import time
+from pathlib import Path
 from typing import Optional
 
 from textual.app import App
 from textual.binding import Binding
 
 from ..core.backend import ModalBackend
+from ..core.config import SETTINGS_DIR
 from ..core.hf_models import fetch_gguf_quantizations, list_llamacpp_candidates, list_vllm_candidates
 from ..core.naming import build_app_name, legacy_app_name
 from ..core.orchestrator import Orchestrator
@@ -19,6 +24,7 @@ from ..protocol.enums import BackendType
 from ..protocol.events import ErrorEvent, LogEvent, OperationCompleteEvent
 from ..protocol.models import EndpointInfo
 from ..protocol.models import DeploymentConfig
+from ..protocol.models import StoredModelInfo
 from ..protocol.models import StorageSnapshot
 
 from .screens.main_menu import MainMenuScreen
@@ -51,12 +57,19 @@ class WizardApp(App):
     BINDINGS = [
         Binding("q", "quit", "Quit", show=True, priority=True),
     ]
+    _STORAGE_CACHE_TTL_SECONDS = 20.0
 
     def __init__(self, **kwargs: object) -> None:
         super().__init__(**kwargs)
         self._orchestrator = Orchestrator()
         self._username: str = ""
         self._version: str = ""
+        self._storage_snapshot_cache: StorageSnapshot | None = None
+        self._storage_snapshot_cached_at_epoch: float = 0.0
+        self._storage_refresh_inflight = False
+        self._storage_refresh_lock = threading.Lock()
+        self._storage_cache_path = SETTINGS_DIR / "storage_snapshot.json"
+        self._load_persisted_storage_cache()
         try:
             from importlib.metadata import version
 
@@ -123,7 +136,11 @@ class WizardApp(App):
         # Warmup if requested and deploy was successful
         if config.do_warmup and config.do_deploy:
             target_app_name = config.app_name or legacy_app_name(config.backend)
-            url = ModalBackend.default_server_url(self._username, app_name=target_app_name)
+            url = ModalBackend.default_server_url(
+                self._username,
+                app_name=target_app_name,
+                function_slug=config.function_slug,
+            )
             for event in self._orchestrator.warmup(
                 backend=config.backend,
                 server_url=url,
@@ -243,7 +260,20 @@ class WizardApp(App):
     # Storage: list
     # ------------------------------------------------------------------
 
-    def begin_storage_refresh(self, receiver: object) -> None:
+    def begin_storage_refresh(self, receiver: object, force: bool = False) -> None:
+        poster = getattr(receiver, "post_message", None)
+        cache_age = time.time() - self._storage_snapshot_cached_at_epoch
+        if not force and self._storage_snapshot_cache is not None and poster is not None:
+            # Fast path: show the latest known snapshot immediately.
+            poster(StorageLoaded(snapshot=self._storage_snapshot_cache))
+            if cache_age <= self._STORAGE_CACHE_TTL_SECONDS:
+                return
+
+        with self._storage_refresh_lock:
+            if self._storage_refresh_inflight:
+                return
+            self._storage_refresh_inflight = True
+
         self.run_worker(
             lambda: self._run_storage_refresh(receiver),
             name="storage-refresh-worker",
@@ -252,23 +282,28 @@ class WizardApp(App):
 
     def _run_storage_refresh(self, receiver: object) -> None:
         poster = getattr(receiver, "post_message", None)
-        if poster is None:
-            return
-        result_snapshot: StorageSnapshot | None = None
-        for event in self._orchestrator.list_storage():
-            if isinstance(event, OperationCompleteEvent):
-                if event.success and isinstance(event.data, StorageSnapshot):
-                    result_snapshot = event.data
-                elif not event.success:
-                    poster(StorageFailed(error=event.detail or "Storage listing failed."))
-                    return
-            elif isinstance(event, ErrorEvent):
-                poster(StorageFailed(error=event.message))
+        try:
+            if poster is None:
                 return
-        if result_snapshot is not None:
-            poster(StorageLoaded(snapshot=result_snapshot))
-        else:
-            poster(StorageFailed(error="No storage data returned by backend."))
+            result_snapshot: StorageSnapshot | None = None
+            for event in self._orchestrator.list_storage():
+                if isinstance(event, OperationCompleteEvent):
+                    if event.success and isinstance(event.data, StorageSnapshot):
+                        result_snapshot = event.data
+                    elif not event.success:
+                        poster(StorageFailed(error=event.detail or "Storage listing failed."))
+                        return
+                elif isinstance(event, ErrorEvent):
+                    poster(StorageFailed(error=event.message))
+                    return
+            if result_snapshot is not None:
+                self._cache_storage_snapshot(result_snapshot)
+                poster(StorageLoaded(snapshot=result_snapshot))
+            else:
+                poster(StorageFailed(error="No storage data returned by backend."))
+        finally:
+            with self._storage_refresh_lock:
+                self._storage_refresh_inflight = False
 
     # ------------------------------------------------------------------
     # Storage: predownload
@@ -309,6 +344,8 @@ class WizardApp(App):
             quant=quant,
             revision=revision,
         ):
+            if isinstance(event, OperationCompleteEvent) and event.success:
+                self._invalidate_storage_cache()
             _dispatch_event(monitor, event)
 
     def begin_storage_delete(self, model: StoredModelInfo) -> None:
@@ -326,7 +363,112 @@ class WizardApp(App):
         monitor: MonitorScreen,
     ):  # type: ignore[return]
         for event in self._orchestrator.delete_stored_model(model):
+            if isinstance(event, OperationCompleteEvent) and event.success:
+                self._invalidate_storage_cache()
             _dispatch_event(monitor, event)
+
+    def _cache_storage_snapshot(self, snapshot: StorageSnapshot) -> None:
+        with self._storage_refresh_lock:
+            self._storage_snapshot_cache = snapshot
+            self._storage_snapshot_cached_at_epoch = time.time()
+        self._persist_storage_snapshot(snapshot)
+
+    def _invalidate_storage_cache(self) -> None:
+        with self._storage_refresh_lock:
+            self._storage_snapshot_cache = None
+            self._storage_snapshot_cached_at_epoch = 0.0
+        try:
+            self._storage_cache_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+    def _persist_storage_snapshot(self, snapshot: StorageSnapshot) -> None:
+        payload = {
+            "cached_at_epoch": time.time(),
+            "snapshot": self._snapshot_to_dict(snapshot),
+        }
+        try:
+            self._storage_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            self._storage_cache_path.write_text(json.dumps(payload))
+        except Exception:
+            pass
+
+    def _load_persisted_storage_cache(self) -> None:
+        try:
+            if not self._storage_cache_path.exists():
+                return
+            payload = json.loads(self._storage_cache_path.read_text())
+            snapshot_payload = payload.get("snapshot")
+            if not isinstance(snapshot_payload, dict):
+                return
+            snapshot = self._snapshot_from_dict(snapshot_payload)
+            if snapshot is None:
+                return
+            self._storage_snapshot_cache = snapshot
+            self._storage_snapshot_cached_at_epoch = float(payload.get("cached_at_epoch", 0.0) or 0.0)
+        except Exception:
+            self._storage_snapshot_cache = None
+            self._storage_snapshot_cached_at_epoch = 0.0
+
+    @staticmethod
+    def _model_to_dict(model: StoredModelInfo) -> dict[str, object]:
+        return {
+            "backend": model.backend.value,
+            "model_id": model.model_id,
+            "revision": model.revision,
+            "quant": model.quant,
+            "size_bytes": model.size_bytes,
+            "file_count": model.file_count,
+            "source_volume": model.source_volume,
+            "paths": model.paths or [],
+            "incomplete": model.incomplete,
+        }
+
+    @staticmethod
+    def _model_from_dict(payload: dict[str, object]) -> StoredModelInfo | None:
+        backend_raw = str(payload.get("backend", "")).strip().lower()
+        if backend_raw not in {"llamacpp", "vllm"}:
+            return None
+        return StoredModelInfo(
+            backend=BackendType(backend_raw),
+            model_id=str(payload.get("model_id", "")).strip(),
+            revision=str(payload.get("revision")) if payload.get("revision") not in {None, ""} else None,
+            quant=str(payload.get("quant")) if payload.get("quant") not in {None, ""} else None,
+            size_bytes=int(payload.get("size_bytes", 0) or 0),
+            file_count=int(payload.get("file_count", 0) or 0),
+            source_volume=str(payload.get("source_volume", "") or ""),
+            paths=[str(path) for path in list(payload.get("paths", []) or [])],
+            incomplete=bool(payload.get("incomplete", False)),
+        )
+
+    @classmethod
+    def _snapshot_to_dict(cls, snapshot: StorageSnapshot) -> dict[str, object]:
+        return {
+            "llamacpp_models": [cls._model_to_dict(model) for model in snapshot.llamacpp_models],
+            "vllm_models": [cls._model_to_dict(model) for model in snapshot.vllm_models],
+        }
+
+    @classmethod
+    def _snapshot_from_dict(cls, payload: dict[str, object]) -> StorageSnapshot | None:
+        llamacpp_payload = payload.get("llamacpp_models")
+        vllm_payload = payload.get("vllm_models")
+        if not isinstance(llamacpp_payload, list) or not isinstance(vllm_payload, list):
+            return None
+        llamacpp_models: list[StoredModelInfo] = []
+        for row in llamacpp_payload:
+            if not isinstance(row, dict):
+                continue
+            model = cls._model_from_dict(row)
+            if model is not None:
+                llamacpp_models.append(model)
+        vllm_models: list[StoredModelInfo] = []
+        for row in vllm_payload:
+            if not isinstance(row, dict):
+                continue
+            model = cls._model_from_dict(row)
+            if model is not None:
+                vllm_models.append(model)
+        return StorageSnapshot(llamacpp_models=llamacpp_models, vllm_models=vllm_models)
 
     # ------------------------------------------------------------------
     # vLLM model discovery
