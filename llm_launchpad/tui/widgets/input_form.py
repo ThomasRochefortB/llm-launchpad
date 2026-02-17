@@ -47,9 +47,10 @@ class FormField(Vertical):
     def compose(self) -> ComposeResult:
         yield Static(self._label, classes="form-label")
         validators = [Length(minimum=1)] if self._required else []
+        placeholder = "" if self._hint else self._label
         yield Input(
             value=self._default,
-            placeholder=self._hint or self._label,
+            placeholder=placeholder,
             password=self._password,
             id=self._field_id,
             validators=validators,

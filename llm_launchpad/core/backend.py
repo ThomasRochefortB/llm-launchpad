@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import threading
@@ -103,28 +105,47 @@ class ModalBackend:
         return f"https://{username}--{resolved}-{serve_name}.modal.run"
 
     @staticmethod
+    def extract_modal_web_url(line: str) -> Optional[str]:
+        """Extract the first Modal web URL from an output line."""
+        match = re.search(r"https://[A-Za-z0-9-]+\.modal\.run", line or "")
+        return match.group(0) if match else None
+
+    @staticmethod
     def test_curl_command(
         backend: BackendType,
         server_url: str,
         served_model_name: Optional[str] = None,
     ) -> str:
         base = server_url.rstrip("/")
+        content = "Say hello in one short sentence."
+
+        def _curl_json(endpoint: str, payload: Dict[str, Any]) -> str:
+            body = shlex.quote(json.dumps(payload, separators=(",", ":")))
+            return (
+                f"curl -s -X POST {base}{endpoint} "
+                "-H 'Content-Type: application/json' "
+                f"-d {body}"
+            )
+
         if backend == BackendType.VLLM:
             model = (served_model_name or "").strip() or os.environ.get(
                 "SERVED_MODEL_NAME",
                 default_served_model_name(os.environ.get("MODEL_NAME")),
             )
-            return (
-                f"curl -s -X POST {base}/v1/chat/completions "
-                "-H 'Content-Type: application/json' "
-                f"-d '{{\"model\":\"{model}\",\"messages\":[{{\"role\":\"user\","
-                "\"content\":\"Say hello in one short sentence.\"}]}'"
+            return _curl_json(
+                "/v1/chat/completions",
+                {
+                    "model": model,
+                    "messages": [{"role": "user", "content": content}],
+                },
             )
-        return (
-            f"curl -s -X POST {base}/v1/completions "
-            "-H 'Content-Type: application/json' "
-            "-d '{\"model\":\"default\",\"prompt\":\"Say hello in one short sentence.\","
-            "\"max_tokens\":32}'"
+        return _curl_json(
+            "/v1/completions",
+            {
+                "model": "default",
+                "prompt": content,
+                "max_tokens": 32,
+            },
         )
 
     # ------------------------------------------------------------------
@@ -165,8 +186,9 @@ class ModalBackend:
         config: DeploymentConfig,
     ) -> Dict[str, str]:
         env = settings.to_env()
-        if config.gpu_type and config.gpu_count is not None and config.gpu_count > 0:
-            env["GPU_CONFIG"] = f"{config.gpu_type.strip().upper()}:{config.gpu_count}"
+        gpu_type = (config.gpu_type or "").strip()
+        if gpu_type and config.gpu_count is not None and config.gpu_count > 0:
+            env["GPU_CONFIG"] = f"{gpu_type.upper()}:{config.gpu_count}"
         env.update(ModalBackend.env_for_backend(config))
         return env
 
@@ -251,7 +273,7 @@ class ModalBackend:
 
     @staticmethod
     def list_apps() -> Optional[List[EndpointInfo]]:
-        """Return parsed app list, or None on failure."""
+        """Return parsed app list (possibly empty), or None on failure."""
         try:
             result = subprocess.run(
                 ["modal", "app", "list", "--json"],
@@ -268,8 +290,7 @@ class ModalBackend:
         except Exception:
             return None
 
-        rows = _extract_modal_app_rows(payload)
-        return rows if rows else None
+        return _extract_modal_app_rows(payload)
 
     @staticmethod
     def list_apps_raw() -> Optional[str]:

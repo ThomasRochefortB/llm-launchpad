@@ -36,9 +36,37 @@ class BackendMultiInstanceTests(unittest.TestCase):
         )
         self.assertEqual(url, "https://alice--vllm-qwen3-serve-alpha-bravo.modal.run")
 
+    def test_extract_modal_web_url_parses_deploy_line(self) -> None:
+        line = (
+            "└── 🔨 Created web function serve-discerning-tapir => "
+            "https://alice--vllm-minimax-m2-5-serve-disc-42c728.modal.run (label truncated)"
+        )
+        parsed = ModalBackend.extract_modal_web_url(line)
+        self.assertEqual(parsed, "https://alice--vllm-minimax-m2-5-serve-disc-42c728.modal.run")
+
 
 class OrchestratorMultiInstanceTests(unittest.TestCase):
-    def test_deploy_assigns_and_forwards_function_slug(self) -> None:
+    def test_deploy_assigns_and_forwards_function_slug_for_non_vllm(self) -> None:
+        orch = Orchestrator(config_store=SimpleNamespace(load=lambda: LaunchpadSettings()))
+        captured_env: list[dict[str, str] | None] = []
+
+        def _fake_run_streaming(command: list[str], env=None):  # type: ignore[no-untyped-def]
+            captured_env.append(env)
+            yield OperationCompleteEvent(success=True, exit_code=0)
+
+        config = DeploymentConfig(
+            backend=BackendType.LLAMACPP,
+            app_name="llamacpp-qwen3",
+            do_deploy=True,
+        )
+        with patch("llm_launchpad.core.orchestrator.random_function_slug", return_value="alpha-bravo"):
+            with patch("llm_launchpad.core.backend.ModalBackend.run_streaming", side_effect=_fake_run_streaming):
+                list(orch.deploy(config))
+        self.assertEqual(config.function_slug, "alpha-bravo")
+        self.assertTrue(captured_env)
+        self.assertEqual(captured_env[0]["MODAL_FUNCTION_SLUG"], "alpha-bravo")
+
+    def test_deploy_does_not_auto_assign_function_slug_for_vllm(self) -> None:
         orch = Orchestrator(config_store=SimpleNamespace(load=lambda: LaunchpadSettings()))
         captured_env: list[dict[str, str] | None] = []
 
@@ -54,9 +82,9 @@ class OrchestratorMultiInstanceTests(unittest.TestCase):
         with patch("llm_launchpad.core.orchestrator.random_function_slug", return_value="alpha-bravo"):
             with patch("llm_launchpad.core.backend.ModalBackend.run_streaming", side_effect=_fake_run_streaming):
                 list(orch.deploy(config))
-        self.assertEqual(config.function_slug, "alpha-bravo")
+        self.assertIsNone(config.function_slug)
         self.assertTrue(captured_env)
-        self.assertEqual(captured_env[0]["MODAL_FUNCTION_SLUG"], "alpha-bravo")
+        self.assertNotIn("MODAL_FUNCTION_SLUG", captured_env[0] or {})
 
     def test_tail_logs_targets_explicit_app_name(self) -> None:
         orch = Orchestrator()
@@ -91,6 +119,25 @@ class OrchestratorMultiInstanceTests(unittest.TestCase):
         self.assertTrue(captured)
         self.assertEqual(captured[0], ["modal", "app", "stop", "vllm-qwen2-5"])
         self.assertTrue(any(isinstance(event, LogEvent) for event in events))
+
+    def test_list_deployments_handles_empty_json_as_success(self) -> None:
+        orch = Orchestrator()
+        with patch("llm_launchpad.core.backend.ModalBackend.list_apps", return_value=[]):
+            with patch("llm_launchpad.core.backend.ModalBackend.list_apps_raw") as raw_mock:
+                events = list(orch.list_deployments())
+        raw_mock.assert_not_called()
+        self.assertTrue(
+            any(isinstance(event, LogEvent) and event.line == "No launchpad deployments found." for event in events)
+        )
+        self.assertTrue(
+            any(
+                isinstance(event, OperationCompleteEvent)
+                and event.success
+                and isinstance(event.data, list)
+                and len(event.data) == 0
+                for event in events
+            )
+        )
 
 
 if __name__ == "__main__":

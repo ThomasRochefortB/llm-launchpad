@@ -70,6 +70,12 @@ def _ensure(ok: bool, msg: str) -> None:
         raise typer.Exit(code=1)
 
 
+def _raise_on_failed_completion(event: object) -> None:
+    """Exit when an operation-complete event reports failure."""
+    if isinstance(event, OperationCompleteEvent) and not event.success:
+        raise typer.Exit(code=event.exit_code or 1)
+
+
 def _preflight() -> tuple[Orchestrator, str]:
     orch = Orchestrator()
     ok, username, err = orch.preflight()
@@ -249,16 +255,19 @@ def deploy(
         f"Deploy target: backend={bt.value} instance={resolved_instance} app={resolved_app_name}"
     )
 
+    deployed_web_url: Optional[str] = None
     for event in orch.deploy(config):
+        if isinstance(event, LogEvent):
+            maybe_url = ModalBackend.extract_modal_web_url(event.line)
+            if maybe_url:
+                deployed_web_url = maybe_url
         _print_event(event)
-        if isinstance(event, OperationCompleteEvent) and not event.success:
-            raise typer.Exit(code=event.exit_code or 1)
+        _raise_on_failed_completion(event)
 
     if do_warmup:
-        url = server_url or ModalBackend.default_server_url(
+        url = server_url or deployed_web_url or ModalBackend.default_server_url(
             username,
             app_name=resolved_app_name,
-            function_slug=config.function_slug,
         )
         for event in orch.warmup(
             bt,
@@ -269,6 +278,7 @@ def deploy(
             served_model_name=config.served_model_name,
         ):
             _print_event(event)
+            _raise_on_failed_completion(event)
 
     raise typer.Exit(code=0)
 
@@ -301,6 +311,7 @@ def warmup(
     )
     for event in orch.warmup(bt, url, timeout, tail_logs, app_name=target_app_name):
         _print_event(event)
+        _raise_on_failed_completion(event)
 
 
 @app.command("list")
@@ -456,13 +467,11 @@ def switch(
             config.do_deploy = True
             for event in orch.deploy(config):
                 _print_event(event)
-                if isinstance(event, OperationCompleteEvent) and not event.success:
-                    raise typer.Exit(code=event.exit_code or 1)
+                _raise_on_failed_completion(event)
             if do_warmup:
                 url = server_url or ModalBackend.default_server_url(
                     username,
                     app_name=resolved_app_name,
-                    function_slug=config.function_slug,
                 )
                 for event in orch.warmup(
                     bt,
@@ -473,6 +482,7 @@ def switch(
                     served_model_name=config.served_model_name,
                 ):
                     _print_event(event)
+                    _raise_on_failed_completion(event)
         else:
             typer.echo("No deploy performed. Use --redeploy to apply vLLM model changes.")
         raise typer.Exit(code=0)
@@ -484,8 +494,7 @@ def switch(
     # Run model switch (no deploy)
     for event in orch.deploy(config):
         _print_event(event)
-        if isinstance(event, OperationCompleteEvent) and not event.success:
-            raise typer.Exit(code=event.exit_code or 1)
+        _raise_on_failed_completion(event)
 
     if redeploy:
         deploy_config = DeploymentConfig(backend=bt, do_deploy=True)
@@ -502,10 +511,10 @@ def switch(
             url = server_url or ModalBackend.default_server_url(
                 username,
                 app_name=resolved_app_name,
-                function_slug=deploy_config.function_slug,
             )
             for event in orch.warmup(bt, url, timeout, tail_logs, app_name=resolved_app_name):
                 _print_event(event)
+                _raise_on_failed_completion(event)
 
     raise typer.Exit(code=0)
 

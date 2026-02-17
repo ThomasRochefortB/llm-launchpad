@@ -19,6 +19,8 @@ class _TestApp(App[None]):
         self.fetch_calls: list[str] = []
         self.quant_fetch_calls: list[tuple[str, str | None]] = []
         self.storage_refresh_calls: list[bool] = []
+        self.predownload_calls: list[tuple[BackendType, str, str | None, str | None]] = []
+        self.notifications: list[tuple[str, str]] = []
         self.deployed_config = None
 
     def begin_fetch_llamacpp_models(self, mode: str, receiver: object) -> None:
@@ -32,6 +34,18 @@ class _TestApp(App[None]):
 
     def begin_deploy(self, config) -> None:  # type: ignore[no-untyped-def]
         self.deployed_config = config
+
+    def begin_storage_predownload(
+        self,
+        backend: BackendType,
+        model_id: str,
+        quant: str | None = None,
+        revision: str | None = None,
+    ) -> None:
+        self.predownload_calls.append((backend, model_id, quant, revision))
+
+    def notify(self, message: object, *, severity: str = "information", **kwargs: object) -> None:
+        self.notifications.append((str(message), severity))
 
 
 class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
@@ -176,6 +190,59 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app.deployed_config.n_gpu_layers, 99)
         self.assertEqual(app.deployed_config.gpu_count, 3)
         self.assertEqual(app.deployed_config.gpu_type, "A100-80GB")
+
+    async def test_predownload_uses_highlighted_model_from_rank_list(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+            screen.on_llama_cpp_models_loaded(
+                LlamaCppModelsLoaded(
+                    mode="cached",
+                    models=[
+                        ModelCandidate(
+                            repo_id="unsloth/Qwen3-Coder-Next-GGUF",
+                            downloads=1000,
+                            likes=10,
+                            quantizations=("Q4_K_M", "Q5_K_M"),
+                        ),
+                        ModelCandidate(
+                            repo_id="Qwen/Qwen3-Coder-Next-GGUF",
+                            downloads=900,
+                            likes=8,
+                            quantizations=("Q6_K",),
+                        ),
+                    ],
+                )
+            )
+            model_list = screen.query_one("#llama-model-list", OptionList)
+            model_list.highlighted = 1
+            await pilot.pause()
+            screen.query_one("#quant", Input).value = "Q6_K"
+            screen.query_one("#revision", Input).value = "main"
+
+            screen.action_predownload_highlighted()
+
+            self.assertEqual(
+                app.predownload_calls,
+                [(BackendType.LLAMACPP, "Qwen/Qwen3-Coder-Next-GGUF", "Q6_K", "main")],
+            )
+
+    async def test_predownload_requires_highlighted_model(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+            screen.action_predownload_highlighted()
+
+            self.assertEqual(app.predownload_calls, [])
+            self.assertEqual(app.notifications[-1], ("Highlight a model in Model ranking first.", "warning"))
 
     async def test_instance_and_app_override_behavior(self) -> None:
         app = _TestApp()

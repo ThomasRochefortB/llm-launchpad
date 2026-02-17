@@ -229,6 +229,54 @@ Button:focus {
     height: 1;
 }
 
+.form-section-title {
+    color: $primary;
+    text-style: bold;
+    height: 1;
+}
+
+.form-section-subtitle {
+    color: $text-disabled;
+    height: 1;
+    padding: 0 0 1 0;
+}
+
+/* ---- Deploy form polish ---- */
+
+LlamaCppDeployScreen .form-label,
+VllmDeployScreen .form-label {
+    color: $text;
+    text-style: bold;
+}
+
+LlamaCppDeployScreen .form-hint,
+VllmDeployScreen .form-hint,
+LlamaCppDeployScreen .form-section-subtitle,
+VllmDeployScreen .form-section-subtitle {
+    color: $text-muted;
+}
+
+LlamaCppDeployScreen Input,
+VllmDeployScreen Input,
+LlamaCppDeployScreen Select,
+VllmDeployScreen Select {
+    border: tall $primary 40%;
+}
+
+LlamaCppDeployScreen Input:focus,
+VllmDeployScreen Input:focus,
+LlamaCppDeployScreen Select:focus,
+VllmDeployScreen Select:focus {
+    border: tall $primary;
+    background: $primary 8%;
+}
+
+LlamaCppDeployScreen .gpu-config-panel,
+VllmDeployScreen .gpu-config-panel {
+    border: tall $primary 60%;
+    background: $primary-background 15%;
+}
+
 /* ---- Monitor screen ---- */
 
 #monitor-layout {
@@ -279,6 +327,21 @@ Button:focus {
     height: auto;
 }
 
+.gpu-config-panel {
+    width: 100%;
+    height: auto;
+    margin: 0 0 1 0;
+    padding: 0 1 1 1;
+    border: tall $primary-background;
+    background: $surface;
+}
+
+.gpu-config-main-row {
+    width: 100%;
+    height: auto;
+    padding: 0 0 1 0;
+}
+
 #gpu-type-group-llama,
 #gpu-type-group-vllm {
     width: 2fr;
@@ -290,11 +353,16 @@ Button:focus {
 #gpu-count-group-vllm {
     width: 1fr;
     height: auto;
+    padding: 0 0 0 1;
 }
 
 #gpu-count-llama,
 #gpu-count-vllm {
-    height: 5;
+    height: 3;
+}
+
+.gpu-config-tensor-field {
+    padding: 0;
 }
 
 /* ---- Utility classes ---- */

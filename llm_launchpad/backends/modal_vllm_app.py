@@ -4,7 +4,6 @@ from pathlib import Path
 from typing import Any
 
 import aiohttp
-from coolname import generate_slug
 import modal
 
 
@@ -24,26 +23,6 @@ MINUTES = 60
 VLLM_PORT = 8000
 HF_CACHE_DIR = "/root/.cache/huggingface"
 HF_HUB_DIR = Path(HF_CACHE_DIR) / "hub"
-
-
-def _slugify_name(raw: str) -> str:
-    return "".join(ch if ch.isalnum() or ch == "-" else "-" for ch in raw.lower()).strip("-")
-
-
-def _read_function_slug() -> str:
-    raw = os.environ.get("MODAL_FUNCTION_SLUG", "").strip()
-    if raw:
-        slug = _slugify_name(raw)
-        if slug:
-            return slug
-    return _slugify_name(generate_slug(2))
-
-
-FUNCTION_SLUG = _read_function_slug()
-
-
-def _function_name(base_name: str) -> str:
-    return f"{base_name}-{FUNCTION_SLUG}"
 
 
 def _read_str_env(name: str, default: str) -> str:
@@ -111,8 +90,6 @@ vllm_image = (
 
 
 @app.function(
-    name=_function_name("predownload-model"),
-    serialized=True,
     image=vllm_image,
     timeout=PREDOWNLOAD_TIMEOUT_MINUTES * MINUTES,
     volumes={
@@ -138,8 +115,6 @@ def predownload_model(
 
 
 @app.function(
-    name=_function_name("list-downloaded-models"),
-    serialized=True,
     image=vllm_image,
     timeout=10 * MINUTES,
     volumes={
@@ -182,8 +157,6 @@ def list_downloaded_models() -> list[dict[str, Any]]:
 
 
 @app.function(
-    name=_function_name("serve"),
-    serialized=True,
     image=vllm_image,
     gpu=DEPLOY_GPU_CONFIG,
     scaledown_window=15 * MINUTES,

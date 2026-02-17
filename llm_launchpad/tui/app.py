@@ -130,16 +130,23 @@ class WizardApp(App):
 
     def _run_deploy(self, config: DeploymentConfig, monitor: MonitorScreen):  # type: ignore[return]
         """Generator consumed by run_worker in a thread."""
+        deployed_web_url: Optional[str] = None
+        deploy_succeeded = False
         for event in self._orchestrator.deploy(config):
+            if isinstance(event, LogEvent):
+                maybe_url = ModalBackend.extract_modal_web_url(event.line)
+                if maybe_url:
+                    deployed_web_url = maybe_url
+            elif isinstance(event, OperationCompleteEvent):
+                deploy_succeeded = event.success
             _dispatch_event(monitor, event)
 
         # Warmup if requested and deploy was successful
-        if config.do_warmup and config.do_deploy:
+        if config.do_warmup and config.do_deploy and deploy_succeeded:
             target_app_name = config.app_name or legacy_app_name(config.backend)
-            url = ModalBackend.default_server_url(
+            url = deployed_web_url or ModalBackend.default_server_url(
                 self._username,
                 app_name=target_app_name,
-                function_slug=config.function_slug,
             )
             for event in self._orchestrator.warmup(
                 backend=config.backend,
@@ -429,6 +436,13 @@ class WizardApp(App):
         backend_raw = str(payload.get("backend", "")).strip().lower()
         if backend_raw not in {"llamacpp", "vllm"}:
             return None
+        paths_value = payload.get("paths")
+        if isinstance(paths_value, str):
+            paths = [paths_value] if paths_value.strip() else []
+        elif isinstance(paths_value, (list, tuple)):
+            paths = [str(path) for path in paths_value if str(path).strip()]
+        else:
+            paths = []
         return StoredModelInfo(
             backend=BackendType(backend_raw),
             model_id=str(payload.get("model_id", "")).strip(),
@@ -437,7 +451,7 @@ class WizardApp(App):
             size_bytes=int(payload.get("size_bytes", 0) or 0),
             file_count=int(payload.get("file_count", 0) or 0),
             source_volume=str(payload.get("source_volume", "") or ""),
-            paths=[str(path) for path in list(payload.get("paths", []) or [])],
+            paths=paths,
             incomplete=bool(payload.get("incomplete", False)),
         )
 
