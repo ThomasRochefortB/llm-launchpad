@@ -48,6 +48,16 @@ class BackendEnvTests(unittest.TestCase):
         self.assertEqual(env["GPU_CONFIG"], "H100:2")
         self.assertEqual(env["SCALEDOWN_WINDOW"], "900")
 
+    def test_build_full_env_ignores_blank_gpu_type(self) -> None:
+        settings = LaunchpadSettings()
+        config = DeploymentConfig(
+            backend=BackendType.LLAMACPP,
+            gpu_type="   ",
+            gpu_count=2,
+        )
+        env = ModalBackend.build_full_env(settings, config)
+        self.assertNotIn("GPU_CONFIG", env)
+
     def test_vllm_n_gpu_is_independent_from_deployment_gpu_count(self) -> None:
         settings = LaunchpadSettings()
         config = DeploymentConfig(

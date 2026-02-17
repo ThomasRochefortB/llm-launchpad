@@ -135,6 +135,44 @@ class CliMainCommandTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0)
         self.assertTrue(captured["config"].trust_remote_code)
 
+    def test_deploy_warmup_prefers_deployed_web_url_from_logs(self) -> None:
+        warmup_calls: list[str] = []
+
+        def _deploy(_config):  # type: ignore[no-untyped-def]
+            return [
+                LogEvent(
+                    line=(
+                        "└── 🔨 Created web function serve-discerning-tapir => "
+                        "https://alice--vllm-test-serve-disc-42c728.modal.run (label truncated)"
+                    )
+                ),
+                OperationCompleteEvent(operation=OperationType.DEPLOY, success=True, exit_code=0),
+            ]
+
+        def _warmup(
+            _backend: BackendType,
+            url: str,
+            _timeout: int,
+            _tail_logs: bool,
+            app_name: str | None = None,
+            served_model_name: str | None = None,
+        ):
+            warmup_calls.append(url)
+            return []
+
+        orch = SimpleNamespace(deploy=_deploy, warmup=_warmup)
+        with patch("llm_launchpad.cli.main._preflight", return_value=(orch, "alice")):
+            with patch("llm_launchpad.cli.main._print_banner", return_value=None):
+                result = self.runner.invoke(
+                    cli_main.app,
+                    ["deploy", "--backend", "vllm", "--app-name", "vllm-test", "--do-warmup"],
+                )
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(
+            warmup_calls,
+            ["https://alice--vllm-test-serve-disc-42c728.modal.run"],
+        )
+
     def test_status_failure_returns_exit_code_1(self) -> None:
         orch = SimpleNamespace(
             check_status=lambda *_args, **_kwargs: [
@@ -217,6 +255,53 @@ class CliMainCommandTests(unittest.TestCase):
                 )
             ],
         )
+
+    def test_warmup_failure_returns_nonzero_exit_code(self) -> None:
+        orch = SimpleNamespace(
+            warmup=lambda *_args, **_kwargs: [
+                OperationCompleteEvent(
+                    operation=OperationType.WARMUP,
+                    success=False,
+                    exit_code=7,
+                    detail="timeout",
+                ),
+            ]
+        )
+        with patch("llm_launchpad.cli.main._preflight", return_value=(orch, "alice")):
+            with patch("llm_launchpad.cli.main._print_banner", return_value=None):
+                result = self.runner.invoke(
+                    cli_main.app, ["warmup", "--backend", "vllm", "--app-name", "vllm-test"]
+                )
+        self.assertEqual(result.exit_code, 7)
+
+    def test_deploy_warmup_failure_returns_nonzero_exit_code(self) -> None:
+        orch = SimpleNamespace(
+            deploy=lambda _config: [
+                OperationCompleteEvent(operation=OperationType.DEPLOY, success=True, exit_code=0),
+            ],
+            warmup=lambda *_args, **_kwargs: [
+                OperationCompleteEvent(
+                    operation=OperationType.WARMUP,
+                    success=False,
+                    exit_code=11,
+                    detail="cold start failed",
+                ),
+            ],
+        )
+        with patch("llm_launchpad.cli.main._preflight", return_value=(orch, "alice")):
+            with patch("llm_launchpad.cli.main._print_banner", return_value=None):
+                result = self.runner.invoke(
+                    cli_main.app,
+                    [
+                        "deploy",
+                        "--backend",
+                        "vllm",
+                        "--app-name",
+                        "vllm-test",
+                        "--do-warmup",
+                    ],
+                )
+        self.assertEqual(result.exit_code, 11)
 
     def test_logs_passes_follow_and_app_name(self) -> None:
         calls: list[tuple[BackendType, bool, str | None]] = []

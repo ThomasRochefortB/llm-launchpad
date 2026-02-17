@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from llm_launchpad.core.backend import ModalBackend, _extract_modal_app_rows
 from llm_launchpad.protocol.enums import BackendType
@@ -8,6 +9,12 @@ from llm_launchpad.protocol.models import DeploymentConfig
 
 
 class BackendParsingAndCommandTests(unittest.TestCase):
+    @patch("llm_launchpad.core.backend.subprocess.run")
+    def test_list_apps_returns_empty_list_for_empty_json_payload(self, mock_run) -> None:  # type: ignore[no-untyped-def]
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stdout = "[]"
+        self.assertEqual(ModalBackend.list_apps(), [])
+
     def test_extract_modal_app_rows_accepts_apps_and_data_wrappers(self) -> None:
         wrapped_apps = {
             "apps": [
@@ -84,6 +91,16 @@ class BackendParsingAndCommandTests(unittest.TestCase):
             served_model_name="Qwen3-0.6B",
         )
         self.assertIn('"model":"Qwen3-0.6B"', cmd)
+
+    def test_test_curl_command_llamacpp_is_copy_paste_ready(self) -> None:
+        cmd = ModalBackend.test_curl_command(
+            BackendType.LLAMACPP,
+            "https://example.modal.run/",
+        )
+        self.assertTrue(
+            cmd.startswith("curl -s -X POST https://example.modal.run/v1/completions ")
+        )
+        self.assertIn('"prompt":"Say hello in one short sentence."', cmd)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,7 @@ class _TestApp(App[None]):
         super().__init__()
         self.fetch_calls: list[str] = []
         self.storage_refresh_calls: list[bool] = []
+        self.predownload_calls: list[tuple[BackendType, str, str | None, str | None]] = []
         self.deployed_config = None
         self.notifications: list[tuple[str, str]] = []
 
@@ -29,6 +30,15 @@ class _TestApp(App[None]):
 
     def begin_deploy(self, config) -> None:  # type: ignore[no-untyped-def]
         self.deployed_config = config
+
+    def begin_storage_predownload(
+        self,
+        backend: BackendType,
+        model_id: str,
+        quant: str | None = None,
+        revision: str | None = None,
+    ) -> None:
+        self.predownload_calls.append((backend, model_id, quant, revision))
 
     def notify(self, message: object, *, severity: str = "information", **kwargs: object) -> None:
         self.notifications.append((str(message), severity))
@@ -314,6 +324,53 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(app.deployed_config)
             self.assertEqual(app.deployed_config.gpu_count, 2)
             self.assertEqual(app.deployed_config.n_gpu, 4)
+
+    async def test_predownload_uses_highlighted_model_from_rank_list(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+            screen.on_storage_loaded(
+                StorageLoaded(
+                    snapshot=StorageSnapshot(
+                        llamacpp_models=[],
+                        vllm_models=[
+                            StoredModelInfo(
+                                backend=BackendType.VLLM,
+                                model_id="Qwen/Qwen3-4B-Thinking-2507-FP8",
+                                size_bytes=8192,
+                            )
+                        ],
+                    )
+                )
+            )
+            model_list = screen.query_one("#vllm-model-list", OptionList)
+            model_list.highlighted = 0
+            await pilot.pause()
+            screen.query_one("#model-revision", Input).value = "main"
+
+            screen.action_predownload_highlighted()
+
+            self.assertEqual(
+                app.predownload_calls,
+                [(BackendType.VLLM, "Qwen/Qwen3-4B-Thinking-2507-FP8", None, "main")],
+            )
+
+    async def test_predownload_requires_highlighted_model(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+            screen.action_predownload_highlighted()
+
+            self.assertEqual(app.predownload_calls, [])
+            self.assertEqual(app.notifications[-1], ("Highlight a model in Model ranking first.", "warning"))
 
     async def test_invalid_chat_template_kwargs_json_blocks_deploy(self) -> None:
         app = _TestApp()

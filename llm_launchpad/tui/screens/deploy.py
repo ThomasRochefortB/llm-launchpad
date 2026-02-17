@@ -99,6 +99,18 @@ def _cached_models_from_snapshot(snapshot: StorageSnapshot, backend: BackendType
     ]
 
 
+def _model_from_option_id(option_id: str, ranked_models: list[ModelCandidate]) -> ModelCandidate | None:
+    if not option_id.startswith("model-"):
+        return None
+    try:
+        idx = int(option_id.split("-", 1)[1])
+    except ValueError:
+        return None
+    if idx < 0 or idx >= len(ranked_models):
+        return None
+    return ranked_models[idx]
+
+
 class BackendSelectScreen(Screen):
     """Step 1: pick backend (llama.cpp or vLLM)."""
 
@@ -134,6 +146,7 @@ class LlamaCppDeployScreen(Screen):
         Binding("escape", "pop_screen", "Back", show=True),
         Binding("ctrl+d", "do_deploy", "Deploy", show=True),
         Binding("ctrl+s", "open_storage", "Storage", show=True),
+        Binding("p", "predownload_highlighted", "Pre-download", show=True),
     ]
 
     def compose(self) -> ComposeResult:
@@ -162,24 +175,26 @@ class LlamaCppDeployScreen(Screen):
             yield Static("")
 
             # Options
-            yield Static("GPU configuration", classes="form-label")
-            with Horizontal(id="gpu-config-row-llama"):
-                with Vertical(id="gpu-type-group-llama"):
-                    yield Static("GPU type", classes="form-label")
-                    yield Select(
-                        options=[(DEFAULT_GPU_TYPE, DEFAULT_GPU_TYPE)],
-                        prompt="Select GPU type",
-                        value=DEFAULT_GPU_TYPE,
-                        id="gpu-type-llama",
-                    )
-                with Vertical(id="gpu-count-group-llama"):
-                    yield Static("GPU count", classes="form-label")
-                    yield Input(
-                        value=str(DEFAULT_GPU_COUNT),
-                        placeholder="1",
-                        id="gpu-count-llama",
-                        type="integer",
-                    )
+            with Vertical(classes="gpu-config-panel"):
+                yield Static("GPU configuration", classes="form-section-title")
+                yield Static("Select the deployment GPU shape.", classes="form-section-subtitle")
+                with Horizontal(id="gpu-config-row-llama", classes="gpu-config-main-row"):
+                    with Vertical(id="gpu-type-group-llama"):
+                        yield Static("GPU type", classes="form-label")
+                        yield Select(
+                            options=[(DEFAULT_GPU_TYPE, DEFAULT_GPU_TYPE)],
+                            prompt="Select GPU type",
+                            value=DEFAULT_GPU_TYPE,
+                            id="gpu-type-llama",
+                        )
+                    with Vertical(id="gpu-count-group-llama"):
+                        yield Static("GPU count", classes="form-label")
+                        yield Input(
+                            value=str(DEFAULT_GPU_COUNT),
+                            placeholder="1",
+                            id="gpu-count-llama",
+                            type="integer",
+                        )
             yield ToggleField("Preload/download weights now", "preload", default=True)
             yield ToggleField("Deploy the server", "do-deploy", default=True)
             yield ToggleField("Warm up after deploy", "warmup", default=True)
@@ -405,6 +420,22 @@ class LlamaCppDeployScreen(Screen):
     def action_do_deploy(self) -> None:
         self._do_deploy()
 
+    def action_predownload_highlighted(self) -> None:
+        selected = self._highlighted_ranked_model()
+        if selected is None:
+            self.app.notify("Highlight a model in Model ranking first.", severity="warning", timeout=5)
+            return
+        quant = self.query_one("#quant", Input).value.strip() or None
+        if quant is None and selected.quantizations:
+            quant = selected.quantizations[0]
+        revision = self.query_one("#revision", Input).value.strip() or None
+        self.app.begin_storage_predownload(  # type: ignore[attr-defined]
+            backend=BackendType.LLAMACPP,
+            model_id=selected.repo_id,
+            quant=quant,
+            revision=revision,
+        )
+
     def _do_deploy(self) -> None:
         config = DeploymentConfig(backend=BackendType.LLAMACPP)
         config.repo_id = self.query_one("#repo-id", Input).value.strip() or None
@@ -500,15 +531,9 @@ class LlamaCppDeployScreen(Screen):
             self._set_model_status("[yellow]No cached llama.cpp models found in storage.[/yellow]")
 
     def _apply_ranked_model_selection(self, option_id: str) -> None:
-        if not option_id.startswith("model-"):
+        selected = _model_from_option_id(option_id, self._ranked_models)
+        if selected is None:
             return
-        try:
-            idx = int(option_id.split("-", 1)[1])
-        except ValueError:
-            return
-        if idx < 0 or idx >= len(self._ranked_models):
-            return
-        selected = self._ranked_models[idx]
         self.query_one("#repo-id", Input).value = selected.repo_id
         self._quant_touched = False
         if selected.quantizations:
@@ -516,6 +541,11 @@ class LlamaCppDeployScreen(Screen):
         else:
             self._lookup_quantizations_for_current_repo(force_refresh=True)
         self._refresh_app_preview()
+
+    def _highlighted_ranked_model(self) -> ModelCandidate | None:
+        highlighted = self.query_one("#llama-model-list", OptionList).highlighted_option
+        option_id = highlighted.id if highlighted is not None else ""
+        return _model_from_option_id(option_id or "", self._ranked_models)
 
     def _lookup_quantizations_for_current_repo(self, force_refresh: bool = False) -> None:
         repo_id = self.query_one("#repo-id", Input).value.strip()
@@ -607,6 +637,7 @@ class VllmDeployScreen(Screen):
         Binding("escape", "pop_screen", "Back", show=True),
         Binding("ctrl+d", "do_deploy", "Deploy", show=True),
         Binding("ctrl+s", "open_storage", "Storage", show=True),
+        Binding("p", "predownload_highlighted", "Pre-download", show=True),
     ]
 
     def compose(self) -> ComposeResult:
@@ -629,30 +660,36 @@ class VllmDeployScreen(Screen):
                 "Model name",
                 "model-name",
             )
-            yield Static("GPU configuration", classes="form-label")
-            with Horizontal(id="gpu-config-row-vllm"):
-                with Vertical(id="gpu-type-group-vllm"):
-                    yield Static("GPU type", classes="form-label")
-                    yield Select(
-                        options=[(DEFAULT_GPU_TYPE, DEFAULT_GPU_TYPE)],
-                        prompt="Select GPU type",
-                        value=DEFAULT_GPU_TYPE,
-                        id="gpu-type-vllm",
-                    )
-                with Vertical(id="gpu-count-group-vllm"):
-                    yield Static("Deployment GPU count", classes="form-label")
-                    yield Input(
-                        value=str(DEFAULT_GPU_COUNT),
-                        placeholder="1",
-                        id="gpu-count-vllm",
-                        type="integer",
-                    )
-            yield FormField(
-                "Tensor parallel size",
-                "n-gpu",
-                default="1",
-                hint="vLLM --tensor-parallel-size (separate from deployment GPU count)",
-            )
+            with Vertical(classes="gpu-config-panel"):
+                yield Static("GPU configuration", classes="form-section-title")
+                yield Static(
+                    "Choose deployment GPUs and in-replica tensor sharding.",
+                    classes="form-section-subtitle",
+                )
+                with Horizontal(id="gpu-config-row-vllm", classes="gpu-config-main-row"):
+                    with Vertical(id="gpu-type-group-vllm"):
+                        yield Static("GPU type", classes="form-label")
+                        yield Select(
+                            options=[(DEFAULT_GPU_TYPE, DEFAULT_GPU_TYPE)],
+                            prompt="Select GPU type",
+                            value=DEFAULT_GPU_TYPE,
+                            id="gpu-type-vllm",
+                        )
+                    with Vertical(id="gpu-count-group-vllm"):
+                        yield Static("Deployment GPU count", classes="form-label")
+                        yield Input(
+                            value=str(DEFAULT_GPU_COUNT),
+                            placeholder="1",
+                            id="gpu-count-vllm",
+                            type="integer",
+                        )
+                yield FormField(
+                    "Tensor parallel size",
+                    "n-gpu",
+                    default="1",
+                    hint="vLLM --tensor-parallel-size (separate from deployment GPU count)",
+                    classes="gpu-config-tensor-field",
+                )
             yield Button("Advanced options...", id="toggle-advanced-vllm", variant="default")
             yield FormField(
                 "Model revision (optional)",
@@ -881,6 +918,18 @@ class VllmDeployScreen(Screen):
     def action_do_deploy(self) -> None:
         self._do_deploy()
 
+    def action_predownload_highlighted(self) -> None:
+        selected = self._highlighted_ranked_model()
+        if selected is None:
+            self.app.notify("Highlight a model in Model ranking first.", severity="warning", timeout=5)
+            return
+        revision = self.query_one("#model-revision", Input).value.strip() or None
+        self.app.begin_storage_predownload(  # type: ignore[attr-defined]
+            backend=BackendType.VLLM,
+            model_id=selected.repo_id,
+            revision=revision,
+        )
+
     def _set_model_status(self, text: str) -> None:
         self.query_one("#vllm-model-status", Static).update(text)
 
@@ -909,16 +958,16 @@ class VllmDeployScreen(Screen):
             self._set_model_status("[yellow]No cached vLLM models found in storage.[/yellow]")
 
     def _apply_ranked_model_selection(self, option_id: str) -> None:
-        if not option_id.startswith("model-"):
+        selected = _model_from_option_id(option_id, self._ranked_models)
+        if selected is None:
             return
-        try:
-            idx = int(option_id.split("-", 1)[1])
-        except ValueError:
-            return
-        if idx < 0 or idx >= len(self._ranked_models):
-            return
-        self.query_one("#model-name", Input).value = self._ranked_models[idx].repo_id
+        self.query_one("#model-name", Input).value = selected.repo_id
         self._refresh_app_preview()
+
+    def _highlighted_ranked_model(self) -> ModelCandidate | None:
+        highlighted = self.query_one("#vllm-model-list", OptionList).highlighted_option
+        option_id = highlighted.id if highlighted is not None else ""
+        return _model_from_option_id(option_id or "", self._ranked_models)
 
     def _refresh_app_preview(self) -> None:
         model_name = self.query_one("#model-name", Input).value.strip()

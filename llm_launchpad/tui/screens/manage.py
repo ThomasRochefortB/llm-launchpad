@@ -205,6 +205,7 @@ class StopParamsScreen(Screen):
 
     BINDINGS = [
         Binding("escape", "pop_screen", "Back", show=True),
+        Binding("enter", "do_submit", "Stop", show=True),
     ]
 
     def compose(self) -> ComposeResult:
@@ -230,6 +231,19 @@ class StopParamsScreen(Screen):
     def on_mount(self) -> None:
         self._target_by_option_id: dict[str, tuple[BackendType, str]] = {}
         self._load_instances()
+        self.query_one("#stop-instance-list", OptionList).focus()
+
+    def action_do_submit(self) -> None:
+        instance_list = self.query_one("#stop-instance-list", OptionList)
+        highlighted = instance_list.highlighted_option
+        if highlighted is None:
+            return
+        selected = str(highlighted.id)
+        target = self._target_by_option_id.get(selected)
+        if target is None:
+            return
+        backend, app_name = target
+        self.app.begin_stop(backend, app_name=app_name)  # type: ignore[attr-defined]
 
     def _load_instances(self) -> None:
         instance_list = self.query_one("#stop-instance-list", OptionList)
@@ -243,6 +257,8 @@ class StopParamsScreen(Screen):
             return
         options, self._target_by_option_id = _build_backend_app_options(stoppable_instances)
         instance_list.set_options(options)
+        if options:
+            instance_list.highlighted = 0
 
     def action_pop_screen(self) -> None:
         self.app.pop_screen()

@@ -3,8 +3,9 @@ from typing import List, Optional, Dict, Any
 import json
 import os
 import time
+import fnmatch
+from uuid import uuid4
 
-from coolname import generate_slug
 import modal
 
 
@@ -29,7 +30,7 @@ def _read_function_slug() -> str:
         slug = _slugify_name(raw)
         if slug:
             return slug
-    return _slugify_name(generate_slug(2))
+    return _slugify_name(uuid4().hex[:8])
 
 
 FUNCTION_SLUG = _read_function_slug()
@@ -37,6 +38,25 @@ FUNCTION_SLUG = _read_function_slug()
 
 def _function_name(base_name: str) -> str:
     return f"{base_name}-{FUNCTION_SLUG}"
+
+
+def _current_modal_username() -> Optional[str]:
+    """Best-effort lookup of the active Modal profile username."""
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            ["modal", "profile", "current"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        value = (result.stdout or "").strip()
+        if result.returncode == 0 and value:
+            return value
+    except Exception:
+        pass
+    return None
 
 
 def _read_int_env(name: str, default: int) -> int:
@@ -190,15 +210,13 @@ image = (
 
 # --- Separate lightweight image for downloading models
 download_image = (
-    modal.Image.debian_slim(python_version="3.11")
+    modal.Image.debian_slim(python_version="3.12")
     .pip_install("huggingface-hub==0.36.0")
     .env({"HF_XET_HIGH_PERFORMANCE": "1"})
 )
 
 
 @app.function(
-    name=_function_name("download-model"),
-    serialized=True,
     image=download_image,
     volumes={cache_dir: model_cache},
     timeout=PREDOWNLOAD_TIMEOUT_MINUTES * MINUTES,
@@ -246,7 +264,7 @@ def _download_model_files(
     # Discover matching GGUF files
     matches: List[str] = []
     for gguf in target_dir.glob("**/*.gguf"):
-        if any(gguf.name.find(pat.strip("*")) != -1 for pat in allow_patterns):
+        if any(fnmatch.fnmatch(gguf.name, pat) for pat in allow_patterns):
             matches.append(str(gguf.relative_to(cache_dir)))
 
     _upsert_index_entry(repo_id, revision, allow_patterns, matches)
@@ -256,8 +274,6 @@ def _download_model_files(
 
 
 @app.function(
-    name=_function_name("predownload-model"),
-    serialized=True,
     image=download_image,
     volumes={cache_dir: model_cache},
     timeout=PREDOWNLOAD_TIMEOUT_MINUTES * MINUTES,
@@ -273,8 +289,6 @@ def predownload_model(
 
 
 @app.function(
-    name=_function_name("list-downloaded-models"),
-    serialized=True,
     image=download_image,
     volumes={cache_dir: model_cache},
 )
@@ -363,8 +377,6 @@ except Exception:
 
 
 @app.function(
-    name=_function_name("serve"),
-    serialized=True,
     image=image,
     volumes={cache_dir: model_cache},
     gpu=GPU_CONFIG,
@@ -421,8 +433,6 @@ def serve():
 
 
 @app.function(
-    name=_function_name("save-config-remote"),
-    serialized=True,
     image=download_image,
     volumes={cache_dir: model_cache},
 )
@@ -497,15 +507,21 @@ def main(
         print("✅ Weights cached in Modal Volume.")
 
     this_file = Path(__file__).resolve()
+    username = _current_modal_username()
+    base_url = (
+        f"https://{username}--{APP_NAME}-serve.modal.run"
+        if username
+        else f"https://$(modal profile current)--{APP_NAME}-serve.modal.run"
+    )
     print("\nNext steps:")
     print(f"1) Deploy the server: modal deploy {this_file}")
     print("2) Once deployed, curl the server (OpenAI-compatible):")
-    print("   Use the URL printed by modal deploy, e.g.: https://<user>--llamacpp-server-serve.modal.run")
+    print(f"   Endpoint base URL: {base_url}")
     print(
-        "   curl -s -X POST "
+        "   curl -sS -X POST "
         "-H 'Content-Type: application/json' "
-        "-d '{\"model\": \"default\", \"prompt\": \"Hello!\"}' "
-        f"https://<user>--llamacpp-server-serve.modal.run/v1/completions"
+        "-d '{\"model\": \"default\", \"prompt\": \"Hello!\", \"max_tokens\": 64, \"temperature\": 0.7}' "
+        f"{base_url}/v1/completions"
     )
 
     if deploy:

@@ -111,7 +111,7 @@ class Orchestrator:
 
     def deploy(self, config: DeploymentConfig) -> EventStream:
         """Run a full deploy workflow (optional preload + deploy + warmup)."""
-        if config.do_deploy and not config.function_slug:
+        if config.do_deploy and config.backend != BackendType.VLLM and not config.function_slug:
             config.function_slug = random_function_slug()
         settings = self.config_store.load()
         env = ModalBackend.build_full_env(settings, config)
@@ -578,7 +578,7 @@ class Orchestrator:
         )
 
         apps = ModalBackend.list_apps()
-        if apps:
+        if apps is not None:
             launchpad = [a for a in apps if a.backend is not None]
             if not launchpad:
                 yield LogEvent(line="No launchpad deployments found.")
