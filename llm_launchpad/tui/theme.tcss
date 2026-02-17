@@ -82,9 +82,35 @@ LogViewer Log {
 }
 
 #menu-container {
-    width: 72;
+    width: 1fr;
+    min-width: 56;
     height: auto;
     padding: 1 2;
+}
+
+#main-menu-layout {
+    width: 100%;
+    max-width: 126;
+    height: auto;
+}
+
+#deployment-status-panel {
+    width: 40;
+    min-width: 32;
+    min-height: 18;
+    margin: 1 0 0 1;
+    padding: 1 1;
+    border: solid $primary-background;
+    background: $surface;
+}
+
+#deployment-status-title {
+    padding: 0 0 1 0;
+}
+
+#deployment-status-body {
+    color: $text;
+    text-wrap: wrap;
 }
 
 #banner-text {
