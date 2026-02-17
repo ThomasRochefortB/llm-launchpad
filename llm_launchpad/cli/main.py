@@ -268,6 +268,7 @@ def deploy(
         url = server_url or deployed_web_url or ModalBackend.default_server_url(
             username,
             app_name=resolved_app_name,
+            function_slug=config.function_slug,
         )
         for event in orch.warmup(
             bt,
@@ -472,6 +473,7 @@ def switch(
                 url = server_url or ModalBackend.default_server_url(
                     username,
                     app_name=resolved_app_name,
+                    function_slug=config.function_slug,
                 )
                 for event in orch.warmup(
                     bt,
@@ -511,6 +513,7 @@ def switch(
             url = server_url or ModalBackend.default_server_url(
                 username,
                 app_name=resolved_app_name,
+                function_slug=deploy_config.function_slug,
             )
             for event in orch.warmup(bt, url, timeout, tail_logs, app_name=resolved_app_name):
                 _print_event(event)

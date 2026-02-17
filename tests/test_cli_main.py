@@ -173,6 +173,37 @@ class CliMainCommandTests(unittest.TestCase):
             ["https://alice--vllm-test-serve-disc-42c728.modal.run"],
         )
 
+    def test_deploy_warmup_uses_function_slug_when_url_not_in_logs(self) -> None:
+        warmup_calls: list[str] = []
+
+        def _deploy(config):  # type: ignore[no-untyped-def]
+            config.function_slug = "alpha-bravo"
+            return [OperationCompleteEvent(operation=OperationType.DEPLOY, success=True, exit_code=0)]
+
+        def _warmup(
+            _backend: BackendType,
+            url: str,
+            _timeout: int,
+            _tail_logs: bool,
+            app_name: str | None = None,
+            served_model_name: str | None = None,
+        ):
+            warmup_calls.append(url)
+            return []
+
+        orch = SimpleNamespace(deploy=_deploy, warmup=_warmup)
+        with patch("llm_launchpad.cli.main._preflight", return_value=(orch, "alice")):
+            with patch("llm_launchpad.cli.main._print_banner", return_value=None):
+                result = self.runner.invoke(
+                    cli_main.app,
+                    ["deploy", "--backend", "llamacpp", "--app-name", "llamacpp-test", "--do-warmup"],
+                )
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(
+            warmup_calls,
+            ["https://alice--llamacpp-test-serve-alpha-bravo.modal.run"],
+        )
+
     def test_status_failure_returns_exit_code_1(self) -> None:
         orch = SimpleNamespace(
             check_status=lambda *_args, **_kwargs: [
@@ -370,6 +401,35 @@ class CliMainCommandTests(unittest.TestCase):
                 )
         self.assertEqual(result.exit_code, 0)
         self.assertIn("No deploy performed. Use --redeploy", result.output)
+
+    def test_switch_llamacpp_redeploy_warmup_uses_generated_function_slug(self) -> None:
+        warmup_calls: list[str] = []
+        orch = SimpleNamespace(
+            deploy=lambda *_args, **_kwargs: [
+                OperationCompleteEvent(operation=OperationType.DEPLOY, success=True, exit_code=0)
+            ],
+            warmup=lambda _backend, url, *_args, **_kwargs: warmup_calls.append(url) or [],
+        )
+        with patch("llm_launchpad.cli.main._preflight", return_value=(orch, "alice")):
+            with patch("llm_launchpad.cli.main._print_banner", return_value=None):
+                with patch("llm_launchpad.cli.main.random_function_slug", return_value="alpha-bravo"):
+                    with patch("llm_launchpad.cli.main.ModalBackend.run_blocking", return_value=0):
+                        result = self.runner.invoke(
+                            cli_main.app,
+                            [
+                                "switch",
+                                "--backend",
+                                "llamacpp",
+                                "--preset",
+                                "qwen2.5-coder-7b-instruct-q4km",
+                                "--do-warmup",
+                            ],
+                        )
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(
+            warmup_calls,
+            ["https://alice--llamacpp-qwen2-5-coder-7b-instruct-q4km-serve-alpha-bravo.modal.run"],
+        )
 
 
 if __name__ == "__main__":

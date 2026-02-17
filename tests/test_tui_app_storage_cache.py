@@ -4,13 +4,50 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from llm_launchpad.protocol.enums import BackendType
+from llm_launchpad.protocol.enums import BackendType, OperationType
+from llm_launchpad.protocol.events import OperationCompleteEvent
+from llm_launchpad.protocol.models import DeploymentConfig
 from llm_launchpad.protocol.models import StorageSnapshot, StoredModelInfo
 from llm_launchpad.tui.app import WizardApp
 
 
 class TuiAppStorageCacheTests(unittest.TestCase):
+    def test_run_deploy_warmup_uses_function_slug_for_default_url(self) -> None:
+        warmup_urls: list[str] = []
+        app = WizardApp()
+        app._username = "alice"
+        app._orchestrator = type(
+            "FakeOrchestrator",
+            (),
+            {
+                "deploy": staticmethod(
+                    lambda _config: [
+                        OperationCompleteEvent(success=True, operation=OperationType.DEPLOY)
+                    ]
+                ),
+                "warmup": staticmethod(
+                    lambda backend, server_url, *_args, **_kwargs: warmup_urls.append(server_url) or []
+                ),
+            },
+        )()
+
+        config = DeploymentConfig(
+            backend=BackendType.LLAMACPP,
+            do_deploy=True,
+            do_warmup=True,
+            app_name="llamacpp-test",
+            function_slug="alpha-bravo",
+        )
+        with patch("llm_launchpad.tui.app._dispatch_event", return_value=None):
+            app._run_deploy(config, monitor=object())
+
+        self.assertEqual(
+            warmup_urls,
+            ["https://alice--llamacpp-test-serve-alpha-bravo.modal.run"],
+        )
+
     def test_snapshot_persist_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cache_path = Path(tmp) / "storage_snapshot.json"

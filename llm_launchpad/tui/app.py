@@ -147,6 +147,7 @@ class WizardApp(App):
             url = deployed_web_url or ModalBackend.default_server_url(
                 self._username,
                 app_name=target_app_name,
+                function_slug=config.function_slug,
             )
             for event in self._orchestrator.warmup(
                 backend=config.backend,
