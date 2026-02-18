@@ -113,6 +113,15 @@ LogViewer Log {
     text-wrap: wrap;
 }
 
+#billing-report-title {
+    padding: 1 0 1 0;
+}
+
+#billing-report-body {
+    color: $text;
+    text-wrap: wrap;
+}
+
 #banner-text {
     text-align: center;
     color: $primary;

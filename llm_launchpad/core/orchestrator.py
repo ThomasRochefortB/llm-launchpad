@@ -43,6 +43,7 @@ _MODAL_GPU_WAIT_RE = re.compile(
 _MODAL_RELAX_RE = re.compile(r"Relaxing requirements \((?P<requirements>[^)]+)\)", flags=re.IGNORECASE)
 _GGUF_QUANT_RE = re.compile(r"(Q\d(?:_[A-Z0-9]+)+|IQ\d+_[A-Z0-9_]+)", flags=re.IGNORECASE)
 _SIZE_TOKEN_RE = re.compile(r"^\s*(?P<num>\d+(?:\.\d+)?)\s*(?P<unit>[A-Za-z]+)?\s*$")
+_LLAMACPP_MIN_PLAUSIBLE_GGUF_BYTES = 1024 * 1024
 
 
 def _modal_gpu_scheduling_hint(response_text: str) -> str | None:
@@ -798,6 +799,9 @@ class Orchestrator:
 
     def _list_llamacpp_models(self) -> list[StoredModelInfo]:
         grouped: dict[tuple[str, Optional[str]], StoredModelInfo] = {}
+        blob_files: dict[str, set[str]] = {}
+        incomplete_blob_files: dict[str, set[str]] = {}
+        snapshot_gguf_sizes: dict[str, list[int]] = {}
         hub_files = self._walk_volume_files(self._LLAMACPP_STORAGE_VOLUME, "/hub")
         for row in hub_files:
             path = str(row.get("path", "")).strip()
@@ -807,14 +811,24 @@ class Orchestrator:
                 continue
             if not row.get("is_file", False):
                 continue
-            if not path.lower().endswith(".gguf"):
-                continue
             parts = rel.split("/")
             if len(parts) < 2:
                 continue
             model_dir = parts[0]
             encoded = model_dir[len("models--") :]
             model_id = encoded.replace("--", "/")
+            lower_path = path.lower()
+            if "/blobs/" in lower_path:
+                blob_name = path.rsplit("/", 1)[-1].strip()
+                if blob_name.endswith(".incomplete"):
+                    final_blob_name = blob_name[: -len(".incomplete")]
+                    if final_blob_name:
+                        incomplete_blob_files.setdefault(model_id, set()).add(final_blob_name)
+                elif blob_name:
+                    blob_files.setdefault(model_id, set()).add(blob_name)
+            if not lower_path.endswith(".gguf"):
+                continue
+            snapshot_gguf_sizes.setdefault(model_id, []).append(size)
             key = (model_id, None)
             entry = grouped.get(key)
             if entry is None:
@@ -837,6 +851,19 @@ class Orchestrator:
                 quant_match = _GGUF_QUANT_RE.search(path.upper())
                 if quant_match:
                     entry.quant = quant_match.group(1).upper()
+
+        for (model_id, _revision), entry in grouped.items():
+            known_blobs = blob_files.get(model_id, set())
+            pending_blobs = incomplete_blob_files.get(model_id, set())
+            unresolved_incomplete = any(blob_name not in known_blobs for blob_name in pending_blobs)
+            gguf_sizes = snapshot_gguf_sizes.get(model_id, [])
+            tiny_snapshot_without_blob = (
+                bool(gguf_sizes)
+                and all(size < _LLAMACPP_MIN_PLAUSIBLE_GGUF_BYTES for size in gguf_sizes)
+                and not known_blobs
+            )
+            if unresolved_incomplete or tiny_snapshot_without_blob:
+                entry.incomplete = True
 
         return sorted(grouped.values(), key=lambda row: (row.model_id, row.revision or ""))
 

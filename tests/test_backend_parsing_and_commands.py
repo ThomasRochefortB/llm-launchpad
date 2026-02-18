@@ -26,6 +26,72 @@ class BackendParsingAndCommandTests(unittest.TestCase):
         mock_run.side_effect = subprocess.TimeoutExpired(cmd=["modal", "volume", "ls"], timeout=8)
         self.assertIsNone(ModalBackend.list_volume("huggingface-cache", "/hub"))
 
+    @patch("llm_launchpad.core.backend.subprocess.run")
+    def test_billing_report_json_returns_payload(self, mock_run) -> None:  # type: ignore[no-untyped-def]
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stdout = '{"summary":{"total_usd":3.25}}'
+        payload, error = ModalBackend.billing_report_json()
+        self.assertIsInstance(payload, dict)
+        self.assertIsNone(error)
+        assert isinstance(payload, dict)
+        self.assertEqual(payload["summary"]["total_usd"], 3.25)
+        called_command = mock_run.call_args.args[0]
+        self.assertEqual(
+            called_command,
+            ["modal", "billing", "report", "--for", "this month", "--json"],
+        )
+
+    @patch("llm_launchpad.core.backend.subprocess.run")
+    def test_billing_report_json_returns_none_on_timeout(self, mock_run) -> None:  # type: ignore[no-untyped-def]
+        mock_run.side_effect = subprocess.TimeoutExpired(
+            cmd=["modal", "billing", "report", "--for", "this month", "--json"],
+            timeout=8,
+        )
+        payload, error = ModalBackend.billing_report_json()
+        self.assertIsNone(payload)
+        self.assertIn("Timed out", error or "")
+
+    @patch("llm_launchpad.core.backend.subprocess.run")
+    def test_billing_report_json_falls_back_to_workspace_command(self, mock_run) -> None:  # type: ignore[no-untyped-def]
+        first = subprocess.CompletedProcess(
+            args=["modal", "billing", "report", "--for", "this month", "--json"],
+            returncode=2,
+            stdout="",
+            stderr="No such command 'billing'.",
+        )
+        second = subprocess.CompletedProcess(
+            args=["modal", "workspace", "billing", "report", "--for", "this month", "--json"],
+            returncode=0,
+            stdout='{"summary":{"total_usd":7.0}}',
+            stderr="",
+        )
+        mock_run.side_effect = [first, second]
+
+        payload, error = ModalBackend.billing_report_json()
+        self.assertIsNone(error)
+        assert isinstance(payload, dict)
+        self.assertEqual(payload["summary"]["total_usd"], 7.0)
+
+    @patch("llm_launchpad.core.backend.subprocess.run")
+    def test_billing_report_json_returns_upgrade_hint_when_billing_command_missing(self, mock_run) -> None:  # type: ignore[no-untyped-def]
+        first = subprocess.CompletedProcess(
+            args=["modal", "billing", "report", "--for", "this month", "--json"],
+            returncode=2,
+            stdout="",
+            stderr="No such command 'billing'.",
+        )
+        second = subprocess.CompletedProcess(
+            args=["modal", "workspace", "billing", "report", "--for", "this month", "--json"],
+            returncode=2,
+            stdout="Usage: modal [OPTIONS] COMMAND [ARGS]...",
+            stderr="",
+        )
+        mock_run.side_effect = [first, second]
+
+        payload, error = ModalBackend.billing_report_json()
+        self.assertIsNone(payload)
+        self.assertIn("Upgrade Modal CLI", error or "")
+
     def test_extract_modal_app_rows_accepts_apps_and_data_wrappers(self) -> None:
         wrapped_apps = {
             "apps": [
