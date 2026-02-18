@@ -1,67 +1,134 @@
 # llm-launchpad
 
-One-click personal LLM deployment with coding agent + chat UI.
+One-click personal LLM deployment with a coding agent + chat UI, built around Modal backends. Use the Textual wizard for guided setup or headless CLI commands for automation.
+
+## What is this?
+- **Who it’s for:** developers who want an OpenAI-compatible endpoint for local or personal use without wiring up infrastructure by hand.
+- **What it does:** provisions vLLM or llama.cpp backends on Modal, manages multiple named instances, and ships a TUI wizard plus headless CLI.
+- **Common uses:** spin up a coding model for your editor, test new quantizations, or manage multiple model variants behind clean endpoints.
+
+## Prerequisites
+- Python **3.12+**
+- **uv** for environment + CLI management (`pip install uv` or `curl -Ls https://astral.sh/uv/install.sh | sh`)
+- **Modal account + CLI**: `pip install modal` then run `modal setup` and paste your token
+- Optional: Hugging Face auth for gated/private weights: `huggingface-cli login` or set `HUGGINGFACE_HUB_TOKEN`
+- cURL (for quick API checks)
 
 ## Install
 
-Using uv (recommended for CLI usage):
+CLI-only (global):
 ```bash
+pip install uv
 uv tool install llm-launchpad
+llm-launchpad --help
 ```
 
-## Endpoint Management From CLI
-
-Manage deployed launchpad endpoints directly from `llm-launchpad`.
-Launchpad now supports multi-instance deployments per backend. By default,
-instance names are auto-derived from the model identifier.
-
-List launchpad deployments:
+From a clone (recommended for contributing):
 ```bash
-llm-launchpad list
+git clone https://github.com/ThomasRochefortB/llm-launchpad.git
+cd llm-launchpad
+uv sync
+uv run llm-launchpad --help
 ```
 
-Deploy independent instances:
+## Quickstart (copy/paste)
+1) Make sure Modal is configured:
 ```bash
-llm-launchpad deploy --backend vllm --model-name Qwen/Qwen3-4B-Thinking-2507-FP8
-llm-launchpad deploy --backend vllm --model-name Qwen/Qwen2.5-7B-Instruct
+pip install modal
+modal setup   # follow the prompt to authenticate
 ```
 
-Use explicit names when needed:
+2) Launch the guided TUI wizard:
 ```bash
-llm-launchpad deploy --backend vllm --model-name Qwen/Qwen3-4B-Thinking-2507-FP8 --instance-name qwen3
-llm-launchpad deploy --backend llamacpp --app-name llamacpp-prod-coder
+uv run llm-launchpad wizard
 ```
+Select a backend (vLLM or llama.cpp), choose a model/preset, and deploy. The wizard will show the instance name and endpoint URL.
 
-Check endpoint readiness:
+Prefer headless? Deploy a default vLLM instance with one command:
 ```bash
-llm-launchpad status --backend llamacpp
-llm-launchpad status --backend vllm
-llm-launchpad status --backend vllm --instance-name qwen3
+uv run llm-launchpad deploy \
+  --backend vllm \
+  --instance-name quickstart \
+  --model-name Qwen/Qwen3-4B-Thinking-2507-FP8
 ```
 
-Tail backend logs:
+3) Check readiness and grab the URL:
 ```bash
-llm-launchpad logs --backend llamacpp
-llm-launchpad logs --backend vllm
-llm-launchpad logs --backend vllm --app-name vllm-qwen3
+uv run llm-launchpad status --backend vllm --instance-name quickstart
 ```
 
-Stop a deployed backend:
+4) Call the endpoint (replace with your URL from the status/logs output):
 ```bash
-llm-launchpad stop --backend llamacpp
-llm-launchpad stop --backend vllm
-llm-launchpad stop --backend vllm --instance-name qwen2-5
+export SERVER_URL="https://<user>--vllm-quickstart-serve.modal.run"
+curl -s -X POST \
+  -H 'Content-Type: application/json' \
+  -d '{"model": "llm", "messages": [{"role": "user", "content": "Hello!"}]}' \
+  "$SERVER_URL"/v1/chat/completions
 ```
 
-When multiple instances exist for one backend, `status`, `logs`, `stop`, and
-`warmup` require `--instance-name` or `--app-name` to avoid ambiguous targeting.
+## Minimal end-to-end example (vLLM)
+```bash
+# 1) Authenticate Modal once
+modal setup
+
+# 2) Optional: auth to HF for private or rate-limited repos
+huggingface-cli login  # or export HUGGINGFACE_HUB_TOKEN=<token>
+
+# 3) Deploy with sensible defaults
+uv run llm-launchpad deploy \
+  --backend vllm \
+  --instance-name demo \
+  --model-name Qwen/Qwen3-4B-Thinking-2507-FP8
+
+# 4) Wait for readiness, then copy the serve URL
+uv run llm-launchpad status --backend vllm --instance-name demo
+
+# 5) Call it
+export SERVER_URL="https://<user>--vllm-demo-serve.modal.run"
+curl -s "$SERVER_URL"/v1/health   # quick smoke
+curl -s -X POST -H 'Content-Type: application/json' \
+  -d '{"model": "llm", "messages": [{"role": "user", "content": "Write a haiku about Modal."}]}' \
+  "$SERVER_URL"/v1/chat/completions
+```
+
+## Common configuration (env vars)
+- `GPU_CONFIG`: GPU type/count (default `A100-80GB:1`; also accepts `A10G:1`, etc.)
+- `N_GPU`: tensor parallel size for vLLM (default `1`, independent of `GPU_CONFIG` count)
+- `MODEL_NAME`: HF repo id (default `Qwen/Qwen3-4B-Thinking-2507-FP8`)
+- `MODEL_REVISION`: optional pinned revision for vLLM
+- `SERVED_MODEL_NAME`: override exposed model name (defaults to model id suffix)
+- `FAST_BOOT`: `true`/`false`, skips warm caches where possible (vLLM)
+- `TRUST_REMOTE_CODE`: `true`/`false`, required for some HF repos with custom code
+- `REASONING_PARSER`: `qwen3`, `deepseek_r1`, `granite`, etc. (vLLM)
+- `DEFAULT_CHAT_TEMPLATE_KWARGS`: JSON for server-wide chat template args (vLLM)
+- `VLLM_PORT`: port inside the Modal container (default `8000`)
+- `HUGGINGFACE_HUB_TOKEN`: auth for private/gated HF models
+- llama.cpp extras: `PRESET`, `REPO_ID`, `QUANT`, `SERVER_ARGS`, `N_GPU_LAYERS`
+
+## Endpoint management from the CLI
+- List deployments: `llm-launchpad list`
+- Deploy instances: `llm-launchpad deploy --backend vllm --model-name Qwen/Qwen2.5-7B-Instruct`
+- Name instances explicitly: `llm-launchpad deploy --backend vllm --model-name ... --instance-name qwen3`
+- Check readiness: `llm-launchpad status --backend vllm --instance-name qwen3`
+- Tail logs: `llm-launchpad logs --backend vllm --instance-name qwen3`
+- Stop: `llm-launchpad stop --backend vllm --instance-name qwen3`
+
+When multiple instances exist for one backend, `status`, `logs`, `stop`, and `warmup` require `--instance-name` or `--app-name` to avoid ambiguity.
+
+## Troubleshooting
+- **Modal CLI errors / auth failed:** rerun `modal setup` and ensure your token is valid.
+- **HF 403 or slow downloads:** run `huggingface-cli login` and optionally set `HF_XET_HIGH_PERFORMANCE=1`.
+- **Wizard fails to open:** install Textual (`pip install textual`) or use headless commands.
+- **GPU unavailable / quota:** pick a smaller GPU in the wizard or change `GPU_CONFIG`.
+- **Endpoints return 503 during warmup:** wait a few minutes after first deploy; cold starts are expected.
+- **Llama.cpp build errors:** ensure host CUDA ≥ 12.4 or switch to CPU/offload configs.
 
 ## GGUF on Modal with llama.cpp
 
 Deploy any GGUF model on Modal using llama.cpp's HTTP server. Includes presets for popular coding models.
 
 ### Prerequisites
-- Python 3.11+ and Modal CLI installed: `pip install modal`
+- Python 3.12+ and Modal CLI installed: `pip install modal`
 - Login/configure Modal: `modal setup`
 - Optional (if HF rate-limited/private): `huggingface-cli login` or set `HUGGINGFACE_HUB_TOKEN`
 
