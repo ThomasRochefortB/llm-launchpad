@@ -29,6 +29,7 @@ class ModalBackend:
     _active_procs: set[subprocess.Popen] = set()
     _active_procs_lock = threading.Lock()
     _shutdown_event = threading.Event()
+    _CLI_TIMEOUT_SECONDS = 8.0
 
     @classmethod
     def register_proc(cls, proc: subprocess.Popen) -> None:
@@ -50,12 +51,18 @@ class ModalBackend:
         on subprocess I/O so Python can shut down cleanly.
         """
         cls._shutdown_event.set()
+        import time
+        time.sleep(0.05)
         with cls._active_procs_lock:
             procs = list(cls._active_procs)
             cls._active_procs.clear()
         for proc in procs:
             try:
                 proc.terminate()
+                if proc.stdout:
+                    proc.stdout.close()
+                if proc.stderr and proc.stderr != subprocess.PIPE:
+                    proc.stderr.close()
             except Exception:
                 pass
 
@@ -81,10 +88,13 @@ class ModalBackend:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                timeout=ModalBackend._CLI_TIMEOUT_SECONDS,
             )
             username = (res.stdout or "").strip()
             if res.returncode == 0 and username:
                 return username
+        except subprocess.TimeoutExpired:
+            return None
         except Exception:
             pass
         return None
@@ -257,12 +267,15 @@ class ModalBackend:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                timeout=ModalBackend._CLI_TIMEOUT_SECONDS,
             )
             text = (res.stdout or "") + (res.stderr or "")
             if "--follow" in text:
                 return ["--follow"]
             if "-f" in text:
                 return ["-f"]
+        except subprocess.TimeoutExpired:
+            return []
         except Exception:
             pass
         return []
@@ -280,7 +293,10 @@ class ModalBackend:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                timeout=ModalBackend._CLI_TIMEOUT_SECONDS,
             )
+        except subprocess.TimeoutExpired:
+            return None
         except Exception:
             return None
         if result.returncode != 0:
@@ -301,9 +317,12 @@ class ModalBackend:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                timeout=ModalBackend._CLI_TIMEOUT_SECONDS,
             )
             if result.returncode == 0:
                 return result.stdout or ""
+        except subprocess.TimeoutExpired:
+            return None
         except Exception:
             pass
         return None
@@ -311,13 +330,18 @@ class ModalBackend:
     @staticmethod
     def list_volume(volume_name: str, path: str = "/") -> Optional[List[Dict[str, Any]]]:
         """List files/directories in a Modal Volume path."""
+        if ModalBackend.is_shutting_down():
+            return []
         try:
             result = subprocess.run(
                 ["modal", "volume", "ls", volume_name, path, "--json"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                timeout=ModalBackend._CLI_TIMEOUT_SECONDS,
             )
+        except subprocess.TimeoutExpired:
+            return None
         except Exception:
             return None
         if result.returncode != 0:

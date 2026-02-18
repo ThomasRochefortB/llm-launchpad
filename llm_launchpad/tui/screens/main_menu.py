@@ -255,5 +255,5 @@ class MainMenuScreen(Screen):
     def action_select_settings(self) -> None:
         self.app.action_push_settings()  # type: ignore[attr-defined]
 
-    def action_quit(self) -> None:
-        self.app.exit()
+    async def action_quit(self) -> None:
+        await self.app.action_quit()  # type: ignore[attr-defined]

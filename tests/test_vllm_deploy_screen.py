@@ -427,7 +427,7 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
 
                 text = str(screen.query_one("#vllm-vram-status", Static).content)
-                self.assertIn("unavailable", text)
+                self.assertIn("N/A", text)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import types
 import unittest
+from pathlib import Path
+from tempfile import NamedTemporaryFile
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -15,6 +17,7 @@ class HFModelsTests(unittest.TestCase):
         hf_models._GGUF_QUANTS_CACHE.clear()
         hf_models._GGUF_QUANT_METADATA_CACHE.clear()
         hf_models._VLLM_MEMORY_CACHE.clear()
+        hf_models._HF_JSON_FILE_CACHE.clear()
 
     def test_normalize_keeps_text_generation_pipeline(self) -> None:
         row = SimpleNamespace(
@@ -341,21 +344,226 @@ class HFModelsTests(unittest.TestCase):
         assert estimate_cached is not None
         self.assertEqual(calls, [("Qwen/Qwen3-8B-Instruct", None)])
         self.assertGreater(estimate.total_gb, estimate.weights_gb)
-        self.assertEqual(estimate.context_tokens, 8192)
+        self.assertEqual(estimate.context_tokens, 32768)
 
-    def test_fetch_vllm_memory_breakdown_falls_back_to_repo_name(self) -> None:
+    def test_fetch_vllm_memory_breakdown_uses_timeout_and_card_data_expand(self) -> None:
+        calls: list[tuple[float, tuple[str, ...]]] = []
+
+        class FakeApi:
+            def model_info(
+                self,
+                *,
+                repo_id: str,
+                revision: str | None,
+                timeout: float,
+                expand: list[str] | None = None,
+            ):
+                self._ = (repo_id, revision)
+                calls.append((timeout, tuple(expand or [])))
+                return SimpleNamespace(
+                    config={
+                        "num_hidden_layers": 32,
+                        "hidden_size": 4096,
+                        "max_position_embeddings": 32768,
+                    },
+                    safetensors={"total": 16_000_000_000},
+                    tags=["text-generation", "bf16"],
+                    cardData={"context_length": 32768},
+                )
+
+        fake_module = types.SimpleNamespace(HfApi=FakeApi)
+        with patch.dict("sys.modules", {"huggingface_hub": fake_module}):
+            estimate = hf_models.fetch_vllm_memory_breakdown("Qwen/Qwen3-8B-Instruct")
+        assert estimate is not None
+        self.assertEqual(calls[0][0], hf_models._HF_REQUEST_TIMEOUT_SECONDS)
+        self.assertIn("cardData", calls[0][1])
+
+    def test_fetch_vllm_memory_breakdown_skips_repo_json_fetch_when_model_info_is_complete(self) -> None:
+        class FakeApi:
+            def model_info(self, *, repo_id: str, revision: str | None, expand: list[str]):
+                self._ = (repo_id, revision, expand)
+                return SimpleNamespace(
+                    config={
+                        "num_hidden_layers": 32,
+                        "hidden_size": 4096,
+                        "max_position_embeddings": 32768,
+                    },
+                    safetensors={"total": 16_000_000_000},
+                    tags=["text-generation", "bf16"],
+                    cardData={"context_length": 32768},
+                )
+
+        fake_module = types.SimpleNamespace(HfApi=FakeApi)
+        with (
+            patch.dict("sys.modules", {"huggingface_hub": fake_module}),
+            patch(
+                "llm_launchpad.core.hf_models._load_repo_json_file",
+                side_effect=AssertionError("should not fetch repo JSON"),
+            ),
+        ):
+            estimate = hf_models.fetch_vllm_memory_breakdown("Qwen/Qwen3-8B-Instruct")
+        assert estimate is not None
+        self.assertEqual(estimate.context_tokens, 32768)
+
+    def test_fetch_vllm_memory_breakdown_uses_default_context_without_metadata(self) -> None:
         class FakeApi:
             def model_info(self, *, repo_id: str, revision: str | None, expand: list[str]):
                 self._ = (repo_id, revision, expand)
                 return SimpleNamespace(config={}, safetensors={}, tags=["text-generation", "fp8"])
 
         fake_module = types.SimpleNamespace(HfApi=FakeApi)
-        with patch.dict("sys.modules", {"huggingface_hub": fake_module}):
+        with (
+            patch.dict("sys.modules", {"huggingface_hub": fake_module}),
+            patch("llm_launchpad.core.hf_models._load_repo_json_file", return_value=None),
+        ):
             estimate = hf_models.fetch_vllm_memory_breakdown("Qwen/Qwen3-8B-FP8")
+        assert estimate is not None
+        self.assertEqual(estimate.context_tokens, hf_models._DEFAULT_CONTEXT_TOKENS)
+
+    def test_fetch_vllm_memory_breakdown_retries_without_expand(self) -> None:
+        class FakeApi:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def model_info(self, *, repo_id: str, revision: str | None, expand=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("expand not supported")
+                self._ = (repo_id, revision, expand)
+                return SimpleNamespace(
+                    config={"max_position_embeddings": 131072, "num_hidden_layers": 32, "hidden_size": 4096},
+                    safetensors={"total": 16_000_000_000},
+                    tags=["bf16"],
+                )
+
+        fake_module = types.SimpleNamespace(HfApi=FakeApi)
+        with patch.dict("sys.modules", {"huggingface_hub": fake_module}):
+            estimate = hf_models.fetch_vllm_memory_breakdown("Qwen/Qwen3-8B-Instruct")
+        assert estimate is not None
+        self.assertEqual(estimate.context_tokens, 131072)
+
+    def test_extract_model_max_context_reads_nested_config(self) -> None:
+        config = {
+            "text_config": {"max_position_embeddings": 32768},
+            "rope_scaling": {"original_max_position_embeddings": 65536},
+            "tokenizer_config": {"model_max_length": 100000000000000000000},
+        }
+        value = hf_models._extract_model_max_context(config)
+        self.assertEqual(value, 32768)
+
+    def test_extract_model_max_context_handles_rope_scaling_factor(self) -> None:
+        config = {
+            "max_position_embeddings": 32768,
+            "rope_scaling": {"factor": 8.0, "original_max_position_embeddings": 32768},
+        }
+        value = hf_models._extract_model_max_context(config)
+        self.assertEqual(value, 262144)
+
+    def test_extract_model_max_context_prefers_original_rope_base(self) -> None:
+        config = {
+            "max_position_embeddings": 131072,
+            "rope_scaling": {"factor": 32.0, "original_max_position_embeddings": 4096},
+        }
+        value = hf_models._extract_model_max_context(config)
+        self.assertEqual(value, 131072)
+
+    def test_extract_model_max_context_parses_k_suffix(self) -> None:
+        config = {"context_length": "200K"}
+        value = hf_models._extract_model_max_context(config)
+        self.assertEqual(value, 200000)
+
+    def test_load_repo_json_file_falls_back_to_http_when_hf_hub_download_fails(self) -> None:
+        def fake_hf_hub_download(*, repo_id: str, filename: str, revision: str | None, etag_timeout: float):
+            self._ = (repo_id, filename, revision, etag_timeout)
+            raise RuntimeError("network error")
+
+        fake_module = types.SimpleNamespace(hf_hub_download=fake_hf_hub_download)
+        with (
+            patch.dict("sys.modules", {"huggingface_hub": fake_module}),
+            patch(
+                "llm_launchpad.core.hf_models._fetch_repo_json_file_via_http",
+                return_value={"max_position_embeddings": 262144},
+            ) as fetch_http,
+        ):
+            parsed = hf_models._load_repo_json_file("Qwen/Qwen3-Coder-Next", None, "config.json")
+        assert parsed is not None
+        self.assertEqual(parsed.get("max_position_embeddings"), 262144)
+        self.assertEqual(fetch_http.call_count, 1)
+
+    def test_load_repo_json_file_falls_back_to_http_when_downloaded_json_is_invalid(self) -> None:
+        with NamedTemporaryFile("w", encoding="utf-8", delete=False) as handle:
+            handle.write("{not-json")
+            temp_path = Path(handle.name)
+
+        def fake_hf_hub_download(*, repo_id: str, filename: str, revision: str | None, etag_timeout: float):
+            self._ = (repo_id, filename, revision, etag_timeout)
+            return str(temp_path)
+
+        fake_module = types.SimpleNamespace(hf_hub_download=fake_hf_hub_download)
+        with (
+            patch.dict("sys.modules", {"huggingface_hub": fake_module}),
+            patch(
+                "llm_launchpad.core.hf_models._fetch_repo_json_file_via_http",
+                return_value={"max_position_embeddings": 262144},
+            ) as fetch_http,
+        ):
+            parsed = hf_models._load_repo_json_file("Qwen/Qwen3-Coder-Next", None, "config.json")
+        try:
+            temp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        assert parsed is not None
+        self.assertEqual(parsed.get("max_position_embeddings"), 262144)
+        self.assertEqual(fetch_http.call_count, 1)
+
+    def test_fetch_vllm_memory_breakdown_uses_repo_json_context_when_model_info_missing(self) -> None:
+        class FakeApi:
+            def model_info(self, *, repo_id: str, revision: str | None, expand=None):
+                self._ = (repo_id, revision, expand)
+                return SimpleNamespace(config={}, safetensors={"total": 16_000_000_000}, tags=["bf16"])
+
+        def fake_load(repo_id: str, revision: str | None, filename: str):
+            self.assertEqual(repo_id, "zai-org/GLM-5")
+            if filename == "config.json":
+                return {
+                    "num_hidden_layers": 64,
+                    "hidden_size": 7168,
+                    "max_position_embeddings": 32768,
+                    "rope_scaling": {"factor": 8.0, "original_max_position_embeddings": 32768},
+                }
+            if filename == "tokenizer_config.json":
+                return {"model_max_length": 262144}
+            return None
+
+        fake_module = types.SimpleNamespace(HfApi=FakeApi)
+        with (
+            patch.dict("sys.modules", {"huggingface_hub": fake_module}),
+            patch("llm_launchpad.core.hf_models._load_repo_json_file", side_effect=fake_load),
+        ):
+            estimate = hf_models.fetch_vllm_memory_breakdown("zai-org/GLM-5")
 
         assert estimate is not None
-        self.assertGreater(estimate.weights_gb, 0.0)
-        self.assertGreater(estimate.total_gb, estimate.weights_gb)
+        self.assertEqual(estimate.context_tokens, 262144)
+
+    def test_fetch_vllm_memory_breakdown_uses_card_data_context(self) -> None:
+        class FakeApi:
+            def model_info(self, *, repo_id: str, revision: str | None, expand=None):
+                self._ = (repo_id, revision, expand)
+                return SimpleNamespace(
+                    config={},
+                    cardData={"context_length": "256K"},
+                    safetensors={"total": 16_000_000_000},
+                    tags=["bf16"],
+                )
+
+        fake_module = types.SimpleNamespace(HfApi=FakeApi)
+        with (
+            patch.dict("sys.modules", {"huggingface_hub": fake_module}),
+            patch("llm_launchpad.core.hf_models._load_repo_json_file", return_value=None),
+        ):
+            estimate = hf_models.fetch_vllm_memory_breakdown("zai-org/GLM-5")
+        assert estimate is not None
+        self.assertEqual(estimate.context_tokens, 256000)
 
 
 if __name__ == "__main__":

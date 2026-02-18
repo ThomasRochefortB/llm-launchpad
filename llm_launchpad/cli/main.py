@@ -171,7 +171,11 @@ def wizard() -> None:
         raise typer.Exit(code=1)
 
     tui = WizardApp()
-    tui.run()
+    try:
+        tui.run()
+    finally:
+        from ..core.backend import ModalBackend
+        ModalBackend.terminate_all()
 
 
 # -----------------------------------------------------------------------
@@ -501,6 +505,7 @@ def switch(
     if redeploy:
         deploy_config = DeploymentConfig(backend=bt, do_deploy=True)
         deploy_config.function_slug = random_function_slug()
+        deploy_config.instance_name = resolved_instance
         settings = ConfigStore().load()
         deploy_config.app_name = resolved_app_name
         env = ModalBackend.build_full_env(settings, deploy_config)

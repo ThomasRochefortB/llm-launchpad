@@ -655,10 +655,18 @@ class LlamaCppDeployScreen(Screen):
         vram_gb_by_quant: dict[str, float] | None = None,
     ) -> None:
         normalized_vram = _normalize_vram_map(vram_gb_by_quant)
+        sorted_quantizations: list[str] = []
+        if normalized_vram:
+            sorted_quantizations = sorted(
+                quantizations,
+                key=lambda q: normalized_vram.get(q.strip().upper(), float("inf"))
+            )
+        else:
+            sorted_quantizations = list(quantizations)
         quant_list = self.query_one("#llama-quant-list", OptionList)
         options = [
             Option(f"  {_format_quant_with_vram(quant, normalized_vram)}", id=f"quant-{quant}")
-            for quant in quantizations
+            for quant in sorted_quantizations
         ]
         quant_list.set_options(options)
         if quantizations:
@@ -1081,7 +1089,7 @@ class VllmDeployScreen(Screen):
 
     def _render_vllm_memory_status(self, estimate: VllmMemoryBreakdown | None) -> None:
         if estimate is None:
-            self._set_vllm_memory_status("[dim]Estimated VRAM: unavailable for this model[/dim]")
+            self._set_vllm_memory_status("[dim]Estimated VRAM: N/A[/dim]")
             return
         tensor_parallel = self._current_tensor_parallel()
         per_gpu_gb = estimate.total_gb / max(1, tensor_parallel)

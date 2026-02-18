@@ -431,6 +431,38 @@ class CliMainCommandTests(unittest.TestCase):
             ["https://alice--llamacpp-qwen2-5-coder-7b-instruct-q4km-serve-alpha-bravo.modal.run"],
         )
 
+    def test_switch_llamacpp_redeploy_sets_instance_name_and_app_name(self) -> None:
+        deploy_configs: list[object] = []
+
+        def _deploy(config):  # type: ignore[no-untyped-def]
+            deploy_configs.append(config)
+            return [OperationCompleteEvent(operation=OperationType.DEPLOY, success=True, exit_code=0)]
+
+        orch = SimpleNamespace(deploy=_deploy, warmup=lambda *_args, **_kwargs: [])
+        with patch("llm_launchpad.cli.main._preflight", return_value=(orch, "alice")):
+            with patch("llm_launchpad.cli.main._print_banner", return_value=None):
+                with patch("llm_launchpad.cli.main.ModalBackend.run_blocking", return_value=0):
+                    with patch("llm_launchpad.cli.main.random_function_slug", return_value="test-slug"):
+                        result = self.runner.invoke(
+                            cli_main.app,
+                            [
+                                "switch",
+                                "--backend",
+                                "llamacpp",
+                                "--repo-id",
+                                "Qwen/Qwen2.5-Coder-7B-Instruct",
+                                "--quant",
+                                "Q4_K_M",
+                                "--no-do-warmup",
+                            ],
+                        )
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(len(deploy_configs), 1)  # Only the switch call
+        swtch_config = deploy_configs[0]
+        self.assertIsNotNone(swtch_config.instance_name)
+        self.assertEqual(swtch_config.instance_name, "qwen-qwen2-5-coder-7b-instruct")
+        self.assertEqual(swtch_config.app_name, "llamacpp-qwen-qwen2-5-coder-7b-instruct")
+
 
 if __name__ == "__main__":
     unittest.main()

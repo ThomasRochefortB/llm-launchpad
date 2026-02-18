@@ -77,13 +77,16 @@ class WizardApp(App):
         except Exception:
             pass
 
-    def action_quit(self) -> None:
-        """Terminate tracked subprocesses before exiting.
+    async def action_quit(self) -> None:
+        """Terminate tracked subprocesses and workers before exiting.
 
         Without this, worker threads blocked on subprocess I/O prevent
         Python from shutting down cleanly (the atexit thread-join hangs).
         """
         ModalBackend.terminate_all()
+        self.workers.cancel_all()
+        import asyncio
+        await asyncio.sleep(0.3)
         self.exit()
 
     def on_mount(self) -> None:
