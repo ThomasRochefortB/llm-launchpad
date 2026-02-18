@@ -125,14 +125,11 @@ class StorageScreen(Screen):
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         row_key = str(event.row_key.value) if getattr(event, "row_key", None) is not None else ""
-        selected = self._rows_by_key.get(row_key)
-        if selected is None:
-            return
-        self._selected_model = selected
-        self.query_one("#storage-model-id", Input).value = selected.model_id
-        self.query_one("#storage-model-backend", Input).value = selected.backend.value
-        self.query_one("#storage-model-quant", Input).value = selected.quant or ""
-        self.query_one("#storage-model-revision", Input).value = selected.revision or ""
+        self._apply_row_selection(row_key)
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        row_key = str(event.row_key.value) if getattr(event, "row_key", None) is not None else ""
+        self._apply_row_selection(row_key)
 
     def on_storage_loaded(self, message: StorageLoaded) -> None:
         self._snapshot = message.snapshot
@@ -167,6 +164,16 @@ class StorageScreen(Screen):
                 _human_bytes(row.size_bytes),
                 key=row_key,
             )
+
+    def _apply_row_selection(self, row_key: str) -> None:
+        selected = self._rows_by_key.get(row_key)
+        if selected is None:
+            return
+        self._selected_model = selected
+        self.query_one("#storage-model-id", Input).value = selected.model_id
+        self.query_one("#storage-model-backend", Input).value = selected.backend.value
+        self.query_one("#storage-model-quant", Input).value = selected.quant or ""
+        self.query_one("#storage-model-revision", Input).value = selected.revision or ""
 
     def action_refresh_storage(self) -> None:
         self._refresh_storage_snapshot(force=True)

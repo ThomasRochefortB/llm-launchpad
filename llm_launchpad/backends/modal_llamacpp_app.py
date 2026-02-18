@@ -4,6 +4,9 @@ import json
 import os
 import time
 import fnmatch
+import re
+import subprocess
+import sys
 from uuid import uuid4
 
 import modal
@@ -70,6 +73,7 @@ def _read_int_env(name: str, default: int) -> int:
 
 
 PREDOWNLOAD_TIMEOUT_MINUTES = _read_int_env("PREDOWNLOAD_TIMEOUT_MINUTES", 6 * 60)
+SNAPSHOT_MAX_WORKERS = _read_int_env("HF_SNAPSHOT_MAX_WORKERS", 16)
 
 
 # --- Model configuration (from Hugging Face)
@@ -82,8 +86,8 @@ QUANT = "Q4_K_M"
 cache_dir = "/root/.cache/huggingface"
 model_cache = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
 CONFIG_PATH = f"{cache_dir}/serve_config.json"
-MODELS_ROOT = Path(cache_dir) / "models"
-INDEX_PATH = Path(cache_dir) / "model_index.json"
+HF_HUB_DIR = Path(cache_dir) / "hub"
+_GGUF_QUANT_RE = re.compile(r"(Q\d(?:_[A-Z0-9]+)+|IQ\d+_[A-Z0-9_]+)", flags=re.IGNORECASE)
 
 # --- Simple presets for convenience (model-agnostic)
 # Note: Import presets lazily inside the local entrypoint to avoid container import issues.
@@ -106,82 +110,81 @@ def _load_config() -> Dict[str, Any]:
     }
 
 
-def _repo_slug(repo_id: str) -> str:
-    return repo_id.strip().replace("/", "__")
+def _hub_repo_slug(repo_id: str) -> str:
+    return repo_id.strip().replace("/", "--")
 
 
-def _revision_slug(revision: Optional[str]) -> str:
-    value = (revision or "").strip()
-    return value if value else "main"
+def _hub_model_dir(repo_id: str) -> Path:
+    return HF_HUB_DIR / f"models--{_hub_repo_slug(repo_id)}"
 
 
-def _model_dir(repo_id: str, revision: Optional[str]) -> Path:
-    return MODELS_ROOT / _repo_slug(repo_id) / _revision_slug(revision)
-
-
-def _load_index() -> list[dict[str, Any]]:
-    if not INDEX_PATH.exists():
-        return []
+def _read_hub_ref(model_dir: Path, revision: Optional[str]) -> Optional[str]:
+    ref_name = (revision or "").strip() or "main"
+    ref_path = model_dir / "refs" / ref_name
+    if not ref_path.exists() or not ref_path.is_file():
+        return None
     try:
-        with open(INDEX_PATH) as handle:
-            payload = json.load(handle)
+        value = ref_path.read_text(encoding="utf-8").strip()
     except Exception:
-        return []
-    if isinstance(payload, list):
-        return [entry for entry in payload if isinstance(entry, dict)]
-    return []
+        return None
+    return value or None
 
 
-def _save_index(rows: list[dict[str, Any]]) -> None:
-    Path(cache_dir).mkdir(parents=True, exist_ok=True)
-    with open(INDEX_PATH, "w") as handle:
-        json.dump(rows, handle)
-    model_cache.commit()
+def _resolve_hub_snapshot_dir(repo_id: str, revision: Optional[str]) -> Optional[Path]:
+    model_dir = _hub_model_dir(repo_id)
+    snapshots_root = model_dir / "snapshots"
+    if not snapshots_root.exists() or not snapshots_root.is_dir():
+        return None
+
+    preferred = (revision or "").strip()
+    candidate_names: list[str] = []
+    if preferred:
+        candidate_names.append(preferred)
+        ref_sha = _read_hub_ref(model_dir, preferred)
+        if ref_sha:
+            candidate_names.append(ref_sha)
+    else:
+        ref_sha = _read_hub_ref(model_dir, "main")
+        if ref_sha:
+            candidate_names.append(ref_sha)
+
+    seen: set[str] = set()
+    for name in candidate_names:
+        if name in seen:
+            continue
+        seen.add(name)
+        candidate = snapshots_root / name
+        if candidate.exists() and candidate.is_dir():
+            return candidate
+
+    snapshots = [entry for entry in snapshots_root.iterdir() if entry.is_dir()]
+    if not snapshots:
+        return None
+    snapshots.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return snapshots[0]
 
 
-def _upsert_index_entry(
+def _collect_hub_gguf_matches(
     repo_id: str,
     revision: Optional[str],
     allow_patterns: list[str],
-    relative_matches: list[str],
-) -> None:
-    rows = _load_index()
-    key_repo = repo_id.strip()
-    key_revision = (revision or "").strip() or None
-    others: list[dict[str, Any]] = []
-    for row in rows:
-        if (
-            str(row.get("repo_id", "")).strip() == key_repo
-            and ((row.get("revision") or None) == key_revision)
-        ):
-            continue
-        others.append(row)
+) -> list[str]:
+    snapshot_dir = _resolve_hub_snapshot_dir(repo_id, revision)
+    if snapshot_dir is None:
+        return []
+    matches: list[str] = []
+    for gguf in snapshot_dir.glob("**/*.gguf"):
+        if any(fnmatch.fnmatch(gguf.name, pat) for pat in allow_patterns):
+            matches.append(str(gguf.relative_to(cache_dir)))
+    matches.sort()
+    return matches
 
-    size_bytes = 0
-    for rel in relative_matches:
-        candidate = Path(cache_dir) / rel
-        if candidate.exists():
-            size_bytes += candidate.stat().st_size
 
-    quant_hint = None
-    for pat in allow_patterns:
-        stripped = pat.strip("*").strip()
-        if stripped and "gguf" not in stripped.lower():
-            quant_hint = stripped
-            break
-
-    others.append(
-        {
-            "repo_id": key_repo,
-            "revision": key_revision,
-            "quant": quant_hint,
-            "size_bytes": size_bytes,
-            "file_count": len(relative_matches),
-            "paths": relative_matches,
-            "updated_at_unix": int(time.time()),
-        }
-    )
-    _save_index(others)
+def _extract_quant(path: str) -> Optional[str]:
+    match = _GGUF_QUANT_RE.search(path.upper())
+    if match:
+        return match.group(1).upper()
+    return None
 
 
 # --- Build llama.cpp with CUDA support
@@ -212,7 +215,13 @@ image = (
 download_image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("huggingface-hub==0.36.0")
-    .env({"HF_XET_HIGH_PERFORMANCE": "1"})
+    .env(
+        {
+            "HF_XET_HIGH_PERFORMANCE": "1",
+            "HF_HUB_ETAG_TIMEOUT": "30",
+            "HF_HUB_DOWNLOAD_TIMEOUT": "120",
+        }
+    )
 )
 
 
@@ -238,39 +247,118 @@ def _download_model_files(
     allow_patterns: Optional[List[str]],
     revision: Optional[str],
 ) -> List[str]:
-    from huggingface_hub import snapshot_download  # type: ignore
-
     if allow_patterns is None:
         allow_patterns = [f"*{QUANT}*.gguf"] if QUANT else ["*.gguf"]
 
-    target_dir = _model_dir(repo_id, revision)
-    target_dir.mkdir(parents=True, exist_ok=True)
-
     print(
         f"🦙 downloading {repo_id} (patterns: {allow_patterns}, revision: {revision}) "
-        f"into {target_dir}"
+        f"into {HF_HUB_DIR}"
     )
 
-    snapshot_download(
+    _snapshot_download_with_keepalive(
         repo_id=repo_id,
         revision=revision,
-        local_dir=str(target_dir),
+        cache_dir=str(HF_HUB_DIR),
         allow_patterns=allow_patterns,
     )
 
     # Ensure other functions can see the writes before we quit
     model_cache.commit()
 
-    # Discover matching GGUF files
-    matches: List[str] = []
-    for gguf in target_dir.glob("**/*.gguf"):
-        if any(fnmatch.fnmatch(gguf.name, pat) for pat in allow_patterns):
-            matches.append(str(gguf.relative_to(cache_dir)))
-
-    _upsert_index_entry(repo_id, revision, allow_patterns, matches)
+    # Discover matching GGUF files in the Hub cache snapshot.
+    matches = _collect_hub_gguf_matches(repo_id, revision, allow_patterns)
 
     print(f"🦙 found GGUF entries: {matches}")
     return matches
+
+
+def _snapshot_download_with_keepalive(
+    repo_id: str,
+    revision: Optional[str],
+    cache_dir: str,
+    allow_patterns: List[str],
+    max_workers: int = SNAPSHOT_MAX_WORKERS,
+) -> None:
+    """Run snapshot_download in a subprocess and print periodic keepalives."""
+    payload = {
+        "repo_id": repo_id,
+        "revision": revision,
+        "cache_dir": cache_dir,
+        "allow_patterns": allow_patterns,
+        "max_workers": max_workers,
+    }
+    worker_code = (
+        "import json, os\n"
+        "from huggingface_hub import snapshot_download\n"
+        "cfg = json.loads(os.environ['LLM_LAUNCHPAD_SNAPSHOT_CFG'])\n"
+        "snapshot_download("
+        "repo_id=cfg['repo_id'],"
+        "revision=cfg.get('revision'),"
+        "cache_dir=cfg['cache_dir'],"
+        "allow_patterns=cfg['allow_patterns'],"
+        "max_workers=cfg.get('max_workers', 8)"
+        ")\n"
+    )
+    env = {
+        **os.environ,
+        "LLM_LAUNCHPAD_SNAPSHOT_CFG": json.dumps(payload),
+    }
+    process = subprocess.Popen(
+        [sys.executable, "-c", worker_code],
+        env=env,
+    )
+    keepalive_interval_seconds = 20
+    started = time.time()
+    last_bytes = -1
+    stalled_intervals = 0
+    while process.poll() is None:
+        elapsed = int(time.time() - started)
+        size_bytes, file_count = _estimate_matched_snapshot_size(
+            repo_id=repo_id,
+            revision=revision,
+            allow_patterns=allow_patterns,
+        )
+        size_gib = size_bytes / (1024**3)
+        rate_mib_s = (size_bytes / (1024**2)) / elapsed if elapsed > 0 else 0.0
+        if size_bytes > last_bytes:
+            stalled_intervals = 0
+        else:
+            stalled_intervals += 1
+        last_bytes = size_bytes
+        stall_note = " (no growth detected)" if stalled_intervals >= 3 else ""
+        print(
+            "🦙 download in progress... "
+            f"elapsed={elapsed}s files={file_count} size={size_gib:.2f}GiB "
+            f"avg_rate={rate_mib_s:.2f}MiB/s{stall_note}"
+        )
+        time.sleep(keepalive_interval_seconds)
+    if process.returncode != 0:
+        raise RuntimeError(f"snapshot_download failed with exit code {process.returncode}")
+
+
+def _estimate_matched_snapshot_size(
+    repo_id: str,
+    revision: Optional[str],
+    allow_patterns: list[str],
+) -> tuple[int, int]:
+    """Estimate size of files matching allow_patterns in the resolved snapshot."""
+    snapshot_dir = _resolve_hub_snapshot_dir(repo_id, revision)
+    if snapshot_dir is None:
+        return 0, 0
+
+    total_bytes = 0
+    file_count = 0
+    for path in snapshot_dir.glob("**/*"):
+        if not path.is_file():
+            continue
+        if allow_patterns and not any(fnmatch.fnmatch(path.name, pat) for pat in allow_patterns):
+            continue
+        file_count += 1
+        try:
+            total_bytes += path.stat().st_size
+        except OSError:
+            continue
+    return total_bytes, file_count
 
 
 @app.function(
@@ -293,47 +381,44 @@ def predownload_model(
     volumes={cache_dir: model_cache},
 )
 def list_downloaded_models() -> List[Dict[str, Any]]:
-    """List cached llama.cpp models with lightweight metadata."""
-    rows = _load_index()
+    """List cached llama.cpp GGUF entries from Hugging Face Hub cache layout."""
     items: List[Dict[str, Any]] = []
-    for row in rows:
-        items.append(
-            {
-                "backend": "llamacpp",
-                "model_id": str(row.get("repo_id", "")).strip(),
-                "revision": row.get("revision"),
-                "quant": row.get("quant"),
-                "size_bytes": int(row.get("size_bytes", 0) or 0),
-                "file_count": int(row.get("file_count", 0) or 0),
-                "source_volume": "huggingface-cache",
-                "paths": list(row.get("paths", []) or []),
-            }
-        )
+    grouped: dict[tuple[str, Optional[str], Optional[str]], dict[str, Any]] = {}
+    if HF_HUB_DIR.exists():
+        for model_dir in sorted(HF_HUB_DIR.glob("models--*")):
+            if not model_dir.is_dir():
+                continue
+            encoded = model_dir.name[len("models--") :]
+            model_id = encoded.replace("--", "/")
+            snapshots_root = model_dir / "snapshots"
+            if not snapshots_root.exists() or not snapshots_root.is_dir():
+                continue
+            for snapshot_dir in snapshots_root.iterdir():
+                if not snapshot_dir.is_dir():
+                    continue
+                revision = snapshot_dir.name
+                for gguf in snapshot_dir.glob("**/*.gguf"):
+                    rel = str(gguf.relative_to(cache_dir))
+                    quant = _extract_quant(gguf.name)
+                    key = (model_id, revision, quant)
+                    entry = grouped.get(key)
+                    if entry is None:
+                        entry = {
+                            "backend": "llamacpp",
+                            "model_id": model_id,
+                            "revision": revision,
+                            "quant": quant,
+                            "size_bytes": 0,
+                            "file_count": 0,
+                            "source_volume": "huggingface-cache",
+                            "paths": [],
+                        }
+                        grouped[key] = entry
+                    entry["size_bytes"] += int(gguf.stat().st_size)
+                    entry["file_count"] += 1
+                    entry["paths"].append(rel)
 
-    # Compatibility: detect legacy flat-cache GGUF files not indexed yet.
-    known_paths = {path for entry in items for path in entry.get("paths", [])}
-    for gguf in Path(cache_dir).glob("**/*.gguf"):
-        try:
-            gguf.relative_to(MODELS_ROOT)
-            continue
-        except ValueError:
-            pass
-        rel = str(gguf.relative_to(cache_dir))
-        if rel in known_paths:
-            continue
-        items.append(
-            {
-                "backend": "llamacpp",
-                "model_id": f"legacy:{gguf.stem}",
-                "revision": None,
-                "quant": None,
-                "size_bytes": int(gguf.stat().st_size),
-                "file_count": 1,
-                "source_volume": "huggingface-cache",
-                "paths": [rel],
-            }
-        )
-    return items
+    return list(grouped.values())
 
 
 DEFAULT_SERVER_ARGS = [
@@ -349,23 +434,23 @@ def _resolve_model_entrypoint(
     revision: Optional[str],
     quant: Optional[str],
 ) -> Path:
-    """Pick a GGUF file, preferring model-specific cache directories."""
+    """Pick a GGUF file from HF hub cache."""
     pattern = f"**/*{quant}*.gguf" if quant else "**/*.gguf"
 
-    # Primary: per-model multi-cache layout.
     if repo_id:
-        scoped_dir = _model_dir(repo_id, revision)
-        scoped_candidates = list(scoped_dir.glob(pattern))
+        snapshot_dir = _resolve_hub_snapshot_dir(repo_id, revision)
+        scoped_candidates = list(snapshot_dir.glob(pattern)) if snapshot_dir else []
         if scoped_candidates:
             scoped_candidates.sort(key=lambda p: p.stat().st_size, reverse=True)
             return scoped_candidates[0]
 
-    # Compatibility: legacy flat layout in cache root.
-    candidates = list(Path(cache_dir).glob(pattern))
+    candidates = list(HF_HUB_DIR.glob(f"models--*/snapshots/{pattern}"))
     if not candidates:
         if quant:
-            raise RuntimeError(f"No GGUF files matching '*{quant}*.gguf' in {cache_dir}")
-        raise RuntimeError(f"No GGUF files found in {cache_dir}")
+            raise RuntimeError(
+                f"No GGUF files matching '*{quant}*.gguf' in HF cache {HF_HUB_DIR}"
+            )
+        raise RuntimeError(f"No GGUF files found in HF cache {HF_HUB_DIR}")
     candidates.sort(key=lambda p: p.stat().st_size, reverse=True)
     return candidates[0]
 

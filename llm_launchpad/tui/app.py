@@ -17,7 +17,7 @@ from textual.binding import Binding
 
 from ..core.backend import ModalBackend
 from ..core.config import SETTINGS_DIR
-from ..core.hf_models import fetch_gguf_quantizations, list_llamacpp_candidates, list_vllm_candidates
+from ..core.hf_models import fetch_gguf_quant_metadata, list_llamacpp_candidates, list_vllm_candidates
 from ..core.naming import build_app_name, legacy_app_name
 from ..core.orchestrator import Orchestrator
 from ..protocol.enums import BackendType
@@ -544,8 +544,15 @@ class WizardApp(App):
         if poster is None:
             return
         try:
-            quantizations = fetch_gguf_quantizations(repo_id=repo_id, revision=revision)
+            metadata = fetch_gguf_quant_metadata(repo_id=repo_id, revision=revision)
         except Exception as exc:
             poster(LlamaCppQuantsFailed(repo_id=repo_id, revision=revision, error=str(exc)))
             return
-        poster(LlamaCppQuantsLoaded(repo_id=repo_id, revision=revision, quantizations=quantizations))
+        poster(
+            LlamaCppQuantsLoaded(
+                repo_id=repo_id,
+                revision=revision,
+                quantizations=list(metadata.quantizations),
+                vram_gb_by_quant=dict(metadata.vram_gb_by_quant),
+            )
+        )

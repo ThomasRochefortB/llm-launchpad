@@ -118,6 +118,24 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
             screen.action_delete_selected_model()
             self.assertEqual(app.delete_calls, [first_model.model_id])
 
+    async def test_keyboard_navigation_prefills_model_fields(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(StorageScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, StorageScreen)
+            table = screen.query_one("#storage-table", DataTable)
+            table.focus()
+            await pilot.pause()
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertEqual(
+                screen.query_one("#storage-model-id", Input).value,
+                "Qwen/Qwen3-4B-Thinking-2507-FP8",
+            )
+            self.assertEqual(screen.query_one("#storage-model-backend", Input).value, "vllm")
+
     async def test_resume_triggers_storage_refresh(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:
