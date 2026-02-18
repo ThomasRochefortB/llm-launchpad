@@ -116,11 +116,18 @@ class LlamaCppModelsFailed(Message):
 class LlamaCppQuantsLoaded(Message):
     """Detected GGUF quantizations for a llama.cpp repo."""
 
-    def __init__(self, repo_id: str, revision: str | None, quantizations: list[str]) -> None:
+    def __init__(
+        self,
+        repo_id: str,
+        revision: str | None,
+        quantizations: list[str],
+        vram_gb_by_quant: dict[str, float] | None = None,
+    ) -> None:
         super().__init__()
         self.repo_id = repo_id
         self.revision = revision
         self.quantizations = quantizations
+        self.vram_gb_by_quant = dict(vram_gb_by_quant or {})
 
 
 class LlamaCppQuantsFailed(Message):

@@ -4,13 +4,13 @@ import unittest
 from types import SimpleNamespace
 
 from textual.app import App
-from textual.widgets import Input, OptionList
+from textual.widgets import Input, OptionList, Static
 
 from llm_launchpad.core.hf_models import ModelCandidate
 from llm_launchpad.protocol.enums import BackendType
 from llm_launchpad.protocol.models import StorageSnapshot, StoredModelInfo
 from llm_launchpad.tui.screens.deploy import LlamaCppDeployScreen
-from llm_launchpad.tui.workers import LlamaCppModelsLoaded, StorageLoaded
+from llm_launchpad.tui.workers import LlamaCppModelsLoaded, LlamaCppQuantsLoaded, StorageLoaded
 
 
 class _TestApp(App[None]):
@@ -105,7 +105,7 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             repo_id = screen.query_one("#repo-id", Input).value
             self.assertEqual(repo_id, "Qwen/Qwen3-Coder-Next-GGUF")
             self.assertEqual(screen.query_one("#quant", Input).value, "Q5_K_M")
-            self.assertEqual(app.quant_fetch_calls, [])
+            self.assertEqual(app.quant_fetch_calls, [("Qwen/Qwen3-Coder-Next-GGUF", None)])
 
     async def test_cached_mode_prefills_repo_and_quant_from_storage(self) -> None:
         app = _TestApp()
@@ -145,7 +145,36 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(screen.query_one("#repo-id", Input).value, "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF")
             self.assertEqual(screen.query_one("#quant", Input).value, "Q4_K_M")
             self.assertEqual(app.fetch_calls, [])
-            self.assertEqual(app.quant_fetch_calls, [])
+            self.assertEqual(app.quant_fetch_calls, [("Qwen/Qwen2.5-Coder-7B-Instruct-GGUF", None)])
+
+    async def test_quants_loaded_shows_vram_in_option_list_and_status(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+            screen.query_one("#repo-id", Input).value = "Qwen/Qwen3-Coder-Next-GGUF"
+            await pilot.pause()
+
+            screen.on_llama_cpp_quants_loaded(
+                LlamaCppQuantsLoaded(
+                    repo_id="Qwen/Qwen3-Coder-Next-GGUF",
+                    revision=None,
+                    quantizations=["Q4_K_M", "Q8_0"],
+                    vram_gb_by_quant={"Q4_K_M": 4.66},
+                )
+            )
+
+            quant_list = screen.query_one("#llama-quant-list", OptionList)
+            first = quant_list.get_option_at_index(0)
+            second = quant_list.get_option_at_index(1)
+            self.assertIn("Q4_K_M (~4.7 GB)", first.prompt)
+            self.assertEqual(second.prompt.strip(), "Q8_0")
+
+            quant_status = str(screen.query_one("#llama-quant-status", Static).content)
+            self.assertIn("Quantizations:", quant_status)
 
     async def test_repo_input_triggers_quant_lookup_when_not_in_ranked_cache(self) -> None:
         app = _TestApp()

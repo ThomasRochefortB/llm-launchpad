@@ -164,7 +164,7 @@ curl -s "$SERVER_URL"/metrics
 - **Quantization**: pass `--quant` (default: `Q4_K_M`) or adjust presets.
 - **Server args**: pass `--server_args "--ctx-size 65536 --threads 24"`.
 - **GPU offload**: override with `--n_gpu_layers <int>` or rely on auto (all layers if GPU provided).
-- **Persisted config**: settings are saved to `/root/.cache/llama.cpp/serve_config.json` and read by the server.
+- **Persisted config**: settings are saved to `/root/.cache/huggingface/serve_config.json` and read by the server.
 
 ### Presets
 Built-in examples (adjust as needed):
@@ -173,12 +173,12 @@ Built-in examples (adjust as needed):
 - `deepseek-coder-lite` → `TheBloke/deepseek-coder-6.7b-instruct-GGUF`
 
 ### Volumes
-- Weights cache volume: `llamacpp-cache`
-  - List files: `modal volume ls llamacpp-cache`
-  - Explore: `modal shell --volume llamacpp-cache` (then `cd /mnt`)
+- Weights cache volume: `huggingface-cache` (HF default hub cache under `/root/.cache/huggingface/hub`)
+  - List files: `modal volume ls huggingface-cache`
+  - Explore: `modal shell --volume huggingface-cache` (then `cd /mnt`)
 
 ### Troubleshooting
-- Slow downloads: ensure `HF_HUB_ENABLE_HF_TRANSFER=1`.
+- Slow downloads: prefer Xet (`hf-xet`) and set `HF_XET_HIGH_PERFORMANCE=1` (legacy `HF_HUB_ENABLE_HF_TRANSFER` is deprecated).
 - HF auth errors: login with `huggingface-cli login`.
 - Build errors: ensure host CUDA >= 12.4, or switch to CPU.
 

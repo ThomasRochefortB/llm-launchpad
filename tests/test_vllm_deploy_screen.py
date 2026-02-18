@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from textual.app import App
-from textual.widgets import Input, OptionList, Switch
+from textual.widgets import Input, OptionList, Static, Switch
 
-from llm_launchpad.core.hf_models import ModelCandidate
+from llm_launchpad.core.hf_models import ModelCandidate, VllmMemoryBreakdown
 from llm_launchpad.protocol.enums import BackendType
 from llm_launchpad.protocol.models import StorageSnapshot, StoredModelInfo
 from llm_launchpad.tui.screens.deploy import VllmDeployScreen
@@ -388,6 +389,45 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(app.deployed_config)
             self.assertTrue(app.notifications)
             self.assertEqual(app.notifications[-1][1], "error")
+
+    async def test_vllm_memory_status_updates_from_estimate(self) -> None:
+        app = _TestApp()
+        estimate = VllmMemoryBreakdown(
+            total_gb=120.0,
+            weights_gb=90.0,
+            kv_cache_gb=20.0,
+            overhead_gb=10.0,
+            context_tokens=8192,
+        )
+        with patch("llm_launchpad.tui.screens.deploy.fetch_vllm_memory_breakdown", return_value=estimate):
+            async with app.run_test() as pilot:
+                app.push_screen(VllmDeployScreen())
+                await pilot.pause()
+
+                screen = app.screen
+                assert isinstance(screen, VllmDeployScreen)
+                screen.query_one("#model-name", Input).value = "Qwen/Qwen3-8B"
+                screen.query_one("#n-gpu", Input).value = "2"
+                await pilot.pause()
+
+                text = str(screen.query_one("#vllm-vram-status", Static).content)
+                self.assertIn("Estimated VRAM", text)
+                self.assertIn("~60.0 GB/GPU @ TP=2", text)
+
+    async def test_vllm_memory_status_handles_unavailable_estimate(self) -> None:
+        app = _TestApp()
+        with patch("llm_launchpad.tui.screens.deploy.fetch_vllm_memory_breakdown", return_value=None):
+            async with app.run_test() as pilot:
+                app.push_screen(VllmDeployScreen())
+                await pilot.pause()
+
+                screen = app.screen
+                assert isinstance(screen, VllmDeployScreen)
+                screen.query_one("#model-name", Input).value = "custom/model-no-metadata"
+                await pilot.pause()
+
+                text = str(screen.query_one("#vllm-vram-status", Static).content)
+                self.assertIn("unavailable", text)
 
 
 if __name__ == "__main__":

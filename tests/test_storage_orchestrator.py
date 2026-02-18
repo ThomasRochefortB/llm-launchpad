@@ -14,20 +14,18 @@ class StorageOrchestratorTests(unittest.TestCase):
     def test_list_storage_builds_snapshot(self, mock_list_volume) -> None:  # type: ignore[no-untyped-def]
         def side_effect(volume_name, path):  # type: ignore[no-untyped-def]
             mapping = {
-                ("huggingface-cache", "/models"): [{"path": "/models/Qwen__Coder", "type": "directory"}],
-                ("huggingface-cache", "/models/Qwen__Coder"): [
-                    {"path": "/models/Qwen__Coder/main", "type": "directory"}
+                ("huggingface-cache", "/models"): [],
+                ("huggingface-cache", "/"): [],
+                ("huggingface-cache", "/hub"): [
+                    {"path": "/hub/models--Qwen--Coder", "type": "directory"},
+                    {"path": "/hub/models--Qwen--Qwen3-4B-Thinking-2507-FP8", "type": "directory"}
                 ],
-                ("huggingface-cache", "/models/Qwen__Coder/main"): [
+                ("huggingface-cache", "/hub/models--Qwen--Coder"): [
                     {
-                        "path": "/models/Qwen__Coder/main/model.Q4_K_M.gguf",
+                        "path": "/hub/models--Qwen--Coder/snapshots/abc/model.Q4_K_M.gguf",
                         "type": "file",
                         "size": 2000,
                     }
-                ],
-                ("huggingface-cache", "/"): [],
-                ("huggingface-cache", "/hub"): [
-                    {"path": "/hub/models--Qwen--Qwen3-4B-Thinking-2507-FP8", "type": "directory"}
                 ],
                 ("huggingface-cache", "/hub/models--Qwen--Qwen3-4B-Thinking-2507-FP8"): [
                     {
@@ -78,13 +76,18 @@ class StorageOrchestratorTests(unittest.TestCase):
     def test_list_storage_handles_uppercase_volume_keys(self, mock_list_volume) -> None:  # type: ignore[no-untyped-def]
         def side_effect(volume_name, path):  # type: ignore[no-untyped-def]
             mapping = {
-                ("huggingface-cache", "/models"): [{"Name": "Qwen__Coder", "Type": "directory"}],
-                ("huggingface-cache", "/models/Qwen__Coder"): [{"Name": "main", "Type": "directory"}],
-                ("huggingface-cache", "/models/Qwen__Coder/main"): [
+                ("huggingface-cache", "/models"): [],
+                ("huggingface-cache", "/"): [],
+                ("huggingface-cache", "/hub"): [{"Name": "models--Qwen--Coder", "Type": "directory"}],
+                ("huggingface-cache", "/hub/models--Qwen--Coder"): [
+                    {"Name": "snapshots", "Type": "directory"}
+                ],
+                ("huggingface-cache", "/hub/models--Qwen--Coder/snapshots"): [
+                    {"Name": "abc", "Type": "directory"}
+                ],
+                ("huggingface-cache", "/hub/models--Qwen--Coder/snapshots/abc"): [
                     {"Name": "weights.Q4_K_M.gguf", "Type": "file", "Size": 2048}
                 ],
-                ("huggingface-cache", "/"): [],
-                ("huggingface-cache", "/hub"): [],
             }
             return mapping.get((volume_name, path), [])
 
@@ -126,6 +129,36 @@ class StorageOrchestratorTests(unittest.TestCase):
         self.assertEqual(len(snapshot.vllm_models), 1)
         self.assertEqual(snapshot.vllm_models[0].model_id, "Qwen/Qwen3-4B")
         self.assertEqual(snapshot.vllm_models[0].size_bytes, 123)
+
+    @patch("llm_launchpad.core.orchestrator.ModalBackend.list_volume")
+    def test_list_storage_detects_llamacpp_hub_snapshot_gguf(self, mock_list_volume) -> None:  # type: ignore[no-untyped-def]
+        def side_effect(volume_name, path):  # type: ignore[no-untyped-def]
+            mapping = {
+                ("huggingface-cache", "/models"): [],
+                ("huggingface-cache", "/"): [],
+                ("huggingface-cache", "/hub"): [
+                    {"path": "/hub/models--unsloth--GLM-5-GGUF", "type": "directory"}
+                ],
+                ("huggingface-cache", "/hub/models--unsloth--GLM-5-GGUF"): [
+                    {
+                        "path": "/hub/models--unsloth--GLM-5-GGUF/snapshots/abc/GLM-5-Q4_K_M.gguf",
+                        "type": "file",
+                        "size": 1024,
+                    }
+                ],
+            }
+            return mapping.get((volume_name, path), [])
+
+        mock_list_volume.side_effect = side_effect
+        orch = Orchestrator()
+        events = list(orch.list_storage())
+        done = next(e for e in events if isinstance(e, OperationCompleteEvent))
+        self.assertTrue(done.success)
+        snapshot = done.data
+        assert isinstance(snapshot, StorageSnapshot)
+        self.assertEqual(len(snapshot.llamacpp_models), 1)
+        self.assertEqual(snapshot.llamacpp_models[0].model_id, "unsloth/GLM-5-GGUF")
+        self.assertEqual(snapshot.llamacpp_models[0].quant, "Q4_K_M")
 
     @patch("llm_launchpad.core.orchestrator.ModalBackend.list_volume")
     def test_list_storage_marks_vllm_model_incomplete(self, mock_list_volume) -> None:  # type: ignore[no-untyped-def]
@@ -287,31 +320,21 @@ class StorageOrchestratorTests(unittest.TestCase):
         self.assertFalse(snapshot.vllm_models[0].incomplete)
 
     @patch("llm_launchpad.core.orchestrator.ModalBackend.list_volume")
-    def test_list_storage_includes_incomplete_llamacpp_model(self, mock_list_volume) -> None:  # type: ignore[no-untyped-def]
+    def test_list_storage_ignores_llamacpp_incomplete_without_gguf(self, mock_list_volume) -> None:  # type: ignore[no-untyped-def]
         def side_effect(volume_name, path):  # type: ignore[no-untyped-def]
             mapping = {
-                ("huggingface-cache", "/models"): [{"path": "/models/Qwen__Coder", "type": "directory"}],
-                ("huggingface-cache", "/models/Qwen__Coder"): [
-                    {"path": "/models/Qwen__Coder/main", "type": "directory"}
+                ("huggingface-cache", "/models"): [],
+                ("huggingface-cache", "/hub"): [
+                    {"path": "/hub/models--Qwen--Coder", "type": "directory"}
                 ],
-                ("huggingface-cache", "/models/Qwen__Coder/main"): [
-                    {"path": "/models/Qwen__Coder/main/.cache", "type": "directory"}
-                ],
-                ("huggingface-cache", "/models/Qwen__Coder/main/.cache"): [
-                    {"path": "/models/Qwen__Coder/main/.cache/huggingface", "type": "directory"}
-                ],
-                ("huggingface-cache", "/models/Qwen__Coder/main/.cache/huggingface"): [
-                    {"path": "/models/Qwen__Coder/main/.cache/huggingface/download", "type": "directory"}
-                ],
-                ("huggingface-cache", "/models/Qwen__Coder/main/.cache/huggingface/download"): [
+                ("huggingface-cache", "/hub/models--Qwen--Coder"): [
                     {
-                        "path": "/models/Qwen__Coder/main/.cache/huggingface/download/model.gguf.incomplete",
+                        "path": "/hub/models--Qwen--Coder/blobs/model.gguf.incomplete",
                         "type": "file",
                         "size": 2048,
                     }
                 ],
                 ("huggingface-cache", "/"): [],
-                ("huggingface-cache", "/hub"): [],
             }
             return mapping.get((volume_name, path), [])
 
@@ -322,39 +345,26 @@ class StorageOrchestratorTests(unittest.TestCase):
         self.assertTrue(done.success)
         snapshot = done.data
         assert isinstance(snapshot, StorageSnapshot)
-        self.assertEqual(len(snapshot.llamacpp_models), 1)
-        model = snapshot.llamacpp_models[0]
-        self.assertEqual(model.model_id, "Qwen/Coder")
-        self.assertTrue(model.incomplete)
+        self.assertEqual(len(snapshot.llamacpp_models), 0)
 
     @patch("llm_launchpad.core.orchestrator.ModalBackend.list_volume")
-    def test_list_storage_marks_llamacpp_incomplete_without_gguf_payload(
+    def test_list_storage_ignores_llamacpp_metadata_without_gguf_payload(
         self, mock_list_volume
     ) -> None:  # type: ignore[no-untyped-def]
         def side_effect(volume_name, path):  # type: ignore[no-untyped-def]
             mapping = {
-                ("huggingface-cache", "/models"): [{"path": "/models/Qwen__Coder", "type": "directory"}],
-                ("huggingface-cache", "/models/Qwen__Coder"): [
-                    {"path": "/models/Qwen__Coder/main", "type": "directory"}
+                ("huggingface-cache", "/models"): [],
+                ("huggingface-cache", "/hub"): [
+                    {"path": "/hub/models--Qwen--Coder", "type": "directory"}
                 ],
-                ("huggingface-cache", "/models/Qwen__Coder/main"): [
-                    {"path": "/models/Qwen__Coder/main/.cache", "type": "directory"}
-                ],
-                ("huggingface-cache", "/models/Qwen__Coder/main/.cache"): [
-                    {"path": "/models/Qwen__Coder/main/.cache/huggingface", "type": "directory"}
-                ],
-                ("huggingface-cache", "/models/Qwen__Coder/main/.cache/huggingface"): [
-                    {"path": "/models/Qwen__Coder/main/.cache/huggingface/download", "type": "directory"}
-                ],
-                ("huggingface-cache", "/models/Qwen__Coder/main/.cache/huggingface/download"): [
+                ("huggingface-cache", "/hub/models--Qwen--Coder"): [
                     {
-                        "path": "/models/Qwen__Coder/main/.cache/huggingface/download/metadata.json",
+                        "path": "/hub/models--Qwen--Coder/refs/main",
                         "type": "file",
-                        "size": 128,
+                        "size": 40,
                     }
                 ],
                 ("huggingface-cache", "/"): [],
-                ("huggingface-cache", "/hub"): [],
             }
             return mapping.get((volume_name, path), [])
 
@@ -365,13 +375,10 @@ class StorageOrchestratorTests(unittest.TestCase):
         self.assertTrue(done.success)
         snapshot = done.data
         assert isinstance(snapshot, StorageSnapshot)
-        self.assertEqual(len(snapshot.llamacpp_models), 1)
-        model = snapshot.llamacpp_models[0]
-        self.assertEqual(model.model_id, "Qwen/Coder")
-        self.assertTrue(model.incomplete)
+        self.assertEqual(len(snapshot.llamacpp_models), 0)
 
     @patch("llm_launchpad.core.orchestrator.ModalBackend.list_volume")
-    def test_legacy_llamacpp_shards_are_grouped(self, mock_list_volume) -> None:  # type: ignore[no-untyped-def]
+    def test_legacy_llamacpp_shards_are_ignored(self, mock_list_volume) -> None:  # type: ignore[no-untyped-def]
         def side_effect(volume_name, path):  # type: ignore[no-untyped-def]
             mapping = {
                 ("huggingface-cache", "/models"): [],
@@ -403,32 +410,27 @@ class StorageOrchestratorTests(unittest.TestCase):
         self.assertTrue(done.success)
         snapshot = done.data
         assert isinstance(snapshot, StorageSnapshot)
-        self.assertEqual(len(snapshot.llamacpp_models), 1)
-        model = snapshot.llamacpp_models[0]
-        self.assertEqual(model.model_id, "legacy:GLM-5-Q4_K_M")
-        self.assertEqual(model.file_count, 3)
-        self.assertEqual(model.size_bytes, 6 * 1024 * 1024)
+        self.assertEqual(len(snapshot.llamacpp_models), 0)
 
     @patch("llm_launchpad.core.orchestrator.ModalBackend.list_volume")
-    def test_llamacpp_legacy_scan_does_not_recurse_root(self, mock_list_volume) -> None:  # type: ignore[no-untyped-def]
+    def test_llamacpp_storage_scan_uses_hub_only(self, mock_list_volume) -> None:  # type: ignore[no-untyped-def]
         def side_effect(volume_name, path):  # type: ignore[no-untyped-def]
             mapping = {
-                ("huggingface-cache", "/models"): [{"path": "/models/Qwen__Coder", "type": "directory"}],
-                ("huggingface-cache", "/models/Qwen__Coder"): [
-                    {"path": "/models/Qwen__Coder/main", "type": "directory"}
-                ],
-                ("huggingface-cache", "/models/Qwen__Coder/main"): [
-                    {
-                        "path": "/models/Qwen__Coder/main/model.Q4_K_M.gguf",
-                        "type": "file",
-                        "size": 2048,
-                    }
-                ],
+                ("huggingface-cache", "/models"): [],
                 ("huggingface-cache", "/"): [
                     {"path": "/models", "type": "directory"},
                     {"path": "/legacy.Q4_K_M.gguf", "type": "file", "size": 1024},
                 ],
-                ("huggingface-cache", "/hub"): [],
+                ("huggingface-cache", "/hub"): [
+                    {"path": "/hub/models--Qwen--Coder", "type": "directory"}
+                ],
+                ("huggingface-cache", "/hub/models--Qwen--Coder"): [
+                    {
+                        "path": "/hub/models--Qwen--Coder/snapshots/abc/model.Q4_K_M.gguf",
+                        "type": "file",
+                        "size": 2048,
+                    }
+                ],
             }
             return mapping.get((volume_name, path), [])
 
@@ -439,13 +441,8 @@ class StorageOrchestratorTests(unittest.TestCase):
         self.assertTrue(done.success)
         snapshot = done.data
         assert isinstance(snapshot, StorageSnapshot)
-        self.assertEqual(len(snapshot.llamacpp_models), 2)
-        qwen_calls = sum(
-            1
-            for call in mock_list_volume.call_args_list
-            if call.args == ("huggingface-cache", "/models/Qwen__Coder")
-        )
-        self.assertEqual(qwen_calls, 1)
+        self.assertEqual(len(snapshot.llamacpp_models), 1)
+        self.assertEqual(snapshot.llamacpp_models[0].model_id, "Qwen/Coder")
 
     @patch("llm_launchpad.core.orchestrator.ModalBackend.run_volume_remove")
     def test_delete_stored_model_vllm_uses_model_directory(self, mock_remove) -> None:  # type: ignore[no-untyped-def]
@@ -463,6 +460,27 @@ class StorageOrchestratorTests(unittest.TestCase):
         mock_remove.assert_called_with(
             "huggingface-cache",
             "/hub/models--Qwen--Qwen3-4B",
+            recursive=True,
+        )
+
+    @patch("llm_launchpad.core.orchestrator.ModalBackend.run_volume_remove")
+    def test_delete_stored_model_llamacpp_hub_layout_uses_model_directory(
+        self, mock_remove
+    ) -> None:  # type: ignore[no-untyped-def]
+        mock_remove.return_value = iter([OperationCompleteEvent(success=True, exit_code=0)])  # type: ignore[call-arg]
+        orch = Orchestrator()
+        model = StoredModelInfo(
+            backend=BackendType.LLAMACPP,
+            model_id="unsloth/GLM-5-GGUF",
+            source_volume="huggingface-cache",
+            paths=["/hub/models--unsloth--GLM-5-GGUF/snapshots/abc/GLM-5-Q4_K_M.gguf"],
+        )
+        events = list(orch.delete_stored_model(model))
+        done = next(e for e in events if isinstance(e, OperationCompleteEvent))
+        self.assertTrue(done.success)
+        mock_remove.assert_called_with(
+            "huggingface-cache",
+            "/hub/models--unsloth--GLM-5-GGUF",
             recursive=True,
         )
 

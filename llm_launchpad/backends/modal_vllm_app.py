@@ -58,6 +58,7 @@ DEPLOY_TRUST_REMOTE_CODE = _read_bool_env("TRUST_REMOTE_CODE", False)
 DEPLOY_REASONING_PARSER = os.environ.get("REASONING_PARSER", "").strip() or None
 DEPLOY_DEFAULT_CHAT_TEMPLATE_KWARGS = os.environ.get("DEFAULT_CHAT_TEMPLATE_KWARGS", "").strip() or None
 PREDOWNLOAD_TIMEOUT_MINUTES = _read_int_env("PREDOWNLOAD_TIMEOUT_MINUTES", 6 * 60)
+SNAPSHOT_MAX_WORKERS = _read_int_env("HF_SNAPSHOT_MAX_WORKERS", 16)
 
 RUNTIME_ENV = {
     "MODEL_NAME": DEPLOY_MODEL_NAME,
@@ -85,7 +86,13 @@ vllm_image = (
         "huggingface-hub==0.36.0",
         "aiohttp>=3.9.5",
     )
-    .env({"HF_XET_HIGH_PERFORMANCE": "1"})
+    .env(
+        {
+            "HF_XET_HIGH_PERFORMANCE": "1",
+            "HF_HUB_ETAG_TIMEOUT": "30",
+            "HF_HUB_DOWNLOAD_TIMEOUT": "120",
+        }
+    )
 )
 
 
@@ -107,8 +114,9 @@ def predownload_model(
     path = snapshot_download(
         repo_id=repo_id,
         revision=revision,
-        cache_dir=HF_CACHE_DIR,
+        cache_dir=HF_HUB_DIR,
         allow_patterns=None,
+        max_workers=SNAPSHOT_MAX_WORKERS,
     )
     hf_cache_vol.commit()
     return {"repo_id": repo_id, "revision": revision, "path": path}

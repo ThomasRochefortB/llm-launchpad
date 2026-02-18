@@ -24,7 +24,7 @@ from textual.widgets import (
 )
 from textual.widgets.option_list import Option
 
-from ...core.hf_models import ModelCandidate
+from ...core.hf_models import ModelCandidate, VllmMemoryBreakdown, fetch_vllm_memory_breakdown
 from ...core.modal_gpu import fetch_modal_gpu_types
 from ...core.naming import (
     auto_instance_name_for_backend,
@@ -70,6 +70,26 @@ class GpuTypesFailed(Message):
         self.error = error
 
 
+class VllmMemoryLoaded(Message):
+    """Heuristic vLLM memory estimate fetched for a model."""
+
+    def __init__(self, repo_id: str, revision: str | None, estimate: VllmMemoryBreakdown | None) -> None:
+        super().__init__()
+        self.repo_id = repo_id
+        self.revision = revision
+        self.estimate = estimate
+
+
+class VllmMemoryFailed(Message):
+    """Heuristic vLLM memory fetch failed."""
+
+    def __init__(self, repo_id: str, revision: str | None, error: str) -> None:
+        super().__init__()
+        self.repo_id = repo_id
+        self.revision = revision
+        self.error = error
+
+
 def _cached_models_from_snapshot(snapshot: StorageSnapshot, backend: BackendType) -> list[ModelCandidate]:
     rows = snapshot.llamacpp_models if backend == BackendType.LLAMACPP else snapshot.vllm_models
     repo_by_key: dict[str, str] = {}
@@ -109,6 +129,43 @@ def _model_from_option_id(option_id: str, ranked_models: list[ModelCandidate]) -
     if idx < 0 or idx >= len(ranked_models):
         return None
     return ranked_models[idx]
+
+
+def _normalize_vram_map(vram_gb_by_quant: dict[str, float] | None) -> dict[str, float]:
+    if not isinstance(vram_gb_by_quant, dict):
+        return {}
+    normalized: dict[str, float] = {}
+    for quant, value in vram_gb_by_quant.items():
+        quant_key = str(quant).strip().upper()
+        if not quant_key:
+            continue
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            continue
+        if numeric <= 0:
+            continue
+        current = normalized.get(quant_key)
+        if current is None or numeric > current:
+            normalized[quant_key] = numeric
+    return normalized
+
+
+def _format_vram_gb(vram_gb: float) -> str:
+    return f"{vram_gb:.1f} GB"
+
+
+def _format_quant_with_vram(quant: str, vram_gb_by_quant: dict[str, float]) -> str:
+    vram_gb = vram_gb_by_quant.get(quant.strip().upper())
+    if vram_gb is None:
+        return quant
+    return f"{quant} (~{_format_vram_gb(vram_gb)})"
+
+
+def _quant_preview(quantizations: list[str], vram_gb_by_quant: dict[str, float], limit: int = 6) -> str:
+    preview_tokens = [_format_quant_with_vram(quant, vram_gb_by_quant) for quant in quantizations[:limit]]
+    suffix = "..." if len(quantizations) > limit else ""
+    return ", ".join(preview_tokens) + suffix
 
 
 class BackendSelectScreen(Screen):
@@ -246,6 +303,7 @@ class LlamaCppDeployScreen(Screen):
         self._cached_models: list[ModelCandidate] = []
         self._has_cached_snapshot = False
         self._repo_to_quants: dict[str, tuple[str, ...]] = {}
+        self._repo_to_quant_vram: dict[str, dict[str, float]] = {}
         self._last_quant_lookup: tuple[str, str] | None = None
         self._updating_quant_input = False
         self._quant_touched = False
@@ -402,8 +460,14 @@ class LlamaCppDeployScreen(Screen):
             return
         if (message.revision or "").strip() != current_revision:
             return
-        self._repo_to_quants[current_repo.casefold()] = tuple(message.quantizations)
-        self._apply_quantizations(message.quantizations, auto_select=not self._quant_touched)
+        repo_key = current_repo.casefold()
+        self._repo_to_quants[repo_key] = tuple(message.quantizations)
+        self._repo_to_quant_vram[repo_key] = _normalize_vram_map(message.vram_gb_by_quant)
+        self._apply_quantizations(
+            message.quantizations,
+            auto_select=not self._quant_touched,
+            vram_gb_by_quant=self._repo_to_quant_vram[repo_key],
+        )
 
     def on_llama_cpp_quants_failed(self, message: LlamaCppQuantsFailed) -> None:
         current_repo = self.query_one("#repo-id", Input).value.strip()
@@ -536,8 +600,16 @@ class LlamaCppDeployScreen(Screen):
             return
         self.query_one("#repo-id", Input).value = selected.repo_id
         self._quant_touched = False
+        repo_key = selected.repo_id.casefold()
+        cached_vram = self._repo_to_quant_vram.get(repo_key, {})
         if selected.quantizations:
-            self._apply_quantizations(list(selected.quantizations), auto_select=True)
+            self._apply_quantizations(
+                list(selected.quantizations),
+                auto_select=True,
+                vram_gb_by_quant=cached_vram,
+            )
+            if not cached_vram:
+                self._lookup_quantizations_for_current_repo()
         else:
             self._lookup_quantizations_for_current_repo(force_refresh=True)
         self._refresh_app_preview()
@@ -556,27 +628,41 @@ class LlamaCppDeployScreen(Screen):
             self._last_quant_lookup = None
             return
 
-        cache_key = (repo_id.casefold(), revision)
+        repo_key = repo_id.casefold()
+        cache_key = (repo_key, revision)
+        cached_quants = self._repo_to_quants.get(repo_key)
+        cached_vram = self._repo_to_quant_vram.get(repo_key, {})
+        if cached_quants is not None and not force_refresh:
+            self._apply_quantizations(
+                list(cached_quants),
+                auto_select=not self._quant_touched,
+                vram_gb_by_quant=cached_vram,
+            )
+            if cached_vram or not cached_quants:
+                return
+
         if not force_refresh and cache_key == self._last_quant_lookup:
             return
         self._last_quant_lookup = cache_key
 
-        cached_quants = self._repo_to_quants.get(repo_id.casefold())
-        if cached_quants is not None and not force_refresh:
-            self._apply_quantizations(list(cached_quants), auto_select=not self._quant_touched)
-            return
-
         self._set_quant_status("[dim]Loading quantizations...[/dim]")
         self.app.begin_fetch_llamacpp_quants(repo_id, revision or None, self)  # type: ignore[attr-defined]
 
-    def _apply_quantizations(self, quantizations: list[str], auto_select: bool) -> None:
+    def _apply_quantizations(
+        self,
+        quantizations: list[str],
+        auto_select: bool,
+        vram_gb_by_quant: dict[str, float] | None = None,
+    ) -> None:
+        normalized_vram = _normalize_vram_map(vram_gb_by_quant)
         quant_list = self.query_one("#llama-quant-list", OptionList)
-        options = [Option(f"  {quant}", id=f"quant-{quant}") for quant in quantizations]
+        options = [
+            Option(f"  {_format_quant_with_vram(quant, normalized_vram)}", id=f"quant-{quant}")
+            for quant in quantizations
+        ]
         quant_list.set_options(options)
         if quantizations:
-            preview = ", ".join(quantizations[:6])
-            suffix = "..." if len(quantizations) > 6 else ""
-            self._set_quant_status(f"[dim]Quantizations: {preview}{suffix}[/dim]")
+            self._set_quant_status("[dim]Quantizations:[/dim]")
         else:
             self._set_quant_status("[yellow]No GGUF quantizations detected.[/yellow]")
 
@@ -660,6 +746,7 @@ class VllmDeployScreen(Screen):
                 "Model name",
                 "model-name",
             )
+            yield Static("[dim]Estimated VRAM: enter model name to compute[/dim]", id="vllm-vram-status")
             with Vertical(classes="gpu-config-panel"):
                 yield Static("GPU configuration", classes="form-section-title")
                 yield Static(
@@ -761,6 +848,8 @@ class VllmDeployScreen(Screen):
         self._served_alias_touched = False
         self._updating_served_alias = False
         self._last_auto_served_alias = ""
+        self._model_to_memory_estimate: dict[str, VllmMemoryBreakdown | None] = {}
+        self._last_memory_lookup: tuple[str, str] | None = None
         for widget in self.query(".vllm-advanced"):
             widget.add_class("hidden")
         rank_mode_list = self.query_one("#vllm-rank-mode", OptionList)
@@ -771,6 +860,7 @@ class VllmDeployScreen(Screen):
         self._refresh_cached_models_from_storage()
         self._sync_served_alias_from_model(force=True)
         self._refresh_app_preview()
+        self._refresh_vllm_memory_status()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option_list.id == "vllm-rank-mode":
@@ -814,6 +904,11 @@ class VllmDeployScreen(Screen):
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "model-name":
             self._sync_served_alias_from_model()
+            self._refresh_vllm_memory_status()
+        elif event.input.id == "model-revision":
+            self._refresh_vllm_memory_status()
+        elif event.input.id == "n-gpu":
+            self._refresh_vllm_memory_status(from_cache_only=True)
         elif event.input.id == "served-model-name" and not self._updating_served_alias:
             self._served_alias_touched = event.input.value.strip() != self._last_auto_served_alias
         if event.input.id in {"model-name", "instance-name-vllm", "app-name-vllm"}:
@@ -963,6 +1058,90 @@ class VllmDeployScreen(Screen):
             return
         self.query_one("#model-name", Input).value = selected.repo_id
         self._refresh_app_preview()
+        self._refresh_vllm_memory_status()
+
+    def _memory_cache_key(self, repo_id: str, revision: str | None) -> str:
+        return f"{repo_id.strip().casefold()}@{(revision or '').strip().casefold()}"
+
+    def _current_memory_lookup(self) -> tuple[str, str | None]:
+        repo_id = self.query_one("#model-name", Input).value.strip()
+        revision = self.query_one("#model-revision", Input).value.strip() or None
+        return repo_id, revision
+
+    def _set_vllm_memory_status(self, text: str) -> None:
+        self.query_one("#vllm-vram-status", Static).update(text)
+
+    def _current_tensor_parallel(self) -> int:
+        raw = self.query_one("#n-gpu", Input).value.strip()
+        try:
+            parsed = int(raw)
+        except ValueError:
+            return 1
+        return max(1, parsed)
+
+    def _render_vllm_memory_status(self, estimate: VllmMemoryBreakdown | None) -> None:
+        if estimate is None:
+            self._set_vllm_memory_status("[dim]Estimated VRAM: unavailable for this model[/dim]")
+            return
+        tensor_parallel = self._current_tensor_parallel()
+        per_gpu_gb = estimate.total_gb / max(1, tensor_parallel)
+        self._set_vllm_memory_status(
+            "[dim]"
+            f"Estimated VRAM (heuristic, ctx={estimate.context_tokens}): "
+            f"~{estimate.total_gb:.1f} GB total, ~{per_gpu_gb:.1f} GB/GPU @ TP={tensor_parallel}"
+            "[/dim]"
+        )
+
+    def _refresh_vllm_memory_status(self, from_cache_only: bool = False) -> None:
+        repo_id, revision = self._current_memory_lookup()
+        if not repo_id:
+            self._set_vllm_memory_status("[dim]Estimated VRAM: enter model name to compute[/dim]")
+            return
+        cache_key = self._memory_cache_key(repo_id, revision)
+        if cache_key in self._model_to_memory_estimate:
+            self._render_vllm_memory_status(self._model_to_memory_estimate[cache_key])
+            return
+        if from_cache_only:
+            self._set_vllm_memory_status("[dim]Estimated VRAM: loading...[/dim]")
+            return
+
+        lookup_key = (repo_id.casefold(), (revision or "").casefold())
+        if self._last_memory_lookup == lookup_key:
+            return
+        self._last_memory_lookup = lookup_key
+        self._set_vllm_memory_status("[dim]Estimated VRAM: loading...[/dim]")
+        self.run_worker(
+            lambda: self._run_fetch_vllm_memory(repo_id=repo_id, revision=revision),
+            name=f"vllm-memory-{repo_id}",
+            thread=True,
+        )
+
+    def _run_fetch_vllm_memory(self, repo_id: str, revision: str | None) -> None:
+        poster = getattr(self, "post_message", None)
+        if poster is None:
+            return
+        try:
+            estimate = fetch_vllm_memory_breakdown(repo_id=repo_id, revision=revision)
+        except Exception as exc:
+            poster(VllmMemoryFailed(repo_id=repo_id, revision=revision, error=str(exc)))
+            return
+        poster(VllmMemoryLoaded(repo_id=repo_id, revision=revision, estimate=estimate))
+
+    def on_vllm_memory_loaded(self, message: VllmMemoryLoaded) -> None:
+        cache_key = self._memory_cache_key(message.repo_id, message.revision)
+        self._model_to_memory_estimate[cache_key] = message.estimate
+        current_repo, current_revision = self._current_memory_lookup()
+        if self._memory_cache_key(current_repo, current_revision) != cache_key:
+            return
+        self._render_vllm_memory_status(message.estimate)
+
+    def on_vllm_memory_failed(self, _: VllmMemoryFailed) -> None:
+        current_repo, current_revision = self._current_memory_lookup()
+        if not current_repo:
+            return
+        cache_key = self._memory_cache_key(current_repo, current_revision)
+        self._model_to_memory_estimate.setdefault(cache_key, None)
+        self._render_vllm_memory_status(None)
 
     def _highlighted_ranked_model(self) -> ModelCandidate | None:
         highlighted = self.query_one("#vllm-model-list", OptionList).highlighted_option

@@ -20,7 +20,7 @@ from ...core.backend import ModalBackend
 from ...protocol.models import EndpointInfo
 
 BANNER = r"""[bold cyan]
- _     _     __  __
+_     _     __  __
 | |   | |   |  \/  |
 | |   | |   | |\/| |
 | |___| |___| |  | |
