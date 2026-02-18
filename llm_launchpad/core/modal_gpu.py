@@ -33,6 +33,7 @@ def fetch_modal_gpu_types(
     timeout: float = 10.0,
 ) -> list[str]:
     """Fetch currently documented Modal GPU type values."""
+    from .backend import ModalBackend
     try:
         import requests
     except Exception as exc:
@@ -43,6 +44,8 @@ def fetch_modal_gpu_types(
     try:
         response = requests.get(url, timeout=timeout, headers=_REQUEST_HEADERS)
     except Exception as exc:
+        if ModalBackend.is_shutting_down():
+            raise RuntimeError("Shutdown requested") from exc
         raise RuntimeError(f"Failed to fetch Modal GPU docs at {url}: {exc}") from exc
 
     if response.status_code >= 400:

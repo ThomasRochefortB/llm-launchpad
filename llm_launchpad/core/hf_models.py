@@ -45,10 +45,15 @@ class VllmMemoryBreakdown:
 
 
 _CACHE_TTL_SECONDS = 300
+_VLLM_MEMORY_CACHE_SCHEMA_VERSION = 3
+_HF_REQUEST_TIMEOUT_SECONDS = 10.0
+_HF_ETAG_TIMEOUT_SECONDS = 10.0
+_DEFAULT_CONTEXT_TOKENS = 8192
 _CACHE: dict[tuple[str, str, int], tuple[float, list[ModelCandidate]]] = {}
 _GGUF_QUANTS_CACHE: dict[tuple[str, str], tuple[float, list[str]]] = {}
 _GGUF_QUANT_METADATA_CACHE: dict[tuple[str, str], tuple[float, GgufQuantMetadata]] = {}
-_VLLM_MEMORY_CACHE: dict[tuple[str, str, int], tuple[float, VllmMemoryBreakdown]] = {}
+_VLLM_MEMORY_CACHE: dict[tuple[int, str, str, int], tuple[float, VllmMemoryBreakdown]] = {}
+_HF_JSON_FILE_CACHE: dict[tuple[str, str, str], tuple[float, dict[str, Any] | None]] = {}
 _SORT_BY_MODE: dict[ModelRankMode, str] = {
     "downloads": "downloads",
     "trending": "trending_score",
@@ -82,15 +87,18 @@ _HF_PAGE_HEADERS = {
 def fetch_vllm_memory_breakdown(
     repo_id: str,
     revision: str | None = None,
-    context_tokens: int = 8192,
+    context_tokens: int | None = None,
 ) -> VllmMemoryBreakdown | None:
     """Estimate vLLM memory needs using HF metadata with a repo-name fallback."""
+    from ..core.backend import ModalBackend
+    if ModalBackend.is_shutting_down():
+        return None
     normalized_repo = repo_id.strip()
     if not normalized_repo:
         return None
     revision_key = (revision or "").strip()
-    context_key = max(1, int(context_tokens))
-    cache_key = (normalized_repo, revision_key, context_key)
+    context_key = max(1, int(context_tokens)) if context_tokens is not None else 0
+    cache_key = (_VLLM_MEMORY_CACHE_SCHEMA_VERSION, normalized_repo, revision_key, context_key)
     now = time.time()
     cached = _VLLM_MEMORY_CACHE.get(cache_key)
     if cached and (now - cached[0]) < _CACHE_TTL_SECONDS:
@@ -100,47 +108,113 @@ def fetch_vllm_memory_breakdown(
     try:
         from huggingface_hub import HfApi
 
-        info = HfApi().model_info(
-            repo_id=normalized_repo,
-            revision=revision_key or None,
-            expand=["config", "safetensors", "tags"],
-        )
+        api = HfApi()
+        try:
+            info = _call_model_info(
+                api=api,
+                repo_id=normalized_repo,
+                revision=revision_key or None,
+                expand=["cardData", "config", "safetensors", "tags"],
+            )
+        except Exception:
+            info = _call_model_info(
+                api=api,
+                repo_id=normalized_repo,
+                revision=revision_key or None,
+            )
     except Exception:
         info = None
 
     config = getattr(info, "config", None)
     safetensors = getattr(info, "safetensors", None)
     tags = getattr(info, "tags", None)
+    card_data = getattr(info, "cardData", None)
+    repo_config: dict[str, Any] | None = None
+    tokenizer_config: dict[str, Any] | None = None
+    generation_config: dict[str, Any] | None = None
+
+    primary_config = config if isinstance(config, dict) else {}
+    if not primary_config:
+        repo_config = _load_repo_json_file(normalized_repo, revision_key or None, "config.json")
+        if isinstance(repo_config, dict):
+            primary_config = repo_config
 
     weights_bytes = _extract_safetensors_total_bytes(safetensors)
-    parameter_count = _extract_parameter_count(repo_id=normalized_repo, config=config, safetensors=safetensors)
+    parameter_count = _extract_parameter_count(repo_id=normalized_repo, config=primary_config, safetensors=safetensors)
     if weights_bytes is None and parameter_count is None:
         return None
 
     if weights_bytes is None and parameter_count is not None:
-        dtype_bytes = _estimate_weight_dtype_bytes(repo_id=normalized_repo, config=config, tags=tags)
+        dtype_bytes = _estimate_weight_dtype_bytes(repo_id=normalized_repo, config=primary_config, tags=tags)
         weights_bytes = parameter_count * dtype_bytes
     if weights_bytes is None:
         return None
 
-    num_layers = _extract_int_config(config, "num_hidden_layers", "n_layer", "num_layers", "n_layers", "decoder_layers")
-    hidden_size = _extract_int_config(config, "hidden_size", "d_model", "n_embd", "dim", "model_dim")
+    num_layers = _extract_int_config(
+        primary_config,
+        "num_hidden_layers",
+        "n_layer",
+        "num_layers",
+        "n_layers",
+        "decoder_layers",
+    ) or _extract_int_config(
+        repo_config,
+        "num_hidden_layers",
+        "n_layer",
+        "num_layers",
+        "n_layers",
+        "decoder_layers",
+    )
+    hidden_size = _extract_int_config(
+        primary_config,
+        "hidden_size",
+        "d_model",
+        "n_embd",
+        "dim",
+        "model_dim",
+    )
+    if num_layers is None or hidden_size is None:
+        if repo_config is None:
+            repo_config = _load_repo_json_file(normalized_repo, revision_key or None, "config.json")
+        num_layers = num_layers or _extract_int_config(
+            repo_config,
+            "num_hidden_layers",
+            "n_layer",
+            "num_layers",
+            "n_layers",
+            "decoder_layers",
+        )
+        hidden_size = hidden_size or _extract_int_config(
+            repo_config,
+            "hidden_size",
+            "d_model",
+            "n_embd",
+            "dim",
+            "model_dim",
+        )
     if (num_layers is None or hidden_size is None) and parameter_count is not None:
         approx_layers, approx_hidden = _approx_transformer_shape(parameter_count)
         num_layers = num_layers or approx_layers
         hidden_size = hidden_size or approx_hidden
 
-    model_max_context = _extract_int_config(
-        config,
-        "max_position_embeddings",
-        "max_seq_len",
-        "seq_length",
-        "context_length",
-        "model_max_length",
-        "n_ctx",
-        "max_sequence_length",
+    model_max_context = _pick_max_positive_int(
+        _extract_model_max_context(primary_config),
+        _extract_model_max_context(card_data),
     )
-    effective_context = _resolve_context_tokens(requested=context_key, model_max=model_max_context)
+    if model_max_context is None:
+        if repo_config is None:
+            repo_config = _load_repo_json_file(normalized_repo, revision_key or None, "config.json")
+        tokenizer_config = _load_repo_json_file(normalized_repo, revision_key or None, "tokenizer_config.json")
+        generation_config = _load_repo_json_file(normalized_repo, revision_key or None, "generation_config.json")
+        model_max_context = _pick_max_positive_int(
+            _extract_model_max_context(repo_config),
+            _extract_model_max_context(tokenizer_config),
+            _extract_model_max_context(generation_config),
+            _extract_model_max_context(card_data),
+        )
+    effective_context = _resolve_context_tokens(requested=context_tokens, model_max=model_max_context)
+    if effective_context is None:
+        return None
 
     kv_cache_bytes = 0.0
     if num_layers and hidden_size and effective_context > 0:
@@ -161,6 +235,29 @@ def fetch_vllm_memory_breakdown(
     )
     _VLLM_MEMORY_CACHE[cache_key] = (now, estimate)
     return estimate
+
+
+def _call_model_info(
+    api: Any,
+    repo_id: str,
+    revision: str | None,
+    expand: list[str] | None = None,
+) -> Any:
+    from ..core.backend import ModalBackend
+    if ModalBackend.is_shutting_down():
+        raise RuntimeError("Shutdown requested")
+    kwargs: dict[str, Any] = {
+        "repo_id": repo_id,
+        "revision": revision,
+    }
+    if expand is not None:
+        kwargs["expand"] = expand
+    try:
+        return api.model_info(timeout=_HF_REQUEST_TIMEOUT_SECONDS, **kwargs)
+    except TypeError:
+        if ModalBackend.is_shutting_down():
+            raise RuntimeError("Shutdown requested")
+        return api.model_info(**kwargs)
 
 
 def list_vllm_candidates(mode: ModelRankMode = "downloads", limit: int = 10) -> list[ModelCandidate]:
@@ -220,6 +317,9 @@ def fetch_gguf_quantizations(repo_id: str, revision: str | None = None) -> list[
 
 def fetch_gguf_quant_metadata(repo_id: str, revision: str | None = None) -> GgufQuantMetadata:
     """Return detected GGUF quantizations and per-quant VRAM estimates in GB."""
+    from ..core.backend import ModalBackend
+    if ModalBackend.is_shutting_down():
+        return GgufQuantMetadata(quantizations=[], vram_gb_by_quant={})
     normalized_repo = repo_id.strip()
     if not normalized_repo:
         return GgufQuantMetadata(quantizations=[], vram_gb_by_quant={})
@@ -242,6 +342,8 @@ def fetch_gguf_quant_metadata(repo_id: str, revision: str | None = None) -> Gguf
         ) from exc
 
     api = HfApi()
+    if ModalBackend.is_shutting_down():
+        return GgufQuantMetadata(quantizations=[], vram_gb_by_quant={})
     info = api.model_info(
         repo_id=normalized_repo,
         revision=revision_key or None,
@@ -513,6 +615,7 @@ def _extract_quantizations_and_vram_from_quantization_data(quantization_data: An
 
 
 def _fetch_gguf_quantization_data_from_model_page(repo_id: str, timeout: float = 10.0) -> Any:
+    from ..core.backend import ModalBackend
     try:
         import requests
     except Exception:
@@ -520,8 +623,10 @@ def _fetch_gguf_quantization_data_from_model_page(repo_id: str, timeout: float =
 
     url = f"https://huggingface.co/{repo_id}"
     try:
-        response = requests.get(url, timeout=timeout, headers=_HF_PAGE_HEADERS)
+        response = requests.get(url, timeout=min(timeout, _HF_REQUEST_TIMEOUT_SECONDS), headers=_HF_PAGE_HEADERS)
     except Exception:
+        if ModalBackend.is_shutting_down():
+            return None
         return None
     if response.status_code >= 400:
         return None
@@ -648,6 +753,217 @@ def _extract_int_config(config: Any, *keys: str) -> int | None:
     return None
 
 
+def _extract_model_max_context(config: Any) -> int | None:
+    keys = {
+        "max_position_embeddings",
+        "max_seq_len",
+        "max_sequence_length",
+        "seq_length",
+        "context_length",
+        "n_ctx",
+        "model_max_length",
+    }
+    max_found: int | None = None
+
+    def _walk(node: Any) -> None:
+        nonlocal max_found
+        if isinstance(node, dict):
+            for key, value in node.items():
+                key_text = str(key).strip().lower()
+                if key_text in keys:
+                    numeric = _parse_context_value(value)
+                    # Guard against tokenizer sentinel values.
+                    if 0 < numeric <= 10_000_000:
+                        max_found = numeric if max_found is None else max(max_found, numeric)
+                if isinstance(value, (dict, list, tuple)):
+                    _walk(value)
+            return
+        if isinstance(node, (list, tuple)):
+            for item in node:
+                _walk(item)
+
+    _walk(config)
+    rope_scaled = _extract_rope_scaled_context(config)
+    if rope_scaled is not None:
+        max_found = rope_scaled if max_found is None else max(max_found, rope_scaled)
+    return max_found
+
+
+def _extract_rope_scaled_context(config: Any) -> int | None:
+    if not isinstance(config, dict):
+        return None
+
+    candidates: list[int] = []
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            rope = node.get("rope_scaling")
+            if isinstance(rope, dict):
+                try:
+                    factor = float(rope.get("factor"))
+                except (TypeError, ValueError):
+                    factor = 0.0
+                original = _pick_max_positive_int(
+                    _to_positive_int(rope.get("original_max_position_embeddings")),
+                    _to_positive_int(rope.get("original_max_position_embedding")),
+                )
+                if original is None:
+                    original = _pick_max_positive_int(
+                        _to_positive_int(node.get("max_position_embeddings")),
+                        _to_positive_int(node.get("max_seq_len")),
+                    )
+                if factor > 1 and original is not None:
+                    scaled = int(round(original * factor))
+                    if 0 < scaled <= 10_000_000:
+                        candidates.append(scaled)
+            for value in node.values():
+                if isinstance(value, (dict, list, tuple)):
+                    _walk(value)
+            return
+        if isinstance(node, (list, tuple)):
+            for item in node:
+                _walk(item)
+
+    _walk(config)
+    return max(candidates) if candidates else None
+
+
+def _to_positive_int(value: Any) -> int | None:
+    numeric = _parse_context_value(value)
+    if numeric <= 0:
+        return None
+    return numeric
+
+
+def _parse_context_value(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        pass
+    text = str(value).strip().lower().replace(",", "")
+    if not text:
+        return 0
+    match = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)\s*([km]?)", text)
+    if not match:
+        return 0
+    number = float(match.group(1))
+    unit = match.group(2)
+    multiplier = 1
+    if unit == "k":
+        multiplier = 1000
+    elif unit == "m":
+        multiplier = 1_000_000
+    return int(round(number * multiplier))
+
+
+def _pick_max_positive_int(*values: int | None) -> int | None:
+    filtered = [value for value in values if value is not None and value > 0]
+    return max(filtered) if filtered else None
+
+
+def _load_repo_json_file(repo_id: str, revision: str | None, filename: str) -> dict[str, Any] | None:
+    from ..core.backend import ModalBackend
+    if ModalBackend.is_shutting_down():
+        return None
+    normalized_repo = repo_id.strip()
+    if not normalized_repo or not filename.strip():
+        return None
+    revision_key = (revision or "").strip()
+    cache_key = (normalized_repo, revision_key, filename.strip())
+    now = time.time()
+    cached = _HF_JSON_FILE_CACHE.get(cache_key)
+    if cached and (now - cached[0]) < _CACHE_TTL_SECONDS:
+        payload = cached[1]
+        return dict(payload) if isinstance(payload, dict) else None
+
+    def _fetch_and_cache_http_fallback() -> dict[str, Any] | None:
+        parsed_http = _fetch_repo_json_file_via_http(
+            repo_id=normalized_repo,
+            revision=revision_key or None,
+            filename=filename.strip(),
+            timeout=_HF_REQUEST_TIMEOUT_SECONDS,
+        )
+        payload = dict(parsed_http) if isinstance(parsed_http, dict) else None
+        _HF_JSON_FILE_CACHE[cache_key] = (now, payload)
+        return dict(payload) if isinstance(payload, dict) else None
+
+    try:
+        import huggingface_hub
+    except ImportError:
+        return _fetch_and_cache_http_fallback()
+    except Exception:
+        return _fetch_and_cache_http_fallback()
+
+    hf_hub_download = getattr(huggingface_hub, "hf_hub_download", None)
+    if not callable(hf_hub_download):
+        return _fetch_and_cache_http_fallback()
+
+    if ModalBackend.is_shutting_down():
+        return None
+
+    try:
+        try:
+            path = hf_hub_download(
+                repo_id=normalized_repo,
+                filename=filename.strip(),
+                revision=revision_key or None,
+                etag_timeout=_HF_ETAG_TIMEOUT_SECONDS,
+            )
+        except TypeError:
+            path = hf_hub_download(
+                repo_id=normalized_repo,
+                filename=filename.strip(),
+                revision=revision_key or None,
+            )
+    except Exception:
+        if ModalBackend.is_shutting_down():
+            return None
+        return _fetch_and_cache_http_fallback()
+
+    try:
+        if path is None or not isinstance(path, (str, bytes)):
+            _HF_JSON_FILE_CACHE[cache_key] = (now, None)
+            return None
+        with open(path, "r", encoding="utf-8") as handle:
+            parsed = json.load(handle)
+    except Exception:
+        return _fetch_and_cache_http_fallback()
+
+    if not isinstance(parsed, dict):
+        return _fetch_and_cache_http_fallback()
+
+    payload = dict(parsed)
+    _HF_JSON_FILE_CACHE[cache_key] = (now, payload)
+    return dict(payload)
+
+
+def _fetch_repo_json_file_via_http(
+    repo_id: str, revision: str | None, filename: str, timeout: float = _HF_REQUEST_TIMEOUT_SECONDS
+) -> dict[str, Any] | None:
+    from ..core.backend import ModalBackend
+    try:
+        import requests
+    except Exception:
+        return None
+    ref = (revision or "main").strip() or "main"
+    url = f"https://huggingface.co/{repo_id}/resolve/{ref}/{filename}"
+    try:
+        response = requests.get(url, timeout=timeout, headers=_HF_PAGE_HEADERS)
+    except Exception:
+        if ModalBackend.is_shutting_down():
+            return None
+        return None
+    if response.status_code >= 400:
+        return None
+    try:
+        parsed = response.json()
+    except Exception:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
+
+
 def _parse_parameter_count_from_repo_id(repo_id: str) -> float | None:
     text = repo_id.strip()
     if not text:
@@ -712,11 +1028,12 @@ def _approx_transformer_shape(parameter_count: float) -> tuple[int, int]:
     return num_layers, hidden
 
 
-def _resolve_context_tokens(requested: int, model_max: int | None) -> int:
-    normalized = max(1, int(requested))
-    if model_max is None or model_max <= 0:
-        return normalized
-    return min(normalized, model_max)
+def _resolve_context_tokens(requested: int | None, model_max: int | None) -> int:
+    if model_max is not None and model_max > 0:
+        return int(model_max)
+    if requested is not None:
+        return max(1, int(requested))
+    return _DEFAULT_CONTEXT_TOKENS
 
 
 def _first_non_empty(*values: object | None) -> str:

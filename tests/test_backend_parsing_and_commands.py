@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -14,6 +15,16 @@ class BackendParsingAndCommandTests(unittest.TestCase):
         mock_run.return_value.returncode = 0
         mock_run.return_value.stdout = "[]"
         self.assertEqual(ModalBackend.list_apps(), [])
+
+    @patch("llm_launchpad.core.backend.subprocess.run")
+    def test_list_apps_returns_none_on_timeout(self, mock_run) -> None:  # type: ignore[no-untyped-def]
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd=["modal", "app", "list"], timeout=8)
+        self.assertIsNone(ModalBackend.list_apps())
+
+    @patch("llm_launchpad.core.backend.subprocess.run")
+    def test_list_volume_returns_none_on_timeout(self, mock_run) -> None:  # type: ignore[no-untyped-def]
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd=["modal", "volume", "ls"], timeout=8)
+        self.assertIsNone(ModalBackend.list_volume("huggingface-cache", "/hub"))
 
     def test_extract_modal_app_rows_accepts_apps_and_data_wrappers(self) -> None:
         wrapped_apps = {
