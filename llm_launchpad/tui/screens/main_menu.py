@@ -7,6 +7,7 @@ auth status line, and keyboard-navigable option list.
 from __future__ import annotations
 
 from collections import Counter
+from typing import Any
 
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -45,6 +46,22 @@ class DeploymentsLoadFailed(Message):
         self.error = error
 
 
+class BillingReportLoaded(Message):
+    """Main-menu billing report fetch completed."""
+
+    def __init__(self, payload: Any) -> None:
+        super().__init__()
+        self.payload = payload
+
+
+class BillingReportLoadFailed(Message):
+    """Main-menu billing report fetch failed."""
+
+    def __init__(self, error: str) -> None:
+        super().__init__()
+        self.error = error
+
+
 def _clip(value: str, width: int) -> str:
     text = (value or "").strip()
     if len(text) <= width:
@@ -52,6 +69,10 @@ def _clip(value: str, width: int) -> str:
     if width <= 3:
         return text[:width]
     return f"{text[:width - 3]}..."
+
+
+def _escape_markup(value: str) -> str:
+    return (value or "").replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
 
 
 def _state_bucket(state: str) -> str:
@@ -143,6 +164,149 @@ def _render_deployment_status(rows: list[EndpointInfo]) -> str:
     return "\n".join(header_lines + app_lines)
 
 
+def _format_money(value: float) -> str:
+    return f"${value:,.2f}"
+
+
+def _coerce_float(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip().replace("$", "").replace(",", "")
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
+    return None
+
+
+def _find_first_float(payload: Any, dotted_keys: list[str]) -> float | None:
+    for dotted_key in dotted_keys:
+        current = payload
+        found = True
+        for key in dotted_key.split("."):
+            if isinstance(current, dict) and key in current:
+                current = current[key]
+            else:
+                found = False
+                break
+        if not found:
+            continue
+        parsed = _coerce_float(current)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _find_first_text(payload: Any, dotted_keys: list[str]) -> str | None:
+    for dotted_key in dotted_keys:
+        current = payload
+        found = True
+        for key in dotted_key.split("."):
+            if isinstance(current, dict) and key in current:
+                current = current[key]
+            else:
+                found = False
+                break
+        if not found or current is None:
+            continue
+        text = str(current).strip()
+        if text:
+            return text
+    return None
+
+
+def _normalize_billing_payload(payload: Any) -> Any:
+    if isinstance(payload, dict):
+        if isinstance(payload.get("report"), dict):
+            return payload["report"]
+        if isinstance(payload.get("data"), dict):
+            return payload["data"]
+        return payload
+    if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+        return payload
+    return payload
+
+
+def _render_billing_report(payload: Any) -> str:
+    normalized = _normalize_billing_payload(payload)
+    if isinstance(normalized, list):
+        rows = [row for row in normalized if isinstance(row, dict)]
+        if not rows:
+            return (
+                "[bold]Workspace Spend[/bold]\n"
+                "[dim]Current month spend[/dim]\n"
+                "[dim]total[/dim] [bold]$0.00[/bold]\n"
+                "[dim]No billed usage in the selected monthly period.[/dim]"
+            )
+
+        total = 0.0
+        has_total = False
+        for row in rows:
+            cost = _coerce_float(row.get("Cost"))
+            if cost is None:
+                cost = _coerce_float(row.get("cost"))
+            if cost is not None:
+                total += cost
+                has_total = True
+
+        lines = ["[bold]Workspace Spend[/bold]", "[dim]Current month spend[/dim]"]
+        if has_total:
+            lines.append(f"[dim]total[/dim] [bold]{_format_money(total)}[/bold]")
+        else:
+            lines.append("[dim]Total unavailable in report payload.[/dim]")
+        return "\n".join(lines)
+
+    if not isinstance(normalized, dict):
+        return (
+            "[bold]Workspace Spend[/bold]\n"
+            "[dim]Billing data unavailable.[/dim]\n"
+            "[dim]Check `modal billing report --json`.[/dim]"
+        )
+
+    total = _find_first_float(
+        normalized,
+        [
+            "summary.total_usd",
+            "summary.cost_usd",
+            "summary.spend_usd",
+            "totals.total_usd",
+            "totals.cost_usd",
+            "total_usd",
+            "cost_usd",
+            "spend_usd",
+        ],
+    )
+    gpu_cost = _find_first_float(
+        normalized,
+        [
+            "summary.gpu_cost_usd",
+            "totals.gpu_cost_usd",
+            "gpu_cost_usd",
+        ],
+    )
+    lines = ["[bold]Workspace Spend[/bold]", "[dim]Current month spend[/dim]"]
+    if total is not None:
+        lines.append(f"[dim]total[/dim] [bold]{_format_money(total)}[/bold]")
+    else:
+        lines.append("[dim]Total unavailable in report payload.[/dim]")
+    if gpu_cost is not None:
+        lines.append(f"[dim]gpu[/dim] {_format_money(gpu_cost)}")
+    return "\n".join(lines)
+
+
+def _render_billing_load_error(error: str) -> str:
+    return (
+        "[bold]Workspace Spend[/bold]\n"
+        "[yellow]Billing unavailable.[/yellow]\n"
+        f"[dim]{_clip(_escape_markup(error), 80)}[/dim]"
+    )
+
+
 class MainMenuScreen(Screen):
     """Top-level menu: deploy, manage, settings."""
 
@@ -159,6 +323,7 @@ class MainMenuScreen(Screen):
         self.username = username
         self.version = version
         self._status_refresh_inflight = False
+        self._billing_refresh_inflight = False
 
     def compose(self) -> ComposeResult:
         with Center():
@@ -186,13 +351,20 @@ class MainMenuScreen(Screen):
                 with Vertical(id="deployment-status-panel"):
                     yield Static("[bold cyan]Deployment Status[/bold cyan]", id="deployment-status-title")
                     yield Static("[dim]Refreshing deployment status...[/dim]", id="deployment-status-body")
+                    yield Static("")
+                    yield Static("[bold cyan]Modal Billing Report[/bold cyan]", id="billing-report-title")
+                    yield Static("[dim]Refreshing billing report...[/dim]", id="billing-report-body")
         yield Footer()
 
     def on_mount(self) -> None:
         """Focus the option list so arrow-key navigation works immediately."""
         self.query_one("#action-list", OptionList).focus()
+        self._refresh_panels()
+        self.set_interval(20.0, self._refresh_panels)
+
+    def _refresh_panels(self) -> None:
         self._refresh_deployment_status()
-        self.set_interval(20.0, self._refresh_deployment_status)
+        self._refresh_billing_report()
 
     def _refresh_deployment_status(self) -> None:
         if self._status_refresh_inflight:
@@ -219,6 +391,31 @@ class MainMenuScreen(Screen):
             return
         poster(DeploymentsLoaded(rows=[row for row in rows if row.backend is not None]))
 
+    def _refresh_billing_report(self) -> None:
+        if self._billing_refresh_inflight:
+            return
+        self._billing_refresh_inflight = True
+        self.query_one("#billing-report-body", Static).update("[dim]Refreshing billing report...[/dim]")
+        self.run_worker(
+            self._run_load_billing_report,
+            name="main-menu-billing-worker",
+            thread=True,
+        )
+
+    def _run_load_billing_report(self) -> None:
+        poster = getattr(self, "post_message", None)
+        if poster is None:
+            return
+        try:
+            payload, error = ModalBackend.billing_report_json()
+        except Exception as exc:
+            poster(BillingReportLoadFailed(error=str(exc)))
+            return
+        if payload is None:
+            poster(BillingReportLoadFailed(error=error or "Could not read billing report."))
+            return
+        poster(BillingReportLoaded(payload=payload))
+
     def on_deployments_loaded(self, message: DeploymentsLoaded) -> None:
         self._status_refresh_inflight = False
         visible_rows = [row for row in message.rows if _should_show_in_panel(row.state)]
@@ -231,6 +428,14 @@ class MainMenuScreen(Screen):
             "[yellow]Status unavailable.[/yellow]\n"
             f"[dim]{_clip(message.error, 80)}[/dim]"
         )
+
+    def on_billing_report_loaded(self, message: BillingReportLoaded) -> None:
+        self._billing_refresh_inflight = False
+        self.query_one("#billing-report-body", Static).update(_render_billing_report(message.payload))
+
+    def on_billing_report_load_failed(self, message: BillingReportLoadFailed) -> None:
+        self._billing_refresh_inflight = False
+        self.query_one("#billing-report-body", Static).update(_render_billing_load_error(message.error))
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         option_id = event.option.id

@@ -328,6 +328,65 @@ class ModalBackend:
         return None
 
     @staticmethod
+    def billing_report_json() -> tuple[Optional[Any], Optional[str]]:
+        """Return billing report JSON and an optional error message."""
+        commands = [
+            ["modal", "billing", "report", "--for", "this month", "--json"],
+            ["modal", "workspace", "billing", "report", "--for", "this month", "--json"],
+        ]
+
+        def _looks_like_unsupported_command(message: str) -> bool:
+            normalized = (message or "").lower()
+            return (
+                "no such command" in normalized
+                or "invalid choice" in normalized
+                or "unrecognized arguments" in normalized
+                or "usage: modal [options] command" in normalized
+            )
+
+        last_error: Optional[str] = None
+        unsupported_command_seen = False
+        for command in commands:
+            try:
+                result = subprocess.run(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=ModalBackend._CLI_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired:
+                return None, "Timed out while requesting billing report."
+            except FileNotFoundError:
+                return None, "Modal CLI not found in PATH."
+            except Exception as exc:
+                return None, str(exc)
+
+            if result.returncode == 0:
+                try:
+                    return json.loads(result.stdout or "{}"), None
+                except Exception:
+                    return None, "Billing report returned invalid JSON."
+
+            stderr = (result.stderr or "").strip()
+            stdout = (result.stdout or "").strip()
+            details = stderr or stdout or f"Exit code {result.returncode}"
+            last_error = details
+            if _looks_like_unsupported_command(details):
+                unsupported_command_seen = True
+                continue
+            return None, details
+
+        if unsupported_command_seen:
+            return (
+                None,
+                "Billing report command is unavailable in this Modal CLI version. "
+                "Upgrade Modal CLI and retry.",
+            )
+
+        return None, last_error or "Could not read billing report."
+
+    @staticmethod
     def list_volume(volume_name: str, path: str = "/") -> Optional[List[Dict[str, Any]]]:
         """List files/directories in a Modal Volume path."""
         if ModalBackend.is_shutting_down():

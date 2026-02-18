@@ -161,6 +161,150 @@ class StorageOrchestratorTests(unittest.TestCase):
         self.assertEqual(snapshot.llamacpp_models[0].quant, "Q4_K_M")
 
     @patch("llm_launchpad.core.orchestrator.ModalBackend.list_volume")
+    def test_list_storage_marks_llamacpp_model_incomplete_from_blob_sidecar(
+        self, mock_list_volume
+    ) -> None:  # type: ignore[no-untyped-def]
+        def side_effect(volume_name, path):  # type: ignore[no-untyped-def]
+            mapping = {
+                ("huggingface-cache", "/models"): [],
+                ("huggingface-cache", "/"): [],
+                ("huggingface-cache", "/hub"): [
+                    {"path": "/hub/models--unsloth--GLM-5-GGUF", "type": "directory"}
+                ],
+                ("huggingface-cache", "/hub/models--unsloth--GLM-5-GGUF"): [
+                    {
+                        "path": "/hub/models--unsloth--GLM-5-GGUF/snapshots/abc/GLM-5-Q4_K_M.gguf",
+                        "type": "file",
+                        "size": 79,
+                    },
+                    {
+                        "path": "/hub/models--unsloth--GLM-5-GGUF/blobs/weights.gguf.incomplete",
+                        "type": "file",
+                        "size": 2048,
+                    },
+                ],
+            }
+            return mapping.get((volume_name, path), [])
+
+        mock_list_volume.side_effect = side_effect
+        orch = Orchestrator()
+        events = list(orch.list_storage())
+        done = next(e for e in events if isinstance(e, OperationCompleteEvent))
+        self.assertTrue(done.success)
+        snapshot = done.data
+        assert isinstance(snapshot, StorageSnapshot)
+        self.assertEqual(len(snapshot.llamacpp_models), 1)
+        self.assertTrue(snapshot.llamacpp_models[0].incomplete)
+
+    @patch("llm_launchpad.core.orchestrator.ModalBackend.list_volume")
+    def test_list_storage_ignores_llamacpp_incomplete_sidecar_when_blob_exists(
+        self, mock_list_volume
+    ) -> None:  # type: ignore[no-untyped-def]
+        def side_effect(volume_name, path):  # type: ignore[no-untyped-def]
+            mapping = {
+                ("huggingface-cache", "/models"): [],
+                ("huggingface-cache", "/"): [],
+                ("huggingface-cache", "/hub"): [
+                    {"path": "/hub/models--unsloth--GLM-5-GGUF", "type": "directory"}
+                ],
+                ("huggingface-cache", "/hub/models--unsloth--GLM-5-GGUF"): [
+                    {
+                        "path": "/hub/models--unsloth--GLM-5-GGUF/snapshots/abc/GLM-5-Q4_K_M.gguf",
+                        "type": "file",
+                        "size": 79,
+                    },
+                    {
+                        "path": "/hub/models--unsloth--GLM-5-GGUF/blobs/weights.gguf",
+                        "type": "file",
+                        "size": 1024,
+                    },
+                    {
+                        "path": "/hub/models--unsloth--GLM-5-GGUF/blobs/weights.gguf.incomplete",
+                        "type": "file",
+                        "size": 128,
+                    },
+                ],
+            }
+            return mapping.get((volume_name, path), [])
+
+        mock_list_volume.side_effect = side_effect
+        orch = Orchestrator()
+        events = list(orch.list_storage())
+        done = next(e for e in events if isinstance(e, OperationCompleteEvent))
+        self.assertTrue(done.success)
+        snapshot = done.data
+        assert isinstance(snapshot, StorageSnapshot)
+        self.assertEqual(len(snapshot.llamacpp_models), 1)
+        self.assertFalse(snapshot.llamacpp_models[0].incomplete)
+
+    @patch("llm_launchpad.core.orchestrator.ModalBackend.list_volume")
+    def test_list_storage_marks_llamacpp_tiny_snapshot_without_blob_incomplete(
+        self, mock_list_volume
+    ) -> None:  # type: ignore[no-untyped-def]
+        def side_effect(volume_name, path):  # type: ignore[no-untyped-def]
+            mapping = {
+                ("huggingface-cache", "/models"): [],
+                ("huggingface-cache", "/"): [],
+                ("huggingface-cache", "/hub"): [
+                    {"path": "/hub/models--unsloth--GLM-5-GGUF", "type": "directory"}
+                ],
+                ("huggingface-cache", "/hub/models--unsloth--GLM-5-GGUF"): [
+                    {
+                        "path": "/hub/models--unsloth--GLM-5-GGUF/snapshots/abc/GLM-5-Q4_K_M.gguf",
+                        "type": "file",
+                        "size": 79,
+                    }
+                ],
+            }
+            return mapping.get((volume_name, path), [])
+
+        mock_list_volume.side_effect = side_effect
+        orch = Orchestrator()
+        events = list(orch.list_storage())
+        done = next(e for e in events if isinstance(e, OperationCompleteEvent))
+        self.assertTrue(done.success)
+        snapshot = done.data
+        assert isinstance(snapshot, StorageSnapshot)
+        self.assertEqual(len(snapshot.llamacpp_models), 1)
+        self.assertTrue(snapshot.llamacpp_models[0].incomplete)
+
+    @patch("llm_launchpad.core.orchestrator.ModalBackend.list_volume")
+    def test_list_storage_keeps_llamacpp_complete_when_tiny_snapshot_has_blob(
+        self, mock_list_volume
+    ) -> None:  # type: ignore[no-untyped-def]
+        def side_effect(volume_name, path):  # type: ignore[no-untyped-def]
+            mapping = {
+                ("huggingface-cache", "/models"): [],
+                ("huggingface-cache", "/"): [],
+                ("huggingface-cache", "/hub"): [
+                    {"path": "/hub/models--unsloth--GLM-5-GGUF", "type": "directory"}
+                ],
+                ("huggingface-cache", "/hub/models--unsloth--GLM-5-GGUF"): [
+                    {
+                        "path": "/hub/models--unsloth--GLM-5-GGUF/snapshots/abc/GLM-5-Q4_K_M.gguf",
+                        "type": "file",
+                        "size": 79,
+                    },
+                    {
+                        "path": "/hub/models--unsloth--GLM-5-GGUF/blobs/weights.gguf",
+                        "type": "file",
+                        "size": 1024,
+                    },
+                ],
+            }
+            return mapping.get((volume_name, path), [])
+
+        mock_list_volume.side_effect = side_effect
+        orch = Orchestrator()
+        events = list(orch.list_storage())
+        done = next(e for e in events if isinstance(e, OperationCompleteEvent))
+        self.assertTrue(done.success)
+        snapshot = done.data
+        assert isinstance(snapshot, StorageSnapshot)
+        self.assertEqual(len(snapshot.llamacpp_models), 1)
+        self.assertFalse(snapshot.llamacpp_models[0].incomplete)
+
+    @patch("llm_launchpad.core.orchestrator.ModalBackend.list_volume")
     def test_list_storage_marks_vllm_model_incomplete(self, mock_list_volume) -> None:  # type: ignore[no-untyped-def]
         def side_effect(volume_name, path):  # type: ignore[no-untyped-def]
             mapping = {

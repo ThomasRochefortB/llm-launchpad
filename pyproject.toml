@@ -19,7 +19,7 @@ classifiers = [
 
 # Minimal runtime dependencies for using the Modal application entrypoints
 dependencies = [
-  "modal>=0.60.0",
+  "modal>=1.3.3",
   "coolname>=2.2.0",
   "typer>=0.12.3",
   "rich>=13.7.1",
