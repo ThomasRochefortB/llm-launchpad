@@ -13,14 +13,8 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
-<<<<<<< ours
-<<<<<<< ours
 from textual.screen import Screen
 from textual.widget import Widget
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
 from textual.widgets import (
     Button,
     Footer,

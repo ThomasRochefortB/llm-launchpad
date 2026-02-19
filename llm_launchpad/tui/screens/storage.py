@@ -7,14 +7,8 @@ from textual.actions import SkipAction
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
-<<<<<<< ours
-<<<<<<< ours
 from textual.screen import Screen
 from textual.widget import Widget
-=======
->>>>>>> theirs
-=======
->>>>>>> theirs
 from textual.widgets import DataTable, Footer, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
@@ -39,9 +33,6 @@ def _model_label(row: StoredModelInfo) -> str:
         return f"{row.model_id} (INCOMPLETE)"
     return row.model_id
 
-
-<<<<<<< ours
-<<<<<<< ours
 def _first_enabled_option_index(option_list: OptionList) -> int | None:
     for index in range(option_list.option_count):
         if not option_list.get_option_at_index(index).disabled:
@@ -150,14 +141,7 @@ def _move_focus_across_widgets(screen: Screen, widget_ids: tuple[str, ...], dire
         )
     return True
 
-
-class StorageScreen(Screen):
-=======
 class StorageScreen(CopyEnabledScreen):
->>>>>>> theirs
-=======
-class StorageScreen(CopyEnabledScreen):
->>>>>>> theirs
     """View and pre-download backend model caches."""
 
     BINDINGS = [
