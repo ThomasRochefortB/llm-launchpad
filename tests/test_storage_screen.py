@@ -4,7 +4,7 @@ import unittest
 
 from textual.app import App
 from textual.screen import Screen
-from textual.widgets import DataTable, Input
+from textual.widgets import DataTable, Input, OptionList
 
 from llm_launchpad.protocol.enums import BackendType
 from llm_launchpad.protocol.models import StorageSnapshot, StoredModelInfo
@@ -86,6 +86,145 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
             assert isinstance(screen, StorageScreen)
             table = screen.query_one("#storage-table", DataTable)
             self.assertEqual(table.row_count, 2)
+
+    async def test_mount_focuses_backend_filter_menu_for_arrow_navigation(self) -> None:
+        app = _TestApp()
+        async with app.run_test(size=(100, 35)) as pilot:
+            app.push_screen(StorageScreen(initial_backend=BackendType.VLLM))
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, StorageScreen)
+            backend_filter = screen.query_one("#storage-backend-filter", OptionList)
+            self.assertTrue(backend_filter.has_focus)
+
+            highlighted = backend_filter.highlighted_option
+            self.assertIsNotNone(highlighted)
+            assert highlighted is not None
+            self.assertEqual(highlighted.id, "filter-vllm")
+
+            await pilot.press("up")
+            await pilot.pause()
+            highlighted = backend_filter.highlighted_option
+            self.assertIsNotNone(highlighted)
+            assert highlighted is not None
+            self.assertEqual(highlighted.id, "filter-llamacpp")
+
+    async def test_down_from_backend_filter_moves_focus_to_action_menu(self) -> None:
+        app = _TestApp()
+        async with app.run_test(size=(100, 35)) as pilot:
+            app.push_screen(StorageScreen(initial_backend=BackendType.VLLM))
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, StorageScreen)
+            backend_filter = screen.query_one("#storage-backend-filter", OptionList)
+            action_list = screen.query_one("#storage-action-list", OptionList)
+
+            backend_filter.focus()
+            backend_filter.highlighted = 2
+            await pilot.pause()
+
+            await pilot.press("down")
+            await pilot.pause()
+
+            self.assertTrue(action_list.has_focus)
+            highlighted = action_list.highlighted_option
+            self.assertIsNotNone(highlighted)
+            assert highlighted is not None
+            self.assertEqual(highlighted.id, "refresh")
+
+    async def test_down_from_action_list_last_option_moves_focus_to_table(self) -> None:
+        app = _TestApp()
+        async with app.run_test(size=(100, 35)) as pilot:
+            app.push_screen(StorageScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, StorageScreen)
+            action_list = screen.query_one("#storage-action-list", OptionList)
+            table = screen.query_one("#storage-table", DataTable)
+
+            action_list.focus()
+            action_list.highlighted = 2
+            await pilot.pause()
+            await pilot.press("down")
+            await pilot.pause()
+
+            self.assertTrue(table.has_focus)
+
+    async def test_down_inside_table_moves_row_until_last_then_focuses_model_id(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(StorageScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, StorageScreen)
+            table = screen.query_one("#storage-table", DataTable)
+            model_id = screen.query_one("#storage-model-id", Input)
+
+            table.focus()
+            table.move_cursor(row=0)
+            await pilot.pause()
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertTrue(table.has_focus)
+            self.assertEqual(table.cursor_row, 1)
+
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertTrue(model_id.has_focus)
+
+    async def test_up_from_table_first_row_moves_focus_to_action_list(self) -> None:
+        app = _TestApp()
+        async with app.run_test(size=(100, 35)) as pilot:
+            app.push_screen(StorageScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, StorageScreen)
+            table = screen.query_one("#storage-table", DataTable)
+            action_list = screen.query_one("#storage-action-list", OptionList)
+
+            table.focus()
+            table.move_cursor(row=0)
+            await pilot.pause()
+            await pilot.press("up")
+            await pilot.pause()
+
+            self.assertTrue(action_list.has_focus)
+
+    async def test_small_viewport_skips_collapsed_option_lists(self) -> None:
+        app = _TestApp()
+        async with app.run_test(size=(100, 24)) as pilot:
+            app.push_screen(StorageScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, StorageScreen)
+            backend_filter = screen.query_one("#storage-backend-filter", OptionList)
+            action_list = screen.query_one("#storage-action-list", OptionList)
+            table = screen.query_one("#storage-table", DataTable)
+
+            self.assertEqual(backend_filter.size.height, 0)
+            self.assertEqual(action_list.size.height, 0)
+            self.assertTrue(table.has_focus)
+
+    async def test_small_viewport_table_boundary_moves_to_model_id(self) -> None:
+        app = _TestApp()
+        async with app.run_test(size=(100, 24)) as pilot:
+            app.push_screen(StorageScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, StorageScreen)
+            table = screen.query_one("#storage-table", DataTable)
+            model_id = screen.query_one("#storage-model-id", Input)
+
+            self.assertTrue(table.has_focus)
+            table.move_cursor(row=0)
+            await pilot.pause()
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertEqual(table.cursor_row, 1)
+
+            await pilot.press("down")
+            await pilot.pause()
+            self.assertTrue(model_id.has_focus)
 
     async def test_predownload_uses_form_values(self) -> None:
         app = _TestApp()

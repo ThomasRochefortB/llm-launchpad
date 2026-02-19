@@ -3,16 +3,25 @@
 from __future__ import annotations
 
 from textual import events
+from textual.actions import SkipAction
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
+<<<<<<< ours
+<<<<<<< ours
 from textual.screen import Screen
+from textual.widget import Widget
+=======
+>>>>>>> theirs
+=======
+>>>>>>> theirs
 from textual.widgets import DataTable, Footer, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
 from ...protocol.enums import BackendType
 from ...protocol.models import StorageSnapshot, StoredModelInfo
 from ..workers import StorageFailed, StorageLoaded
+from .copy_enabled import CopyEnabledScreen
 
 
 def _human_bytes(size_bytes: int) -> str:
@@ -31,15 +40,143 @@ def _model_label(row: StoredModelInfo) -> str:
     return row.model_id
 
 
+<<<<<<< ours
+<<<<<<< ours
+def _first_enabled_option_index(option_list: OptionList) -> int | None:
+    for index in range(option_list.option_count):
+        if not option_list.get_option_at_index(index).disabled:
+            return index
+    return None
+
+
+def _last_enabled_option_index(option_list: OptionList) -> int | None:
+    for index in range(option_list.option_count - 1, -1, -1):
+        if not option_list.get_option_at_index(index).disabled:
+            return index
+    return None
+
+
+def _next_enabled_option_index(option_list: OptionList, direction: int) -> int | None:
+    if direction not in (-1, 1):
+        raise ValueError("direction must be -1 or 1")
+    highlighted = option_list.highlighted
+    if highlighted is None:
+        return _first_enabled_option_index(option_list) if direction == 1 else _last_enabled_option_index(option_list)
+    if direction == 1:
+        indexes = range(highlighted + 1, option_list.option_count)
+    else:
+        indexes = range(highlighted - 1, -1, -1)
+    for index in indexes:
+        if not option_list.get_option_at_index(index).disabled:
+            return index
+    return None
+
+
+def _move_focus_across_option_lists(screen: Screen, option_list_ids: tuple[str, ...], direction: int) -> bool:
+    if direction not in (-1, 1):
+        raise ValueError("direction must be -1 or 1")
+    focused = screen.focused
+    if not isinstance(focused, OptionList):
+        return False
+    option_lists = tuple(
+        option_list
+        for option_list_id in option_list_ids
+        for option_list in (screen.query_one(f"#{option_list_id}", OptionList),)
+        if _is_focusable_for_arrow_navigation(option_list)
+    )
+    if not option_lists:
+        return False
+    try:
+        focused_index = option_lists.index(focused)
+    except ValueError:
+        return False
+    next_index = _next_enabled_option_index(focused, direction)
+    if next_index is not None:
+        focused.highlighted = next_index
+        return True
+    neighbor_index = focused_index + direction
+    if neighbor_index < 0 or neighbor_index >= len(option_lists):
+        return False
+    neighbor = option_lists[neighbor_index]
+    neighbor.focus()
+    neighbor_highlighted = _first_enabled_option_index(neighbor) if direction == 1 else _last_enabled_option_index(neighbor)
+    if neighbor_highlighted is not None:
+        neighbor.highlighted = neighbor_highlighted
+    return True
+
+
+def _is_focusable_for_arrow_navigation(widget: Widget) -> bool:
+    if not widget.can_focus:
+        return False
+    if getattr(widget, "disabled", False):
+        return False
+    if widget.size.height <= 0 or widget.size.width <= 0:
+        return False
+    return True
+
+
+def _move_focus_across_widgets(screen: Screen, widget_ids: tuple[str, ...], direction: int) -> bool:
+    if direction not in (-1, 1):
+        raise ValueError("direction must be -1 or 1")
+    focused = screen.focused
+    if not isinstance(focused, Widget):
+        return False
+    widgets = [
+        widget
+        for widget_id in widget_ids
+        for widget in (screen.query_one(f"#{widget_id}", Widget),)
+        if _is_focusable_for_arrow_navigation(widget)
+    ]
+    if not widgets:
+        return False
+    try:
+        focused_index = widgets.index(focused)
+    except ValueError:
+        fallback = widgets[0] if direction == 1 else widgets[-1]
+        fallback.focus()
+        if isinstance(fallback, OptionList) and fallback.highlighted is None:
+            fallback.highlighted = (
+                _first_enabled_option_index(fallback) if direction == 1 else _last_enabled_option_index(fallback)
+            )
+        return True
+    neighbor_index = focused_index + direction
+    if neighbor_index < 0 or neighbor_index >= len(widgets):
+        return False
+    neighbor = widgets[neighbor_index]
+    neighbor.focus()
+    if isinstance(neighbor, OptionList) and neighbor.highlighted is None:
+        neighbor.highlighted = (
+            _first_enabled_option_index(neighbor) if direction == 1 else _last_enabled_option_index(neighbor)
+        )
+    return True
+
+
 class StorageScreen(Screen):
+=======
+class StorageScreen(CopyEnabledScreen):
+>>>>>>> theirs
+=======
+class StorageScreen(CopyEnabledScreen):
+>>>>>>> theirs
     """View and pre-download backend model caches."""
 
     BINDINGS = [
+        Binding("up", "navigate_option_list_up", show=False, priority=True),
+        Binding("down", "navigate_option_list_down", show=False, priority=True),
         Binding("escape", "pop_screen", "Back", show=True),
         Binding("r", "refresh_storage", "Refresh", show=True),
         Binding("p", "predownload_selected", "Pre-download", show=True),
         Binding("x", "delete_selected_model", "Delete", show=True),
     ]
+    NAVIGATION_ORDER = (
+        "storage-backend-filter",
+        "storage-action-list",
+        "storage-table",
+        "storage-model-id",
+        "storage-model-backend",
+        "storage-model-quant",
+        "storage-model-revision",
+    )
 
     def __init__(self, initial_backend: BackendType | None = None) -> None:
         super().__init__()
@@ -93,6 +230,17 @@ class StorageScreen(Screen):
         table.add_columns("backend", "model", "revision", "quant", "files", "size")
         if self._initial_backend is not None:
             self.query_one("#storage-model-backend", Input).value = self._initial_backend.value
+        backend_filter = self.query_one("#storage-backend-filter", OptionList)
+        if self._selected_filter == BackendType.LLAMACPP:
+            backend_filter.highlighted = 1
+        elif self._selected_filter == BackendType.VLLM:
+            backend_filter.highlighted = 2
+        elif backend_filter.option_count > 0:
+            backend_filter.highlighted = 0
+        action_list = self.query_one("#storage-action-list", OptionList)
+        if action_list.option_count > 0:
+            action_list.highlighted = 0
+        self.call_after_refresh(self._focus_first_visible_navigation_target)
         self._refresh_storage_snapshot()
 
     def on_screen_suspend(self, _: events.ScreenSuspend) -> None:
@@ -137,6 +285,9 @@ class StorageScreen(Screen):
         self.query_one("#storage-status", Static).update(
             "[green]Storage refreshed.[/green] Use selected row or type a model to pre-download."
         )
+        focused = self.focused
+        if not isinstance(focused, Widget) or not _is_focusable_for_arrow_navigation(focused):
+            self.call_after_refresh(self._focus_first_visible_navigation_target)
 
     def on_storage_failed(self, message: StorageFailed) -> None:
         self.query_one("#storage-status", Static).update(
@@ -211,3 +362,34 @@ class StorageScreen(Screen):
 
     def action_pop_screen(self) -> None:
         self.app.pop_screen()
+
+    def action_navigate_option_list_down(self) -> None:
+        if _move_focus_across_option_lists(
+            self,
+            ("storage-backend-filter", "storage-action-list"),
+            direction=1,
+        ):
+            return
+        focused = self.focused
+        if isinstance(focused, DataTable) and focused.row_count > 0 and focused.cursor_row < focused.row_count - 1:
+            raise SkipAction()
+        if _move_focus_across_widgets(self, self.NAVIGATION_ORDER, direction=1):
+            return
+        raise SkipAction()
+
+    def action_navigate_option_list_up(self) -> None:
+        if _move_focus_across_option_lists(
+            self,
+            ("storage-backend-filter", "storage-action-list"),
+            direction=-1,
+        ):
+            return
+        focused = self.focused
+        if isinstance(focused, DataTable) and focused.row_count > 0 and focused.cursor_row > 0:
+            raise SkipAction()
+        if _move_focus_across_widgets(self, self.NAVIGATION_ORDER, direction=-1):
+            return
+        raise SkipAction()
+
+    def _focus_first_visible_navigation_target(self) -> None:
+        _move_focus_across_widgets(self, self.NAVIGATION_ORDER, direction=1)

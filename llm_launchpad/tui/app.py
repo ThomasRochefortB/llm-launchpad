@@ -7,6 +7,8 @@ screen stack and bridges user actions to Core via threaded workers.
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -76,6 +78,20 @@ class WizardApp(App):
             self._version = version("llm-launchpad")
         except Exception:
             pass
+
+    def copy_to_clipboard(self, text: str) -> None:
+        """Copy text via OSC 52 and use pbcopy fallback on macOS terminals."""
+        super().copy_to_clipboard(text)
+        if sys.platform == "darwin":
+            try:
+                subprocess.run(
+                    ["pbcopy"],
+                    input=text.encode(),
+                    check=True,
+                    timeout=2,
+                )
+            except Exception:
+                pass
 
     async def action_quit(self) -> None:
         """Terminate tracked subprocesses and workers before exiting.

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from textual.app import App
-from textual.widgets import Input, OptionList, Static, Switch
+from textual.widgets import Input, OptionList, Select, Static, Switch
 
 from llm_launchpad.core.hf_models import ModelCandidate, VllmMemoryBreakdown
 from llm_launchpad.protocol.enums import BackendType
@@ -46,6 +46,178 @@ class _TestApp(App[None]):
 
 
 class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
+    async def test_down_from_rank_mode_last_option_moves_focus_to_model_list(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+            screen.on_vllm_models_loaded(
+                VllmModelsLoaded(
+                    mode="cached",
+                    models=[ModelCandidate(repo_id="Qwen/Qwen3-0.6B", downloads=10, likes=1)],
+                )
+            )
+
+            rank_mode_list = screen.query_one("#vllm-rank-mode", OptionList)
+            model_list = screen.query_one("#vllm-model-list", OptionList)
+            rank_mode_list.focus()
+            rank_mode_list.highlighted = 2
+            await pilot.pause()
+
+            await pilot.press("down")
+            await pilot.pause()
+
+            self.assertTrue(model_list.has_focus)
+            highlighted = model_list.highlighted_option
+            self.assertIsNotNone(highlighted)
+            assert highlighted is not None
+            self.assertEqual(highlighted.id, "model-0")
+
+    async def test_up_from_model_list_first_option_moves_focus_to_rank_mode(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+            screen.on_vllm_models_loaded(
+                VllmModelsLoaded(
+                    mode="cached",
+                    models=[ModelCandidate(repo_id="Qwen/Qwen3-0.6B", downloads=10, likes=1)],
+                )
+            )
+
+            rank_mode_list = screen.query_one("#vllm-rank-mode", OptionList)
+            model_list = screen.query_one("#vllm-model-list", OptionList)
+            model_list.focus()
+            model_list.highlighted = 0
+            await pilot.pause()
+
+            await pilot.press("up")
+            await pilot.pause()
+
+            self.assertTrue(rank_mode_list.has_focus)
+            highlighted = rank_mode_list.highlighted_option
+            self.assertIsNotNone(highlighted)
+            assert highlighted is not None
+            self.assertEqual(highlighted.id, "rank-trending")
+
+    async def test_down_from_model_list_last_option_moves_focus_to_model_name(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+            screen.on_vllm_models_loaded(
+                VllmModelsLoaded(
+                    mode="cached",
+                    models=[
+                        ModelCandidate(repo_id="Qwen/Qwen3-0.6B", downloads=10, likes=1),
+                        ModelCandidate(repo_id="Qwen/Qwen3-4B", downloads=8, likes=1),
+                    ],
+                )
+            )
+            model_list = screen.query_one("#vllm-model-list", OptionList)
+            model_name = screen.query_one("#model-name", Input)
+
+            model_list.focus()
+            model_list.highlighted = 1
+            await pilot.pause()
+            await pilot.press("down")
+            await pilot.pause()
+
+            self.assertTrue(model_name.has_focus)
+
+    async def test_enter_on_model_list_commits_and_exits_to_model_name(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+            screen.on_vllm_models_loaded(
+                VllmModelsLoaded(
+                    mode="cached",
+                    models=[
+                        ModelCandidate(repo_id="Qwen/Qwen3-0.6B", downloads=10, likes=1),
+                        ModelCandidate(repo_id="Qwen/Qwen3-4B", downloads=8, likes=1),
+                    ],
+                )
+            )
+            model_list = screen.query_one("#vllm-model-list", OptionList)
+            model_name = screen.query_one("#model-name", Input)
+
+            model_list.focus()
+            model_list.highlighted = 1
+            await pilot.pause()
+
+            await pilot.press("enter")
+            await pilot.pause()
+
+            self.assertTrue(model_name.has_focus)
+            self.assertEqual(model_name.value, "Qwen/Qwen3-4B")
+
+            await pilot.press("down")
+            await pilot.pause()
+
+            self.assertFalse(model_list.has_focus)
+            self.assertEqual(model_name.value, "Qwen/Qwen3-4B")
+
+    async def test_down_from_model_name_moves_focus_to_gpu_type_select(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+
+            model_name = screen.query_one("#model-name", Input)
+            gpu_type = screen.query_one("#gpu-type-vllm", Select)
+            model_name.focus()
+            await pilot.pause()
+            await pilot.press("down")
+            await pilot.pause()
+
+            self.assertTrue(gpu_type.has_focus)
+
+    async def test_down_from_gpu_type_moves_focus_to_gpu_count_input(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+
+            gpu_type = screen.query_one("#gpu-type-vllm", Select)
+            gpu_count = screen.query_one("#gpu-count-vllm", Input)
+            gpu_type.focus()
+            await pilot.pause()
+            await pilot.press("down")
+            await pilot.pause()
+
+            self.assertTrue(gpu_count.has_focus)
+
+    async def test_rank_mode_menu_is_focused_for_arrow_navigation(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+            rank_mode_list = screen.query_one("#vllm-rank-mode", OptionList)
+
+            self.assertTrue(rank_mode_list.has_focus)
+            highlighted = rank_mode_list.highlighted_option
+            self.assertIsNotNone(highlighted)
+            assert highlighted is not None
+            self.assertEqual(highlighted.id, "rank-cached")
+
     async def test_default_rank_mode_highlight_matches_cached(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:

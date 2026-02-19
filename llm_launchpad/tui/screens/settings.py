@@ -5,14 +5,15 @@ from __future__ import annotations
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Center, Vertical
-from textual.screen import Screen
 from textual.widgets import Button, Footer, Input, Static
 
 from ...core.config import ConfigStore
 from ...protocol.models import LaunchpadSettings
 from ..widgets.input_form import FormField
+from .copy_enabled import CopyEnabledScreen
 
-class SettingsScreen(Screen):
+
+class SettingsScreen(CopyEnabledScreen):
     """Edit and persist SCALEDOWN_WINDOW."""
 
     BINDINGS = [

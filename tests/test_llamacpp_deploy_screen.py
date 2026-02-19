@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 from textual.app import App
-from textual.widgets import Input, OptionList, Static
+from textual.widgets import Input, OptionList, Select, Static
 
 from llm_launchpad.core.hf_models import ModelCandidate
 from llm_launchpad.protocol.enums import BackendType
@@ -49,6 +49,171 @@ class _TestApp(App[None]):
 
 
 class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
+    async def test_down_from_rank_mode_last_option_moves_focus_to_model_list(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+            screen.on_llama_cpp_models_loaded(
+                LlamaCppModelsLoaded(
+                    mode="cached",
+                    models=[
+                        ModelCandidate(
+                            repo_id="Qwen/Qwen3-Coder-Next-GGUF",
+                            downloads=1000,
+                            likes=10,
+                            quantizations=("Q4_K_M",),
+                        )
+                    ],
+                )
+            )
+
+            rank_mode_list = screen.query_one("#llama-rank-mode", OptionList)
+            model_list = screen.query_one("#llama-model-list", OptionList)
+            rank_mode_list.focus()
+            rank_mode_list.highlighted = 2
+            await pilot.pause()
+
+            await pilot.press("down")
+            await pilot.pause()
+
+            self.assertTrue(model_list.has_focus)
+            highlighted = model_list.highlighted_option
+            self.assertIsNotNone(highlighted)
+            assert highlighted is not None
+            self.assertEqual(highlighted.id, "model-0")
+
+    async def test_up_from_model_list_first_option_moves_focus_to_rank_mode(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+            screen.on_llama_cpp_models_loaded(
+                LlamaCppModelsLoaded(
+                    mode="cached",
+                    models=[
+                        ModelCandidate(
+                            repo_id="Qwen/Qwen3-Coder-Next-GGUF",
+                            downloads=1000,
+                            likes=10,
+                            quantizations=("Q4_K_M",),
+                        )
+                    ],
+                )
+            )
+
+            rank_mode_list = screen.query_one("#llama-rank-mode", OptionList)
+            model_list = screen.query_one("#llama-model-list", OptionList)
+            model_list.focus()
+            model_list.highlighted = 0
+            await pilot.pause()
+
+            await pilot.press("up")
+            await pilot.pause()
+
+            self.assertTrue(rank_mode_list.has_focus)
+            highlighted = rank_mode_list.highlighted_option
+            self.assertIsNotNone(highlighted)
+            assert highlighted is not None
+            self.assertEqual(highlighted.id, "rank-trending")
+
+    async def test_down_from_quant_list_last_option_moves_focus_to_gpu_type_select(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+            screen.query_one("#repo-id", Input).value = "Qwen/Qwen3-Coder-Next-GGUF"
+            await pilot.pause()
+            screen.on_llama_cpp_quants_loaded(
+                LlamaCppQuantsLoaded(
+                    repo_id="Qwen/Qwen3-Coder-Next-GGUF",
+                    revision=None,
+                    quantizations=["Q4_K_M", "Q8_0"],
+                    vram_gb_by_quant={},
+                )
+            )
+            quant_list = screen.query_one("#llama-quant-list", OptionList)
+            gpu_type = screen.query_one("#gpu-type-llama", Select)
+
+            quant_list.focus()
+            quant_list.highlighted = 1
+            await pilot.pause()
+            await pilot.press("down")
+            await pilot.pause()
+
+            self.assertTrue(gpu_type.has_focus)
+
+    async def test_enter_on_model_list_commits_and_exits_to_repo_id(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+            screen.on_llama_cpp_models_loaded(
+                LlamaCppModelsLoaded(
+                    mode="cached",
+                    models=[
+                        ModelCandidate(
+                            repo_id="Qwen/Qwen3-Coder-Next-GGUF",
+                            downloads=1000,
+                            likes=10,
+                            quantizations=("Q4_K_M",),
+                        ),
+                        ModelCandidate(
+                            repo_id="unsloth/Qwen3-Coder-Next-GGUF",
+                            downloads=900,
+                            likes=8,
+                            quantizations=("Q5_K_M",),
+                        ),
+                    ],
+                )
+            )
+            model_list = screen.query_one("#llama-model-list", OptionList)
+            repo_id = screen.query_one("#repo-id", Input)
+
+            model_list.focus()
+            model_list.highlighted = 1
+            await pilot.pause()
+
+            await pilot.press("enter")
+            await pilot.pause()
+
+            self.assertTrue(repo_id.has_focus)
+            self.assertEqual(repo_id.value, "unsloth/Qwen3-Coder-Next-GGUF")
+
+            await pilot.press("down")
+            await pilot.pause()
+
+            self.assertFalse(model_list.has_focus)
+            self.assertEqual(repo_id.value, "unsloth/Qwen3-Coder-Next-GGUF")
+
+    async def test_rank_mode_menu_is_focused_for_arrow_navigation(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+            rank_mode_list = screen.query_one("#llama-rank-mode", OptionList)
+
+            self.assertTrue(rank_mode_list.has_focus)
+            highlighted = rank_mode_list.highlighted_option
+            self.assertIsNotNone(highlighted)
+            assert highlighted is not None
+            self.assertEqual(highlighted.id, "rank-cached")
+
     async def test_default_rank_mode_highlight_matches_cached(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:

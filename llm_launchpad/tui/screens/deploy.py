@@ -8,11 +8,19 @@ from __future__ import annotations
 
 import json
 
+from textual.actions import SkipAction
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
+<<<<<<< ours
+<<<<<<< ours
 from textual.screen import Screen
+from textual.widget import Widget
+=======
+>>>>>>> theirs
+=======
+>>>>>>> theirs
 from textual.widgets import (
     Button,
     Footer,
@@ -52,6 +60,7 @@ from ..workers import (
     VllmModelsLoaded,
 )
 from ..widgets.input_form import FormField, ToggleField
+from .copy_enabled import CopyEnabledScreen
 
 
 class GpuTypesLoaded(Message):
@@ -88,6 +97,112 @@ class VllmMemoryFailed(Message):
         self.repo_id = repo_id
         self.revision = revision
         self.error = error
+
+
+def _first_enabled_option_index(option_list: OptionList) -> int | None:
+    for index in range(option_list.option_count):
+        if not option_list.get_option_at_index(index).disabled:
+            return index
+    return None
+
+
+def _last_enabled_option_index(option_list: OptionList) -> int | None:
+    for index in range(option_list.option_count - 1, -1, -1):
+        if not option_list.get_option_at_index(index).disabled:
+            return index
+    return None
+
+
+def _next_enabled_option_index(option_list: OptionList, direction: int) -> int | None:
+    if direction not in (-1, 1):
+        raise ValueError("direction must be -1 or 1")
+    highlighted = option_list.highlighted
+    if highlighted is None:
+        return _first_enabled_option_index(option_list) if direction == 1 else _last_enabled_option_index(option_list)
+    if direction == 1:
+        indexes = range(highlighted + 1, option_list.option_count)
+    else:
+        indexes = range(highlighted - 1, -1, -1)
+    for index in indexes:
+        if not option_list.get_option_at_index(index).disabled:
+            return index
+    return None
+
+
+def _move_focus_across_option_lists(screen: Screen, option_list_ids: tuple[str, ...], direction: int) -> bool:
+    if direction not in (-1, 1):
+        raise ValueError("direction must be -1 or 1")
+    focused = screen.focused
+    if not isinstance(focused, OptionList):
+        return False
+    option_lists = tuple(screen.query_one(f"#{option_list_id}", OptionList) for option_list_id in option_list_ids)
+    try:
+        focused_index = option_lists.index(focused)
+    except ValueError:
+        return False
+    next_index = _next_enabled_option_index(focused, direction)
+    if next_index is not None:
+        focused.highlighted = next_index
+        return True
+    neighbor_index = focused_index + direction
+    if neighbor_index < 0 or neighbor_index >= len(option_lists):
+        return False
+    neighbor = option_lists[neighbor_index]
+    neighbor.focus()
+    neighbor_highlighted = _first_enabled_option_index(neighbor) if direction == 1 else _last_enabled_option_index(neighbor)
+    if neighbor_highlighted is not None:
+        neighbor.highlighted = neighbor_highlighted
+    return True
+
+
+def _has_hidden_ancestor(widget: Widget) -> bool:
+    current: Widget | None = widget
+    while current is not None:
+        if current.has_class("hidden"):
+            return True
+        parent = current.parent
+        current = parent if isinstance(parent, Widget) else None
+    return False
+
+
+def _is_focusable_for_arrow_navigation(widget: Widget) -> bool:
+    if not widget.can_focus:
+        return False
+    if getattr(widget, "disabled", False):
+        return False
+    if _has_hidden_ancestor(widget):
+        return False
+    return True
+
+
+def _move_focus_across_widgets(screen: Screen, widget_ids: tuple[str, ...], direction: int) -> bool:
+    if direction not in (-1, 1):
+        raise ValueError("direction must be -1 or 1")
+    focused = screen.focused
+    if not isinstance(focused, Widget):
+        return False
+    widgets = [
+        widget
+        for widget_id in widget_ids
+        for widget in (screen.query_one(f"#{widget_id}", Widget),)
+        if _is_focusable_for_arrow_navigation(widget)
+    ]
+    if not widgets:
+        return False
+    try:
+        focused_index = widgets.index(focused)
+    except ValueError:
+        return False
+    neighbor_index = focused_index + direction
+    if neighbor_index < 0 or neighbor_index >= len(widgets):
+        return False
+    neighbor = widgets[neighbor_index]
+    neighbor.focus()
+    if isinstance(neighbor, OptionList) and neighbor.highlighted is None:
+        highlighted = _first_enabled_option_index(neighbor) if direction == 1 else _last_enabled_option_index(neighbor)
+        if highlighted is not None:
+            neighbor.highlighted = highlighted
+    return True
 
 
 def _cached_models_from_snapshot(snapshot: StorageSnapshot, backend: BackendType) -> list[ModelCandidate]:
@@ -168,7 +283,7 @@ def _quant_preview(quantizations: list[str], vram_gb_by_quant: dict[str, float],
     return ", ".join(preview_tokens) + suffix
 
 
-class BackendSelectScreen(Screen):
+class BackendSelectScreen(CopyEnabledScreen):
     """Step 1: pick backend (llama.cpp or vLLM)."""
 
     BINDINGS = [
@@ -186,6 +301,12 @@ class BackendSelectScreen(Screen):
             )
         yield Footer()
 
+    def on_mount(self) -> None:
+        backend_list = self.query_one("#backend-list", OptionList)
+        if backend_list.option_count > 0:
+            backend_list.highlighted = 0
+        backend_list.focus()
+
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option.id == "llamacpp":
             self.app.push_screen(LlamaCppDeployScreen())
@@ -196,15 +317,38 @@ class BackendSelectScreen(Screen):
         self.app.pop_screen()
 
 
-class LlamaCppDeployScreen(Screen):
+class LlamaCppDeployScreen(CopyEnabledScreen):
     """llama.cpp deploy form."""
 
     BINDINGS = [
+        Binding("up", "navigate_option_list_up", show=False, priority=True),
+        Binding("down", "navigate_option_list_down", show=False, priority=True),
         Binding("escape", "pop_screen", "Back", show=True),
         Binding("ctrl+d", "do_deploy", "Deploy", show=True),
         Binding("ctrl+s", "open_storage", "Storage", show=True),
         Binding("p", "predownload_highlighted", "Pre-download", show=True),
     ]
+    NAVIGATION_ORDER = (
+        "llama-rank-mode",
+        "llama-model-list",
+        "repo-id",
+        "quant",
+        "llama-quant-list",
+        "gpu-type-llama",
+        "gpu-count-llama",
+        "preload",
+        "do-deploy",
+        "warmup",
+        "toggle-advanced-llama",
+        "revision",
+        "server-args",
+        "host-input",
+        "port-input",
+        "n-gpu-layers",
+        "instance-name-llama",
+        "app-name-llama",
+        "deploy-btn",
+    )
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="menu-container"):
@@ -313,6 +457,7 @@ class LlamaCppDeployScreen(Screen):
         rank_mode_list = self.query_one("#llama-rank-mode", OptionList)
         if rank_mode_list.option_count > 0:
             rank_mode_list.highlighted = 0
+        rank_mode_list.focus()
         self._refresh_gpu_types()
         self._set_model_status("[dim]Loading cached models from storage...[/dim]")
         self._refresh_cached_models_from_storage()
@@ -341,6 +486,7 @@ class LlamaCppDeployScreen(Screen):
         if event.option_list.id == "llama-model-list":
             self._apply_ranked_model_selection(event.option.id or "")
             self._refresh_app_preview()
+            self.query_one("#repo-id", Input).focus()
             return
 
         if event.option_list.id == "llama-quant-list":
@@ -720,19 +866,63 @@ class LlamaCppDeployScreen(Screen):
     def action_pop_screen(self) -> None:
         self.app.pop_screen()
 
+    def action_navigate_option_list_down(self) -> None:
+        if _move_focus_across_option_lists(
+            self,
+            ("llama-rank-mode", "llama-model-list", "llama-quant-list"),
+            direction=1,
+        ):
+            return
+        if _move_focus_across_widgets(self, self.NAVIGATION_ORDER, direction=1):
+            return
+        raise SkipAction()
+
+    def action_navigate_option_list_up(self) -> None:
+        if _move_focus_across_option_lists(
+            self,
+            ("llama-rank-mode", "llama-model-list", "llama-quant-list"),
+            direction=-1,
+        ):
+            return
+        if _move_focus_across_widgets(self, self.NAVIGATION_ORDER, direction=-1):
+            return
+        raise SkipAction()
+
     def action_open_storage(self) -> None:
         self.app.action_push_storage(BackendType.LLAMACPP)  # type: ignore[attr-defined]
 
 
-class VllmDeployScreen(Screen):
+class VllmDeployScreen(CopyEnabledScreen):
     """vLLM deploy form."""
 
     BINDINGS = [
+        Binding("up", "navigate_option_list_up", show=False, priority=True),
+        Binding("down", "navigate_option_list_down", show=False, priority=True),
         Binding("escape", "pop_screen", "Back", show=True),
         Binding("ctrl+d", "do_deploy", "Deploy", show=True),
         Binding("ctrl+s", "open_storage", "Storage", show=True),
         Binding("p", "predownload_highlighted", "Pre-download", show=True),
     ]
+    NAVIGATION_ORDER = (
+        "vllm-rank-mode",
+        "vllm-model-list",
+        "model-name",
+        "gpu-type-vllm",
+        "gpu-count-vllm",
+        "n-gpu",
+        "toggle-advanced-vllm",
+        "model-revision",
+        "smoke-only-vllm",
+        "warmup-vllm",
+        "fast-boot",
+        "trust-remote-code",
+        "served-model-name",
+        "reasoning-parser",
+        "chat-template-kwargs",
+        "instance-name-vllm",
+        "app-name-vllm",
+        "deploy-vllm-btn",
+    )
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="menu-container"):
@@ -863,6 +1053,7 @@ class VllmDeployScreen(Screen):
         rank_mode_list = self.query_one("#vllm-rank-mode", OptionList)
         if rank_mode_list.option_count > 0:
             rank_mode_list.highlighted = 0
+        rank_mode_list.focus()
         self._refresh_gpu_types()
         self._set_model_status("[dim]Loading cached models from storage...[/dim]")
         self._refresh_cached_models_from_storage()
@@ -893,6 +1084,7 @@ class VllmDeployScreen(Screen):
         if event.option_list.id == "vllm-model-list":
             self._apply_ranked_model_selection(event.option.id or "")
             self._refresh_app_preview()
+            self.query_one("#model-name", Input).focus()
             return
 
     def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
@@ -1236,6 +1428,28 @@ class VllmDeployScreen(Screen):
 
     def action_pop_screen(self) -> None:
         self.app.pop_screen()
+
+    def action_navigate_option_list_down(self) -> None:
+        if _move_focus_across_option_lists(
+            self,
+            ("vllm-rank-mode", "vllm-model-list"),
+            direction=1,
+        ):
+            return
+        if _move_focus_across_widgets(self, self.NAVIGATION_ORDER, direction=1):
+            return
+        raise SkipAction()
+
+    def action_navigate_option_list_up(self) -> None:
+        if _move_focus_across_option_lists(
+            self,
+            ("vllm-rank-mode", "vllm-model-list"),
+            direction=-1,
+        ):
+            return
+        if _move_focus_across_widgets(self, self.NAVIGATION_ORDER, direction=-1):
+            return
+        raise SkipAction()
 
     def action_open_storage(self) -> None:
         self.app.action_push_storage(BackendType.VLLM)  # type: ignore[attr-defined]

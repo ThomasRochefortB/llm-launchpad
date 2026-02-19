@@ -13,12 +13,12 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Center, Horizontal, Vertical
 from textual.message import Message
-from textual.screen import Screen
 from textual.widgets import Footer, OptionList, Static
 from textual.widgets.option_list import Option
 
 from ...core.backend import ModalBackend
 from ...protocol.models import EndpointInfo
+from .copy_enabled import CopyEnabledScreen
 
 BANNER = r"""[bold cyan]
 _     _     __  __
@@ -307,7 +307,7 @@ def _render_billing_load_error(error: str) -> str:
     )
 
 
-class MainMenuScreen(Screen):
+class MainMenuScreen(CopyEnabledScreen):
     """Top-level menu: deploy, manage, settings."""
 
     BINDINGS = [

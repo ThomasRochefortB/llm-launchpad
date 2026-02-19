@@ -7,17 +7,15 @@ operation (deploy, warmup, logs, status, stop).
 from __future__ import annotations
 
 import re
-import subprocess
-import sys
 
 from textual import events
 from textual.actions import SkipAction
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
-from textual.screen import Screen
 from textual.widgets import Footer, Static
 
+from .copy_enabled import CopyEnabledScreen
 from ..widgets.log_viewer import LogViewer
 from ..widgets.status_header import StatusHeader
 from ..workers import LogMessage, OperationDone, OperationError, StateChanged
@@ -29,7 +27,7 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_ESCAPE_RE.sub("", text or "")
 
 
-class MonitorScreen(Screen):
+class MonitorScreen(CopyEnabledScreen):
     """Full-screen operation monitor with streaming logs."""
 
     BINDINGS = [
@@ -155,29 +153,13 @@ class MonitorScreen(Screen):
         # OSC 52 (works in iTerm2, Kitty, WezTerm, Ghostty, etc.)
         self.app.copy_to_clipboard(text)
 
-        # macOS: also pipe into pbcopy for terminals that ignore OSC 52
-        if sys.platform == "darwin":
-            try:
-                subprocess.run(
-                    ["pbcopy"],
-                    input=text.encode(),
-                    check=True,
-                    timeout=2,
-                )
-            except Exception:
-                pass
-
         if notify:
             lines = text.count("\n") + 1
             self.notify(f"Copied {lines} line{'s' if lines != 1 else ''}", timeout=2)
         return True
 
     def action_copy_text(self) -> None:
-        """Copy selected log text to clipboard.
-
-        Uses OSC 52 (built-in) **and** ``pbcopy`` on macOS as a fallback so
-        the copy works even in terminals that don't support OSC 52.
-        """
+        """Copy selected log text to clipboard."""
         self._copy_selected_text(notify=True, raise_on_empty=True)
 
     def action_go_back(self) -> None:

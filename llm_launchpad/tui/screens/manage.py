@@ -5,13 +5,13 @@ from __future__ import annotations
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
-from textual.screen import Screen
 from textual.widgets import Footer, Input, OptionList, Static, Switch
 from textual.widgets.option_list import Option
 
 from ...protocol.enums import BackendType
 from ...protocol.models import EndpointInfo
 from ..widgets.input_form import FormField, ToggleField
+from .copy_enabled import CopyEnabledScreen
 
 
 def _is_stoppable_state(state: str) -> bool:
@@ -37,7 +37,7 @@ def _build_backend_app_options(
     return options, option_to_target
 
 
-class ManageScreen(Screen):
+class ManageScreen(CopyEnabledScreen):
     """Manage endpoints: pick action, then pick backend and params."""
 
     BINDINGS = [
@@ -57,6 +57,12 @@ class ManageScreen(Screen):
             )
         yield Footer()
 
+    def on_mount(self) -> None:
+        action_list = self.query_one("#manage-action-list", OptionList)
+        if action_list.option_count > 0:
+            action_list.highlighted = 0
+        action_list.focus()
+
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         opt = event.option.id
         if opt == "list":
@@ -72,7 +78,7 @@ class ManageScreen(Screen):
         self.app.pop_screen()
 
 
-class StatusParamsScreen(Screen):
+class StatusParamsScreen(CopyEnabledScreen):
     """Params for status check: backend, optional URL override, timeout."""
 
     BINDINGS = [
@@ -100,6 +106,7 @@ class StatusParamsScreen(Screen):
         self._instance_app_name: str | None = None
         self._target_by_option_id: dict[str, tuple[BackendType, str]] = {}
         self._load_instances()
+        self.query_one("#status-instance-list", OptionList).focus()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option_list.id == "status-instance-list":
@@ -138,15 +145,19 @@ class StatusParamsScreen(Screen):
         if not checkable_instances:
             self._target_by_option_id = {}
             instance_list.set_options([Option("  No running deployments found")])
+            if instance_list.option_count > 0:
+                instance_list.highlighted = 0
             return
         options, self._target_by_option_id = _build_backend_app_options(checkable_instances)
         instance_list.set_options(options)
+        if options:
+            instance_list.highlighted = 0
 
     def action_pop_screen(self) -> None:
         self.app.pop_screen()
 
 
-class LogsParamsScreen(Screen):
+class LogsParamsScreen(CopyEnabledScreen):
     """Params for log tailing: backend, follow toggle."""
 
     BINDINGS = [
@@ -167,6 +178,7 @@ class LogsParamsScreen(Screen):
         self._instance_app_name: str | None = None
         self._target_by_option_id: dict[str, tuple[BackendType, str]] = {}
         self._load_instances()
+        self.query_one("#logs-instance-list", OptionList).focus()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option_list.id == "logs-instance-list":
@@ -192,15 +204,19 @@ class LogsParamsScreen(Screen):
         if not loggable_instances:
             self._target_by_option_id = {}
             instance_list.set_options([Option("  No running deployments found")])
+            if instance_list.option_count > 0:
+                instance_list.highlighted = 0
             return
         options, self._target_by_option_id = _build_backend_app_options(loggable_instances)
         instance_list.set_options(options)
+        if options:
+            instance_list.highlighted = 0
 
     def action_pop_screen(self) -> None:
         self.app.pop_screen()
 
 
-class StopParamsScreen(Screen):
+class StopParamsScreen(CopyEnabledScreen):
     """Confirmation for stopping a backend."""
 
     BINDINGS = [
@@ -254,6 +270,8 @@ class StopParamsScreen(Screen):
         if not stoppable_instances:
             self._target_by_option_id = {}
             instance_list.set_options([Option("  No running deployments found")])
+            if instance_list.option_count > 0:
+                instance_list.highlighted = 0
             return
         options, self._target_by_option_id = _build_backend_app_options(stoppable_instances)
         instance_list.set_options(options)
