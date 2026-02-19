@@ -6,13 +6,13 @@ from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
-from textual.screen import Screen
 from textual.widgets import DataTable, Footer, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
 from ...protocol.enums import BackendType
 from ...protocol.models import StorageSnapshot, StoredModelInfo
 from ..workers import StorageFailed, StorageLoaded
+from .copy_enabled import CopyEnabledScreen
 
 
 def _human_bytes(size_bytes: int) -> str:
@@ -31,7 +31,7 @@ def _model_label(row: StoredModelInfo) -> str:
     return row.model_id
 
 
-class StorageScreen(Screen):
+class StorageScreen(CopyEnabledScreen):
     """View and pre-download backend model caches."""
 
     BINDINGS = [

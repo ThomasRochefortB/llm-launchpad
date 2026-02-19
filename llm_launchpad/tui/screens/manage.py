@@ -5,13 +5,13 @@ from __future__ import annotations
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
-from textual.screen import Screen
 from textual.widgets import Footer, Input, OptionList, Static, Switch
 from textual.widgets.option_list import Option
 
 from ...protocol.enums import BackendType
 from ...protocol.models import EndpointInfo
 from ..widgets.input_form import FormField, ToggleField
+from .copy_enabled import CopyEnabledScreen
 
 
 def _is_stoppable_state(state: str) -> bool:
@@ -37,7 +37,7 @@ def _build_backend_app_options(
     return options, option_to_target
 
 
-class ManageScreen(Screen):
+class ManageScreen(CopyEnabledScreen):
     """Manage endpoints: pick action, then pick backend and params."""
 
     BINDINGS = [
@@ -72,7 +72,7 @@ class ManageScreen(Screen):
         self.app.pop_screen()
 
 
-class StatusParamsScreen(Screen):
+class StatusParamsScreen(CopyEnabledScreen):
     """Params for status check: backend, optional URL override, timeout."""
 
     BINDINGS = [
@@ -146,7 +146,7 @@ class StatusParamsScreen(Screen):
         self.app.pop_screen()
 
 
-class LogsParamsScreen(Screen):
+class LogsParamsScreen(CopyEnabledScreen):
     """Params for log tailing: backend, follow toggle."""
 
     BINDINGS = [
@@ -200,7 +200,7 @@ class LogsParamsScreen(Screen):
         self.app.pop_screen()
 
 
-class StopParamsScreen(Screen):
+class StopParamsScreen(CopyEnabledScreen):
     """Confirmation for stopping a backend."""
 
     BINDINGS = [

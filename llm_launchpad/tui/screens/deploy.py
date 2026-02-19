@@ -12,7 +12,6 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
-from textual.screen import Screen
 from textual.widgets import (
     Button,
     Footer,
@@ -52,6 +51,7 @@ from ..workers import (
     VllmModelsLoaded,
 )
 from ..widgets.input_form import FormField, ToggleField
+from .copy_enabled import CopyEnabledScreen
 
 
 class GpuTypesLoaded(Message):
@@ -168,7 +168,7 @@ def _quant_preview(quantizations: list[str], vram_gb_by_quant: dict[str, float],
     return ", ".join(preview_tokens) + suffix
 
 
-class BackendSelectScreen(Screen):
+class BackendSelectScreen(CopyEnabledScreen):
     """Step 1: pick backend (llama.cpp or vLLM)."""
 
     BINDINGS = [
@@ -196,7 +196,7 @@ class BackendSelectScreen(Screen):
         self.app.pop_screen()
 
 
-class LlamaCppDeployScreen(Screen):
+class LlamaCppDeployScreen(CopyEnabledScreen):
     """llama.cpp deploy form."""
 
     BINDINGS = [
@@ -724,7 +724,7 @@ class LlamaCppDeployScreen(Screen):
         self.app.action_push_storage(BackendType.LLAMACPP)  # type: ignore[attr-defined]
 
 
-class VllmDeployScreen(Screen):
+class VllmDeployScreen(CopyEnabledScreen):
     """vLLM deploy form."""
 
     BINDINGS = [
