@@ -279,8 +279,10 @@ class WizardApp(App):
         for event in self._orchestrator.stop_app(backend, app_name=app_name):
             _dispatch_event(monitor, event)
 
-    def list_instances(self, backend: BackendType) -> list[EndpointInfo]:
+    def list_instances(self, backend: BackendType | None = None) -> list[EndpointInfo]:
         rows = ModalBackend.list_apps() or []
+        if backend is None:
+            return rows
         return [row for row in rows if row.backend == backend]
 
     # ------------------------------------------------------------------

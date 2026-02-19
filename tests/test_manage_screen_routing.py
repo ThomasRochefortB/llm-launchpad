@@ -29,7 +29,9 @@ class _TestApp(App[None]):
     def begin_list(self) -> None:
         self.list_called += 1
 
-    def list_instances(self, _backend):  # type: ignore[no-untyped-def]
+    def list_instances(self, _backend=None):  # type: ignore[no-untyped-def]
+        if _backend is None:
+            return self.instances_by_backend[BackendType.LLAMACPP] + self.instances_by_backend[BackendType.VLLM]
         return self.instances_by_backend.get(_backend, [])
 
     def push_screen(self, screen, *args, **kwargs):  # type: ignore[no-untyped-def]

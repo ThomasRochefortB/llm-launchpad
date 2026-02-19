@@ -138,9 +138,7 @@ class StatusParamsScreen(CopyEnabledScreen):
 
     def _load_instances(self) -> None:
         instance_list = self.query_one("#status-instance-list", OptionList)
-        instances: list[EndpointInfo] = []
-        for backend in (BackendType.LLAMACPP, BackendType.VLLM):
-            instances.extend(self.app.list_instances(backend))  # type: ignore[attr-defined]
+        instances = self.app.list_instances()  # type: ignore[attr-defined]
         checkable_instances = [row for row in instances if _is_stoppable_state(row.state)]
         if not checkable_instances:
             self._target_by_option_id = {}
@@ -197,9 +195,7 @@ class LogsParamsScreen(CopyEnabledScreen):
 
     def _load_instances(self) -> None:
         instance_list = self.query_one("#logs-instance-list", OptionList)
-        instances: list[EndpointInfo] = []
-        for backend in (BackendType.LLAMACPP, BackendType.VLLM):
-            instances.extend(self.app.list_instances(backend))  # type: ignore[attr-defined]
+        instances = self.app.list_instances()  # type: ignore[attr-defined]
         loggable_instances = [row for row in instances if _is_stoppable_state(row.state)]
         if not loggable_instances:
             self._target_by_option_id = {}
@@ -263,9 +259,7 @@ class StopParamsScreen(CopyEnabledScreen):
 
     def _load_instances(self) -> None:
         instance_list = self.query_one("#stop-instance-list", OptionList)
-        instances: list[EndpointInfo] = []
-        for backend in (BackendType.LLAMACPP, BackendType.VLLM):
-            instances.extend(self.app.list_instances(backend))  # type: ignore[attr-defined]
+        instances = self.app.list_instances()  # type: ignore[attr-defined]
         stoppable_instances = [row for row in instances if _is_stoppable_state(row.state)]
         if not stoppable_instances:
             self._target_by_option_id = {}
