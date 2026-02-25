@@ -214,6 +214,10 @@ def deploy(
         None,
         help="vLLM reasoning parser (e.g. qwen3, deepseek_r1, granite)",
     ),
+    tool_call_parser: Optional[str] = typer.Option(
+        None,
+        help="vLLM tool call parser (e.g. hermes, qwen3_xml, llama3_json)",
+    ),
     default_chat_template_kwargs: Optional[str] = typer.Option(
         None,
         help=(
@@ -251,6 +255,7 @@ def deploy(
         n_gpu=n_gpu,
         trust_remote_code=trust_remote_code,
         reasoning_parser=reasoning_parser,
+        tool_call_parser=tool_call_parser,
         default_chat_template_kwargs=default_chat_template_kwargs,
         instance_name=resolved_instance,
         app_name=resolved_app_name,
@@ -416,6 +421,10 @@ def switch(
         None,
         help="vLLM reasoning parser (e.g. qwen3, deepseek_r1, granite)",
     ),
+    tool_call_parser: Optional[str] = typer.Option(
+        None,
+        help="vLLM tool call parser (e.g. hermes, qwen3_xml, llama3_json)",
+    ),
     default_chat_template_kwargs: Optional[str] = typer.Option(
         None,
         help=(
@@ -456,6 +465,7 @@ def switch(
         n_gpu=n_gpu,
         trust_remote_code=trust_remote_code,
         reasoning_parser=reasoning_parser,
+        tool_call_parser=tool_call_parser,
         default_chat_template_kwargs=default_chat_template_kwargs,
     )
     model_hint = model_name if bt == BackendType.VLLM else (repo_id or preset)

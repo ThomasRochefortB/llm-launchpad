@@ -8,12 +8,13 @@ from llm_launchpad.protocol.models import DeploymentConfig, LaunchpadSettings
 
 
 class BackendEnvTests(unittest.TestCase):
-    def test_vllm_reasoning_fields_are_forwarded(self) -> None:
+    def test_vllm_reasoning_and_tool_fields_are_forwarded(self) -> None:
         config = DeploymentConfig(
             backend=BackendType.VLLM,
             model_name="Qwen/Qwen3-8B",
             trust_remote_code=True,
             reasoning_parser="qwen3",
+            tool_call_parser="qwen3_xml",
             default_chat_template_kwargs='{"enable_thinking": false}',
         )
 
@@ -21,20 +22,23 @@ class BackendEnvTests(unittest.TestCase):
         self.assertEqual(env["MODEL_NAME"], "Qwen/Qwen3-8B")
         self.assertEqual(env["TRUST_REMOTE_CODE"], "true")
         self.assertEqual(env["REASONING_PARSER"], "qwen3")
+        self.assertEqual(env["TOOL_CALL_PARSER"], "qwen3_xml")
         self.assertEqual(env["DEFAULT_CHAT_TEMPLATE_KWARGS"], '{"enable_thinking": false}')
 
-    def test_vllm_reasoning_fields_are_omitted_when_empty(self) -> None:
+    def test_vllm_reasoning_and_tool_fields_are_omitted_when_empty(self) -> None:
         config = DeploymentConfig(
             backend=BackendType.VLLM,
             model_name="Qwen/Qwen3-8B",
             trust_remote_code=None,
             reasoning_parser=None,
+            tool_call_parser="",
             default_chat_template_kwargs="",
         )
 
         env = ModalBackend.env_for_backend(config)
         self.assertNotIn("TRUST_REMOTE_CODE", env)
         self.assertNotIn("REASONING_PARSER", env)
+        self.assertNotIn("TOOL_CALL_PARSER", env)
         self.assertNotIn("DEFAULT_CHAT_TEMPLATE_KWARGS", env)
 
     def test_build_full_env_uses_deployment_gpu_config(self) -> None:

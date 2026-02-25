@@ -149,10 +149,11 @@ class ModalBackend:
                     "messages": [{"role": "user", "content": content}],
                 },
             )
+        model = (served_model_name or "").strip() or "default"
         return _curl_json(
             "/v1/completions",
             {
-                "model": "default",
+                "model": model,
                 "prompt": content,
                 "max_tokens": 32,
             },
@@ -170,6 +171,10 @@ class ModalBackend:
             env["MODAL_APP_NAME"] = config.app_name
         if config.function_slug:
             env["MODAL_FUNCTION_SLUG"] = config.function_slug
+        if config.backend == BackendType.LLAMACPP:
+            if config.llamacpp_image_no_cache is not None:
+                env["LLAMA_CPP_IMAGE_NO_CACHE"] = "true" if config.llamacpp_image_no_cache else "false"
+            return env
         if config.backend != BackendType.VLLM:
             return env
         if config.model_name:
@@ -186,6 +191,8 @@ class ModalBackend:
             env["TRUST_REMOTE_CODE"] = "true" if config.trust_remote_code else "false"
         if config.reasoning_parser:
             env["REASONING_PARSER"] = config.reasoning_parser
+        if config.tool_call_parser:
+            env["TOOL_CALL_PARSER"] = config.tool_call_parser
         if config.default_chat_template_kwargs:
             env["DEFAULT_CHAT_TEMPLATE_KWARGS"] = config.default_chat_template_kwargs
         return env
