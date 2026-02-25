@@ -20,9 +20,14 @@ from textual.binding import Binding
 from ..core.backend import ModalBackend
 from ..core.config import SETTINGS_DIR
 from ..core.hf_models import fetch_gguf_quant_metadata, list_llamacpp_candidates, list_vllm_candidates
-from ..core.naming import build_app_name, legacy_app_name
+from ..core.naming import (
+    build_app_name,
+    default_llamacpp_served_model_name,
+    default_served_model_name,
+    legacy_app_name,
+)
 from ..core.orchestrator import Orchestrator
-from ..protocol.enums import BackendType
+from ..protocol.enums import BackendType, OperationType
 from ..protocol.events import ErrorEvent, LogEvent, OperationCompleteEvent
 from ..protocol.models import EndpointInfo
 from ..protocol.models import DeploymentConfig
@@ -46,6 +51,33 @@ from .workers import (
     VllmModelsLoaded,
     _dispatch_event,
 )
+
+
+def _deploy_connection_summary_lines(config: DeploymentConfig, server_url: str) -> list[str]:
+    """Build a compact post-deploy connection summary for OpenAI-compatible clients."""
+    base_root = server_url.rstrip("/")
+    base_url = base_root if base_root.endswith("/v1") else f"{base_root}/v1"
+
+    if config.backend == BackendType.VLLM:
+        model_id = (config.served_model_name or default_served_model_name(config.model_name)).strip()
+        display_name = (config.served_model_name or config.model_name or model_id or "Model").strip()
+    else:
+        model_id = (
+            (config.served_model_name or "").strip()
+            or default_llamacpp_served_model_name(config.repo_id, config.quant)
+        )
+        source = (config.repo_id or "llama.cpp GGUF").strip()
+        quant = (config.quant or "").strip()
+        display_name = f"{source} ({quant})" if quant else source
+
+    return [
+        "=== OpenAI-compatible ===",
+        f"Base URL: {base_url}",
+        f"Model ID: {model_id}",
+        f"Display name: {display_name}",
+        "API key: (leave blank; no auth by default)",
+        "=========================",
+    ]
 
 
 class WizardApp(App):
@@ -139,7 +171,12 @@ class WizardApp(App):
         """Start a deploy operation via a threaded worker."""
         if not config.app_name:
             config.app_name = build_app_name(config.backend, config.instance_name)
-        monitor = MonitorScreen(title="Deploy")
+        monitor = MonitorScreen(
+            title="Deploy",
+            deploy_backend=config.backend,
+            summarize_backend_logs=True,
+            show_debug_logs=config.show_debug_logs,
+        )
         self.push_screen(monitor)
         self.run_worker(
             lambda: self._run_deploy(config, monitor),
@@ -150,14 +187,43 @@ class WizardApp(App):
     def _run_deploy(self, config: DeploymentConfig, monitor: MonitorScreen):  # type: ignore[return]
         """Generator consumed by run_worker in a thread."""
         deployed_web_url: Optional[str] = None
+        deployed_web_url_priority = -1
         deploy_succeeded = False
+        will_run_warmup = bool(config.do_warmup and config.do_deploy)
+
+        def _emit_connection_summary(url: str) -> None:
+            for line in _deploy_connection_summary_lines(config, url):
+                _dispatch_event(monitor, LogEvent(line=line))
+
         for event in self._orchestrator.deploy(config):
             if isinstance(event, LogEvent):
+                line = event.line or ""
                 maybe_url = ModalBackend.extract_modal_web_url(event.line)
                 if maybe_url:
-                    deployed_web_url = maybe_url
+                    if "Created web function" in line:
+                        # Prefer the Modal-emitted web function URL over backend-printed
+                        # guidance URLs; within those, prefer the non-dev URL.
+                        priority = 2 if not maybe_url.endswith("-dev.modal.run") else 1
+                    else:
+                        priority = 0
+                    if priority >= deployed_web_url_priority:
+                        deployed_web_url = maybe_url
+                        deployed_web_url_priority = priority
             elif isinstance(event, OperationCompleteEvent):
                 deploy_succeeded = event.success
+                # When warmup immediately follows a successful deploy in the same
+                # monitor session, suppress the intermediate completion footer
+                # ("Operation complete... Press esc") to keep the summary cleaner.
+                if will_run_warmup and event.success and event.operation == OperationType.DEPLOY:
+                    continue
+                if event.success and event.operation == OperationType.DEPLOY and config.do_deploy:
+                    target_app_name = config.app_name or legacy_app_name(config.backend)
+                    url = deployed_web_url or ModalBackend.default_server_url(
+                        self._username,
+                        app_name=target_app_name,
+                        function_slug=config.function_slug,
+                    )
+                    _emit_connection_summary(url)
             _dispatch_event(monitor, event)
 
         # Warmup if requested and deploy was successful
@@ -176,6 +242,17 @@ class WizardApp(App):
                 app_name=target_app_name,
                 served_model_name=config.served_model_name,
             ):
+                if (
+                    isinstance(event, OperationCompleteEvent)
+                    and event.success
+                    and event.operation == OperationType.WARMUP
+                ):
+                    completed_url = url
+                    if isinstance(event.data, dict):
+                        maybe_url = event.data.get("url")
+                        if isinstance(maybe_url, str) and maybe_url.strip():
+                            completed_url = maybe_url.strip()
+                    _emit_connection_summary(completed_url)
                 _dispatch_event(monitor, event)
 
     # ------------------------------------------------------------------

@@ -8,6 +8,8 @@ CLI both consume these generators.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+import json
 import os
 import queue
 import re
@@ -30,6 +32,7 @@ from ..protocol.models import StoredModelInfo, StorageSnapshot
 from .backend import ModalBackend
 from .config import ConfigStore
 from .naming import legacy_app_name
+from .naming import default_llamacpp_served_model_name
 from .naming import random_function_slug
 from .paths import MODAL_LLAMACPP_SCRIPT, MODAL_VLLM_SCRIPT
 
@@ -44,6 +47,8 @@ _MODAL_RELAX_RE = re.compile(r"Relaxing requirements \((?P<requirements>[^)]+)\)
 _GGUF_QUANT_RE = re.compile(r"(Q\d(?:_[A-Z0-9]+)+|IQ\d+_[A-Z0-9_]+)", flags=re.IGNORECASE)
 _SIZE_TOKEN_RE = re.compile(r"^\s*(?P<num>\d+(?:\.\d+)?)\s*(?P<unit>[A-Za-z]+)?\s*$")
 _LLAMACPP_MIN_PLAUSIBLE_GGUF_BYTES = 1024 * 1024
+_LLAMACPP_STORAGE_JSON_BEGIN = "LLM_LAUNCHPAD_STORAGE_JSON_BEGIN"
+_LLAMACPP_STORAGE_JSON_END = "LLM_LAUNCHPAD_STORAGE_JSON_END"
 
 
 def _modal_gpu_scheduling_hint(response_text: str) -> str | None:
@@ -72,6 +77,36 @@ def _modal_gpu_scheduling_hint(response_text: str) -> str | None:
     if not parts:
         return "Waiting for GPU scheduling"
     return f"Waiting for GPU scheduling ({', '.join(parts)})"
+
+
+def _probe_response_is_ready(backend: BackendType, status_code: int, body: str) -> tuple[bool, str | None]:
+    """Validate readiness probe success beyond HTTP status for llama.cpp.
+
+    Modal can return intermediary/fallback 200 responses while the underlying
+    containerized server is still starting or has already crashed. For llama.cpp
+    we require an OpenAI-compatible completions payload (`choices`) to treat the
+    endpoint as ready.
+    """
+    if not (200 <= status_code < 300):
+        return False, None
+    if backend == BackendType.VLLM:
+        return True, None
+
+    text = (body or "").strip()
+    if not text:
+        return False, "empty response body"
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return False, "non-JSON response body"
+    if not isinstance(payload, dict):
+        return False, "unexpected JSON payload type"
+    choices = payload.get("choices")
+    if isinstance(choices, list):
+        return True, None
+    if isinstance(payload.get("error"), dict):
+        return False, "error response"
+    return False, "missing completions choices"
 
 
 class Orchestrator:
@@ -116,6 +151,11 @@ class Orchestrator:
         """Run a full deploy workflow (optional preload + deploy + warmup)."""
         if config.do_deploy and config.backend != BackendType.VLLM and not config.function_slug:
             config.function_slug = random_function_slug()
+        if config.backend == BackendType.LLAMACPP and not (config.served_model_name or "").strip():
+            config.served_model_name = default_llamacpp_served_model_name(
+                config.repo_id,
+                config.quant,
+            )
         settings = self.config_store.load()
         env = ModalBackend.build_full_env(settings, config)
 
@@ -151,16 +191,99 @@ class Orchestrator:
     def _deploy_llamacpp(
         self, config: DeploymentConfig, env: dict[str, str]
     ) -> EventStream:
-        cmd = ModalBackend.build_run_command(config)
-        yield StateChangeEvent(
-            current=DeploymentState.DEPLOYING if config.do_deploy else DeploymentState.RUNNING,
-            operation=OperationType.DEPLOY,
-            detail=" ".join(cmd),
+        def _run_step(
+            cmd: list[str],
+            *,
+            state: DeploymentState,
+            emit_env: bool,
+        ) -> Generator[BaseEvent, None, tuple[bool, int, str]]:
+            yield StateChangeEvent(
+                current=state,
+                operation=OperationType.DEPLOY,
+                detail=" ".join(cmd),
+            )
+            yield LogEvent(line=f"Running: {' '.join(cmd)}")
+            if emit_env and env:
+                yield LogEvent(line=f"  env: {', '.join(f'{k}={v}' for k, v in env.items())}")
+
+            saw_completion = False
+            success = True
+            exit_code = 0
+            detail = ""
+            for event in ModalBackend.run_streaming(cmd, env=env):
+                if isinstance(event, OperationCompleteEvent):
+                    saw_completion = True
+                    success = event.success
+                    exit_code = event.exit_code
+                    detail = event.detail
+                    continue
+                if isinstance(event, ErrorEvent):
+                    yield ErrorEvent(
+                        message=event.message,
+                        operation=OperationType.DEPLOY,
+                        exit_code=event.exit_code,
+                        recoverable=event.recoverable,
+                    )
+                    return False, event.exit_code or 1, event.message
+                if isinstance(event, LogEvent):
+                    yield LogEvent(
+                        line=event.line,
+                        stream=event.stream,
+                        operation=OperationType.DEPLOY,
+                    )
+                    continue
+                yield event
+
+            if not saw_completion:
+                return False, 1, "Command finished without completion event."
+            return success, exit_code, detail
+
+        if not config.do_deploy:
+            cmd = ModalBackend.build_run_command(config)
+            ok, exit_code, detail = yield from _run_step(
+                cmd,
+                state=DeploymentState.RUNNING,
+                emit_env=True,
+            )
+            yield OperationCompleteEvent(
+                operation=OperationType.DEPLOY,
+                success=ok,
+                exit_code=exit_code,
+                detail=detail,
+            )
+            return
+
+        # Split llama.cpp flow into:
+        # 1) configure + optional preload (`modal run ...::main` without nested deploy)
+        # 2) explicit `modal deploy`
+        prep_config = replace(config, do_deploy=False)
+        prep_cmd = ModalBackend.build_run_command(prep_config)
+        prep_ok, prep_exit_code, prep_detail = yield from _run_step(
+            prep_cmd,
+            state=DeploymentState.DEPLOYING,
+            emit_env=True,
         )
-        yield LogEvent(line=f"Running: {' '.join(cmd)}")
-        if env:
-            yield LogEvent(line=f"  env: {', '.join(f'{k}={v}' for k, v in env.items())}")
-        yield from ModalBackend.run_streaming(cmd, env=env)
+        if not prep_ok:
+            yield OperationCompleteEvent(
+                operation=OperationType.DEPLOY,
+                success=False,
+                exit_code=prep_exit_code,
+                detail=prep_detail or "llama.cpp preparation step failed",
+            )
+            return
+
+        deploy_cmd = ModalBackend.build_deploy_command(config.backend, app_name=config.app_name)
+        deploy_ok, deploy_exit_code, deploy_detail = yield from _run_step(
+            deploy_cmd,
+            state=DeploymentState.DEPLOYING,
+            emit_env=False,
+        )
+        yield OperationCompleteEvent(
+            operation=OperationType.DEPLOY,
+            success=deploy_ok,
+            exit_code=deploy_exit_code,
+            detail=deploy_detail,
+        )
 
     # ------------------------------------------------------------------
     # Warmup
@@ -244,9 +367,20 @@ class Orchestrator:
                 operation=OperationType.WARMUP,
                 recoverable=False,
             )
+            yield OperationCompleteEvent(
+                operation=OperationType.WARMUP,
+                success=False,
+                exit_code=1,
+            )
             return
 
-        payload = {"model": "default", "prompt": "ping", "max_tokens": 1, "temperature": 0}
+        llama_probe_model = (served_model_name or "").strip() or "default"
+        payload = {
+            "model": llama_probe_model,
+            "prompt": "ping",
+            "max_tokens": 1,
+            "temperature": 0,
+        }
         headers = {"Content-Type": "application/json"}
         start = time.time()
         backoff = 2.0
@@ -333,7 +467,11 @@ class Orchestrator:
                     resp = requests.post(
                         probe_url, headers=headers, data=_json.dumps(payload), timeout=10
                     )
-                if 200 <= resp.status_code < 300:
+                body = resp.text or ""
+                ready_ok, readiness_reason = _probe_response_is_ready(
+                    backend, resp.status_code, body
+                )
+                if ready_ok:
                     if logs_proc:
                         try:
                             logs_proc.terminate()
@@ -353,8 +491,10 @@ class Orchestrator:
                         operation=OperationType.WARMUP, success=True, data={"url": server_url}
                     )
                     return
-                body = resp.text or ""
-                last_err = f"HTTP {resp.status_code}: {body[:200]}"
+                if 200 <= resp.status_code < 300 and readiness_reason:
+                    last_err = f"HTTP {resp.status_code} (not ready): {readiness_reason}; body={body[:200]}"
+                else:
+                    last_err = f"HTTP {resp.status_code}: {body[:200]}"
                 scheduling_hint = _modal_gpu_scheduling_hint(body)
                 if scheduling_hint:
                     if scheduling_hint != last_scheduling_hint:
@@ -493,6 +633,11 @@ class Orchestrator:
             yield ErrorEvent(
                 message="'requests' required", operation=OperationType.STATUS, recoverable=False
             )
+            yield OperationCompleteEvent(
+                operation=OperationType.STATUS,
+                success=False,
+                exit_code=1,
+            )
             return
 
         import json as _json
@@ -526,7 +671,11 @@ class Orchestrator:
                     resp = requests.post(
                         probe_url, headers=headers, data=_json.dumps(payload), timeout=10
                     )
-                if 200 <= resp.status_code < 300:
+                body = resp.text or ""
+                ready_ok, readiness_reason = _probe_response_is_ready(
+                    backend, resp.status_code, body
+                )
+                if ready_ok:
                     curl_cmd = ModalBackend.test_curl_command(backend, server_url)
                     yield LogEvent(
                         line=f"Status: healthy (backend={backend.value}, url={server_url})"
@@ -539,8 +688,10 @@ class Orchestrator:
                         operation=OperationType.STATUS, success=True
                     )
                     return
-                body = resp.text or ""
-                last_err = f"HTTP {resp.status_code}: {body[:200]}"
+                if 200 <= resp.status_code < 300 and readiness_reason:
+                    last_err = f"HTTP {resp.status_code} (not ready): {readiness_reason}; body={body[:200]}"
+                else:
+                    last_err = f"HTTP {resp.status_code}: {body[:200]}"
                 scheduling_hint = _modal_gpu_scheduling_hint(body)
                 if scheduling_hint:
                     if scheduling_hint != last_scheduling_hint:
@@ -798,6 +949,74 @@ class Orchestrator:
         )
 
     def _list_llamacpp_models(self) -> list[StoredModelInfo]:
+        backend_rows = self._list_llamacpp_models_via_backend()
+        if backend_rows is not None:
+            return backend_rows
+        return self._list_llamacpp_models_from_volume()
+
+    def _list_llamacpp_models_via_backend(self) -> list[StoredModelInfo] | None:
+        captured = ModalBackend.run_modal_script_entrypoint_capture(
+            MODAL_LLAMACPP_SCRIPT,
+            "list_downloaded_models_json",
+        )
+        if not captured:
+            return None
+        returncode, stdout, _stderr = captured
+        if returncode != 0 or not stdout.strip():
+            return None
+
+        lines = stdout.splitlines()
+        try:
+            start = lines.index(_LLAMACPP_STORAGE_JSON_BEGIN)
+            end = lines.index(_LLAMACPP_STORAGE_JSON_END, start + 1)
+        except ValueError:
+            return None
+        if end <= start + 1:
+            return []
+
+        payload_text = "\n".join(lines[start + 1 : end]).strip()
+        if not payload_text:
+            return []
+        try:
+            payload = json.loads(payload_text)
+        except Exception:
+            return None
+        if not isinstance(payload, list):
+            return None
+
+        rows: list[StoredModelInfo] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            model_id = str(item.get("model_id", "")).strip()
+            if not model_id:
+                continue
+            revision_raw = item.get("revision")
+            quant_raw = item.get("quant")
+            source_volume_raw = item.get("source_volume")
+            paths_raw = item.get("paths")
+            rows.append(
+                StoredModelInfo(
+                    backend=BackendType.LLAMACPP,
+                    model_id=model_id,
+                    revision=str(revision_raw).strip() if revision_raw not in (None, "") else None,
+                    quant=str(quant_raw).strip() if quant_raw not in (None, "") else None,
+                    size_bytes=max(0, int(item.get("size_bytes", 0) or 0)),
+                    file_count=max(0, int(item.get("file_count", 0) or 0)),
+                    source_volume=(
+                        str(source_volume_raw).strip()
+                        if source_volume_raw not in (None, "")
+                        else self._LLAMACPP_STORAGE_VOLUME
+                    ),
+                    paths=[str(p) for p in paths_raw if isinstance(p, str)]
+                    if isinstance(paths_raw, list)
+                    else [],
+                    incomplete=False,
+                )
+            )
+        return sorted(rows, key=lambda row: (row.model_id, row.revision or ""))
+
+    def _list_llamacpp_models_from_volume(self) -> list[StoredModelInfo]:
         grouped: dict[tuple[str, Optional[str]], StoredModelInfo] = {}
         blob_files: dict[str, set[str]] = {}
         incomplete_blob_files: dict[str, set[str]] = {}

@@ -471,6 +471,31 @@ class ModalBackend:
         yield from ModalBackend.run_streaming(cmd, env=env)
 
     @staticmethod
+    def run_modal_script_entrypoint_capture(
+        script: str,
+        entrypoint: str,
+        args: Optional[List[str]] = None,
+        env: Optional[Dict[str, str]] = None,
+    ) -> Optional[tuple[int, str, str]]:
+        """Run `modal run <script>::<entrypoint>` and capture stdout/stderr."""
+        cmd = ModalBackend.build_modal_entrypoint_command(script, entrypoint, args=args)
+        merged = {**os.environ, **(env or {})}
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=merged,
+                timeout=ModalBackend._CLI_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            return None
+        except Exception:
+            return None
+        return result.returncode, result.stdout or "", result.stderr or ""
+
+    @staticmethod
     def run_volume_remove(
         volume_name: str,
         remote_path: str,

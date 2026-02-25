@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
@@ -242,8 +243,18 @@ class StopParamsScreen(CopyEnabledScreen):
 
     def on_mount(self) -> None:
         self._target_by_option_id: dict[str, tuple[BackendType, str]] = {}
+        self._was_suspended = False
         self._load_instances()
         self.query_one("#stop-instance-list", OptionList).focus()
+
+    def on_screen_suspend(self, _: events.ScreenSuspend) -> None:
+        self._was_suspended = True
+
+    def on_screen_resume(self, _: events.ScreenResume) -> None:
+        """Refresh instance list when returning from the stop monitor screen."""
+        if self._was_suspended:
+            self._was_suspended = False
+            self._load_instances()
 
     def action_do_submit(self) -> None:
         instance_list = self.query_one("#stop-instance-list", OptionList)

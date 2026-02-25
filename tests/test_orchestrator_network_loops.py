@@ -72,6 +72,52 @@ class _SyncThread:
 
 
 class OrchestratorNetworkLoopTests(unittest.TestCase):
+    def test_warmup_llamacpp_requires_completion_payload_not_any_http_200(self) -> None:
+        responses = iter(
+            [
+                _Response(200, "Server is starting..."),
+                _Response(200, '{"id":"cmpl-1","object":"text_completion","choices":[{"text":"ok"}]}'),
+            ]
+        )
+        post_calls = {"n": 0}
+
+        def _post(*_args, **_kwargs):
+            post_calls["n"] += 1
+            return next(responses)
+
+        fake_requests = types.SimpleNamespace(post=_post)
+
+        with patch.dict("sys.modules", {"requests": fake_requests}):
+            with patch("llm_launchpad.core.orchestrator.time.sleep", return_value=None):
+                with patch(
+                    "llm_launchpad.core.orchestrator.ModalBackend.test_curl_command",
+                    return_value="curl ok",
+                ):
+                    events = list(
+                        Orchestrator().warmup(
+                            backend=BackendType.LLAMACPP,
+                            server_url="https://example.modal.run",
+                            timeout=10,
+                            tail_logs=False,
+                        )
+                    )
+
+        self.assertGreaterEqual(post_calls["n"], 2)
+        self.assertTrue(
+            any(
+                isinstance(e, LogEvent) and e.line == "Server is ready!"
+                for e in events
+            )
+        )
+        self.assertTrue(
+            any(
+                isinstance(e, OperationCompleteEvent)
+                and e.operation == OperationType.WARMUP
+                and e.success
+                for e in events
+            )
+        )
+
     def test_warmup_success_vllm(self) -> None:
         fake_requests = types.SimpleNamespace(get=lambda *_args, **_kwargs: _Response(200, "ok"))
         with patch.dict("sys.modules", {"requests": fake_requests}):
@@ -461,6 +507,67 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
                     )
 
         self.assertTrue(any(isinstance(e, ErrorEvent) and "network down" in e.message for e in events))
+
+    def test_warmup_missing_requests_emits_failed_completion(self) -> None:
+        import builtins
+
+        real_import = builtins.__import__
+
+        def _fake_import(name, *args, **kwargs):  # type: ignore[no-untyped-def]
+            if name == "requests":
+                raise ImportError("requests not installed")
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=_fake_import):
+            events = list(
+                Orchestrator().warmup(
+                    backend=BackendType.VLLM,
+                    server_url="https://example.modal.run",
+                    timeout=1,
+                    tail_logs=False,
+                )
+            )
+
+        self.assertTrue(any(isinstance(e, ErrorEvent) and "requests" in e.message for e in events))
+        self.assertTrue(
+            any(
+                isinstance(e, OperationCompleteEvent)
+                and e.operation == OperationType.WARMUP
+                and not e.success
+                and e.exit_code == 1
+                for e in events
+            )
+        )
+
+    def test_check_status_missing_requests_emits_failed_completion(self) -> None:
+        import builtins
+
+        real_import = builtins.__import__
+
+        def _fake_import(name, *args, **kwargs):  # type: ignore[no-untyped-def]
+            if name == "requests":
+                raise ImportError("requests not installed")
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=_fake_import):
+            events = list(
+                Orchestrator().check_status(
+                    backend=BackendType.VLLM,
+                    server_url="https://example.modal.run",
+                    timeout=1,
+                )
+            )
+
+        self.assertTrue(any(isinstance(e, ErrorEvent) and "requests" in e.message for e in events))
+        self.assertTrue(
+            any(
+                isinstance(e, OperationCompleteEvent)
+                and e.operation == OperationType.STATUS
+                and not e.success
+                and e.exit_code == 1
+                for e in events
+            )
+        )
 
 
 if __name__ == "__main__":

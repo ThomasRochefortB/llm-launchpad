@@ -45,6 +45,7 @@ class DeploymentConfig:
     host: Optional[str] = None
     port: Optional[int] = None
     n_gpu_layers: Optional[int] = None
+    llamacpp_image_no_cache: Optional[bool] = None
     gpu_type: Optional[str] = None
     gpu_count: Optional[int] = None
 
@@ -56,12 +57,14 @@ class DeploymentConfig:
     n_gpu: Optional[int] = None
     trust_remote_code: Optional[bool] = None
     reasoning_parser: Optional[str] = None
+    tool_call_parser: Optional[str] = None
     default_chat_template_kwargs: Optional[str] = None
 
     # Deployment options
     do_deploy: bool = True
     run_smoke: bool = False
     do_warmup: bool = True
+    show_debug_logs: bool = False
 
     # Instance identity
     instance_name: Optional[str] = None
