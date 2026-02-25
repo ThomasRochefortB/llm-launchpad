@@ -168,6 +168,27 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(model_list.has_focus)
             self.assertEqual(model_name.value, "Qwen/Qwen3-4B")
 
+    async def test_enter_on_rank_mode_moves_focus_to_model_list(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+            rank_mode_list = screen.query_one("#vllm-rank-mode", OptionList)
+            model_list = screen.query_one("#vllm-model-list", OptionList)
+
+            rank_mode_list.focus()
+            rank_mode_list.highlighted = 1
+            await pilot.pause()
+
+            await pilot.press("enter")
+            await pilot.pause()
+
+            self.assertEqual(app.fetch_calls, ["downloads"])
+            self.assertTrue(model_list.has_focus)
+
     async def test_down_from_model_name_moves_focus_to_gpu_type_select(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:
@@ -441,9 +462,11 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             assert isinstance(screen, VllmDeployScreen)
             screen.query_one("#model-name", Input).value = "Qwen/Qwen3-8B"
             screen.query_one("#reasoning-parser", Input).value = "qwen3"
+            screen.query_one("#tool-call-parser", Input).value = "qwen3_xml"
             screen.query_one("#chat-template-kwargs", Input).value = '{"enable_thinking": false}'
             screen.query_one("#fast-boot", Switch).value = True
             screen.query_one("#trust-remote-code", Switch).value = True
+            screen.query_one("#show-debug-logs-vllm", Switch).value = True
             # Expand advanced fields
             for w in screen.query(".vllm-advanced"):
                 w.remove_class("hidden")
@@ -452,11 +475,32 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(app.deployed_config)
             self.assertTrue(app.deployed_config.fast_boot)
             self.assertTrue(app.deployed_config.trust_remote_code)
+            self.assertTrue(app.deployed_config.show_debug_logs)
             self.assertEqual(app.deployed_config.reasoning_parser, "qwen3")
+            self.assertEqual(app.deployed_config.tool_call_parser, "qwen3_xml")
             self.assertEqual(
                 app.deployed_config.default_chat_template_kwargs,
                 '{"enable_thinking": false}',
             )
+
+    async def test_show_debug_logs_toggle_defaults_false_and_maps_to_config(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+            debug_toggle = screen.query_one("#show-debug-logs-vllm", Switch)
+            self.assertFalse(debug_toggle.value)
+
+            for widget in screen.query(".vllm-advanced"):
+                widget.remove_class("hidden")
+            debug_toggle.value = True
+            screen._do_deploy()
+
+            self.assertIsNotNone(app.deployed_config)
+            self.assertTrue(app.deployed_config.show_debug_logs)
 
     async def test_model_revision_is_hidden_with_advanced_fields_and_maps_to_config(self) -> None:
         app = _TestApp()

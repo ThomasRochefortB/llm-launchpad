@@ -8,6 +8,13 @@ from llm_launchpad.protocol.events import OperationCompleteEvent
 
 
 class BackendStorageTests(unittest.TestCase):
+    def test_llamacpp_and_vllm_share_hf_cache_storage(self) -> None:
+        from llm_launchpad.backends import modal_llamacpp_app, modal_vllm_app
+
+        self.assertEqual(modal_llamacpp_app.HF_CACHE_VOLUME_NAME, "huggingface-cache")
+        self.assertEqual(modal_llamacpp_app.HF_CACHE_DIR, modal_vllm_app.HF_CACHE_DIR)
+        self.assertEqual(str(modal_llamacpp_app.HF_HUB_DIR), str(modal_vllm_app.HF_HUB_DIR))
+
     def test_build_modal_entrypoint_command(self) -> None:
         cmd = ModalBackend.build_modal_entrypoint_command(
             "llm_launchpad/backends/modal_vllm_app.py",

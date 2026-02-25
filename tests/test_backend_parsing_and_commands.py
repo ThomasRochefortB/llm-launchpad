@@ -161,6 +161,21 @@ class BackendParsingAndCommandTests(unittest.TestCase):
         env = ModalBackend.env_for_backend(config)
         self.assertEqual(env, {"MODAL_APP_NAME": "llamacpp-prod"})
 
+    def test_env_for_backend_llamacpp_forwards_image_no_cache_toggle(self) -> None:
+        config = DeploymentConfig(
+            backend=BackendType.LLAMACPP,
+            app_name="llamacpp-prod",
+            llamacpp_image_no_cache=True,
+        )
+        env = ModalBackend.env_for_backend(config)
+        self.assertEqual(
+            env,
+            {
+                "MODAL_APP_NAME": "llamacpp-prod",
+                "LLAMA_CPP_IMAGE_NO_CACHE": "true",
+            },
+        )
+
     def test_test_curl_command_vllm_prefers_provided_served_model_name(self) -> None:
         cmd = ModalBackend.test_curl_command(
             BackendType.VLLM,
@@ -178,6 +193,14 @@ class BackendParsingAndCommandTests(unittest.TestCase):
             cmd.startswith("curl -s -X POST https://example.modal.run/v1/completions ")
         )
         self.assertIn('"prompt":"Say hello in one short sentence."', cmd)
+
+    def test_test_curl_command_llamacpp_uses_served_model_name_when_provided(self) -> None:
+        cmd = ModalBackend.test_curl_command(
+            BackendType.LLAMACPP,
+            "https://example.modal.run/",
+            served_model_name="Nanbeige4.1-3B-Q4_K_M-GGUF",
+        )
+        self.assertIn('"model":"Nanbeige4.1-3B-Q4_K_M-GGUF"', cmd)
 
 
 if __name__ == "__main__":

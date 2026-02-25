@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 from textual.app import App
-from textual.widgets import Input, OptionList, Select, Static
+from textual.widgets import Input, OptionList, Select, Static, Switch
 
 from llm_launchpad.core.hf_models import ModelCandidate
 from llm_launchpad.protocol.enums import BackendType
@@ -198,6 +198,59 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(model_list.has_focus)
             self.assertEqual(repo_id.value, "unsloth/Qwen3-Coder-Next-GGUF")
 
+    async def test_enter_on_rank_mode_moves_focus_to_model_list(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+            rank_mode_list = screen.query_one("#llama-rank-mode", OptionList)
+            model_list = screen.query_one("#llama-model-list", OptionList)
+
+            rank_mode_list.focus()
+            rank_mode_list.highlighted = 1
+            await pilot.pause()
+
+            await pilot.press("enter")
+            await pilot.pause()
+
+            self.assertEqual(app.fetch_calls, ["downloads"])
+            self.assertTrue(model_list.has_focus)
+
+    async def test_enter_on_quant_list_commits_and_exits_to_gpu_type(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+            screen.query_one("#repo-id", Input).value = "Qwen/Qwen3-Coder-Next-GGUF"
+            await pilot.pause()
+            screen.on_llama_cpp_quants_loaded(
+                LlamaCppQuantsLoaded(
+                    repo_id="Qwen/Qwen3-Coder-Next-GGUF",
+                    revision=None,
+                    quantizations=["Q4_K_M", "Q8_0"],
+                    vram_gb_by_quant={},
+                )
+            )
+            quant_list = screen.query_one("#llama-quant-list", OptionList)
+            quant_input = screen.query_one("#quant", Input)
+            gpu_type = screen.query_one("#gpu-type-llama", Select)
+
+            quant_list.focus()
+            quant_list.highlighted = 1
+            await pilot.pause()
+
+            await pilot.press("enter")
+            await pilot.pause()
+
+            self.assertEqual(quant_input.value, "Q8_0")
+            self.assertTrue(gpu_type.has_focus)
+
     async def test_rank_mode_menu_is_focused_for_arrow_navigation(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:
@@ -312,6 +365,51 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.fetch_calls, [])
             self.assertEqual(app.quant_fetch_calls, [("Qwen/Qwen2.5-Coder-7B-Instruct-GGUF", None)])
 
+    async def test_cached_mode_keeps_quant_list_filtered_after_metadata_lookup(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+            screen.on_storage_loaded(
+                StorageLoaded(
+                    snapshot=StorageSnapshot(
+                        llamacpp_models=[
+                            StoredModelInfo(
+                                backend=BackendType.LLAMACPP,
+                                model_id="unsloth/GLM-5-GGUF",
+                                quant="Q4_K_M",
+                                size_bytes=4096,
+                            )
+                        ],
+                        vllm_models=[],
+                    )
+                )
+            )
+
+            model_list = screen.query_one("#llama-model-list", OptionList)
+            selected_option = model_list.get_option_at_index(0)
+            screen.on_option_list_option_selected(SimpleNamespace(option_list=model_list, option=selected_option))
+
+            screen.on_llama_cpp_quants_loaded(
+                LlamaCppQuantsLoaded(
+                    repo_id="unsloth/GLM-5-GGUF",
+                    revision=None,
+                    quantizations=["Q3_K_S", "Q4_K_M", "Q5_K_M"],
+                    vram_gb_by_quant={"Q3_K_S": 326.3, "Q4_K_M": 360.0, "Q5_K_M": 410.0},
+                )
+            )
+
+            quant_list = screen.query_one("#llama-quant-list", OptionList)
+            self.assertEqual(quant_list.option_count, 1)
+            self.assertIn("Q4_K_M", quant_list.get_option_at_index(0).prompt)
+
+            screen._lookup_quantizations_for_current_repo()
+            self.assertEqual(quant_list.option_count, 1)
+            self.assertIn("Q4_K_M", quant_list.get_option_at_index(0).prompt)
+
     async def test_quants_loaded_shows_vram_in_option_list_and_status(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:
@@ -370,6 +468,8 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             screen.query_one("#host-input", Input).value = "0.0.0.0"
             screen.query_one("#port-input", Input).value = "8088"
             screen.query_one("#n-gpu-layers", Input).value = "99"
+            screen.query_one("#llama-image-no-cache", Switch).value = True
+            screen.query_one("#show-debug-logs-llama", Switch).value = True
             screen.query_one("#gpu-count-llama", Input).value = "3"
 
             screen._do_deploy()
@@ -382,8 +482,29 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app.deployed_config.host, "0.0.0.0")
         self.assertEqual(app.deployed_config.port, 8088)
         self.assertEqual(app.deployed_config.n_gpu_layers, 99)
+        self.assertTrue(app.deployed_config.llamacpp_image_no_cache)
+        self.assertTrue(app.deployed_config.show_debug_logs)
         self.assertEqual(app.deployed_config.gpu_count, 3)
         self.assertEqual(app.deployed_config.gpu_type, "A100-80GB")
+
+    async def test_show_debug_logs_toggle_defaults_false_and_maps_to_config(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+            debug_toggle = screen.query_one("#show-debug-logs-llama", Switch)
+            self.assertFalse(debug_toggle.value)
+
+            for widget in screen.query(".llama-advanced"):
+                widget.remove_class("hidden")
+            debug_toggle.value = True
+            screen._do_deploy()
+
+        self.assertIsNotNone(app.deployed_config)
+        self.assertTrue(app.deployed_config.show_debug_logs)
 
     async def test_predownload_uses_highlighted_model_from_rank_list(self) -> None:
         app = _TestApp()

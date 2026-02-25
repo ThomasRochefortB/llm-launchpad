@@ -47,6 +47,36 @@ def _read_bool_env(name: str, default: bool) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _read_optional_bool_env(name: str) -> bool | None:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def tool_call_flags(
+    *,
+    tool_call_parser: str | None = None,
+    enable_auto_tool_choice: bool | None = None,
+) -> tuple[list[str], str | None, bool]:
+    """Return vLLM tool-calling CLI flags plus resolved parser/enable values.
+
+    Default behavior:
+    - do not infer parser from model name
+    - enable auto tool choice whenever a parser is explicitly configured
+    """
+    parser = (tool_call_parser or "").strip() or None
+    enabled = enable_auto_tool_choice if enable_auto_tool_choice is not None else bool(parser)
+
+    if not parser:
+        return [], None, enabled
+
+    flags = ["--tool-call-parser", parser]
+    if enabled:
+        flags.insert(0, "--enable-auto-tool-choice")
+    return flags, parser, enabled
+
+
 # These values are captured at deploy/run time by the Modal CLI process.
 DEPLOY_N_GPU = _read_int_env("N_GPU", 1)
 DEPLOY_GPU_CONFIG = _read_str_env("GPU_CONFIG", "A100-80GB:1")
@@ -57,6 +87,8 @@ DEPLOY_FAST_BOOT = _read_bool_env("FAST_BOOT", False)
 DEPLOY_TRUST_REMOTE_CODE = _read_bool_env("TRUST_REMOTE_CODE", False)
 DEPLOY_REASONING_PARSER = os.environ.get("REASONING_PARSER", "").strip() or None
 DEPLOY_DEFAULT_CHAT_TEMPLATE_KWARGS = os.environ.get("DEFAULT_CHAT_TEMPLATE_KWARGS", "").strip() or None
+DEPLOY_TOOL_CALL_PARSER = os.environ.get("TOOL_CALL_PARSER", "").strip() or None
+DEPLOY_ENABLE_AUTO_TOOL_CHOICE = _read_optional_bool_env("ENABLE_AUTO_TOOL_CHOICE")
 PREDOWNLOAD_TIMEOUT_MINUTES = _read_int_env("PREDOWNLOAD_TIMEOUT_MINUTES", 6 * 60)
 SNAPSHOT_MAX_WORKERS = _read_int_env("HF_SNAPSHOT_MAX_WORKERS", 16)
 
@@ -73,6 +105,10 @@ if DEPLOY_REASONING_PARSER:
     RUNTIME_ENV["REASONING_PARSER"] = DEPLOY_REASONING_PARSER
 if DEPLOY_DEFAULT_CHAT_TEMPLATE_KWARGS:
     RUNTIME_ENV["DEFAULT_CHAT_TEMPLATE_KWARGS"] = DEPLOY_DEFAULT_CHAT_TEMPLATE_KWARGS
+if DEPLOY_TOOL_CALL_PARSER:
+    RUNTIME_ENV["TOOL_CALL_PARSER"] = DEPLOY_TOOL_CALL_PARSER
+if DEPLOY_ENABLE_AUTO_TOOL_CHOICE is not None:
+    RUNTIME_ENV["ENABLE_AUTO_TOOL_CHOICE"] = "true" if DEPLOY_ENABLE_AUTO_TOOL_CHOICE else "false"
 
 
 hf_cache_vol = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
@@ -191,6 +227,10 @@ def serve() -> None:
     default_chat_template_kwargs = (
         os.environ.get("DEFAULT_CHAT_TEMPLATE_KWARGS", "").strip() or DEPLOY_DEFAULT_CHAT_TEMPLATE_KWARGS
     )
+    tool_call_parser = os.environ.get("TOOL_CALL_PARSER", "").strip() or DEPLOY_TOOL_CALL_PARSER
+    runtime_enable_auto_tool_choice = _read_optional_bool_env("ENABLE_AUTO_TOOL_CHOICE")
+    if runtime_enable_auto_tool_choice is None:
+        runtime_enable_auto_tool_choice = DEPLOY_ENABLE_AUTO_TOOL_CHOICE
 
     cmd = [
         "vllm",
@@ -215,6 +255,27 @@ def serve() -> None:
         cmd += ["--default-chat-template-kwargs", default_chat_template_kwargs]
     if trust_remote_code:
         cmd += ["--trust-remote-code"]
+    tool_flags, resolved_tool_parser, auto_tool_enabled = tool_call_flags(
+        tool_call_parser=tool_call_parser,
+        enable_auto_tool_choice=runtime_enable_auto_tool_choice,
+    )
+    if tool_flags:
+        cmd += tool_flags
+        print(
+            "vLLM tool calling config:",
+            json.dumps(
+                {
+                    "enabled": auto_tool_enabled,
+                    "tool_call_parser": resolved_tool_parser,
+                },
+                separators=(",", ":"),
+            ),
+        )
+    elif auto_tool_enabled:
+        print(
+            "Warning: ENABLE_AUTO_TOOL_CHOICE requested but no tool-call parser is configured. "
+            "Set TOOL_CALL_PARSER explicitly for your model."
+        )
     cmd += ["--enforce-eager" if fast_boot else "--no-enforce-eager"]
 
     print("Starting vLLM command:")

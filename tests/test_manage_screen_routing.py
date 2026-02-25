@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 from textual.app import App
+from textual.screen import Screen
 from textual.widgets import OptionList
 
 from llm_launchpad.protocol.enums import BackendType
@@ -122,6 +123,39 @@ class ManageScreenRoutingTests(unittest.IsolatedAsyncioTestCase):
             assert first is not None
             assert second is not None
             self.assertNotEqual(first.id, second.id)
+
+    async def test_stop_params_refreshes_instances_on_resume(self) -> None:
+        app = _TestApp()
+        app.instances_by_backend[BackendType.LLAMACPP] = [
+            EndpointInfo(name="llamacpp-alpha", app_id="ap-llama", state="running", backend=BackendType.LLAMACPP),
+        ]
+        app.instances_by_backend[BackendType.VLLM] = [
+            EndpointInfo(name="vllm-beta", app_id="ap-vllm", state="deployed", backend=BackendType.VLLM),
+        ]
+
+        async with app.run_test() as pilot:
+            app.push_screen(StopParamsScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, StopParamsScreen)
+            instance_list = screen.query_one("#stop-instance-list", OptionList)
+            self.assertEqual(instance_list.option_count, 2)
+
+            app.push_screen(Screen())
+            await pilot.pause()
+
+            app.instances_by_backend[BackendType.VLLM] = []
+            app.pop_screen()
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, StopParamsScreen)
+            instance_list = screen.query_one("#stop-instance-list", OptionList)
+            self.assertEqual(instance_list.option_count, 1)
+            highlighted = instance_list.highlighted_option
+            self.assertIsNotNone(highlighted)
+            assert highlighted is not None
+            self.assertEqual(str(highlighted.id), "app-id:ap-llama")
 
 
 if __name__ == "__main__":
