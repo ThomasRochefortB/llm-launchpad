@@ -708,6 +708,7 @@ except Exception:
 
 
 @app.function(
+    name=_function_name("serve"),
     image=image,
     volumes={cache_dir: model_cache},
     gpu=GPU_CONFIG,
