@@ -1,4 +1,5 @@
-"""CLI dispatcher: ``wizard`` launches TUI, other commands route through Core.
+"""CLI dispatcher: the default command launches the TUI, with headless
+commands available for automation.
 
 This replaces the monolithic ``llm_launchpad.cli`` module while keeping
 all non-interactive commands available for automation.
@@ -39,9 +40,9 @@ app = typer.Typer(
 
 @app.callback()
 def _default(ctx: typer.Context) -> None:
-    """Launch the TUI wizard when no subcommand is given."""
+    """Launch the TUI when no subcommand is given."""
     if ctx.invoked_subcommand is None:
-        wizard()
+        tui()
 
 
 # -----------------------------------------------------------------------
@@ -154,28 +155,34 @@ def _print_banner() -> None:
 
 
 # -----------------------------------------------------------------------
-# Wizard (TUI)
+# TUI
 # -----------------------------------------------------------------------
 
 
-@app.command()
-def wizard() -> None:
-    """Interactive TUI wizard for deploying and managing LLM backends."""
+@app.command("tui")
+def tui() -> None:
+    """Interactive terminal UI for deploying and managing LLM backends."""
     try:
-        from ..tui.app import WizardApp
+        from ..tui.app import TuiApp
     except ImportError as exc:
         typer.echo(
-            f"Error: Textual is required for the wizard. Install with: pip install textual\n({exc})",
+            f"Error: Textual is required for the TUI. Install with: pip install textual\n({exc})",
             err=True,
         )
         raise typer.Exit(code=1)
 
-    tui = WizardApp()
+    app_instance = TuiApp()
     try:
-        tui.run()
+        app_instance.run()
     finally:
         from ..core.backend import ModalBackend
         ModalBackend.terminate_all()
+
+
+@app.command(hidden=True)
+def wizard() -> None:
+    """Deprecated alias for the interactive terminal UI."""
+    tui()
 
 
 # -----------------------------------------------------------------------

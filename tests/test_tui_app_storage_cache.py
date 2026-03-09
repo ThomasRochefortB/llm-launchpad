@@ -11,7 +11,7 @@ from llm_launchpad.protocol.events import LogEvent, OperationCompleteEvent
 from llm_launchpad.protocol.models import DeploymentConfig
 from llm_launchpad.protocol.models import EndpointInfo
 from llm_launchpad.protocol.models import StorageSnapshot, StoredModelInfo
-from llm_launchpad.tui.app import WizardApp, _deploy_connection_summary_lines
+from llm_launchpad.tui.app import TuiApp, WizardApp, _deploy_connection_summary_lines
 
 
 class TuiAppStorageCacheTests(unittest.TestCase):
@@ -55,7 +55,7 @@ class TuiAppStorageCacheTests(unittest.TestCase):
 
     def test_run_deploy_warmup_uses_function_slug_for_default_url(self) -> None:
         warmup_urls: list[str] = []
-        app = WizardApp()
+        app = TuiApp()
         app._username = "alice"
         app._orchestrator = type(
             "FakeOrchestrator",
@@ -275,7 +275,7 @@ class TuiAppStorageCacheTests(unittest.TestCase):
     def test_snapshot_persist_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cache_path = Path(tmp) / "storage_snapshot.json"
-            app = WizardApp()
+            app = TuiApp()
             app._storage_cache_path = cache_path
             app._storage_snapshot_cache = None
             app._storage_snapshot_cached_at_epoch = 0.0
@@ -311,7 +311,7 @@ class TuiAppStorageCacheTests(unittest.TestCase):
             app._cache_storage_snapshot(snapshot)
             self.assertTrue(cache_path.exists())
 
-            reloaded = WizardApp()
+            reloaded = TuiApp()
             reloaded._storage_cache_path = cache_path
             reloaded._storage_snapshot_cache = None
             reloaded._storage_snapshot_cached_at_epoch = 0.0
@@ -329,7 +329,7 @@ class TuiAppStorageCacheTests(unittest.TestCase):
     def test_invalidate_storage_cache_removes_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             cache_path = Path(tmp) / "storage_snapshot.json"
-            app = WizardApp()
+            app = TuiApp()
             app._storage_cache_path = cache_path
             snapshot = StorageSnapshot(llamacpp_models=[], vllm_models=[])
             app._cache_storage_snapshot(snapshot)
@@ -366,7 +366,7 @@ class TuiAppStorageCacheTests(unittest.TestCase):
                 )
             )
 
-            app = WizardApp()
+            app = TuiApp()
             app._storage_cache_path = cache_path
             app._storage_snapshot_cache = None
             app._storage_snapshot_cached_at_epoch = 0.0

@@ -14,7 +14,7 @@
 - `uv run pytest`: run the full test suite.
 - `uv run pytest tests/test_modal_gpu.py`: run a focused test file during iteration.
 - `uv run llm-launchpad --help`: inspect CLI commands.
-- `uv run llm-launchpad wizard`: launch the Textual TUI locally.
+- `uv run llm-launchpad tui`: launch the Textual TUI locally.
 - `modal deploy llm_launchpad/backends/modal_vllm_app.py` or `modal deploy llm_launchpad/backends/modal_llamacpp_app.py`: deploy a backend to Modal.
 
 ## Coding Style & Naming Conventions
