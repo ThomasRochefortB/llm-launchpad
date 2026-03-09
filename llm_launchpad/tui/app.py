@@ -55,6 +55,26 @@ from .workers import (
 
 def _deploy_connection_summary_lines(config: DeploymentConfig, server_url: str) -> list[str]:
     """Build a compact post-deploy connection summary for OpenAI-compatible clients."""
+    payload = _deploy_connection_summary_payload(config, server_url)
+    base_url = str(payload["base_url"])
+    model_id = str(payload["model_id"])
+    display_name = str(payload["display_name"])
+
+    return [
+        "=== OpenAI-compatible ===",
+        f"Base URL: {base_url}",
+        f"Model ID: {model_id}",
+        f"Display name: {display_name}",
+        "API key: (leave blank; no auth by default)",
+        "=========================",
+    ]
+
+
+def _deploy_connection_summary_payload(
+    config: DeploymentConfig,
+    server_url: str,
+) -> dict[str, str]:
+    """Structured OpenAI-compatible connection summary for a completed deploy."""
     base_root = server_url.rstrip("/")
     base_url = base_root if base_root.endswith("/v1") else f"{base_root}/v1"
 
@@ -70,14 +90,11 @@ def _deploy_connection_summary_lines(config: DeploymentConfig, server_url: str) 
         quant = (config.quant or "").strip()
         display_name = f"{source} ({quant})" if quant else source
 
-    return [
-        "=== OpenAI-compatible ===",
-        f"Base URL: {base_url}",
-        f"Model ID: {model_id}",
-        f"Display name: {display_name}",
-        "API key: (leave blank; no auth by default)",
-        "=========================",
-    ]
+    return {
+        "base_url": base_url,
+        "model_id": model_id,
+        "display_name": display_name,
+    }
 
 
 class WizardApp(App):
@@ -103,7 +120,10 @@ class WizardApp(App):
         self._storage_refresh_inflight = False
         self._storage_refresh_lock = threading.Lock()
         self._storage_cache_path = SETTINGS_DIR / "storage_snapshot.json"
+        self._deploy_connection_cache_path = SETTINGS_DIR / "deployment_connection_summaries.json"
+        self._deploy_connection_cache: dict[str, dict[str, object]] = {}
         self._load_persisted_storage_cache()
+        self._load_persisted_deploy_connection_cache()
         try:
             from importlib.metadata import version
 
@@ -192,6 +212,7 @@ class WizardApp(App):
         will_run_warmup = bool(config.do_warmup and config.do_deploy)
 
         def _emit_connection_summary(url: str) -> None:
+            self._cache_deploy_connection_summary(config, url)
             for line in _deploy_connection_summary_lines(config, url):
                 _dispatch_event(monitor, LogEvent(line=line))
 
@@ -282,13 +303,21 @@ class WizardApp(App):
         server_url: Optional[str] = None,
         timeout: int = 60,
         app_name: Optional[str] = None,
+        served_model_name: Optional[str] = None,
     ) -> None:
         target_app_name = app_name or legacy_app_name(backend)
         url = server_url or ModalBackend.default_server_url(self._username, app_name=target_app_name)
         monitor = MonitorScreen(title="Status Check")
         self.push_screen(monitor)
         self.run_worker(
-            lambda: self._run_status(backend, url, timeout, target_app_name, monitor),
+            lambda: self._run_status(
+                backend,
+                url,
+                timeout,
+                target_app_name,
+                served_model_name,
+                monitor,
+            ),
             name="status-worker",
             thread=True,
         )
@@ -299,10 +328,16 @@ class WizardApp(App):
         url: str,
         timeout: int,
         app_name: str,
+        served_model_name: Optional[str],
         monitor: MonitorScreen,
     ):  # type: ignore[return]
         _dispatch_event(monitor, LogEvent(line=f"Target app: {app_name}"))
-        for event in self._orchestrator.check_status(backend, url, timeout):
+        for event in self._orchestrator.check_status(
+            backend,
+            url,
+            timeout,
+            served_model_name=served_model_name,
+        ):
             _dispatch_event(monitor, event)
 
     # ------------------------------------------------------------------
@@ -358,6 +393,7 @@ class WizardApp(App):
 
     def list_instances(self, backend: BackendType | None = None) -> list[EndpointInfo]:
         rows = ModalBackend.list_apps() or []
+        self._merge_deploy_connection_cache(rows)
         if backend is None:
             return rows
         return [row for row in rows if row.backend == backend]
@@ -498,6 +534,66 @@ class WizardApp(App):
             self._storage_cache_path.write_text(json.dumps(payload))
         except Exception:
             pass
+
+    def _cache_deploy_connection_summary(self, config: DeploymentConfig, server_url: str) -> None:
+        app_name = (config.app_name or "").strip()
+        if not app_name:
+            return
+        payload = _deploy_connection_summary_payload(config, server_url)
+        self._deploy_connection_cache[app_name] = {
+            "backend": config.backend.value,
+            "base_url": payload["base_url"],
+            "model_id": payload["model_id"],
+            "display_name": payload["display_name"],
+            "cached_at_epoch": time.time(),
+        }
+        self._persist_deploy_connection_cache()
+
+    def _persist_deploy_connection_cache(self) -> None:
+        payload = {"entries": self._deploy_connection_cache}
+        try:
+            self._deploy_connection_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            self._deploy_connection_cache_path.write_text(json.dumps(payload))
+        except Exception:
+            pass
+
+    def _load_persisted_deploy_connection_cache(self) -> None:
+        try:
+            if not self._deploy_connection_cache_path.exists():
+                return
+            payload = json.loads(self._deploy_connection_cache_path.read_text())
+            entries = payload.get("entries")
+            if not isinstance(entries, dict):
+                return
+            normalized: dict[str, dict[str, object]] = {}
+            for key, value in entries.items():
+                app_name = str(key or "").strip()
+                if not app_name or not isinstance(value, dict):
+                    continue
+                normalized[app_name] = value
+            self._deploy_connection_cache = normalized
+        except Exception:
+            self._deploy_connection_cache = {}
+
+    def _merge_deploy_connection_cache(self, rows: list[EndpointInfo]) -> None:
+        if not self._deploy_connection_cache:
+            return
+        for row in rows:
+            cached = self._deploy_connection_cache.get((row.name or "").strip())
+            if not isinstance(cached, dict):
+                continue
+            if not (row.web_url or "").strip():
+                base_url = str(cached.get("base_url", "") or "").strip()
+                if base_url:
+                    row.web_url = base_url
+            if not (row.served_model_name or "").strip():
+                model_id = str(cached.get("model_id", "") or "").strip()
+                if model_id:
+                    row.served_model_name = model_id
+            if not (row.display_name or "").strip():
+                display_name = str(cached.get("display_name", "") or "").strip()
+                if display_name:
+                    row.display_name = display_name
 
     def _load_persisted_storage_cache(self) -> None:
         try:

@@ -220,7 +220,12 @@ class CliMainCommandTests(unittest.TestCase):
     def test_status_uses_function_slug_for_default_url(self) -> None:
         calls: list[tuple[BackendType, str, int]] = []
 
-        def _check_status(backend: BackendType, url: str, timeout: int):
+        def _check_status(
+            backend: BackendType,
+            url: str,
+            timeout: int,
+            served_model_name: str | None = None,
+        ):
             calls.append((backend, url, timeout))
             return [OperationCompleteEvent(operation=OperationType.STATUS, success=True, exit_code=0)]
 
@@ -254,6 +259,7 @@ class CliMainCommandTests(unittest.TestCase):
             timeout: int,
             tail_logs: bool,
             app_name: str | None = None,
+            served_model_name: str | None = None,
         ):
             calls.append((backend, url, timeout, tail_logs, app_name))
             return []

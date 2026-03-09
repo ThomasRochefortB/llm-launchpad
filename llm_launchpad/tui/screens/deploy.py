@@ -197,8 +197,8 @@ class BackendSelectScreen(CopyEnabledScreen):
             yield Static("[bold cyan]Deploy[/bold cyan]  [dim]Step 1: Choose backend[/dim]")
             yield Static("")
             yield OptionList(
-                Option("  llama.cpp (GGUF)            Quantized models, single GPU", id="llamacpp"),
-                Option("  vLLM (OpenAI-compatible)    Full-precision, tensor parallel", id="vllm"),
+                Option("  llama.cpp (GGUF) ( Recommended )", id="llamacpp"),
+                Option("  vLLM", id="vllm"),
                 id="backend-list",
             )
         yield Footer()

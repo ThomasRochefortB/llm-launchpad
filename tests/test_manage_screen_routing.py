@@ -22,6 +22,7 @@ class _TestApp(App[None]):
         super().__init__()
         self.list_called = 0
         self.pushed: list[object] = []
+        self.status_calls: list[tuple[BackendType, str | None, int, str | None, str | None]] = []
         self.instances_by_backend: dict[BackendType, list[EndpointInfo]] = {
             BackendType.LLAMACPP: [],
             BackendType.VLLM: [],
@@ -38,6 +39,16 @@ class _TestApp(App[None]):
     def push_screen(self, screen, *args, **kwargs):  # type: ignore[no-untyped-def]
         self.pushed.append(screen)
         return super().push_screen(screen, *args, **kwargs)
+
+    def begin_status(  # type: ignore[no-untyped-def]
+        self,
+        backend,
+        server_url=None,
+        timeout=60,
+        app_name=None,
+        served_model_name=None,
+    ) -> None:
+        self.status_calls.append((backend, server_url, timeout, app_name, served_model_name))
 
 
 class ManageScreenRoutingTests(unittest.IsolatedAsyncioTestCase):
@@ -156,6 +167,46 @@ class ManageScreenRoutingTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(highlighted)
             assert highlighted is not None
             self.assertEqual(str(highlighted.id), "app-id:ap-llama")
+
+    async def test_status_params_uses_selected_instance_web_url_and_served_model_name(self) -> None:
+        app = _TestApp()
+        app.instances_by_backend[BackendType.LLAMACPP] = [
+            EndpointInfo(
+                name="llamacpp-nanbeige",
+                app_id="ap-llama",
+                state="running",
+                backend=BackendType.LLAMACPP,
+                web_url="https://alice--llamacpp-nanbeige-serve-alpha-bravo.modal.run",
+                served_model_name="Nanbeige4.1-3B-Q4_K_M-GGUF",
+            ),
+        ]
+
+        async with app.run_test() as pilot:
+            app.push_screen(StatusParamsScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, StatusParamsScreen)
+            instance_list = screen.query_one("#status-instance-list", OptionList)
+            highlighted = instance_list.highlighted_option
+            self.assertIsNotNone(highlighted)
+            assert highlighted is not None
+            screen.on_option_list_option_selected(
+                SimpleNamespace(option=highlighted, option_list=instance_list)
+            )
+            await pilot.pause()
+
+        self.assertEqual(
+            app.status_calls,
+            [
+                (
+                    BackendType.LLAMACPP,
+                    "https://alice--llamacpp-nanbeige-serve-alpha-bravo.modal.run",
+                    60,
+                    "llamacpp-nanbeige",
+                    "Nanbeige4.1-3B-Q4_K_M-GGUF",
+                )
+            ],
+        )
 
 
 if __name__ == "__main__":

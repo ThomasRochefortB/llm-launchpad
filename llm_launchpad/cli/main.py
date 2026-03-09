@@ -297,6 +297,7 @@ def deploy(
 def warmup(
     backend: str = typer.Option("llamacpp", help="Backend: llamacpp or vllm"),
     server_url: Optional[str] = typer.Option(None, help="Deployed web URL"),
+    served_model_name: Optional[str] = typer.Option(None, help="Served model name for llama.cpp probes"),
     function_slug: Optional[str] = typer.Option(
         None, help="Modal function slug suffix used in endpoint URL"
     ),
@@ -319,7 +320,14 @@ def warmup(
             function_slug=function_slug or os.environ.get("MODAL_FUNCTION_SLUG"),
         )
     )
-    for event in orch.warmup(bt, url, timeout, tail_logs, app_name=target_app_name):
+    for event in orch.warmup(
+        bt,
+        url,
+        timeout,
+        tail_logs,
+        app_name=target_app_name,
+        served_model_name=served_model_name,
+    ):
         _print_event(event)
         _raise_on_failed_completion(event)
 
@@ -337,6 +345,7 @@ def list_apps() -> None:
 def status(
     backend: str = typer.Option("llamacpp", help="Backend: llamacpp or vllm"),
     server_url: Optional[str] = typer.Option(None, help="Deployed web URL"),
+    served_model_name: Optional[str] = typer.Option(None, help="Served model name for llama.cpp probes"),
     function_slug: Optional[str] = typer.Option(
         None, help="Modal function slug suffix used in endpoint URL"
     ),
@@ -358,7 +367,7 @@ def status(
             function_slug=function_slug or os.environ.get("MODAL_FUNCTION_SLUG"),
         )
     )
-    for event in orch.check_status(bt, url, timeout):
+    for event in orch.check_status(bt, url, timeout, served_model_name=served_model_name):
         _print_event(event)
         if isinstance(event, OperationCompleteEvent) and not event.success:
             raise typer.Exit(code=1)
