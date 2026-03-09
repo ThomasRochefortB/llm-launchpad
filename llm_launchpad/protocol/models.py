@@ -81,6 +81,14 @@ class EndpointInfo:
     state: str = "unknown"
     backend: Optional[BackendType] = None
     instance_name: Optional[str] = None
+    web_url: Optional[str] = None
+    served_model_name: Optional[str] = None
+    display_name: Optional[str] = None
+    model_name: Optional[str] = None
+    repo_id: Optional[str] = None
+    quant: Optional[str] = None
+    runtime_status: Optional[str] = None
+    runtime_status_detail: Optional[str] = None
 
 
 @dataclass

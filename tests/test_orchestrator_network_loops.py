@@ -417,6 +417,44 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
             )
         )
 
+    def test_check_status_llamacpp_uses_served_model_name_in_probe_and_test_command(self) -> None:
+        captured_payloads: list[str] = []
+
+        def _post(*_args, **kwargs):
+            captured_payloads.append(str(kwargs.get("data", "")))
+            return _Response(200, '{"choices":[{"text":"ok"}]}')
+
+        fake_requests = types.SimpleNamespace(post=_post)
+        with patch.dict("sys.modules", {"requests": fake_requests}):
+            with patch(
+                "llm_launchpad.core.orchestrator.ModalBackend.test_curl_command",
+                return_value="curl ok",
+            ) as curl_mock:
+                events = list(
+                    Orchestrator().check_status(
+                        backend=BackendType.LLAMACPP,
+                        server_url="https://example.modal.run",
+                        timeout=5,
+                        served_model_name="Nanbeige4.1-3B-Q4_K_M-GGUF",
+                    )
+                )
+
+        self.assertEqual(len(captured_payloads), 1)
+        self.assertIn('"model": "Nanbeige4.1-3B-Q4_K_M-GGUF"', captured_payloads[0])
+        curl_mock.assert_called_once_with(
+            BackendType.LLAMACPP,
+            "https://example.modal.run",
+            served_model_name="Nanbeige4.1-3B-Q4_K_M-GGUF",
+        )
+        self.assertTrue(
+            any(
+                isinstance(e, OperationCompleteEvent)
+                and e.operation == OperationType.STATUS
+                and e.success
+                for e in events
+            )
+        )
+
     def test_check_status_reports_modal_gpu_scheduling_queue_state(self) -> None:
         responses = iter(
             [

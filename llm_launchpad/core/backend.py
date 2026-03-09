@@ -531,6 +531,86 @@ class ModalBackend:
 # Internal helpers
 # ------------------------------------------------------------------
 
+def _non_empty_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _nested_string_for_keys(
+    value: Any,
+    keys: set[str],
+    *,
+    max_depth: int = 6,
+) -> Optional[str]:
+    """Depth-limited search for a string value by key name (case-insensitive)."""
+    if max_depth < 0:
+        return None
+
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if str(key).strip().lower() in keys:
+                text = _non_empty_text(child)
+                if text:
+                    return text
+        for child in value.values():
+            found = _nested_string_for_keys(child, keys, max_depth=max_depth - 1)
+            if found:
+                return found
+        return None
+
+    if isinstance(value, list):
+        for child in value:
+            found = _nested_string_for_keys(child, keys, max_depth=max_depth - 1)
+            if found:
+                return found
+        return None
+
+    return None
+
+
+def _collect_modal_web_urls(value: Any, *, max_depth: int = 6) -> List[str]:
+    """Collect Modal web URLs found anywhere in a nested JSON-like payload."""
+    if max_depth < 0:
+        return []
+
+    urls: List[str] = []
+    if isinstance(value, dict):
+        for child in value.values():
+            urls.extend(_collect_modal_web_urls(child, max_depth=max_depth - 1))
+        return urls
+
+    if isinstance(value, list):
+        for child in value:
+            urls.extend(_collect_modal_web_urls(child, max_depth=max_depth - 1))
+        return urls
+
+    if isinstance(value, str):
+        maybe_url = ModalBackend.extract_modal_web_url(value)
+        if maybe_url:
+            urls.append(maybe_url)
+    return urls
+
+
+def _extract_item_web_url(item: dict[str, Any]) -> Optional[str]:
+    """Best-effort extraction of a Modal web URL from one app-list row."""
+    for key in ("web_url", "webUrl", "url", "URL"):
+        candidate = item.get(key)
+        if isinstance(candidate, str):
+            maybe_url = ModalBackend.extract_modal_web_url(candidate)
+            if maybe_url:
+                return maybe_url
+
+    urls = _collect_modal_web_urls(item)
+    if not urls:
+        return None
+
+    unique_urls = list(dict.fromkeys(urls))
+    unique_urls.sort(key=lambda url: (url.endswith("-dev.modal.run"), len(url)))
+    return unique_urls[0]
+
+
 def _extract_modal_app_rows(payload: Any) -> List[EndpointInfo]:
     rows: List[EndpointInfo] = []
     if isinstance(payload, dict):
@@ -569,6 +649,10 @@ def _extract_modal_app_rows(payload: Any) -> List[EndpointInfo]:
         ).strip()
         backend = infer_backend_from_app_name(name)
         instance = infer_instance_from_app_name(name, backend)
+        served_model_name = _nested_string_for_keys(item, {"served_model_name"})
+        model_name = _nested_string_for_keys(item, {"model_name"})
+        repo_id = _nested_string_for_keys(item, {"repo_id", "model_repo_id"})
+        quant = _nested_string_for_keys(item, {"quant"})
         rows.append(
             EndpointInfo(
                 name=name,
@@ -576,6 +660,11 @@ def _extract_modal_app_rows(payload: Any) -> List[EndpointInfo]:
                 state=state,
                 backend=backend,
                 instance_name=instance,
+                web_url=_extract_item_web_url(item),
+                served_model_name=served_model_name,
+                model_name=model_name,
+                repo_id=repo_id,
+                quant=quant,
             )
         )
     return rows

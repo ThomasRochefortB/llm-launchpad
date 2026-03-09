@@ -51,6 +51,40 @@ _LLAMACPP_STORAGE_JSON_BEGIN = "LLM_LAUNCHPAD_STORAGE_JSON_BEGIN"
 _LLAMACPP_STORAGE_JSON_END = "LLM_LAUNCHPAD_STORAGE_JSON_END"
 
 
+def _is_historical_modal_app_state(state: str) -> bool:
+    """Return True for terminal/inactive Modal app rows that commonly accumulate."""
+    normalized = (state or "").strip().lower()
+    return normalized in {"stopped", "stopping", "terminated", "archived"}
+
+
+def _dedupe_launchpad_apps(rows: list[EndpointInfo]) -> list[EndpointInfo]:
+    """Collapse repeated historical rows for the same logical deployment.
+
+    Modal app list can include many old stopped revisions for the same app name.
+    We keep the first row for each app (Modal typically returns newest-first) and
+    prefer replacing a historical row if a later active row appears.
+    """
+    deduped: list[EndpointInfo] = []
+    key_to_index: dict[tuple[str, str, str], int] = {}
+
+    for row in rows:
+        backend_key = row.backend.value if row.backend else ""
+        instance_key = (row.instance_name or "").strip()
+        name_key = (row.name or "").strip()
+        key = (backend_key, instance_key, name_key)
+        existing_index = key_to_index.get(key)
+        if existing_index is None:
+            key_to_index[key] = len(deduped)
+            deduped.append(row)
+            continue
+
+        existing = deduped[existing_index]
+        if _is_historical_modal_app_state(existing.state) and not _is_historical_modal_app_state(row.state):
+            deduped[existing_index] = row
+
+    return deduped
+
+
 def _modal_gpu_scheduling_hint(response_text: str) -> str | None:
     """Extract a concise queueing status from Modal's scheduling message."""
     text = (response_text or "").strip()
@@ -615,6 +649,7 @@ class Orchestrator:
         backend: BackendType,
         server_url: str,
         timeout: int = 60,
+        served_model_name: Optional[str] = None,
     ) -> EventStream:
         """Probe endpoint health with backoff."""
         is_vllm = backend == BackendType.VLLM
@@ -642,7 +677,12 @@ class Orchestrator:
 
         import json as _json
 
-        payload = {"model": "default", "prompt": "ping", "max_tokens": 1, "temperature": 0}
+        payload = {
+            "model": (served_model_name or "").strip() or "default",
+            "prompt": "ping",
+            "max_tokens": 1,
+            "temperature": 0,
+        }
         headers = {"Content-Type": "application/json"}
         start = time.time()
         backoff = 2.0
@@ -676,7 +716,11 @@ class Orchestrator:
                     backend, resp.status_code, body
                 )
                 if ready_ok:
-                    curl_cmd = ModalBackend.test_curl_command(backend, server_url)
+                    curl_cmd = ModalBackend.test_curl_command(
+                        backend,
+                        server_url,
+                        served_model_name=served_model_name,
+                    )
                     yield LogEvent(
                         line=f"Status: healthy (backend={backend.value}, url={server_url})"
                     )
@@ -734,19 +778,25 @@ class Orchestrator:
         apps = ModalBackend.list_apps()
         if apps is not None:
             launchpad = [a for a in apps if a.backend is not None]
+            visible_launchpad = _dedupe_launchpad_apps(launchpad)
             if not launchpad:
                 yield LogEvent(line="No launchpad deployments found.")
             else:
                 yield LogEvent(line="Launchpad deployments:")
-                for info in launchpad:
+                for info in visible_launchpad:
                     suffix = f" ({info.app_id})" if info.app_id else ""
                     bk = info.backend.value if info.backend else "unknown"
                     inst = info.instance_name or "-"
                     yield LogEvent(
                         line=f"  backend={bk}  instance={inst}  app={info.name}  state={info.state}{suffix}"
                     )
+                hidden_count = len(launchpad) - len(visible_launchpad)
+                if hidden_count > 0:
+                    yield LogEvent(
+                        line=f"  [hidden {hidden_count} historical duplicate app row{'s' if hidden_count != 1 else ''}]"
+                    )
             yield OperationCompleteEvent(
-                operation=OperationType.LIST, success=True, data=launchpad
+                operation=OperationType.LIST, success=True, data=visible_launchpad
             )
             return
 

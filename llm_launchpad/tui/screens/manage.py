@@ -103,38 +103,38 @@ class StatusParamsScreen(CopyEnabledScreen):
         yield Footer()
 
     def on_mount(self) -> None:
-        self._backend: BackendType | None = None
-        self._instance_app_name: str | None = None
-        self._target_by_option_id: dict[str, tuple[BackendType, str]] = {}
+        self._selected_row: EndpointInfo | None = None
+        self._row_by_option_id: dict[str, EndpointInfo] = {}
         self._load_instances()
         self.query_one("#status-instance-list", OptionList).focus()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option_list.id == "status-instance-list":
             selected = str(event.option.id)
-            target = self._target_by_option_id.get(selected)
-            if target is None:
+            row = self._row_by_option_id.get(selected)
+            if row is None:
                 return
-            self._backend, self._instance_app_name = target
+            self._selected_row = row
             self._submit()
 
     def action_do_submit(self) -> None:
         self._submit()
 
     def _submit(self) -> None:
-        if self._backend is None or self._instance_app_name is None:
+        if self._selected_row is None or self._selected_row.backend is None:
             return
-        url = self.query_one("#status-url", Input).value.strip() or None
+        url = self.query_one("#status-url", Input).value.strip() or self._selected_row.web_url or None
         timeout_str = self.query_one("#status-timeout", Input).value.strip()
         try:
             timeout = int(timeout_str) if timeout_str else 60
         except ValueError:
             timeout = 60
         self.app.begin_status(  # type: ignore[attr-defined]
-            self._backend,
+            self._selected_row.backend,
             url,
             timeout,
-            app_name=self._instance_app_name,
+            app_name=self._selected_row.name,
+            served_model_name=self._selected_row.served_model_name,
         )
 
     def _load_instances(self) -> None:
@@ -142,12 +142,17 @@ class StatusParamsScreen(CopyEnabledScreen):
         instances = self.app.list_instances()  # type: ignore[attr-defined]
         checkable_instances = [row for row in instances if _is_stoppable_state(row.state)]
         if not checkable_instances:
-            self._target_by_option_id = {}
+            self._row_by_option_id = {}
             instance_list.set_options([Option("  No running deployments found")])
             if instance_list.option_count > 0:
                 instance_list.highlighted = 0
             return
-        options, self._target_by_option_id = _build_backend_app_options(checkable_instances)
+        options, option_to_target = _build_backend_app_options(checkable_instances)
+        self._row_by_option_id = {}
+        for option_id, (_backend, app_name) in option_to_target.items():
+            row = next((candidate for candidate in checkable_instances if candidate.name == app_name), None)
+            if row is not None:
+                self._row_by_option_id[option_id] = row
         instance_list.set_options(options)
         if options:
             instance_list.highlighted = 0

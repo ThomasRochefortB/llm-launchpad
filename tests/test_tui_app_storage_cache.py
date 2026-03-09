@@ -9,6 +9,7 @@ from unittest.mock import patch
 from llm_launchpad.protocol.enums import BackendType, OperationType
 from llm_launchpad.protocol.events import LogEvent, OperationCompleteEvent
 from llm_launchpad.protocol.models import DeploymentConfig
+from llm_launchpad.protocol.models import EndpointInfo
 from llm_launchpad.protocol.models import StorageSnapshot, StoredModelInfo
 from llm_launchpad.tui.app import WizardApp, _deploy_connection_summary_lines
 
@@ -232,6 +233,44 @@ class TuiAppStorageCacheTests(unittest.TestCase):
         self.assertTrue(
             any("Display name: Edge-Quant/Nanbeige4.1-3B-Q4_K_M-GGUF (Q4_K_M)" in line for line in summary_lines)
         )
+
+    def test_list_instances_merges_cached_deploy_connection_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = WizardApp()
+            app._deploy_connection_cache_path = Path(tmp) / "deployment_connection_summaries.json"
+            app._deploy_connection_cache = {}
+            config = DeploymentConfig(
+                backend=BackendType.LLAMACPP,
+                repo_id="Edge-Quant/Nanbeige4.1-3B-Q4_K_M-GGUF",
+                quant="Q4_K_M",
+                app_name="llamacpp-edge-quant",
+                instance_name="edge-quant",
+                served_model_name="Nanbeige4.1-3B-Q4_K_M-GGUF",
+            )
+            app._cache_deploy_connection_summary(config, "https://alice--llamacpp-edge-quant-serve.modal.run")
+
+            rows = [
+                EndpointInfo(
+                    name="llamacpp-edge-quant",
+                    app_id="ap-123",
+                    state="running",
+                    backend=BackendType.LLAMACPP,
+                    instance_name="edge-quant",
+                )
+            ]
+            with patch("llm_launchpad.tui.app.ModalBackend.list_apps", return_value=rows):
+                merged = app.list_instances()
+
+            self.assertEqual(len(merged), 1)
+            self.assertEqual(
+                merged[0].web_url,
+                "https://alice--llamacpp-edge-quant-serve.modal.run/v1",
+            )
+            self.assertEqual(merged[0].served_model_name, "Nanbeige4.1-3B-Q4_K_M-GGUF")
+            self.assertEqual(
+                merged[0].display_name,
+                "Edge-Quant/Nanbeige4.1-3B-Q4_K_M-GGUF (Q4_K_M)",
+            )
 
     def test_snapshot_persist_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -8,7 +8,7 @@ from llm_launchpad.core.backend import ModalBackend, _extract_modal_app_rows
 from llm_launchpad.core.orchestrator import Orchestrator
 from llm_launchpad.protocol.enums import BackendType
 from llm_launchpad.protocol.events import LogEvent, OperationCompleteEvent
-from llm_launchpad.protocol.models import DeploymentConfig, LaunchpadSettings
+from llm_launchpad.protocol.models import DeploymentConfig, EndpointInfo, LaunchpadSettings
 
 
 class BackendMultiInstanceTests(unittest.TestCase):
@@ -138,6 +138,59 @@ class OrchestratorMultiInstanceTests(unittest.TestCase):
                 for event in events
             )
         )
+
+    def test_list_deployments_hides_historical_duplicates_for_same_app(self) -> None:
+        orch = Orchestrator()
+        rows = [
+            EndpointInfo(
+                name="llamacpp-edge-quant-nanbeige4",
+                app_id="ap-live",
+                state="deployed",
+                backend=BackendType.LLAMACPP,
+                instance_name="edge-quant-nanbeige4",
+            ),
+            EndpointInfo(
+                name="llamacpp-edge-quant-nanbeige4",
+                app_id="ap-old-1",
+                state="stopped",
+                backend=BackendType.LLAMACPP,
+                instance_name="edge-quant-nanbeige4",
+            ),
+            EndpointInfo(
+                name="llamacpp-edge-quant-nanbeige4",
+                app_id="ap-old-2",
+                state="stopped",
+                backend=BackendType.LLAMACPP,
+                instance_name="edge-quant-nanbeige4",
+            ),
+            EndpointInfo(
+                name="llamacpp-server",
+                app_id="ap-default",
+                state="stopped",
+                backend=BackendType.LLAMACPP,
+                instance_name="default",
+            ),
+        ]
+
+        with patch("llm_launchpad.core.backend.ModalBackend.list_apps", return_value=rows):
+            events = list(orch.list_deployments())
+
+        log_lines = [event.line for event in events if isinstance(event, LogEvent)]
+        deployment_lines = [line for line in log_lines if line.startswith("  backend=")]
+        self.assertEqual(len(deployment_lines), 2)
+        self.assertTrue(any("ap-live" in line and "state=deployed" in line for line in deployment_lines))
+        self.assertFalse(any("ap-old-1" in line for line in deployment_lines))
+        self.assertFalse(any("ap-old-2" in line for line in deployment_lines))
+        self.assertTrue(any("hidden 2 historical duplicate app rows" in line for line in log_lines))
+
+        done = next(
+            event
+            for event in events
+            if isinstance(event, OperationCompleteEvent) and event.operation.value == "list"
+        )
+        self.assertTrue(done.success)
+        self.assertIsInstance(done.data, list)
+        self.assertEqual(len(done.data), 2)
 
 
 if __name__ == "__main__":
