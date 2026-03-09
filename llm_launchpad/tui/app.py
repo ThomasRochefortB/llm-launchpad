@@ -1,7 +1,7 @@
 """Main Textual App: screen routing, keybindings, worker orchestration.
 
-WizardApp is the entry point for ``llm-launchpad wizard``.  It owns the
-screen stack and bridges user actions to Core via threaded workers.
+TuiApp is the entry point for the interactive ``llm-launchpad`` TUI. It owns
+the screen stack and bridges user actions to Core via threaded workers.
 """
 
 from __future__ import annotations
@@ -46,8 +46,8 @@ from .workers import (
 )
 
 
-class WizardApp(App):
-    """llm-launchpad interactive wizard."""
+class TuiApp(App):
+    """llm-launchpad interactive terminal UI."""
 
     TITLE = "llm-launchpad"
     SUB_TITLE = "Modal LLM backends"
@@ -559,3 +559,7 @@ class WizardApp(App):
                 vram_gb_by_quant=dict(metadata.vram_gb_by_quant),
             )
         )
+
+
+# Backward-compatible alias for older imports.
+WizardApp = TuiApp

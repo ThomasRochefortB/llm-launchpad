@@ -1,11 +1,25 @@
 # llm-launchpad
 
-One-click personal LLM deployment with a coding agent + chat UI, built around Modal backends. Use the Textual wizard for guided setup or headless CLI commands for automation.
+Launch and manage personal LLM inference on Modal from a Textual TUI, with headless CLI commands available for automation.
 
 ## What is this?
 - **Who it’s for:** developers who want an OpenAI-compatible endpoint for local or personal use without wiring up infrastructure by hand.
-- **What it does:** provisions vLLM or llama.cpp backends on Modal, manages multiple named instances, and ships a TUI wizard plus headless CLI.
+- **What it does:** provisions vLLM or llama.cpp backends on Modal, manages multiple named instances, and ships a TUI plus headless CLI.
 - **Common uses:** spin up a coding model for your editor, test new quantizations, or manage multiple model variants behind clean endpoints.
+
+## Why a TUI?
+
+Launching LLM inference on Modal usually means juggling model names, GPU choices, warmup checks, logs, and endpoint details across several commands. The TUI keeps that flow in one place.
+
+Use the TUI when you want to:
+- launch a model without memorizing Modal or backend-specific commands
+- compare `vLLM` and `llama.cpp` from one interface
+- manage multiple deployed instances and inspect their status
+- copy the final OpenAI-compatible base URL and model ID after deployment
+
+`llm-launchpad` is designed so the terminal UI is the default experience for humans, while the headless CLI commands remain available for automation and scripting.
+
+If you see the command `llm-launchpad wizard`, that is an older alias for the same TUI.
 
 ## Prerequisites
 - Python **3.12+**
@@ -16,7 +30,7 @@ One-click personal LLM deployment with a coding agent + chat UI, built around Mo
 
 ## Install
 
-CLI-only (global):
+CLI/TUI (global):
 ```bash
 pip install uv
 uv tool install llm-launchpad
@@ -31,18 +45,22 @@ uv sync
 uv run llm-launchpad --help
 ```
 
-## Quickstart (copy/paste)
+## Quickstart
 1) Make sure Modal is configured:
 ```bash
 pip install modal
 modal setup   # follow the prompt to authenticate
 ```
 
-2) Launch the guided TUI wizard:
+2) Launch the TUI:
 ```bash
-uv run llm-launchpad wizard
+uv run llm-launchpad
 ```
-Select a backend (vLLM or llama.cpp), choose a model/preset, and deploy. The wizard will show the instance name and endpoint URL.
+Explicit TUI command:
+```bash
+uv run llm-launchpad tui
+```
+Select a backend (vLLM or llama.cpp), choose a model/preset, and deploy. The TUI will show the instance name, endpoint URL, and final connection details.
 
 Prefer headless? Deploy a default vLLM instance with one command:
 ```bash
@@ -118,8 +136,8 @@ When multiple instances exist for one backend, `status`, `logs`, `stop`, and `wa
 ## Troubleshooting
 - **Modal CLI errors / auth failed:** rerun `modal setup` and ensure your token is valid.
 - **HF 403 or slow downloads:** run `huggingface-cli login` and optionally set `HF_XET_HIGH_PERFORMANCE=1`.
-- **Wizard fails to open:** install Textual (`pip install textual`) or use headless commands.
-- **GPU unavailable / quota:** pick a smaller GPU in the wizard or change `GPU_CONFIG`.
+- **The TUI fails to open:** install Textual (`pip install textual`) or use headless commands.
+- **GPU unavailable / quota:** pick a smaller GPU in the TUI or change `GPU_CONFIG`.
 - **Endpoints return 503 during warmup:** wait a few minutes after first deploy; cold starts are expected.
 - **Llama.cpp build errors:** ensure host CUDA ≥ 12.4 or switch to CPU/offload configs.
 
@@ -227,7 +245,7 @@ curl -s "$SERVER_URL"/metrics
 ```
 
 ### Tuning and configuration
-- **GPU shape**: in `llm-launchpad wizard`, choose GPU type/count on each deploy screen so each instance can use its own shape. For raw `modal deploy/run`, set `GPU_CONFIG` manually.
+- **GPU shape**: in the `llm-launchpad` TUI, choose GPU type/count on each deploy screen so each instance can use its own shape. For raw `modal deploy/run`, set `GPU_CONFIG` manually.
 - **Quantization**: pass `--quant` (default: `Q4_K_M`) or adjust presets.
 - **Server args**: pass `--server_args "--ctx-size 65536 --threads 24"`.
 - **GPU offload**: override with `--n_gpu_layers <int>` or rely on auto (all layers if GPU provided).
@@ -304,7 +322,7 @@ open "$SERVER_URL"/docs
 ```
 
 ### Configuration
-In `llm-launchpad wizard`, these are set from deployment form fields (per deployment). If you use raw `modal deploy`, you can still set them via environment variables:
+In the `llm-launchpad` TUI, these are set from deployment form fields (per deployment). If you use raw `modal deploy`, you can still set them via environment variables:
 - `GPU_CONFIG` (default: `A100-80GB:1`)
 - `N_GPU` (default: `1`, tensor parallel size; intentionally separate from `GPU_CONFIG` count)
 - `MODEL_NAME` (default: `Qwen/Qwen3-4B-Thinking-2507-FP8`)
