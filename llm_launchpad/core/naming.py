@@ -54,6 +54,21 @@ def default_served_model_name(model_name: Optional[str], default: str = "llm") -
     return tail or default
 
 
+def default_llamacpp_served_model_name(
+    repo_id: Optional[str],
+    quant: Optional[str] = None,
+    default: str = "default",
+) -> str:
+    """Return a friendly llama.cpp OpenAI model id derived from repo + quant."""
+    alias = default_served_model_name(repo_id, default=default)
+    quant_text = (quant or "").strip()
+    if not quant_text:
+        return alias
+    if quant_text.casefold() in alias.casefold():
+        return alias
+    return f"{alias}-{quant_text}"
+
+
 def build_app_name(backend: BackendType, instance_name: Optional[str]) -> str:
     """Compose a launchpad app name from backend + instance name."""
     if not instance_name:

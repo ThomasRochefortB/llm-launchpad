@@ -154,7 +154,7 @@ Deploy any GGUF model on Modal using llama.cpp's HTTP server. Includes presets f
 - Server entrypoint: `llm_launchpad/backends/modal_llamacpp_app.py`
 
 ### 1) Preload/download model weights (optional, recommended)
-This downloads GGUF weights into a persistent Volume (`llamacpp-cache`).
+This downloads GGUF weights into the shared persistent Volume (`huggingface-cache`) used by both llama.cpp and vLLM, so models appear in the storage menu.
 
 Presets (recommended):
 ```bash
@@ -179,7 +179,7 @@ Common flags:
 - `--n_gpu_layers <int>`
 
 ### 2) Deploy the HTTP server
-Builds llama.cpp with CUDA and serves an OpenAI-compatible API on port 8080.
+Uses the official `ghcr.io/ggml-org/llama.cpp:server-cuda` image (plus a small Modal runtime layer for Python/Modal deps) and serves an OpenAI-compatible API on port 8080.
 
 ```bash
 modal deploy llm_launchpad/backends/modal_llamacpp_app.py
@@ -196,6 +196,12 @@ modal run llm_launchpad/backends/modal_llamacpp_app.py::main \
 Notes:
 - First cold start can take many minutes; long timeouts are configured.
 - During warmup you may see 503 responses; retry after a few minutes.
+- `modal run ...::main --deploy` triggers a second `modal deploy` build by design (you will see two image-build phases).
+- llama.cpp image cache behavior defaults to reuse for faster iteration. To force a fresh pull/build from the latest image tag:
+  ```bash
+  LLAMA_CPP_IMAGE_NO_CACHE=true modal deploy llm_launchpad/backends/modal_llamacpp_app.py
+  ```
+- For reproducible builds, pin `LLAMA_CPP_IMAGE_REF` to a digest and keep cache reuse enabled.
 
 Get the public URL:
 - Copy the web function URL printed by `modal deploy` (e.g. `https://<user>--llamacpp-qwen3-coder-serve.modal.run`).
@@ -250,6 +256,7 @@ curl -s "$SERVER_URL"/metrics
 - **Server args**: pass `--server_args "--ctx-size 65536 --threads 24"`.
 - **GPU offload**: override with `--n_gpu_layers <int>` or rely on auto (all layers if GPU provided).
 - **Persisted config**: settings are saved to `/root/.cache/huggingface/serve_config.json` and read by the server.
+- **Image source**: override `LLAMA_CPP_IMAGE_REF` (default: `ghcr.io/ggml-org/llama.cpp:server-cuda`) or use `LLAMA_CPP_SERVER_BIN` for an alternate binary path if the upstream image layout changes.
 
 ### Presets
 Built-in examples (adjust as needed):
@@ -265,7 +272,7 @@ Built-in examples (adjust as needed):
 ### Troubleshooting
 - Slow downloads: prefer Xet (`hf-xet`) and set `HF_XET_HIGH_PERFORMANCE=1` (legacy `HF_HUB_ENABLE_HF_TRANSFER` is deprecated).
 - HF auth errors: login with `huggingface-cli login`.
-- Build errors: ensure host CUDA >= 12.4, or switch to CPU.
+- If `llama-server` fails with a missing shared library in the official image, make sure you are using a recent `llm-launchpad` version (the backend now sets the runtime library path for `/app` on Modal's legacy image builder).
 
 ## vLLM on Modal (OpenAI-compatible)
 

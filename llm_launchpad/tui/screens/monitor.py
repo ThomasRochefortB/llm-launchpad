@@ -7,17 +7,17 @@ operation (deploy, warmup, logs, status, stop).
 from __future__ import annotations
 
 import re
-import subprocess
-import sys
 
 from textual import events
 from textual.actions import SkipAction
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
-from textual.screen import Screen
 from textual.widgets import Footer, Static
 
+from ...protocol.enums import BackendType, OperationType
+from ..deploy_log_summary import DeployLogSummarizer
+from .copy_enabled import CopyEnabledScreen
 from ..widgets.log_viewer import LogViewer
 from ..widgets.status_header import StatusHeader
 from ..workers import LogMessage, OperationDone, OperationError, StateChanged
@@ -29,7 +29,7 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_ESCAPE_RE.sub("", text or "")
 
 
-class MonitorScreen(Screen):
+class MonitorScreen(CopyEnabledScreen):
     """Full-screen operation monitor with streaming logs."""
 
     BINDINGS = [
@@ -45,10 +45,25 @@ class MonitorScreen(Screen):
         Binding("ctrl+l", "clear_log", "Clear log", show=True),
     ]
 
-    def __init__(self, title: str = "Operation") -> None:
+    def __init__(
+        self,
+        title: str = "Operation",
+        deploy_backend: BackendType | None = None,
+        summarize_backend_logs: bool = False,
+        show_debug_logs: bool = True,
+    ) -> None:
         super().__init__()
         self._title = title
         self._done = False
+        self._deploy_backend = deploy_backend
+        self._summarize_backend_logs = summarize_backend_logs
+        self._show_debug_logs = show_debug_logs
+        self._current_operation: OperationType | None = None
+        self._deploy_summarizer = (
+            DeployLogSummarizer(deploy_backend)
+            if deploy_backend is not None and summarize_backend_logs and not show_debug_logs
+            else None
+        )
 
     def compose(self) -> ComposeResult:
         yield StatusHeader(id="monitor-status-header")
@@ -72,13 +87,32 @@ class MonitorScreen(Screen):
     def status_header(self) -> StatusHeader:
         return self.query_one("#monitor-status-header", StatusHeader)
 
+    @property
+    def _summary_mode_enabled(self) -> bool:
+        return self._deploy_summarizer is not None
+
     # -- Message handlers --
 
+    def on_mount(self) -> None:
+        if self._summary_mode_enabled:
+            self.log_viewer.write_line(
+                "Log view: summary (normalized milestones; raw backend logs hidden)"
+            )
+            self.log_viewer.write_line("")
+
     def on_log_message(self, message: LogMessage) -> None:
+        cleaned = _strip_ansi(message.line)
         prefix = "stderr | " if message.stream == "stderr" else ""
-        self.log_viewer.write_line(f"{prefix}{_strip_ansi(message.line)}")
+        if self._summary_mode_enabled:
+            assert self._deploy_summarizer is not None
+            for line in self._deploy_summarizer.transform(cleaned, self._current_operation):
+                self.log_viewer.write_line(f"{prefix}{line}" if prefix else line)
+            return
+        self.log_viewer.write_line(f"{prefix}{cleaned}")
 
     def on_state_changed(self, message: StateChanged) -> None:
+        if message.operation is not None:
+            self._current_operation = message.operation
         self.status_header.update_from_event(
             state=message.state,
             operation=message.operation,
@@ -98,6 +132,10 @@ class MonitorScreen(Screen):
             )
             if message.detail:
                 self.log_viewer.write_line(f"Detail: {message.detail}")
+            if self._summary_mode_enabled:
+                self.log_viewer.write_line(
+                    'Tip: re-run with "Show debug logs" enabled to see full backend logs.'
+                )
         self.log_viewer.write_line("Press esc or q to return.")
 
     def on_operation_error(self, message: OperationError) -> None:
@@ -155,29 +193,13 @@ class MonitorScreen(Screen):
         # OSC 52 (works in iTerm2, Kitty, WezTerm, Ghostty, etc.)
         self.app.copy_to_clipboard(text)
 
-        # macOS: also pipe into pbcopy for terminals that ignore OSC 52
-        if sys.platform == "darwin":
-            try:
-                subprocess.run(
-                    ["pbcopy"],
-                    input=text.encode(),
-                    check=True,
-                    timeout=2,
-                )
-            except Exception:
-                pass
-
         if notify:
             lines = text.count("\n") + 1
             self.notify(f"Copied {lines} line{'s' if lines != 1 else ''}", timeout=2)
         return True
 
     def action_copy_text(self) -> None:
-        """Copy selected log text to clipboard.
-
-        Uses OSC 52 (built-in) **and** ``pbcopy`` on macOS as a fallback so
-        the copy works even in terminals that don't support OSC 52.
-        """
+        """Copy selected log text to clipboard."""
         self._copy_selected_text(notify=True, raise_on_empty=True)
 
     def action_go_back(self) -> None:

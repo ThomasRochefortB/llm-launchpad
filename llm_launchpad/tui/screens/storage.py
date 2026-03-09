@@ -3,16 +3,19 @@
 from __future__ import annotations
 
 from textual import events
+from textual.actions import SkipAction
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
-from textual.screen import Screen
+from textual.widget import Widget
 from textual.widgets import DataTable, Footer, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
 from ...protocol.enums import BackendType
 from ...protocol.models import StorageSnapshot, StoredModelInfo
+from ..navigation import is_focusable_for_navigation, move_focus_across_option_lists, move_focus_across_widgets
 from ..workers import StorageFailed, StorageLoaded
+from .copy_enabled import CopyEnabledScreen
 
 
 def _human_bytes(size_bytes: int) -> str:
@@ -30,16 +33,29 @@ def _model_label(row: StoredModelInfo) -> str:
         return f"{row.model_id} (INCOMPLETE)"
     return row.model_id
 
+def _is_focusable_for_arrow_navigation(widget: Widget) -> bool:
+    return is_focusable_for_navigation(widget, check_size=True)
 
-class StorageScreen(Screen):
+class StorageScreen(CopyEnabledScreen):
     """View and pre-download backend model caches."""
 
     BINDINGS = [
+        Binding("up", "navigate_option_list_up", show=False, priority=True),
+        Binding("down", "navigate_option_list_down", show=False, priority=True),
         Binding("escape", "pop_screen", "Back", show=True),
         Binding("r", "refresh_storage", "Refresh", show=True),
         Binding("p", "predownload_selected", "Pre-download", show=True),
         Binding("x", "delete_selected_model", "Delete", show=True),
     ]
+    NAVIGATION_ORDER = (
+        "storage-backend-filter",
+        "storage-action-list",
+        "storage-table",
+        "storage-model-id",
+        "storage-model-backend",
+        "storage-model-quant",
+        "storage-model-revision",
+    )
 
     def __init__(self, initial_backend: BackendType | None = None) -> None:
         super().__init__()
@@ -93,6 +109,17 @@ class StorageScreen(Screen):
         table.add_columns("backend", "model", "revision", "quant", "files", "size")
         if self._initial_backend is not None:
             self.query_one("#storage-model-backend", Input).value = self._initial_backend.value
+        backend_filter = self.query_one("#storage-backend-filter", OptionList)
+        if self._selected_filter == BackendType.LLAMACPP:
+            backend_filter.highlighted = 1
+        elif self._selected_filter == BackendType.VLLM:
+            backend_filter.highlighted = 2
+        elif backend_filter.option_count > 0:
+            backend_filter.highlighted = 0
+        action_list = self.query_one("#storage-action-list", OptionList)
+        if action_list.option_count > 0:
+            action_list.highlighted = 0
+        self.call_after_refresh(self._focus_first_visible_navigation_target)
         self._refresh_storage_snapshot()
 
     def on_screen_suspend(self, _: events.ScreenSuspend) -> None:
@@ -137,6 +164,9 @@ class StorageScreen(Screen):
         self.query_one("#storage-status", Static).update(
             "[green]Storage refreshed.[/green] Use selected row or type a model to pre-download."
         )
+        focused = self.focused
+        if not isinstance(focused, Widget) or not _is_focusable_for_arrow_navigation(focused):
+            self.call_after_refresh(self._focus_first_visible_navigation_target)
 
     def on_storage_failed(self, message: StorageFailed) -> None:
         self.query_one("#storage-status", Static).update(
@@ -211,3 +241,54 @@ class StorageScreen(Screen):
 
     def action_pop_screen(self) -> None:
         self.app.pop_screen()
+
+    def action_navigate_option_list_down(self) -> None:
+        if move_focus_across_option_lists(
+            self,
+            ("storage-backend-filter", "storage-action-list"),
+            direction=1,
+            is_focusable=_is_focusable_for_arrow_navigation,
+        ):
+            return
+        focused = self.focused
+        if isinstance(focused, DataTable) and focused.row_count > 0 and focused.cursor_row < focused.row_count - 1:
+            raise SkipAction()
+        if move_focus_across_widgets(
+            self,
+            self.NAVIGATION_ORDER,
+            direction=1,
+            is_focusable=_is_focusable_for_arrow_navigation,
+            fallback_to_edge_if_focus_missing=True,
+        ):
+            return
+        raise SkipAction()
+
+    def action_navigate_option_list_up(self) -> None:
+        if move_focus_across_option_lists(
+            self,
+            ("storage-backend-filter", "storage-action-list"),
+            direction=-1,
+            is_focusable=_is_focusable_for_arrow_navigation,
+        ):
+            return
+        focused = self.focused
+        if isinstance(focused, DataTable) and focused.row_count > 0 and focused.cursor_row > 0:
+            raise SkipAction()
+        if move_focus_across_widgets(
+            self,
+            self.NAVIGATION_ORDER,
+            direction=-1,
+            is_focusable=_is_focusable_for_arrow_navigation,
+            fallback_to_edge_if_focus_missing=True,
+        ):
+            return
+        raise SkipAction()
+
+    def _focus_first_visible_navigation_target(self) -> None:
+        move_focus_across_widgets(
+            self,
+            self.NAVIGATION_ORDER,
+            direction=1,
+            is_focusable=_is_focusable_for_arrow_navigation,
+            fallback_to_edge_if_focus_missing=True,
+        )

@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import json
 
+from textual.actions import SkipAction
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
-from textual.screen import Screen
+from textual.widget import Widget
 from textual.widgets import (
     Button,
     Footer,
@@ -41,6 +42,7 @@ from ..gpu_config import (
     normalize_gpu_type,
     parse_gpu_count,
 )
+from ..navigation import is_focusable_for_navigation, move_focus_across_option_lists, move_focus_across_widgets
 from ..workers import (
     LlamaCppModelsFailed,
     LlamaCppModelsLoaded,
@@ -52,6 +54,7 @@ from ..workers import (
     VllmModelsLoaded,
 )
 from ..widgets.input_form import FormField, ToggleField
+from .copy_enabled import CopyEnabledScreen
 
 
 class GpuTypesLoaded(Message):
@@ -88,6 +91,10 @@ class VllmMemoryFailed(Message):
         self.repo_id = repo_id
         self.revision = revision
         self.error = error
+
+
+def _is_focusable_for_arrow_navigation(widget: Widget) -> bool:
+    return is_focusable_for_navigation(widget, check_hidden_ancestor=True)
 
 
 def _cached_models_from_snapshot(snapshot: StorageSnapshot, backend: BackendType) -> list[ModelCandidate]:
@@ -168,7 +175,17 @@ def _quant_preview(quantizations: list[str], vram_gb_by_quant: dict[str, float],
     return ", ".join(preview_tokens) + suffix
 
 
-class BackendSelectScreen(Screen):
+def _advance_deploy_focus(screen: CopyEnabledScreen, navigation_order: tuple[str, ...]) -> None:
+    """Advance focus to the next visible deploy form widget."""
+    move_focus_across_widgets(
+        screen,
+        navigation_order,
+        direction=1,
+        is_focusable=_is_focusable_for_arrow_navigation,
+    )
+
+
+class BackendSelectScreen(CopyEnabledScreen):
     """Step 1: pick backend (llama.cpp or vLLM)."""
 
     BINDINGS = [
@@ -180,11 +197,17 @@ class BackendSelectScreen(Screen):
             yield Static("[bold cyan]Deploy[/bold cyan]  [dim]Step 1: Choose backend[/dim]")
             yield Static("")
             yield OptionList(
-                Option("  llama.cpp (GGUF)            Quantized models, single GPU", id="llamacpp"),
-                Option("  vLLM (OpenAI-compatible)    Full-precision, tensor parallel", id="vllm"),
+                Option("  llama.cpp (GGUF) ( Recommended )", id="llamacpp"),
+                Option("  vLLM", id="vllm"),
                 id="backend-list",
             )
         yield Footer()
+
+    def on_mount(self) -> None:
+        backend_list = self.query_one("#backend-list", OptionList)
+        if backend_list.option_count > 0:
+            backend_list.highlighted = 0
+        backend_list.focus()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option.id == "llamacpp":
@@ -196,15 +219,40 @@ class BackendSelectScreen(Screen):
         self.app.pop_screen()
 
 
-class LlamaCppDeployScreen(Screen):
+class LlamaCppDeployScreen(CopyEnabledScreen):
     """llama.cpp deploy form."""
 
     BINDINGS = [
+        Binding("up", "navigate_option_list_up", show=False, priority=True),
+        Binding("down", "navigate_option_list_down", show=False, priority=True),
         Binding("escape", "pop_screen", "Back", show=True),
         Binding("ctrl+d", "do_deploy", "Deploy", show=True),
         Binding("ctrl+s", "open_storage", "Storage", show=True),
         Binding("p", "predownload_highlighted", "Pre-download", show=True),
     ]
+    NAVIGATION_ORDER = (
+        "llama-rank-mode",
+        "llama-model-list",
+        "repo-id",
+        "quant",
+        "llama-quant-list",
+        "gpu-type-llama",
+        "gpu-count-llama",
+        "preload",
+        "do-deploy",
+        "warmup",
+        "toggle-advanced-llama",
+        "revision",
+        "server-args",
+        "host-input",
+        "port-input",
+        "n-gpu-layers",
+        "llama-image-no-cache",
+        "show-debug-logs-llama",
+        "instance-name-llama",
+        "app-name-llama",
+        "deploy-btn",
+    )
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="menu-container"):
@@ -274,6 +322,18 @@ class LlamaCppDeployScreen(Screen):
                 "n-gpu-layers",
                 classes="llama-advanced",
             )
+            yield ToggleField(
+                "Force fresh llama.cpp image pull/build (ignore cache)",
+                "llama-image-no-cache",
+                default=False,
+                classes="llama-advanced",
+            )
+            yield ToggleField(
+                "Show debug logs (full raw backend logs)",
+                "show-debug-logs-llama",
+                default=False,
+                classes="llama-advanced",
+            )
 
             yield Static("")
             yield FormField(
@@ -301,6 +361,7 @@ class LlamaCppDeployScreen(Screen):
         self._rank_mode = "cached"
         self._ranked_models: list[ModelCandidate] = []
         self._cached_models: list[ModelCandidate] = []
+        self._cached_repo_to_quants: dict[str, tuple[str, ...]] = {}
         self._has_cached_snapshot = False
         self._repo_to_quants: dict[str, tuple[str, ...]] = {}
         self._repo_to_quant_vram: dict[str, dict[str, float]] = {}
@@ -313,6 +374,7 @@ class LlamaCppDeployScreen(Screen):
         rank_mode_list = self.query_one("#llama-rank-mode", OptionList)
         if rank_mode_list.option_count > 0:
             rank_mode_list.highlighted = 0
+        rank_mode_list.focus()
         self._refresh_gpu_types()
         self._set_model_status("[dim]Loading cached models from storage...[/dim]")
         self._refresh_cached_models_from_storage()
@@ -323,28 +385,30 @@ class LlamaCppDeployScreen(Screen):
             selected_mode = self._resolve_rank_mode(event.option.id or "")
             if selected_mode is None:
                 return
-            if selected_mode == self._rank_mode:
-                return
-            self._rank_mode = selected_mode
-            self._ranked_models = []
-            self._set_model_status("[dim]Loading model suggestions...[/dim]")
-            self.query_one("#llama-model-list", OptionList).set_options([])
-            if self._rank_mode == "cached":
-                self._set_model_status("[dim]Loading cached models from storage...[/dim]")
-                if self._has_cached_snapshot:
-                    self._show_cached_models()
-                self._refresh_cached_models_from_storage()
-            else:
-                self.app.begin_fetch_llamacpp_models(self._rank_mode, self)  # type: ignore[attr-defined]
+            if selected_mode != self._rank_mode:
+                self._rank_mode = selected_mode
+                self._ranked_models = []
+                self._set_model_status("[dim]Loading model suggestions...[/dim]")
+                self.query_one("#llama-model-list", OptionList).set_options([])
+                if self._rank_mode == "cached":
+                    self._set_model_status("[dim]Loading cached models from storage...[/dim]")
+                    if self._has_cached_snapshot:
+                        self._show_cached_models()
+                    self._refresh_cached_models_from_storage()
+                else:
+                    self.app.begin_fetch_llamacpp_models(self._rank_mode, self)  # type: ignore[attr-defined]
+            _advance_deploy_focus(self, self.NAVIGATION_ORDER)
             return
 
         if event.option_list.id == "llama-model-list":
             self._apply_ranked_model_selection(event.option.id or "")
             self._refresh_app_preview()
+            _advance_deploy_focus(self, self.NAVIGATION_ORDER)
             return
 
         if event.option_list.id == "llama-quant-list":
             self._apply_quant_selection(event.option.id or "")
+            _advance_deploy_focus(self, self.NAVIGATION_ORDER)
             return
 
     def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
@@ -432,6 +496,7 @@ class LlamaCppDeployScreen(Screen):
 
     def on_storage_loaded(self, message: StorageLoaded) -> None:
         self._cached_models = _cached_models_from_snapshot(message.snapshot, BackendType.LLAMACPP)
+        self._cached_repo_to_quants = {model.repo_id.casefold(): model.quantizations for model in self._cached_models}
         self._has_cached_snapshot = True
         if self._rank_mode == "cached":
             self._show_cached_models()
@@ -464,7 +529,7 @@ class LlamaCppDeployScreen(Screen):
         self._repo_to_quants[repo_key] = tuple(message.quantizations)
         self._repo_to_quant_vram[repo_key] = _normalize_vram_map(message.vram_gb_by_quant)
         self._apply_quantizations(
-            message.quantizations,
+            self._display_quantizations_for_repo(repo_key, list(message.quantizations)),
             auto_select=not self._quant_touched,
             vram_gb_by_quant=self._repo_to_quant_vram[repo_key],
         )
@@ -510,6 +575,7 @@ class LlamaCppDeployScreen(Screen):
         config.preload = self.query_one("#preload", Switch).value
         config.do_deploy = self.query_one("#do-deploy", Switch).value
         config.do_warmup = self.query_one("#warmup", Switch).value
+        config.show_debug_logs = self.query_one("#show-debug-logs-llama", Switch).value
 
         gpu_type = normalize_gpu_type(self._selected_gpu_type)
         if not gpu_type:
@@ -541,6 +607,7 @@ class LlamaCppDeployScreen(Screen):
                     config.n_gpu_layers = int(ngl)
                 except ValueError:
                     pass
+            config.llamacpp_image_no_cache = self.query_one("#llama-image-no-cache", Switch).value
 
         model_hint = config.repo_id
         instance_override = self.query_one("#instance-name-llama", Input).value.strip()
@@ -619,6 +686,18 @@ class LlamaCppDeployScreen(Screen):
         option_id = highlighted.id if highlighted is not None else ""
         return _model_from_option_id(option_id or "", self._ranked_models)
 
+    def _display_quantizations_for_repo(self, repo_key: str, quantizations: list[str]) -> list[str]:
+        if self._rank_mode != "cached":
+            return list(quantizations)
+        cached_quants = self._cached_repo_to_quants.get(repo_key)
+        if not cached_quants:
+            return list(quantizations)
+        allowed = {quant.strip().upper() for quant in cached_quants}
+        filtered = [quant for quant in quantizations if quant.strip().upper() in allowed]
+        if filtered:
+            return filtered
+        return list(cached_quants)
+
     def _lookup_quantizations_for_current_repo(self, force_refresh: bool = False) -> None:
         repo_id = self.query_one("#repo-id", Input).value.strip()
         revision = self.query_one("#revision", Input).value.strip()
@@ -634,7 +713,7 @@ class LlamaCppDeployScreen(Screen):
         cached_vram = self._repo_to_quant_vram.get(repo_key, {})
         if cached_quants is not None and not force_refresh:
             self._apply_quantizations(
-                list(cached_quants),
+                self._display_quantizations_for_repo(repo_key, list(cached_quants)),
                 auto_select=not self._quant_touched,
                 vram_gb_by_quant=cached_vram,
             )
@@ -720,19 +799,74 @@ class LlamaCppDeployScreen(Screen):
     def action_pop_screen(self) -> None:
         self.app.pop_screen()
 
+    def action_navigate_option_list_down(self) -> None:
+        if move_focus_across_option_lists(
+            self,
+            ("llama-rank-mode", "llama-model-list", "llama-quant-list"),
+            direction=1,
+        ):
+            return
+        if move_focus_across_widgets(
+            self,
+            self.NAVIGATION_ORDER,
+            direction=1,
+            is_focusable=_is_focusable_for_arrow_navigation,
+        ):
+            return
+        raise SkipAction()
+
+    def action_navigate_option_list_up(self) -> None:
+        if move_focus_across_option_lists(
+            self,
+            ("llama-rank-mode", "llama-model-list", "llama-quant-list"),
+            direction=-1,
+        ):
+            return
+        if move_focus_across_widgets(
+            self,
+            self.NAVIGATION_ORDER,
+            direction=-1,
+            is_focusable=_is_focusable_for_arrow_navigation,
+        ):
+            return
+        raise SkipAction()
+
     def action_open_storage(self) -> None:
         self.app.action_push_storage(BackendType.LLAMACPP)  # type: ignore[attr-defined]
 
 
-class VllmDeployScreen(Screen):
+class VllmDeployScreen(CopyEnabledScreen):
     """vLLM deploy form."""
 
     BINDINGS = [
+        Binding("up", "navigate_option_list_up", show=False, priority=True),
+        Binding("down", "navigate_option_list_down", show=False, priority=True),
         Binding("escape", "pop_screen", "Back", show=True),
         Binding("ctrl+d", "do_deploy", "Deploy", show=True),
         Binding("ctrl+s", "open_storage", "Storage", show=True),
         Binding("p", "predownload_highlighted", "Pre-download", show=True),
     ]
+    NAVIGATION_ORDER = (
+        "vllm-rank-mode",
+        "vllm-model-list",
+        "model-name",
+        "gpu-type-vllm",
+        "gpu-count-vllm",
+        "n-gpu",
+        "toggle-advanced-vllm",
+        "model-revision",
+        "smoke-only-vllm",
+        "warmup-vllm",
+        "fast-boot",
+        "trust-remote-code",
+        "show-debug-logs-vllm",
+        "served-model-name",
+        "reasoning-parser",
+        "chat-template-kwargs",
+        "instance-name-vllm",
+        "app-name-vllm",
+        "deploy-vllm-btn",
+    )
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="menu-container"):
@@ -811,6 +945,12 @@ class VllmDeployScreen(Screen):
                 default=False,
                 classes="vllm-advanced",
             )
+            yield ToggleField(
+                "Show debug logs (full raw backend logs)",
+                "show-debug-logs-vllm",
+                default=False,
+                classes="vllm-advanced",
+            )
             yield FormField(
                 "Served model alias",
                 "served-model-name",
@@ -821,6 +961,12 @@ class VllmDeployScreen(Screen):
                 "Reasoning parser (optional)",
                 "reasoning-parser",
                 hint="e.g., qwen3, deepseek_r1, granite",
+                classes="vllm-advanced",
+            )
+            yield FormField(
+                "Tool call parser (optional)",
+                "tool-call-parser",
+                hint="e.g., hermes, qwen3_xml, llama3_json",
                 classes="vllm-advanced",
             )
             yield FormField(
@@ -863,6 +1009,7 @@ class VllmDeployScreen(Screen):
         rank_mode_list = self.query_one("#vllm-rank-mode", OptionList)
         if rank_mode_list.option_count > 0:
             rank_mode_list.highlighted = 0
+        rank_mode_list.focus()
         self._refresh_gpu_types()
         self._set_model_status("[dim]Loading cached models from storage...[/dim]")
         self._refresh_cached_models_from_storage()
@@ -875,24 +1022,25 @@ class VllmDeployScreen(Screen):
             selected_mode = self._resolve_rank_mode(event.option.id or "")
             if selected_mode is None:
                 return
-            if selected_mode == self._rank_mode:
-                return
-            self._rank_mode = selected_mode
-            self._ranked_models = []
-            self._set_model_status("[dim]Loading model suggestions...[/dim]")
-            self.query_one("#vllm-model-list", OptionList).set_options([])
-            if self._rank_mode == "cached":
-                self._set_model_status("[dim]Loading cached models from storage...[/dim]")
-                if self._has_cached_snapshot:
-                    self._show_cached_models()
-                self._refresh_cached_models_from_storage()
-            else:
-                self.app.begin_fetch_vllm_models(self._rank_mode, self)  # type: ignore[attr-defined]
+            if selected_mode != self._rank_mode:
+                self._rank_mode = selected_mode
+                self._ranked_models = []
+                self._set_model_status("[dim]Loading model suggestions...[/dim]")
+                self.query_one("#vllm-model-list", OptionList).set_options([])
+                if self._rank_mode == "cached":
+                    self._set_model_status("[dim]Loading cached models from storage...[/dim]")
+                    if self._has_cached_snapshot:
+                        self._show_cached_models()
+                    self._refresh_cached_models_from_storage()
+                else:
+                    self.app.begin_fetch_vllm_models(self._rank_mode, self)  # type: ignore[attr-defined]
+            _advance_deploy_focus(self, self.NAVIGATION_ORDER)
             return
 
         if event.option_list.id == "vllm-model-list":
             self._apply_ranked_model_selection(event.option.id or "")
             self._refresh_app_preview()
+            _advance_deploy_focus(self, self.NAVIGATION_ORDER)
             return
 
     def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
@@ -1197,6 +1345,7 @@ class VllmDeployScreen(Screen):
         adv_visible = not self.query(".vllm-advanced").first().has_class("hidden")
         if adv_visible:
             config.reasoning_parser = self.query_one("#reasoning-parser", Input).value.strip() or None
+            config.tool_call_parser = self.query_one("#tool-call-parser", Input).value.strip() or None
         kwargs_raw = self.query_one("#chat-template-kwargs", Input).value.strip() if adv_visible else ""
         if kwargs_raw:
             try:
@@ -1220,6 +1369,7 @@ class VllmDeployScreen(Screen):
         config.do_deploy = not smoke_only
         config.run_smoke = smoke_only
         config.do_warmup = self.query_one("#warmup-vllm", Switch).value if config.do_deploy else False
+        config.show_debug_logs = self.query_one("#show-debug-logs-vllm", Switch).value
         instance_override = self.query_one("#instance-name-vllm", Input).value.strip()
         app_override = self.query_one("#app-name-vllm", Input).value.strip()
         if app_override:
@@ -1236,6 +1386,38 @@ class VllmDeployScreen(Screen):
 
     def action_pop_screen(self) -> None:
         self.app.pop_screen()
+
+    def action_navigate_option_list_down(self) -> None:
+        if move_focus_across_option_lists(
+            self,
+            ("vllm-rank-mode", "vllm-model-list"),
+            direction=1,
+        ):
+            return
+        if move_focus_across_widgets(
+            self,
+            self.NAVIGATION_ORDER,
+            direction=1,
+            is_focusable=_is_focusable_for_arrow_navigation,
+        ):
+            return
+        raise SkipAction()
+
+    def action_navigate_option_list_up(self) -> None:
+        if move_focus_across_option_lists(
+            self,
+            ("vllm-rank-mode", "vllm-model-list"),
+            direction=-1,
+        ):
+            return
+        if move_focus_across_widgets(
+            self,
+            self.NAVIGATION_ORDER,
+            direction=-1,
+            is_focusable=_is_focusable_for_arrow_navigation,
+        ):
+            return
+        raise SkipAction()
 
     def action_open_storage(self) -> None:
         self.app.action_push_storage(BackendType.VLLM)  # type: ignore[attr-defined]

@@ -6,19 +6,24 @@ auth status line, and keyboard-navigable option list.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
+import json
 from typing import Any
 
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Center, Horizontal, Vertical
 from textual.message import Message
-from textual.screen import Screen
 from textual.widgets import Footer, OptionList, Static
 from textual.widgets.option_list import Option
 
 from ...core.backend import ModalBackend
+from ...core.hf_auth import HuggingFaceAuthStatus, get_huggingface_auth_status
+from ...core.naming import default_llamacpp_served_model_name, default_served_model_name
+from ...protocol.enums import BackendType
 from ...protocol.models import EndpointInfo
+from .copy_enabled import CopyEnabledScreen
 
 BANNER = r"""[bold cyan]
 _     _     __  __
@@ -28,6 +33,8 @@ _     _     __  __
 |_____|_____|_|  |_|
     LAUNCHPAD
 [/bold cyan]"""
+
+PANEL_SEPARATOR = "[dim]----------------------------------------[/dim]"
 
 
 class DeploymentsLoaded(Message):
@@ -62,6 +69,14 @@ class BillingReportLoadFailed(Message):
         self.error = error
 
 
+class HuggingFaceAuthLoaded(Message):
+    """Main-menu Hugging Face auth check completed."""
+
+    def __init__(self, status: HuggingFaceAuthStatus) -> None:
+        super().__init__()
+        self.status = status
+
+
 def _clip(value: str, width: int) -> str:
     text = (value or "").strip()
     if len(text) <= width:
@@ -73,6 +88,31 @@ def _clip(value: str, width: int) -> str:
 
 def _escape_markup(value: str) -> str:
     return (value or "").replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+
+
+def _render_hf_auth_status(status: HuggingFaceAuthStatus | None = None) -> str:
+    if status is None:
+        return "[dim]🤗 Checking Hugging Face auth...[/dim]"
+    if status.authenticated:
+        if status.username:
+            return f"[green]🤗 Hugging Face authenticated as {_escape_markup(status.username)}[/green]"
+        return "[green]🤗 Hugging Face authenticated[/green]"
+    if status.error:
+        color = "red" if "invalid" in status.error.lower() else "yellow"
+        detail = _escape_markup(_clip(status.error, 72))
+        return f"[{color}]🤗 Hugging Face auth check failed: {detail}[/{color}]"
+    return "[yellow]🤗 Hugging Face not authenticated (run: hf auth login)[/yellow]"
+
+
+def _render_auth_status_block(
+    username: str = "",
+    hf_status: HuggingFaceAuthStatus | None = None,
+) -> str:
+    lines: list[str] = []
+    if username:
+        lines.append(f"[green]▰ Modal authenticated as: {_escape_markup(username)}[/green]")
+    lines.append(_render_hf_auth_status(hf_status))
+    return "\n".join(lines)
 
 
 def _state_bucket(state: str) -> str:
@@ -111,30 +151,252 @@ def _should_show_in_panel(state: str) -> bool:
     return bucket in {"healthy", "deploying", "queued", "error"}
 
 
-def _render_deployment_status(rows: list[EndpointInfo]) -> str:
-    if not rows:
-        return (
-            "[bold]Fleet Pulse[/bold]\n"
-            "[dim]No active launchpad deployments.[/dim]\n"
-            "\n"
-            "[dim]Use Manage -> List deployments for full details.[/dim]"
-        )
+def _resolve_openai_base_url(row: EndpointInfo, username: str = "") -> tuple[str | None, bool]:
+    raw_url = (row.web_url or "").strip()
+    if raw_url:
+        base_root = raw_url.rstrip("/")
+        return (base_root if base_root.endswith("/v1") else f"{base_root}/v1"), False
+    if not username.strip() or not row.name.strip():
+        return None, False
+    derived = ModalBackend.default_server_url(username.strip(), app_name=row.name.strip()).rstrip("/")
+    return (derived if derived.endswith("/v1") else f"{derived}/v1"), True
 
-    state_counts = Counter(_state_bucket(row.state) for row in rows)
+
+def _runtime_bucket_from_modal_state(state: str) -> str:
+    bucket = _state_bucket(state)
+    if bucket == "healthy":
+        return "healthy"
+    if bucket in {"deploying", "queued"}:
+        return "in_progress"
+    if bucket == "error":
+        return "error"
+    return "in_progress"
+
+
+def _runtime_bucket(row: EndpointInfo) -> str:
+    status = (row.runtime_status or "").strip().lower()
+    if status in {"healthy", "in_progress", "error"}:
+        return status
+    return _runtime_bucket_from_modal_state(row.state)
+
+
+def _style_runtime_bucket(bucket: str) -> str:
+    normalized = (bucket or "").strip().lower()
+    if normalized == "healthy":
+        return "[green]healthy[/green]"
+    if normalized == "in_progress":
+        return "[yellow]in progress[/yellow]"
+    if normalized == "error":
+        return "[red]error[/red]"
+    return f"[dim]{_escape_markup(normalized or 'unknown')}[/dim]"
+
+
+def _llamacpp_probe_ready(status_code: int, body: str) -> bool:
+    if not (200 <= status_code < 300):
+        return False
+    text = (body or "").strip()
+    if not text:
+        return False
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return isinstance(payload.get("choices"), list)
+
+
+def _probe_row_runtime_status(row: EndpointInfo, username: str) -> tuple[str, str | None]:
+    modal_runtime = _runtime_bucket_from_modal_state(row.state)
+    if modal_runtime != "healthy":
+        return modal_runtime, None
+    if row.backend not in {BackendType.VLLM, BackendType.LLAMACPP}:
+        return "in_progress", "unknown backend"
+
+    base_url, was_derived = _resolve_openai_base_url(row, username=username)
+    if not base_url:
+        return "in_progress", "missing URL"
+
+    try:
+        import requests  # type: ignore
+    except ImportError:
+        return modal_runtime, "requests unavailable"
+
+    base_root = base_url.rstrip("/")
+    host_root = base_root[:-3] if base_root.endswith("/v1") else base_root
+    try:
+        if row.backend == BackendType.VLLM:
+            probe_url = host_root.rstrip("/") + "/health"
+            response = requests.get(probe_url, timeout=2.5)
+            if 200 <= response.status_code < 300:
+                return "healthy", None
+        else:
+            probe_url = base_root.rstrip("/") + "/completions"
+            response = requests.post(
+                probe_url,
+                headers={"Content-Type": "application/json"},
+                data=json.dumps(
+                    {
+                        "model": (row.served_model_name or "").strip() or "default",
+                        "prompt": "ping",
+                        "max_tokens": 1,
+                        "temperature": 0,
+                    }
+                ),
+                timeout=2.5,
+            )
+            if _llamacpp_probe_ready(response.status_code, response.text or ""):
+                return "healthy", None
+
+        # If we had to derive the URL, avoid false "error" when function slug differs.
+        if not was_derived and response.status_code in {401, 403, 404}:
+            return "error", f"HTTP {response.status_code}"
+        return "in_progress", f"HTTP {response.status_code}"
+    except Exception as exc:
+        return "in_progress", str(exc)
+
+
+def _annotate_runtime_statuses(rows: list[EndpointInfo], username: str) -> None:
+    candidates = [
+        row
+        for row in rows
+        if _runtime_bucket_from_modal_state(row.state) == "healthy"
+        and row.backend in {BackendType.VLLM, BackendType.LLAMACPP}
+    ]
+    for row in rows:
+        if _runtime_bucket_from_modal_state(row.state) != "healthy":
+            row.runtime_status = _runtime_bucket_from_modal_state(row.state)
+            row.runtime_status_detail = None
+
+    if not candidates:
+        return
+
+    max_workers = min(4, len(candidates))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_probe_row_runtime_status, row, username): row
+            for row in candidates
+        }
+        for future in as_completed(futures):
+            row = futures[future]
+            try:
+                status, detail = future.result()
+            except Exception as exc:
+                status, detail = "in_progress", str(exc)
+            row.runtime_status = status
+            row.runtime_status_detail = detail
+
+
+def _backend_display_name(backend: BackendType | None) -> str:
+    if backend == BackendType.VLLM:
+        return "vLLM"
+    if backend == BackendType.LLAMACPP:
+        return "llama.cpp"
+    return "unknown"
+
+
+def _friendly_count_line(rows: list[EndpointInfo]) -> list[str]:
+    runtime_counts = Counter(_runtime_bucket(row) for row in rows)
     backend_counts = Counter(
         row.backend.value if row.backend is not None else "unknown"
         for row in rows
     )
-    healthy = state_counts.get("healthy", 0)
-    pending = state_counts.get("deploying", 0) + state_counts.get("queued", 0)
-    issues = state_counts.get("error", 0)
+    healthy = runtime_counts.get("healthy", 0)
+    in_progress = runtime_counts.get("in_progress", 0)
+    errors = runtime_counts.get("error", 0)
 
-    header_lines = [
-        "[bold]Fleet Pulse[/bold]",
-        f"[dim]deployments={len(rows)}  healthy={healthy}  pending={pending}  issues={issues}[/dim]",
-        f"[dim]vllm={backend_counts.get('vllm', 0)}  llamacpp={backend_counts.get('llamacpp', 0)}[/dim]",
-        "",
-    ]
+    noun = "deployment" if len(rows) == 1 else "deployments"
+    chips = [f"[green]{healthy} healthy[/green]"]
+    if in_progress:
+        chips.append(f"[yellow]{in_progress} in progress[/yellow]")
+    if errors:
+        chips.append(f"[red]{errors} error[/red]")
+    summary = f"[bold]{len(rows)} active {noun}[/bold]"
+    if chips:
+        summary += "  " + "  ".join(chips)
+
+    backend_parts = []
+    if backend_counts.get("vllm", 0):
+        backend_parts.append(f"{backend_counts['vllm']} vLLM")
+    if backend_counts.get("llamacpp", 0):
+        backend_parts.append(f"{backend_counts['llamacpp']} llama.cpp")
+    if not backend_parts:
+        backend_parts.append(f"{len(rows)} launchpad")
+    return [summary, f"[dim]{' | '.join(backend_parts)}[/dim]", ""]
+
+
+def _wrap_url_for_panel(value: str, width: int = 44) -> list[str]:
+    """Pre-wrap long URLs so they remain readable in the narrow status panel."""
+    text = (value or "").strip()
+    if not text:
+        return []
+    if len(text) <= width:
+        return [text]
+
+    # Keep separators attached to the preceding chunk so we don't end up
+    # with visual artifacts like a line containing only "-".
+    tokens: list[str] = []
+    current = ""
+    for char in text:
+        current += char
+        if char in {"/", "-"}:
+            tokens.append(current)
+            current = ""
+    if current:
+        tokens.append(current)
+
+    lines: list[str] = []
+    line = ""
+    for token in tokens:
+        if not line:
+            line = token
+            continue
+        if len(line) + len(token) <= width:
+            line += token
+            continue
+        lines.append(line)
+        line = token
+    if line:
+        lines.append(line)
+    return lines or [text]
+
+
+def _endpoint_model_summary(row: EndpointInfo) -> tuple[str | None, str | None]:
+    explicit_display_name = (row.display_name or "").strip() or None
+
+    if row.backend == BackendType.VLLM:
+        model_id = (row.served_model_name or "").strip()
+        if not model_id and (row.model_name or "").strip():
+            model_id = default_served_model_name(row.model_name)
+        display_name = explicit_display_name or (row.model_name or row.served_model_name or "").strip() or None
+        return model_id or None, display_name
+
+    if row.backend == BackendType.LLAMACPP:
+        model_id = (row.served_model_name or "").strip()
+        if not model_id and (row.repo_id or "").strip():
+            model_id = default_llamacpp_served_model_name(row.repo_id, row.quant)
+        if explicit_display_name:
+            display_name = explicit_display_name
+        else:
+            repo = (row.repo_id or "").strip()
+            quant = (row.quant or "").strip()
+            if repo:
+                display_name = f"{repo} ({quant})" if quant else repo
+            else:
+                display_name = (row.served_model_name or "").strip() or None
+        return model_id or None, display_name or None
+
+    return (row.served_model_name or "").strip() or None, explicit_display_name
+
+
+def _render_deployment_status(rows: list[EndpointInfo], username: str = "") -> str:
+    if not rows:
+        return (
+            "[bold]Fleet Pulse[/bold]\n"
+            "[dim]No active launchpad deployments.[/dim]"
+        )
+
+    header_lines = _friendly_count_line(rows)
 
     display_rows = sorted(
         rows,
@@ -145,21 +407,46 @@ def _render_deployment_status(rows: list[EndpointInfo]) -> str:
             ),
             row.name.casefold(),
         ),
-    )[:8]
+    )
 
     app_lines = []
-    for row in display_rows:
-        backend = row.backend.value if row.backend is not None else "unknown"
-        instance = row.instance_name or "-"
+    for index, row in enumerate(display_rows):
+        instance = (row.instance_name or "").strip() or "default"
+        backend_name = _backend_display_name(row.backend)
         app_lines.append(
-            "  "
-            f"[bold]{_clip(backend, 8):<8}[/bold] "
-            f"{_clip(instance, 12):<12} "
-            f"{_clip(row.name, 20):<20} "
-            f"{_style_state(row.state)}"
+            f"[bold]{_escape_markup(instance)}[/bold]  "
+            f"[dim]{_escape_markup(backend_name)}[/dim]  {_style_runtime_bucket(_runtime_bucket(row))} "
+            f"[dim](modal: {_escape_markup((row.state or 'unknown').strip().lower())})[/dim]"
         )
-    if len(rows) > len(display_rows):
-        app_lines.append(f"[dim]  ... and {len(rows) - len(display_rows)} more[/dim]")
+
+        model_id, display_name = _endpoint_model_summary(row)
+        app_lines.append(f"[dim]Display name:[/dim] {_escape_markup(display_name or '')}")
+        app_lines.append(f"[dim]Model ID:[/dim] {_escape_markup(model_id or '')}")
+
+        base_url, _was_derived = _resolve_openai_base_url(row, username=username)
+        show_connection = _state_bucket(row.state) == "healthy" or bool((row.web_url or "").strip())
+        if base_url:
+            base_root = base_url.rstrip("/")
+            if base_root.endswith("/v1"):
+                host_url = base_root[: -len("/v1")] or base_root
+            else:
+                host_url = base_root
+
+            if show_connection:
+                app_lines.append(PANEL_SEPARATOR)
+                wrapped_url_lines = _wrap_url_for_panel(host_url)
+                if wrapped_url_lines:
+                    app_lines.append(f"  [dim]Base URL:[/dim] {_escape_markup(wrapped_url_lines[0])}")
+                    for line in wrapped_url_lines[1:]:
+                        app_lines.append(f"    {_escape_markup(line)}")
+                app_lines.append("  [dim]API key[/dim] ")
+            else:
+                app_lines.append("[dim]OpenAI URL will be available once deployment is running.[/dim]")
+        else:
+            app_lines.append("[dim]OpenAI URL unavailable (Modal app list has no web URL yet).[/dim]")
+
+        if index != len(display_rows) - 1:
+            app_lines.append("")
 
     return "\n".join(header_lines + app_lines)
 
@@ -307,7 +594,7 @@ def _render_billing_load_error(error: str) -> str:
     )
 
 
-class MainMenuScreen(Screen):
+class MainMenuScreen(CopyEnabledScreen):
     """Top-level menu: deploy, manage, settings."""
 
     BINDINGS = [
@@ -322,6 +609,7 @@ class MainMenuScreen(Screen):
         super().__init__()
         self.username = username
         self.version = version
+        self._hf_auth_refresh_inflight = False
         self._status_refresh_inflight = False
         self._billing_refresh_inflight = False
 
@@ -335,11 +623,6 @@ class MainMenuScreen(Screen):
                         f"[bold]{version_text}[/bold][dim]Modal LLM backends[/dim]",
                         classes="centered",
                     )
-                    if self.username:
-                        yield Static(
-                            f"[green]  Authenticated as {self.username}[/green]",
-                            id="auth-status",
-                        )
                     yield Static("")  # spacer
                     yield OptionList(
                         Option("  Deploy            Launch a new LLM backend", id="deploy"),
@@ -351,16 +634,50 @@ class MainMenuScreen(Screen):
                 with Vertical(id="deployment-status-panel"):
                     yield Static("[bold cyan]Deployment Status[/bold cyan]", id="deployment-status-title")
                     yield Static("[dim]Refreshing deployment status...[/dim]", id="deployment-status-body")
-                    yield Static("")
+                    yield Static(PANEL_SEPARATOR, id="deployment-billing-separator")
                     yield Static("[bold cyan]Modal Billing Report[/bold cyan]", id="billing-report-title")
                     yield Static("[dim]Refreshing billing report...[/dim]", id="billing-report-body")
+        yield Static(
+            _render_auth_status_block(username=self.username),
+            id="auth-status-block",
+        )
         yield Footer()
 
     def on_mount(self) -> None:
         """Focus the option list so arrow-key navigation works immediately."""
         self.query_one("#action-list", OptionList).focus()
+        self._refresh_hf_auth_status()
         self._refresh_panels()
         self.set_interval(20.0, self._refresh_panels)
+
+    def _refresh_hf_auth_status(self) -> None:
+        if self._hf_auth_refresh_inflight:
+            return
+        self._hf_auth_refresh_inflight = True
+        self.query_one("#auth-status-block", Static).update(
+            _render_auth_status_block(username=self.username)
+        )
+        self.run_worker(
+            self._run_load_hf_auth_status,
+            name="main-menu-hf-auth-worker",
+            thread=True,
+        )
+
+    def _run_load_hf_auth_status(self) -> None:
+        poster = getattr(self, "post_message", None)
+        if poster is None:
+            return
+        try:
+            status = get_huggingface_auth_status()
+        except Exception as exc:
+            status = HuggingFaceAuthStatus(authenticated=False, error=str(exc))
+        poster(HuggingFaceAuthLoaded(status=status))
+
+    def on_hugging_face_auth_loaded(self, message: HuggingFaceAuthLoaded) -> None:
+        self._hf_auth_refresh_inflight = False
+        self.query_one("#auth-status-block", Static).update(
+            _render_auth_status_block(username=self.username, hf_status=message.status)
+        )
 
     def _refresh_panels(self) -> None:
         self._refresh_deployment_status()
@@ -382,13 +699,15 @@ class MainMenuScreen(Screen):
         if poster is None:
             return
         try:
-            rows = ModalBackend.list_apps()
+            list_instances = getattr(self.app, "list_instances", None)  # type: ignore[attr-defined]
+            rows = list_instances() if callable(list_instances) else ModalBackend.list_apps()
         except Exception as exc:
             poster(DeploymentsLoadFailed(error=str(exc)))
             return
         if rows is None:
             poster(DeploymentsLoadFailed(error="Could not read Modal app list."))
             return
+        _annotate_runtime_statuses(rows, self.username)
         poster(DeploymentsLoaded(rows=[row for row in rows if row.backend is not None]))
 
     def _refresh_billing_report(self) -> None:
@@ -419,7 +738,9 @@ class MainMenuScreen(Screen):
     def on_deployments_loaded(self, message: DeploymentsLoaded) -> None:
         self._status_refresh_inflight = False
         visible_rows = [row for row in message.rows if _should_show_in_panel(row.state)]
-        self.query_one("#deployment-status-body", Static).update(_render_deployment_status(visible_rows))
+        self.query_one("#deployment-status-body", Static).update(
+            _render_deployment_status(visible_rows, username=self.username)
+        )
 
     def on_deployments_load_failed(self, message: DeploymentsLoadFailed) -> None:
         self._status_refresh_inflight = False

@@ -149,10 +149,11 @@ class ModalBackend:
                     "messages": [{"role": "user", "content": content}],
                 },
             )
+        model = (served_model_name or "").strip() or "default"
         return _curl_json(
             "/v1/completions",
             {
-                "model": "default",
+                "model": model,
                 "prompt": content,
                 "max_tokens": 32,
             },
@@ -170,6 +171,10 @@ class ModalBackend:
             env["MODAL_APP_NAME"] = config.app_name
         if config.function_slug:
             env["MODAL_FUNCTION_SLUG"] = config.function_slug
+        if config.backend == BackendType.LLAMACPP:
+            if config.llamacpp_image_no_cache is not None:
+                env["LLAMA_CPP_IMAGE_NO_CACHE"] = "true" if config.llamacpp_image_no_cache else "false"
+            return env
         if config.backend != BackendType.VLLM:
             return env
         if config.model_name:
@@ -186,6 +191,8 @@ class ModalBackend:
             env["TRUST_REMOTE_CODE"] = "true" if config.trust_remote_code else "false"
         if config.reasoning_parser:
             env["REASONING_PARSER"] = config.reasoning_parser
+        if config.tool_call_parser:
+            env["TOOL_CALL_PARSER"] = config.tool_call_parser
         if config.default_chat_template_kwargs:
             env["DEFAULT_CHAT_TEMPLATE_KWARGS"] = config.default_chat_template_kwargs
         return env
@@ -471,6 +478,31 @@ class ModalBackend:
         yield from ModalBackend.run_streaming(cmd, env=env)
 
     @staticmethod
+    def run_modal_script_entrypoint_capture(
+        script: str,
+        entrypoint: str,
+        args: Optional[List[str]] = None,
+        env: Optional[Dict[str, str]] = None,
+    ) -> Optional[tuple[int, str, str]]:
+        """Run `modal run <script>::<entrypoint>` and capture stdout/stderr."""
+        cmd = ModalBackend.build_modal_entrypoint_command(script, entrypoint, args=args)
+        merged = {**os.environ, **(env or {})}
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=merged,
+                timeout=ModalBackend._CLI_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            return None
+        except Exception:
+            return None
+        return result.returncode, result.stdout or "", result.stderr or ""
+
+    @staticmethod
     def run_volume_remove(
         volume_name: str,
         remote_path: str,
@@ -498,6 +530,86 @@ class ModalBackend:
 # ------------------------------------------------------------------
 # Internal helpers
 # ------------------------------------------------------------------
+
+def _non_empty_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _nested_string_for_keys(
+    value: Any,
+    keys: set[str],
+    *,
+    max_depth: int = 6,
+) -> Optional[str]:
+    """Depth-limited search for a string value by key name (case-insensitive)."""
+    if max_depth < 0:
+        return None
+
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if str(key).strip().lower() in keys:
+                text = _non_empty_text(child)
+                if text:
+                    return text
+        for child in value.values():
+            found = _nested_string_for_keys(child, keys, max_depth=max_depth - 1)
+            if found:
+                return found
+        return None
+
+    if isinstance(value, list):
+        for child in value:
+            found = _nested_string_for_keys(child, keys, max_depth=max_depth - 1)
+            if found:
+                return found
+        return None
+
+    return None
+
+
+def _collect_modal_web_urls(value: Any, *, max_depth: int = 6) -> List[str]:
+    """Collect Modal web URLs found anywhere in a nested JSON-like payload."""
+    if max_depth < 0:
+        return []
+
+    urls: List[str] = []
+    if isinstance(value, dict):
+        for child in value.values():
+            urls.extend(_collect_modal_web_urls(child, max_depth=max_depth - 1))
+        return urls
+
+    if isinstance(value, list):
+        for child in value:
+            urls.extend(_collect_modal_web_urls(child, max_depth=max_depth - 1))
+        return urls
+
+    if isinstance(value, str):
+        maybe_url = ModalBackend.extract_modal_web_url(value)
+        if maybe_url:
+            urls.append(maybe_url)
+    return urls
+
+
+def _extract_item_web_url(item: dict[str, Any]) -> Optional[str]:
+    """Best-effort extraction of a Modal web URL from one app-list row."""
+    for key in ("web_url", "webUrl", "url", "URL"):
+        candidate = item.get(key)
+        if isinstance(candidate, str):
+            maybe_url = ModalBackend.extract_modal_web_url(candidate)
+            if maybe_url:
+                return maybe_url
+
+    urls = _collect_modal_web_urls(item)
+    if not urls:
+        return None
+
+    unique_urls = list(dict.fromkeys(urls))
+    unique_urls.sort(key=lambda url: (url.endswith("-dev.modal.run"), len(url)))
+    return unique_urls[0]
+
 
 def _extract_modal_app_rows(payload: Any) -> List[EndpointInfo]:
     rows: List[EndpointInfo] = []
@@ -537,6 +649,10 @@ def _extract_modal_app_rows(payload: Any) -> List[EndpointInfo]:
         ).strip()
         backend = infer_backend_from_app_name(name)
         instance = infer_instance_from_app_name(name, backend)
+        served_model_name = _nested_string_for_keys(item, {"served_model_name"})
+        model_name = _nested_string_for_keys(item, {"model_name"})
+        repo_id = _nested_string_for_keys(item, {"repo_id", "model_repo_id"})
+        quant = _nested_string_for_keys(item, {"quant"})
         rows.append(
             EndpointInfo(
                 name=name,
@@ -544,6 +660,11 @@ def _extract_modal_app_rows(payload: Any) -> List[EndpointInfo]:
                 state=state,
                 backend=backend,
                 instance_name=instance,
+                web_url=_extract_item_web_url(item),
+                served_model_name=served_model_name,
+                model_name=model_name,
+                repo_id=repo_id,
+                quant=quant,
             )
         )
     return rows

@@ -8,8 +8,10 @@ from llm_launchpad.tui.screens.main_menu import (
     _render_billing_load_error,
     _render_billing_report,
     _render_deployment_status,
+    _render_hf_auth_status,
     _should_show_in_panel,
 )
+from llm_launchpad.core.hf_auth import HuggingFaceAuthStatus
 
 
 class MainMenuStatusRenderTests(unittest.TestCase):
@@ -25,6 +27,9 @@ class MainMenuStatusRenderTests(unittest.TestCase):
                 state="running",
                 backend=BackendType.VLLM,
                 instance_name="qwen",
+                web_url="https://alice--vllm-qwen-serve.modal.run",
+                served_model_name="Qwen3-4B",
+                model_name="Qwen/Qwen3-4B",
             ),
             EndpointInfo(
                 name="llamacpp-phi",
@@ -32,6 +37,9 @@ class MainMenuStatusRenderTests(unittest.TestCase):
                 state="deploying",
                 backend=BackendType.LLAMACPP,
                 instance_name="phi",
+                web_url="https://alice--llamacpp-phi-serve-abc123.modal.run",
+                repo_id="unsloth/phi-gguf",
+                quant="Q4_K_M",
             ),
             EndpointInfo(
                 name="vllm-broken",
@@ -42,16 +50,24 @@ class MainMenuStatusRenderTests(unittest.TestCase):
             ),
         ]
 
-        rendered = _render_deployment_status(rows)
-        self.assertIn("deployments=3", rendered)
-        self.assertIn("healthy=1", rendered)
-        self.assertIn("pending=1", rendered)
-        self.assertIn("issues=1", rendered)
-        self.assertIn("vllm-qwen", rendered)
-        self.assertIn("llamacpp-phi", rendered)
-        self.assertIn("vllm-broken", rendered)
+        rendered = _render_deployment_status(rows, username="alice")
+        self.assertIn("3 active deployments", rendered)
+        self.assertIn("1 healthy", rendered)
+        self.assertIn("1 in progress", rendered)
+        self.assertIn("1 error", rendered)
+        self.assertIn("qwen", rendered)
+        self.assertIn("phi", rendered)
+        self.assertIn("broken", rendered)
+        self.assertIn("modal: running", rendered)
+        self.assertIn("modal: deploying", rendered)
+        self.assertIn("modal: failed", rendered)
+        self.assertIn("Base URL:", rendered)
+        self.assertIn("Display name:", rendered)
+        self.assertIn("Model ID:", rendered)
+        self.assertIn("Qwen3-4B", rendered)
+        self.assertIn("https://alice--vllm-qwen-serve.modal.run", rendered)
 
-    def test_render_deployment_status_truncates_long_names(self) -> None:
+    def test_render_deployment_status_derives_base_url_when_web_url_missing(self) -> None:
         rows = [
             EndpointInfo(
                 name="vllm-very-very-very-very-long-application-name",
@@ -62,8 +78,10 @@ class MainMenuStatusRenderTests(unittest.TestCase):
             )
         ]
 
-        rendered = _render_deployment_status(rows)
-        self.assertIn("...", rendered)
+        rendered = _render_deployment_status(rows, username="alice")
+        self.assertIn("https://alice--vllm-very-very-very-very-", rendered)
+        self.assertIn("long-application-name-serve.modal.run", rendered)
+        self.assertIn("API key", rendered)
 
     def test_should_show_in_panel_hides_stopped(self) -> None:
         self.assertFalse(_should_show_in_panel("stopped"))
@@ -112,6 +130,24 @@ class MainMenuStatusRenderTests(unittest.TestCase):
     def test_render_billing_load_error_escapes_rich_markup_chars(self) -> None:
         rendered = _render_billing_load_error("Usage: modal [OPTIONS] COMMAND")
         self.assertIn("modal \\[OPTIONS\\] COMMAND", rendered)
+
+    def test_render_hf_auth_status_shows_authenticated_username(self) -> None:
+        rendered = _render_hf_auth_status(
+            HuggingFaceAuthStatus(authenticated=True, username="alice")
+        )
+        self.assertIn("Hugging Face authenticated as alice", rendered)
+
+    def test_render_hf_auth_status_shows_login_hint_when_unauthenticated(self) -> None:
+        rendered = _render_hf_auth_status(HuggingFaceAuthStatus(authenticated=False))
+        self.assertIn("Hugging Face not authenticated", rendered)
+        self.assertIn("hf auth login", rendered)
+
+    def test_render_hf_auth_status_shows_invalid_token_error(self) -> None:
+        rendered = _render_hf_auth_status(
+            HuggingFaceAuthStatus(authenticated=False, error="Invalid Hugging Face token")
+        )
+        self.assertIn("auth check failed", rendered)
+        self.assertIn("Invalid Hugging Face token", rendered)
 
 
 if __name__ == "__main__":

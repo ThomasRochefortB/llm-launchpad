@@ -5,10 +5,10 @@ import unittest
 from textual.app import App
 from textual.widgets import Log, Static
 
-from llm_launchpad.protocol.enums import OperationType
+from llm_launchpad.protocol.enums import BackendType, DeploymentState, OperationType
 from llm_launchpad.tui.screens.monitor import MonitorScreen
 from llm_launchpad.tui.widgets.log_viewer import SelectableLog
-from llm_launchpad.tui.workers import LogMessage, OperationDone, OperationError
+from llm_launchpad.tui.workers import LogMessage, OperationDone, OperationError, StateChanged
 
 
 class _TestApp(App[None]):
@@ -94,6 +94,87 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("[red", content)
             self.assertNotIn("[green", content)
             self.assertNotIn("[dim]", content)
+
+    async def test_summary_mode_normalizes_backend_log_lines(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(
+                MonitorScreen(
+                    title="Deploy",
+                    deploy_backend=BackendType.VLLM,
+                    summarize_backend_logs=True,
+                    show_debug_logs=False,
+                )
+            )
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, MonitorScreen)
+            screen.on_state_changed(
+                StateChanged(
+                    state=DeploymentState.WARMING_UP,
+                    operation=OperationType.WARMUP,
+                    detail="warming",
+                )
+            )
+            screen.on_log_message(LogMessage("(APIServer pid=4) INFO 02-25 03:08:40 vLLM API server version 0.13.0"))
+            await pilot.pause()
+
+            content = "\n".join(screen.log_viewer.log_widget.lines)
+            self.assertIn("Log view: summary (normalized milestones; raw backend logs hidden)", content)
+            self.assertIn("Starting server", content)
+            self.assertNotIn("vLLM API server version", content)
+
+    async def test_debug_mode_preserves_raw_backend_log_lines(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(
+                MonitorScreen(
+                    title="Deploy",
+                    deploy_backend=BackendType.VLLM,
+                    summarize_backend_logs=True,
+                    show_debug_logs=True,
+                )
+            )
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, MonitorScreen)
+            raw_line = "(APIServer pid=4) INFO 02-25 03:08:40 vLLM API server version 0.13.0"
+            screen.on_log_message(LogMessage(raw_line))
+            await pilot.pause()
+
+            content = "\n".join(screen.log_viewer.log_widget.lines)
+            self.assertIn(raw_line, content)
+            self.assertNotIn("Log view: summary (normalized milestones; raw backend logs hidden)", content)
+
+    async def test_summary_mode_failure_appends_debug_hint(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(
+                MonitorScreen(
+                    title="Deploy",
+                    deploy_backend=BackendType.LLAMACPP,
+                    summarize_backend_logs=True,
+                    show_debug_logs=False,
+                )
+            )
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, MonitorScreen)
+            screen.on_operation_done(
+                OperationDone(
+                    operation=OperationType.WARMUP,
+                    success=False,
+                    exit_code=1,
+                    detail="timed out",
+                )
+            )
+            await pilot.pause()
+
+            content = "\n".join(screen.log_viewer.log_widget.lines)
+            self.assertIn('Tip: re-run with "Show debug logs" enabled to see full backend logs.', content)
 
     async def test_log_widget_is_selectable_log(self) -> None:
         """LogViewer should use SelectableLog (not plain Log) for line selection."""

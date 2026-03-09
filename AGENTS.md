@@ -38,3 +38,4 @@
 ## Security & Configuration Tips
 - Never commit credentials (`modal setup`, HF tokens).
 - Use environment variables for runtime config (`GPU_CONFIG`, `MODEL_NAME`, `HUGGINGFACE_HUB_TOKEN`).
+- llama.cpp Modal backend image selection/refresh is env-driven (`LLAMA_CPP_IMAGE_REF`, `LLAMA_CPP_IMAGE_NO_CACHE`, `LLAMA_CPP_SERVER_BIN`); prefer cache reuse by default and use `LLAMA_CPP_IMAGE_NO_CACHE=true` only when forcing a fresh latest-image pull.

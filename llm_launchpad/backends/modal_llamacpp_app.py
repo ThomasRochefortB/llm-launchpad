@@ -5,6 +5,7 @@ import os
 import time
 import fnmatch
 import re
+import shutil
 import subprocess
 import sys
 from uuid import uuid4
@@ -72,8 +73,62 @@ def _read_int_env(name: str, default: int) -> int:
         raise RuntimeError(f"Environment variable {name} must be an integer, got: {raw!r}") from None
 
 
+def _read_bool_env(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    return raw.lower() in {"1", "true", "yes", "on"}
+
+
+def _read_optional_bool_env(name: str) -> Optional[bool]:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return None
+    return raw.lower() in {"1", "true", "yes", "on"}
+
+
+def _default_llamacpp_served_model_name(
+    repo_id: Optional[str],
+    quant: Optional[str] = None,
+    default: str = "default",
+) -> str:
+    candidate = (repo_id or "").strip()
+    if not candidate:
+        alias = default
+    else:
+        alias = candidate.rsplit("/", 1)[-1].strip() or default
+    quant_text = (quant or "").strip()
+    if not quant_text:
+        return alias
+    if quant_text.casefold() in alias.casefold():
+        return alias
+    return f"{alias}-{quant_text}"
+
+
+def _server_args_define_alias(args: Optional[List[str]]) -> bool:
+    if not args:
+        return False
+    return any(token in {"--alias", "-a"} for token in args)
+
+
 PREDOWNLOAD_TIMEOUT_MINUTES = _read_int_env("PREDOWNLOAD_TIMEOUT_MINUTES", 6 * 60)
-SNAPSHOT_MAX_WORKERS = _read_int_env("HF_SNAPSHOT_MAX_WORKERS", 16)
+SNAPSHOT_MAX_WORKERS = _read_int_env("HF_SNAPSHOT_MAX_WORKERS", 32)
+DOWNLOAD_CPU = _read_int_env("HF_DOWNLOAD_CPU", 4)
+LLAMA_CPP_IMAGE_REF = (
+    os.environ.get("LLAMA_CPP_IMAGE_REF", "ghcr.io/ggml-org/llama.cpp:server-cuda").strip()
+    or "ghcr.io/ggml-org/llama.cpp:server-cuda"
+)
+LLAMA_CPP_IMAGE_NO_CACHE = _read_optional_bool_env("LLAMA_CPP_IMAGE_NO_CACHE")
+# Prefer cached image layers by default. Set LLAMA_CPP_IMAGE_NO_CACHE=true (or LLAMA_CPP_IMAGE_FORCE_BUILD=true)
+# to force a fresh pull/build from the latest tag.
+_llama_cpp_force_build_override = _read_optional_bool_env("LLAMA_CPP_IMAGE_FORCE_BUILD")
+if _llama_cpp_force_build_override is not None:
+    LLAMA_CPP_IMAGE_FORCE_BUILD = _llama_cpp_force_build_override
+elif LLAMA_CPP_IMAGE_NO_CACHE is not None:
+    LLAMA_CPP_IMAGE_FORCE_BUILD = LLAMA_CPP_IMAGE_NO_CACHE
+else:
+    LLAMA_CPP_IMAGE_FORCE_BUILD = False
+LLAMA_CPP_SERVER_BIN = os.environ.get("LLAMA_CPP_SERVER_BIN", "/app/llama-server").strip() or "/app/llama-server"
 
 
 # --- Model configuration (from Hugging Face)
@@ -83,11 +138,14 @@ QUANT = "Q4_K_M"
 
 
 # --- Persistent cache for model weights (shared with vLLM)
-cache_dir = "/root/.cache/huggingface"
-model_cache = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
-CONFIG_PATH = f"{cache_dir}/serve_config.json"
-HF_HUB_DIR = Path(cache_dir) / "hub"
+HF_CACHE_VOLUME_NAME = "huggingface-cache"
+HF_CACHE_DIR = "/root/.cache/huggingface"
+cache_dir = HF_CACHE_DIR  # backwards-compatible alias used throughout this module
+model_cache = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing=True)
+CONFIG_PATH = f"{HF_CACHE_DIR}/serve_config.json"
+HF_HUB_DIR = Path(HF_CACHE_DIR) / "hub"
 _GGUF_QUANT_RE = re.compile(r"(Q\d(?:_[A-Z0-9]+)+|IQ\d+_[A-Z0-9_]+)", flags=re.IGNORECASE)
+_GGUF_SPLIT_RE = re.compile(r"-(\d+)-of-(\d+)\.gguf$", flags=re.IGNORECASE)
 
 # --- Simple presets for convenience (model-agnostic)
 # Note: Import presets lazily inside the local entrypoint to avoid container import issues.
@@ -174,10 +232,86 @@ def _collect_hub_gguf_matches(
         return []
     matches: list[str] = []
     for gguf in snapshot_dir.glob("**/*.gguf"):
-        if any(fnmatch.fnmatch(gguf.name, pat) for pat in allow_patterns):
+        if _matches_any_pattern(gguf.name, allow_patterns):
+            matches.append(str(gguf.relative_to(cache_dir)))
+    for gguf in snapshot_dir.glob("**/*.GGUF"):
+        if _matches_any_pattern(gguf.name, allow_patterns):
             matches.append(str(gguf.relative_to(cache_dir)))
     matches.sort()
     return matches
+
+
+def _matches_any_pattern(name: str, patterns: list[str]) -> bool:
+    """Case-insensitive fnmatch to tolerate mixed-case quant/file naming."""
+    folded = name.casefold()
+    return any(fnmatch.fnmatch(folded, pat.casefold()) for pat in patterns)
+
+
+def _gguf_allow_patterns(quant: Optional[str]) -> list[str]:
+    """Build HF allow_patterns that tolerate common case variants."""
+    if not quant:
+        return ["*.gguf", "*.GGUF"]
+
+    quant_variants: list[str] = []
+    for value in (quant, quant.upper(), quant.lower()):
+        if value not in quant_variants:
+            quant_variants.append(value)
+
+    patterns: list[str] = []
+    for q in quant_variants:
+        for ext in (".gguf", ".GGUF"):
+            pattern = f"*{q}*{ext}"
+            if pattern not in patterns:
+                patterns.append(pattern)
+    return patterns
+
+
+def _snapshot_gguf_candidates(snapshot_dir: Path, quant: Optional[str]) -> list[Path]:
+    quant_folded = quant.casefold() if quant else None
+    candidates: list[Path] = []
+    for path in snapshot_dir.glob("**/*"):
+        if not path.is_file():
+            continue
+        if path.suffix.casefold() != ".gguf":
+            continue
+        if quant_folded and quant_folded not in path.name.casefold():
+            continue
+        candidates.append(path)
+    return candidates
+
+
+def _raise_missing_gguf_match(
+    repo_id: str,
+    allow_patterns: list[str],
+    revision: Optional[str],
+) -> None:
+    patterns = ", ".join(repr(pat) for pat in allow_patterns) if allow_patterns else "'*.gguf'"
+    revision_text = f", revision={revision}" if revision else ""
+    raise RuntimeError(
+        "No GGUF files matched the requested repo/quant for llama.cpp "
+        f"(repo_id={repo_id!r}, patterns=[{patterns}]{revision_text}). "
+        "Use a GGUF repo and the correct quant name, or omit the quant filter."
+    )
+
+
+def _resolve_or_download_model_entrypoint(
+    repo_id: str,
+    revision: Optional[str],
+    quant: Optional[str],
+) -> Path:
+    """Resolve a cached GGUF path first; download only on cache miss."""
+    try:
+        model_path = _resolve_model_entrypoint(repo_id, revision, quant)
+        print(f"🦙 cache hit: using cached GGUF for {repo_id}")
+        return model_path
+    except RuntimeError as exc:
+        print(f"🦙 cache miss for requested model ({exc}); downloading...")
+
+    allow_patterns = _gguf_allow_patterns(quant)
+    matches = download_model.remote(repo_id, allow_patterns, revision)
+    if not matches:
+        _raise_missing_gguf_match(repo_id, allow_patterns, revision)
+    return _resolve_model_entrypoint(repo_id, revision, quant)
 
 
 def _extract_quant(path: str) -> Optional[str]:
@@ -187,27 +321,50 @@ def _extract_quant(path: str) -> Optional[str]:
     return None
 
 
-# --- Build llama.cpp with CUDA support
-cuda_version = "12.4.0"  # should be <= host CUDA version
-flavor = "devel"  # includes full CUDA toolkit
-operating_sys = "ubuntu22.04"
-tag = f"{cuda_version}-{flavor}-{operating_sys}"
+def _gguf_split_index(path: Path) -> Optional[int]:
+    match = _GGUF_SPLIT_RE.search(path.name)
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
 
 
+def _pick_preferred_gguf_entrypoint(candidates: list[Path]) -> Path:
+    """Choose a loadable GGUF path, preferring the first shard for split GGUF sets."""
+    split_first: list[Path] = []
+    unsplit: list[Path] = []
+    split_nonfirst: list[Path] = []
+
+    for candidate in candidates:
+        split_idx = _gguf_split_index(candidate)
+        if split_idx is None:
+            unsplit.append(candidate)
+        elif split_idx == 1:
+            split_first.append(candidate)
+        else:
+            split_nonfirst.append(candidate)
+
+    def _largest(paths: list[Path]) -> Path:
+        paths.sort(key=lambda p: (p.stat().st_size, str(p)), reverse=True)
+        return paths[0]
+
+    if split_first:
+        return _largest(split_first)
+    if unsplit:
+        return _largest(unsplit)
+    return _largest(split_nonfirst)
+
+
+# --- Use official llama.cpp GHCR server image (CUDA build) and add Python for Modal functions
 image = (
-    modal.Image.from_registry(f"nvidia/cuda:{tag}", add_python="3.12")
-    .apt_install("git", "build-essential", "cmake", "curl", "libcurl4-openssl-dev")
-    .run_commands("git clone https://github.com/ggerganov/llama.cpp")
-    .run_commands(
-        "cmake llama.cpp -B llama.cpp/build "
-        "-DBUILD_SHARED_LIBS=OFF -DGGML_CUDA=ON -DLLAMA_CURL=ON "
+    modal.Image.from_registry(
+        LLAMA_CPP_IMAGE_REF,
+        add_python="3.12",
+        force_build=LLAMA_CPP_IMAGE_FORCE_BUILD,
     )
-    .run_commands(
-        # build cli and server binaries
-        "cmake --build llama.cpp/build --config Release -j --clean-first --target llama-quantize llama-cli llama-server"
-    )
-    .run_commands("cp llama.cpp/build/bin/llama-* llama.cpp")
-    .entrypoint([])  # remove NVIDIA base container entrypoint
+    .entrypoint([])  # clear image entrypoint so Modal can run Python function code
 )
 
 
@@ -229,6 +386,7 @@ download_image = (
     image=download_image,
     volumes={cache_dir: model_cache},
     timeout=PREDOWNLOAD_TIMEOUT_MINUTES * MINUTES,
+    cpu=DOWNLOAD_CPU,
 )
 def download_model(
     repo_id: str = REPO_ID,
@@ -248,7 +406,7 @@ def _download_model_files(
     revision: Optional[str],
 ) -> List[str]:
     if allow_patterns is None:
-        allow_patterns = [f"*{QUANT}*.gguf"] if QUANT else ["*.gguf"]
+        allow_patterns = _gguf_allow_patterns(QUANT)
 
     print(
         f"🦙 downloading {repo_id} (patterns: {allow_patterns}, revision: {revision}) "
@@ -313,22 +471,26 @@ def _snapshot_download_with_keepalive(
     stalled_intervals = 0
     while process.poll() is None:
         elapsed = int(time.time() - started)
-        size_bytes, file_count = _estimate_matched_snapshot_size(
+        complete_bytes, complete_files = _estimate_matched_snapshot_size(
             repo_id=repo_id,
             revision=revision,
             allow_patterns=allow_patterns,
         )
-        size_gib = size_bytes / (1024**3)
-        rate_mib_s = (size_bytes / (1024**2)) / elapsed if elapsed > 0 else 0.0
-        if size_bytes > last_bytes:
+        inflight_bytes, inflight_files = _estimate_incomplete_blob_size(repo_id=repo_id)
+        observed_bytes = complete_bytes + inflight_bytes
+        observed_files = complete_files + inflight_files
+        size_gib = observed_bytes / (1024**3)
+        rate_mib_s = (observed_bytes / (1024**2)) / elapsed if elapsed > 0 else 0.0
+        if observed_bytes > last_bytes:
             stalled_intervals = 0
         else:
             stalled_intervals += 1
-        last_bytes = size_bytes
+        last_bytes = observed_bytes
         stall_note = " (no growth detected)" if stalled_intervals >= 3 else ""
         print(
             "🦙 download in progress... "
-            f"elapsed={elapsed}s files={file_count} size={size_gib:.2f}GiB "
+            f"elapsed={elapsed}s files={observed_files} size={size_gib:.2f}GiB "
+            f"complete={complete_files} inflight={inflight_files} "
             f"avg_rate={rate_mib_s:.2f}MiB/s{stall_note}"
         )
         time.sleep(keepalive_interval_seconds)
@@ -351,7 +513,26 @@ def _estimate_matched_snapshot_size(
     for path in snapshot_dir.glob("**/*"):
         if not path.is_file():
             continue
-        if allow_patterns and not any(fnmatch.fnmatch(path.name, pat) for pat in allow_patterns):
+        if allow_patterns and not _matches_any_pattern(path.name, allow_patterns):
+            continue
+        file_count += 1
+        try:
+            total_bytes += path.stat().st_size
+        except OSError:
+            continue
+    return total_bytes, file_count
+
+
+def _estimate_incomplete_blob_size(repo_id: str) -> tuple[int, int]:
+    """Estimate active download size from .incomplete blob files."""
+    blobs_dir = _hub_model_dir(repo_id) / "blobs"
+    if not blobs_dir.exists() or not blobs_dir.is_dir():
+        return 0, 0
+
+    total_bytes = 0
+    file_count = 0
+    for path in blobs_dir.glob("*.incomplete"):
+        if not path.is_file():
             continue
         file_count += 1
         try:
@@ -365,6 +546,7 @@ def _estimate_matched_snapshot_size(
     image=download_image,
     volumes={cache_dir: model_cache},
     timeout=PREDOWNLOAD_TIMEOUT_MINUTES * MINUTES,
+    cpu=DOWNLOAD_CPU,
 )
 def predownload_model(
     repo_id: str,
@@ -372,7 +554,7 @@ def predownload_model(
     revision: Optional[str] = None,
 ) -> List[str]:
     """Pre-download model files for storage management workflows."""
-    allow_patterns = [f"*{quant}*.gguf"] if quant else ["*.gguf"]
+    allow_patterns = _gguf_allow_patterns(quant)
     return _download_model_files(repo_id, allow_patterns, revision)
 
 
@@ -410,7 +592,7 @@ def list_downloaded_models() -> List[Dict[str, Any]]:
                             "quant": quant,
                             "size_bytes": 0,
                             "file_count": 0,
-                            "source_volume": "huggingface-cache",
+                            "source_volume": HF_CACHE_VOLUME_NAME,
                             "paths": [],
                         }
                         grouped[key] = entry
@@ -421,6 +603,15 @@ def list_downloaded_models() -> List[Dict[str, Any]]:
     return list(grouped.values())
 
 
+@app.local_entrypoint()
+def list_downloaded_models_json() -> None:
+    """Print cached llama.cpp models as JSON for local tooling."""
+    rows = list_downloaded_models.remote()
+    print("LLM_LAUNCHPAD_STORAGE_JSON_BEGIN")
+    print(json.dumps(rows, separators=(",", ":")))
+    print("LLM_LAUNCHPAD_STORAGE_JSON_END")
+
+
 DEFAULT_SERVER_ARGS = [
     "--ctx-size",
     "32768",
@@ -429,30 +620,85 @@ DEFAULT_SERVER_ARGS = [
 ]
 
 
+def _resolve_llama_server_binary() -> str:
+    """Resolve llama-server binary path for official docker image with PATH fallback."""
+    configured = os.environ.get("LLAMA_CPP_SERVER_BIN", LLAMA_CPP_SERVER_BIN).strip() or LLAMA_CPP_SERVER_BIN
+    candidates: list[str] = []
+    for candidate in (configured, "llama-server"):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+
+    for candidate in candidates:
+        if os.path.isabs(candidate):
+            if Path(candidate).exists():
+                return candidate
+            continue
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+
+    raise RuntimeError(
+        "Could not find llama-server binary. "
+        f"Tried {candidates}. Set LLAMA_CPP_SERVER_BIN to the correct path in the image."
+    )
+
+
+def _llama_server_runtime_env(server_bin: str) -> tuple[dict[str, str], Optional[str]]:
+    """Prepare env/cwd so official docker image shared libs resolve under Modal."""
+    env = dict(os.environ)
+
+    ld_entries: list[str] = []
+    if os.path.isabs(server_bin):
+        bin_dir = str(Path(server_bin).parent)
+        if bin_dir:
+            ld_entries.append(bin_dir)
+    if "/app" not in ld_entries:
+        ld_entries.append("/app")
+
+    existing_ld = env.get("LD_LIBRARY_PATH", "").strip()
+    if existing_ld:
+        ld_entries.append(existing_ld)
+    env["LD_LIBRARY_PATH"] = ":".join(entry for entry in ld_entries if entry)
+
+    cwd: Optional[str] = "/app" if Path("/app").is_dir() else None
+    return env, cwd
+
+
 def _resolve_model_entrypoint(
     repo_id: Optional[str],
     revision: Optional[str],
     quant: Optional[str],
 ) -> Path:
     """Pick a GGUF file from HF hub cache."""
-    pattern = f"**/*{quant}*.gguf" if quant else "**/*.gguf"
-
     if repo_id:
         snapshot_dir = _resolve_hub_snapshot_dir(repo_id, revision)
-        scoped_candidates = list(snapshot_dir.glob(pattern)) if snapshot_dir else []
+        if snapshot_dir is None:
+            raise RuntimeError(
+                f"No cached snapshot found for repo {repo_id!r} in HF cache {HF_HUB_DIR}"
+            )
+        scoped_candidates = _snapshot_gguf_candidates(snapshot_dir, quant)
         if scoped_candidates:
-            scoped_candidates.sort(key=lambda p: p.stat().st_size, reverse=True)
-            return scoped_candidates[0]
+            return _pick_preferred_gguf_entrypoint(scoped_candidates)
+        if quant:
+            raise RuntimeError(
+                f"No GGUF files matching '*{quant}*.gguf' found for repo {repo_id!r} "
+                f"in cached snapshot {snapshot_dir}"
+            )
+        raise RuntimeError(
+            f"No GGUF files found for repo {repo_id!r} in cached snapshot {snapshot_dir}"
+        )
 
-    candidates = list(HF_HUB_DIR.glob(f"models--*/snapshots/{pattern}"))
+    candidates: list[Path] = []
+    for snapshot_dir in HF_HUB_DIR.glob("models--*/snapshots/*"):
+        if snapshot_dir.is_dir():
+            candidates.extend(_snapshot_gguf_candidates(snapshot_dir, quant))
     if not candidates:
         if quant:
             raise RuntimeError(
                 f"No GGUF files matching '*{quant}*.gguf' in HF cache {HF_HUB_DIR}"
             )
         raise RuntimeError(f"No GGUF files found in HF cache {HF_HUB_DIR}")
-    candidates.sort(key=lambda p: p.stat().st_size, reverse=True)
-    return candidates[0]
+    return _pick_preferred_gguf_entrypoint(candidates)
 
 
 try:
@@ -462,6 +708,7 @@ except Exception:
 
 
 @app.function(
+    name=_function_name("serve"),
     image=image,
     volumes={cache_dir: model_cache},
     gpu=GPU_CONFIG,
@@ -482,23 +729,29 @@ def serve():
     model_repo_id = cfg.get("repo_id", REPO_ID)
     quant = cfg.get("quant", QUANT)
     revision = cfg.get("revision", None)
+    served_model_name = str(
+        cfg.get("served_model_name") or _default_llamacpp_served_model_name(model_repo_id, quant)
+    ).strip() or _default_llamacpp_served_model_name(model_repo_id, quant)
     extra_server_args: Optional[List[str]] = cfg.get("server_args")
     host = str(cfg.get("host", "0.0.0.0"))
     port = int(cfg.get("port", 8080))
 
-    # Ensure the weights are present (download once and persist in Volume)
-    allow_patterns = [f"*{quant}*.gguf"] if quant else ["*.gguf"]
-    download_model.remote(model_repo_id, allow_patterns, revision)
-
-    model_path = _resolve_model_entrypoint(model_repo_id, revision, quant)
+    # Prefer cached GGUFs already in the shared volume; download only on cache miss.
+    model_path = _resolve_or_download_model_entrypoint(model_repo_id, revision, quant)
     print(f"🦙 using model file: {model_path}")
 
     # offload all layers to GPU if configured, or use explicit override
     n_gpu_layers_cfg = cfg.get("n_gpu_layers")
     n_gpu_layers = int(n_gpu_layers_cfg) if n_gpu_layers_cfg is not None else (9999 if GPU_CONFIG else 0)
+    server_bin = _resolve_llama_server_binary()
+    server_env, server_cwd = _llama_server_runtime_env(server_bin)
+    print(f"🦙 using llama-server binary: {server_bin}")
+    if server_cwd:
+        print(f"🦙 using llama-server cwd: {server_cwd}")
 
+    server_args = extra_server_args or DEFAULT_SERVER_ARGS
     command = [
-        "/llama.cpp/llama-server",
+        server_bin,
         "--model",
         str(model_path),
         "--n-gpu-layers",
@@ -508,13 +761,16 @@ def serve():
         "--port",
         str(port),
         "--metrics",  # Enable metrics endpoint
-    ] + (extra_server_args or DEFAULT_SERVER_ARGS)
+    ]
+    if not _server_args_define_alias(server_args):
+        command += ["--alias", served_model_name]
+    command += server_args
 
     print("🦙 starting llama-server:")
     print(" ", " ".join(command))
 
     # Start server process; the web_server decorator will keep the container alive
-    subprocess.Popen(command)
+    subprocess.Popen(command, env=server_env, cwd=server_cwd)
 
 
 @app.function(
@@ -573,6 +829,10 @@ def main(
     cfg.setdefault("repo_id", REPO_ID)
     cfg.setdefault("quant", QUANT)
     cfg.setdefault("revision", None)
+    cfg["served_model_name"] = _default_llamacpp_served_model_name(
+        cfg.get("repo_id"),
+        cfg.get("quant"),
+    )
     cfg["host"] = host
     cfg["port"] = int(port)
     cfg["n_gpu_layers"] = n_gpu_layers if n_gpu_layers is not None else None
@@ -587,31 +847,38 @@ def main(
     print(f"📝 Saved config (remote volume): {json.dumps(cfg, indent=2)}")
 
     if preload:
-        allow_patterns = [f"*{cfg['quant']}*.gguf"] if cfg.get("quant") else ["*.gguf"]
-        download_model.remote(cfg["repo_id"], allow_patterns, cfg.get("revision"))
-        print("✅ Weights cached in Modal Volume.")
+        allow_patterns = _gguf_allow_patterns(cfg.get("quant"))
+        matches = download_model.remote(cfg["repo_id"], allow_patterns, cfg.get("revision"))
+        if not matches:
+            _raise_missing_gguf_match(cfg["repo_id"], allow_patterns, cfg.get("revision"))
+        print(f"✅ Weights cached in Modal Volume ({len(matches)} GGUF file(s)).")
 
     this_file = Path(__file__).resolve()
-    username = _current_modal_username()
-    base_url = (
-        f"https://{username}--{APP_NAME}-serve.modal.run"
-        if username
-        else f"https://$(modal profile current)--{APP_NAME}-serve.modal.run"
-    )
     print("\nNext steps:")
     print(f"1) Deploy the server: modal deploy {this_file}")
     print("2) Once deployed, curl the server (OpenAI-compatible):")
-    print(f"   Endpoint base URL: {base_url}")
+    print("   Use the exact URL from the `Created web function serve => ...` line above.")
+    print("   (Modal may truncate long labels and append a hash, so guessed hostnames can be wrong.)")
     print(
         "   curl -sS -X POST "
         "-H 'Content-Type: application/json' "
-        "-d '{\"model\": \"default\", \"prompt\": \"Hello!\", \"max_tokens\": 64, \"temperature\": 0.7}' "
-        f"{base_url}/v1/completions"
+        f"-d '{{\"model\": \"{cfg['served_model_name']}\", \"prompt\": \"Hello!\", \"max_tokens\": 64, \"temperature\": 0.7}}' "
+        "https://<ACTUAL_MODAL_WEB_URL>/v1/completions"
     )
+    print("3) Faster iteration (avoids nested deploy after preload):")
+    print(f"   modal run {this_file}::main --preload True")
+    print(f"   modal deploy {this_file}")
+    print("4) Image cache behavior (llama.cpp backend):")
+    print("   Default: reuse cached image layers for faster runs.")
+    print("   Force fresh latest image pull/build: set LLAMA_CPP_IMAGE_NO_CACHE=true")
+    print("   Example: LLAMA_CPP_IMAGE_NO_CACHE=true modal deploy " + str(this_file))
 
     if deploy:
         try:
             import subprocess
+            print(
+                "\nℹ️ `--deploy` runs `modal deploy` after this `modal run`, so a second image build is expected."
+            )
             print("\n🚀 Deploying...")
             subprocess.run(["modal", "deploy", str(this_file)], check=True)
             print("✅ Deploy triggered. Check the Modal dashboard for status.")

@@ -221,6 +221,10 @@ def deploy(
         None,
         help="vLLM reasoning parser (e.g. qwen3, deepseek_r1, granite)",
     ),
+    tool_call_parser: Optional[str] = typer.Option(
+        None,
+        help="vLLM tool call parser (e.g. hermes, qwen3_xml, llama3_json)",
+    ),
     default_chat_template_kwargs: Optional[str] = typer.Option(
         None,
         help=(
@@ -258,6 +262,7 @@ def deploy(
         n_gpu=n_gpu,
         trust_remote_code=trust_remote_code,
         reasoning_parser=reasoning_parser,
+        tool_call_parser=tool_call_parser,
         default_chat_template_kwargs=default_chat_template_kwargs,
         instance_name=resolved_instance,
         app_name=resolved_app_name,
@@ -299,6 +304,7 @@ def deploy(
 def warmup(
     backend: str = typer.Option("llamacpp", help="Backend: llamacpp or vllm"),
     server_url: Optional[str] = typer.Option(None, help="Deployed web URL"),
+    served_model_name: Optional[str] = typer.Option(None, help="Served model name for llama.cpp probes"),
     function_slug: Optional[str] = typer.Option(
         None, help="Modal function slug suffix used in endpoint URL"
     ),
@@ -321,7 +327,14 @@ def warmup(
             function_slug=function_slug or os.environ.get("MODAL_FUNCTION_SLUG"),
         )
     )
-    for event in orch.warmup(bt, url, timeout, tail_logs, app_name=target_app_name):
+    for event in orch.warmup(
+        bt,
+        url,
+        timeout,
+        tail_logs,
+        app_name=target_app_name,
+        served_model_name=served_model_name,
+    ):
         _print_event(event)
         _raise_on_failed_completion(event)
 
@@ -339,6 +352,7 @@ def list_apps() -> None:
 def status(
     backend: str = typer.Option("llamacpp", help="Backend: llamacpp or vllm"),
     server_url: Optional[str] = typer.Option(None, help="Deployed web URL"),
+    served_model_name: Optional[str] = typer.Option(None, help="Served model name for llama.cpp probes"),
     function_slug: Optional[str] = typer.Option(
         None, help="Modal function slug suffix used in endpoint URL"
     ),
@@ -360,7 +374,7 @@ def status(
             function_slug=function_slug or os.environ.get("MODAL_FUNCTION_SLUG"),
         )
     )
-    for event in orch.check_status(bt, url, timeout):
+    for event in orch.check_status(bt, url, timeout, served_model_name=served_model_name):
         _print_event(event)
         if isinstance(event, OperationCompleteEvent) and not event.success:
             raise typer.Exit(code=1)
@@ -423,6 +437,10 @@ def switch(
         None,
         help="vLLM reasoning parser (e.g. qwen3, deepseek_r1, granite)",
     ),
+    tool_call_parser: Optional[str] = typer.Option(
+        None,
+        help="vLLM tool call parser (e.g. hermes, qwen3_xml, llama3_json)",
+    ),
     default_chat_template_kwargs: Optional[str] = typer.Option(
         None,
         help=(
@@ -463,6 +481,7 @@ def switch(
         n_gpu=n_gpu,
         trust_remote_code=trust_remote_code,
         reasoning_parser=reasoning_parser,
+        tool_call_parser=tool_call_parser,
         default_chat_template_kwargs=default_chat_template_kwargs,
     )
     model_hint = model_name if bt == BackendType.VLLM else (repo_id or preset)

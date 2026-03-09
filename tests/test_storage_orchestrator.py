@@ -10,6 +10,14 @@ from llm_launchpad.protocol.models import StorageSnapshot, StoredModelInfo
 
 
 class StorageOrchestratorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._capture_patcher = patch(
+            "llm_launchpad.core.orchestrator.ModalBackend.run_modal_script_entrypoint_capture",
+            return_value=None,
+        )
+        self._capture_patcher.start()
+        self.addCleanup(self._capture_patcher.stop)
+
     @patch("llm_launchpad.core.orchestrator.ModalBackend.list_volume")
     def test_list_storage_builds_snapshot(self, mock_list_volume) -> None:  # type: ignore[no-untyped-def]
         def side_effect(volume_name, path):  # type: ignore[no-untyped-def]
@@ -159,6 +167,45 @@ class StorageOrchestratorTests(unittest.TestCase):
         self.assertEqual(len(snapshot.llamacpp_models), 1)
         self.assertEqual(snapshot.llamacpp_models[0].model_id, "unsloth/GLM-5-GGUF")
         self.assertEqual(snapshot.llamacpp_models[0].quant, "Q4_K_M")
+
+    @patch("llm_launchpad.core.orchestrator.ModalBackend.run_modal_script_entrypoint_capture")
+    @patch("llm_launchpad.core.orchestrator.ModalBackend.list_volume")
+    def test_list_storage_uses_llamacpp_backend_inventory_for_real_sizes(
+        self, mock_list_volume, mock_capture
+    ) -> None:  # type: ignore[no-untyped-def]
+        mock_list_volume.return_value = []
+        mock_capture.return_value = (
+            0,
+            "\n".join(
+                [
+                    "modal noise",
+                    "LLM_LAUNCHPAD_STORAGE_JSON_BEGIN",
+                    (
+                        '[{"backend":"llamacpp","model_id":"unsloth/GLM-5-GGUF","revision":"abc",'
+                        '"quant":"Q4_K_M","size_bytes":123456789,"file_count":11,'
+                        '"source_volume":"huggingface-cache","paths":["hub/models--unsloth--GLM-5-GGUF/'
+                        'snapshots/abc/Q4_K_M/GLM-5-Q4_K_M-00001-of-00011.gguf"]}]'
+                    ),
+                    "LLM_LAUNCHPAD_STORAGE_JSON_END",
+                ]
+            ),
+            "",
+        )
+
+        orch = Orchestrator()
+        events = list(orch.list_storage())
+        done = next(e for e in events if isinstance(e, OperationCompleteEvent))
+        self.assertTrue(done.success)
+        snapshot = done.data
+        assert isinstance(snapshot, StorageSnapshot)
+        self.assertEqual(len(snapshot.llamacpp_models), 1)
+        row = snapshot.llamacpp_models[0]
+        self.assertEqual(row.model_id, "unsloth/GLM-5-GGUF")
+        self.assertEqual(row.revision, "abc")
+        self.assertEqual(row.quant, "Q4_K_M")
+        self.assertEqual(row.size_bytes, 123456789)
+        self.assertEqual(row.file_count, 11)
+        self.assertFalse(row.incomplete)
 
     @patch("llm_launchpad.core.orchestrator.ModalBackend.list_volume")
     def test_list_storage_marks_llamacpp_model_incomplete_from_blob_sidecar(

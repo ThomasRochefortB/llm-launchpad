@@ -95,11 +95,11 @@ LogViewer Log {
 }
 
 #deployment-status-panel {
-    width: 40;
-    min-width: 32;
+    width: 50;
+    min-width: 38;
     min-height: 18;
     margin: 1 0 0 1;
-    padding: 1 1;
+    padding: 1 2;
     border: solid $primary-background;
     background: $surface;
 }
@@ -128,10 +128,17 @@ LogViewer Log {
     padding: 0 0 1 0;
 }
 
-#auth-status {
-    text-align: center;
-    color: $success;
-    padding: 0 0 1 0;
+#auth-status-block {
+    dock: bottom;
+    width: auto;
+    max-width: 92;
+    height: 2;
+    min-height: 2;
+    margin: 0 0 1 1;
+    padding: 0 1;
+    border-left: tall $primary-background;
+    color: $text-muted;
+    background: transparent;
 }
 
 /* ---- Option / Selection Lists ---- */
