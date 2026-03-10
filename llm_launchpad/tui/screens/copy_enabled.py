@@ -16,7 +16,10 @@ class CopyEnabledScreen(Screen):
     """Screen base class that provides consistent copy behavior."""
 
     _COPY_KEY_ALIASES = {
+        "y",
         "ctrl+c",
+    }
+    _DIRECT_CLIPBOARD_KEY_ALIASES = {
         "ctrl+shift+c",
         "meta+c",
         "super+c",
@@ -25,11 +28,25 @@ class CopyEnabledScreen(Screen):
     }
 
     BINDINGS = [
-        Binding("meta+c,ctrl+shift+c", "copy_text", "Copy", show=False),
+        Binding("y,ctrl+c", "copy_text", "Copy", key_display="y", show=False),
+        Binding("meta+c,ctrl+shift+c", "copy_text_to_clipboard", "Copy", show=False),
     ]
 
     def action_copy_text(self) -> None:
-        """Copy selected text, or focused widget text fallback."""
+        """Present copyable text via a terminal-native fallback."""
+        text = self.get_selected_text() or self._focused_text_fallback()
+        normalized = self._normalize_text(text)
+        if normalized:
+            presenter = getattr(self.app, "present_text_for_copy", None)
+            if callable(presenter):
+                presenter(normalized)
+            else:
+                self.app.copy_to_clipboard(normalized)
+            return
+        self.notify("Nothing to copy", timeout=2)
+
+    def action_copy_text_to_clipboard(self) -> None:
+        """Copy selected text directly to the clipboard when the terminal supports it."""
         text = self.get_selected_text() or self._focused_text_fallback()
         normalized = self._normalize_text(text)
         if normalized:
@@ -42,6 +59,11 @@ class CopyEnabledScreen(Screen):
         key_forms = {event.key, event.name, *event.aliases}
         if key_forms.intersection(self._COPY_KEY_ALIASES):
             self.action_copy_text()
+            event.stop()
+            event.prevent_default()
+            return
+        if key_forms.intersection(self._DIRECT_CLIPBOARD_KEY_ALIASES):
+            self.action_copy_text_to_clipboard()
             event.stop()
             event.prevent_default()
 

@@ -8,7 +8,7 @@ all non-interactive commands available for automation.
 from __future__ import annotations
 
 import os
-from typing import Optional
+from typing import Annotated, Optional
 
 import typer
 
@@ -82,6 +82,23 @@ def _preflight() -> tuple[Orchestrator, str]:
     ok, username, err = orch.preflight()
     _ensure(ok, err)
     return orch, username
+
+
+def _parse_bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _default_tui_mouse_enabled() -> bool:
+    ssh_default = not bool(os.getenv("SSH_CONNECTION") or os.getenv("SSH_TTY"))
+    return _parse_bool_env("LLM_LAUNCHPAD_TUI_MOUSE", ssh_default)
 
 
 def _resolve_deploy_target(
@@ -160,7 +177,18 @@ def _print_banner() -> None:
 
 
 @app.command("tui")
-def tui() -> None:
+def tui(
+    mouse: Annotated[
+        Optional[bool],
+        typer.Option(
+            "--mouse/--no-mouse",
+            help=(
+                "Enable Textual mouse support. "
+                "Use --no-mouse to let the terminal handle native text selection/copy."
+            ),
+        ),
+    ] = None,
+) -> None:
     """Interactive terminal UI for deploying and managing LLM backends."""
     try:
         from ..tui.app import TuiApp
@@ -171,9 +199,10 @@ def tui() -> None:
         )
         raise typer.Exit(code=1)
 
-    app_instance = TuiApp()
+    resolved_mouse = _default_tui_mouse_enabled() if mouse is None else mouse
+    app_instance = TuiApp(mouse_enabled=resolved_mouse)
     try:
-        app_instance.run()
+        app_instance.run(mouse=resolved_mouse)
     finally:
         from ..core.backend import ModalBackend
         ModalBackend.terminate_all()
