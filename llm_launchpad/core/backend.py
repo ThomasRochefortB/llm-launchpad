@@ -14,6 +14,7 @@ from typing import Any, Dict, Generator, List, Optional
 from ..protocol.enums import BackendType
 from ..protocol.events import ErrorEvent, LogEvent, OperationCompleteEvent
 from ..protocol.models import DeploymentConfig, EndpointInfo, LaunchpadSettings
+from .modal_auth import get_modal_profile
 from .naming import default_served_model_name
 from .naming import infer_backend_from_app_name, infer_instance_from_app_name, legacy_app_name
 from .naming import modal_function_name
@@ -81,23 +82,8 @@ class ModalBackend:
 
     @staticmethod
     def get_username() -> Optional[str]:
-        """Return the current Modal profile username, or None."""
-        try:
-            res = subprocess.run(
-                ["modal", "profile", "current"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=ModalBackend._CLI_TIMEOUT_SECONDS,
-            )
-            username = (res.stdout or "").strip()
-            if res.returncode == 0 and username:
-                return username
-        except subprocess.TimeoutExpired:
-            return None
-        except Exception:
-            pass
-        return None
+        """Return the current Modal profile/workspace slug, or None."""
+        return get_modal_profile()
 
     # ------------------------------------------------------------------
     # URL helpers
