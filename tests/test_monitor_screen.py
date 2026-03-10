@@ -33,7 +33,19 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("first line", content)
             self.assertIn("stderr | stderr line", content)
             title = screen.query_one("#monitor-title", Static)
-            self.assertIn("cmd+c/ctrl+c/c to copy  ctrl+l clear", str(title.content))
+            self.assertIn("y/c/ctrl+c to copy  ctrl+shift+c direct clip  ctrl+l clear", str(title.content))
+
+    async def test_title_mentions_terminal_selection_when_mouse_disabled(self) -> None:
+        app = _TestApp()
+        app.mouse_enabled = False
+        async with app.run_test() as pilot:
+            app.push_screen(MonitorScreen(title="Logs"))
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, MonitorScreen)
+            title = screen.query_one("#monitor-title", Static)
+            self.assertIn("use terminal selection + cmd+c", str(title.content))
 
     async def test_log_lines_strip_ansi_escape_sequences(self) -> None:
         app = _TestApp()
@@ -187,9 +199,17 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             assert isinstance(screen, MonitorScreen)
             self.assertIsInstance(screen.log_viewer.log_widget, SelectableLog)
 
-    def test_copy_binding_includes_ctrl_and_cmd_variants(self) -> None:
+    def test_copy_binding_includes_terminal_safe_variants(self) -> None:
         copy_binding = next(b for b in MonitorScreen.BINDINGS if b.action == "copy_text")
+        self.assertIn("y", copy_binding.key)
+        self.assertIn("c", copy_binding.key)
         self.assertIn("ctrl+c", copy_binding.key)
+
+    def test_direct_clipboard_binding_keeps_terminal_clipboard_variants(self) -> None:
+        copy_binding = next(
+            b for b in MonitorScreen.BINDINGS if b.action == "copy_text_to_clipboard"
+        )
+        self.assertIn("ctrl+shift+c", copy_binding.key)
         self.assertIn("meta+c", copy_binding.key)
         self.assertIn("super+c", copy_binding.key)
 

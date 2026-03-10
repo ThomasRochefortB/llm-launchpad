@@ -6,7 +6,9 @@ the screen stack and bridges user actions to Core via threaded workers.
 
 from __future__ import annotations
 
+import base64
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -97,6 +99,20 @@ def _deploy_connection_summary_payload(
     }
 
 
+def _osc_52_sequence(text: str) -> str:
+    payload = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    return f"\x1b]52;c;{payload}\a"
+
+
+def _tmux_passthrough_sequence(text: str) -> str:
+    osc = _osc_52_sequence(text).replace("\x1b", "\x1b\x1b")
+    return f"\x1bPtmux;{osc}\x1b\\"
+
+
+def _screen_passthrough_sequence(text: str) -> str:
+    return f"\x1bP{_osc_52_sequence(text)}\x1b\\"
+
+
 class TuiApp(App):
     """llm-launchpad interactive terminal UI."""
 
@@ -110,8 +126,9 @@ class TuiApp(App):
     ]
     _STORAGE_CACHE_TTL_SECONDS = 20.0
 
-    def __init__(self, **kwargs: object) -> None:
+    def __init__(self, *, mouse_enabled: bool = True, **kwargs: object) -> None:
         super().__init__(**kwargs)
+        self.mouse_enabled = mouse_enabled
         self._orchestrator = Orchestrator()
         self._username: str = ""
         self._version: str = ""
@@ -132,8 +149,19 @@ class TuiApp(App):
             pass
 
     def copy_to_clipboard(self, text: str) -> None:
-        """Copy text via OSC 52 and use pbcopy fallback on macOS terminals."""
+        """Copy text via OSC 52, including tmux/screen passthrough variants."""
         super().copy_to_clipboard(text)
+        driver = getattr(self, "_driver", None)
+        if driver is not None:
+            try:
+                tmux_session = os.environ.get("TMUX")
+                term = os.environ.get("TERM", "")
+                if tmux_session:
+                    driver.write(_tmux_passthrough_sequence(text))
+                elif term.startswith("screen"):
+                    driver.write(_screen_passthrough_sequence(text))
+            except Exception:
+                pass
         if sys.platform == "darwin":
             try:
                 subprocess.run(
@@ -144,6 +172,36 @@ class TuiApp(App):
                 )
             except Exception:
                 pass
+
+    def present_text_for_copy(self, text: str) -> bool:
+        """Suspend the app and let the terminal handle normal text selection/copy."""
+        normalized = text.rstrip("\n")
+        if not normalized:
+            return False
+
+        driver = getattr(self, "_driver", None)
+        if driver is None or not getattr(driver, "can_suspend", False):
+            self.copy_to_clipboard(normalized)
+            return False
+
+        try:
+            with self.suspend():
+                separator = "-" * 80
+                print()
+                print("llm-launchpad copy mode")
+                print("Select the text below with your terminal, use its normal copy shortcut,")
+                print("then press Enter to return to llm-launchpad.")
+                print(separator)
+                print(normalized)
+                print(separator)
+                try:
+                    input("Press Enter to return to llm-launchpad...")
+                except (EOFError, KeyboardInterrupt):
+                    pass
+            return True
+        except Exception:
+            self.copy_to_clipboard(normalized)
+            return False
 
     async def action_quit(self) -> None:
         """Terminate tracked subprocesses and workers before exiting.

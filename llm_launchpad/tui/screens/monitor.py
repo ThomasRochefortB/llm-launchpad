@@ -36,11 +36,17 @@ class MonitorScreen(CopyEnabledScreen):
         Binding("escape", "go_back", "Back", show=True),
         Binding("q", "go_back", "Back"),
         Binding(
-            "c,ctrl+c,ctrl+shift+c,meta+c,super+c",
+            "y,c,ctrl+c",
             "copy_text",
             "Copy",
-            key_display="cmd+c",
+            key_display="y",
             show=True,
+        ),
+        Binding(
+            "ctrl+shift+c,meta+c,super+c",
+            "copy_text_to_clipboard",
+            "Copy",
+            show=False,
         ),
         Binding("ctrl+l", "clear_log", "Clear log", show=True),
     ]
@@ -66,13 +72,18 @@ class MonitorScreen(CopyEnabledScreen):
         )
 
     def compose(self) -> ComposeResult:
+        mouse_enabled = getattr(self.app, "mouse_enabled", True)
+        copy_help = (
+            "use terminal selection + cmd+c  y/c/ctrl+c fallback"
+            if not mouse_enabled
+            else "drag to select, dbl-click for line  y/c/ctrl+c to copy  ctrl+shift+c direct clip"
+        )
         yield StatusHeader(id="monitor-status-header")
         with Vertical(id="monitor-layout"):
             yield Static(
                 (
                     f"[bold cyan]{self._title}[/bold cyan]  "
-                    "[dim]drag to select, dbl-click for line  "
-                    "cmd+c/ctrl+c/c to copy  ctrl+l clear  esc to return[/dim]"
+                    f"[dim]{copy_help}  ctrl+l clear  esc to return[/dim]"
                 ),
                 id="monitor-title",
             )
@@ -146,8 +157,17 @@ class MonitorScreen(CopyEnabledScreen):
         key_forms = {event.key, event.name, *event.aliases}
         if key_forms.intersection(
             {
+                "y",
                 "c",
                 "ctrl+c",
+            }
+        ):
+            self.action_copy_text()
+            event.stop()
+            event.prevent_default()
+            return
+        if key_forms.intersection(
+            {
                 "ctrl+shift+c",
                 "meta+c",
                 "super+c",
@@ -155,7 +175,7 @@ class MonitorScreen(CopyEnabledScreen):
                 "command+c",
             }
         ):
-            self.action_copy_text()
+            self.action_copy_text_to_clipboard()
             event.stop()
             event.prevent_default()
 
@@ -176,13 +196,7 @@ class MonitorScreen(CopyEnabledScreen):
     def _copy_selected_text(
         self, *, notify: bool = True, raise_on_empty: bool = True
     ) -> bool:
-        text = None
-        log_widget = self.log_viewer.log_widget
-        getter = getattr(log_widget, "get_selected_text", None)
-        if callable(getter):
-            text = getter()
-        if not text:
-            text = self.get_selected_text()
+        text = self._selected_text()
         if not text:
             if notify:
                 self.notify("No text selected to copy", timeout=2)
@@ -198,8 +212,30 @@ class MonitorScreen(CopyEnabledScreen):
             self.notify(f"Copied {lines} line{'s' if lines != 1 else ''}", timeout=2)
         return True
 
+    def _selected_text(self) -> str | None:
+        """Get the currently selected log text, if any."""
+        log_widget = self.log_viewer.log_widget
+        getter = getattr(log_widget, "get_selected_text", None)
+        if callable(getter):
+            text = getter()
+        if not text:
+            text = self.get_selected_text()
+        return text
+
     def action_copy_text(self) -> None:
-        """Copy selected log text to clipboard."""
+        """Present selected log text via a terminal-native fallback."""
+        text = self._selected_text()
+        if not text:
+            self.notify("No text selected to copy", timeout=2)
+            raise SkipAction()
+        presenter = getattr(self.app, "present_text_for_copy", None)
+        if callable(presenter):
+            presenter(text)
+            return
+        self._copy_selected_text(notify=True, raise_on_empty=True)
+
+    def action_copy_text_to_clipboard(self) -> None:
+        """Copy selected log text directly to the clipboard."""
         self._copy_selected_text(notify=True, raise_on_empty=True)
 
     def action_go_back(self) -> None:
