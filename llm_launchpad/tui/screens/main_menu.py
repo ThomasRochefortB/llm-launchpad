@@ -20,6 +20,7 @@ from textual.widgets.option_list import Option
 
 from ...core.backend import ModalBackend
 from ...core.hf_auth import HuggingFaceAuthStatus, get_huggingface_auth_status
+from ...core.modal_auth import ModalAuthStatus, get_modal_auth_status
 from ...core.naming import default_llamacpp_served_model_name, default_served_model_name
 from ...protocol.enums import BackendType
 from ...protocol.models import EndpointInfo
@@ -77,6 +78,14 @@ class HuggingFaceAuthLoaded(Message):
         self.status = status
 
 
+class ModalAuthLoaded(Message):
+    """Main-menu Modal auth check completed."""
+
+    def __init__(self, status: ModalAuthStatus) -> None:
+        super().__init__()
+        self.status = status
+
+
 def _clip(value: str, width: int) -> str:
     text = (value or "").strip()
     if len(text) <= width:
@@ -104,13 +113,25 @@ def _render_hf_auth_status(status: HuggingFaceAuthStatus | None = None) -> str:
     return "[yellow]🤗 Hugging Face not authenticated (run: hf auth login)[/yellow]"
 
 
+def _render_modal_auth_status(status: ModalAuthStatus | None = None) -> str:
+    if status is None:
+        return "[dim]▰ Checking Modal auth...[/dim]"
+    if status.authenticated:
+        return "[green]▰ Modal authenticated[/green]"
+    if status.error:
+        detail = _escape_markup(_clip(status.error, 72))
+        return f"[yellow]▰ Modal auth check failed: {detail}[/yellow]"
+    return "[yellow]▰ Modal not authenticated (run: modal setup)[/yellow]"
+
+
 def _render_auth_status_block(
     username: str = "",
+    modal_status: ModalAuthStatus | None = None,
     hf_status: HuggingFaceAuthStatus | None = None,
 ) -> str:
-    lines: list[str] = []
+    lines: list[str] = [_render_modal_auth_status(modal_status)]
     if username:
-        lines.append(f"[green]▰ Modal authenticated as: {_escape_markup(username)}[/green]")
+        lines.append(f"[dim]Modal profile: {_escape_markup(username)}[/dim]")
     lines.append(_render_hf_auth_status(hf_status))
     return "\n".join(lines)
 
@@ -609,7 +630,10 @@ class MainMenuScreen(CopyEnabledScreen):
         super().__init__()
         self.username = username
         self.version = version
+        self._modal_auth_status: ModalAuthStatus | None = None
+        self._hf_auth_status: HuggingFaceAuthStatus | None = None
         self._hf_auth_refresh_inflight = False
+        self._modal_auth_refresh_inflight = False
         self._status_refresh_inflight = False
         self._billing_refresh_inflight = False
 
@@ -646,16 +670,59 @@ class MainMenuScreen(CopyEnabledScreen):
     def on_mount(self) -> None:
         """Focus the option list so arrow-key navigation works immediately."""
         self.query_one("#action-list", OptionList).focus()
+        self._refresh_modal_auth_status()
         self._refresh_hf_auth_status()
         self._refresh_panels()
         self.set_interval(20.0, self._refresh_panels)
+
+    def _refresh_modal_auth_status(self) -> None:
+        if self._modal_auth_refresh_inflight:
+            return
+        self._modal_auth_refresh_inflight = True
+        self.query_one("#auth-status-block", Static).update(
+            _render_auth_status_block(
+                username=self.username,
+                modal_status=self._modal_auth_status,
+                hf_status=self._hf_auth_status,
+            )
+        )
+        self.run_worker(
+            self._run_load_modal_auth_status,
+            name="main-menu-modal-auth-worker",
+            thread=True,
+        )
+
+    def _run_load_modal_auth_status(self) -> None:
+        poster = getattr(self, "post_message", None)
+        if poster is None:
+            return
+        try:
+            status = get_modal_auth_status()
+        except Exception as exc:
+            status = ModalAuthStatus(authenticated=False, error=str(exc))
+        poster(ModalAuthLoaded(status=status))
+
+    def on_modal_auth_loaded(self, message: ModalAuthLoaded) -> None:
+        self._modal_auth_refresh_inflight = False
+        self._modal_auth_status = message.status
+        self.query_one("#auth-status-block", Static).update(
+            _render_auth_status_block(
+                username=self.username,
+                modal_status=self._modal_auth_status,
+                hf_status=self._hf_auth_status,
+            )
+        )
 
     def _refresh_hf_auth_status(self) -> None:
         if self._hf_auth_refresh_inflight:
             return
         self._hf_auth_refresh_inflight = True
         self.query_one("#auth-status-block", Static).update(
-            _render_auth_status_block(username=self.username)
+            _render_auth_status_block(
+                username=self.username,
+                modal_status=self._modal_auth_status,
+                hf_status=self._hf_auth_status,
+            )
         )
         self.run_worker(
             self._run_load_hf_auth_status,
@@ -675,8 +742,13 @@ class MainMenuScreen(CopyEnabledScreen):
 
     def on_hugging_face_auth_loaded(self, message: HuggingFaceAuthLoaded) -> None:
         self._hf_auth_refresh_inflight = False
+        self._hf_auth_status = message.status
         self.query_one("#auth-status-block", Static).update(
-            _render_auth_status_block(username=self.username, hf_status=message.status)
+            _render_auth_status_block(
+                username=self.username,
+                modal_status=self._modal_auth_status,
+                hf_status=self._hf_auth_status,
+            )
         )
 
     def _refresh_panels(self) -> None:

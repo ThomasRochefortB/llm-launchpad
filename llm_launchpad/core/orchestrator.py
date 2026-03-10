@@ -31,6 +31,7 @@ from ..protocol.models import StoredModelInfo, StorageSnapshot
 
 from .backend import ModalBackend
 from .config import ConfigStore
+from .modal_auth import get_modal_auth_status
 from .naming import legacy_app_name
 from .naming import default_llamacpp_served_model_name
 from .naming import random_function_slug
@@ -172,10 +173,10 @@ class Orchestrator:
         """
         if not ModalBackend.is_cli_available():
             return False, "", "Modal CLI not found. Install with: pip install modal && modal setup"
-        username = ModalBackend.get_username()
-        if not username:
+        status = get_modal_auth_status()
+        if not status.authenticated:
             return False, "", "Modal authentication missing. Run: modal setup"
-        return True, username, ""
+        return True, status.profile or "", ""
 
     # ------------------------------------------------------------------
     # Deploy
