@@ -30,19 +30,16 @@ If you see the command `llm-launchpad wizard`, that is an older alias for the sa
 
 ## Install
 
-CLI/TUI (global):
+Install the CLI so `llm-launchpad` is available directly in your shell:
 ```bash
 pip install uv
 uv tool install llm-launchpad
 llm-launchpad --help
 ```
 
-From a clone (recommended for contributing):
+If uv says its tool directory is not on your `PATH`, run:
 ```bash
-git clone https://github.com/ThomasRochefortB/llm-launchpad.git
-cd llm-launchpad
-uv sync
-uv run llm-launchpad --help
+uv tool update-shell
 ```
 
 ## Quickstart
@@ -54,17 +51,17 @@ modal setup   # follow the prompt to authenticate
 
 2) Launch the TUI:
 ```bash
-uv run llm-launchpad
+llm-launchpad
 ```
 Explicit TUI command:
 ```bash
-uv run llm-launchpad tui
+llm-launchpad tui
 ```
 Select a backend (vLLM or llama.cpp), choose a model/preset, and deploy. The TUI will show the instance name, endpoint URL, and final connection details.
 
 Prefer headless? Deploy a default vLLM instance with one command:
 ```bash
-uv run llm-launchpad deploy \
+llm-launchpad deploy \
   --backend vllm \
   --instance-name quickstart \
   --model-name Qwen/Qwen3-4B-Thinking-2507-FP8
@@ -72,7 +69,7 @@ uv run llm-launchpad deploy \
 
 3) Check readiness and grab the URL:
 ```bash
-uv run llm-launchpad status --backend vllm --instance-name quickstart
+llm-launchpad status --backend vllm --instance-name quickstart
 ```
 
 4) Call the endpoint (replace with your URL from the status/logs output):
@@ -93,13 +90,13 @@ modal setup
 huggingface-cli login  # or export HUGGINGFACE_HUB_TOKEN=<token>
 
 # 3) Deploy with sensible defaults
-uv run llm-launchpad deploy \
+llm-launchpad deploy \
   --backend vllm \
   --instance-name demo \
   --model-name Qwen/Qwen3-4B-Thinking-2507-FP8
 
 # 4) Wait for readiness, then copy the serve URL
-uv run llm-launchpad status --backend vllm --instance-name demo
+llm-launchpad status --backend vllm --instance-name demo
 
 # 5) Call it
 export SERVER_URL="https://<user>--vllm-demo-serve.modal.run"
@@ -140,6 +137,22 @@ When multiple instances exist for one backend, `status`, `logs`, `stop`, and `wa
 - **GPU unavailable / quota:** pick a smaller GPU in the TUI or change `GPU_CONFIG`.
 - **Endpoints return 503 during warmup:** wait a few minutes after first deploy; cold starts are expected.
 - **Llama.cpp build errors:** ensure host CUDA ≥ 12.4 or switch to CPU/offload configs.
+
+## Development setup
+
+If you are working from a clone and want the command available directly while editing the source:
+```bash
+git clone https://github.com/ThomasRochefortB/llm-launchpad.git
+cd llm-launchpad
+uv tool install --editable .
+llm-launchpad --help
+```
+
+If you need the full project environment for tests or local development workflows:
+```bash
+uv sync
+uv run pytest
+```
 
 ## GGUF on Modal with llama.cpp
 
