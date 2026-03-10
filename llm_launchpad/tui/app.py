@@ -216,13 +216,19 @@ class TuiApp(App):
         self.exit()
 
     def on_mount(self) -> None:
-        """Run pre-flight checks and push main menu."""
-        ok, username, err = self._orchestrator.preflight()
-        if not ok:
-            self.notify(err, severity="error", timeout=10)
+        """Launch the TUI if the Modal CLI is installed.
+
+        Authentication is surfaced inside the main menu instead of gating startup.
+        """
+        if not ModalBackend.is_cli_available():
+            self.notify(
+                "Modal CLI not found. Install with: pip install modal && modal setup",
+                severity="error",
+                timeout=10,
+            )
             self.exit(return_code=1)
             return
-        self._username = username
+        self._username = ModalBackend.get_username() or ""
         self.push_screen(MainMenuScreen(username=self._username, version=self._version))
 
     # ------------------------------------------------------------------

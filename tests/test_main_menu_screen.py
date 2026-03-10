@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import unittest
 
+from llm_launchpad.core.modal_auth import ModalAuthStatus
 from llm_launchpad.protocol.enums import BackendType
 from llm_launchpad.protocol.models import EndpointInfo
 from llm_launchpad.tui.screens.main_menu import (
+    _render_auth_status_block,
     _render_billing_load_error,
     _render_billing_report,
     _render_deployment_status,
     _render_hf_auth_status,
+    _render_modal_auth_status,
     _should_show_in_panel,
 )
 from llm_launchpad.core.hf_auth import HuggingFaceAuthStatus
@@ -148,6 +151,34 @@ class MainMenuStatusRenderTests(unittest.TestCase):
         )
         self.assertIn("auth check failed", rendered)
         self.assertIn("Invalid Hugging Face token", rendered)
+
+    def test_render_modal_auth_status_shows_authenticated_state(self) -> None:
+        rendered = _render_modal_auth_status(ModalAuthStatus(authenticated=True))
+        self.assertIn("Modal authenticated", rendered)
+
+    def test_render_modal_auth_status_shows_login_hint_when_unauthenticated(self) -> None:
+        rendered = _render_modal_auth_status(ModalAuthStatus(authenticated=False))
+        self.assertIn("Modal not authenticated", rendered)
+        self.assertIn("modal setup", rendered)
+
+    def test_render_auth_status_block_shows_profile_not_username(self) -> None:
+        rendered = _render_auth_status_block(
+            username="default",
+            modal_status=ModalAuthStatus(authenticated=True, profile="default"),
+        )
+        self.assertIn("Modal authenticated", rendered)
+        self.assertIn("Modal profile: default", rendered)
+        self.assertNotIn("authenticated as: default", rendered)
+
+    def test_render_auth_status_block_includes_both_modal_and_hf_lines(self) -> None:
+        rendered = _render_auth_status_block(
+            username="default",
+            modal_status=ModalAuthStatus(authenticated=False, profile="default"),
+            hf_status=HuggingFaceAuthStatus(authenticated=True, username="alice"),
+        )
+        self.assertIn("Modal not authenticated", rendered)
+        self.assertIn("Modal profile: default", rendered)
+        self.assertIn("Hugging Face authenticated as alice", rendered)
 
 
 if __name__ == "__main__":

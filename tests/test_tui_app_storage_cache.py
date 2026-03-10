@@ -15,6 +15,30 @@ from llm_launchpad.tui.app import TuiApp, WizardApp, _deploy_connection_summary_
 
 
 class TuiAppStorageCacheTests(unittest.TestCase):
+    def test_on_mount_launches_main_menu_without_authenticated_preflight(self) -> None:
+        app = TuiApp()
+        app._version = "1.2.3"
+        app._orchestrator = type(
+            "FakeOrchestrator",
+            (),
+            {
+                "preflight": staticmethod(lambda: (False, "", "Modal authentication missing. Run: modal setup")),
+            },
+        )()
+
+        with (
+            patch("llm_launchpad.tui.app.ModalBackend.is_cli_available", return_value=True),
+            patch("llm_launchpad.tui.app.ModalBackend.get_username", return_value="default"),
+            patch.object(app, "push_screen", return_value=None) as push_screen,
+            patch.object(app, "notify", return_value=None) as notify,
+            patch.object(app, "exit", return_value=None) as exit_mock,
+        ):
+            app.on_mount()
+
+        notify.assert_not_called()
+        exit_mock.assert_not_called()
+        push_screen.assert_called_once()
+
     def test_deploy_connection_summary_lines_for_llamacpp_are_simple_and_boxed(self) -> None:
         config = DeploymentConfig(
             backend=BackendType.LLAMACPP,
