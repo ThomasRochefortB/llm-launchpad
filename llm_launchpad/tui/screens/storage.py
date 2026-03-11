@@ -63,7 +63,7 @@ class StorageScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="menu-container"):
-            yield Static("[bold cyan]Storage[/bold cyan]  [dim]Cached models and pre-download[/dim]")
+            yield Static("[bold #7bf168]Storage[/]  [dim]Cached models and pre-download[/dim]")
             yield Static("[dim]Storage status appears here.[/dim]", id="storage-status")
             yield Static("")
             with Vertical(id="storage-controls"):

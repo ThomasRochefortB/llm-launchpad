@@ -17,11 +17,11 @@ class FormField(Vertical):
         padding: 0 0 1 0;
     }
     FormField .form-label {
-        color: $text-muted;
+        color: #c8d6c9;
         height: 1;
     }
     FormField .form-hint {
-        color: $text-disabled;
+        color: #7f9082;
         height: 1;
     }
     """
@@ -72,7 +72,7 @@ class ToggleField(Vertical):
         padding: 0 0 1 0;
     }
     ToggleField .form-label {
-        color: $text-muted;
+        color: #c8d6c9;
         height: 1;
     }
     """

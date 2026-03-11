@@ -47,7 +47,7 @@ class ManageScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="menu-container"):
-            yield Static("[bold cyan]Manage Endpoints[/bold cyan]")
+            yield Static("[bold #7bf168]Manage Endpoints[/]")
             yield Static("")
             yield OptionList(
                 Option("  List deployments          Show deployed launchpad apps", id="list"),
@@ -89,7 +89,7 @@ class StatusParamsScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="menu-container"):
-            yield Static("[bold cyan]Status Check[/bold cyan]")
+            yield Static("[bold #7bf168]Status Check[/]")
             yield Static("")
             yield Static("[bold]Choose running instance[/bold]")
             yield OptionList(id="status-instance-list")
@@ -170,7 +170,7 @@ class LogsParamsScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="menu-container"):
-            yield Static("[bold cyan]Tail Logs[/bold cyan]")
+            yield Static("[bold #7bf168]Tail Logs[/]")
             yield Static("")
             yield Static("[bold]Choose running instance[/bold]")
             yield OptionList(id="logs-instance-list")
@@ -228,7 +228,7 @@ class StopParamsScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="menu-container"):
-            yield Static("[bold cyan]Stop Deployment[/bold cyan]")
+            yield Static("[bold #7bf168]Stop Deployment[/]")
             yield Static("")
             yield Static("[bold]Choose running instance[/bold]")
             yield OptionList(id="stop-instance-list")

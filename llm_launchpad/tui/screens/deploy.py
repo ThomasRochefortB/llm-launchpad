@@ -194,7 +194,7 @@ class BackendSelectScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="menu-container"):
-            yield Static("[bold cyan]Deploy[/bold cyan]  [dim]Step 1: Choose backend[/dim]")
+            yield Static("[bold #7bf168]Deploy[/]  [dim]Step 1: Choose backend[/dim]")
             yield Static("")
             yield OptionList(
                 Option("  llama.cpp (GGUF) ( Recommended )", id="llamacpp"),
@@ -256,7 +256,7 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="menu-container"):
-            yield Static("[bold cyan]Deploy llama.cpp[/bold cyan]  [dim]Step 2: Model & options[/dim]")
+            yield Static("[bold #7bf168]Deploy llama.cpp[/]  [dim]Step 2: Model & options[/dim]")
             yield Static("")
 
             yield Static("[bold]Model ranking[/bold]  [dim](Top 10 GGUF text-generation models)[/dim]")
@@ -870,7 +870,7 @@ class VllmDeployScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="menu-container"):
-            yield Static("[bold cyan]Deploy vLLM[/bold cyan]  [dim]Step 2: Model & options[/dim]")
+            yield Static("[bold #7bf168]Deploy vLLM[/]  [dim]Step 2: Model & options[/dim]")
             yield Static("")
 
             yield Static("[bold]Model ranking[/bold]  [dim](Top 10 text-generation models)[/dim]")

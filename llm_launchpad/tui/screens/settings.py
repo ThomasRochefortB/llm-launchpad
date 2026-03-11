@@ -30,7 +30,7 @@ class SettingsScreen(CopyEnabledScreen):
 
         with Center():
             with Vertical(id="settings-form"):
-                yield Static("[bold cyan]Settings[/bold cyan]")
+                yield Static("[bold #7bf168]Settings[/]")
                 yield Static("")
                 yield FormField(
                     "Scaledown window (seconds)",
