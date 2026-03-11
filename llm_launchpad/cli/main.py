@@ -8,6 +8,7 @@ all non-interactive commands available for automation.
 from __future__ import annotations
 
 import os
+import sys
 from typing import Annotated, Optional
 
 import typer
@@ -99,6 +100,22 @@ def _parse_bool_env(name: str, default: bool) -> bool:
 def _default_tui_mouse_enabled() -> bool:
     ssh_default = not bool(os.getenv("SSH_CONNECTION") or os.getenv("SSH_TTY"))
     return _parse_bool_env("LLM_LAUNCHPAD_TUI_MOUSE", ssh_default)
+
+
+def _ensure_tui_runtime() -> None:
+    """Fail fast with visible CLI errors before handing off to Textual."""
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        typer.echo(
+            "Error: llm-launchpad TUI requires an interactive terminal (TTY).",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    if not ModalBackend.is_cli_available():
+        typer.echo(
+            "Error: Modal CLI not found in PATH. Install it and run `modal setup`.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
 
 
 def _resolve_deploy_target(
@@ -199,6 +216,7 @@ def tui(
         )
         raise typer.Exit(code=1)
 
+    _ensure_tui_runtime()
     resolved_mouse = _default_tui_mouse_enabled() if mouse is None else mouse
     app_instance = TuiApp(mouse_enabled=resolved_mouse)
     try:
@@ -589,6 +607,8 @@ def switch(
 
 def main() -> None:
     """Console script entrypoint."""
+    if len(sys.argv) == 1:
+        sys.argv.append("tui")
     app()
 
 
