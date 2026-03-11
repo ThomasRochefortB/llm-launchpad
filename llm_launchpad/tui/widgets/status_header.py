@@ -15,8 +15,8 @@ class StatusHeader(Static):
     StatusHeader {
         height: 3;
         padding: 0 2;
-        background: $surface;
-        border-bottom: solid $primary-background;
+        background: #070b08;
+        border-bottom: solid #17321e;
     }
     """
 
@@ -28,11 +28,11 @@ class StatusHeader(Static):
     def render(self) -> str:
         state_icon = _state_icon(self.state)
         parts = [
-            f"[bold cyan]backend:[/] {self.backend}",
-            f"  {state_icon} [bold cyan]state:[/] {self.state}",
+            f"[bold #7bf168]backend:[/] {self.backend}",
+            f"  {state_icon} [bold #7bf168]state:[/] {self.state}",
         ]
         if self.operation and self.operation != "--":
-            parts.append(f"  [bold cyan]op:[/] {self.operation}")
+            parts.append(f"  [bold #7bf168]op:[/] {self.operation}")
         if self.detail:
             parts.append(f"  [dim]{self.detail}[/]")
         return " ".join(parts)
@@ -58,8 +58,8 @@ def _state_icon(state: str) -> str:
     icons = {
         "idle": "[dim]o[/]",
         "queued": "[yellow]~[/]",
-        "running": "[cyan]>[/]",
-        "deploying": "[cyan]>>[/]",
+        "running": "[#7bf168]>[/]",
+        "deploying": "[#7bf168]>>[/]",
         "warming_up": "[yellow]*[/]",
         "healthy": "[green]OK[/]",
         "unhealthy": "[red]X[/]",
