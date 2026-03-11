@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 import shutil
 import subprocess
+import sys
 
 
 @dataclass(frozen=True)
@@ -20,11 +22,24 @@ class ModalAuthStatus:
 _CLI_TIMEOUT_SECONDS = 8.0
 
 
+def _modal_cli_path() -> str | None:
+    env_prefix = Path(sys.prefix)
+    candidates = [
+        env_prefix / "bin" / "modal",
+        env_prefix / "Scripts" / "modal.exe",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return shutil.which("modal")
+
+
 def _run_modal_command(*args: str) -> subprocess.CompletedProcess[str] | None:
-    if shutil.which("modal") is None:
+    modal_cli = _modal_cli_path()
+    if modal_cli is None:
         return None
     return subprocess.run(
-        ["modal", *args],
+        [modal_cli, *args],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -74,7 +89,7 @@ def get_modal_profile() -> str | None:
 
 def get_modal_auth_status() -> ModalAuthStatus:
     """Return a best-effort Modal auth status for the current CLI session."""
-    if shutil.which("modal") is None:
+    if _modal_cli_path() is None:
         return ModalAuthStatus(
             authenticated=False,
             error="Modal CLI not found (install with: pip install modal)",

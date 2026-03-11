@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import subprocess
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -10,6 +12,19 @@ from llm_launchpad.protocol.models import DeploymentConfig
 
 
 class BackendParsingAndCommandTests(unittest.TestCase):
+    def test_modal_cli_path_prefers_active_env_scripts_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = os.path.join(tmp, "bin")
+            os.makedirs(bin_dir, exist_ok=True)
+            modal_path = os.path.join(bin_dir, "modal")
+            with open(modal_path, "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/sh\n")
+            with (
+                patch("llm_launchpad.core.backend.sys.prefix", tmp),
+                patch("llm_launchpad.core.backend.shutil.which", return_value=None),
+            ):
+                self.assertEqual(ModalBackend.modal_cli_path(), modal_path)
+
     @patch("llm_launchpad.core.backend.subprocess.run")
     def test_list_apps_returns_empty_list_for_empty_json_payload(self, mock_run) -> None:  # type: ignore[no-untyped-def]
         mock_run.return_value.returncode = 0
@@ -37,8 +52,8 @@ class BackendParsingAndCommandTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["total_usd"], 3.25)
         called_command = mock_run.call_args.args[0]
         self.assertEqual(
-            called_command,
-            ["modal", "billing", "report", "--for", "this month", "--json"],
+            called_command[-5:],
+            ["billing", "report", "--for", "this month", "--json"],
         )
 
     @patch("llm_launchpad.core.backend.subprocess.run")

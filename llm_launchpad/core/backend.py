@@ -8,7 +8,9 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import threading
+from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional
 
 from ..protocol.enums import BackendType
@@ -31,6 +33,27 @@ class ModalBackend:
     _active_procs_lock = threading.Lock()
     _shutdown_event = threading.Event()
     _CLI_TIMEOUT_SECONDS = 8.0
+
+    @staticmethod
+    def modal_cli_path() -> Optional[str]:
+        """Resolve the Modal CLI, preferring the active environment's scripts dir."""
+        env_prefix = Path(sys.prefix)
+        candidates = [
+            env_prefix / "bin" / "modal",
+            env_prefix / "Scripts" / "modal.exe",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return str(candidate)
+        return shutil.which("modal")
+
+    @classmethod
+    def _resolve_command(cls, command: List[str]) -> List[str]:
+        if command and command[0] == "modal":
+            modal_cli = cls.modal_cli_path()
+            if modal_cli:
+                return [modal_cli, *command[1:]]
+        return command
 
     @classmethod
     def register_proc(cls, proc: subprocess.Popen) -> None:
@@ -78,7 +101,7 @@ class ModalBackend:
 
     @staticmethod
     def is_cli_available() -> bool:
-        return shutil.which("modal") is not None
+        return ModalBackend.modal_cli_path() is not None
 
     @staticmethod
     def get_username() -> Optional[str]:
@@ -256,7 +279,7 @@ class ModalBackend:
         """Best available follow flag for ``modal app logs``."""
         try:
             res = subprocess.run(
-                ["modal", "app", "logs", "--help"],
+                ModalBackend._resolve_command(["modal", "app", "logs", "--help"]),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -282,7 +305,7 @@ class ModalBackend:
         """Return parsed app list (possibly empty), or None on failure."""
         try:
             result = subprocess.run(
-                ["modal", "app", "list", "--json"],
+                ModalBackend._resolve_command(["modal", "app", "list", "--json"]),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -306,7 +329,7 @@ class ModalBackend:
         """Fallback: return raw text from ``modal app list``."""
         try:
             result = subprocess.run(
-                ["modal", "app", "list"],
+                ModalBackend._resolve_command(["modal", "app", "list"]),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -342,7 +365,7 @@ class ModalBackend:
         for command in commands:
             try:
                 result = subprocess.run(
-                    command,
+                    ModalBackend._resolve_command(command),
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
@@ -386,7 +409,7 @@ class ModalBackend:
             return []
         try:
             result = subprocess.run(
-                ["modal", "volume", "ls", volume_name, path, "--json"],
+                ModalBackend._resolve_command(["modal", "volume", "ls", volume_name, path, "--json"]),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -423,7 +446,7 @@ class ModalBackend:
         merged = {**os.environ, **(env or {})}
         try:
             proc = subprocess.Popen(
-                command,
+                ModalBackend._resolve_command(command),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -475,7 +498,7 @@ class ModalBackend:
         merged = {**os.environ, **(env or {})}
         try:
             result = subprocess.run(
-                cmd,
+                ModalBackend._resolve_command(cmd),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -509,7 +532,7 @@ class ModalBackend:
         merged = None
         if env:
             merged = {**os.environ, **env}
-        result = subprocess.run(command, text=True, env=merged)
+        result = subprocess.run(ModalBackend._resolve_command(command), text=True, env=merged)
         return result.returncode
 
 

@@ -28,6 +28,25 @@ class CliMainHelperTests(unittest.TestCase):
         ):
             self.assertTrue(cli_main._default_tui_mouse_enabled())
 
+    def test_ensure_tui_runtime_requires_tty(self) -> None:
+        with (
+            patch("llm_launchpad.cli.main.sys.stdin.isatty", return_value=False),
+            patch("llm_launchpad.cli.main.sys.stdout.isatty", return_value=True),
+        ):
+            with self.assertRaises(cli_main.typer.Exit) as ctx:
+                cli_main._ensure_tui_runtime()
+        self.assertEqual(ctx.exception.exit_code, 1)
+
+    def test_ensure_tui_runtime_requires_modal_cli(self) -> None:
+        with (
+            patch("llm_launchpad.cli.main.sys.stdin.isatty", return_value=True),
+            patch("llm_launchpad.cli.main.sys.stdout.isatty", return_value=True),
+            patch("llm_launchpad.cli.main.ModalBackend.is_cli_available", return_value=False),
+        ):
+            with self.assertRaises(cli_main.typer.Exit) as ctx:
+                cli_main._ensure_tui_runtime()
+        self.assertEqual(ctx.exception.exit_code, 1)
+
     def test_resolve_deploy_target_prefers_explicit_app_name(self) -> None:
         instance, app_name = cli_main._resolve_deploy_target(
             BackendType.VLLM,
@@ -96,6 +115,17 @@ class CliMainCommandTests(unittest.TestCase):
     def setUp(self) -> None:
         self.runner = CliRunner()
 
+    def test_main_defaults_to_tui_subcommand_when_no_args(self) -> None:
+        fake_app = Mock()
+        argv = ["llm-launchpad"]
+        with (
+            patch("llm_launchpad.cli.main.app", fake_app),
+            patch("llm_launchpad.cli.main.sys.argv", argv),
+        ):
+            cli_main.main()
+        self.assertEqual(argv, ["llm-launchpad", "tui"])
+        fake_app.assert_called_once_with()
+
     def test_deploy_success_prints_target(self) -> None:
         orch = SimpleNamespace(
             deploy=lambda _config: [
@@ -117,6 +147,9 @@ class CliMainCommandTests(unittest.TestCase):
             patch.dict("os.environ", {"SSH_CONNECTION": "1"}, clear=True),
             patch("llm_launchpad.tui.app.TuiApp", return_value=app_instance) as app_cls,
             patch("llm_launchpad.core.backend.ModalBackend.terminate_all", return_value=None),
+            patch("llm_launchpad.cli.main.sys.stdin.isatty", return_value=True),
+            patch("llm_launchpad.cli.main.sys.stdout.isatty", return_value=True),
+            patch("llm_launchpad.cli.main.ModalBackend.is_cli_available", return_value=True),
         ):
             cli_main.tui()
         app_cls.assert_called_once_with(mouse_enabled=False)
@@ -127,6 +160,9 @@ class CliMainCommandTests(unittest.TestCase):
         with (
             patch("llm_launchpad.tui.app.TuiApp", return_value=app_instance) as app_cls,
             patch("llm_launchpad.core.backend.ModalBackend.terminate_all", return_value=None),
+            patch("llm_launchpad.cli.main.sys.stdin.isatty", return_value=True),
+            patch("llm_launchpad.cli.main.sys.stdout.isatty", return_value=True),
+            patch("llm_launchpad.cli.main.ModalBackend.is_cli_available", return_value=True),
         ):
             cli_main.tui(mouse=True)
         app_cls.assert_called_once_with(mouse_enabled=True)
