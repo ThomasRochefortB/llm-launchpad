@@ -72,7 +72,7 @@ class MonitorScreen(CopyEnabledScreen):
     def compose(self) -> ComposeResult:
         mouse_enabled = getattr(self.app, "mouse_enabled", True)
         copy_help = (
-            "terminal selection mode  use ctrl+shift+c to copy  ctrl+c exits"
+            "terminal selection mode  use your terminal copy shortcut  ctrl+c exits"
             if not mouse_enabled
             else "drag to select, dbl-click for line  ctrl+shift+c copy  y fallback  ctrl+c exits"
         )

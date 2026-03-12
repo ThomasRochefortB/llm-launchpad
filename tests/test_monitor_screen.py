@@ -49,7 +49,7 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             assert isinstance(screen, MonitorScreen)
             title = screen.query_one("#monitor-title", Static)
             self.assertIn(
-                "terminal selection mode  use ctrl+shift+c to copy  ctrl+c exits",
+                "terminal selection mode  use your terminal copy shortcut  ctrl+c exits",
                 str(title.content),
             )
 
