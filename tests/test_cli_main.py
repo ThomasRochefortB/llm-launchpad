@@ -16,9 +16,9 @@ class CliMainHelperTests(unittest.TestCase):
         with patch.dict("os.environ", {"LLM_LAUNCHPAD_TUI_MOUSE": "yes"}):
             self.assertTrue(cli_main._parse_bool_env("LLM_LAUNCHPAD_TUI_MOUSE", False))
 
-    def test_default_tui_mouse_enabled_defaults_off_over_ssh(self) -> None:
+    def test_default_tui_mouse_enabled_defaults_on_over_ssh(self) -> None:
         with patch.dict("os.environ", {"SSH_CONNECTION": "1"}, clear=True):
-            self.assertFalse(cli_main._default_tui_mouse_enabled())
+            self.assertTrue(cli_main._default_tui_mouse_enabled())
 
     def test_default_tui_mouse_enabled_can_be_forced_on_by_env(self) -> None:
         with patch.dict(
@@ -27,6 +27,10 @@ class CliMainHelperTests(unittest.TestCase):
             clear=True,
         ):
             self.assertTrue(cli_main._default_tui_mouse_enabled())
+
+    def test_default_tui_mouse_enabled_can_be_forced_off_by_env(self) -> None:
+        with patch.dict("os.environ", {"LLM_LAUNCHPAD_TUI_MOUSE": "false"}, clear=True):
+            self.assertFalse(cli_main._default_tui_mouse_enabled())
 
     def test_resolve_deploy_target_prefers_explicit_app_name(self) -> None:
         instance, app_name = cli_main._resolve_deploy_target(
@@ -111,7 +115,7 @@ class CliMainCommandTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0)
         self.assertIn("Deploy target: backend=vllm", result.output)
 
-    def test_tui_uses_ssh_default_mouse_setting(self) -> None:
+    def test_tui_uses_mouse_by_default_over_ssh(self) -> None:
         app_instance = Mock()
         with (
             patch.dict("os.environ", {"SSH_CONNECTION": "1"}, clear=True),
@@ -119,8 +123,8 @@ class CliMainCommandTests(unittest.TestCase):
             patch("llm_launchpad.core.backend.ModalBackend.terminate_all", return_value=None),
         ):
             cli_main.tui()
-        app_cls.assert_called_once_with(mouse_enabled=False)
-        app_instance.run.assert_called_once_with(mouse=False)
+        app_cls.assert_called_once_with(mouse_enabled=True)
+        app_instance.run.assert_called_once_with(mouse=True)
 
     def test_tui_allows_mouse_override(self) -> None:
         app_instance = Mock()
@@ -131,6 +135,16 @@ class CliMainCommandTests(unittest.TestCase):
             cli_main.tui(mouse=True)
         app_cls.assert_called_once_with(mouse_enabled=True)
         app_instance.run.assert_called_once_with(mouse=True)
+
+    def test_tui_allows_no_mouse_override(self) -> None:
+        app_instance = Mock()
+        with (
+            patch("llm_launchpad.tui.app.TuiApp", return_value=app_instance) as app_cls,
+            patch("llm_launchpad.core.backend.ModalBackend.terminate_all", return_value=None),
+        ):
+            cli_main.tui(mouse=False)
+        app_cls.assert_called_once_with(mouse_enabled=False)
+        app_instance.run.assert_called_once_with(mouse=False)
 
     def test_deploy_failure_propagates_operation_exit_code(self) -> None:
         orch = SimpleNamespace(

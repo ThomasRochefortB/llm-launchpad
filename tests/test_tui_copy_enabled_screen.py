@@ -9,12 +9,7 @@ from textual.selection import SELECT_ALL
 from textual.widgets import DataTable, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
-from llm_launchpad.tui.app import (
-    WizardApp,
-    _osc_52_sequence,
-    _screen_passthrough_sequence,
-    _tmux_passthrough_sequence,
-)
+from llm_launchpad.tui.app import WizardApp, _osc_52_sequence, _screen_passthrough_sequence, _tmux_passthrough_sequence
 from llm_launchpad.tui.screens.copy_enabled import CopyEnabledScreen
 from llm_launchpad.tui.screens.deploy import (
     BackendSelectScreen,
@@ -101,8 +96,29 @@ class _CopyKeyApp(App[None]):
         self.presented_text = text
 
 
+class _QuitCaptureApp(WizardApp):
+    def __init__(self) -> None:
+        super().__init__()
+        self.notifications: list[tuple[object, object, object, object]] = []
+        self.quit_calls = 0
+
+    def notify(
+        self,
+        message: object,
+        *,
+        title: object | None = None,
+        severity: str = "information",
+        timeout: float | None = None,
+        **kwargs: object,
+    ) -> None:
+        self.notifications.append((message, title, severity, timeout))
+
+    async def action_quit(self) -> None:
+        self.quit_calls += 1
+
+
 class CopyEnabledScreenTests(unittest.IsolatedAsyncioTestCase):
-    async def test_selection_copy_from_static_uses_present_text_fallback(self) -> None:
+    async def test_selection_copy_from_static_writes_to_clipboard(self) -> None:
         app = _CopyTestApp()
         async with app.run_test() as pilot:
             app.push_screen(_StaticSelectionScreen())
@@ -115,7 +131,7 @@ class CopyEnabledScreenTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             screen.action_copy_text()
-            self.assertEqual(app.presented_text, "Hello world")
+            self.assertEqual(app.clipboard, "Hello world")
 
     async def test_option_list_fallback_copies_highlighted_option(self) -> None:
         app = _CopyTestApp()
@@ -126,7 +142,7 @@ class CopyEnabledScreenTests(unittest.IsolatedAsyncioTestCase):
             screen = app.screen
             assert isinstance(screen, _OptionListFallbackScreen)
             screen.action_copy_text()
-            self.assertIn("Second option", app.presented_text)
+            self.assertIn("Second option", app.clipboard)
 
     async def test_data_table_fallback_copies_highlighted_row_as_tsv(self) -> None:
         app = _CopyTestApp()
@@ -138,7 +154,7 @@ class CopyEnabledScreenTests(unittest.IsolatedAsyncioTestCase):
             assert isinstance(screen, _DataTableFallbackScreen)
             screen.action_copy_text()
             self.assertEqual(
-                app.presented_text,
+                app.clipboard,
                 "vllm\tQwen/Qwen3-4B-Thinking-2507-FP8\t-",
             )
 
@@ -151,41 +167,26 @@ class CopyEnabledScreenTests(unittest.IsolatedAsyncioTestCase):
             screen = app.screen
             assert isinstance(screen, _InputFallbackScreen)
             screen.action_copy_text()
-            self.assertEqual(app.presented_text, "Qwen/Qwen3-8B")
+            self.assertEqual(app.clipboard, "Qwen/Qwen3-8B")
 
-    async def test_ctrl_c_without_copyable_text_does_not_call_help_quit(self) -> None:
+    async def test_input_ctrl_c_uses_input_native_copy_behavior(self) -> None:
         app = _CopyKeyApp()
         async with app.run_test() as pilot:
-            app.push_screen(_NoCopyFallbackScreen())
+            app.push_screen(_InputFallbackScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, _InputFallbackScreen)
+            input_widget = screen.query_one("#copy-input", Input)
+            input_widget.action_select_all()
             await pilot.pause()
 
             await pilot.press("ctrl+c")
             await pilot.pause()
 
             self.assertFalse(app.help_quit_called)
-            self.assertEqual(app.clipboard, "")
-
-    async def test_command_c_alias_triggers_copy_action(self) -> None:
-        app = _CopyTestApp()
-        async with app.run_test() as pilot:
-            app.push_screen(_StaticSelectionScreen())
-            await pilot.pause()
-
-            screen = app.screen
-            assert isinstance(screen, _StaticSelectionScreen)
-            target = screen.query_one("#copy-static", Static)
-            screen.selections = {target: SELECT_ALL}
-            await pilot.pause()
-
-            event = SimpleNamespace(
-                key="command+c",
-                name="command+c",
-                aliases=["command+c"],
-                stop=lambda: None,
-                prevent_default=lambda: None,
-            )
-            screen.on_key(event)
-            self.assertEqual(app.clipboard, "Hello world")
+            self.assertEqual(app.presented_text, "")
+            self.assertEqual(app.clipboard, "Qwen/Qwen3-8B")
 
     async def test_y_alias_triggers_copy_action(self) -> None:
         app = _CopyTestApp()
@@ -202,7 +203,43 @@ class CopyEnabledScreenTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("y")
             await pilot.pause()
 
-            self.assertEqual(app.presented_text, "Hello world")
+            self.assertEqual(app.clipboard, "Hello world")
+
+    async def test_ctrl_shift_c_binding_copies_selected_text_to_clipboard(self) -> None:
+        app = _CopyTestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(_StaticSelectionScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, _StaticSelectionScreen)
+            target = screen.query_one("#copy-static", Static)
+            screen.selections = {target: SELECT_ALL}
+            await pilot.pause()
+
+            await pilot.press("ctrl+shift+c")
+            await pilot.pause()
+
+            self.assertEqual(app.presented_text, "")
+            self.assertEqual(app.clipboard, "Hello world")
+
+    async def test_super_c_binding_copies_selected_text_to_clipboard(self) -> None:
+        app = _CopyTestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(_StaticSelectionScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, _StaticSelectionScreen)
+            target = screen.query_one("#copy-static", Static)
+            screen.selections = {target: SELECT_ALL}
+            await pilot.pause()
+
+            await pilot.press("super+c")
+            await pilot.pause()
+
+            self.assertEqual(app.presented_text, "")
+            self.assertEqual(app.clipboard, "Hello world")
 
     async def test_direct_clipboard_action_copies_to_clipboard(self) -> None:
         app = _CopyTestApp()
@@ -220,7 +257,7 @@ class CopyEnabledScreenTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(app.clipboard, "Hello world")
 
-    async def test_selection_only_helper_does_not_copy_focused_fallback_without_selection(self) -> None:
+    async def test_selected_text_hook_does_not_fall_back_without_selection(self) -> None:
         app = _CopyTestApp()
         async with app.run_test() as pilot:
             app.push_screen(_OptionListFallbackScreen())
@@ -228,8 +265,7 @@ class CopyEnabledScreenTests(unittest.IsolatedAsyncioTestCase):
 
             screen = app.screen
             assert isinstance(screen, _OptionListFallbackScreen)
-            copied = screen._copy_selected_text_if_any()
-            self.assertFalse(copied)
+            self.assertIsNone(screen._selected_text_for_copy())
             self.assertEqual(app.clipboard, "")
 
 
@@ -283,7 +319,7 @@ class WizardAppClipboardTests(unittest.TestCase):
             ],
         )
 
-    def test_present_text_for_copy_falls_back_to_clipboard_without_suspend_support(self) -> None:
+    def test_present_text_for_copy_copies_directly(self) -> None:
         app = WizardApp()
 
         copied: list[str] = []
@@ -295,8 +331,41 @@ class WizardAppClipboardTests(unittest.TestCase):
 
         result = app.present_text_for_copy("copied text")
 
-        self.assertFalse(result)
+        self.assertTrue(result)
         self.assertEqual(copied, ["copied text"])
+
+
+class WizardAppQuitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ctrl_c_first_press_warns_before_quitting(self) -> None:
+        app = _QuitCaptureApp()
+
+        with patch("llm_launchpad.tui.app.time.monotonic", return_value=10.0):
+            await app.action_request_quit()
+
+        self.assertEqual(app.quit_calls, 0)
+        self.assertEqual(
+            app.notifications,
+            [("Ctrl+C again to exit", "Exit llm-launchpad?", "warning", 2.0)],
+        )
+
+    async def test_ctrl_c_second_press_within_window_quits(self) -> None:
+        app = _QuitCaptureApp()
+
+        with patch("llm_launchpad.tui.app.time.monotonic", side_effect=[10.0, 11.0]):
+            await app.action_request_quit()
+            await app.action_request_quit()
+
+        self.assertEqual(app.quit_calls, 1)
+
+    async def test_ctrl_c_after_window_warns_again(self) -> None:
+        app = _QuitCaptureApp()
+
+        with patch("llm_launchpad.tui.app.time.monotonic", side_effect=[10.0, 13.5]):
+            await app.action_request_quit()
+            await app.action_request_quit()
+
+        self.assertEqual(app.quit_calls, 0)
+        self.assertEqual(len(app.notifications), 2)
 
 
 class CopyEnabledScreenInheritanceTests(unittest.TestCase):

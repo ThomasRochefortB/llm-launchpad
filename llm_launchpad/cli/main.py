@@ -97,8 +97,7 @@ def _parse_bool_env(name: str, default: bool) -> bool:
 
 
 def _default_tui_mouse_enabled() -> bool:
-    ssh_default = not bool(os.getenv("SSH_CONNECTION") or os.getenv("SSH_TTY"))
-    return _parse_bool_env("LLM_LAUNCHPAD_TUI_MOUSE", ssh_default)
+    return _parse_bool_env("LLM_LAUNCHPAD_TUI_MOUSE", True)
 
 
 def _resolve_deploy_target(
