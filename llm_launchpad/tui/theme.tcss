@@ -1,13 +1,14 @@
 /* ==========================================================
    llm-launchpad Textual theme
-   Inspired by Codex TUI aesthetics: dark bg, cyan accents,
-   prominent keyboard hints, minimal chrome.
+   Modal-inspired: deep black surfaces, vivid green accents,
+   restrained chrome, and high-contrast content areas.
    ========================================================== */
 
 /* ---- Global ---- */
 
 Screen {
-    background: $surface;
+    background: #050806;
+    color: #eef7ef;
 }
 
 /* ---- Header / Footer bars ---- */
@@ -15,32 +16,33 @@ Screen {
 #header-bar {
     dock: top;
     height: 3;
-    background: $surface;
-    color: $text;
+    background: #070b08;
+    color: #eef7ef;
     padding: 0 2;
-    border-bottom: solid $primary;
+    border-bottom: solid #7bf168;
 }
 
 #header-bar .app-title {
     text-style: bold;
-    color: $primary;
+    color: #7bf168;
 }
 
 #header-bar .app-meta {
-    color: $text-muted;
+    color: #93a596;
 }
 
 #footer-bar {
     dock: bottom;
     height: 1;
-    background: $surface;
-    color: $text-muted;
+    background: #070b08;
+    color: #93a596;
     padding: 0 2;
 }
 
 Footer {
-    background: $surface;
-    color: $text-muted;
+    background: #070b08;
+    color: #93a596;
+    border-top: solid #17321e;
 }
 
 /* ---- Status header widget ---- */
@@ -48,24 +50,25 @@ Footer {
 StatusHeader {
     height: 4;
     padding: 0 2;
-    background: $surface;
-    border-bottom: solid $primary-background;
+    background: #070b08;
+    border-bottom: solid #17321e;
 }
 
 StatusHeader .status-label {
     text-style: bold;
-    color: $primary;
+    color: #7bf168;
 }
 
 StatusHeader .status-value {
-    color: $text;
+    color: #eef7ef;
 }
 
 /* ---- Log viewer ---- */
 
 LogViewer {
     height: 1fr;
-    border: solid $primary-background;
+    border: solid #17321e;
+    background: #0a0f0b;
     padding: 0 1;
 }
 
@@ -100,8 +103,8 @@ LogViewer Log {
     min-height: 18;
     margin: 1 0 0 1;
     padding: 1 2;
-    border: solid $primary-background;
-    background: $surface;
+    border: solid #17321e;
+    background: #0b110d;
 }
 
 #deployment-status-title {
@@ -109,7 +112,7 @@ LogViewer Log {
 }
 
 #deployment-status-body {
-    color: $text;
+    color: #eef7ef;
     text-wrap: wrap;
 }
 
@@ -118,13 +121,13 @@ LogViewer Log {
 }
 
 #billing-report-body {
-    color: $text;
+    color: #eef7ef;
     text-wrap: wrap;
 }
 
 #banner-text {
     text-align: center;
-    color: $primary;
+    color: #7bf168;
     padding: 0 0 1 0;
 }
 
@@ -136,112 +139,133 @@ LogViewer Log {
     min-height: 3;
     margin: 0 0 1 1;
     padding: 0 1;
-    border-left: tall $primary-background;
-    color: $text-muted;
+    border-left: tall #17321e;
+    color: #93a596;
     background: transparent;
 }
 
 /* ---- Option / Selection Lists ---- */
 
 OptionList {
-    background: $surface;
-    border: solid $primary-background;
+    background: #0b110d;
+    border: solid #17321e;
     padding: 0;
     height: auto;
     max-height: 20;
 }
 
 OptionList:focus {
-    border: solid $primary;
+    border: solid #7bf168;
 }
 
 OptionList > .option-list--option-highlighted {
-    background: $primary 25%;
-    color: $text;
+    background: #12311b;
+    color: #eef7ef;
     text-style: bold;
 }
 
 OptionList > .option-list--option-hover-highlighted {
-    background: $primary 25%;
-    color: $text;
+    background: #12311b;
+    color: #eef7ef;
     text-style: bold;
 }
 
 DataTable {
-    background: $surface;
-    border: solid $primary-background;
+    background: #0b110d;
+    border: solid #17321e;
     height: 20;
+    color: #eef7ef;
 }
 
 DataTable:focus {
-    border: solid $primary;
+    border: solid #7bf168;
 }
 
 SelectionList {
-    background: $surface;
+    background: #0b110d;
     height: auto;
     max-height: 20;
 }
 
 ListView {
-    background: $surface;
+    background: #0b110d;
     height: auto;
     max-height: 20;
 }
 
 ListView > ListItem.--highlight {
-    background: $primary 20%;
+    background: #12311b;
 }
 
 /* ---- Inputs ---- */
 
 Input {
-    border: tall $primary-background;
-    background: $surface;
+    border: tall #1d3c25;
+    background: #0b110d;
+    color: #eef7ef;
     padding: 0 1;
 }
 
 Input:focus {
-    border: tall $primary;
+    border: tall #7bf168;
+    background: #0f1812;
 }
 
 Select {
-    border: tall $primary-background;
-    background: $surface;
+    border: tall #1d3c25;
+    background: #0b110d;
+    color: #eef7ef;
 }
 
 Select:focus {
-    border: tall $primary;
+    border: tall #7bf168;
+    background: #0f1812;
+}
+
+Switch {
+    background: #0b110d;
+}
+
+Switch > .switch--slider {
+    color: #050806;
+    background: #2d3b30;
+}
+
+Switch.-on > .switch--slider {
+    background: #7bf168;
 }
 
 /* ---- Buttons ---- */
 
 Button {
     min-width: 16;
-    background: $primary-background;
-    color: $text;
-    border: none;
+    background: #101913;
+    color: #eef7ef;
+    border: solid #17321e;
 }
 
 Button:hover {
-    background: $primary 40%;
+    background: #12311b;
+    border: solid #7bf168;
 }
 
 Button.-primary {
-    background: $primary;
-    color: $text;
+    background: #7bf168;
+    color: #050806;
     text-style: bold;
+    border: solid #7bf168;
 }
 
 Button:focus {
-    text-style: bold reverse;
+    text-style: bold;
+    border: solid #95ff85;
 }
 
 /* ---- Dialogs / Modals ---- */
 
 #dialog-overlay {
     align: center middle;
-    background: $surface 80%;
+    background: #050806 82%;
 }
 
 #dialog-box {
@@ -249,8 +273,8 @@ Button:focus {
     height: auto;
     max-height: 70%;
     padding: 1 2;
-    border: solid $primary;
-    background: $surface;
+    border: solid #7bf168;
+    background: #0b110d;
 }
 
 /* ---- Deploy form ---- */
@@ -261,24 +285,24 @@ Button:focus {
 }
 
 .form-label {
-    color: $text-muted;
+    color: #c8d6c9;
     padding: 0 0 0 0;
     height: 1;
 }
 
 .form-hint {
-    color: $text-disabled;
+    color: #7f9082;
     height: 1;
 }
 
 .form-section-title {
-    color: $primary;
+    color: #7bf168;
     text-style: bold;
     height: 1;
 }
 
 .form-section-subtitle {
-    color: $text-disabled;
+    color: #7f9082;
     height: 1;
     padding: 0 0 1 0;
 }
@@ -287,7 +311,7 @@ Button:focus {
 
 LlamaCppDeployScreen .form-label,
 VllmDeployScreen .form-label {
-    color: $text;
+    color: #eef7ef;
     text-style: bold;
 }
 
@@ -295,28 +319,28 @@ LlamaCppDeployScreen .form-hint,
 VllmDeployScreen .form-hint,
 LlamaCppDeployScreen .form-section-subtitle,
 VllmDeployScreen .form-section-subtitle {
-    color: $text-muted;
+    color: #93a596;
 }
 
 LlamaCppDeployScreen Input,
 VllmDeployScreen Input,
 LlamaCppDeployScreen Select,
 VllmDeployScreen Select {
-    border: tall $primary 40%;
+    border: tall #2b5933;
 }
 
 LlamaCppDeployScreen Input:focus,
 VllmDeployScreen Input:focus,
 LlamaCppDeployScreen Select:focus,
 VllmDeployScreen Select:focus {
-    border: tall $primary;
-    background: $primary 8%;
+    border: tall #7bf168;
+    background: #0f1812;
 }
 
 LlamaCppDeployScreen .gpu-config-panel,
 VllmDeployScreen .gpu-config-panel {
-    border: tall $primary 60%;
-    background: $primary-background 15%;
+    border: tall #2b5933;
+    background: #0f1812;
 }
 
 /* ---- Monitor screen ---- */
@@ -327,7 +351,7 @@ VllmDeployScreen .gpu-config-panel {
 
 #monitor-log {
     height: 1fr;
-    border: solid $primary-background;
+    border: solid #17321e;
     padding: 0 1;
 }
 
@@ -335,8 +359,8 @@ VllmDeployScreen .gpu-config-panel {
     dock: top;
     height: 3;
     padding: 0 2;
-    background: $surface;
-    border-bottom: solid $primary-background;
+    background: #070b08;
+    border-bottom: solid #17321e;
 }
 
 /* ---- Manage screen ---- */
@@ -358,7 +382,8 @@ VllmDeployScreen .gpu-config-panel {
     width: 60;
     height: auto;
     padding: 1 2;
-    border: solid $primary-background;
+    border: solid #17321e;
+    background: #0b110d;
 }
 
 /* ---- Deploy screen GPU row ---- */
@@ -374,8 +399,8 @@ VllmDeployScreen .gpu-config-panel {
     height: auto;
     margin: 0 0 1 0;
     padding: 0 1 1 1;
-    border: tall $primary-background;
-    background: $surface;
+    border: tall #1d3c25;
+    background: #0b110d;
 }
 
 .gpu-config-main-row {
@@ -422,11 +447,11 @@ VllmDeployScreen .gpu-config-panel {
 }
 
 .accent {
-    color: $primary;
+    color: #7bf168;
 }
 
 .muted {
-    color: $text-muted;
+    color: #93a596;
 }
 
 .spacer {

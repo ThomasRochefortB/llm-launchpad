@@ -26,14 +26,14 @@ from ...protocol.enums import BackendType
 from ...protocol.models import EndpointInfo
 from .copy_enabled import CopyEnabledScreen
 
-BANNER = r"""[bold cyan]
+BANNER = r"""[bold #7bf168]
 _     _     __  __
 | |   | |   |  \/  |
 | |   | |   | |\/| |
 | |___| |___| |  | |
 |_____|_____|_|  |_|
     LAUNCHPAD
-[/bold cyan]"""
+[/]"""
 
 PANEL_SEPARATOR = "[dim]----------------------------------------[/dim]"
 
@@ -157,13 +157,13 @@ def _style_state(state: str) -> str:
     if bucket == "healthy":
         return f"[green]{normalized}[/green]"
     if bucket == "deploying":
-        return f"[cyan]{normalized}[/cyan]"
+        return f"[#7bf168]{normalized}[/]"
     if bucket == "queued":
         return f"[yellow]{normalized}[/yellow]"
     if bucket == "error":
         return f"[red]{normalized}[/red]"
     if bucket == "stopped":
-        return f"[magenta]{normalized}[/magenta]"
+        return f"[dim]{normalized}[/dim]"
     return f"[dim]{normalized}[/dim]"
 
 
@@ -656,10 +656,10 @@ class MainMenuScreen(CopyEnabledScreen):
                         id="action-list",
                     )
                 with Vertical(id="deployment-status-panel"):
-                    yield Static("[bold cyan]Deployment Status[/bold cyan]", id="deployment-status-title")
+                    yield Static("[bold #7bf168]Deployment Status[/]", id="deployment-status-title")
                     yield Static("[dim]Refreshing deployment status...[/dim]", id="deployment-status-body")
                     yield Static(PANEL_SEPARATOR, id="deployment-billing-separator")
-                    yield Static("[bold cyan]Modal Billing Report[/bold cyan]", id="billing-report-title")
+                    yield Static("[bold #7bf168]Modal Billing Report[/]", id="billing-report-title")
                     yield Static("[dim]Refreshing billing report...[/dim]", id="billing-report-body")
         yield Static(
             _render_auth_status_block(username=self.username),

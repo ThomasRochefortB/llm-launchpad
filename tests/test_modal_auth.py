@@ -1,19 +1,35 @@
 from __future__ import annotations
 
+import os
 import subprocess
+import tempfile
 import unittest
 from unittest.mock import patch
 
 from llm_launchpad.core.modal_auth import (
     ModalAuthStatus,
+    _modal_cli_path,
     get_modal_auth_status,
     get_modal_profile,
 )
 
 
 class ModalAuthTests(unittest.TestCase):
-    @patch("llm_launchpad.core.modal_auth.shutil.which", return_value=None)
-    def test_get_modal_auth_status_reports_missing_cli(self, _mock_which) -> None:
+    def test_modal_cli_path_prefers_active_env_scripts_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_dir = os.path.join(tmp, "bin")
+            os.makedirs(bin_dir, exist_ok=True)
+            modal_path = os.path.join(bin_dir, "modal")
+            with open(modal_path, "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/sh\n")
+            with (
+                patch("llm_launchpad.core.modal_auth.sys.prefix", tmp),
+                patch("llm_launchpad.core.modal_auth.shutil.which", return_value=None),
+            ):
+                self.assertEqual(_modal_cli_path(), modal_path)
+
+    @patch("llm_launchpad.core.modal_auth._modal_cli_path", return_value=None)
+    def test_get_modal_auth_status_reports_missing_cli(self, _mock_modal_path) -> None:
         status = get_modal_auth_status()
         self.assertEqual(
             status,

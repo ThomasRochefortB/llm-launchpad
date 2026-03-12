@@ -75,7 +75,7 @@ class MonitorScreen(CopyEnabledScreen):
         with Vertical(id="monitor-layout"):
             yield Static(
                 (
-                    f"[bold cyan]{self._title}[/bold cyan]  "
+                    f"[bold #7bf168]{self._title}[/]  "
                     f"[dim]{copy_help}  ctrl+l clear  esc to return[/dim]"
                 ),
                 id="monitor-title",
