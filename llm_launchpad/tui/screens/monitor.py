@@ -70,12 +70,7 @@ class MonitorScreen(CopyEnabledScreen):
         )
 
     def compose(self) -> ComposeResult:
-        mouse_enabled = getattr(self.app, "mouse_enabled", True)
-        copy_help = (
-            "terminal selection mode  use your terminal copy shortcut  ctrl+c exits"
-            if not mouse_enabled
-            else "drag to select, dbl-click for line  ctrl+shift+c copy  y fallback  ctrl+c exits"
-        )
+        copy_help = self._copy_help_text()
         yield StatusHeader(id="monitor-status-header")
         with Vertical(id="monitor-layout"):
             yield Static(
@@ -87,6 +82,27 @@ class MonitorScreen(CopyEnabledScreen):
             )
             yield LogViewer(id="monitor-log-viewer")
         yield Footer()
+
+    def _copy_help_text(self) -> str:
+        mouse_enabled = getattr(self.app, "mouse_enabled", True)
+        if not mouse_enabled:
+            return (
+                "terminal selection mode  use your terminal copy shortcut  "
+                "ctrl+t mouse  ctrl+c exits"
+            )
+        return (
+            "drag to select, dbl-click for line  ctrl+shift+c copy  "
+            "y fallback  ctrl+t terminal copy  ctrl+c exits"
+        )
+
+    def refresh_copy_help(self) -> None:
+        title = self.query_one("#monitor-title", Static)
+        title.update(
+            (
+                f"[bold cyan]{self._title}[/bold cyan]  "
+                f"[dim]{self._copy_help_text()}  ctrl+l clear  esc to return[/dim]"
+            )
+        )
 
     @property
     def log_viewer(self) -> LogViewer:

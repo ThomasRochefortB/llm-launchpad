@@ -117,6 +117,19 @@ class _QuitCaptureApp(WizardApp):
         self.quit_calls += 1
 
 
+class _MouseDriverStub:
+    def __init__(self, mouse: bool) -> None:
+        self._mouse = mouse
+        self.enable_calls = 0
+        self.disable_calls = 0
+
+    def _enable_mouse_support(self) -> None:
+        self.enable_calls += 1
+
+    def _disable_mouse_support(self) -> None:
+        self.disable_calls += 1
+
+
 class CopyEnabledScreenTests(unittest.IsolatedAsyncioTestCase):
     async def test_selection_copy_from_static_writes_to_clipboard(self) -> None:
         app = _CopyTestApp()
@@ -381,6 +394,32 @@ class WizardAppQuitTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(app.quit_calls, 0)
         self.assertEqual(len(app.notifications), 2)
+
+
+class WizardAppMouseModeTests(unittest.TestCase):
+    def test_toggle_mouse_mode_enables_driver_mouse_support(self) -> None:
+        app = WizardApp(mouse_enabled=False)
+        driver = _MouseDriverStub(mouse=False)
+        app._driver = driver
+
+        app.action_toggle_mouse_mode()
+
+        self.assertTrue(app.mouse_enabled)
+        self.assertTrue(driver._mouse)
+        self.assertEqual(driver.enable_calls, 1)
+        self.assertEqual(driver.disable_calls, 0)
+
+    def test_toggle_mouse_mode_disables_driver_mouse_support(self) -> None:
+        app = WizardApp(mouse_enabled=True)
+        driver = _MouseDriverStub(mouse=True)
+        app._driver = driver
+
+        app.action_toggle_mouse_mode()
+
+        self.assertFalse(app.mouse_enabled)
+        self.assertFalse(driver._mouse)
+        self.assertEqual(driver.enable_calls, 0)
+        self.assertEqual(driver.disable_calls, 1)
 
 
 class CopyEnabledScreenInheritanceTests(unittest.TestCase):

@@ -123,6 +123,7 @@ class TuiApp(App):
 
     BINDINGS = [
         Binding("ctrl+c", "request_quit", show=False, priority=True, system=True),
+        Binding("ctrl+t", "toggle_mouse_mode", "Mouse", show=True),
         Binding("q", "quit", "Quit", show=True, priority=True),
     ]
     _CTRL_C_CONFIRM_WINDOW_SECONDS = 2.0
@@ -184,6 +185,33 @@ class TuiApp(App):
         self.copy_to_clipboard(normalized)
         return True
 
+    def _set_mouse_mode(self, enabled: bool) -> None:
+        """Enable or disable driver mouse reporting at runtime."""
+        driver = getattr(self, "_driver", None)
+        if driver is not None:
+            currently_enabled = bool(getattr(driver, "_mouse", self.mouse_enabled))
+            if enabled and not currently_enabled:
+                setattr(driver, "_mouse", True)
+                enable = getattr(driver, "_enable_mouse_support", None)
+                if callable(enable):
+                    enable()
+            elif not enabled and currently_enabled:
+                disable = getattr(driver, "_disable_mouse_support", None)
+                if callable(disable):
+                    disable()
+                setattr(driver, "_mouse", False)
+
+        self.mouse_enabled = enabled
+        try:
+            screen = self.screen
+        except Exception:
+            return
+
+        refresher = getattr(screen, "refresh_copy_help", None)
+        if callable(refresher):
+            refresher()
+        screen.refresh()
+
     async def action_quit(self) -> None:
         """Terminate tracked subprocesses and workers before exiting.
 
@@ -212,6 +240,23 @@ class TuiApp(App):
             timeout=self._CTRL_C_CONFIRM_WINDOW_SECONDS,
         )
 
+    def action_toggle_mouse_mode(self) -> None:
+        """Toggle between app mouse mode and terminal-native selection mode."""
+        enabled = not self.mouse_enabled
+        self._set_mouse_mode(enabled)
+        if enabled:
+            self.notify(
+                "Mouse enabled. Clicks and drags go to llm-launchpad.",
+                title="Mouse mode on",
+                timeout=3,
+            )
+        else:
+            self.notify(
+                "Mouse disabled. Use your terminal selection and copy shortcuts.",
+                title="Terminal copy mode",
+                timeout=3,
+            )
+
     def on_mount(self) -> None:
         """Launch the TUI if the Modal CLI is installed.
 
@@ -227,6 +272,11 @@ class TuiApp(App):
             return
         self._username = ModalBackend.get_username() or ""
         self.push_screen(MainMenuScreen(username=self._username, version=self._version))
+        if not self.mouse_enabled:
+            self.notify(
+                "Terminal copy mode active. Press Ctrl+T to enable mouse.",
+                timeout=4,
+            )
 
     # ------------------------------------------------------------------
     # Actions called by screens

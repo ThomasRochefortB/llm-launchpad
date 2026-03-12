@@ -34,7 +34,7 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("stderr | stderr line", content)
             title = screen.query_one("#monitor-title", Static)
             self.assertIn(
-                "ctrl+shift+c copy  y fallback  ctrl+c exits  ctrl+l clear",
+                "ctrl+shift+c copy  y fallback  ctrl+t terminal copy  ctrl+c exits  ctrl+l clear",
                 str(title.content),
             )
 
@@ -49,7 +49,7 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             assert isinstance(screen, MonitorScreen)
             title = screen.query_one("#monitor-title", Static)
             self.assertIn(
-                "terminal selection mode  use your terminal copy shortcut  ctrl+c exits",
+                "terminal selection mode  use your terminal copy shortcut  ctrl+t mouse  ctrl+c exits",
                 str(title.content),
             )
 
