@@ -1,4 +1,4 @@
-"""Shared screen behavior for consistent copy-to-clipboard support."""
+"""Shared screen behavior for native-first copy-to-clipboard support."""
 
 from __future__ import annotations
 
@@ -6,8 +6,8 @@ from typing import Any
 
 from rich.errors import MarkupError
 from rich.markup import render as render_markup
-from textual import events
 from textual.binding import Binding
+from textual.selection import Selection
 from textual.screen import Screen
 from textual.widgets import DataTable, Input, OptionList, Select, Static
 
@@ -15,62 +15,69 @@ from textual.widgets import DataTable, Input, OptionList, Select, Static
 class CopyEnabledScreen(Screen):
     """Screen base class that provides consistent copy behavior."""
 
-    _COPY_KEY_ALIASES = {
-        "y",
-        "ctrl+c",
-    }
-    _DIRECT_CLIPBOARD_KEY_ALIASES = {
-        "ctrl+shift+c",
-        "meta+c",
-        "super+c",
-        "cmd+c",
-        "command+c",
-    }
-
     BINDINGS = [
-        Binding("y,ctrl+c", "copy_text", "Copy", key_display="y", show=False),
-        Binding("meta+c,ctrl+shift+c", "copy_text_to_clipboard", "Copy", show=False),
+        Binding("y", "copy_text", "Copy", key_display="y", show=False),
+        Binding(
+            "ctrl+shift+c,super+c,meta+c,cmd+c,command+c",
+            "copy_text_to_clipboard",
+            "Copy",
+            show=False,
+        ),
     ]
 
-    def action_copy_text(self) -> None:
-        """Present copyable text via a terminal-native fallback."""
-        text = self.get_selected_text() or self._focused_text_fallback()
-        normalized = self._normalize_text(text)
-        if normalized:
-            presenter = getattr(self.app, "present_text_for_copy", None)
-            if callable(presenter):
-                presenter(normalized)
-            else:
-                self.app.copy_to_clipboard(normalized)
-            return
-        self.notify("Nothing to copy", timeout=2)
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self._selection_sync_scheduled = False
+        self._last_synced_selection: str | None = None
 
-    def action_copy_text_to_clipboard(self) -> None:
-        """Copy selected text directly to the clipboard when the terminal supports it."""
-        text = self.get_selected_text() or self._focused_text_fallback()
-        normalized = self._normalize_text(text)
+    def action_copy_text(self) -> None:
+        """Copy selected or focused text to the clipboard."""
+        normalized = self._copyable_text()
         if normalized:
             self.app.copy_to_clipboard(normalized)
             return
         self.notify("Nothing to copy", timeout=2)
 
-    def on_key(self, event: events.Key) -> None:
-        """Handle additional copy key aliases seen across terminal implementations."""
-        key_forms = {event.key, event.name, *event.aliases}
-        if key_forms.intersection(self._COPY_KEY_ALIASES):
-            self.action_copy_text()
-            event.stop()
-            event.prevent_default()
+    def action_copy_text_to_clipboard(self) -> None:
+        """Copy selected text directly to the clipboard when the terminal supports it."""
+        normalized = self._copyable_text()
+        if normalized:
+            self.app.copy_to_clipboard(normalized)
             return
-        if key_forms.intersection(self._DIRECT_CLIPBOARD_KEY_ALIASES):
-            self.action_copy_text_to_clipboard()
-            event.stop()
-            event.prevent_default()
+        self.notify("Nothing to copy", timeout=2)
 
-    def on_mouse_up(self, event: events.MouseUp) -> None:
-        """Copy selected text on drag-end as a fallback when Cmd+C is intercepted."""
-        if event.button in (1, "left"):
-            self.call_after_refresh(self._copy_selected_text_if_any)
+    async def _watch_selections(
+        self,
+        old_selections: dict[Static, Selection],
+        selections: dict[Static, Selection],
+    ) -> None:
+        await super()._watch_selections(old_selections, selections)
+        if not selections:
+            self._last_synced_selection = None
+            return
+        if self._selection_sync_scheduled:
+            return
+        self._selection_sync_scheduled = True
+        self.call_after_refresh(self._sync_selection_to_clipboard)
+
+    def _copyable_text(self) -> str | None:
+        return self._normalize_text(
+            self._selected_text_for_copy() or self._focused_text_fallback()
+        )
+
+    def _sync_selection_to_clipboard(self) -> None:
+        self._selection_sync_scheduled = False
+        selection = self._normalize_text(self._selected_text_for_copy())
+        if not selection:
+            self._last_synced_selection = None
+            return
+        if selection == self._last_synced_selection:
+            return
+        self.app.copy_to_clipboard(selection)
+        self._last_synced_selection = selection
+
+    def _selected_text_for_copy(self) -> str | None:
+        return self.get_selected_text()
 
     def _focused_text_fallback(self) -> str | None:
         focused = self.focused
@@ -111,13 +118,6 @@ class CopyEnabledScreen(Screen):
             return None
         normalized = text.rstrip("\n")
         return normalized if normalized else None
-
-    def _copy_selected_text_if_any(self) -> bool:
-        text = self._normalize_text(self.get_selected_text())
-        if not text:
-            return False
-        self.app.copy_to_clipboard(text)
-        return True
 
     def _to_plain_text(self, value: Any) -> str:
         if value is None:

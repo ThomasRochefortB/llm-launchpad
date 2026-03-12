@@ -8,8 +8,6 @@ from __future__ import annotations
 
 import re
 
-from textual import events
-from textual.actions import SkipAction
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
@@ -36,14 +34,14 @@ class MonitorScreen(CopyEnabledScreen):
         Binding("escape", "go_back", "Back", show=True),
         Binding("q", "go_back", "Back"),
         Binding(
-            "y,c,ctrl+c",
+            "y",
             "copy_text",
             "Copy",
             key_display="y",
             show=True,
         ),
         Binding(
-            "ctrl+shift+c,meta+c,super+c",
+            "ctrl+shift+c,super+c,meta+c,cmd+c,command+c",
             "copy_text_to_clipboard",
             "Copy",
             show=False,
@@ -72,12 +70,7 @@ class MonitorScreen(CopyEnabledScreen):
         )
 
     def compose(self) -> ComposeResult:
-        mouse_enabled = getattr(self.app, "mouse_enabled", True)
-        copy_help = (
-            "use terminal selection + cmd+c  y/c/ctrl+c fallback"
-            if not mouse_enabled
-            else "drag to select, dbl-click for line  y/c/ctrl+c to copy  ctrl+shift+c direct clip"
-        )
+        copy_help = self._copy_help_text()
         yield StatusHeader(id="monitor-status-header")
         with Vertical(id="monitor-layout"):
             yield Static(
@@ -89,6 +82,27 @@ class MonitorScreen(CopyEnabledScreen):
             )
             yield LogViewer(id="monitor-log-viewer")
         yield Footer()
+
+    def _copy_help_text(self) -> str:
+        mouse_enabled = getattr(self.app, "mouse_enabled", True)
+        if not mouse_enabled:
+            return (
+                "terminal selection mode  use your terminal copy shortcut  "
+                "ctrl+t mouse  ctrl+c exits"
+            )
+        return (
+            "drag to select, dbl-click for line  ctrl+shift+c copy  "
+            "y fallback  ctrl+t terminal copy  ctrl+c exits"
+        )
+
+    def refresh_copy_help(self) -> None:
+        title = self.query_one("#monitor-title", Static)
+        title.update(
+            (
+                f"[bold cyan]{self._title}[/bold cyan]  "
+                f"[dim]{self._copy_help_text()}  ctrl+l clear  esc to return[/dim]"
+            )
+        )
 
     @property
     def log_viewer(self) -> LogViewer:
@@ -152,91 +166,16 @@ class MonitorScreen(CopyEnabledScreen):
     def on_operation_error(self, message: OperationError) -> None:
         self.log_viewer.write_line(f"Error: {message.message}")
 
-    def on_key(self, event: events.Key) -> None:
-        """Handle additional copy aliases across terminal implementations."""
-        key_forms = {event.key, event.name, *event.aliases}
-        if key_forms.intersection(
-            {
-                "y",
-                "c",
-                "ctrl+c",
-            }
-        ):
-            self.action_copy_text()
-            event.stop()
-            event.prevent_default()
-            return
-        if key_forms.intersection(
-            {
-                "ctrl+shift+c",
-                "meta+c",
-                "super+c",
-                "cmd+c",
-                "command+c",
-            }
-        ):
-            self.action_copy_text_to_clipboard()
-            event.stop()
-            event.prevent_default()
-
-    def on_mouse_up(self, event: events.MouseUp) -> None:
-        """Fallback: copy selected text when drag selection ends in log view.
-
-        Some terminals reserve Cmd+C and never forward it to Textual. In that
-        case, copying on mouse release keeps log copying usable with Cmd-based
-        workflows.
-        """
-        if event.button in (1, "left"):
-            self.call_after_refresh(
-                lambda: self._copy_selected_text(notify=False, raise_on_empty=False)
-            )
-
-    # -- Actions --
-
-    def _copy_selected_text(
-        self, *, notify: bool = True, raise_on_empty: bool = True
-    ) -> bool:
-        text = self._selected_text()
-        if not text:
-            if notify:
-                self.notify("No text selected to copy", timeout=2)
-            if raise_on_empty:
-                raise SkipAction()
-            return False
-
-        # OSC 52 (works in iTerm2, Kitty, WezTerm, Ghostty, etc.)
-        self.app.copy_to_clipboard(text)
-
-        if notify:
-            lines = text.count("\n") + 1
-            self.notify(f"Copied {lines} line{'s' if lines != 1 else ''}", timeout=2)
-        return True
-
-    def _selected_text(self) -> str | None:
-        """Get the currently selected log text, if any."""
+    def _selected_text_for_copy(self) -> str | None:
+        """Return selected log text before falling back to screen selections."""
         log_widget = self.log_viewer.log_widget
         getter = getattr(log_widget, "get_selected_text", None)
+        text = None
         if callable(getter):
             text = getter()
         if not text:
             text = self.get_selected_text()
         return text
-
-    def action_copy_text(self) -> None:
-        """Present selected log text via a terminal-native fallback."""
-        text = self._selected_text()
-        if not text:
-            self.notify("No text selected to copy", timeout=2)
-            raise SkipAction()
-        presenter = getattr(self.app, "present_text_for_copy", None)
-        if callable(presenter):
-            presenter(text)
-            return
-        self._copy_selected_text(notify=True, raise_on_empty=True)
-
-    def action_copy_text_to_clipboard(self) -> None:
-        """Copy selected log text directly to the clipboard."""
-        self._copy_selected_text(notify=True, raise_on_empty=True)
 
     def action_go_back(self) -> None:
         self.app.pop_screen()

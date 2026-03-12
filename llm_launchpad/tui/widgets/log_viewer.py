@@ -18,6 +18,22 @@ class SelectableLog(Log):
     * Single click / drag selection is unchanged.
     """
 
+    def _select_line(self, line_index: int) -> bool:
+        """Select a single line."""
+        if not (0 <= line_index < self.line_count):
+            return False
+        line_text = self.lines[line_index]
+        start = Offset(0, line_index)
+        end = Offset(len(line_text), line_index)
+        self.screen.selections = {
+            self: Selection(start, end)
+        }
+        return True
+
+    def _select_all(self) -> None:
+        """Select all log content."""
+        self.text_select_all()
+
     async def _on_click(self, event: events.Click) -> None:
         if event.widget is self:
             if (
@@ -30,17 +46,11 @@ class SelectableLog(Log):
                     # prevent_default() stops Textual from also calling
                     # the parent Log._on_click which would text_select_all().
                     line_index = int(self.scroll_y) + event.y
-                    if 0 <= line_index < self.line_count:
-                        line_text = self.lines[line_index]
-                        start = Offset(0, line_index)
-                        end = Offset(len(line_text), line_index)
-                        self.screen.selections = {
-                            self: Selection(start, end)
-                        }
-                    event.prevent_default()
-                    return
+                    if self._select_line(line_index):
+                        event.prevent_default()
+                        return
                 elif event.chain == 3:
-                    self.text_select_all()
+                    self._select_all()
                     event.prevent_default()
                     return
         await self.broker_event("click", event)

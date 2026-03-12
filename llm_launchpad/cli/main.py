@@ -97,9 +97,47 @@ def _parse_bool_env(name: str, default: bool) -> bool:
     return default
 
 
+def _is_ssh_session() -> bool:
+    return bool(os.getenv("SSH_CONNECTION") or os.getenv("SSH_TTY"))
+
+
+def _likely_remote_clipboard_supported() -> bool:
+    """Best-effort guess for whether remote clipboard writes can reach the local terminal."""
+    marker_values = [
+        os.getenv("TERM", ""),
+        os.getenv("TERM_PROGRAM", ""),
+        os.getenv("LC_TERMINAL", ""),
+    ]
+    normalized_markers = " ".join(value.strip().lower() for value in marker_values if value)
+
+    if any(
+        os.getenv(name)
+        for name in (
+            "ITERM_SESSION_ID",
+            "KITTY_WINDOW_ID",
+            "KITTY_PUBLIC_KEY",
+            "WEZTERM_EXECUTABLE",
+            "GHOSTTY_RESOURCES_DIR",
+        )
+    ):
+        return True
+
+    if any(marker in normalized_markers for marker in ("iterm", "wezterm", "kitty", "ghostty", "vscode")):
+        return True
+
+    if "apple_terminal" in normalized_markers or "apple terminal" in normalized_markers:
+        return False
+
+    # Over SSH, default to terminal-native selection unless we recognize a terminal
+    # that is likely to accept clipboard escape sequences from the remote app.
+    return False
+
+
 def _default_tui_mouse_enabled() -> bool:
-    ssh_default = not bool(os.getenv("SSH_CONNECTION") or os.getenv("SSH_TTY"))
-    return _parse_bool_env("LLM_LAUNCHPAD_TUI_MOUSE", ssh_default)
+    default = True
+    if _is_ssh_session():
+        default = _likely_remote_clipboard_supported()
+    return _parse_bool_env("LLM_LAUNCHPAD_TUI_MOUSE", default)
 
 
 def _ensure_tui_runtime() -> None:

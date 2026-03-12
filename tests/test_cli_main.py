@@ -28,6 +28,18 @@ class CliMainHelperTests(unittest.TestCase):
         ):
             self.assertTrue(cli_main._default_tui_mouse_enabled())
 
+    def test_default_tui_mouse_enabled_can_be_forced_off_by_env(self) -> None:
+        with patch.dict("os.environ", {"LLM_LAUNCHPAD_TUI_MOUSE": "false"}, clear=True):
+            self.assertFalse(cli_main._default_tui_mouse_enabled())
+
+    def test_default_tui_mouse_enabled_stays_on_for_known_remote_clipboard_terminal(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {"SSH_CONNECTION": "1", "LC_TERMINAL": "iTerm2"},
+            clear=True,
+        ):
+            self.assertTrue(cli_main._default_tui_mouse_enabled())
+
     def test_ensure_tui_runtime_requires_tty(self) -> None:
         with (
             patch("llm_launchpad.cli.main.sys.stdin.isatty", return_value=False),
@@ -141,7 +153,7 @@ class CliMainCommandTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0)
         self.assertIn("Deploy target: backend=vllm", result.output)
 
-    def test_tui_uses_ssh_default_mouse_setting(self) -> None:
+    def test_tui_defaults_to_terminal_selection_over_ssh(self) -> None:
         app_instance = Mock()
         with (
             patch.dict("os.environ", {"SSH_CONNECTION": "1"}, clear=True),
@@ -167,6 +179,19 @@ class CliMainCommandTests(unittest.TestCase):
             cli_main.tui(mouse=True)
         app_cls.assert_called_once_with(mouse_enabled=True)
         app_instance.run.assert_called_once_with(mouse=True)
+
+    def test_tui_allows_no_mouse_override(self) -> None:
+        app_instance = Mock()
+        with (
+            patch("llm_launchpad.tui.app.TuiApp", return_value=app_instance) as app_cls,
+            patch("llm_launchpad.core.backend.ModalBackend.terminate_all", return_value=None),
+            patch("llm_launchpad.cli.main.sys.stdin.isatty", return_value=True),
+            patch("llm_launchpad.cli.main.sys.stdout.isatty", return_value=True),
+            patch("llm_launchpad.cli.main.ModalBackend.is_cli_available", return_value=True),
+        ):
+            cli_main.tui(mouse=False)
+        app_cls.assert_called_once_with(mouse_enabled=False)
+        app_instance.run.assert_called_once_with(mouse=False)
 
     def test_deploy_failure_propagates_operation_exit_code(self) -> None:
         orch = SimpleNamespace(

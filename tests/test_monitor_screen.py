@@ -33,7 +33,10 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("first line", content)
             self.assertIn("stderr | stderr line", content)
             title = screen.query_one("#monitor-title", Static)
-            self.assertIn("y/c/ctrl+c to copy  ctrl+shift+c direct clip  ctrl+l clear", str(title.content))
+            self.assertIn(
+                "ctrl+shift+c copy  y fallback  ctrl+t terminal copy  ctrl+c exits  ctrl+l clear",
+                str(title.content),
+            )
 
     async def test_title_mentions_terminal_selection_when_mouse_disabled(self) -> None:
         app = _TestApp()
@@ -45,7 +48,10 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             screen = app.screen
             assert isinstance(screen, MonitorScreen)
             title = screen.query_one("#monitor-title", Static)
-            self.assertIn("use terminal selection + cmd+c", str(title.content))
+            self.assertIn(
+                "terminal selection mode  use your terminal copy shortcut  ctrl+t mouse  ctrl+c exits",
+                str(title.content),
+            )
 
     async def test_log_lines_strip_ansi_escape_sequences(self) -> None:
         app = _TestApp()
@@ -199,19 +205,36 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             assert isinstance(screen, MonitorScreen)
             self.assertIsInstance(screen.log_viewer.log_widget, SelectableLog)
 
+    async def test_double_click_line_selection_copies_line_to_clipboard(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(MonitorScreen(title="Logs"))
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, MonitorScreen)
+            screen.on_log_message(LogMessage("first line"))
+            await pilot.pause()
+
+            copied = screen.log_viewer.log_widget._select_line(0)
+            self.assertTrue(copied)
+            await pilot.pause()
+            await pilot.pause()
+
+            self.assertEqual(app.clipboard, "first line")
+
     def test_copy_binding_includes_terminal_safe_variants(self) -> None:
         copy_binding = next(b for b in MonitorScreen.BINDINGS if b.action == "copy_text")
-        self.assertIn("y", copy_binding.key)
-        self.assertIn("c", copy_binding.key)
-        self.assertIn("ctrl+c", copy_binding.key)
+        self.assertEqual(copy_binding.key, "y")
 
-    def test_direct_clipboard_binding_keeps_terminal_clipboard_variants(self) -> None:
+    def test_direct_clipboard_binding_keeps_terminal_copy_aliases(self) -> None:
         copy_binding = next(
             b for b in MonitorScreen.BINDINGS if b.action == "copy_text_to_clipboard"
         )
-        self.assertIn("ctrl+shift+c", copy_binding.key)
-        self.assertIn("meta+c", copy_binding.key)
-        self.assertIn("super+c", copy_binding.key)
+        self.assertEqual(
+            copy_binding.key,
+            "ctrl+shift+c,super+c,meta+c,cmd+c,command+c",
+        )
 
 
 if __name__ == "__main__":
