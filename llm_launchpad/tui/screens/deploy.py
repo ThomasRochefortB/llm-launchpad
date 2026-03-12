@@ -238,10 +238,8 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
         "llama-quant-list",
         "gpu-type-llama",
         "gpu-count-llama",
-        "preload",
-        "do-deploy",
-        "warmup",
         "toggle-advanced-llama",
+        "warmup",
         "revision",
         "server-args",
         "host-input",
@@ -300,14 +298,12 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
                             id="gpu-count-llama",
                             type="integer",
                         )
-            yield ToggleField("Preload/download weights now", "preload", default=True)
-            yield ToggleField("Deploy the server", "do-deploy", default=True)
-            yield ToggleField("Warm up after deploy", "warmup", default=True)
 
             yield Static("")
 
             # Advanced options (collapsed by default)
             yield Button("Advanced options...", id="toggle-advanced-llama", variant="default")
+            yield ToggleField("Warm up after deploy", "warmup", default=True, classes="llama-advanced")
             yield FormField("HF revision (optional)", "revision", classes="llama-advanced")
             yield FormField(
                 "Server args",
@@ -572,8 +568,8 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
         rev = self.query_one("#revision", Input).value.strip()
         config.revision = rev or None
 
-        config.preload = self.query_one("#preload", Switch).value
-        config.do_deploy = self.query_one("#do-deploy", Switch).value
+        config.preload = False
+        config.do_deploy = True
         config.do_warmup = self.query_one("#warmup", Switch).value
         config.show_debug_logs = self.query_one("#show-debug-logs-llama", Switch).value
 
