@@ -468,6 +468,7 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             screen.query_one("#host-input", Input).value = "0.0.0.0"
             screen.query_one("#port-input", Input).value = "8088"
             screen.query_one("#n-gpu-layers", Input).value = "99"
+            screen.query_one("#warmup", Switch).value = False
             screen.query_one("#llama-image-no-cache", Switch).value = True
             screen.query_one("#show-debug-logs-llama", Switch).value = True
             screen.query_one("#gpu-count-llama", Input).value = "3"
@@ -482,10 +483,28 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app.deployed_config.host, "0.0.0.0")
         self.assertEqual(app.deployed_config.port, 8088)
         self.assertEqual(app.deployed_config.n_gpu_layers, 99)
+        self.assertFalse(app.deployed_config.preload)
+        self.assertTrue(app.deployed_config.do_deploy)
+        self.assertFalse(app.deployed_config.do_warmup)
         self.assertTrue(app.deployed_config.llamacpp_image_no_cache)
         self.assertTrue(app.deployed_config.show_debug_logs)
         self.assertEqual(app.deployed_config.gpu_count, 3)
         self.assertEqual(app.deployed_config.gpu_type, "A100-80GB")
+
+    async def test_warmup_toggle_is_hidden_by_default_and_enabled(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+            warmup_toggle = screen.query_one("#warmup", Switch)
+
+            self.assertIsNotNone(warmup_toggle.parent)
+            assert warmup_toggle.parent is not None
+            self.assertTrue(warmup_toggle.parent.has_class("hidden"))
+            self.assertTrue(warmup_toggle.value)
 
     async def test_show_debug_logs_toggle_defaults_false_and_maps_to_config(self) -> None:
         app = _TestApp()
