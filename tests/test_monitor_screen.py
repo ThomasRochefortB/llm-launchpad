@@ -205,6 +205,24 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             assert isinstance(screen, MonitorScreen)
             self.assertIsInstance(screen.log_viewer.log_widget, SelectableLog)
 
+    async def test_double_click_line_selection_copies_line_to_clipboard(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(MonitorScreen(title="Logs"))
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, MonitorScreen)
+            screen.on_log_message(LogMessage("first line"))
+            await pilot.pause()
+
+            copied = screen.log_viewer.log_widget._select_line(0)
+            self.assertTrue(copied)
+            await pilot.pause()
+            await pilot.pause()
+
+            self.assertEqual(app.clipboard, "first line")
+
     def test_copy_binding_includes_terminal_safe_variants(self) -> None:
         copy_binding = next(b for b in MonitorScreen.BINDINGS if b.action == "copy_text")
         self.assertEqual(copy_binding.key, "y")

@@ -154,6 +154,7 @@ class MonitorScreen(CopyEnabledScreen):
         """Return selected log text before falling back to screen selections."""
         log_widget = self.log_viewer.log_widget
         getter = getattr(log_widget, "get_selected_text", None)
+        text = None
         if callable(getter):
             text = getter()
         if not text:

@@ -205,6 +205,21 @@ class CopyEnabledScreenTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(app.clipboard, "Hello world")
 
+    async def test_selection_change_auto_copies_selection(self) -> None:
+        app = _CopyTestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(_StaticSelectionScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, _StaticSelectionScreen)
+            target = screen.query_one("#copy-static", Static)
+            target.text_select_all()
+            await pilot.pause()
+            await pilot.pause()
+
+            self.assertEqual(app.clipboard, "Hello world")
+
     async def test_ctrl_shift_c_binding_copies_selected_text_to_clipboard(self) -> None:
         app = _CopyTestApp()
         async with app.run_test() as pilot:
