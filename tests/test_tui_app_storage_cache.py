@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -15,6 +16,13 @@ from llm_launchpad.tui.app import TuiApp, WizardApp, _deploy_connection_summary_
 
 
 class TuiAppStorageCacheTests(unittest.TestCase):
+    def test_packaging_config_includes_tui_theme_css(self) -> None:
+        pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+        payload = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+
+        package_data = payload["tool"]["setuptools"]["package-data"]
+        self.assertEqual(package_data["llm_launchpad.tui"], ["theme.tcss"])
+
     def test_on_mount_launches_main_menu_without_authenticated_preflight(self) -> None:
         app = TuiApp()
         app._version = "1.2.3"
