@@ -14,7 +14,6 @@ from llm_launchpad.core.hf_models import ModelCandidate
 class HFModelsTests(unittest.TestCase):
     def setUp(self) -> None:
         hf_models._CACHE.clear()
-        hf_models._GGUF_QUANTS_CACHE.clear()
         hf_models._GGUF_QUANT_METADATA_CACHE.clear()
         hf_models._VLLM_MEMORY_CACHE.clear()
         hf_models._HF_JSON_FILE_CACHE.clear()
@@ -170,32 +169,6 @@ class HFModelsTests(unittest.TestCase):
             SimpleNamespace(rfilename="README.md"),
         ]
         self.assertEqual(hf_models._extract_gguf_quantizations(siblings), ["Q4_K_M", "Q5_K_M", "Q8_0"])
-
-    def test_fetch_gguf_quantizations_uses_cache(self) -> None:
-        calls: list[tuple[str, str | None]] = []
-
-        class FakeApi:
-            def model_info(self, *, repo_id: str, revision: str | None, expand: list[str]):
-                self._ = expand
-                calls.append((repo_id, revision))
-                return SimpleNamespace(
-                    siblings=[
-                        SimpleNamespace(rfilename="Q4_K_M/model-Q4_K_M.gguf"),
-                        SimpleNamespace(rfilename="Q6_K/model-Q6_K.gguf"),
-                    ],
-                    gguf={},
-                )
-
-        fake_module = types.SimpleNamespace(HfApi=FakeApi)
-        with (
-            patch.dict("sys.modules", {"huggingface_hub": fake_module}),
-            patch("llm_launchpad.core.hf_models._fetch_gguf_quantization_data_from_model_page", return_value=None),
-        ):
-            first = hf_models.fetch_gguf_quantizations("Qwen/Qwen3-Coder-Next-GGUF")
-            second = hf_models.fetch_gguf_quantizations("Qwen/Qwen3-Coder-Next-GGUF")
-        self.assertEqual(first, ["Q4_K_M", "Q6_K"])
-        self.assertEqual(second, ["Q4_K_M", "Q6_K"])
-        self.assertEqual(calls, [("Qwen/Qwen3-Coder-Next-GGUF", None)])
 
     def test_fetch_gguf_quant_metadata_uses_cache(self) -> None:
         calls: list[tuple[str, str | None]] = []

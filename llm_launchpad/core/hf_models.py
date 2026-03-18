@@ -50,7 +50,6 @@ _HF_REQUEST_TIMEOUT_SECONDS = 10.0
 _HF_ETAG_TIMEOUT_SECONDS = 10.0
 _DEFAULT_CONTEXT_TOKENS = 8192
 _CACHE: dict[tuple[str, str, int], tuple[float, list[ModelCandidate]]] = {}
-_GGUF_QUANTS_CACHE: dict[tuple[str, str], tuple[float, list[str]]] = {}
 _GGUF_QUANT_METADATA_CACHE: dict[tuple[str, str], tuple[float, GgufQuantMetadata]] = {}
 _VLLM_MEMORY_CACHE: dict[tuple[int, str, str, int], tuple[float, VllmMemoryBreakdown]] = {}
 _HF_JSON_FILE_CACHE: dict[tuple[str, str, str], tuple[float, dict[str, Any] | None]] = {}
@@ -294,27 +293,6 @@ def list_llamacpp_candidates(mode: ModelRankMode = "downloads", limit: int = 10)
     return models
 
 
-def fetch_gguf_quantizations(repo_id: str, revision: str | None = None) -> list[str]:
-    """Return detected GGUF quantizations for a model repo.
-
-    Backward-compatible wrapper around `fetch_gguf_quant_metadata`.
-    """
-    normalized_repo = repo_id.strip()
-    if not normalized_repo:
-        return []
-    revision_key = (revision or "").strip()
-    cache_key = (normalized_repo, revision_key)
-    now = time.time()
-    cached = _GGUF_QUANTS_CACHE.get(cache_key)
-    if cached and (now - cached[0]) < _CACHE_TTL_SECONDS:
-        return cached[1]
-
-    metadata = fetch_gguf_quant_metadata(repo_id=normalized_repo, revision=revision_key or None)
-    quantizations = list(metadata.quantizations)
-    _GGUF_QUANTS_CACHE[cache_key] = (now, quantizations)
-    return quantizations
-
-
 def fetch_gguf_quant_metadata(repo_id: str, revision: str | None = None) -> GgufQuantMetadata:
     """Return detected GGUF quantizations and per-quant VRAM estimates in GB."""
     from ..core.backend import ModalBackend
@@ -366,7 +344,6 @@ def fetch_gguf_quant_metadata(repo_id: str, revision: str | None = None) -> Gguf
         vram_gb_by_quant=dict(vram_gb_by_quant),
     )
     _GGUF_QUANT_METADATA_CACHE[cache_key] = (now, metadata)
-    _GGUF_QUANTS_CACHE[cache_key] = (now, list(quantizations))
     return GgufQuantMetadata(
         quantizations=list(metadata.quantizations),
         vram_gb_by_quant=dict(metadata.vram_gb_by_quant),

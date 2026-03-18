@@ -9,7 +9,7 @@ from textual.selection import SELECT_ALL
 from textual.widgets import DataTable, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
-from llm_launchpad.tui.app import WizardApp, _osc_52_sequence, _screen_passthrough_sequence, _tmux_passthrough_sequence
+from llm_launchpad.tui.app import TuiApp, _osc_52_sequence, _screen_passthrough_sequence, _tmux_passthrough_sequence
 from llm_launchpad.tui.screens.copy_enabled import CopyEnabledScreen
 from llm_launchpad.tui.screens.deploy import (
     BackendSelectScreen,
@@ -75,28 +75,19 @@ class _NoCopyFallbackScreen(CopyEnabledScreen):
 
 
 class _CopyTestApp(App[None]):
-    def __init__(self) -> None:
-        super().__init__()
-        self.presented_text = ""
-
-    def present_text_for_copy(self, text: str) -> None:
-        self.presented_text = text
+    pass
 
 
 class _CopyKeyApp(App[None]):
     def __init__(self) -> None:
         super().__init__()
         self.help_quit_called = False
-        self.presented_text = ""
 
     def action_help_quit(self) -> None:
         self.help_quit_called = True
 
-    def present_text_for_copy(self, text: str) -> None:
-        self.presented_text = text
 
-
-class _QuitCaptureApp(WizardApp):
+class _QuitCaptureApp(TuiApp):
     def __init__(self) -> None:
         super().__init__()
         self.notifications: list[tuple[object, object, object, object]] = []
@@ -198,7 +189,6 @@ class CopyEnabledScreenTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             self.assertFalse(app.help_quit_called)
-            self.assertEqual(app.presented_text, "")
             self.assertEqual(app.clipboard, "Qwen/Qwen3-8B")
 
     async def test_y_alias_triggers_copy_action(self) -> None:
@@ -248,7 +238,6 @@ class CopyEnabledScreenTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("ctrl+shift+c")
             await pilot.pause()
 
-            self.assertEqual(app.presented_text, "")
             self.assertEqual(app.clipboard, "Hello world")
 
     async def test_super_c_binding_copies_selected_text_to_clipboard(self) -> None:
@@ -266,7 +255,6 @@ class CopyEnabledScreenTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("super+c")
             await pilot.pause()
 
-            self.assertEqual(app.presented_text, "")
             self.assertEqual(app.clipboard, "Hello world")
 
     async def test_direct_clipboard_action_copies_to_clipboard(self) -> None:
@@ -297,9 +285,9 @@ class CopyEnabledScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.clipboard, "")
 
 
-class WizardAppClipboardTests(unittest.TestCase):
+class TuiAppClipboardTests(unittest.TestCase):
     def test_copy_to_clipboard_uses_pbcopy_on_darwin(self) -> None:
-        app = WizardApp()
+        app = TuiApp()
         with (
             patch("llm_launchpad.tui.app.sys.platform", "darwin"),
             patch("llm_launchpad.tui.app.subprocess.run") as run_mock,
@@ -315,7 +303,7 @@ class WizardAppClipboardTests(unittest.TestCase):
 
     def test_copy_to_clipboard_writes_tmux_passthrough_sequence(self) -> None:
         writes: list[str] = []
-        app = WizardApp()
+        app = TuiApp()
         app._driver = SimpleNamespace(write=writes.append)
 
         with patch.dict("llm_launchpad.tui.app.os.environ", {"TMUX": "/tmp/tmux-1000/default,123,0"}):
@@ -332,7 +320,7 @@ class WizardAppClipboardTests(unittest.TestCase):
 
     def test_copy_to_clipboard_writes_screen_passthrough_sequence(self) -> None:
         writes: list[str] = []
-        app = WizardApp()
+        app = TuiApp()
         app._driver = SimpleNamespace(write=writes.append)
 
         with patch.dict("llm_launchpad.tui.app.os.environ", {"TERM": "screen-256color"}, clear=True):
@@ -347,23 +335,7 @@ class WizardAppClipboardTests(unittest.TestCase):
             ],
         )
 
-    def test_present_text_for_copy_copies_directly(self) -> None:
-        app = WizardApp()
-
-        copied: list[str] = []
-
-        def _copy_to_clipboard(text: str) -> None:
-            copied.append(text)
-
-        app.copy_to_clipboard = _copy_to_clipboard  # type: ignore[method-assign]
-
-        result = app.present_text_for_copy("copied text")
-
-        self.assertTrue(result)
-        self.assertEqual(copied, ["copied text"])
-
-
-class WizardAppQuitTests(unittest.IsolatedAsyncioTestCase):
+class TuiAppQuitTests(unittest.IsolatedAsyncioTestCase):
     async def test_ctrl_c_first_press_warns_before_quitting(self) -> None:
         app = _QuitCaptureApp()
 
@@ -396,9 +368,9 @@ class WizardAppQuitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(app.notifications), 2)
 
 
-class WizardAppMouseModeTests(unittest.TestCase):
+class TuiAppMouseModeTests(unittest.TestCase):
     def test_toggle_mouse_mode_enables_driver_mouse_support(self) -> None:
-        app = WizardApp(mouse_enabled=False)
+        app = TuiApp(mouse_enabled=False)
         driver = _MouseDriverStub(mouse=False)
         app._driver = driver
 
@@ -410,7 +382,7 @@ class WizardAppMouseModeTests(unittest.TestCase):
         self.assertEqual(driver.disable_calls, 0)
 
     def test_toggle_mouse_mode_disables_driver_mouse_support(self) -> None:
-        app = WizardApp(mouse_enabled=True)
+        app = TuiApp(mouse_enabled=True)
         driver = _MouseDriverStub(mouse=True)
         app._driver = driver
 
