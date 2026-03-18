@@ -264,12 +264,6 @@ def tui(
         ModalBackend.terminate_all()
 
 
-@app.command(hidden=True)
-def wizard() -> None:
-    """Deprecated alias for the interactive terminal UI."""
-    tui()
-
-
 # -----------------------------------------------------------------------
 # Headless commands
 # -----------------------------------------------------------------------

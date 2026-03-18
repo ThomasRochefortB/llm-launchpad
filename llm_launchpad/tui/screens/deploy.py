@@ -169,12 +169,6 @@ def _format_quant_with_vram(quant: str, vram_gb_by_quant: dict[str, float]) -> s
     return f"{quant} (~{_format_vram_gb(vram_gb)})"
 
 
-def _quant_preview(quantizations: list[str], vram_gb_by_quant: dict[str, float], limit: int = 6) -> str:
-    preview_tokens = [_format_quant_with_vram(quant, vram_gb_by_quant) for quant in quantizations[:limit]]
-    suffix = "..." if len(quantizations) > limit else ""
-    return ", ".join(preview_tokens) + suffix
-
-
 def _advance_deploy_focus(screen: CopyEnabledScreen, navigation_order: tuple[str, ...]) -> None:
     """Advance focus to the next visible deploy form widget."""
     move_focus_across_widgets(

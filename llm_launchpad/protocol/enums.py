@@ -42,17 +42,6 @@ class DeploymentState(str, Enum):
     ERROR = "error"
     CANCELLED = "cancelled"
 
-    @property
-    def is_terminal(self) -> bool:
-        return self in {
-            DeploymentState.HEALTHY,
-            DeploymentState.UNHEALTHY,
-            DeploymentState.STOPPED,
-            DeploymentState.ERROR,
-            DeploymentState.CANCELLED,
-            DeploymentState.IDLE,
-        }
-
 
 class OperationType(str, Enum):
     """Types of operations the orchestrator can run."""

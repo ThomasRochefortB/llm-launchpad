@@ -44,25 +44,6 @@ def _function_name(base_name: str) -> str:
     return f"{base_name}-{FUNCTION_SLUG}"
 
 
-def _current_modal_username() -> Optional[str]:
-    """Best-effort lookup of the active Modal profile username."""
-    try:
-        import subprocess
-
-        result = subprocess.run(
-            ["modal", "profile", "current"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        value = (result.stdout or "").strip()
-        if result.returncode == 0 and value:
-            return value
-    except Exception:
-        pass
-    return None
-
-
 def _read_int_env(name: str, default: int) -> int:
     raw = os.environ.get(name, "").strip()
     if not raw:

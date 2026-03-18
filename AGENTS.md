@@ -39,6 +39,7 @@
 - Existing history uses short, direct subjects (examples: `bugfix gpu dropdown`, `Adding HF hub cli`).
 - Prefer imperative, specific commit messages, ideally under 72 chars (e.g., `Fix vLLM instance name slugging`).
 - PRs should include: what changed, why, and local validation commands run.
+- When opening a PR, always start from `.github/pull_request_template.md` and fill it out instead of writing an ad hoc body.
 - Link related issues, and include screenshots/GIFs for TUI screen changes.
 
 ## Security & Configuration Tips

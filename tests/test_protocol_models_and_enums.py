@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from llm_launchpad.core.paths import MODAL_LLAMACPP_SCRIPT, MODAL_VLLM_SCRIPT
-from llm_launchpad.protocol.enums import BackendType, DeploymentState, OperationType
+from llm_launchpad.protocol.enums import BackendType, OperationType
 from llm_launchpad.protocol.models import LaunchpadSettings, StorageSnapshot, StoredModelInfo
 
 
@@ -29,12 +29,6 @@ class ProtocolEnumsTests(unittest.TestCase):
         self.assertEqual(BackendType.LLAMACPP.display_name, "llama.cpp (GGUF)")
         self.assertEqual(BackendType.VLLM.script, MODAL_VLLM_SCRIPT)
         self.assertEqual(BackendType.LLAMACPP.script, MODAL_LLAMACPP_SCRIPT)
-
-    def test_deployment_state_terminal_property(self) -> None:
-        self.assertTrue(DeploymentState.HEALTHY.is_terminal)
-        self.assertTrue(DeploymentState.ERROR.is_terminal)
-        self.assertFalse(DeploymentState.DEPLOYING.is_terminal)
-        self.assertFalse(DeploymentState.WARMING_UP.is_terminal)
 
     def test_storage_operation_types_exist(self) -> None:
         self.assertEqual(OperationType.STORAGE_LIST.value, "storage_list")

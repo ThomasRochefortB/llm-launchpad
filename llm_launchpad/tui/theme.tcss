@@ -40,6 +40,7 @@ Screen {
 }
 
 Footer {
+    height: 2;
     background: #070b08;
     color: #93a596;
     border-top: solid #17321e;

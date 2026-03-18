@@ -177,14 +177,6 @@ class TuiApp(App):
             except Exception:
                 pass
 
-    def present_text_for_copy(self, text: str) -> bool:
-        """Copy text directly to the clipboard."""
-        normalized = text.rstrip("\n")
-        if not normalized:
-            return False
-        self.copy_to_clipboard(normalized)
-        return True
-
     def _set_mouse_mode(self, enabled: bool) -> None:
         """Enable or disable driver mouse reporting at runtime."""
         driver = getattr(self, "_driver", None)
@@ -861,7 +853,3 @@ class TuiApp(App):
                 vram_gb_by_quant=dict(metadata.vram_gb_by_quant),
             )
         )
-
-
-# Backward-compatible alias for older imports.
-WizardApp = TuiApp

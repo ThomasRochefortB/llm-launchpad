@@ -12,7 +12,7 @@ from llm_launchpad.protocol.events import LogEvent, OperationCompleteEvent
 from llm_launchpad.protocol.models import DeploymentConfig
 from llm_launchpad.protocol.models import EndpointInfo
 from llm_launchpad.protocol.models import StorageSnapshot, StoredModelInfo
-from llm_launchpad.tui.app import TuiApp, WizardApp, _deploy_connection_summary_lines
+from llm_launchpad.tui.app import TuiApp, _deploy_connection_summary_lines
 
 
 class TuiAppStorageCacheTests(unittest.TestCase):
@@ -121,7 +121,7 @@ class TuiAppStorageCacheTests(unittest.TestCase):
 
     def test_run_deploy_warmup_prefers_created_web_function_url_over_printed_endpoint(self) -> None:
         warmup_urls: list[str] = []
-        app = WizardApp()
+        app = TuiApp()
         app._username = "alice"
         created_dev_url = "https://alice--llamacpp-test-serve-alpha-bravo-dev.modal.run"
         created_prod_url = "https://alice--llamacpp-test-serve-abcd1234.modal.run"
@@ -162,7 +162,7 @@ class TuiAppStorageCacheTests(unittest.TestCase):
         self.assertEqual(warmup_urls, [created_prod_url])
 
     def test_run_deploy_suppresses_intermediate_deploy_completion_when_warmup_follows(self) -> None:
-        app = WizardApp()
+        app = TuiApp()
         app._username = "alice"
         app._orchestrator = type(
             "FakeOrchestrator",
@@ -211,7 +211,7 @@ class TuiAppStorageCacheTests(unittest.TestCase):
         )
 
     def test_run_deploy_emits_connection_summary_on_warmup_success(self) -> None:
-        app = WizardApp()
+        app = TuiApp()
         app._username = "alice"
         app._orchestrator = type(
             "FakeOrchestrator",
@@ -268,7 +268,7 @@ class TuiAppStorageCacheTests(unittest.TestCase):
 
     def test_list_instances_merges_cached_deploy_connection_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            app = WizardApp()
+            app = TuiApp()
             app._deploy_connection_cache_path = Path(tmp) / "deployment_connection_summaries.json"
             app._deploy_connection_cache = {}
             config = DeploymentConfig(

@@ -151,22 +151,6 @@ def _state_bucket(state: str) -> str:
     return "other"
 
 
-def _style_state(state: str) -> str:
-    normalized = (state or "").strip().lower() or "unknown"
-    bucket = _state_bucket(normalized)
-    if bucket == "healthy":
-        return f"[green]{normalized}[/green]"
-    if bucket == "deploying":
-        return f"[#7bf168]{normalized}[/]"
-    if bucket == "queued":
-        return f"[yellow]{normalized}[/yellow]"
-    if bucket == "error":
-        return f"[red]{normalized}[/red]"
-    if bucket == "stopped":
-        return f"[dim]{normalized}[/dim]"
-    return f"[dim]{normalized}[/dim]"
-
-
 def _should_show_in_panel(state: str) -> bool:
     bucket = _state_bucket(state)
     return bucket in {"healthy", "deploying", "queued", "error"}
@@ -507,24 +491,6 @@ def _find_first_float(payload: Any, dotted_keys: list[str]) -> float | None:
         parsed = _coerce_float(current)
         if parsed is not None:
             return parsed
-    return None
-
-
-def _find_first_text(payload: Any, dotted_keys: list[str]) -> str | None:
-    for dotted_key in dotted_keys:
-        current = payload
-        found = True
-        for key in dotted_key.split("."):
-            if isinstance(current, dict) and key in current:
-                current = current[key]
-            else:
-                found = False
-                break
-        if not found or current is None:
-            continue
-        text = str(current).strip()
-        if text:
-            return text
     return None
 
 
