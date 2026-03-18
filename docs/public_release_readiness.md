@@ -111,7 +111,7 @@ Because of that, the items below are provided as **issue-ready drafts** to open 
 - Version appears in multiple places, which can drift during release.
 
 **Evidence**
-- Version is defined in `pyproject.toml` and in package code.
+- Version is defined in `pyproject.toml` and in `llm_launchpad/__init__.py`.
 
 **Issue draft**
 - **Title:** Make versioning single-source and document release steps
