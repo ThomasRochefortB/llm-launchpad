@@ -39,6 +39,7 @@ from .screens.main_menu import MainMenuScreen
 from .screens.deploy import BackendSelectScreen
 from .screens.manage import ManageScreen
 from .screens.monitor import MonitorScreen
+from .screens.quick_deploy import QuickDeployScreen
 from .screens.storage import StorageScreen
 from .screens.settings import SettingsScreen
 from .workers import (
@@ -284,6 +285,9 @@ class TuiApp(App):
 
     def action_push_storage(self, backend: BackendType | None = None) -> None:
         self.push_screen(StorageScreen(initial_backend=backend))
+
+    def push_quick_deploy(self, profile_id: str) -> None:
+        self.push_screen(QuickDeployScreen(profile_id=profile_id))
 
     # ------------------------------------------------------------------
     # Deploy

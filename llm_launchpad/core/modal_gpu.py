@@ -18,12 +18,12 @@ _REQUEST_HEADERS: Final[dict[str, str]] = {
 
 _GPU_TOKEN_RE: Final[re.Pattern[str]] = re.compile(
     r"(?<![A-Za-z0-9_-])"
-    r"([A-Z]\d+[A-Z0-9]*(?:-[A-Z0-9]+)*!?)"
+    r"([A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*(?:[+!])?)"
     r"(?::\d+)?"
     r"(?![A-Za-z0-9_-])"
 )
 _VALID_GPU_RE: Final[re.Pattern[str]] = re.compile(
-    r"(?=.*\d)[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*(?:!)?"
+    r"(?=.*\d)[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*(?:[+!])?"
 )
 _HTML_TAG_RE: Final[re.Pattern[str]] = re.compile(r"<[^>]+>")
 

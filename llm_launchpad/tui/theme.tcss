@@ -98,18 +98,42 @@ LogViewer Log {
     height: auto;
 }
 
-#deployment-status-panel {
+#main-menu-side-column {
     width: 50;
     min-width: 38;
-    min-height: 18;
+    height: auto;
     margin: 1 0 0 1;
-    padding: 1 2;
+}
+
+#deployment-status-panel {
+    width: 100%;
+    height: auto;
+    padding: 0 2;
     border: solid #17321e;
     background: #0b110d;
 }
 
+#billing-report-panel {
+    width: 100%;
+    height: auto;
+    margin: 1 0 0 0;
+    padding: 0 2;
+    border: solid #17321e;
+    background: #0b110d;
+}
+
+#quick-deploy-panel {
+    width: 100%;
+    height: auto;
+    min-height: 11;
+    margin: 1 0 0 0;
+    padding: 0 2;
+    border: solid #2b5933;
+    background: #0f1812;
+}
+
 #deployment-status-title {
-    padding: 0 0 1 0;
+    padding: 0 0 0 0;
 }
 
 #deployment-status-body {
@@ -118,12 +142,37 @@ LogViewer Log {
 }
 
 #billing-report-title {
-    padding: 1 0 1 0;
+    padding: 0 0 0 0;
 }
 
 #billing-report-body {
     color: #eef7ef;
     text-wrap: wrap;
+}
+
+#landing-quick-deploy-title {
+    padding: 0 0 0 0;
+}
+
+#landing-quick-deploy-subtitle {
+    color: #b7c9b9;
+    text-style: bold;
+    padding: 0 0 0 0;
+}
+
+#landing-quick-deploy-helper {
+    color: #93a596;
+    padding: 1 0 0 0;
+}
+
+#quick-deploy-list {
+    border: solid #2b5933;
+    background: #0b110d;
+    max-height: 10;
+}
+
+#quick-deploy-list:focus {
+    border: solid #7bf168;
 }
 
 #banner-text {
@@ -137,7 +186,7 @@ LogViewer Log {
     width: auto;
     max-width: 92;
     height: auto;
-    min-height: 3;
+    min-height: 4;
     margin: 0 0 1 1;
     padding: 0 1;
     border-left: tall #17321e;
@@ -260,6 +309,55 @@ Button.-primary {
 Button:focus {
     text-style: bold;
     border: solid #95ff85;
+}
+
+/* ---- Quick deploy screen ---- */
+
+#quick-deploy-title {
+    padding: 1 2 0 2;
+}
+
+#quick-deploy-subtitle {
+    padding: 0 2 0 2;
+    color: #93a596;
+}
+
+#quick-deploy-layout {
+    width: 100%;
+    height: auto;
+    padding: 0 2 1 2;
+}
+
+#quick-deploy-profile-card,
+#quick-deploy-form {
+    height: auto;
+    padding: 1 2;
+    border: solid #17321e;
+    background: #0b110d;
+}
+
+#quick-deploy-profile-card {
+    width: 100%;
+    margin: 0 0 1 0;
+}
+
+#quick-deploy-form {
+    width: 100%;
+    margin: 0 0 0 0;
+}
+
+#quick-deploy-profile-title {
+    color: #7bf168;
+    padding: 0 0 1 0;
+}
+
+#quick-deploy-profile-body {
+    color: #eef7ef;
+    text-wrap: wrap;
+}
+
+#quick-deploy-feedback {
+    height: 1;
 }
 
 /* ---- Dialogs / Modals ---- */
