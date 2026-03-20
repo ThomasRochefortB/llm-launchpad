@@ -47,13 +47,13 @@ class MainMenuQuickDeployTests(unittest.IsolatedAsyncioTestCase):
                 assert isinstance(screen, MainMenuScreen)
                 quick_list = screen.query_one("#quick-deploy-list", OptionList)
                 self.assertEqual(quick_list.option_count, 3)
-                self.assertIn("Qwen3.5 397B A17B", str(quick_list.get_option_at_index(0).prompt))
+                self.assertIn("Qwen3.5 397B A17B[/bold] [dim](UD-Q3_K_XL)[/dim]", str(quick_list.get_option_at_index(0).prompt))
                 self.assertNotIn("Cheap but good", str(quick_list.get_option_at_index(0).prompt))
                 self.assertIn("max 262,144 ctx", str(quick_list.get_option_at_index(0).prompt))
-                self.assertIn("GLM-5", str(quick_list.get_option_at_index(1).prompt))
+                self.assertIn("GLM-5[/bold] [dim](UD-Q2_K_XL)[/dim]", str(quick_list.get_option_at_index(1).prompt))
                 self.assertIn("RTX-PRO-6000 x4", str(quick_list.get_option_at_index(1).prompt))
                 self.assertIn("max 202,752 ctx", str(quick_list.get_option_at_index(1).prompt))
-                self.assertIn("Kimi K2.5", str(quick_list.get_option_at_index(2).prompt))
+                self.assertIn("Kimi K2.5[/bold] [dim](UD-Q2_K_XL)[/dim]", str(quick_list.get_option_at_index(2).prompt))
                 self.assertIn("RTX-PRO-6000 x5", str(quick_list.get_option_at_index(2).prompt))
                 self.assertIn("max 262,144 ctx", str(quick_list.get_option_at_index(2).prompt))
 
@@ -79,6 +79,60 @@ class MainMenuQuickDeployTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.press("shift+tab")
                 await pilot.pause()
                 self.assertTrue(action_list.has_focus)
+
+    async def test_down_from_last_main_menu_item_moves_focus_to_quick_deploy(self) -> None:
+        app = _TestApp()
+        with patch.object(MainMenuScreen, "_refresh_modal_auth_status", lambda self: None), patch.object(
+            MainMenuScreen, "_refresh_hf_auth_status", lambda self: None
+        ), patch.object(MainMenuScreen, "_refresh_panels", lambda self: None):
+            async with app.run_test() as pilot:
+                app.push_screen(MainMenuScreen(username="alice", version="1.0.0"))
+                await pilot.pause()
+
+                screen = app.screen
+                assert isinstance(screen, MainMenuScreen)
+                action_list = screen.query_one("#action-list", OptionList)
+                quick_list = screen.query_one("#quick-deploy-list", OptionList)
+
+                action_list.focus()
+                action_list.highlighted = action_list.option_count - 1
+                await pilot.pause()
+
+                await pilot.press("down")
+                await pilot.pause()
+
+                self.assertTrue(quick_list.has_focus)
+                highlighted = quick_list.highlighted_option
+                self.assertIsNotNone(highlighted)
+                assert highlighted is not None
+                self.assertEqual(highlighted.id, "qwen35-397b-rtxpro")
+
+    async def test_up_from_first_quick_deploy_item_moves_focus_to_main_menu(self) -> None:
+        app = _TestApp()
+        with patch.object(MainMenuScreen, "_refresh_modal_auth_status", lambda self: None), patch.object(
+            MainMenuScreen, "_refresh_hf_auth_status", lambda self: None
+        ), patch.object(MainMenuScreen, "_refresh_panels", lambda self: None):
+            async with app.run_test() as pilot:
+                app.push_screen(MainMenuScreen(username="alice", version="1.0.0"))
+                await pilot.pause()
+
+                screen = app.screen
+                assert isinstance(screen, MainMenuScreen)
+                action_list = screen.query_one("#action-list", OptionList)
+                quick_list = screen.query_one("#quick-deploy-list", OptionList)
+
+                quick_list.focus()
+                quick_list.highlighted = 0
+                await pilot.pause()
+
+                await pilot.press("up")
+                await pilot.pause()
+
+                self.assertTrue(action_list.has_focus)
+                highlighted = action_list.highlighted_option
+                self.assertIsNotNone(highlighted)
+                assert highlighted is not None
+                self.assertEqual(highlighted.id, "settings")
 
     async def test_selecting_quick_deploy_entry_opens_detail_screen(self) -> None:
         app = _TestApp()

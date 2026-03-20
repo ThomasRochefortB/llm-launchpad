@@ -9,7 +9,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 import json
-from typing import Any
+from typing import Any, Literal
 
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -27,6 +27,7 @@ from ...core.quick_deploy import (
     format_context_length,
     format_hourly_cost,
     list_quick_deploy_profiles,
+    quick_deploy_model_label_parts,
 )
 from ...protocol.enums import BackendType
 from ...protocol.models import EndpointInfo
@@ -43,6 +44,59 @@ _     _     __  __
 
 PANEL_SEPARATOR = "[dim]----------------------------------------[/dim]"
 QUICK_DEPLOY_PROFILES = list_quick_deploy_profiles()
+
+
+class _LauncherOptionList(OptionList):
+    """OptionList with cross-panel arrow navigation at list boundaries."""
+
+    def __init__(
+        self,
+        *content: Option,
+        handoff_up_target: str | None = None,
+        handoff_down_target: str | None = None,
+        **kwargs: object,
+    ) -> None:
+        self._handoff_up_target = handoff_up_target
+        self._handoff_down_target = handoff_down_target
+        super().__init__(*content, **kwargs)
+
+    def _has_enabled_neighbor(self, direction: Literal[-1, 1]) -> bool:
+        highlighted = self.highlighted
+        if highlighted is None:
+            return False
+        if direction == -1:
+            indexes = range(highlighted - 1, -1, -1)
+        else:
+            indexes = range(highlighted + 1, self.option_count)
+        return any(not self.get_option_at_index(index).disabled for index in indexes)
+
+    def _handoff_focus(self, target_id: str | None, position: Literal["first", "last"]) -> bool:
+        if not target_id:
+            return False
+        try:
+            target = self.screen.query_one(f"#{target_id}", OptionList)
+        except Exception:
+            return False
+        if target.option_count <= 0:
+            return False
+        if position == "first":
+            target.action_first()
+        else:
+            target.action_last()
+        target.focus()
+        return True
+
+    def action_cursor_up(self) -> None:
+        if self.highlighted is not None and not self._has_enabled_neighbor(-1):
+            if self._handoff_focus(self._handoff_up_target, "last"):
+                return
+        super().action_cursor_up()
+
+    def action_cursor_down(self) -> None:
+        if self.highlighted is not None and not self._has_enabled_neighbor(1):
+            if self._handoff_focus(self._handoff_down_target, "first"):
+                return
+        super().action_cursor_down()
 
 
 class DeploymentsLoaded(Message):
@@ -589,8 +643,10 @@ def _render_billing_load_error(error: str) -> str:
 
 
 def _render_quick_deploy_option(profile: QuickDeployProfile) -> str:
+    label, quant_suffix = quick_deploy_model_label_parts(profile)
+    quant_markup = f" [dim]{_escape_markup(quant_suffix)}[/dim]" if quant_suffix else ""
     return (
-        f"  [bold]{_escape_markup(profile.display_name)}[/bold]\n"
+        f"  [bold]{_escape_markup(label)}[/bold]{quant_markup}\n"
         f"    [dim]{_escape_markup(profile.gpu_type)} x{profile.gpu_count} · "
         f"max {_escape_markup(format_context_length(profile.max_context_tokens))} · "
         f"{_escape_markup(format_hourly_cost(profile.approx_cost_per_hour_usd))}[/dim]"
@@ -632,12 +688,14 @@ class MainMenuScreen(CopyEnabledScreen):
                         classes="centered",
                     )
                     yield Static("")  # spacer
-                    yield OptionList(
+                    yield _LauncherOptionList(
                         Option("  Deploy            Launch a new LLM backend", id="deploy"),
                         Option("  Manage            List, status, logs, stop", id="manage"),
                         Option("  Storage           Cached models and pre-download", id="storage"),
                         Option("  Settings          Scaledown defaults", id="settings"),
                         id="action-list",
+                        handoff_up_target="quick-deploy-list",
+                        handoff_down_target="quick-deploy-list",
                     )
                 with Vertical(id="main-menu-side-column"):
                     with Vertical(id="deployment-status-panel"):
@@ -652,12 +710,14 @@ class MainMenuScreen(CopyEnabledScreen):
                             "Curated llama.cpp coding profiles",
                             id="landing-quick-deploy-subtitle",
                         )
-                        yield OptionList(
+                        yield _LauncherOptionList(
                             *[
                                 Option(_render_quick_deploy_option(profile), id=profile.id)
                                 for profile in QUICK_DEPLOY_PROFILES
                             ],
                             id="quick-deploy-list",
+                            handoff_up_target="action-list",
+                            handoff_down_target="action-list",
                         )
         yield Static(
             _render_auth_status_block(username=self.username),

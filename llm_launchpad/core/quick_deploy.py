@@ -141,6 +141,24 @@ def format_context_length(value: int) -> str:
     return f"{value:,} ctx"
 
 
+def quick_deploy_model_label_parts(profile: QuickDeployProfile) -> tuple[str, str]:
+    """Return the base model label and optional quant suffix."""
+    quant = profile.quant.strip()
+    if not quant:
+        return (profile.display_name, "")
+    if quant.casefold() in profile.display_name.casefold():
+        return (profile.display_name, "")
+    return (profile.display_name, f"({quant})")
+
+
+def format_quick_deploy_model_label(profile: QuickDeployProfile) -> str:
+    """Render a quick-deploy model label with its configured quantization."""
+    label, quant_suffix = quick_deploy_model_label_parts(profile)
+    if not quant_suffix:
+        return label
+    return f"{label} {quant_suffix}"
+
+
 def build_quick_deploy_config(
     profile: QuickDeployProfile,
     *,
