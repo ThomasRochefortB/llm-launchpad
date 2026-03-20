@@ -266,6 +266,54 @@ class TuiAppStorageCacheTests(unittest.TestCase):
             any("Display name: Edge-Quant/Nanbeige4.1-3B-Q4_K_M-GGUF (Q4_K_M)" in line for line in summary_lines)
         )
 
+    def test_run_deploy_syncs_opencode_on_warmup_success(self) -> None:
+        app = TuiApp()
+        app._username = "alice"
+        app._orchestrator = type(
+            "FakeOrchestrator",
+            (),
+            {
+                "deploy": staticmethod(
+                    lambda _config: [
+                        OperationCompleteEvent(success=True, operation=OperationType.DEPLOY),
+                    ]
+                ),
+                "warmup": staticmethod(
+                    lambda *_args, **_kwargs: [
+                        OperationCompleteEvent(
+                            success=True,
+                            operation=OperationType.WARMUP,
+                            data={"url": "https://alice--llamacpp-test-serve-abcd.modal.run"},
+                        )
+                    ]
+                ),
+            },
+        )()
+
+        config = DeploymentConfig(
+            backend=BackendType.LLAMACPP,
+            repo_id="Edge-Quant/Nanbeige4.1-3B-Q4_K_M-GGUF",
+            quant="Q4_K_M",
+            do_deploy=True,
+            do_warmup=True,
+            app_name="llamacpp-test",
+            instance_name="llamacpp-test",
+            function_slug="alpha-bravo",
+        )
+        with (
+            patch("llm_launchpad.tui.app._dispatch_event", return_value=None),
+            patch.object(app, "_load_visible_launchpad_rows", return_value=[]),
+            patch.object(app, "_sync_opencode") as sync_mock,
+        ):
+            app._run_deploy(config, monitor=object())
+
+        sync_mock.assert_called_once()
+        self.assertEqual(sync_mock.call_args.kwargs["target_app_name"], "llamacpp-test")
+        self.assertEqual(
+            sync_mock.call_args.kwargs["target_url"],
+            "https://alice--llamacpp-test-serve-abcd.modal.run",
+        )
+
     def test_list_instances_merges_cached_deploy_connection_summary(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             app = TuiApp()
@@ -303,6 +351,55 @@ class TuiAppStorageCacheTests(unittest.TestCase):
                 merged[0].display_name,
                 "Edge-Quant/Nanbeige4.1-3B-Q4_K_M-GGUF (Q4_K_M)",
             )
+
+    def test_list_instances_triggers_opencode_prune_for_visible_rows(self) -> None:
+        app = TuiApp()
+        rows = [
+            EndpointInfo(
+                name="vllm-qwen3",
+                app_id="ap-123",
+                state="running",
+                backend=BackendType.VLLM,
+                instance_name="qwen3",
+            )
+        ]
+        with (
+            patch("llm_launchpad.tui.app.ModalBackend.list_apps", return_value=rows),
+            patch.object(app, "_sync_opencode") as sync_mock,
+        ):
+            app.list_instances()
+
+        sync_mock.assert_called_once()
+        synced_rows = sync_mock.call_args.kwargs["current_rows"]
+        self.assertEqual(len(synced_rows), 1)
+        self.assertEqual(synced_rows[0].name, "vllm-qwen3")
+
+    def test_run_stop_syncs_opencode_with_removed_app_name(self) -> None:
+        app = TuiApp()
+        monitor = object()
+        app._orchestrator = type(
+            "FakeOrchestrator",
+            (),
+            {
+                "stop_app": staticmethod(
+                    lambda *_args, **_kwargs: [
+                        OperationCompleteEvent(success=True, operation=OperationType.STOP),
+                    ]
+                ),
+            },
+        )()
+        with (
+            patch("llm_launchpad.tui.app._dispatch_event", return_value=None),
+            patch.object(app, "_load_visible_launchpad_rows", return_value=[]),
+            patch.object(app, "_sync_opencode") as sync_mock,
+        ):
+            app._run_stop(BackendType.VLLM, "vllm-qwen3", monitor=monitor)
+
+        sync_mock.assert_called_once()
+        self.assertEqual(sync_mock.call_args.kwargs["current_rows"], [])
+        self.assertEqual(sync_mock.call_args.kwargs["remove_app_names"], ["vllm-qwen3"])
+        self.assertIs(sync_mock.call_args.kwargs["monitor"], monitor)
+        self.assertTrue(sync_mock.call_args.kwargs["emit_skipped"])
 
     def test_snapshot_persist_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

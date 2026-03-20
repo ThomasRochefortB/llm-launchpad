@@ -28,15 +28,19 @@ from ..core.naming import (
     random_function_slug,
     slugify_instance_name,
 )
+from ..core.opencode import resolve_connection_for_app, sync_opencode_config, visible_launchpad_rows
 from ..core.orchestrator import Orchestrator
 from ..protocol.enums import BackendType
+from ..protocol.enums import OperationType
 from ..protocol.events import ErrorEvent, LogEvent, OperationCompleteEvent, StateChangeEvent
-from ..protocol.models import EndpointInfo
+from ..protocol.models import DeploymentConfig, EndpointInfo
 
 app = typer.Typer(
     help="llm-launchpad CLI - configure and deploy LLM backends on Modal.",
     invoke_without_command=True,
 )
+opencode_app = typer.Typer(help="OpenCode integration commands.")
+app.add_typer(opencode_app, name="opencode")
 
 
 @app.callback()
@@ -226,6 +230,52 @@ def _print_banner() -> None:
     console.print(Panel.fit("llm-launchpad", subtitle=subtitle, border_style="cyan"))
 
 
+def _load_visible_launchpad_rows() -> list[EndpointInfo] | None:
+    rows = ModalBackend.list_apps()
+    if rows is None:
+        return None
+    return visible_launchpad_rows(rows)
+
+
+def _sync_opencode_cli(
+    *,
+    target_app_name: Optional[str] = None,
+    target_url: Optional[str] = None,
+    target_config: Optional[DeploymentConfig] = None,
+    current_rows: list[EndpointInfo] | None = None,
+    remove_app_names: list[str] | None = None,
+    username: str = "",
+    dry_run: bool = False,
+    fail_on_error: bool = False,
+) -> None:
+    target = None
+    if target_app_name:
+        target = resolve_connection_for_app(
+            target_app_name,
+            rows=current_rows,
+            username=username,
+            fallback_config=target_config,
+            fallback_server_url=target_url,
+        )
+    try:
+        result = sync_opencode_config(
+            target=target,
+            current_rows=current_rows,
+            remove_app_names=remove_app_names,
+            dry_run=dry_run,
+        )
+    except Exception as exc:
+        message = f"OpenCode sync failed: {exc}"
+        if fail_on_error:
+            typer.echo(message, err=True)
+            raise typer.Exit(code=1)
+        typer.echo(message, err=True)
+        return
+
+    for line in result.messages:
+        typer.echo(line)
+
+
 # -----------------------------------------------------------------------
 # TUI
 # -----------------------------------------------------------------------
@@ -351,14 +401,19 @@ def deploy(
     )
 
     deployed_web_url: Optional[str] = None
+    deploy_succeeded = False
     for event in orch.deploy(config):
         if isinstance(event, LogEvent):
             maybe_url = ModalBackend.extract_modal_web_url(event.line)
             if maybe_url:
                 deployed_web_url = maybe_url
+        elif isinstance(event, OperationCompleteEvent) and event.operation == OperationType.DEPLOY:
+            deploy_succeeded = event.success
         _print_event(event)
         _raise_on_failed_completion(event)
 
+    warmup_succeeded = False
+    final_sync_url: Optional[str] = None
     if do_warmup:
         url = server_url or deployed_web_url or ModalBackend.default_server_url(
             username,
@@ -373,8 +428,34 @@ def deploy(
             app_name=resolved_app_name,
             served_model_name=config.served_model_name,
         ):
+            if (
+                isinstance(event, OperationCompleteEvent)
+                and event.success
+                and event.operation == OperationType.WARMUP
+            ):
+                warmup_succeeded = True
+                final_sync_url = url
+                if isinstance(event.data, dict):
+                    maybe_url = event.data.get("url")
+                    if isinstance(maybe_url, str) and maybe_url.strip():
+                        final_sync_url = maybe_url.strip()
             _print_event(event)
             _raise_on_failed_completion(event)
+    elif deploy_succeeded:
+        final_sync_url = server_url or deployed_web_url or ModalBackend.default_server_url(
+            username,
+            app_name=resolved_app_name,
+            function_slug=config.function_slug,
+        )
+
+    if (do_warmup and warmup_succeeded and final_sync_url) or (not do_warmup and final_sync_url):
+        _sync_opencode_cli(
+            target_app_name=resolved_app_name,
+            target_url=final_sync_url,
+            target_config=config,
+            current_rows=_load_visible_launchpad_rows(),
+            username=username,
+        )
 
     raise typer.Exit(code=0)
 
@@ -423,8 +504,16 @@ def list_apps() -> None:
     """List launchpad Modal apps."""
     orch, _ = _preflight()
     _print_banner()
+    visible_rows: list[EndpointInfo] | None = None
     for event in orch.list_deployments():
+        if (
+            isinstance(event, OperationCompleteEvent)
+            and event.success
+            and isinstance(event.data, list)
+        ):
+            visible_rows = [row for row in event.data if isinstance(row, EndpointInfo)]
         _print_event(event)
+    _sync_opencode_cli(current_rows=visible_rows)
 
 
 @app.command()
@@ -492,8 +581,16 @@ def stop(
         if not confirmed:
             typer.echo("Aborted.")
             raise typer.Exit(code=1)
+    stop_succeeded = False
     for event in orch.stop_app(bt, app_name=target_app_name):
+        if isinstance(event, OperationCompleteEvent) and event.operation == OperationType.STOP:
+            stop_succeeded = event.success
         _print_event(event)
+    if stop_succeeded:
+        _sync_opencode_cli(
+            current_rows=_load_visible_launchpad_rows(),
+            remove_app_names=[target_app_name],
+        )
 
 
 @app.command()
@@ -574,12 +671,22 @@ def switch(
         if preload:
             typer.echo("Note: --preload is only used by llama.cpp and is ignored for vLLM.")
         if redeploy:
+            deployed_web_url: Optional[str] = None
+            deploy_succeeded = False
             config.do_deploy = True
             for event in orch.deploy(config):
+                if isinstance(event, LogEvent):
+                    maybe_url = ModalBackend.extract_modal_web_url(event.line)
+                    if maybe_url:
+                        deployed_web_url = maybe_url
+                elif isinstance(event, OperationCompleteEvent) and event.operation == OperationType.DEPLOY:
+                    deploy_succeeded = event.success
                 _print_event(event)
                 _raise_on_failed_completion(event)
+            warmup_succeeded = False
+            final_sync_url: Optional[str] = None
             if do_warmup:
-                url = server_url or ModalBackend.default_server_url(
+                url = server_url or deployed_web_url or ModalBackend.default_server_url(
                     username,
                     app_name=resolved_app_name,
                     function_slug=config.function_slug,
@@ -592,8 +699,33 @@ def switch(
                     app_name=resolved_app_name,
                     served_model_name=config.served_model_name,
                 ):
+                    if (
+                        isinstance(event, OperationCompleteEvent)
+                        and event.success
+                        and event.operation == OperationType.WARMUP
+                    ):
+                        warmup_succeeded = True
+                        final_sync_url = url
+                        if isinstance(event.data, dict):
+                            maybe_url = event.data.get("url")
+                            if isinstance(maybe_url, str) and maybe_url.strip():
+                                final_sync_url = maybe_url.strip()
                     _print_event(event)
                     _raise_on_failed_completion(event)
+            elif deploy_succeeded:
+                final_sync_url = server_url or deployed_web_url or ModalBackend.default_server_url(
+                    username,
+                    app_name=resolved_app_name,
+                    function_slug=config.function_slug,
+                )
+            if (do_warmup and warmup_succeeded and final_sync_url) or (not do_warmup and final_sync_url):
+                _sync_opencode_cli(
+                    target_app_name=resolved_app_name,
+                    target_url=final_sync_url,
+                    target_config=config,
+                    current_rows=_load_visible_launchpad_rows(),
+                    username=username,
+                )
         else:
             typer.echo("No deploy performed. Use --redeploy to apply vLLM model changes.")
         raise typer.Exit(code=0)
@@ -619,17 +751,83 @@ def switch(
         )
         if code != 0:
             raise typer.Exit(code=code)
+        final_sync_url = server_url or ModalBackend.default_server_url(
+            username,
+            app_name=resolved_app_name,
+            function_slug=deploy_config.function_slug,
+        )
+        warmup_succeeded = False
         if do_warmup:
-            url = server_url or ModalBackend.default_server_url(
-                username,
+            for event in orch.warmup(
+                bt,
+                final_sync_url,
+                timeout,
+                tail_logs,
                 app_name=resolved_app_name,
-                function_slug=deploy_config.function_slug,
-            )
-            for event in orch.warmup(bt, url, timeout, tail_logs, app_name=resolved_app_name):
+            ):
+                if (
+                    isinstance(event, OperationCompleteEvent)
+                    and event.success
+                    and event.operation == OperationType.WARMUP
+                ):
+                    warmup_succeeded = True
+                    if isinstance(event.data, dict):
+                        maybe_url = event.data.get("url")
+                        if isinstance(maybe_url, str) and maybe_url.strip():
+                            final_sync_url = maybe_url.strip()
                 _print_event(event)
                 _raise_on_failed_completion(event)
+        if (do_warmup and warmup_succeeded) or not do_warmup:
+            _sync_opencode_cli(
+                target_app_name=resolved_app_name,
+                target_url=final_sync_url,
+                target_config=config,
+                current_rows=_load_visible_launchpad_rows(),
+                username=username,
+            )
 
     raise typer.Exit(code=0)
+
+
+# -----------------------------------------------------------------------
+# OpenCode
+# -----------------------------------------------------------------------
+
+
+@opencode_app.command("sync")
+def opencode_sync(
+    backend: Optional[str] = typer.Option(None, help="Backend: llamacpp or vllm"),
+    instance_name: Optional[str] = typer.Option(None, help="Target instance name"),
+    app_name: Optional[str] = typer.Option(None, help="Target Modal app name"),
+    dry_run: bool = typer.Option(False, help="Print the intended sync changes without writing files"),
+) -> None:
+    """Sync Launchpad-managed deployments into OpenCode config."""
+    _, username = _preflight()
+    _print_banner()
+
+    target_app_name = (app_name or "").strip() or None
+    if target_app_name is None and instance_name:
+        if not backend:
+            typer.echo("Specify --backend when using --instance-name.", err=True)
+            raise typer.Exit(code=1)
+        target_app_name = _resolve_manage_app_name(BackendType(backend), None, instance_name)
+
+    current_rows = _load_visible_launchpad_rows()
+    if target_app_name:
+        if current_rows is None:
+            typer.echo("Could not load Modal app list to resolve the requested sync target.", err=True)
+            raise typer.Exit(code=1)
+        if not any((row.name or "").strip() == target_app_name for row in current_rows):
+            typer.echo(f"OpenCode sync target '{target_app_name}' was not found.", err=True)
+            raise typer.Exit(code=1)
+
+    _sync_opencode_cli(
+        target_app_name=target_app_name,
+        current_rows=current_rows,
+        username=username,
+        dry_run=dry_run,
+        fail_on_error=True,
+    )
 
 
 # -----------------------------------------------------------------------
