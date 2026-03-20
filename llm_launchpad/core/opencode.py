@@ -324,11 +324,11 @@ def sync_opencode_config(
 
         if current_rows is not None:
             visible_rows = visible_launchpad_rows(current_rows)
-            visible_by_name = {
-                (row.name or "").strip(): row
-                for row in visible_rows
-                if (row.name or "").strip()
-            }
+            visible_by_name: dict[str, EndpointInfo] = {}
+            for row in visible_rows:
+                row_name = str(row.name or "").strip()
+                if row_name:
+                    visible_by_name[row_name] = row
 
             for app_name in sorted(list(registry.keys())):
                 entry = registry.get(app_name)
