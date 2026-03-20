@@ -4,15 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llm-launchpad"
-version = "0.0.2"
+dynamic = ["version"]
 description = "Personal LLM deployments made simple."
 readme = "README.md"
 requires-python = ">=3.12"
 license = { file = "LICENSE" }
 authors = [{ name = "Thomas Rochefort-Beaudoin" }]
+maintainers = [{ name = "Thomas Rochefort-Beaudoin", email = "ThomasRochefortB@users.noreply.github.com" }]
 keywords = ["llm", "deployment", "modal", "agent", "chat"]
 classifiers = [
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
   "License :: OSI Approved :: GNU Affero General Public License v3",
   "Operating System :: OS Independent",
 ]
@@ -33,10 +36,17 @@ llm-launchpad = "llm_launchpad.cli.main:main"
 
 [project.urls]
 Homepage = "https://github.com/ThomasRochefortB/llm-launchpad"
+Documentation = "https://github.com/ThomasRochefortB/llm-launchpad#readme"
+Repository = "https://github.com/ThomasRochefortB/llm-launchpad"
 Issues = "https://github.com/ThomasRochefortB/llm-launchpad/issues"
+Changelog = "https://github.com/ThomasRochefortB/llm-launchpad/blob/main/CHANGELOG.md"
+Security = "https://github.com/ThomasRochefortB/llm-launchpad/blob/main/SECURITY.md"
 
 [tool.setuptools]
 packages = ["llm_launchpad", "llm_launchpad.backends", "llm_launchpad.cli", "llm_launchpad.core", "llm_launchpad.protocol", "llm_launchpad.tui", "llm_launchpad.tui.screens", "llm_launchpad.tui.widgets"]
+
+[tool.setuptools.dynamic]
+version = { attr = "llm_launchpad._version.__version__" }
 
 [tool.setuptools.package-data]
 "llm_launchpad.tui" = ["theme.tcss"]
@@ -45,8 +55,30 @@ packages = ["llm_launchpad", "llm_launchpad.backends", "llm_launchpad.cli", "llm
 dev = [
     "pytest>=9.0.2",
     "pytest-cov>=7.0.0",
+    "ruff>=0.11.0",
+    "ty>=0.0.17",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F"]
+ignore = ["E501"]
+
+[tool.ty.environment]
+python-version = "3.12"
+
+[tool.ty.src]
+include = ["llm_launchpad", "tests/smoke_test.py", "tests/test_release_metadata.py"]
+exclude = [
+    "llm_launchpad/backends",
+    "llm_launchpad/tui",
+    "llm_launchpad/core/hf_models.py",
+    "llm_launchpad/core/modal_gpu.py",
+]
