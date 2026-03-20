@@ -24,6 +24,7 @@ from ...core.modal_auth import ModalAuthStatus, get_modal_auth_status
 from ...core.naming import default_llamacpp_served_model_name, default_served_model_name
 from ...core.quick_deploy import (
     QuickDeployProfile,
+    format_context_length,
     format_hourly_cost,
     list_quick_deploy_profiles,
 )
@@ -592,6 +593,7 @@ def _render_quick_deploy_option(profile: QuickDeployProfile) -> str:
         f"  [bold]{_escape_markup(profile.display_name)}[/bold]  "
         f"[#7bf168]{_escape_markup(profile.profile_label)}[/]\n"
         f"    [dim]{_escape_markup(profile.gpu_type)} x{profile.gpu_count} · "
+        f"max {_escape_markup(format_context_length(profile.max_context_tokens))} · "
         f"{_escape_markup(format_hourly_cost(profile.approx_cost_per_hour_usd))}[/dim]"
     )
 

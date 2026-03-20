@@ -10,6 +10,7 @@ from textual.widgets import Button, Footer, Input, Static, Switch
 from ...core.quick_deploy import (
     QuickDeployProfile,
     build_quick_deploy_config,
+    format_context_length,
     format_hourly_cost,
     get_quick_deploy_profile,
 )
@@ -30,6 +31,7 @@ def _render_profile_summary(profile: QuickDeployProfile) -> str:
             f"[bold]Profile[/bold]  {_escape_markup(profile.profile_label)}",
             f"[bold]Quant[/bold]    {_escape_markup(profile.quant)}",
             f"[bold]GPU[/bold]      {_escape_markup(profile.gpu_type)} x{profile.gpu_count}",
+            f"[bold]Max ctx[/bold]  {_escape_markup(format_context_length(profile.max_context_tokens))}",
             f"[bold]Cost[/bold]     {_escape_markup(format_hourly_cost(profile.approx_cost_per_hour_usd))}",
             f"[bold]Repo[/bold]     {_escape_markup(profile.repo_id)}",
             f"[bold]Default slug[/bold]  {_escape_markup(profile.instance_slug_hint)}",

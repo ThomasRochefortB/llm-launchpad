@@ -31,6 +31,7 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Kimi K2.5", title)
             self.assertIn("Kimi K2.5", summary)
             self.assertIn("RTX-PRO-6000 x5", summary)
+            self.assertIn("262,144 ctx", summary)
             self.assertIn("Cheap but good", summary)
             self.assertIn("UD-Q2_K_XL", summary)
 

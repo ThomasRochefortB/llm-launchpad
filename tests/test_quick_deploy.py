@@ -5,6 +5,7 @@ import unittest
 
 from llm_launchpad.core.quick_deploy import (
     build_quick_deploy_config,
+    format_context_length,
     get_quick_deploy_profile,
     list_quick_deploy_profiles,
 )
@@ -12,6 +13,9 @@ from llm_launchpad.protocol.enums import BackendType
 
 
 class QuickDeployConfigTests(unittest.TestCase):
+    def test_format_context_length_uses_grouped_tokens(self) -> None:
+        self.assertEqual(format_context_length(262144), "262,144 ctx")
+
     def test_catalog_contains_expected_profiles(self) -> None:
         profiles = list_quick_deploy_profiles()
         self.assertEqual(
@@ -36,6 +40,7 @@ class QuickDeployConfigTests(unittest.TestCase):
         self.assertEqual(config.quant, "UD-Q3_K_XL")
         self.assertEqual(config.gpu_type, "RTX-PRO-6000")
         self.assertEqual(config.gpu_count, 3)
+        self.assertEqual(profile.max_context_tokens, 262144)
         self.assertTrue(config.preload)
         self.assertTrue(config.do_deploy)
         self.assertTrue(config.do_warmup)
@@ -57,6 +62,7 @@ class QuickDeployConfigTests(unittest.TestCase):
         self.assertEqual(config.quant, "UD-Q2_K_XL")
         self.assertEqual(config.gpu_type, "RTX-PRO-6000")
         self.assertEqual(config.gpu_count, 4)
+        self.assertEqual(profile.max_context_tokens, 202752)
         self.assertEqual(config.instance_name, "glm5-rtxpro")
         self.assertEqual(config.app_name, "llamacpp-glm5-rtxpro")
         self.assertEqual(
@@ -74,6 +80,7 @@ class QuickDeployConfigTests(unittest.TestCase):
         self.assertEqual(config.quant, "UD-Q2_K_XL")
         self.assertEqual(config.gpu_type, "RTX-PRO-6000")
         self.assertEqual(config.gpu_count, 5)
+        self.assertEqual(profile.max_context_tokens, 262144)
         self.assertEqual(config.instance_name, "kimi25-rtxpro")
         self.assertEqual(config.app_name, "llamacpp-kimi25-rtxpro")
         self.assertEqual(

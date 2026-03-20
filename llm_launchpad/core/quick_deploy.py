@@ -22,6 +22,7 @@ class QuickDeployProfile:
     gpu_count: int
     profile_label: str
     approx_cost_per_hour_usd: float
+    max_context_tokens: int
     instance_slug_hint: str
     summary: str
     server_args: tuple[str, ...]
@@ -79,6 +80,7 @@ QUICK_DEPLOY_PROFILES: tuple[QuickDeployProfile, ...] = (
         gpu_count=3,
         profile_label="Cheap but good",
         approx_cost_per_hour_usd=9.09,
+        max_context_tokens=262144,
         instance_slug_hint="qwen35-397b-rtxpro",
         summary="Lower-cost curated profile for long-context coding workloads on three RTX PRO 6000 GPUs.",
         server_args=QWEN35_397B_SERVER_ARGS,
@@ -92,6 +94,7 @@ QUICK_DEPLOY_PROFILES: tuple[QuickDeployProfile, ...] = (
         gpu_count=2,
         profile_label="Fast but $$$",
         approx_cost_per_hour_usd=12.50,
+        max_context_tokens=262144,
         instance_slug_hint="qwen35-397b-b200",
         summary="Higher-throughput curated profile for heavy coding and reasoning workloads on two B200 GPUs.",
         server_args=QWEN35_397B_SERVER_ARGS,
@@ -105,6 +108,7 @@ QUICK_DEPLOY_PROFILES: tuple[QuickDeployProfile, ...] = (
         gpu_count=4,
         profile_label="Cheap but good",
         approx_cost_per_hour_usd=12.12,
+        max_context_tokens=202752,
         instance_slug_hint="glm5-rtxpro",
         summary="Lower-cost GLM-5 profile for long-context coding and agent workflows on four RTX PRO 6000 GPUs.",
         server_args=GLM5_SERVER_ARGS,
@@ -118,6 +122,7 @@ QUICK_DEPLOY_PROFILES: tuple[QuickDeployProfile, ...] = (
         gpu_count=2,
         profile_label="Fast but $$$",
         approx_cost_per_hour_usd=12.50,
+        max_context_tokens=202752,
         instance_slug_hint="glm5-b200",
         summary="Higher-throughput GLM-5 profile for long-context coding and agent workflows on two B200 GPUs.",
         server_args=GLM5_SERVER_ARGS,
@@ -131,6 +136,7 @@ QUICK_DEPLOY_PROFILES: tuple[QuickDeployProfile, ...] = (
         gpu_count=5,
         profile_label="Cheap but good",
         approx_cost_per_hour_usd=15.15,
+        max_context_tokens=262144,
         instance_slug_hint="kimi25-rtxpro",
         summary="Lower-cost Kimi K2.5 profile for long-context coding and agent workflows on five RTX PRO 6000 GPUs.",
         server_args=KIMI_K25_SERVER_ARGS,
@@ -144,6 +150,7 @@ QUICK_DEPLOY_PROFILES: tuple[QuickDeployProfile, ...] = (
         gpu_count=3,
         profile_label="Fast but $$$",
         approx_cost_per_hour_usd=18.75,
+        max_context_tokens=262144,
         instance_slug_hint="kimi25-b200",
         summary="Higher-throughput Kimi K2.5 profile for long-context coding and agent workflows on three B200 GPUs.",
         server_args=KIMI_K25_SERVER_ARGS,
@@ -169,6 +176,11 @@ def get_quick_deploy_profile(profile_id: str) -> QuickDeployProfile:
 def format_hourly_cost(value: float) -> str:
     """Render approximate hourly pricing for UI copy."""
     return f"~${value:.2f}/hr"
+
+
+def format_context_length(value: int) -> str:
+    """Render a token context length for UI copy."""
+    return f"{value:,} ctx"
 
 
 def build_quick_deploy_config(
