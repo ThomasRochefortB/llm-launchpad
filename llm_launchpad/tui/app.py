@@ -23,9 +23,13 @@ from ..core.config import SETTINGS_DIR
 from ..core.hf_models import fetch_gguf_quant_metadata, list_llamacpp_candidates, list_vllm_candidates
 from ..core.naming import (
     build_app_name,
-    default_llamacpp_served_model_name,
-    default_served_model_name,
     legacy_app_name,
+)
+from ..core.opencode import (
+    build_openai_connection_payload,
+    resolve_connection_for_app,
+    sync_opencode_config,
+    visible_launchpad_rows,
 )
 from ..core.orchestrator import Orchestrator
 from ..protocol.enums import BackendType, OperationType
@@ -76,26 +80,7 @@ def _deploy_connection_summary_payload(
     server_url: str,
 ) -> dict[str, str]:
     """Structured OpenAI-compatible connection summary for a completed deploy."""
-    base_root = server_url.rstrip("/")
-    base_url = base_root if base_root.endswith("/v1") else f"{base_root}/v1"
-
-    if config.backend == BackendType.VLLM:
-        model_id = (config.served_model_name or default_served_model_name(config.model_name)).strip()
-        display_name = (config.served_model_name or config.model_name or model_id or "Model").strip()
-    else:
-        model_id = (
-            (config.served_model_name or "").strip()
-            or default_llamacpp_served_model_name(config.repo_id, config.quant)
-        )
-        source = (config.repo_id or "llama.cpp GGUF").strip()
-        quant = (config.quant or "").strip()
-        display_name = f"{source} ({quant})" if quant else source
-
-    return {
-        "base_url": base_url,
-        "model_id": model_id,
-        "display_name": display_name,
-    }
+    return build_openai_connection_payload(config, server_url)
 
 
 def _osc_52_sequence(text: str) -> str:
@@ -347,6 +332,14 @@ class TuiApp(App):
                         function_slug=config.function_slug,
                     )
                     _emit_connection_summary(url)
+                    self._sync_opencode(
+                        target_app_name=target_app_name,
+                        target_url=url,
+                        target_config=config,
+                        current_rows=self._load_visible_launchpad_rows(),
+                        monitor=monitor,
+                        emit_skipped=True,
+                    )
             _dispatch_event(monitor, event)
 
         # Warmup if requested and deploy was successful
@@ -376,6 +369,14 @@ class TuiApp(App):
                         if isinstance(maybe_url, str) and maybe_url.strip():
                             completed_url = maybe_url.strip()
                     _emit_connection_summary(completed_url)
+                    self._sync_opencode(
+                        target_app_name=target_app_name,
+                        target_url=completed_url,
+                        target_config=config,
+                        current_rows=self._load_visible_launchpad_rows(),
+                        monitor=monitor,
+                        emit_skipped=True,
+                    )
                 _dispatch_event(monitor, event)
 
     # ------------------------------------------------------------------
@@ -393,6 +394,17 @@ class TuiApp(App):
 
     def _run_list(self, monitor: MonitorScreen):  # type: ignore[return]
         for event in self._orchestrator.list_deployments():
+            if (
+                isinstance(event, OperationCompleteEvent)
+                and event.success
+                and isinstance(event.data, list)
+            ):
+                visible_rows = [row for row in event.data if isinstance(row, EndpointInfo)]
+                self._sync_opencode(
+                    current_rows=visible_rows,
+                    monitor=monitor,
+                    emit_skipped=True,
+                )
             _dispatch_event(monitor, event)
 
     # ------------------------------------------------------------------
@@ -491,14 +503,74 @@ class TuiApp(App):
     ):  # type: ignore[return]
         _dispatch_event(monitor, LogEvent(line=f"Target app: {app_name}"))
         for event in self._orchestrator.stop_app(backend, app_name=app_name):
+            if (
+                isinstance(event, OperationCompleteEvent)
+                and event.success
+                and event.operation == OperationType.STOP
+            ):
+                self._sync_opencode(
+                    current_rows=self._load_visible_launchpad_rows(),
+                    remove_app_names=[app_name],
+                    monitor=monitor,
+                    emit_skipped=True,
+                )
             _dispatch_event(monitor, event)
 
     def list_instances(self, backend: BackendType | None = None) -> list[EndpointInfo]:
-        rows = ModalBackend.list_apps() or []
-        self._merge_deploy_connection_cache(rows)
+        rows = ModalBackend.list_apps()
+        if rows is None:
+            rows = []
+        else:
+            self._merge_deploy_connection_cache(rows)
+            self._sync_opencode(current_rows=visible_launchpad_rows(rows))
         if backend is None:
             return rows
         return [row for row in rows if row.backend == backend]
+
+    def _load_visible_launchpad_rows(self) -> list[EndpointInfo] | None:
+        rows = ModalBackend.list_apps()
+        if rows is None:
+            return None
+        self._merge_deploy_connection_cache(rows)
+        return visible_launchpad_rows(rows)
+
+    def _sync_opencode(
+        self,
+        *,
+        target_app_name: str | None = None,
+        target_url: str | None = None,
+        target_config: DeploymentConfig | None = None,
+        current_rows: list[EndpointInfo] | None = None,
+        remove_app_names: list[str] | None = None,
+        monitor: MonitorScreen | None = None,
+        emit_skipped: bool = False,
+    ) -> None:
+        target = None
+        if target_app_name:
+            target = resolve_connection_for_app(
+                target_app_name,
+                rows=current_rows,
+                username=self._username,
+                fallback_config=target_config,
+                fallback_server_url=target_url,
+            )
+        try:
+            result = sync_opencode_config(
+                target=target,
+                current_rows=current_rows,
+                remove_app_names=remove_app_names,
+            )
+        except Exception as exc:
+            if monitor is not None:
+                _dispatch_event(monitor, LogEvent(line=f"OpenCode sync failed: {exc}"))
+            return
+
+        if monitor is None:
+            return
+
+        for line in result.messages:
+            if result.detected or emit_skipped:
+                _dispatch_event(monitor, LogEvent(line=line))
 
     # ------------------------------------------------------------------
     # Storage: list

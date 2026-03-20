@@ -9,6 +9,7 @@ from typer.testing import CliRunner
 from llm_launchpad.cli import main as cli_main
 from llm_launchpad.protocol.enums import BackendType, OperationType
 from llm_launchpad.protocol.events import LogEvent, OperationCompleteEvent
+from llm_launchpad.protocol.models import EndpointInfo
 
 
 class CliMainHelperTests(unittest.TestCase):
@@ -271,6 +272,28 @@ class CliMainCommandTests(unittest.TestCase):
             ["https://alice--vllm-test-serve-disc-42c728.modal.run"],
         )
 
+    def test_deploy_syncs_opencode_after_success_without_warmup(self) -> None:
+        orch = SimpleNamespace(
+            deploy=lambda _config: [
+                OperationCompleteEvent(operation=OperationType.DEPLOY, success=True, exit_code=0),
+            ]
+        )
+        with (
+            patch("llm_launchpad.cli.main._preflight", return_value=(orch, "alice")),
+            patch("llm_launchpad.cli.main._print_banner", return_value=None),
+            patch("llm_launchpad.cli.main._load_visible_launchpad_rows", return_value=[]),
+            patch("llm_launchpad.cli.main._sync_opencode_cli") as sync_mock,
+        ):
+            result = self.runner.invoke(
+                cli_main.app,
+                ["deploy", "--backend", "vllm", "--app-name", "vllm-test"],
+            )
+        self.assertEqual(result.exit_code, 0)
+        sync_mock.assert_called_once()
+        self.assertEqual(sync_mock.call_args.kwargs["target_app_name"], "vllm-test")
+        self.assertEqual(sync_mock.call_args.kwargs["target_url"], "https://alice--vllm-test-serve.modal.run")
+        self.assertEqual(sync_mock.call_args.kwargs["username"], "alice")
+
     def test_deploy_warmup_uses_function_slug_when_url_not_in_logs(self) -> None:
         warmup_calls: list[str] = []
 
@@ -409,6 +432,22 @@ class CliMainCommandTests(unittest.TestCase):
                 )
         self.assertEqual(result.exit_code, 7)
 
+    def test_list_command_triggers_opencode_prune_with_visible_rows(self) -> None:
+        visible_rows = [EndpointInfo(name="vllm-qwen3", backend=BackendType.VLLM, state="running")]
+        orch = SimpleNamespace(
+            list_deployments=lambda: [
+                OperationCompleteEvent(operation=OperationType.LIST, success=True, data=visible_rows),
+            ]
+        )
+        with (
+            patch("llm_launchpad.cli.main._preflight", return_value=(orch, "alice")),
+            patch("llm_launchpad.cli.main._print_banner", return_value=None),
+            patch("llm_launchpad.cli.main._sync_opencode_cli") as sync_mock,
+        ):
+            result = self.runner.invoke(cli_main.app, ["list"])
+        self.assertEqual(result.exit_code, 0)
+        sync_mock.assert_called_once_with(current_rows=visible_rows)
+
     def test_deploy_warmup_failure_returns_nonzero_exit_code(self) -> None:
         orch = SimpleNamespace(
             deploy=lambda _config: [
@@ -483,6 +522,25 @@ class CliMainCommandTests(unittest.TestCase):
                 )
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(calls, [(BackendType.VLLM, "vllm-qwen3")])
+
+    def test_stop_triggers_opencode_sync_with_removed_app_name(self) -> None:
+        orch = SimpleNamespace(
+            stop_app=lambda *_args, **_kwargs: [
+                OperationCompleteEvent(operation=OperationType.STOP, success=True, exit_code=0),
+            ]
+        )
+        with (
+            patch("llm_launchpad.cli.main._preflight", return_value=(orch, "alice")),
+            patch("llm_launchpad.cli.main._print_banner", return_value=None),
+            patch("llm_launchpad.cli.main._load_visible_launchpad_rows", return_value=[]),
+            patch("llm_launchpad.cli.main._sync_opencode_cli") as sync_mock,
+        ):
+            result = self.runner.invoke(
+                cli_main.app,
+                ["stop", "--backend", "vllm", "--yes", "--app-name", "vllm-test"],
+            )
+        self.assertEqual(result.exit_code, 0)
+        sync_mock.assert_called_once_with(current_rows=[], remove_app_names=["vllm-test"])
 
     def test_switch_llamacpp_requires_preset_or_repo(self) -> None:
         orch = SimpleNamespace(deploy=lambda *_args, **_kwargs: [])
@@ -566,6 +624,27 @@ class CliMainCommandTests(unittest.TestCase):
         self.assertIsNotNone(swtch_config.instance_name)
         self.assertEqual(swtch_config.instance_name, "qwen-qwen2-5-coder-7b-instruct")
         self.assertEqual(swtch_config.app_name, "llamacpp-qwen-qwen2-5-coder-7b-instruct")
+
+    def test_opencode_sync_command_uses_target_rows_and_dry_run(self) -> None:
+        rows = [SimpleNamespace(name="vllm-qwen3")]
+        with (
+            patch("llm_launchpad.cli.main._preflight", return_value=(SimpleNamespace(), "alice")),
+            patch("llm_launchpad.cli.main._print_banner", return_value=None),
+            patch("llm_launchpad.cli.main._load_visible_launchpad_rows", return_value=rows),
+            patch("llm_launchpad.cli.main._sync_opencode_cli") as sync_mock,
+        ):
+            result = self.runner.invoke(
+                cli_main.app,
+                ["opencode", "sync", "--app-name", "vllm-qwen3", "--dry-run"],
+            )
+        self.assertEqual(result.exit_code, 0)
+        sync_mock.assert_called_once_with(
+            target_app_name="vllm-qwen3",
+            current_rows=rows,
+            username="alice",
+            dry_run=True,
+            fail_on_error=True,
+        )
 
 
 if __name__ == "__main__":
