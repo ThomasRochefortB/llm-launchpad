@@ -28,7 +28,6 @@ def _render_profile_summary(profile: QuickDeployProfile) -> str:
             f"[bold #7bf168]{_escape_markup(profile.display_name)}[/]",
             f"[dim]{_escape_markup(profile.summary)}[/dim]",
             "",
-            f"[bold]Profile[/bold]  {_escape_markup(profile.profile_label)}",
             f"[bold]Quant[/bold]    {_escape_markup(profile.quant)}",
             f"[bold]GPU[/bold]      {_escape_markup(profile.gpu_type)} x{profile.gpu_count}",
             f"[bold]Max ctx[/bold]  {_escape_markup(format_context_length(profile.max_context_tokens))}",

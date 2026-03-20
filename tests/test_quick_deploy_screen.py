@@ -32,13 +32,13 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Kimi K2.5", summary)
             self.assertIn("RTX-PRO-6000 x5", summary)
             self.assertIn("262,144 ctx", summary)
-            self.assertIn("Cheap but good", summary)
+            self.assertNotIn("Cheap but good", summary)
             self.assertIn("UD-Q2_K_XL", summary)
 
     async def test_deploy_uses_blank_override_defaults(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:
-            app.push_screen(QuickDeployScreen(profile_id="qwen35-397b-b200"))
+            app.push_screen(QuickDeployScreen(profile_id="qwen35-397b-rtxpro"))
             await pilot.pause()
 
             screen = app.screen
@@ -46,16 +46,16 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             screen._deploy()
 
         self.assertIsNotNone(app.deployed_config)
-        self.assertEqual(app.deployed_config.instance_name, "qwen35-397b-b200")
-        self.assertEqual(app.deployed_config.app_name, "llamacpp-qwen35-397b-b200")
-        self.assertEqual(app.deployed_config.gpu_type, "B200")
-        self.assertEqual(app.deployed_config.gpu_count, 2)
+        self.assertEqual(app.deployed_config.instance_name, "qwen35-397b-rtxpro")
+        self.assertEqual(app.deployed_config.app_name, "llamacpp-qwen35-397b-rtxpro")
+        self.assertEqual(app.deployed_config.gpu_type, "RTX-PRO-6000")
+        self.assertEqual(app.deployed_config.gpu_count, 3)
         self.assertTrue(app.deployed_config.preload)
 
     async def test_advanced_options_are_hidden_by_default(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:
-            app.push_screen(QuickDeployScreen(profile_id="qwen35-397b-b200"))
+            app.push_screen(QuickDeployScreen(profile_id="qwen35-397b-rtxpro"))
             await pilot.pause()
 
             screen = app.screen

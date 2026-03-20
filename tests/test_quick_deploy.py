@@ -22,11 +22,8 @@ class QuickDeployConfigTests(unittest.TestCase):
             [profile.id for profile in profiles],
             [
                 "qwen35-397b-rtxpro",
-                "qwen35-397b-b200",
                 "glm5-rtxpro",
-                "glm5-b200",
                 "kimi25-rtxpro",
-                "kimi25-b200",
             ],
         )
 
@@ -89,7 +86,7 @@ class QuickDeployConfigTests(unittest.TestCase):
         )
 
     def test_build_quick_deploy_config_applies_overrides(self) -> None:
-        profile = get_quick_deploy_profile("qwen35-397b-b200")
+        profile = get_quick_deploy_profile("qwen35-397b-rtxpro")
 
         config = build_quick_deploy_config(
             profile,
@@ -103,8 +100,8 @@ class QuickDeployConfigTests(unittest.TestCase):
         self.assertEqual(config.app_name, "llamacpp-custom-prod")
         self.assertFalse(config.do_warmup)
         self.assertTrue(config.show_debug_logs)
-        self.assertEqual(config.gpu_type, "B200")
-        self.assertEqual(config.gpu_count, 2)
+        self.assertEqual(config.gpu_type, "RTX-PRO-6000")
+        self.assertEqual(config.gpu_count, 3)
 
 
 if __name__ == "__main__":

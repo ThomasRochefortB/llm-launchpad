@@ -46,19 +46,16 @@ class MainMenuQuickDeployTests(unittest.IsolatedAsyncioTestCase):
                 screen = app.screen
                 assert isinstance(screen, MainMenuScreen)
                 quick_list = screen.query_one("#quick-deploy-list", OptionList)
-                self.assertEqual(quick_list.option_count, 6)
+                self.assertEqual(quick_list.option_count, 3)
                 self.assertIn("Qwen3.5 397B A17B", str(quick_list.get_option_at_index(0).prompt))
-                self.assertIn("Cheap but good", str(quick_list.get_option_at_index(0).prompt))
+                self.assertNotIn("Cheap but good", str(quick_list.get_option_at_index(0).prompt))
                 self.assertIn("max 262,144 ctx", str(quick_list.get_option_at_index(0).prompt))
-                self.assertIn("Fast but $$$", str(quick_list.get_option_at_index(1).prompt))
-                self.assertIn("GLM-5", str(quick_list.get_option_at_index(2).prompt))
-                self.assertIn("RTX-PRO-6000 x4", str(quick_list.get_option_at_index(2).prompt))
-                self.assertIn("max 202,752 ctx", str(quick_list.get_option_at_index(2).prompt))
-                self.assertIn("B200 x2", str(quick_list.get_option_at_index(3).prompt))
-                self.assertIn("Kimi K2.5", str(quick_list.get_option_at_index(4).prompt))
-                self.assertIn("RTX-PRO-6000 x5", str(quick_list.get_option_at_index(4).prompt))
-                self.assertIn("max 262,144 ctx", str(quick_list.get_option_at_index(4).prompt))
-                self.assertIn("B200 x3", str(quick_list.get_option_at_index(5).prompt))
+                self.assertIn("GLM-5", str(quick_list.get_option_at_index(1).prompt))
+                self.assertIn("RTX-PRO-6000 x4", str(quick_list.get_option_at_index(1).prompt))
+                self.assertIn("max 202,752 ctx", str(quick_list.get_option_at_index(1).prompt))
+                self.assertIn("Kimi K2.5", str(quick_list.get_option_at_index(2).prompt))
+                self.assertIn("RTX-PRO-6000 x5", str(quick_list.get_option_at_index(2).prompt))
+                self.assertIn("max 262,144 ctx", str(quick_list.get_option_at_index(2).prompt))
 
     async def test_tab_moves_focus_between_action_menu_and_quick_deploy(self) -> None:
         app = _TestApp()
@@ -95,7 +92,7 @@ class MainMenuQuickDeployTests(unittest.IsolatedAsyncioTestCase):
                 screen = app.screen
                 assert isinstance(screen, MainMenuScreen)
                 quick_list = screen.query_one("#quick-deploy-list", OptionList)
-                option = quick_list.get_option_at_index(4)
+                option = quick_list.get_option_at_index(2)
                 screen.on_option_list_option_selected(
                     SimpleNamespace(option=option, option_list=quick_list)
                 )

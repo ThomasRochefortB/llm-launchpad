@@ -590,8 +590,7 @@ def _render_billing_load_error(error: str) -> str:
 
 def _render_quick_deploy_option(profile: QuickDeployProfile) -> str:
     return (
-        f"  [bold]{_escape_markup(profile.display_name)}[/bold]  "
-        f"[#7bf168]{_escape_markup(profile.profile_label)}[/]\n"
+        f"  [bold]{_escape_markup(profile.display_name)}[/bold]\n"
         f"    [dim]{_escape_markup(profile.gpu_type)} x{profile.gpu_count} · "
         f"max {_escape_markup(format_context_length(profile.max_context_tokens))} · "
         f"{_escape_markup(format_hourly_cost(profile.approx_cost_per_hour_usd))}[/dim]"
