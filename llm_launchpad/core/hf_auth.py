@@ -70,7 +70,7 @@ def _summarize_error(exc: Exception) -> str:
 
 def _has_local_token() -> bool:
     try:
-        from huggingface_hub import get_token  # type: ignore
+        from huggingface_hub import get_token
 
         token = get_token()
     except Exception:

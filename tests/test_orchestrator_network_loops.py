@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import queue
 import types
 import unittest
 from unittest.mock import patch
@@ -329,7 +328,10 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
         self.assertIn("line-B", lines)
         self.assertIn("line-C", lines)
         # line-A was already seen → not duplicated
-        self.assertNotIn("line-A", [l for l in lines if l != "── Fetched historical container logs ──"])
+        self.assertNotIn(
+            "line-A",
+            [line for line in lines if line != "── Fetched historical container logs ──"],
+        )
         # Both new lines recorded in seen
         self.assertIn("line-B", seen)
         self.assertIn("line-C", seen)

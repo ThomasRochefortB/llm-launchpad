@@ -8,6 +8,12 @@ Easily launch and manage inference of open-source LLMs on Modal from a Python te
 - **What it does:** provisions vLLM or llama.cpp backends on Modal, manages multiple named instances, and ships a TUI for deployment and monitoring.
 - **Common uses:** spin up a coding model for your editor, test new quantizations, or manage multiple model variants behind clean endpoints.
 
+## Project docs
+
+- [Changelog](CHANGELOG.md)
+- [Contributing](CONTRIBUTING.md)
+- [Security policy](SECURITY.md)
+
 ## Why a TUI?
 
 Launching LLM inference on Modal usually means juggling model names, GPU choices, warmup checks, logs, and endpoint details across several commands. The TUI keeps that flow in one place.

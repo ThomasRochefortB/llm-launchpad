@@ -16,7 +16,7 @@ import re
 import subprocess
 import threading
 import time
-from typing import Any, Generator, List, Optional, Union
+from typing import Any, Generator, List, Optional
 
 from ..protocol.enums import BackendType, DeploymentState, OperationType
 from ..protocol.events import (
@@ -26,7 +26,7 @@ from ..protocol.events import (
     OperationCompleteEvent,
     StateChangeEvent,
 )
-from ..protocol.models import DeploymentConfig, EndpointInfo, LaunchpadSettings
+from ..protocol.models import DeploymentConfig, EndpointInfo
 from ..protocol.models import StoredModelInfo, StorageSnapshot
 
 from .backend import ModalBackend
@@ -395,7 +395,7 @@ class Orchestrator:
                 logs_retry_at = time.time() + 5.0
 
         try:
-            import requests  # type: ignore
+            import requests
         except ImportError:
             yield ErrorEvent(
                 message="'requests' is required. Install with: pip install requests",
@@ -664,7 +664,7 @@ class Orchestrator:
         yield LogEvent(line=f"Checking endpoint status at: {probe_url}")
 
         try:
-            import requests  # type: ignore
+            import requests
         except ImportError:
             yield ErrorEvent(
                 message="'requests' required", operation=OperationType.STATUS, recoverable=False
@@ -806,7 +806,11 @@ class Orchestrator:
         if raw:
             names = {legacy_app_name(bt) for bt in BackendType}
             lines = raw.splitlines()
-            matches = [l for l in lines if any(n in l for n in names) or "vllm-" in l or "llamacpp-" in l]
+            matches = [
+                line
+                for line in lines
+                if any(name in line for name in names) or "vllm-" in line or "llamacpp-" in line
+            ]
             if matches:
                 yield LogEvent(line="Launchpad deployments:")
                 for line in matches:

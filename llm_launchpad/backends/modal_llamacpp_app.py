@@ -545,7 +545,6 @@ def predownload_model(
 )
 def list_downloaded_models() -> List[Dict[str, Any]]:
     """List cached llama.cpp GGUF entries from Hugging Face Hub cache layout."""
-    items: List[Dict[str, Any]] = []
     grouped: dict[tuple[str, Optional[str], Optional[str]], dict[str, Any]] = {}
     if HF_HUB_DIR.exists():
         for model_dir in sorted(HF_HUB_DIR.glob("models--*")):

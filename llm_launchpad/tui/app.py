@@ -13,7 +13,6 @@ import subprocess
 import sys
 import threading
 import time
-from pathlib import Path
 from typing import Optional
 
 from textual.app import App
