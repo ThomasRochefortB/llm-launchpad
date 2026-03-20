@@ -19,9 +19,11 @@ Modal supports the following values for this parameter:
 * `A100-40GB`
 * `A100-80GB`
 * `L40S`
+* `RTX-PRO-6000`
 * `H100`/`H100!`
 * `H200`
 * `B200`
+* `B200+`
 
 For instance, to run a Function with eight H100s:
 
@@ -38,7 +40,21 @@ class ModalGpuTypesTests(unittest.TestCase):
         parsed = modal_gpu._parse_modal_gpu_types(_DOC_SNIPPET)
         self.assertEqual(
             parsed,
-            ["T4", "L4", "A10", "A100", "A100-40GB", "A100-80GB", "L40S", "H100", "H100!", "H200", "B200"],
+            [
+                "T4",
+                "L4",
+                "A10",
+                "A100",
+                "A100-40GB",
+                "A100-80GB",
+                "L40S",
+                "RTX-PRO-6000",
+                "H100",
+                "H100!",
+                "H200",
+                "B200",
+                "B200+",
+            ],
         )
 
     def test_fetch_modal_gpu_types_reads_docs_response(self) -> None:
@@ -57,6 +73,8 @@ class ModalGpuTypesTests(unittest.TestCase):
             values = modal_gpu.fetch_modal_gpu_types(timeout=7.0)
         self.assertIn("H100", values)
         self.assertIn("A100-80GB", values)
+        self.assertIn("RTX-PRO-6000", values)
+        self.assertIn("B200+", values)
         self.assertNotIn("H100:8", values)
 
     def test_fetch_modal_gpu_types_raises_on_http_error(self) -> None:

@@ -22,6 +22,11 @@ from ...core.backend import ModalBackend
 from ...core.hf_auth import HuggingFaceAuthStatus, get_huggingface_auth_status
 from ...core.modal_auth import ModalAuthStatus, get_modal_auth_status
 from ...core.naming import default_llamacpp_served_model_name, default_served_model_name
+from ...core.quick_deploy import (
+    QuickDeployProfile,
+    format_hourly_cost,
+    list_quick_deploy_profiles,
+)
 from ...protocol.enums import BackendType
 from ...protocol.models import EndpointInfo
 from .copy_enabled import CopyEnabledScreen
@@ -36,6 +41,7 @@ _     _     __  __
 [/]"""
 
 PANEL_SEPARATOR = "[dim]----------------------------------------[/dim]"
+QUICK_DEPLOY_PROFILES = list_quick_deploy_profiles()
 
 
 class DeploymentsLoaded(Message):
@@ -581,6 +587,15 @@ def _render_billing_load_error(error: str) -> str:
     )
 
 
+def _render_quick_deploy_option(profile: QuickDeployProfile) -> str:
+    return (
+        f"  [bold]{_escape_markup(profile.display_name)}[/bold]  "
+        f"[#7bf168]{_escape_markup(profile.profile_label)}[/]\n"
+        f"    [dim]{_escape_markup(profile.gpu_type)} x{profile.gpu_count} · "
+        f"{_escape_markup(format_hourly_cost(profile.approx_cost_per_hour_usd))}[/dim]"
+    )
+
+
 class MainMenuScreen(CopyEnabledScreen):
     """Top-level menu: deploy, manage, settings."""
 
@@ -590,6 +605,8 @@ class MainMenuScreen(CopyEnabledScreen):
         Binding("m", "select_manage", "Manage", show=True),
         Binding("t", "select_storage", "Storage", show=True),
         Binding("s", "select_settings", "Settings", show=True),
+        Binding("tab", "focus_next_launcher", show=False),
+        Binding("shift+tab", "focus_previous_launcher", show=False),
     ]
 
     def __init__(self, username: str = "", version: str = "") -> None:
@@ -621,12 +638,26 @@ class MainMenuScreen(CopyEnabledScreen):
                         Option("  Settings          Scaledown defaults", id="settings"),
                         id="action-list",
                     )
-                with Vertical(id="deployment-status-panel"):
-                    yield Static("[bold #7bf168]Deployment Status[/]", id="deployment-status-title")
-                    yield Static("[dim]Refreshing deployment status...[/dim]", id="deployment-status-body")
-                    yield Static(PANEL_SEPARATOR, id="deployment-billing-separator")
-                    yield Static("[bold #7bf168]Modal Billing Report[/]", id="billing-report-title")
-                    yield Static("[dim]Refreshing billing report...[/dim]", id="billing-report-body")
+                with Vertical(id="main-menu-side-column"):
+                    with Vertical(id="deployment-status-panel"):
+                        yield Static("[bold #7bf168]Deployment Status[/]", id="deployment-status-title")
+                        yield Static("[dim]Refreshing deployment status...[/dim]", id="deployment-status-body")
+                    with Vertical(id="billing-report-panel"):
+                        yield Static("[bold #7bf168]Modal Billing Report[/]", id="billing-report-title")
+                        yield Static("[dim]Refreshing billing report...[/dim]", id="billing-report-body")
+                    with Vertical(id="quick-deploy-panel"):
+                        yield Static("[bold #7bf168]Quick Deploy[/]", id="landing-quick-deploy-title")
+                        yield Static(
+                            "Curated llama.cpp coding profiles",
+                            id="landing-quick-deploy-subtitle",
+                        )
+                        yield OptionList(
+                            *[
+                                Option(_render_quick_deploy_option(profile), id=profile.id)
+                                for profile in QUICK_DEPLOY_PROFILES
+                            ],
+                            id="quick-deploy-list",
+                        )
         yield Static(
             _render_auth_status_block(username=self.username),
             id="auth-status-block",
@@ -635,7 +666,13 @@ class MainMenuScreen(CopyEnabledScreen):
 
     def on_mount(self) -> None:
         """Focus the option list so arrow-key navigation works immediately."""
-        self.query_one("#action-list", OptionList).focus()
+        action_list = self.query_one("#action-list", OptionList)
+        if action_list.option_count > 0:
+            action_list.highlighted = 0
+        action_list.focus()
+        quick_list = self.query_one("#quick-deploy-list", OptionList)
+        if quick_list.option_count > 0:
+            quick_list.highlighted = 0
         self._refresh_modal_auth_status()
         self._refresh_hf_auth_status()
         self._refresh_panels()
@@ -797,7 +834,11 @@ class MainMenuScreen(CopyEnabledScreen):
         self.query_one("#billing-report-body", Static).update(_render_billing_load_error(message.error))
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        option_list_id = event.option_list.id
         option_id = event.option.id
+        if option_list_id == "quick-deploy-list":
+            self.app.push_quick_deploy(str(option_id))  # type: ignore[attr-defined]
+            return
         if option_id == "deploy":
             self.app.action_push_deploy()  # type: ignore[attr-defined]
         elif option_id == "manage":
@@ -818,6 +859,20 @@ class MainMenuScreen(CopyEnabledScreen):
 
     def action_select_settings(self) -> None:
         self.app.action_push_settings()  # type: ignore[attr-defined]
+
+    def _focus_launcher(self, target_id: str) -> None:
+        target = self.query_one(f"#{target_id}", OptionList)
+        target.focus()
+        if target.highlighted is None and target.option_count > 0:
+            target.highlighted = 0
+
+    def action_focus_next_launcher(self) -> None:
+        focused_id = getattr(self.focused, "id", "")
+        self._focus_launcher("quick-deploy-list" if focused_id == "action-list" else "action-list")
+
+    def action_focus_previous_launcher(self) -> None:
+        focused_id = getattr(self.focused, "id", "")
+        self._focus_launcher("action-list" if focused_id == "quick-deploy-list" else "quick-deploy-list")
 
     async def action_quit(self) -> None:
         await self.app.action_quit()  # type: ignore[attr-defined]

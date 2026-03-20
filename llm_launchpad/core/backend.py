@@ -250,13 +250,13 @@ class ModalBackend:
         if config.do_deploy:
             args += ["--deploy"]
         if config.server_args:
-            args += ["--server_args", config.server_args]
+            args.append(f"--server-args={config.server_args}")
         if config.host:
             args += ["--host", config.host]
         if config.port is not None:
             args += ["--port", str(config.port)]
         if config.n_gpu_layers is not None:
-            args += ["--n_gpu_layers", str(config.n_gpu_layers)]
+            args += ["--n-gpu-layers", str(config.n_gpu_layers)]
         return args
 
     @staticmethod

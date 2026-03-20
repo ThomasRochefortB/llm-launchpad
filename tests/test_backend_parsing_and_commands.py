@@ -195,10 +195,10 @@ class BackendParsingAndCommandTests(unittest.TestCase):
         self.assertIn("--revision", cmd)
         self.assertIn("--no-preload", cmd)
         self.assertIn("--deploy", cmd)
-        self.assertIn("--server_args", cmd)
+        self.assertIn("--server-args=--ctx-size 65536", cmd)
         self.assertIn("--host", cmd)
         self.assertIn("--port", cmd)
-        self.assertIn("--n_gpu_layers", cmd)
+        self.assertIn("--n-gpu-layers", cmd)
 
     def test_env_for_backend_non_vllm_only_sets_app_name(self) -> None:
         config = DeploymentConfig(
