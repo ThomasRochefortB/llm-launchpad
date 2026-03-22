@@ -1,5 +1,6 @@
+from contextlib import contextmanager
 from pathlib import Path
-from typing import List, Optional, Dict, Any
+from typing import List, Optional, Dict, Any, Callable, Iterator
 import json
 import os
 import time
@@ -68,6 +69,13 @@ def _read_optional_bool_env(name: str) -> Optional[bool]:
     return raw.lower() in {"1", "true", "yes", "on"}
 
 
+def _env_value_is_true(value: Optional[str]) -> bool:
+    raw = (value or "").strip()
+    if not raw:
+        return False
+    return raw.lower() in {"1", "true", "yes", "on"}
+
+
 def _default_llamacpp_served_model_name(
     repo_id: Optional[str],
     quant: Optional[str] = None,
@@ -95,6 +103,8 @@ def _server_args_define_alias(args: Optional[List[str]]) -> bool:
 PREDOWNLOAD_TIMEOUT_MINUTES = _read_int_env("PREDOWNLOAD_TIMEOUT_MINUTES", 6 * 60)
 SNAPSHOT_MAX_WORKERS = _read_int_env("HF_SNAPSHOT_MAX_WORKERS", 32)
 DOWNLOAD_CPU = _read_int_env("HF_DOWNLOAD_CPU", 4)
+HF_HUB_DISABLE_XET_DEFAULT = _read_bool_env("HF_HUB_DISABLE_XET", True)
+HF_XET_HIGH_PERFORMANCE_DEFAULT = _read_optional_bool_env("HF_XET_HIGH_PERFORMANCE")
 LLAMA_CPP_IMAGE_REF = (
     os.environ.get("LLAMA_CPP_IMAGE_REF", "ghcr.io/ggml-org/llama.cpp:server-cuda").strip()
     or "ghcr.io/ggml-org/llama.cpp:server-cuda"
@@ -123,6 +133,11 @@ HF_CACHE_VOLUME_NAME = "huggingface-cache"
 HF_CACHE_DIR = "/root/.cache/huggingface"
 cache_dir = HF_CACHE_DIR  # backwards-compatible alias used throughout this module
 model_cache = modal.Volume.from_name(HF_CACHE_VOLUME_NAME, create_if_missing=True)
+HF_DOWNLOAD_LEASES_NAME = "llm-launchpad-hf-download-leases"
+HF_DOWNLOAD_LOCK_WAIT_SECONDS = _read_int_env("HF_DOWNLOAD_LOCK_WAIT_SECONDS", 10)
+HF_DOWNLOAD_LOCK_WAIT_TIMEOUT_SECONDS = _read_int_env("HF_DOWNLOAD_LOCK_WAIT_TIMEOUT_SECONDS", 5 * 60)
+HF_DOWNLOAD_LOCK_STALE_SECONDS = _read_int_env("HF_DOWNLOAD_LOCK_STALE_SECONDS", 15 * 60)
+download_leases = modal.Dict.from_name(HF_DOWNLOAD_LEASES_NAME, create_if_missing=True)
 CONFIG_PATH = f"{HF_CACHE_DIR}/serve_config.json"
 HF_HUB_DIR = Path(HF_CACHE_DIR) / "hub"
 _GGUF_QUANT_RE = re.compile(r"(Q\d(?:_[A-Z0-9]+)+|IQ\d+_[A-Z0-9_]+)", flags=re.IGNORECASE)
@@ -130,6 +145,18 @@ _GGUF_SPLIT_RE = re.compile(r"-(\d+)-of-(\d+)\.gguf$", flags=re.IGNORECASE)
 
 # --- Simple presets for convenience (model-agnostic)
 # Note: Import presets lazily inside the local entrypoint to avoid container import issues.
+
+
+def _download_image_env() -> Dict[str, str]:
+    env = {
+        "HF_HUB_ETAG_TIMEOUT": "30",
+        "HF_HUB_DOWNLOAD_TIMEOUT": "120",
+    }
+    if HF_HUB_DISABLE_XET_DEFAULT:
+        env["HF_HUB_DISABLE_XET"] = "1"
+    elif HF_XET_HIGH_PERFORMANCE_DEFAULT:
+        env["HF_XET_HIGH_PERFORMANCE"] = "1"
+    return env
 
 
 def _load_config() -> Dict[str, Any]:
@@ -211,15 +238,187 @@ def _collect_hub_gguf_matches(
     snapshot_dir = _resolve_hub_snapshot_dir(repo_id, revision)
     if snapshot_dir is None:
         return []
+    matched_candidates = _matched_snapshot_gguf_candidates(snapshot_dir, allow_patterns)
+    complete_candidates, _ = _partition_complete_gguf_candidates(matched_candidates)
     matches: list[str] = []
-    for gguf in snapshot_dir.glob("**/*.gguf"):
-        if _matches_any_pattern(gguf.name, allow_patterns):
-            matches.append(str(gguf.relative_to(cache_dir)))
-    for gguf in snapshot_dir.glob("**/*.GGUF"):
-        if _matches_any_pattern(gguf.name, allow_patterns):
-            matches.append(str(gguf.relative_to(cache_dir)))
+    for gguf in complete_candidates:
+        matches.append(str(gguf.relative_to(cache_dir)))
     matches.sort()
     return matches
+
+
+def _fetch_expected_gguf_sizes(
+    repo_id: str,
+    revision: Optional[str],
+    allow_patterns: list[str],
+) -> dict[str, int]:
+    from huggingface_hub import HfApi
+
+    info = HfApi().repo_info(repo_id=repo_id, revision=revision, files_metadata=True)
+    expected: dict[str, int] = {}
+    for sibling in info.siblings or []:
+        repo_path = str(getattr(sibling, "rfilename", "") or "").strip()
+        if not repo_path:
+            continue
+        filename = Path(repo_path).name
+        if Path(filename).suffix.casefold() != ".gguf":
+            continue
+        if allow_patterns and not _matches_any_pattern(filename, allow_patterns):
+            continue
+        size = getattr(sibling, "size", None)
+        if isinstance(size, int) and size > 0:
+            expected[repo_path] = size
+    return expected
+
+
+def _validate_cached_gguf_matches(
+    repo_id: str,
+    revision: Optional[str],
+    allow_patterns: list[str],
+) -> tuple[list[str], list[str]]:
+    snapshot_dir = _resolve_hub_snapshot_dir(repo_id, revision)
+    if snapshot_dir is None:
+        return [], []
+
+    matched_candidates = _matched_snapshot_gguf_candidates(snapshot_dir, allow_patterns)
+    complete_candidates, incomplete_groups = _partition_complete_gguf_candidates(matched_candidates)
+    if not complete_candidates:
+        if incomplete_groups:
+            return [], [f"incomplete split groups: {_describe_incomplete_split_groups(incomplete_groups)}"]
+        return [], []
+
+    expected_sizes = _fetch_expected_gguf_sizes(repo_id, revision, allow_patterns)
+    if not expected_sizes:
+        return [], [f"could not resolve expected GGUF sizes for repo {repo_id!r}"]
+
+    candidate_by_repo_path: dict[str, Path] = {}
+    matches: list[str] = []
+    for gguf in complete_candidates:
+        repo_path = gguf.relative_to(snapshot_dir).as_posix()
+        candidate_by_repo_path[repo_path] = gguf
+        matches.append(str(gguf.relative_to(cache_dir)))
+
+    problems: list[str] = []
+    for repo_path, expected_size in sorted(expected_sizes.items()):
+        local_path = candidate_by_repo_path.get(repo_path)
+        if local_path is None:
+            problems.append(f"missing {repo_path}")
+            continue
+        try:
+            local_size = local_path.stat().st_size
+        except OSError as exc:
+            problems.append(f"stat failed for {repo_path}: {exc}")
+            continue
+        if local_size != expected_size:
+            problems.append(f"{repo_path} size={local_size} expected={expected_size}")
+
+    if problems:
+        return [], problems
+
+    matches.sort()
+    return matches, []
+
+
+def _estimate_completed_expected_gguf_size(
+    repo_id: str,
+    revision: Optional[str],
+    expected_sizes: dict[str, int],
+) -> tuple[int, int]:
+    snapshot_dir = _resolve_hub_snapshot_dir(repo_id, revision)
+    if snapshot_dir is None:
+        return 0, 0
+
+    total_bytes = 0
+    file_count = 0
+    for repo_path, expected_size in expected_sizes.items():
+        local_path = snapshot_dir / repo_path
+        if not local_path.is_file():
+            continue
+        try:
+            local_size = local_path.stat().st_size
+        except OSError:
+            continue
+        if local_size != expected_size:
+            continue
+        total_bytes += local_size
+        file_count += 1
+    return total_bytes, file_count
+
+
+def _matched_snapshot_gguf_candidates(snapshot_dir: Path, allow_patterns: list[str]) -> list[Path]:
+    candidates: list[Path] = []
+    for path in snapshot_dir.glob("**/*"):
+        if not path.is_file():
+            continue
+        if path.suffix.casefold() != ".gguf":
+            continue
+        if allow_patterns and not _matches_any_pattern(path.name, allow_patterns):
+            continue
+        candidates.append(path)
+    return candidates
+
+
+def _partition_complete_gguf_candidates(
+    candidates: list[Path],
+) -> tuple[list[Path], list[dict[str, Any]]]:
+    complete: list[Path] = []
+    split_groups: dict[tuple[str, str], dict[str, Any]] = {}
+
+    for candidate in candidates:
+        match = _GGUF_SPLIT_RE.search(candidate.name)
+        if not match:
+            complete.append(candidate)
+            continue
+        try:
+            shard_index = int(match.group(1))
+            shard_total = int(match.group(2))
+        except ValueError:
+            complete.append(candidate)
+            continue
+        group_key = (str(candidate.parent), candidate.name[: match.start()])
+        group = split_groups.get(group_key)
+        if group is None:
+            group = {
+                "parent": str(candidate.parent),
+                "prefix": candidate.name[: match.start()],
+                "expected_total": shard_total,
+                "indices": set(),
+                "paths": [],
+            }
+            split_groups[group_key] = group
+        else:
+            group["expected_total"] = max(int(group["expected_total"]), shard_total)
+        group["indices"].add(shard_index)
+        group["paths"].append(candidate)
+
+    incomplete: list[dict[str, Any]] = []
+    for group in split_groups.values():
+        expected_total = int(group["expected_total"])
+        missing = [idx for idx in range(1, expected_total + 1) if idx not in group["indices"]]
+        if not missing:
+            complete.extend(group["paths"])
+            continue
+        incomplete.append(
+            {
+                "parent": group["parent"],
+                "prefix": group["prefix"],
+                "expected_total": expected_total,
+                "missing": missing,
+            }
+        )
+
+    return complete, incomplete
+
+
+def _describe_incomplete_split_groups(groups: list[dict[str, Any]]) -> str:
+    details: list[str] = []
+    for group in groups:
+        missing = ", ".join(f"{idx:05d}" for idx in group["missing"])
+        details.append(
+            f"{group['prefix']}*-of-{int(group['expected_total']):05d}.gguf "
+            f"in {group['parent']} is missing shard(s) {missing}"
+        )
+    return "; ".join(details)
 
 
 def _matches_any_pattern(name: str, patterns: list[str]) -> bool:
@@ -338,6 +537,123 @@ def _pick_preferred_gguf_entrypoint(candidates: list[Path]) -> Path:
     return _largest(split_nonfirst)
 
 
+def _download_lease_key(repo_id: str, revision: Optional[str]) -> str:
+    revision_text = (revision or "").strip() or "main"
+    return f"hf-download::{_hub_repo_slug(repo_id)}::{revision_text}"
+
+
+def _download_lease_payload(
+    owner_id: str,
+    repo_id: str,
+    revision: Optional[str],
+    allow_patterns: list[str],
+    timestamp: float,
+) -> dict[str, Any]:
+    return {
+        "owner_id": owner_id,
+        "repo_id": repo_id,
+        "revision": revision,
+        "allow_patterns": list(allow_patterns),
+        "acquired_at": timestamp,
+        "heartbeat_at": timestamp,
+    }
+
+
+def _refresh_download_lease(
+    lease_key: str,
+    owner_id: str,
+    repo_id: str,
+    revision: Optional[str],
+    allow_patterns: list[str],
+) -> None:
+    current = download_leases.get(lease_key, None)
+    if not isinstance(current, dict) or current.get("owner_id") != owner_id:
+        raise RuntimeError(f"Lost download lease for {repo_id!r}; another worker took over.")
+    acquired_at = float(current.get("acquired_at", time.time()))
+    download_leases.put(
+        lease_key,
+        _download_lease_payload(
+            owner_id=owner_id,
+            repo_id=repo_id,
+            revision=revision,
+            allow_patterns=allow_patterns,
+            timestamp=acquired_at,
+        )
+        | {"heartbeat_at": time.time()},
+    )
+
+
+def _release_download_lease(lease_key: str, owner_id: str) -> None:
+    current = download_leases.get(lease_key, None)
+    if isinstance(current, dict) and current.get("owner_id") == owner_id:
+        download_leases.pop(lease_key, None)
+
+
+@contextmanager
+def _acquire_download_lease(
+    repo_id: str,
+    revision: Optional[str],
+    allow_patterns: list[str],
+) -> Iterator[Callable[[], None]]:
+    lease_key = _download_lease_key(repo_id, revision)
+    owner_id = f"{FUNCTION_SLUG}:{os.getpid()}:{uuid4().hex[:8]}"
+    wait_started = time.time()
+
+    while True:
+        now = time.time()
+        payload = _download_lease_payload(owner_id, repo_id, revision, allow_patterns, now)
+        if download_leases.put(lease_key, payload, skip_if_exists=True):
+            print(f"🦙 acquired download lease for {repo_id} (revision: {revision or 'main'})")
+
+            def _heartbeat() -> None:
+                _refresh_download_lease(lease_key, owner_id, repo_id, revision, allow_patterns)
+
+            try:
+                yield _heartbeat
+            finally:
+                _release_download_lease(lease_key, owner_id)
+            return
+
+        current = download_leases.get(lease_key, None)
+        if not isinstance(current, dict):
+            time.sleep(HF_DOWNLOAD_LOCK_WAIT_SECONDS)
+            continue
+
+        heartbeat_at_raw = current.get("heartbeat_at", current.get("acquired_at", 0.0))
+        try:
+            heartbeat_at = float(heartbeat_at_raw)
+        except (TypeError, ValueError):
+            heartbeat_at = 0.0
+        age_seconds = max(0, int(now - heartbeat_at))
+
+        if heartbeat_at and now - heartbeat_at > HF_DOWNLOAD_LOCK_STALE_SECONDS:
+            print(
+                f"🦙 removing stale download lease for {repo_id} "
+                f"(owner={current.get('owner_id')!r}, age={age_seconds}s)"
+            )
+            latest = download_leases.get(lease_key, None)
+            if latest == current:
+                download_leases.pop(lease_key, None)
+            time.sleep(1)
+            continue
+
+        waited_seconds = max(0, int(now - wait_started))
+        owner_text = current.get("owner_id", "unknown")
+        if waited_seconds >= HF_DOWNLOAD_LOCK_WAIT_TIMEOUT_SECONDS:
+            raise RuntimeError(
+                f"Another download for {repo_id!r} is already in progress on Modal "
+                f"(owner={owner_text!r}, waited={waited_seconds}s). "
+                "Wait for it to finish or stop the other run before retrying."
+            )
+
+        print(
+            f"🦙 another download is active for {repo_id}; waiting for lease release "
+            f"(owner={owner_text!r}, waited={waited_seconds}s)"
+        )
+        time.sleep(HF_DOWNLOAD_LOCK_WAIT_SECONDS)
+        model_cache.reload()
+
+
 # --- Use official llama.cpp GHCR server image (CUDA build) and add Python for Modal functions
 image = (
     modal.Image.from_registry(
@@ -353,13 +669,7 @@ image = (
 download_image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install("huggingface-hub==0.36.0")
-    .env(
-        {
-            "HF_XET_HIGH_PERFORMANCE": "1",
-            "HF_HUB_ETAG_TIMEOUT": "30",
-            "HF_HUB_DOWNLOAD_TIMEOUT": "120",
-        }
-    )
+    .env(_download_image_env())
 )
 
 
@@ -389,26 +699,54 @@ def _download_model_files(
     if allow_patterns is None:
         allow_patterns = _gguf_allow_patterns(QUANT)
 
-    print(
-        f"🦙 downloading {repo_id} (patterns: {allow_patterns}, revision: {revision}) "
-        f"into {HF_HUB_DIR}"
-    )
+    matches, validation_errors = _validate_cached_gguf_matches(repo_id, revision, allow_patterns)
+    if matches:
+        print(f"🦙 cache hit: using existing GGUF entries for {repo_id}")
+        print(f"🦙 found GGUF entries: {matches}")
+        return matches
+    force_download = False
+    if validation_errors:
+        force_download = True
+        print(f"🦙 cached GGUF validation failed for {repo_id}: {'; '.join(validation_errors)}")
+        print(f"🦙 forcing fresh GGUF download for {repo_id}")
 
-    _snapshot_download_with_keepalive(
-        repo_id=repo_id,
-        revision=revision,
-        cache_dir=str(HF_HUB_DIR),
-        allow_patterns=allow_patterns,
-    )
+    with _acquire_download_lease(repo_id, revision, allow_patterns) as heartbeat_download_lease:
+        model_cache.reload()
+        matches, validation_errors = _validate_cached_gguf_matches(repo_id, revision, allow_patterns)
+        if matches:
+            print(f"🦙 cache filled while waiting for download lease; using cached GGUF for {repo_id}")
+            print(f"🦙 found GGUF entries: {matches}")
+            return matches
+        if validation_errors:
+            force_download = True
+            print(f"🦙 cached GGUF validation still failing for {repo_id}: {'; '.join(validation_errors)}")
+            print(f"🦙 retrying download with force_download=True for {repo_id}")
 
-    # Ensure other functions can see the writes before we quit
-    model_cache.commit()
+        print(
+            f"🦙 downloading {repo_id} (patterns: {allow_patterns}, revision: {revision}) "
+            f"into {HF_HUB_DIR}"
+        )
 
-    # Discover matching GGUF files in the Hub cache snapshot.
-    matches = _collect_hub_gguf_matches(repo_id, revision, allow_patterns)
+        _snapshot_download_with_keepalive(
+            repo_id=repo_id,
+            revision=revision,
+            cache_dir=str(HF_HUB_DIR),
+            allow_patterns=allow_patterns,
+            force_download=force_download,
+            heartbeat=heartbeat_download_lease,
+        )
 
-    print(f"🦙 found GGUF entries: {matches}")
-    return matches
+        # Ensure other functions can see the writes before we quit
+        model_cache.commit()
+
+        matches, validation_errors = _validate_cached_gguf_matches(repo_id, revision, allow_patterns)
+        if validation_errors:
+            raise RuntimeError(
+                f"Downloaded GGUF cache validation failed for {repo_id!r}: {'; '.join(validation_errors)}"
+            )
+
+        print(f"🦙 found GGUF entries: {matches}")
+        return matches
 
 
 def _snapshot_download_with_keepalive(
@@ -417,14 +755,22 @@ def _snapshot_download_with_keepalive(
     cache_dir: str,
     allow_patterns: List[str],
     max_workers: int = SNAPSHOT_MAX_WORKERS,
+    force_download: bool = False,
+    heartbeat: Optional[Callable[[], None]] = None,
 ) -> None:
     """Run snapshot_download in a subprocess and print periodic keepalives."""
+    try:
+        expected_sizes = _fetch_expected_gguf_sizes(repo_id, revision, allow_patterns)
+    except Exception:
+        expected_sizes = {}
+    total_expected_bytes = sum(expected_sizes.values())
     payload = {
         "repo_id": repo_id,
         "revision": revision,
         "cache_dir": cache_dir,
         "allow_patterns": allow_patterns,
         "max_workers": max_workers,
+        "force_download": force_download,
     }
     worker_code = (
         "import json, os\n"
@@ -435,48 +781,93 @@ def _snapshot_download_with_keepalive(
         "revision=cfg.get('revision'),"
         "cache_dir=cfg['cache_dir'],"
         "allow_patterns=cfg['allow_patterns'],"
-        "max_workers=cfg.get('max_workers', 8)"
+        "max_workers=cfg.get('max_workers', 8),"
+        "force_download=cfg.get('force_download', False)"
         ")\n"
     )
-    env = {
-        **os.environ,
-        "LLM_LAUNCHPAD_SNAPSHOT_CFG": json.dumps(payload),
-    }
-    process = subprocess.Popen(
-        [sys.executable, "-c", worker_code],
-        env=env,
-    )
-    keepalive_interval_seconds = 20
-    started = time.time()
-    last_bytes = -1
-    stalled_intervals = 0
-    while process.poll() is None:
-        elapsed = int(time.time() - started)
-        complete_bytes, complete_files = _estimate_matched_snapshot_size(
-            repo_id=repo_id,
-            revision=revision,
-            allow_patterns=allow_patterns,
+
+    def _attempt_env(*, disable_xet: bool) -> Dict[str, str]:
+        env = {
+            **os.environ,
+            "LLM_LAUNCHPAD_SNAPSHOT_CFG": json.dumps(payload),
+        }
+        if disable_xet:
+            env["HF_HUB_DISABLE_XET"] = "1"
+            env.pop("HF_XET_HIGH_PERFORMANCE", None)
+        return env
+
+    def _run_attempt(env: Dict[str, str]) -> int:
+        process = subprocess.Popen(
+            [sys.executable, "-c", worker_code],
+            env=env,
         )
-        inflight_bytes, inflight_files = _estimate_incomplete_blob_size(repo_id=repo_id)
-        observed_bytes = complete_bytes + inflight_bytes
-        observed_files = complete_files + inflight_files
-        size_gib = observed_bytes / (1024**3)
-        rate_mib_s = (observed_bytes / (1024**2)) / elapsed if elapsed > 0 else 0.0
-        if observed_bytes > last_bytes:
-            stalled_intervals = 0
-        else:
-            stalled_intervals += 1
-        last_bytes = observed_bytes
-        stall_note = " (no growth detected)" if stalled_intervals >= 3 else ""
+        keepalive_interval_seconds = 20
+        started = time.time()
+        last_bytes = -1
+        stalled_intervals = 0
+        while process.poll() is None:
+            elapsed = int(time.time() - started)
+            if expected_sizes:
+                complete_bytes, complete_files = _estimate_completed_expected_gguf_size(
+                    repo_id=repo_id,
+                    revision=revision,
+                    expected_sizes=expected_sizes,
+                )
+            else:
+                complete_bytes, complete_files = _estimate_matched_snapshot_size(
+                    repo_id=repo_id,
+                    revision=revision,
+                    allow_patterns=allow_patterns,
+                )
+            inflight_bytes, inflight_files = _estimate_incomplete_blob_size(repo_id=repo_id)
+            observed_bytes = complete_bytes + inflight_bytes
+            observed_files = complete_files + inflight_files
+            if total_expected_bytes > 0:
+                observed_bytes = min(observed_bytes, total_expected_bytes)
+            size_gib = observed_bytes / (1024**3)
+            rate_mib_s = (observed_bytes / (1024**2)) / elapsed if elapsed > 0 else 0.0
+            if observed_bytes > last_bytes:
+                stalled_intervals = 0
+            else:
+                stalled_intervals += 1
+            last_bytes = observed_bytes
+            stall_note = " (no growth detected)" if stalled_intervals >= 3 else ""
+            progress_text = ""
+            if total_expected_bytes > 0:
+                total_gib = total_expected_bytes / (1024**3)
+                pct = int((observed_bytes * 100) / total_expected_bytes) if total_expected_bytes else 0
+                pct = max(0, min(100, pct))
+                progress_text = f"/{total_gib:.2f}GiB pct={pct}%"
+            print(
+                "🦙 download in progress... "
+                f"elapsed={elapsed}s files={observed_files} size={size_gib:.2f}GiB{progress_text} "
+                f"complete={complete_files} inflight={inflight_files} "
+                f"avg_rate={rate_mib_s:.2f}MiB/s{stall_note}"
+            )
+            if heartbeat is not None:
+                heartbeat()
+            time.sleep(keepalive_interval_seconds)
+        return process.returncode
+
+    env = _attempt_env(disable_xet=False)
+    returncode = _run_attempt(env)
+    xet_was_enabled = not _env_value_is_true(env.get("HF_HUB_DISABLE_XET"))
+    if returncode == 0:
+        return
+    if xet_was_enabled:
         print(
-            "🦙 download in progress... "
-            f"elapsed={elapsed}s files={observed_files} size={size_gib:.2f}GiB "
-            f"complete={complete_files} inflight={inflight_files} "
-            f"avg_rate={rate_mib_s:.2f}MiB/s{stall_note}"
+            f"🦙 snapshot_download failed with exit code {returncode}; "
+            "retrying once with HF_HUB_DISABLE_XET=1"
         )
-        time.sleep(keepalive_interval_seconds)
-    if process.returncode != 0:
-        raise RuntimeError(f"snapshot_download failed with exit code {process.returncode}")
+        fallback_returncode = _run_attempt(_attempt_env(disable_xet=True))
+        if fallback_returncode == 0:
+            return
+        raise RuntimeError(
+            "snapshot_download failed with exit code "
+            f"{fallback_returncode} after retrying with HF_HUB_DISABLE_XET=1"
+        )
+
+    raise RuntimeError(f"snapshot_download failed with exit code {returncode}")
 
 
 def _estimate_matched_snapshot_size(
@@ -657,8 +1048,14 @@ def _resolve_model_entrypoint(
                 f"No cached snapshot found for repo {repo_id!r} in HF cache {HF_HUB_DIR}"
             )
         scoped_candidates = _snapshot_gguf_candidates(snapshot_dir, quant)
-        if scoped_candidates:
-            return _pick_preferred_gguf_entrypoint(scoped_candidates)
+        complete_candidates, incomplete_groups = _partition_complete_gguf_candidates(scoped_candidates)
+        if complete_candidates:
+            return _pick_preferred_gguf_entrypoint(complete_candidates)
+        if incomplete_groups:
+            raise RuntimeError(
+                f"Incomplete GGUF shard set for repo {repo_id!r} in cached snapshot {snapshot_dir}: "
+                f"{_describe_incomplete_split_groups(incomplete_groups)}"
+            )
         if quant:
             raise RuntimeError(
                 f"No GGUF files matching '*{quant}*.gguf' found for repo {repo_id!r} "

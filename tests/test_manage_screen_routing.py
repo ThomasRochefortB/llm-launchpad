@@ -23,6 +23,8 @@ class _TestApp(App[None]):
         self.list_called = 0
         self.pushed: list[object] = []
         self.status_calls: list[tuple[BackendType, str | None, int, str | None, str | None]] = []
+        self.logs_calls: list[tuple[BackendType, bool, str | None, str | None]] = []
+        self.stop_calls: list[tuple[BackendType, str | None, str | None]] = []
         self.instances_by_backend: dict[BackendType, list[EndpointInfo]] = {
             BackendType.LLAMACPP: [],
             BackendType.VLLM: [],
@@ -49,6 +51,23 @@ class _TestApp(App[None]):
         served_model_name=None,
     ) -> None:
         self.status_calls.append((backend, server_url, timeout, app_name, served_model_name))
+
+    def begin_logs(  # type: ignore[no-untyped-def]
+        self,
+        backend,
+        follow=True,
+        app_name=None,
+        app_id=None,
+    ) -> None:
+        self.logs_calls.append((backend, follow, app_name, app_id))
+
+    def begin_stop(  # type: ignore[no-untyped-def]
+        self,
+        backend,
+        app_name=None,
+        app_id=None,
+    ) -> None:
+        self.stop_calls.append((backend, app_name, app_id))
 
 
 class ManageScreenRoutingTests(unittest.IsolatedAsyncioTestCase):
@@ -206,6 +225,64 @@ class ManageScreenRoutingTests(unittest.IsolatedAsyncioTestCase):
                     "Nanbeige4.1-3B-Q4_K_M-GGUF",
                 )
             ],
+        )
+
+    async def test_logs_and_stop_use_exact_duplicate_app_id(self) -> None:
+        duplicate_rows = [
+            EndpointInfo(
+                name="llamacpp-glm5-rtxpro",
+                app_id="ap-first",
+                state="ephemeral",
+                backend=BackendType.LLAMACPP,
+                instance_name="glm5-rtxpro",
+            ),
+            EndpointInfo(
+                name="llamacpp-glm5-rtxpro",
+                app_id="ap-second",
+                state="ephemeral",
+                backend=BackendType.LLAMACPP,
+                instance_name="glm5-rtxpro",
+            ),
+        ]
+        app = _TestApp()
+        app.instances_by_backend[BackendType.LLAMACPP] = duplicate_rows
+
+        async with app.run_test() as pilot:
+            app.push_screen(LogsParamsScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, LogsParamsScreen)
+            instance_list = screen.query_one("#logs-instance-list", OptionList)
+            option = next(
+                candidate for candidate in instance_list._options if str(candidate.id) == "app-id:ap-second"
+            )
+            screen.on_option_list_option_selected(
+                SimpleNamespace(option=option, option_list=instance_list)
+            )
+            await pilot.pause()
+
+            app.pop_screen()
+            await pilot.pause()
+            app.push_screen(StopParamsScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, StopParamsScreen)
+            instance_list = screen.query_one("#stop-instance-list", OptionList)
+            option = next(
+                candidate for candidate in instance_list._options if str(candidate.id) == "app-id:ap-second"
+            )
+            screen.on_option_list_option_selected(
+                SimpleNamespace(option=option, option_list=instance_list)
+            )
+            await pilot.pause()
+
+        self.assertEqual(
+            app.logs_calls,
+            [(BackendType.LLAMACPP, True, "llamacpp-glm5-rtxpro", "ap-second")],
+        )
+        self.assertEqual(
+            app.stop_calls,
+            [(BackendType.LLAMACPP, "llamacpp-glm5-rtxpro", "ap-second")],
         )
 
 

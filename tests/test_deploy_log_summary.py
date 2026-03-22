@@ -41,6 +41,27 @@ class DeployLogSummarizerTests(unittest.TestCase):
         )
         self.assertEqual(out, ["Downloading model"])
 
+    def test_llamacpp_download_progress_maps_to_percent_update_when_available(self) -> None:
+        s = DeployLogSummarizer(BackendType.LLAMACPP)
+        out = s.transform(
+            "🦙 download in progress... elapsed=20s files=1 size=2.28GiB/10.00GiB pct=22% complete=0 inflight=1 avg_rate=12.34MiB/s",
+            OperationType.DEPLOY,
+        )
+        self.assertEqual(out, ["Downloading model (22%)"])
+
+    def test_llamacpp_download_progress_emits_new_line_when_percent_changes(self) -> None:
+        s = DeployLogSummarizer(BackendType.LLAMACPP)
+        first = s.transform(
+            "🦙 download in progress... elapsed=20s files=1 size=2.28GiB/10.00GiB pct=22% complete=0 inflight=1 avg_rate=12.34MiB/s",
+            OperationType.DEPLOY,
+        )
+        second = s.transform(
+            "🦙 download in progress... elapsed=40s files=2 size=3.28GiB/10.00GiB pct=32% complete=1 inflight=1 avg_rate=12.34MiB/s",
+            OperationType.DEPLOY,
+        )
+        self.assertEqual(first, ["Downloading model (22%)"])
+        self.assertEqual(second, ["Downloading model (32%)"])
+
     def test_llamacpp_download_progress_cache_hit_is_suppressed(self) -> None:
         s = DeployLogSummarizer(BackendType.LLAMACPP)
         out = s.transform(

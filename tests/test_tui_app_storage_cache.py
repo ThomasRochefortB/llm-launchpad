@@ -393,7 +393,7 @@ class TuiAppStorageCacheTests(unittest.TestCase):
             patch.object(app, "_load_visible_launchpad_rows", return_value=[]),
             patch.object(app, "_sync_opencode") as sync_mock,
         ):
-            app._run_stop(BackendType.VLLM, "vllm-qwen3", monitor=monitor)
+            app._run_stop(BackendType.VLLM, "vllm-qwen3", "vllm-qwen3", monitor=monitor)
 
         sync_mock.assert_called_once()
         self.assertEqual(sync_mock.call_args.kwargs["current_rows"], [])

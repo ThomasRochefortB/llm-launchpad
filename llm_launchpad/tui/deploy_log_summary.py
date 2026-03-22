@@ -21,6 +21,7 @@ _HTTP_ERROR_CONTEXT_RE = re.compile(
 _VLLM_INFO_LINE_RE = re.compile(r"^\((APIServer|EngineCore[^)]*) pid=\d+\)\s+INFO\b")
 _LLAMACPP_DOWNLOAD_INFLIGHT_RE = re.compile(r"\binflight=(\d+)\b")
 _LLAMACPP_DOWNLOAD_RATE_RE = re.compile(r"\bavg_rate=([0-9]+(?:\.[0-9]+)?)MiB/s\b")
+_LLAMACPP_DOWNLOAD_PCT_RE = re.compile(r"\bpct=(\d+)%")
 
 
 class DeployLogSummarizer:
@@ -139,6 +140,9 @@ class DeployLogSummarizer:
         # canonical download milestone once we see progress output.
         if "download in progress..." in text:
             if self._llamacpp_progress_indicates_actual_transfer(text):
+                pct = self._llamacpp_progress_percent(text)
+                if pct is not None:
+                    return f"Downloading model ({pct}%)"
                 return "Downloading model"
             return None
         if "found GGUF entries:" in text:
@@ -280,3 +284,14 @@ class DeployLogSummarizer:
             except ValueError:
                 return False
         return False
+
+    @staticmethod
+    def _llamacpp_progress_percent(text: str) -> int | None:
+        pct_match = _LLAMACPP_DOWNLOAD_PCT_RE.search(text)
+        if pct_match is None:
+            return None
+        try:
+            pct = int(pct_match.group(1))
+        except ValueError:
+            return None
+        return max(0, min(100, pct))
