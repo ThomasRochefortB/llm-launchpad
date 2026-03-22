@@ -13,6 +13,7 @@ from ...core.quick_deploy import (
     format_context_length,
     format_hourly_cost,
     get_quick_deploy_profile,
+    quick_deploy_model_label_parts,
 )
 from ..widgets.input_form import FormField, ToggleField
 from .copy_enabled import CopyEnabledScreen
@@ -22,10 +23,20 @@ def _escape_markup(value: str) -> str:
     return (value or "").replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
 
 
+def _render_profile_label(profile: QuickDeployProfile, *, accent: str = "") -> str:
+    label, quant_suffix = quick_deploy_model_label_parts(profile)
+    label_markup = _escape_markup(label)
+    if accent:
+        label_markup = f"[{accent}]{label_markup}[/]"
+    if not quant_suffix:
+        return label_markup
+    return f"{label_markup} [dim]{_escape_markup(quant_suffix)}[/dim]"
+
+
 def _render_profile_summary(profile: QuickDeployProfile) -> str:
     return "\n".join(
         [
-            f"[bold #7bf168]{_escape_markup(profile.display_name)}[/]",
+            _render_profile_label(profile, accent="bold #7bf168"),
             f"[dim]{_escape_markup(profile.summary)}[/dim]",
             "",
             f"[bold]Quant[/bold]    {_escape_markup(profile.quant)}",
@@ -52,7 +63,8 @@ class QuickDeployScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         yield Static(
-            f"[bold #7bf168]Quick Deploy[/]  [dim]Curated llama.cpp profile for {_escape_markup(self.profile.display_name)}[/dim]",
+            "[bold #7bf168]Quick Deploy[/]  "
+            f"[dim]Curated llama.cpp profile for[/dim] {_render_profile_label(self.profile)}",
             id="quick-deploy-title",
         )
         yield Static(
