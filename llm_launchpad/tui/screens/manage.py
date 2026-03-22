@@ -9,31 +9,43 @@ from textual.containers import Vertical
 from textual.widgets import Footer, Input, OptionList, Static, Switch
 from textual.widgets.option_list import Option
 
-from ...protocol.enums import BackendType
 from ...protocol.models import EndpointInfo
 from ..widgets.input_form import FormField, ToggleField
 from .copy_enabled import CopyEnabledScreen
 
 
 def _is_stoppable_state(state: str) -> bool:
-    """Return True when the app state should appear in Stop UI."""
-    return state.strip().lower() in {"deployed", "running"}
+    """Return True when the app state should appear in the manage UI."""
+    return state.strip().lower() in {
+        "building",
+        "deployed",
+        "deploying",
+        "ephemeral",
+        "initializing",
+        "pending",
+        "queued",
+        "running",
+        "starting",
+    }
 
 
 def _build_backend_app_options(
     instances: list[EndpointInfo],
-) -> tuple[list[Option], dict[str, tuple[BackendType, str]]]:
-    """Build options and map option IDs to backend/app pairs."""
+) -> tuple[list[Option], dict[str, EndpointInfo]]:
+    """Build options and map option IDs to the originating Modal row."""
     options: list[Option] = []
-    option_to_target: dict[str, tuple[BackendType, str]] = {}
+    option_to_target: dict[str, EndpointInfo] = {}
 
     for index, row in enumerate(instances):
         if row.backend is None:
             continue
         option_id = f"app-id:{row.app_id}" if row.app_id else f"app-name:{row.name}:{index}"
-        label = f"  [{row.backend.value}] {row.name}  ({row.state})"
+        label = f"  [{row.backend.value}] {row.name}  ({row.state}"
+        if row.app_id:
+            label += f", {row.app_id}"
+        label += ")"
         options.append(Option(label, id=option_id))
-        option_to_target[option_id] = (row.backend, row.name)
+        option_to_target[option_id] = row
 
     return options, option_to_target
 
@@ -50,10 +62,10 @@ class ManageScreen(CopyEnabledScreen):
             yield Static("[bold #7bf168]Manage Endpoints[/]")
             yield Static("")
             yield OptionList(
-                Option("  List deployments          Show deployed launchpad apps", id="list"),
+                Option("  List apps                 Show active launchpad Modal apps", id="list"),
                 Option("  Status check              Probe endpoint health", id="status"),
                 Option("  Tail logs                 Stream Modal app logs", id="logs"),
-                Option("  Stop deployment           Stop a running app", id="stop"),
+                Option("  Stop app                  Stop an active Modal app", id="stop"),
                 id="manage-action-list",
             )
         yield Footer()
@@ -91,7 +103,7 @@ class StatusParamsScreen(CopyEnabledScreen):
         with Vertical(id="menu-container"):
             yield Static("[bold #7bf168]Status Check[/]")
             yield Static("")
-            yield Static("[bold]Choose running instance[/bold]")
+            yield Static("[bold]Choose active app[/bold]")
             yield OptionList(id="status-instance-list")
             yield FormField(
                 "Server URL override (optional)",
@@ -143,16 +155,11 @@ class StatusParamsScreen(CopyEnabledScreen):
         checkable_instances = [row for row in instances if _is_stoppable_state(row.state)]
         if not checkable_instances:
             self._row_by_option_id = {}
-            instance_list.set_options([Option("  No running deployments found")])
+            instance_list.set_options([Option("  No active apps found")])
             if instance_list.option_count > 0:
                 instance_list.highlighted = 0
             return
-        options, option_to_target = _build_backend_app_options(checkable_instances)
-        self._row_by_option_id = {}
-        for option_id, (_backend, app_name) in option_to_target.items():
-            row = next((candidate for candidate in checkable_instances if candidate.name == app_name), None)
-            if row is not None:
-                self._row_by_option_id[option_id] = row
+        options, self._row_by_option_id = _build_backend_app_options(checkable_instances)
         instance_list.set_options(options)
         if options:
             instance_list.highlighted = 0
@@ -172,32 +179,35 @@ class LogsParamsScreen(CopyEnabledScreen):
         with Vertical(id="menu-container"):
             yield Static("[bold #7bf168]Tail Logs[/]")
             yield Static("")
-            yield Static("[bold]Choose running instance[/bold]")
+            yield Static("[bold]Choose active app[/bold]")
             yield OptionList(id="logs-instance-list")
             yield ToggleField("Follow log stream", "logs-follow", default=True)
         yield Footer()
 
     def on_mount(self) -> None:
-        self._backend: BackendType | None = None
-        self._instance_app_name: str | None = None
-        self._target_by_option_id: dict[str, tuple[BackendType, str]] = {}
+        self._selected_row: EndpointInfo | None = None
+        self._target_by_option_id: dict[str, EndpointInfo] = {}
         self._load_instances()
         self.query_one("#logs-instance-list", OptionList).focus()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option_list.id == "logs-instance-list":
             selected = str(event.option.id)
-            target = self._target_by_option_id.get(selected)
-            if target is None:
+            self._selected_row = self._target_by_option_id.get(selected)
+            if self._selected_row is None:
                 return
-            self._backend, self._instance_app_name = target
             self._submit()
 
     def _submit(self) -> None:
-        if self._backend is None or self._instance_app_name is None:
+        if self._selected_row is None or self._selected_row.backend is None:
             return
         follow = self.query_one("#logs-follow", Switch).value
-        self.app.begin_logs(self._backend, follow, app_name=self._instance_app_name)  # type: ignore[attr-defined]
+        self.app.begin_logs(  # type: ignore[attr-defined]
+            self._selected_row.backend,
+            follow,
+            app_name=self._selected_row.name,
+            app_id=self._selected_row.app_id or None,
+        )
 
     def _load_instances(self) -> None:
         instance_list = self.query_one("#logs-instance-list", OptionList)
@@ -205,7 +215,7 @@ class LogsParamsScreen(CopyEnabledScreen):
         loggable_instances = [row for row in instances if _is_stoppable_state(row.state)]
         if not loggable_instances:
             self._target_by_option_id = {}
-            instance_list.set_options([Option("  No running deployments found")])
+            instance_list.set_options([Option("  No active apps found")])
             if instance_list.option_count > 0:
                 instance_list.highlighted = 0
             return
@@ -228,26 +238,29 @@ class StopParamsScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="menu-container"):
-            yield Static("[bold #7bf168]Stop Deployment[/]")
+            yield Static("[bold #7bf168]Stop App[/]")
             yield Static("")
-            yield Static("[bold]Choose running instance[/bold]")
+            yield Static("[bold]Choose active app[/bold]")
             yield OptionList(id="stop-instance-list")
             yield Static("")
-            yield Static("[yellow]Warning:[/yellow] This will stop the running deployment.")
-            yield Static("[dim]Select an instance to confirm and stop.[/dim]")
+            yield Static("[yellow]Warning:[/yellow] This will stop the selected Modal app.")
+            yield Static("[dim]Select an app to confirm and stop.[/dim]")
         yield Footer()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option_list.id == "stop-instance-list":
             selected = str(event.option.id)
-            target = self._target_by_option_id.get(selected)
-            if target is None:
+            row = self._target_by_option_id.get(selected)
+            if row is None or row.backend is None:
                 return
-            backend, app_name = target
-            self.app.begin_stop(backend, app_name=app_name)  # type: ignore[attr-defined]
+            self.app.begin_stop(  # type: ignore[attr-defined]
+                row.backend,
+                app_name=row.name,
+                app_id=row.app_id or None,
+            )
 
     def on_mount(self) -> None:
-        self._target_by_option_id: dict[str, tuple[BackendType, str]] = {}
+        self._target_by_option_id: dict[str, EndpointInfo] = {}
         self._was_suspended = False
         self._load_instances()
         self.query_one("#stop-instance-list", OptionList).focus()
@@ -267,11 +280,14 @@ class StopParamsScreen(CopyEnabledScreen):
         if highlighted is None:
             return
         selected = str(highlighted.id)
-        target = self._target_by_option_id.get(selected)
-        if target is None:
+        row = self._target_by_option_id.get(selected)
+        if row is None or row.backend is None:
             return
-        backend, app_name = target
-        self.app.begin_stop(backend, app_name=app_name)  # type: ignore[attr-defined]
+        self.app.begin_stop(  # type: ignore[attr-defined]
+            row.backend,
+            app_name=row.name,
+            app_id=row.app_id or None,
+        )
 
     def _load_instances(self) -> None:
         instance_list = self.query_one("#stop-instance-list", OptionList)
@@ -279,7 +295,7 @@ class StopParamsScreen(CopyEnabledScreen):
         stoppable_instances = [row for row in instances if _is_stoppable_state(row.state)]
         if not stoppable_instances:
             self._target_by_option_id = {}
-            instance_list.set_options([Option("  No running deployments found")])
+            instance_list.set_options([Option("  No active apps found")])
             if instance_list.option_count > 0:
                 instance_list.highlighted = 0
             return

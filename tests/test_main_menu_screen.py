@@ -20,7 +20,7 @@ from llm_launchpad.core.hf_auth import HuggingFaceAuthStatus
 class MainMenuStatusRenderTests(unittest.TestCase):
     def test_render_deployment_status_empty_state(self) -> None:
         rendered = _render_deployment_status([])
-        self.assertIn("No active launchpad deployments", rendered)
+        self.assertIn("No active launchpad apps", rendered)
 
     def test_render_deployment_status_includes_counts_and_rows(self) -> None:
         rows = [
@@ -54,13 +54,15 @@ class MainMenuStatusRenderTests(unittest.TestCase):
         ]
 
         rendered = _render_deployment_status(rows, username="alice")
-        self.assertIn("3 active deployments", rendered)
+        self.assertIn("3 active launchpad apps", rendered)
         self.assertIn("1 healthy", rendered)
         self.assertIn("1 in progress", rendered)
         self.assertIn("1 error", rendered)
         self.assertIn("qwen", rendered)
         self.assertIn("phi", rendered)
         self.assertIn("broken", rendered)
+        self.assertIn("Modal app:", rendered)
+        self.assertIn("ap-1", rendered)
         self.assertIn("modal: running", rendered)
         self.assertIn("modal: deploying", rendered)
         self.assertIn("modal: failed", rendered)
@@ -89,6 +91,7 @@ class MainMenuStatusRenderTests(unittest.TestCase):
     def test_should_show_in_panel_hides_stopped(self) -> None:
         self.assertFalse(_should_show_in_panel("stopped"))
         self.assertFalse(_should_show_in_panel("stopping"))
+        self.assertTrue(_should_show_in_panel("ephemeral"))
         self.assertTrue(_should_show_in_panel("running"))
         self.assertTrue(_should_show_in_panel("deploying"))
         self.assertTrue(_should_show_in_panel("failed"))

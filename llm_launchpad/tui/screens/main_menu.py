@@ -201,7 +201,7 @@ def _state_bucket(state: str) -> str:
     normalized = (state or "").strip().lower()
     if normalized in {"running", "deployed"}:
         return "healthy"
-    if normalized in {"deploying", "starting", "initializing", "building"}:
+    if normalized in {"deploying", "starting", "initializing", "building", "ephemeral"}:
         return "deploying"
     if normalized in {"queued", "pending"}:
         return "queued"
@@ -371,7 +371,7 @@ def _friendly_count_line(rows: list[EndpointInfo]) -> list[str]:
     in_progress = runtime_counts.get("in_progress", 0)
     errors = runtime_counts.get("error", 0)
 
-    noun = "deployment" if len(rows) == 1 else "deployments"
+    noun = "launchpad app" if len(rows) == 1 else "launchpad apps"
     chips = [f"[green]{healthy} healthy[/green]"]
     if in_progress:
         chips.append(f"[yellow]{in_progress} in progress[/yellow]")
@@ -459,7 +459,7 @@ def _render_deployment_status(rows: list[EndpointInfo], username: str = "") -> s
     if not rows:
         return (
             "[bold]Fleet Pulse[/bold]\n"
-            "[dim]No active launchpad deployments.[/dim]"
+            "[dim]No active launchpad apps.[/dim]"
         )
 
     header_lines = _friendly_count_line(rows)
@@ -484,6 +484,10 @@ def _render_deployment_status(rows: list[EndpointInfo], username: str = "") -> s
             f"[dim]{_escape_markup(backend_name)}[/dim]  {_style_runtime_bucket(_runtime_bucket(row))} "
             f"[dim](modal: {_escape_markup((row.state or 'unknown').strip().lower())})[/dim]"
         )
+        modal_app_line = f"[dim]Modal app:[/dim] {_escape_markup(row.name or '')}"
+        if (row.app_id or "").strip():
+            modal_app_line += f" [dim]({_escape_markup(row.app_id)})[/dim]"
+        app_lines.append(modal_app_line)
 
         model_id, display_name = _endpoint_model_summary(row)
         app_lines.append(f"[dim]Display name:[/dim] {_escape_markup(display_name or '')}")
@@ -507,9 +511,12 @@ def _render_deployment_status(rows: list[EndpointInfo], username: str = "") -> s
                         app_lines.append(f"    {_escape_markup(line)}")
                 app_lines.append("  [dim]API key[/dim] ")
             else:
-                app_lines.append("[dim]OpenAI URL will be available once deployment is running.[/dim]")
+                app_lines.append("[dim]OpenAI URL will be available once the app is serving traffic.[/dim]")
         else:
-            app_lines.append("[dim]OpenAI URL unavailable (Modal app list has no web URL yet).[/dim]")
+            if _state_bucket(row.state) in {"deploying", "queued"}:
+                app_lines.append("[dim]OpenAI URL unavailable while the app is still starting.[/dim]")
+            else:
+                app_lines.append("[dim]OpenAI URL unavailable (Modal app list has no web URL yet).[/dim]")
 
         if index != len(display_rows) - 1:
             app_lines.append("")

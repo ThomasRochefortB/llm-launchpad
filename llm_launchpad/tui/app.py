@@ -467,12 +467,14 @@ class TuiApp(App):
         backend: BackendType,
         follow: bool = True,
         app_name: Optional[str] = None,
+        app_id: Optional[str] = None,
     ) -> None:
         monitor = MonitorScreen(title="Logs")
         self.push_screen(monitor)
         target_app_name = app_name or legacy_app_name(backend)
+        target_ref = (app_id or target_app_name).strip()
         self.run_worker(
-            lambda: self._run_logs(backend, follow, target_app_name, monitor),
+            lambda: self._run_logs(backend, follow, target_ref, target_app_name, monitor),
             name="logs-worker",
             thread=True,
         )
@@ -481,32 +483,45 @@ class TuiApp(App):
         self,
         backend: BackendType,
         follow: bool,
+        app_ref: str,
         app_name: str,
         monitor: MonitorScreen,
     ):  # type: ignore[return]
-        _dispatch_event(monitor, LogEvent(line=f"Target app: {app_name}"))
-        for event in self._orchestrator.tail_logs(backend, follow, app_name=app_name):
+        target_label = app_name if app_ref == app_name else f"{app_name} ({app_ref})"
+        _dispatch_event(monitor, LogEvent(line=f"Target app: {target_label}"))
+        for event in self._orchestrator.tail_logs(backend, follow, app_name=app_name, app_id=app_ref):
             _dispatch_event(monitor, event)
 
     # ------------------------------------------------------------------
     # Manage: stop
     # ------------------------------------------------------------------
 
-    def begin_stop(self, backend: BackendType, app_name: Optional[str] = None) -> None:
+    def begin_stop(
+        self,
+        backend: BackendType,
+        app_name: Optional[str] = None,
+        app_id: Optional[str] = None,
+    ) -> None:
         monitor = MonitorScreen(title="Stop")
         self.push_screen(monitor)
         target_app_name = app_name or legacy_app_name(backend)
+        target_ref = (app_id or target_app_name).strip()
         self.run_worker(
-            lambda: self._run_stop(backend, target_app_name, monitor),
+            lambda: self._run_stop(backend, target_ref, target_app_name, monitor),
             name="stop-worker",
             thread=True,
         )
 
     def _run_stop(
-        self, backend: BackendType, app_name: str, monitor: MonitorScreen
+        self,
+        backend: BackendType,
+        app_ref: str,
+        app_name: str,
+        monitor: MonitorScreen,
     ):  # type: ignore[return]
-        _dispatch_event(monitor, LogEvent(line=f"Target app: {app_name}"))
-        for event in self._orchestrator.stop_app(backend, app_name=app_name):
+        target_label = app_name if app_ref == app_name else f"{app_name} ({app_ref})"
+        _dispatch_event(monitor, LogEvent(line=f"Target app: {target_label}"))
+        for event in self._orchestrator.stop_app(backend, app_name=app_name, app_id=app_ref):
             if (
                 isinstance(event, OperationCompleteEvent)
                 and event.success

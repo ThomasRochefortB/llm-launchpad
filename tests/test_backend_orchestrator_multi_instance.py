@@ -103,6 +103,23 @@ class OrchestratorMultiInstanceTests(unittest.TestCase):
         self.assertTrue(captured)
         self.assertEqual(captured[0], ["modal", "app", "logs", "vllm-qwen3"])
 
+    def test_tail_logs_prefers_explicit_app_id(self) -> None:
+        orch = Orchestrator()
+        captured: list[list[str]] = []
+
+        def _fake_run_streaming(command: list[str], env=None):  # type: ignore[no-untyped-def]
+            captured.append(command)
+            if False:
+                yield None
+            return
+            yield  # pragma: no cover
+
+        with patch("llm_launchpad.core.backend.ModalBackend.logs_follow_args", return_value=[]):
+            with patch("llm_launchpad.core.backend.ModalBackend.run_streaming", side_effect=_fake_run_streaming):
+                list(orch.tail_logs(BackendType.VLLM, follow=False, app_name="vllm-qwen3", app_id="ap-123"))
+        self.assertTrue(captured)
+        self.assertEqual(captured[0], ["modal", "app", "logs", "ap-123"])
+
     def test_stop_app_targets_explicit_app_name(self) -> None:
         orch = Orchestrator()
         captured: list[list[str]] = []
@@ -119,6 +136,22 @@ class OrchestratorMultiInstanceTests(unittest.TestCase):
         self.assertTrue(captured)
         self.assertEqual(captured[0], ["modal", "app", "stop", "vllm-qwen2-5"])
         self.assertTrue(any(isinstance(event, LogEvent) for event in events))
+
+    def test_stop_app_prefers_explicit_app_id(self) -> None:
+        orch = Orchestrator()
+        captured: list[list[str]] = []
+
+        def _fake_run_streaming(command: list[str], env=None):  # type: ignore[no-untyped-def]
+            captured.append(command)
+            if False:
+                yield None
+            return
+            yield  # pragma: no cover
+
+        with patch("llm_launchpad.core.backend.ModalBackend.run_streaming", side_effect=_fake_run_streaming):
+            list(orch.stop_app(BackendType.VLLM, app_name="vllm-qwen2-5", app_id="ap-123"))
+        self.assertTrue(captured)
+        self.assertEqual(captured[0], ["modal", "app", "stop", "ap-123"])
 
     def test_list_deployments_handles_empty_json_as_success(self) -> None:
         orch = Orchestrator()
@@ -191,6 +224,42 @@ class OrchestratorMultiInstanceTests(unittest.TestCase):
         self.assertTrue(done.success)
         self.assertIsInstance(done.data, list)
         self.assertEqual(len(done.data), 2)
+
+    def test_list_deployments_keeps_concurrent_active_duplicates(self) -> None:
+        orch = Orchestrator()
+        rows = [
+            EndpointInfo(
+                name="llamacpp-glm5-rtxpro",
+                app_id="ap-first",
+                state="ephemeral",
+                backend=BackendType.LLAMACPP,
+                instance_name="glm5-rtxpro",
+            ),
+            EndpointInfo(
+                name="llamacpp-glm5-rtxpro",
+                app_id="ap-second",
+                state="ephemeral",
+                backend=BackendType.LLAMACPP,
+                instance_name="glm5-rtxpro",
+            ),
+            EndpointInfo(
+                name="llamacpp-glm5-rtxpro",
+                app_id="ap-old",
+                state="stopped",
+                backend=BackendType.LLAMACPP,
+                instance_name="glm5-rtxpro",
+            ),
+        ]
+
+        with patch("llm_launchpad.core.backend.ModalBackend.list_apps", return_value=rows):
+            events = list(orch.list_deployments())
+
+        log_lines = [event.line for event in events if isinstance(event, LogEvent)]
+        deployment_lines = [line for line in log_lines if line.startswith("  backend=")]
+        self.assertEqual(len(deployment_lines), 2)
+        self.assertTrue(any("ap-first" in line and "state=ephemeral" in line for line in deployment_lines))
+        self.assertTrue(any("ap-second" in line and "state=ephemeral" in line for line in deployment_lines))
+        self.assertFalse(any("ap-old" in line for line in deployment_lines))
 
 
 if __name__ == "__main__":

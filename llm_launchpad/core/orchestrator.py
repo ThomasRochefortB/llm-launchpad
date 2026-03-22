@@ -59,29 +59,37 @@ def _is_historical_modal_app_state(state: str) -> bool:
 
 
 def _dedupe_launchpad_apps(rows: list[EndpointInfo]) -> list[EndpointInfo]:
-    """Collapse repeated historical rows for the same logical deployment.
+    """Collapse repeated historical rows while preserving concurrent live apps.
 
-    Modal app list can include many old stopped revisions for the same app name.
-    We keep the first row for each app (Modal typically returns newest-first) and
-    prefer replacing a historical row if a later active row appears.
+    Modal app list often includes many stopped revisions for one logical app.
+    Those should not crowd the UI, but two active rows with the same app name
+    can represent distinct live jobs and must both remain visible.
     """
+    active_keys = {
+        (
+            row.backend.value if row.backend else "",
+            (row.instance_name or "").strip(),
+            (row.name or "").strip(),
+        )
+        for row in rows
+        if not _is_historical_modal_app_state(row.state)
+    }
+    kept_historical_keys: set[tuple[str, str, str]] = set()
     deduped: list[EndpointInfo] = []
-    key_to_index: dict[tuple[str, str, str], int] = {}
 
     for row in rows:
-        backend_key = row.backend.value if row.backend else ""
-        instance_key = (row.instance_name or "").strip()
-        name_key = (row.name or "").strip()
-        key = (backend_key, instance_key, name_key)
-        existing_index = key_to_index.get(key)
-        if existing_index is None:
-            key_to_index[key] = len(deduped)
+        key = (
+            row.backend.value if row.backend else "",
+            (row.instance_name or "").strip(),
+            (row.name or "").strip(),
+        )
+        if not _is_historical_modal_app_state(row.state):
             deduped.append(row)
             continue
-
-        existing = deduped[existing_index]
-        if _is_historical_modal_app_state(existing.state) and not _is_historical_modal_app_state(row.state):
-            deduped[existing_index] = row
+        if key in active_keys or key in kept_historical_keys:
+            continue
+        kept_historical_keys.add(key)
+        deduped.append(row)
 
     return deduped
 
@@ -626,9 +634,10 @@ class Orchestrator:
         backend: BackendType,
         follow: bool = True,
         app_name: Optional[str] = None,
+        app_id: Optional[str] = None,
     ) -> EventStream:
         """Tail Modal logs for the given backend."""
-        target_app_name = app_name or legacy_app_name(backend)
+        target_app_name = (app_id or app_name or legacy_app_name(backend)).strip()
         cmd: List[str] = ["modal", "app", "logs"]
         if follow:
             cmd.extend(ModalBackend.logs_follow_args())
@@ -1363,9 +1372,14 @@ class Orchestrator:
     # Stop
     # ------------------------------------------------------------------
 
-    def stop_app(self, backend: BackendType, app_name: Optional[str] = None) -> EventStream:
+    def stop_app(
+        self,
+        backend: BackendType,
+        app_name: Optional[str] = None,
+        app_id: Optional[str] = None,
+    ) -> EventStream:
         """Stop a deployed app."""
-        target_app_name = app_name or legacy_app_name(backend)
+        target_app_name = (app_id or app_name or legacy_app_name(backend)).strip()
         cmd = ["modal", "app", "stop", target_app_name]
         yield StateChangeEvent(
             current=DeploymentState.RUNNING,
