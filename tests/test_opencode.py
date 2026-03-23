@@ -96,7 +96,6 @@ class OpenCodeSyncTests(unittest.TestCase):
     def test_sync_updates_existing_provider_without_duplication(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "opencode.json"
-            registry_path = Path(tmp) / "opencode_registry.json"
             first = _connection()
             second = _connection(
                 base_url="https://alice--vllm-qwen3-serve-abc.modal.run/v1",
@@ -249,7 +248,6 @@ class OpenCodeSyncTests(unittest.TestCase):
     def test_sync_reads_jsonc_and_writes_backup(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "opencode.json"
-            registry_path = Path(tmp) / "opencode_registry.json"
             config_path.write_text(
                 """
                 {
@@ -280,7 +278,6 @@ class OpenCodeSyncTests(unittest.TestCase):
     def test_sync_uses_existing_jsonc_config_when_cli_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             jsonc_path = Path(tmp) / "opencode.jsonc"
-            registry_path = Path(tmp) / "opencode_registry.json"
             jsonc_path.write_text('{"provider":{"custom":{"name":"Keep"}}}\n', encoding="utf-8")
             target = _connection()
 
@@ -321,7 +318,6 @@ class OpenCodeSyncTests(unittest.TestCase):
     def test_sync_migrates_legacy_launchpad_provider_names_to_flat_name(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "opencode.json"
-            registry_path = Path(tmp) / "opencode_registry.json"
             config_path.write_text(
                 json.dumps(
                     {
