@@ -174,6 +174,38 @@ class BackendParsingAndCommandTests(unittest.TestCase):
         self.assertEqual(rows[1].repo_id, "unsloth/Phi-3-GGUF")
         self.assertEqual(rows[1].quant, "Q4_K_M")
 
+    def test_extract_modal_app_rows_infers_backend_from_metadata_for_custom_names(self) -> None:
+        payload = [
+            {
+                "name": "prod-coder",
+                "state": "running",
+                "details": {
+                    "webUrl": "https://alice--prod-coder-serve.modal.run",
+                    "env": {
+                        "MODEL_NAME": "Qwen/Qwen3-4B-Thinking-2507-FP8",
+                        "SERVED_MODEL_NAME": "Qwen3-4B",
+                    },
+                },
+            },
+            {
+                "name": "edge-gguf",
+                "state": "deployed",
+                "metadata": {
+                    "config": {
+                        "repo_id": "unsloth/Phi-3-GGUF",
+                        "quant": "Q4_K_M",
+                    }
+                },
+            },
+        ]
+
+        rows = _extract_modal_app_rows(payload)
+
+        self.assertEqual(rows[0].backend, BackendType.VLLM)
+        self.assertIsNone(rows[0].instance_name)
+        self.assertEqual(rows[1].backend, BackendType.LLAMACPP)
+        self.assertIsNone(rows[1].instance_name)
+
     def test_build_run_command_llamacpp_includes_full_option_set(self) -> None:
         config = DeploymentConfig(
             backend=BackendType.LLAMACPP,

@@ -28,6 +28,7 @@ from ..core.naming import (
 from ..core.opencode import (
     build_openai_connection_payload,
     resolve_connection_for_app,
+    resolve_connections_for_rows,
     sync_opencode_config,
     visible_launchpad_rows,
 )
@@ -565,6 +566,7 @@ class TuiApp(App):
         emit_skipped: bool = False,
     ) -> None:
         target = None
+        targets = None
         if target_app_name:
             target = resolve_connection_for_app(
                 target_app_name,
@@ -573,9 +575,12 @@ class TuiApp(App):
                 fallback_config=target_config,
                 fallback_server_url=target_url,
             )
+        elif current_rows is not None:
+            targets = resolve_connections_for_rows(current_rows, username=self._username)
         try:
             result = sync_opencode_config(
                 target=target,
+                targets=targets,
                 current_rows=current_rows,
                 remove_app_names=remove_app_names,
             )
