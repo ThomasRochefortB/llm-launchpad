@@ -176,6 +176,38 @@ class OpenCodeSyncTests(unittest.TestCase):
         assert connection is not None
         self.assertEqual(connection.display_name, "GLM-5")
 
+    def test_resolve_connection_for_app_prefers_modal_row_web_url_over_fallback_url(self) -> None:
+        row = EndpointInfo(
+            name="llamacpp-glm",
+            state="running",
+            backend=BackendType.LLAMACPP,
+            instance_name="glm",
+            web_url="https://alice--llamacpp-glm-serve-live.modal.run",
+            repo_id="unsloth/GLM-4.7-Flash-GGUF",
+            quant="Q4_K_M",
+        )
+        fallback_config = DeploymentConfig(
+            backend=BackendType.LLAMACPP,
+            app_name="llamacpp-glm",
+            instance_name="glm",
+            repo_id="unsloth/GLM-4.7-Flash-GGUF",
+            quant="Q4_K_M",
+        )
+
+        resolved = opencode.resolve_connection_for_app(
+            "llamacpp-glm",
+            rows=[row],
+            fallback_config=fallback_config,
+            fallback_server_url="https://alice--llamacpp-glm-serve-stale.modal.run",
+        )
+
+        self.assertIsNotNone(resolved)
+        assert resolved is not None
+        self.assertEqual(
+            resolved.base_url,
+            "https://alice--llamacpp-glm-serve-live.modal.run/v1",
+        )
+
     def test_sync_prunes_missing_and_stopped_entries(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "opencode.json"

@@ -7,9 +7,10 @@ from textual.app import App
 from textual.widgets import Input, OptionList, Select, Static, Switch
 
 from llm_launchpad.core.hf_models import ModelCandidate
+from llm_launchpad.core.modal_gpu import ModalGpuSpec
 from llm_launchpad.protocol.enums import BackendType
 from llm_launchpad.protocol.models import StorageSnapshot, StoredModelInfo
-from llm_launchpad.tui.screens.deploy import LlamaCppDeployScreen
+from llm_launchpad.tui.screens.deploy import GpuTypesLoaded, LlamaCppDeployScreen
 from llm_launchpad.tui.workers import LlamaCppModelsLoaded, LlamaCppQuantsLoaded, StorageLoaded
 
 
@@ -250,6 +251,33 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(quant_input.value, "Q8_0")
             self.assertTrue(gpu_type.has_focus)
+
+    async def test_gpu_type_dropdown_shows_hourly_price_labels(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+            screen.on_gpu_types_loaded(
+                GpuTypesLoaded(
+                    gpu_types=[
+                        ModalGpuSpec("A100-80GB", price_per_hour_usd=2.4984),
+                        ModalGpuSpec("H100", price_per_hour_usd=3.9492),
+                    ]
+                )
+            )
+
+            gpu_type = screen.query_one("#gpu-type-llama", Select)
+            self.assertEqual(gpu_type.value, "A100-80GB")
+            self.assertEqual(
+                gpu_type._options[1:],
+                [
+                    ("A100-80GB ($2.50/hr)", "A100-80GB"),
+                    ("H100 ($3.95/hr)", "H100"),
+                ],
+            )
 
     async def test_rank_mode_menu_is_focused_for_arrow_navigation(self) -> None:
         app = _TestApp()

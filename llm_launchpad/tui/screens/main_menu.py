@@ -8,7 +8,6 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
-import json
 from typing import Any, Literal
 
 from textual.app import ComposeResult
@@ -257,21 +256,6 @@ def _style_runtime_bucket(bucket: str) -> str:
     return f"[dim]{_escape_markup(normalized or 'unknown')}[/dim]"
 
 
-def _llamacpp_probe_ready(status_code: int, body: str) -> bool:
-    if not (200 <= status_code < 300):
-        return False
-    text = (body or "").strip()
-    if not text:
-        return False
-    try:
-        payload = json.loads(text)
-    except json.JSONDecodeError:
-        return False
-    if not isinstance(payload, dict):
-        return False
-    return isinstance(payload.get("choices"), list)
-
-
 def _probe_row_runtime_status(row: EndpointInfo, username: str) -> tuple[str, str | None]:
     modal_runtime = _runtime_bucket_from_modal_state(row.state)
     if modal_runtime != "healthy":
@@ -290,31 +274,12 @@ def _probe_row_runtime_status(row: EndpointInfo, username: str) -> tuple[str, st
 
     base_root = base_url.rstrip("/")
     host_root = base_root[:-3] if base_root.endswith("/v1") else base_root
+    probe_url = host_root.rstrip("/") + "/health"
     try:
-        if row.backend == BackendType.VLLM:
-            probe_url = host_root.rstrip("/") + "/health"
-            response = requests.get(probe_url, timeout=2.5)
-            if 200 <= response.status_code < 300:
-                return "healthy", None
-        else:
-            probe_url = base_root.rstrip("/") + "/completions"
-            response = requests.post(
-                probe_url,
-                headers={"Content-Type": "application/json"},
-                data=json.dumps(
-                    {
-                        "model": (row.served_model_name or "").strip() or "default",
-                        "prompt": "ping",
-                        "max_tokens": 1,
-                        "temperature": 0,
-                    }
-                ),
-                timeout=2.5,
-            )
-            if _llamacpp_probe_ready(response.status_code, response.text or ""):
-                return "healthy", None
+        response = requests.get(probe_url, timeout=2.5)
+        if 200 <= response.status_code < 300:
+            return "healthy", None
 
-        # If we had to derive the URL, avoid false "error" when function slug differs.
         if not was_derived and response.status_code in {401, 403, 404}:
             return "error", f"HTTP {response.status_code}"
         return "in_progress", f"HTTP {response.status_code}"
