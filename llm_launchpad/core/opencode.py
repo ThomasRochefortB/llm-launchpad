@@ -74,6 +74,24 @@ def resolve_opencode_config_path() -> Path:
     return OPENCODE_CONFIG_PATH
 
 
+def _strip_repo_owner(value: str) -> str:
+    """Return the repo/model segment for Hugging Face-style owner/model labels."""
+    text = value.strip()
+    if text.count("/") != 1:
+        return text
+    owner, model = text.split("/", 1)
+    if not owner or not model:
+        return text
+    return model.strip() or text
+
+
+def _format_opencode_display_name(source: str, quant: str = "") -> str:
+    """Build the user-facing OpenCode label without the HF namespace prefix."""
+    base = _strip_repo_owner(source) or "Model"
+    quant_text = quant.strip()
+    return f"{base} ({quant_text})" if quant_text else base
+
+
 def build_openai_connection_payload(
     config: DeploymentConfig,
     server_url: str,
@@ -84,15 +102,13 @@ def build_openai_connection_payload(
 
     if config.backend == BackendType.VLLM:
         model_id = (config.served_model_name or default_served_model_name(config.model_name)).strip()
-        display_name = (config.served_model_name or config.model_name or model_id or "Model").strip()
+        display_name = _format_opencode_display_name(config.served_model_name or config.model_name or model_id)
     else:
         model_id = (
             (config.served_model_name or "").strip()
             or default_llamacpp_served_model_name(config.repo_id, config.quant)
         )
-        source = (config.repo_id or "llama.cpp GGUF").strip()
-        quant = (config.quant or "").strip()
-        display_name = f"{source} ({quant})" if quant else source
+        display_name = _format_opencode_display_name(config.repo_id or "llama.cpp GGUF", config.quant or "")
 
     return {
         "base_url": base_url,
@@ -155,6 +171,7 @@ def build_connection_from_endpoint(
             or (row.served_model_name or "").strip()
             or model_id
         )
+        display_name = _format_opencode_display_name(display_name)
     else:
         model_id = (
             (row.served_model_name or "").strip()
@@ -162,9 +179,9 @@ def build_connection_from_endpoint(
         )
         display_name = (row.display_name or "").strip()
         if not display_name:
-            source = (row.repo_id or "llama.cpp GGUF").strip()
-            quant = (row.quant or "").strip()
-            display_name = f"{source} ({quant})" if quant else source
+            display_name = _format_opencode_display_name(row.repo_id or "llama.cpp GGUF", row.quant or "")
+        else:
+            display_name = _format_opencode_display_name(display_name)
 
     return OpenCodeConnection(
         app_name=app_name,

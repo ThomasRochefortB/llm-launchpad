@@ -126,14 +126,19 @@ class MonitorScreen(CopyEnabledScreen):
             self.log_viewer.write_line("")
 
     def on_log_message(self, message: LogMessage) -> None:
-        cleaned = _strip_ansi(message.line)
         prefix = "stderr | " if message.stream == "stderr" else ""
         if self._summary_mode_enabled:
             assert self._deploy_summarizer is not None
+            cleaned = _strip_ansi(message.line)
             for line in self._deploy_summarizer.transform(cleaned, self._current_operation):
                 self.log_viewer.write_line(f"{prefix}{line}" if prefix else line)
             return
-        self.log_viewer.write_line(f"{prefix}{cleaned}")
+        line = (
+            message.line
+            if self._show_debug_logs and self._summarize_backend_logs
+            else _strip_ansi(message.line)
+        )
+        self.log_viewer.write_line(f"{prefix}{line}")
 
     def on_state_changed(self, message: StateChanged) -> None:
         if message.operation is not None:

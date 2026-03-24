@@ -160,48 +160,6 @@ def predownload_model(
 
 @app.function(
     image=vllm_image,
-    timeout=10 * MINUTES,
-    volumes={
-        "/root/.cache/huggingface": hf_cache_vol,
-        "/root/.cache/vllm": vllm_cache_vol,
-    },
-)
-def list_downloaded_models() -> list[dict[str, Any]]:
-    """List model repos present in the huggingface-cache volume."""
-    if not HF_HUB_DIR.exists():
-        return []
-
-    items: list[dict[str, Any]] = []
-    for model_dir in sorted(HF_HUB_DIR.glob("models--*")):
-        if not model_dir.is_dir():
-            continue
-        encoded = model_dir.name[len("models--") :]
-        model_id = encoded.replace("--", "/")
-
-        file_count = 0
-        size_bytes = 0
-        for file_path in model_dir.glob("snapshots/**/*"):
-            if file_path.is_file():
-                file_count += 1
-                size_bytes += file_path.stat().st_size
-
-        items.append(
-            {
-                "backend": "vllm",
-                "model_id": model_id,
-                "revision": None,
-                "quant": None,
-                "size_bytes": size_bytes,
-                "file_count": file_count,
-                "source_volume": "huggingface-cache",
-                "paths": [str(model_dir.relative_to(HF_CACHE_DIR))],
-            }
-        )
-    return items
-
-
-@app.function(
-    image=vllm_image,
     gpu=DEPLOY_GPU_CONFIG,
     scaledown_window=15 * MINUTES,
     timeout=10 * MINUTES,

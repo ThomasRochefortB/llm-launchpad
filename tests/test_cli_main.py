@@ -446,7 +446,7 @@ class CliMainCommandTests(unittest.TestCase):
         ):
             result = self.runner.invoke(cli_main.app, ["list"])
         self.assertEqual(result.exit_code, 0)
-        sync_mock.assert_called_once_with(current_rows=visible_rows)
+        sync_mock.assert_called_once_with(current_rows=visible_rows, username="alice")
 
     def test_deploy_warmup_failure_returns_nonzero_exit_code(self) -> None:
         orch = SimpleNamespace(
@@ -540,7 +540,11 @@ class CliMainCommandTests(unittest.TestCase):
                 ["stop", "--backend", "vllm", "--yes", "--app-name", "vllm-test"],
             )
         self.assertEqual(result.exit_code, 0)
-        sync_mock.assert_called_once_with(current_rows=[], remove_app_names=["vllm-test"])
+        sync_mock.assert_called_once_with(
+            current_rows=[],
+            remove_app_names=["vllm-test"],
+            username="alice",
+        )
 
     def test_switch_llamacpp_requires_preset_or_repo(self) -> None:
         orch = SimpleNamespace(deploy=lambda *_args, **_kwargs: [])

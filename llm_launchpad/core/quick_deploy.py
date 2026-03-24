@@ -7,7 +7,7 @@ import shlex
 
 from ..protocol.enums import BackendType
 from ..protocol.models import DeploymentConfig
-from .naming import build_app_name, slugify_instance_name
+from .naming import build_app_name, infer_instance_from_app_name, slugify_instance_name
 
 
 @dataclass(frozen=True)
@@ -151,14 +151,6 @@ def quick_deploy_model_label_parts(profile: QuickDeployProfile) -> tuple[str, st
     return (profile.display_name, f"({quant})")
 
 
-def format_quick_deploy_model_label(profile: QuickDeployProfile) -> str:
-    """Render a quick-deploy model label with its configured quantization."""
-    label, quant_suffix = quick_deploy_model_label_parts(profile)
-    if not quant_suffix:
-        return label
-    return f"{label} {quant_suffix}"
-
-
 def build_quick_deploy_config(
     profile: QuickDeployProfile,
     *,
@@ -183,7 +175,8 @@ def build_quick_deploy_config(
     app_override = app_name.strip()
     if app_override:
         config.app_name = app_override
-        config.instance_name = slugify_instance_name(instance_override or app_override)
+        inferred_instance = infer_instance_from_app_name(app_override, config.backend)
+        config.instance_name = slugify_instance_name(instance_override or inferred_instance or app_override)
     elif instance_override:
         config.instance_name = slugify_instance_name(instance_override)
         config.app_name = build_app_name(config.backend, config.instance_name)

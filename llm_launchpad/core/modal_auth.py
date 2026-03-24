@@ -62,7 +62,7 @@ def _looks_unauthenticated(text: str) -> bool:
         for marker in (
             "modal setup",
             "authenticate",
-            "authentication",
+            "authentication required",
             "not logged in",
             "not authenticated",
             "no token",

@@ -98,6 +98,29 @@ class ModalAuthTests(unittest.TestCase):
 
     @patch("llm_launchpad.core.modal_auth.shutil.which", return_value="/usr/bin/modal")
     @patch("llm_launchpad.core.modal_auth.subprocess.run")
+    def test_get_modal_auth_status_surfaces_auth_service_errors(self, mock_run, _mock_which) -> None:  # type: ignore[no-untyped-def]
+        mock_run.side_effect = [
+            subprocess.CompletedProcess(
+                args=["modal", "profile", "current"],
+                returncode=0,
+                stdout="default\n",
+                stderr="",
+            ),
+            subprocess.CompletedProcess(
+                args=["modal", "token", "info"],
+                returncode=2,
+                stdout="",
+                stderr="Authentication service unavailable.",
+            ),
+        ]
+
+        status = get_modal_auth_status()
+        self.assertFalse(status.authenticated)
+        self.assertEqual(status.profile, "default")
+        self.assertEqual(status.error, "Authentication service unavailable.")
+
+    @patch("llm_launchpad.core.modal_auth.shutil.which", return_value="/usr/bin/modal")
+    @patch("llm_launchpad.core.modal_auth.subprocess.run")
     def test_get_modal_auth_status_surfaces_unexpected_errors(self, mock_run, _mock_which) -> None:  # type: ignore[no-untyped-def]
         mock_run.side_effect = [
             subprocess.CompletedProcess(

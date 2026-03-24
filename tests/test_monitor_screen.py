@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from textual.app import App
 from textual.widgets import Log, Static
@@ -165,6 +166,27 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             content = "\n".join(screen.log_viewer.log_widget.lines)
             self.assertIn(raw_line, content)
             self.assertNotIn("Log view: summary (normalized milestones; raw backend logs hidden)", content)
+
+    async def test_debug_mode_preserves_ansi_escape_sequences(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(
+                MonitorScreen(
+                    title="Deploy",
+                    deploy_backend=BackendType.VLLM,
+                    summarize_backend_logs=True,
+                    show_debug_logs=True,
+                )
+            )
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, MonitorScreen)
+            raw_line = "\x1b[0;36m(APIServer pid=4)\x1b[0;0m INFO booted"
+            with patch.object(screen.log_viewer, "write_line") as write_line:
+                screen.on_log_message(LogMessage(raw_line))
+
+            write_line.assert_called_once_with(raw_line)
 
     async def test_summary_mode_failure_appends_debug_hint(self) -> None:
         app = _TestApp()

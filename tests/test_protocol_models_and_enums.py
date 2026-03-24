@@ -18,6 +18,10 @@ class LaunchpadSettingsTests(unittest.TestCase):
         restored = LaunchpadSettings.from_dict(serialized)
         self.assertEqual(restored.scaledown_window, 600)
 
+    def test_from_dict_accepts_legacy_lowercase_key(self) -> None:
+        restored = LaunchpadSettings.from_dict({"scaledown_window": 900})
+        self.assertEqual(restored.scaledown_window, 900)
+
     def test_to_env_omits_non_positive_scaledown(self) -> None:
         env = LaunchpadSettings(scaledown_window=0).to_env()
         self.assertNotIn("SCALEDOWN_WINDOW", env)

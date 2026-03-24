@@ -63,7 +63,7 @@ class TuiAppStorageCacheTests(unittest.TestCase):
         self.assertIn("=== OpenAI-compatible ===", joined)
         self.assertIn("Base URL: https://example.modal.run/v1", joined)
         self.assertIn("Model ID: Nanbeige4.1-3B-Q4_K_M-GGUF", joined)
-        self.assertIn("Display name: Edge-Quant/Nanbeige4.1-3B-Q4_K_M-GGUF (Q4_K_M)", joined)
+        self.assertIn("Display name: Nanbeige4.1-3B-Q4_K_M-GGUF (Q4_K_M)", joined)
         self.assertIn("API key: (leave blank; no auth by default)", joined)
         self.assertIn("=========================", joined)
         self.assertNotIn("OpenCode custom provider:", joined)
@@ -262,9 +262,7 @@ class TuiAppStorageCacheTests(unittest.TestCase):
         ]
         self.assertTrue(any("=== OpenAI-compatible ===" in line for line in summary_lines))
         self.assertTrue(any("Model ID: Nanbeige4.1-3B-Q4_K_M-GGUF" in line for line in summary_lines))
-        self.assertTrue(
-            any("Display name: Edge-Quant/Nanbeige4.1-3B-Q4_K_M-GGUF (Q4_K_M)" in line for line in summary_lines)
-        )
+        self.assertTrue(any("Display name: Nanbeige4.1-3B-Q4_K_M-GGUF (Q4_K_M)" in line for line in summary_lines))
 
     def test_run_deploy_syncs_opencode_on_warmup_success(self) -> None:
         app = TuiApp()
@@ -349,7 +347,7 @@ class TuiAppStorageCacheTests(unittest.TestCase):
             self.assertEqual(merged[0].served_model_name, "Nanbeige4.1-3B-Q4_K_M-GGUF")
             self.assertEqual(
                 merged[0].display_name,
-                "Edge-Quant/Nanbeige4.1-3B-Q4_K_M-GGUF (Q4_K_M)",
+                "Nanbeige4.1-3B-Q4_K_M-GGUF (Q4_K_M)",
             )
 
     def test_list_instances_triggers_opencode_prune_for_visible_rows(self) -> None:
