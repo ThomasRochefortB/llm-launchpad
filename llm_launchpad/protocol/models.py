@@ -26,7 +26,8 @@ class LaunchpadSettings:
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> LaunchpadSettings:
-        return cls(scaledown_window=int(data.get("SCALEDOWN_WINDOW", 1800)))
+        raw_value = data.get("SCALEDOWN_WINDOW", data.get("scaledown_window", 1800))
+        return cls(scaledown_window=int(raw_value))
 
 
 @dataclass

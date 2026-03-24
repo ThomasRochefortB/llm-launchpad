@@ -12,6 +12,34 @@ from llm_launchpad.tui.screens.storage import StorageScreen, _model_label
 from llm_launchpad.tui.workers import StorageLoaded
 
 
+def _sample_snapshot() -> StorageSnapshot:
+    return StorageSnapshot(
+        llamacpp_models=[
+            StoredModelInfo(
+                backend=BackendType.LLAMACPP,
+                model_id="Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+                revision="main",
+                quant="Q4_K_M",
+                size_bytes=1024,
+                file_count=1,
+                source_volume="huggingface-cache",
+                incomplete=True,
+            )
+        ],
+        vllm_models=[
+            StoredModelInfo(
+                backend=BackendType.VLLM,
+                model_id="Qwen/Qwen3-4B-Thinking-2507-FP8",
+                revision=None,
+                quant=None,
+                size_bytes=2048,
+                file_count=2,
+                source_volume="huggingface-cache",
+            )
+        ],
+    )
+
+
 class _TestApp(App[None]):
     def __init__(self) -> None:
         super().__init__()
@@ -23,33 +51,7 @@ class _TestApp(App[None]):
     def begin_storage_refresh(self, receiver: object, force: bool = False) -> None:
         self.refresh_calls += 1
         self.refresh_force_flags.append(force)
-        poster = getattr(receiver, "post_message")
-        snapshot = StorageSnapshot(
-            llamacpp_models=[
-                StoredModelInfo(
-                    backend=BackendType.LLAMACPP,
-                    model_id="Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
-                    revision="main",
-                    quant="Q4_K_M",
-                    size_bytes=1024,
-                    file_count=1,
-                    source_volume="huggingface-cache",
-                    incomplete=True,
-                )
-            ],
-            vllm_models=[
-                StoredModelInfo(
-                    backend=BackendType.VLLM,
-                    model_id="Qwen/Qwen3-4B-Thinking-2507-FP8",
-                    revision=None,
-                    quant=None,
-                    size_bytes=2048,
-                    file_count=2,
-                    source_volume="huggingface-cache",
-                )
-            ],
-        )
-        poster(StorageLoaded(snapshot=snapshot))
+        receiver.post_message(StorageLoaded(snapshot=_sample_snapshot()))
 
     def begin_storage_predownload(  # type: ignore[override]
         self,
@@ -62,6 +64,21 @@ class _TestApp(App[None]):
 
     def begin_storage_delete(self, model) -> None:  # type: ignore[no-untyped-def]
         self.delete_calls.append(model.model_id)
+
+
+class _DeferredRefreshApp(_TestApp):
+    def __init__(self) -> None:
+        super().__init__()
+        self._refresh_receiver: object | None = None
+
+    def begin_storage_refresh(self, receiver: object, force: bool = False) -> None:
+        self.refresh_calls += 1
+        self.refresh_force_flags.append(force)
+        self._refresh_receiver = receiver
+
+    def deliver_snapshot(self) -> None:
+        assert self._refresh_receiver is not None
+        self._refresh_receiver.post_message(StorageLoaded(snapshot=_sample_snapshot()))
 
 
 class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
@@ -225,6 +242,26 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("down")
             await pilot.pause()
             self.assertTrue(model_id.has_focus)
+
+    async def test_initial_storage_load_refocuses_table_in_small_viewport(self) -> None:
+        app = _DeferredRefreshApp()
+        async with app.run_test(size=(100, 24)) as pilot:
+            app.push_screen(StorageScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, StorageScreen)
+            table = screen.query_one("#storage-table", DataTable)
+            model_id = screen.query_one("#storage-model-id", Input)
+
+            model_id.focus()
+            await pilot.pause()
+            self.assertTrue(model_id.has_focus)
+
+            app.deliver_snapshot()
+            await pilot.pause()
+
+            self.assertEqual(table.row_count, 2)
+            self.assertTrue(table.has_focus)
 
     async def test_predownload_uses_form_values(self) -> None:
         app = _TestApp()

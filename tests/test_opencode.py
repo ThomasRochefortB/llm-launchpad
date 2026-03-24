@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from llm_launchpad.core import opencode
+from llm_launchpad.protocol.models import DeploymentConfig
 from llm_launchpad.protocol.enums import BackendType
 from llm_launchpad.protocol.models import EndpointInfo
 
@@ -144,6 +145,36 @@ class OpenCodeSyncTests(unittest.TestCase):
                 set(registry["entries"].keys()),
                 {vllm_target.app_name, llamacpp_target.app_name},
             )
+
+    def test_build_openai_connection_payload_strips_hf_owner_from_llamacpp_display_name(self) -> None:
+        config = DeploymentConfig(
+            backend=BackendType.LLAMACPP,
+            app_name="llamacpp-glm",
+            instance_name="glm",
+            repo_id="unsloth/GLM-4.7-Flash-GGUF",
+            quant="Q4_K_M",
+        )
+
+        payload = opencode.build_openai_connection_payload(config, "https://example.com")
+
+        self.assertEqual(payload["display_name"], "GLM-4.7-Flash-GGUF (Q4_K_M)")
+
+    def test_build_connection_from_endpoint_strips_hf_owner_from_vllm_display_name(self) -> None:
+        row = EndpointInfo(
+            name="vllm-glm",
+            state="running",
+            backend=BackendType.VLLM,
+            model_name="zai-org/GLM-5",
+        )
+
+        connection = opencode.build_connection_from_endpoint(
+            row,
+            server_url="https://example.com",
+        )
+
+        self.assertIsNotNone(connection)
+        assert connection is not None
+        self.assertEqual(connection.display_name, "GLM-5")
 
     def test_sync_prunes_missing_and_stopped_entries(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

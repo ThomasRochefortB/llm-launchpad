@@ -511,7 +511,7 @@ def warmup(
 @app.command("list")
 def list_apps() -> None:
     """List launchpad Modal apps."""
-    orch, _ = _preflight()
+    orch, username = _preflight()
     _print_banner()
     visible_rows: list[EndpointInfo] | None = None
     for event in orch.list_deployments():
@@ -522,7 +522,7 @@ def list_apps() -> None:
         ):
             visible_rows = [row for row in event.data if isinstance(row, EndpointInfo)]
         _print_event(event)
-    _sync_opencode_cli(current_rows=visible_rows)
+    _sync_opencode_cli(current_rows=visible_rows, username=username)
 
 
 @app.command()
@@ -581,7 +581,7 @@ def stop(
     app_name: Optional[str] = typer.Option(None, help="Target Modal app name"),
 ) -> None:
     """Stop a deployed backend app."""
-    orch, _ = _preflight()
+    orch, username = _preflight()
     _print_banner()
     bt = BackendType(backend)
     target_app_name = _resolve_manage_app_name(bt, app_name, instance_name)
@@ -599,6 +599,7 @@ def stop(
         _sync_opencode_cli(
             current_rows=_load_visible_launchpad_rows(),
             remove_app_names=[target_app_name],
+            username=username,
         )
 
 

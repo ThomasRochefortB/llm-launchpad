@@ -6,7 +6,6 @@ import unittest
 from llm_launchpad.core.quick_deploy import (
     build_quick_deploy_config,
     format_context_length,
-    format_quick_deploy_model_label,
     get_quick_deploy_profile,
     list_quick_deploy_profiles,
     quick_deploy_model_label_parts,
@@ -27,14 +26,6 @@ class QuickDeployConfigTests(unittest.TestCase):
                 "glm5-rtxpro",
                 "kimi25-rtxpro",
             ],
-        )
-
-    def test_format_quick_deploy_model_label_appends_quant(self) -> None:
-        profile = get_quick_deploy_profile("qwen35-397b-rtxpro")
-
-        self.assertEqual(
-            format_quick_deploy_model_label(profile),
-            "Qwen3.5 397B A17B (UD-Q3_K_XL)",
         )
 
     def test_quick_deploy_model_label_parts_split_quant_suffix(self) -> None:
@@ -120,6 +111,14 @@ class QuickDeployConfigTests(unittest.TestCase):
         self.assertTrue(config.show_debug_logs)
         self.assertEqual(config.gpu_type, "RTX-PRO-6000")
         self.assertEqual(config.gpu_count, 3)
+
+    def test_build_quick_deploy_config_infers_instance_from_prefixed_app_name(self) -> None:
+        profile = get_quick_deploy_profile("qwen35-397b-rtxpro")
+
+        config = build_quick_deploy_config(profile, app_name="llamacpp-custom-prod")
+
+        self.assertEqual(config.app_name, "llamacpp-custom-prod")
+        self.assertEqual(config.instance_name, "custom-prod")
 
 
 if __name__ == "__main__":

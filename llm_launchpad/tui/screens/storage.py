@@ -13,7 +13,12 @@ from textual.widgets.option_list import Option
 
 from ...protocol.enums import BackendType
 from ...protocol.models import StorageSnapshot, StoredModelInfo
-from ..navigation import is_focusable_for_navigation, move_focus_across_option_lists, move_focus_across_widgets
+from ..navigation import (
+    first_enabled_option_index,
+    is_focusable_for_navigation,
+    move_focus_across_option_lists,
+    move_focus_across_widgets,
+)
 from ..workers import StorageFailed, StorageLoaded
 from .copy_enabled import CopyEnabledScreen
 
@@ -33,8 +38,10 @@ def _model_label(row: StoredModelInfo) -> str:
         return f"{row.model_id} (INCOMPLETE)"
     return row.model_id
 
+
 def _is_focusable_for_arrow_navigation(widget: Widget) -> bool:
     return is_focusable_for_navigation(widget, check_size=True)
+
 
 class StorageScreen(CopyEnabledScreen):
     """View and pre-download backend model caches."""
@@ -103,6 +110,7 @@ class StorageScreen(CopyEnabledScreen):
         self._rows_by_key: dict[str, StoredModelInfo] = {}
         self._selected_model: StoredModelInfo | None = None
         self._was_suspended = False
+        self._initial_focus_pending = True
         table = self.query_one("#storage-table", DataTable)
         table.cursor_type = "row"
         table.zebra_stripes = True
@@ -164,8 +172,10 @@ class StorageScreen(CopyEnabledScreen):
         self.query_one("#storage-status", Static).update(
             "[green]Storage refreshed.[/green] Use selected row or type a model to pre-download."
         )
+        should_refocus = self._initial_focus_pending
+        self._initial_focus_pending = False
         focused = self.focused
-        if not isinstance(focused, Widget) or not _is_focusable_for_arrow_navigation(focused):
+        if should_refocus or not isinstance(focused, Widget) or not _is_focusable_for_arrow_navigation(focused):
             self.call_after_refresh(self._focus_first_visible_navigation_target)
 
     def on_storage_failed(self, message: StorageFailed) -> None:
@@ -285,10 +295,11 @@ class StorageScreen(CopyEnabledScreen):
         raise SkipAction()
 
     def _focus_first_visible_navigation_target(self) -> None:
-        move_focus_across_widgets(
-            self,
-            self.NAVIGATION_ORDER,
-            direction=1,
-            is_focusable=_is_focusable_for_arrow_navigation,
-            fallback_to_edge_if_focus_missing=True,
-        )
+        for widget_id in self.NAVIGATION_ORDER:
+            widget = self.query_one(f"#{widget_id}", Widget)
+            if not _is_focusable_for_arrow_navigation(widget):
+                continue
+            widget.focus()
+            if isinstance(widget, OptionList) and widget.highlighted is None:
+                widget.highlighted = first_enabled_option_index(widget)
+            return
