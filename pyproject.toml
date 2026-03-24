@@ -33,6 +33,7 @@ dependencies = [
 
 [project.scripts]
 llm-launchpad = "llm_launchpad.cli.main:main"
+modal = "modal.__main__:main"
 
 [project.urls]
 Homepage = "https://github.com/ThomasRochefortB/llm-launchpad"

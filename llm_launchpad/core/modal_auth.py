@@ -92,7 +92,7 @@ def get_modal_auth_status() -> ModalAuthStatus:
     if _modal_cli_path() is None:
         return ModalAuthStatus(
             authenticated=False,
-            error="Modal CLI not found (install with: pip install modal)",
+            error="Modal CLI not found (reinstall llm-launchpad, then run: modal setup)",
         )
 
     profile = get_modal_profile()
@@ -115,7 +115,7 @@ def get_modal_auth_status() -> ModalAuthStatus:
         return ModalAuthStatus(
             authenticated=False,
             profile=profile,
-            error="Modal CLI not found (install with: pip install modal)",
+            error="Modal CLI not found (reinstall llm-launchpad, then run: modal setup)",
         )
 
     stdout = (result.stdout or "").strip()
