@@ -335,7 +335,11 @@ class TuiAppClipboardTests(unittest.TestCase):
             ],
         )
 
+
 class TuiAppQuitTests(unittest.IsolatedAsyncioTestCase):
+    def test_app_bindings_do_not_include_q_quit(self) -> None:
+        self.assertFalse(any(binding.key == "q" for binding in TuiApp.BINDINGS))
+
     async def test_ctrl_c_first_press_warns_before_quitting(self) -> None:
         app = _QuitCaptureApp()
 
@@ -345,13 +349,13 @@ class TuiAppQuitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app.quit_calls, 0)
         self.assertEqual(
             app.notifications,
-            [("Ctrl+C again to exit", "Exit llm-launchpad?", "warning", 2.0)],
+            [("Hit CTRL+C again to exit", "Exit llm-launchpad?", "warning", 10.0)],
         )
 
     async def test_ctrl_c_second_press_within_window_quits(self) -> None:
         app = _QuitCaptureApp()
 
-        with patch("llm_launchpad.tui.app.time.monotonic", side_effect=[10.0, 11.0]):
+        with patch("llm_launchpad.tui.app.time.monotonic", side_effect=[10.0, 19.5]):
             await app.action_request_quit()
             await app.action_request_quit()
 
@@ -360,7 +364,7 @@ class TuiAppQuitTests(unittest.IsolatedAsyncioTestCase):
     async def test_ctrl_c_after_window_warns_again(self) -> None:
         app = _QuitCaptureApp()
 
-        with patch("llm_launchpad.tui.app.time.monotonic", side_effect=[10.0, 13.5]):
+        with patch("llm_launchpad.tui.app.time.monotonic", side_effect=[10.0, 20.5]):
             await app.action_request_quit()
             await app.action_request_quit()
 

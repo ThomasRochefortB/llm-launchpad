@@ -180,7 +180,7 @@ class Orchestrator:
         Returns ``(ok, username, error_message)``.
         """
         if not ModalBackend.is_cli_available():
-            return False, "", "Modal CLI not found. Install with: pip install modal && modal setup"
+            return False, "", "Modal CLI not found. Reinstall llm-launchpad, then run: modal setup"
         status = get_modal_auth_status()
         if not status.authenticated:
             return False, "", "Modal authentication missing. Run: modal setup"

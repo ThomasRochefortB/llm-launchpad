@@ -35,7 +35,7 @@ class ModalAuthTests(unittest.TestCase):
             status,
             ModalAuthStatus(
                 authenticated=False,
-                error="Modal CLI not found (install with: pip install modal)",
+                error="Modal CLI not found (reinstall llm-launchpad, then run: modal setup)",
             ),
         )
 

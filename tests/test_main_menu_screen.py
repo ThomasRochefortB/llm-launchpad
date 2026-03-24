@@ -6,6 +6,7 @@ from llm_launchpad.core.modal_auth import ModalAuthStatus
 from llm_launchpad.protocol.enums import BackendType
 from llm_launchpad.protocol.models import EndpointInfo
 from llm_launchpad.tui.screens.main_menu import (
+    MainMenuScreen,
     _render_auth_status_block,
     _render_billing_load_error,
     _render_billing_report,
@@ -18,6 +19,9 @@ from llm_launchpad.core.hf_auth import HuggingFaceAuthStatus
 
 
 class MainMenuStatusRenderTests(unittest.TestCase):
+    def test_main_menu_bindings_do_not_include_q_quit(self) -> None:
+        self.assertFalse(any(binding.key == "q" for binding in MainMenuScreen.BINDINGS))
+
     def test_render_deployment_status_empty_state(self) -> None:
         rendered = _render_deployment_status([])
         self.assertIn("No active launchpad apps", rendered)
@@ -137,11 +141,12 @@ class MainMenuStatusRenderTests(unittest.TestCase):
         rendered = _render_billing_load_error("Usage: modal [OPTIONS] COMMAND")
         self.assertIn("modal \\[OPTIONS\\] COMMAND", rendered)
 
-    def test_render_hf_auth_status_shows_authenticated_username(self) -> None:
+    def test_render_hf_auth_status_hides_authenticated_username(self) -> None:
         rendered = _render_hf_auth_status(
             HuggingFaceAuthStatus(authenticated=True, username="alice")
         )
-        self.assertIn("Hugging Face authenticated as alice", rendered)
+        self.assertIn("Hugging Face authenticated", rendered)
+        self.assertNotIn("alice", rendered)
 
     def test_render_hf_auth_status_shows_login_hint_when_unauthenticated(self) -> None:
         rendered = _render_hf_auth_status(HuggingFaceAuthStatus(authenticated=False))
@@ -164,14 +169,14 @@ class MainMenuStatusRenderTests(unittest.TestCase):
         self.assertIn("Modal not authenticated", rendered)
         self.assertIn("modal setup", rendered)
 
-    def test_render_auth_status_block_shows_profile_not_username(self) -> None:
+    def test_render_auth_status_block_hides_modal_profile_details(self) -> None:
         rendered = _render_auth_status_block(
             username="default",
             modal_status=ModalAuthStatus(authenticated=True, profile="default"),
         )
         self.assertIn("Modal authenticated", rendered)
-        self.assertIn("Modal profile: default", rendered)
-        self.assertNotIn("authenticated as: default", rendered)
+        self.assertNotIn("Modal profile: default", rendered)
+        self.assertNotIn("default", rendered)
 
     def test_render_auth_status_block_includes_both_modal_and_hf_lines(self) -> None:
         rendered = _render_auth_status_block(
@@ -180,8 +185,9 @@ class MainMenuStatusRenderTests(unittest.TestCase):
             hf_status=HuggingFaceAuthStatus(authenticated=True, username="alice"),
         )
         self.assertIn("Modal not authenticated", rendered)
-        self.assertIn("Modal profile: default", rendered)
-        self.assertIn("Hugging Face authenticated as alice", rendered)
+        self.assertNotIn("Modal profile: default", rendered)
+        self.assertIn("Hugging Face authenticated", rendered)
+        self.assertNotIn("alice", rendered)
 
 
 if __name__ == "__main__":

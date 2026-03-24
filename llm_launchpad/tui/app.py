@@ -110,9 +110,8 @@ class TuiApp(App):
     BINDINGS = [
         Binding("ctrl+c", "request_quit", show=False, priority=True, system=True),
         Binding("ctrl+t", "toggle_mouse_mode", "Mouse", show=True),
-        Binding("q", "quit", "Quit", show=True, priority=True),
     ]
-    _CTRL_C_CONFIRM_WINDOW_SECONDS = 2.0
+    _CTRL_C_CONFIRM_WINDOW_SECONDS = 10.0
     _STORAGE_CACHE_TTL_SECONDS = 20.0
 
     def __init__(self, *, mouse_enabled: bool = True, **kwargs: object) -> None:
@@ -205,14 +204,17 @@ class TuiApp(App):
     async def action_request_quit(self) -> None:
         """Require a second Ctrl+C press before quitting the TUI."""
         now = time.monotonic()
-        if now - self._ctrl_c_last_requested_at <= self._CTRL_C_CONFIRM_WINDOW_SECONDS:
+        if (
+            self._ctrl_c_last_requested_at > 0.0
+            and now - self._ctrl_c_last_requested_at <= self._CTRL_C_CONFIRM_WINDOW_SECONDS
+        ):
             self._ctrl_c_last_requested_at = 0.0
             await self.action_quit()
             return
 
         self._ctrl_c_last_requested_at = now
         self.notify(
-            "Ctrl+C again to exit",
+            "Hit CTRL+C again to exit",
             title="Exit llm-launchpad?",
             severity="warning",
             timeout=self._CTRL_C_CONFIRM_WINDOW_SECONDS,
@@ -242,7 +244,7 @@ class TuiApp(App):
         """
         if not ModalBackend.is_cli_available():
             self.notify(
-                "Modal CLI not found. Install with: pip install modal && modal setup",
+                "Modal CLI not found. Reinstall llm-launchpad, then run: modal setup",
                 severity="error",
                 timeout=10,
             )

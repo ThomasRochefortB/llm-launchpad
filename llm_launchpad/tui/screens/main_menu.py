@@ -163,8 +163,6 @@ def _render_hf_auth_status(status: HuggingFaceAuthStatus | None = None) -> str:
     if status is None:
         return "[dim]🤗 Checking Hugging Face auth...[/dim]"
     if status.authenticated:
-        if status.username:
-            return f"[green]🤗 Hugging Face authenticated as {_escape_markup(status.username)}[/green]"
         return "[green]🤗 Hugging Face authenticated[/green]"
     if status.error:
         color = "red" if "invalid" in status.error.lower() else "yellow"
@@ -190,8 +188,6 @@ def _render_auth_status_block(
     hf_status: HuggingFaceAuthStatus | None = None,
 ) -> str:
     lines: list[str] = [_render_modal_auth_status(modal_status)]
-    if username:
-        lines.append(f"[dim]Modal profile: {_escape_markup(username)}[/dim]")
     lines.append(_render_hf_auth_status(hf_status))
     return "\n".join(lines)
 
@@ -629,7 +625,6 @@ class MainMenuScreen(CopyEnabledScreen):
     """Top-level menu: deploy, manage, settings."""
 
     BINDINGS = [
-        Binding("q", "quit", "Quit", show=True),
         Binding("d", "select_deploy", "Deploy", show=True),
         Binding("m", "select_manage", "Manage", show=True),
         Binding("t", "select_storage", "Storage", show=True),
@@ -906,6 +901,3 @@ class MainMenuScreen(CopyEnabledScreen):
     def action_focus_previous_launcher(self) -> None:
         focused_id = getattr(self.focused, "id", "")
         self._focus_launcher("action-list" if focused_id == "quick-deploy-list" else "quick-deploy-list")
-
-    async def action_quit(self) -> None:
-        await self.app.action_quit()  # type: ignore[attr-defined]
