@@ -34,6 +34,54 @@ def run_llama_405b_fp8():
 ## Specifying GPU count
 """
 
+_PRICING_SNIPPET = """
+### Compute costs
+
+GPU Tasks
+
+Nvidia B200
+
+$0.001736 / sec
+
+Nvidia H200
+
+$0.001261 / sec
+
+Nvidia H100
+
+$0.001097 / sec
+
+Nvidia RTX PRO 6000
+
+$0.000842 / sec
+
+Nvidia A100, 80 GB
+
+$0.000694 / sec
+
+Nvidia A100, 40 GB
+
+$0.000583 / sec
+
+Nvidia L40S
+
+$0.000542 / sec
+
+Nvidia A10
+
+$0.000306 / sec
+
+Nvidia L4
+
+$0.000222 / sec
+
+Nvidia T4
+
+$0.000164 / sec
+
+CPU
+"""
+
 
 class ModalGpuTypesTests(unittest.TestCase):
     def test_parse_modal_gpu_types_from_docs_snippet(self) -> None:
@@ -76,6 +124,72 @@ class ModalGpuTypesTests(unittest.TestCase):
         self.assertIn("RTX-PRO-6000", values)
         self.assertIn("B200+", values)
         self.assertNotIn("H100:8", values)
+
+    def test_parse_modal_gpu_pricing_from_pricing_snippet(self) -> None:
+        pricing = modal_gpu._parse_modal_gpu_pricing(_PRICING_SNIPPET)
+        self.assertAlmostEqual(pricing["B200"], 6.2496)
+        self.assertAlmostEqual(pricing["H200"], 4.5396)
+        self.assertAlmostEqual(pricing["H100"], 3.9492)
+        self.assertAlmostEqual(pricing["RTX-PRO-6000"], 3.0312)
+        self.assertAlmostEqual(pricing["A100-80GB"], 2.4984)
+        self.assertAlmostEqual(pricing["A100-40GB"], 2.0988)
+        self.assertAlmostEqual(pricing["L40S"], 1.9512)
+        self.assertAlmostEqual(pricing["A10"], 1.1016)
+        self.assertAlmostEqual(pricing["L4"], 0.7992)
+        self.assertAlmostEqual(pricing["T4"], 0.5904)
+        self.assertAlmostEqual(pricing["A100"], pricing["A100-40GB"])
+        self.assertAlmostEqual(pricing["H100!"], pricing["H100"])
+        self.assertAlmostEqual(pricing["B200+"], pricing["B200"])
+
+    def test_fetch_modal_gpu_catalog_merges_docs_and_pricing(self) -> None:
+        class FakeResponse:
+            def __init__(self, text: str) -> None:
+                self.status_code = 200
+                self.text = text
+
+        def fake_get(url: str, timeout: float, headers: dict[str, str]):
+            self.assertEqual(timeout, 7.0)
+            self.assertIn("User-Agent", headers)
+            if url == modal_gpu.MODAL_GPU_GUIDE_URL:
+                return FakeResponse(_DOC_SNIPPET)
+            if url == modal_gpu.MODAL_PRICING_URL:
+                return FakeResponse(_PRICING_SNIPPET)
+            self.fail(f"Unexpected URL: {url}")
+
+        fake_requests = types.SimpleNamespace(get=fake_get)
+        with patch.dict("sys.modules", {"requests": fake_requests}):
+            catalog = modal_gpu.fetch_modal_gpu_catalog(timeout=7.0)
+
+        pricing_by_gpu = {entry.value: entry.price_per_hour_usd for entry in catalog}
+        self.assertAlmostEqual(pricing_by_gpu["B200"] or 0.0, 6.2496)
+        self.assertAlmostEqual(pricing_by_gpu["B200+"] or 0.0, 6.2496)
+        self.assertAlmostEqual(pricing_by_gpu["H100"] or 0.0, 3.9492)
+        self.assertAlmostEqual(pricing_by_gpu["H100!"] or 0.0, 3.9492)
+        self.assertAlmostEqual(pricing_by_gpu["A100"] or 0.0, 2.0988)
+        self.assertAlmostEqual(pricing_by_gpu["A100-80GB"] or 0.0, 2.4984)
+        self.assertAlmostEqual(pricing_by_gpu["RTX-PRO-6000"] or 0.0, 3.0312)
+
+    def test_fetch_modal_gpu_catalog_keeps_types_when_pricing_fetch_fails(self) -> None:
+        class FakeResponse:
+            def __init__(self, status_code: int, text: str) -> None:
+                self.status_code = status_code
+                self.text = text
+
+        def fake_get(url: str, timeout: float, headers: dict[str, str]):
+            self.assertEqual(timeout, 7.0)
+            self.assertIn("User-Agent", headers)
+            if url == modal_gpu.MODAL_GPU_GUIDE_URL:
+                return FakeResponse(200, _DOC_SNIPPET)
+            if url == modal_gpu.MODAL_PRICING_URL:
+                return FakeResponse(503, "")
+            self.fail(f"Unexpected URL: {url}")
+
+        fake_requests = types.SimpleNamespace(get=fake_get)
+        with patch.dict("sys.modules", {"requests": fake_requests}):
+            catalog = modal_gpu.fetch_modal_gpu_catalog(timeout=7.0)
+
+        self.assertEqual(catalog[0].value, "T4")
+        self.assertIsNone(catalog[0].price_per_hour_usd)
 
     def test_fetch_modal_gpu_types_raises_on_http_error(self) -> None:
         class FakeResponse:

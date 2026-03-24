@@ -152,7 +152,10 @@ def build_connection_from_endpoint(
     if not app_name or backend is None:
         return None
 
-    base_root = (server_url or row.web_url or "").strip().rstrip("/")
+    # Prefer Modal's currently reported web URL for the app whenever present.
+    # A fallback URL may come from deploy/warmup output and can point at a
+    # transient or stale web endpoint after the app is redeployed.
+    base_root = (row.web_url or server_url or "").strip().rstrip("/")
     if not base_root and username.strip():
         from .backend import ModalBackend
 

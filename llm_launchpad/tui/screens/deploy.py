@@ -26,7 +26,7 @@ from textual.widgets import (
 from textual.widgets.option_list import Option
 
 from ...core.hf_models import ModelCandidate, VllmMemoryBreakdown, fetch_vllm_memory_breakdown
-from ...core.modal_gpu import fetch_modal_gpu_types
+from ...core.modal_gpu import ModalGpuSpec, fetch_modal_gpu_catalog
 from ...core.naming import (
     auto_instance_name_for_backend,
     build_app_name,
@@ -60,7 +60,7 @@ from .copy_enabled import CopyEnabledScreen
 class GpuTypesLoaded(Message):
     """GPU type options were fetched successfully."""
 
-    def __init__(self, gpu_types: list[str]) -> None:
+    def __init__(self, gpu_types: list[ModalGpuSpec]) -> None:
         super().__init__()
         self.gpu_types = gpu_types
 
@@ -274,7 +274,10 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
             # Options
             with Vertical(classes="gpu-config-panel"):
                 yield Static("GPU configuration", classes="form-section-title")
-                yield Static("Select the deployment GPU shape.", classes="form-section-subtitle")
+                yield Static(
+                    "Select the deployment GPU shape. Base Modal hourly price per GPU is shown when available.",
+                    classes="form-section-subtitle",
+                )
                 with Horizontal(id="gpu-config-row-llama", classes="gpu-config-main-row"):
                     with Vertical(id="gpu-type-group-llama"):
                         yield Static("GPU type", classes="form-label")
@@ -441,7 +444,7 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
         if poster is None:
             return
         try:
-            gpu_types = fetch_modal_gpu_types()
+            gpu_types = fetch_modal_gpu_catalog()
         except Exception as exc:
             poster(GpuTypesFailed(error=str(exc)))
             return
@@ -450,12 +453,14 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
     def on_gpu_types_loaded(self, message: GpuTypesLoaded) -> None:
         dropdown = self.query_one("#gpu-type-llama", Select)
         options = build_gpu_type_options(message.gpu_types)
-        if self._selected_gpu_type and self._selected_gpu_type not in options:
-            options.insert(0, self._selected_gpu_type)
+        option_values = [value for _, value in options]
+        if self._selected_gpu_type and self._selected_gpu_type not in option_values:
+            options.insert(0, (self._selected_gpu_type, self._selected_gpu_type))
+            option_values.insert(0, self._selected_gpu_type)
         if not options:
             return
-        dropdown.set_options([(value, value) for value in options])
-        selected = self._selected_gpu_type if self._selected_gpu_type in options else options[0]
+        dropdown.set_options(options)
+        selected = self._selected_gpu_type if self._selected_gpu_type in option_values else option_values[0]
         dropdown.value = selected
         self._selected_gpu_type = selected
 
@@ -882,7 +887,7 @@ class VllmDeployScreen(CopyEnabledScreen):
             with Vertical(classes="gpu-config-panel"):
                 yield Static("GPU configuration", classes="form-section-title")
                 yield Static(
-                    "Choose deployment GPUs and in-replica tensor sharding.",
+                    "Choose deployment GPUs and in-replica tensor sharding. Base Modal hourly price per GPU is shown when available.",
                     classes="form-section-subtitle",
                 )
                 with Horizontal(id="gpu-config-row-vllm", classes="gpu-config-main-row"):
@@ -1078,7 +1083,7 @@ class VllmDeployScreen(CopyEnabledScreen):
         if poster is None:
             return
         try:
-            gpu_types = fetch_modal_gpu_types()
+            gpu_types = fetch_modal_gpu_catalog()
         except Exception as exc:
             poster(GpuTypesFailed(error=str(exc)))
             return
@@ -1087,12 +1092,14 @@ class VllmDeployScreen(CopyEnabledScreen):
     def on_gpu_types_loaded(self, message: GpuTypesLoaded) -> None:
         dropdown = self.query_one("#gpu-type-vllm", Select)
         options = build_gpu_type_options(message.gpu_types)
-        if self._selected_gpu_type and self._selected_gpu_type not in options:
-            options.insert(0, self._selected_gpu_type)
+        option_values = [value for _, value in options]
+        if self._selected_gpu_type and self._selected_gpu_type not in option_values:
+            options.insert(0, (self._selected_gpu_type, self._selected_gpu_type))
+            option_values.insert(0, self._selected_gpu_type)
         if not options:
             return
-        dropdown.set_options([(value, value) for value in options])
-        selected = self._selected_gpu_type if self._selected_gpu_type in options else options[0]
+        dropdown.set_options(options)
+        selected = self._selected_gpu_type if self._selected_gpu_type in option_values else option_values[0]
         dropdown.value = selected
         self._selected_gpu_type = selected
 

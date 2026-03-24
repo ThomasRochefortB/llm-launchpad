@@ -35,6 +35,14 @@
 - Cover success and failure paths for CLI/core changes, especially Modal command construction, app naming, auth detection, warmup/status probing, and storage parsing.
 - Prefer mocks/fakes over real Modal or Hugging Face calls; keep tests hermetic and fast.
 
+## CI Checks
+- Before opening a PR, ensure all CI checks pass locally:
+  - `uv run ruff check .` — linting
+  - `uv run ty check` — type checking
+  - `uv run pytest` — test suite
+  - `uv build --no-sources` — package build verification
+- CI runs on every pull_request and push to main; failing checks block merges.
+
 ## Commit & Pull Request Guidelines
 - Existing history uses short, direct subjects (examples: `bugfix gpu dropdown`, `Adding HF hub cli`).
 - Prefer imperative, specific commit messages, ideally under 72 chars (e.g., `Fix vLLM instance name slugging`).
