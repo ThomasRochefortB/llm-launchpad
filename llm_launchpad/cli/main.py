@@ -28,7 +28,12 @@ from ..core.naming import (
     random_function_slug,
     slugify_instance_name,
 )
-from ..core.opencode import resolve_connection_for_app, sync_opencode_config, visible_launchpad_rows
+from ..core.opencode import (
+    resolve_connection_for_app,
+    resolve_connections_for_rows,
+    sync_opencode_config,
+    visible_launchpad_rows,
+)
 from ..core.orchestrator import Orchestrator
 from ..protocol.enums import BackendType
 from ..protocol.enums import OperationType
@@ -249,6 +254,7 @@ def _sync_opencode_cli(
     fail_on_error: bool = False,
 ) -> None:
     target = None
+    targets = None
     if target_app_name:
         target = resolve_connection_for_app(
             target_app_name,
@@ -257,9 +263,12 @@ def _sync_opencode_cli(
             fallback_config=target_config,
             fallback_server_url=target_url,
         )
+    elif current_rows is not None:
+        targets = resolve_connections_for_rows(current_rows, username=username)
     try:
         result = sync_opencode_config(
             target=target,
+            targets=targets,
             current_rows=current_rows,
             remove_app_names=remove_app_names,
             dry_run=dry_run,

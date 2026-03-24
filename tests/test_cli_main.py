@@ -646,6 +646,28 @@ class CliMainCommandTests(unittest.TestCase):
             fail_on_error=True,
         )
 
+    def test_sync_opencode_cli_backfills_visible_rows_when_target_is_omitted(self) -> None:
+        rows = [
+            EndpointInfo(
+                name="vllm-qwen3",
+                state="running",
+                backend=BackendType.VLLM,
+                instance_name="qwen3",
+                web_url="https://alice--vllm-qwen3-serve.modal.run",
+                model_name="Qwen/Qwen3-4B",
+                served_model_name="Qwen3-4B",
+            )
+        ]
+        with patch("llm_launchpad.cli.main.sync_opencode_config") as sync_mock:
+            sync_mock.return_value = SimpleNamespace(messages=[])
+            cli_main._sync_opencode_cli(current_rows=rows, username="alice")
+
+        sync_mock.assert_called_once()
+        targets = sync_mock.call_args.kwargs["targets"]
+        self.assertEqual(len(targets), 1)
+        self.assertEqual(targets[0].app_name, "vllm-qwen3")
+        self.assertEqual(targets[0].base_url, "https://alice--vllm-qwen3-serve.modal.run/v1")
+
 
 if __name__ == "__main__":
     unittest.main()

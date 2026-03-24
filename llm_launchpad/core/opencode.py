@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import os
 from pathlib import Path
 import shutil
 import threading
@@ -15,11 +16,13 @@ from .config import SETTINGS_DIR
 from .naming import default_llamacpp_served_model_name, default_served_model_name
 
 OPENCODE_CONFIG_PATH = Path.home() / ".config" / "opencode" / "opencode.json"
+OPENCODE_JSONC_CONFIG_PATH = Path.home() / ".config" / "opencode" / "opencode.jsonc"
 OPENCODE_REGISTRY_PATH = SETTINGS_DIR / "opencode_registry.json"
 OPENCODE_SCHEMA_URL = "https://opencode.ai/config.json"
 
 _PROVIDER_PREFIX = "llm-launchpad-"
-_PROVIDER_NAME_PREFIX = "llm-launchpad: "
+_PROVIDER_NAME = "llm-launchpad"
+_LEGACY_PROVIDER_NAME_PREFIX = "llm-launchpad: "
 _MANAGED_NPM = "@ai-sdk/openai-compatible"
 _REMOVABLE_STATES = {"stopped", "stopping", "terminated", "archived"}
 _SYNC_LOCK = threading.Lock()
@@ -55,8 +58,20 @@ class OpenCodeSyncResult:
 
 
 def is_opencode_installed() -> bool:
-    """Return True only when the OpenCode executable is on PATH."""
-    return bool(shutil.which("opencode"))
+    """Return True when OpenCode is discoverable via CLI or an existing config file."""
+    return bool(shutil.which("opencode")) or resolve_opencode_config_path().exists()
+
+
+def resolve_opencode_config_path() -> Path:
+    """Resolve the config path OpenCode/Launchpad should read and write."""
+    configured = os.environ.get("OPENCODE_CONFIG", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    if OPENCODE_CONFIG_PATH.exists():
+        return OPENCODE_CONFIG_PATH
+    if OPENCODE_JSONC_CONFIG_PATH.exists():
+        return OPENCODE_JSONC_CONFIG_PATH
+    return OPENCODE_CONFIG_PATH
 
 
 def build_openai_connection_payload(
@@ -101,7 +116,7 @@ def build_connection_from_config(
         app_name=app_name,
         instance_name=instance_name,
         provider_id=provider_id_for_app(app_name),
-        provider_name=f"{_PROVIDER_NAME_PREFIX}{instance_name}",
+        provider_name=_PROVIDER_NAME,
         base_url=payload["base_url"],
         model_id=payload["model_id"],
         display_name=payload["display_name"],
@@ -155,7 +170,7 @@ def build_connection_from_endpoint(
         app_name=app_name,
         instance_name=instance_name,
         provider_id=provider_id_for_app(app_name),
-        provider_name=f"{_PROVIDER_NAME_PREFIX}{instance_name}",
+        provider_name=_PROVIDER_NAME,
         base_url=base_url,
         model_id=model_id,
         display_name=display_name,
@@ -223,9 +238,25 @@ def resolve_connection_for_app(
     return None
 
 
+def resolve_connections_for_rows(
+    rows: Iterable[EndpointInfo] | None,
+    *,
+    username: str = "",
+) -> list[OpenCodeConnection]:
+    """Resolve OpenCode descriptors for all visible Launchpad rows."""
+    resolved_by_app: dict[str, OpenCodeConnection] = {}
+    for row in visible_launchpad_rows(rows or []):
+        connection = build_connection_from_endpoint(row, username=username)
+        if connection is None:
+            continue
+        resolved_by_app[connection.app_name] = connection
+    return list(resolved_by_app.values())
+
+
 def sync_opencode_config(
     *,
     target: OpenCodeConnection | None = None,
+    targets: Iterable[OpenCodeConnection] | None = None,
     current_rows: Iterable[EndpointInfo] | None = None,
     remove_app_names: Iterable[str] | None = None,
     dry_run: bool = False,
@@ -233,7 +264,7 @@ def sync_opencode_config(
     """Upsert the target provider and prune stale Launchpad-managed providers."""
     result = OpenCodeSyncResult(
         detected=False,
-        config_path=OPENCODE_CONFIG_PATH,
+        config_path=resolve_opencode_config_path(),
         registry_path=OPENCODE_REGISTRY_PATH,
     )
     if not is_opencode_installed():
@@ -253,48 +284,79 @@ def sync_opencode_config(
         if not isinstance(provider_map, dict):
             provider_map = {}
 
+        for provider_id, provider_value in provider_map.items():
+            if not str(provider_id or "").strip().startswith(_PROVIDER_PREFIX):
+                continue
+            if not isinstance(provider_value, dict):
+                continue
+            if str(provider_value.get("npm", "") or "").strip() != _MANAGED_NPM:
+                continue
+            provider_name = str(provider_value.get("name", "") or "").strip()
+            if not provider_name.startswith(_LEGACY_PROVIDER_NAME_PREFIX):
+                continue
+            next_provider = dict(provider_value)
+            next_provider["name"] = _PROVIDER_NAME
+            provider_map[provider_id] = next_provider
+            config_changed = True
+
+        desired_targets: list[OpenCodeConnection] = []
         if target is not None:
+            desired_targets.append(target)
+        for candidate in targets or []:
+            if candidate is None:
+                continue
+            desired_targets.append(candidate)
+        deduped_targets: dict[str, OpenCodeConnection] = {}
+        for connection in desired_targets:
+            deduped_targets[connection.app_name] = connection
+
+        if deduped_targets:
             if not isinstance(config.get("provider"), dict):
                 config["provider"] = provider_map
                 config_changed = True
             if "$schema" not in config:
                 config["$schema"] = OPENCODE_SCHEMA_URL
                 config_changed = True
-            desired_provider = _provider_payload(target)
-            existing_provider = provider_map.get(target.provider_id)
-            if existing_provider != desired_provider:
-                provider_map[target.provider_id] = desired_provider
-                registry[target.app_name] = _registry_entry_for_connection(target)
-                config_changed = True
-                registry_changed = True
-                if existing_provider is None:
-                    result.created_provider_ids.append(target.provider_id)
-                    result.messages.append(
-                        _prefixed_message(
-                            dry_run,
-                            f"upsert provider {target.provider_id} ({target.model_id} -> {target.base_url})",
-                        )
-                    )
-                else:
-                    result.updated_provider_ids.append(target.provider_id)
-                    result.messages.append(
-                        _prefixed_message(
-                            dry_run,
-                            f"update provider {target.provider_id} ({target.model_id} -> {target.base_url})",
-                        )
-                    )
-            else:
-                next_entry = _registry_entry_for_connection(target)
-                if registry.get(target.app_name) != next_entry:
-                    registry[target.app_name] = next_entry
+            for connection in deduped_targets.values():
+                desired_provider = _provider_payload(connection)
+                existing_provider = provider_map.get(connection.provider_id)
+                if existing_provider != desired_provider:
+                    provider_map[connection.provider_id] = desired_provider
+                    registry[connection.app_name] = _registry_entry_for_connection(connection)
+                    config_changed = True
                     registry_changed = True
+                    if existing_provider is None:
+                        result.created_provider_ids.append(connection.provider_id)
+                        result.messages.append(
+                            _prefixed_message(
+                                dry_run,
+                                f"upsert provider {connection.provider_id} ({connection.model_id} -> {connection.base_url})",
+                            )
+                        )
+                    else:
+                        result.updated_provider_ids.append(connection.provider_id)
+                        result.messages.append(
+                            _prefixed_message(
+                                dry_run,
+                                f"update provider {connection.provider_id} ({connection.model_id} -> {connection.base_url})",
+                            )
+                        )
+                else:
+                    next_entry = _registry_entry_for_connection(connection)
+                    if registry.get(connection.app_name) != next_entry:
+                        registry[connection.app_name] = next_entry
+                        registry_changed = True
 
         removed_app_names = {
             str(app_name or "").strip()
             for app_name in (remove_app_names or [])
             if str(app_name or "").strip()
         }
-        protected_app_names = {target.app_name} if target is not None and target.app_name not in removed_app_names else set()
+        protected_app_names = {
+            connection.app_name
+            for connection in deduped_targets.values()
+            if connection.app_name not in removed_app_names
+        }
 
         for app_name in sorted(removed_app_names):
             entry = registry.get(app_name)
@@ -475,12 +537,16 @@ def _bootstrap_registry_from_config(config: dict[str, Any]) -> dict[str, dict[st
             continue
         if str(value.get("npm", "") or "").strip() != _MANAGED_NPM:
             continue
-        provider_name = str(value.get("name", "") or "").strip()
-        if not provider_name.startswith(_PROVIDER_NAME_PREFIX):
-            continue
-
         app_name = key.removeprefix(_PROVIDER_PREFIX).strip()
-        instance_name = provider_name.removeprefix(_PROVIDER_NAME_PREFIX).strip() or app_name
+        if not app_name:
+            continue
+        provider_name = str(value.get("name", "") or "").strip()
+        if provider_name == _PROVIDER_NAME:
+            instance_name = app_name
+        elif provider_name.startswith(_LEGACY_PROVIDER_NAME_PREFIX):
+            instance_name = provider_name.removeprefix(_LEGACY_PROVIDER_NAME_PREFIX).strip() or app_name
+        else:
+            continue
         options = value.get("options")
         models = value.get("models")
         base_url = ""
@@ -494,9 +560,6 @@ def _bootstrap_registry_from_config(config: dict[str, Any]) -> dict[str, dict[st
                 if isinstance(model_value, dict):
                     display_name = str(model_value.get("name", "") or "").strip()
                 break
-
-        if not app_name:
-            continue
         adopted[app_name] = {
             "provider_id": key,
             "app_name": app_name,

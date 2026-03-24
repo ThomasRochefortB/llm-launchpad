@@ -656,12 +656,17 @@ def _extract_modal_app_rows(payload: Any) -> List[EndpointInfo]:
             or item.get("State")
             or "unknown"
         ).strip()
-        backend = infer_backend_from_app_name(name)
-        instance = infer_instance_from_app_name(name, backend)
         served_model_name = _nested_string_for_keys(item, {"served_model_name"})
         model_name = _nested_string_for_keys(item, {"model_name"})
         repo_id = _nested_string_for_keys(item, {"repo_id", "model_repo_id"})
         quant = _nested_string_for_keys(item, {"quant"})
+        backend = infer_backend_from_app_name(name)
+        if backend is None:
+            if model_name:
+                backend = BackendType.VLLM
+            elif repo_id or quant:
+                backend = BackendType.LLAMACPP
+        instance = infer_instance_from_app_name(name, backend)
         rows.append(
             EndpointInfo(
                 name=name,
