@@ -17,7 +17,7 @@ class BackendStorageTests(unittest.TestCase):
 
     def test_build_modal_entrypoint_command(self) -> None:
         cmd = ModalBackend.build_modal_entrypoint_command(
-            "llm_launchpad/backends/modal_vllm_app.py",
+            "llm_launchpad.backends.modal_vllm_app",
             "predownload_model",
             args=["--repo-id", "Qwen/Qwen3-4B"],
         )
@@ -26,7 +26,8 @@ class BackendStorageTests(unittest.TestCase):
             [
                 "modal",
                 "run",
-                "llm_launchpad/backends/modal_vllm_app.py::predownload_model",
+                "-m",
+                "llm_launchpad.backends.modal_vllm_app::predownload_model",
                 "--repo-id",
                 "Qwen/Qwen3-4B",
             ],
@@ -57,7 +58,7 @@ class BackendStorageTests(unittest.TestCase):
         )
         events = list(
             ModalBackend.run_modal_script_entrypoint(
-                "llm_launchpad/backends/modal_llamacpp_app.py",
+                "llm_launchpad.backends.modal_llamacpp_app",
                 "predownload_model",
                 args=["--repo-id", "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF"],
             )
@@ -65,7 +66,7 @@ class BackendStorageTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         called_cmd = mock_stream.call_args.args[0]
         self.assertIn(
-            "llm_launchpad/backends/modal_llamacpp_app.py::predownload_model",
+            "llm_launchpad.backends.modal_llamacpp_app::predownload_model",
             called_cmd,
         )
 

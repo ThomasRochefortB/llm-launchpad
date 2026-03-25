@@ -260,6 +260,7 @@ class LlamacppDownloadProgressTests(unittest.TestCase):
         downloaded_path = Path("/tmp/downloaded-model.gguf")
         calls: list[tuple[object, ...]] = []
         fake_download = SimpleNamespace()
+        fake_cache = SimpleNamespace(reload=Mock())
 
         def _remote(repo_id, allow_patterns, revision):  # type: ignore[no-untyped-def]
             calls.append((repo_id, tuple(allow_patterns), revision))
@@ -268,21 +269,23 @@ class LlamacppDownloadProgressTests(unittest.TestCase):
         fake_download.remote = _remote
 
         with patch.object(modal_llamacpp_app, "download_model", fake_download):
-            with patch.object(
-                modal_llamacpp_app,
-                "_resolve_model_entrypoint",
-                side_effect=[RuntimeError("cache miss"), downloaded_path],
-            ):
-                selected = modal_llamacpp_app._resolve_or_download_model_entrypoint(
-                    repo_id="Edge-Quant/Nanbeige4.1-3B-Q4_K_M-GGUF",
-                    revision=None,
-                    quant="Q4_K_M",
-                )
+            with patch.object(modal_llamacpp_app, "model_cache", fake_cache):
+                with patch.object(
+                    modal_llamacpp_app,
+                    "_resolve_model_entrypoint",
+                    side_effect=[RuntimeError("cache miss"), downloaded_path],
+                ):
+                    selected = modal_llamacpp_app._resolve_or_download_model_entrypoint(
+                        repo_id="Edge-Quant/Nanbeige4.1-3B-Q4_K_M-GGUF",
+                        revision=None,
+                        quant="Q4_K_M",
+                    )
 
         self.assertEqual(selected, downloaded_path)
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0][0], "Edge-Quant/Nanbeige4.1-3B-Q4_K_M-GGUF")
         self.assertIn("*Q4_K_M*.gguf", calls[0][1])
+        fake_cache.reload.assert_called_once()
 
     def test_acquire_download_lease_raises_when_another_owner_is_active(self) -> None:
         fake_dict = FakeModalDict()

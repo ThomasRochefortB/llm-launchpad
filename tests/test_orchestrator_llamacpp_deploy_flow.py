@@ -54,12 +54,15 @@ class OrchestratorLlamaCppDeployFlowTests(unittest.TestCase):
         self.assertEqual(len(seen_commands), 2)
         prep_cmd, deploy_cmd = seen_commands
 
-        self.assertEqual(prep_cmd[:3], ["modal", "run", "llm_launchpad/backends/modal_llamacpp_app.py::main"])
+        self.assertEqual(
+            prep_cmd[:4],
+            ["modal", "run", "-m", "llm_launchpad.backends.modal_llamacpp_app::main"],
+        )
         self.assertIn("--preload", prep_cmd)
         self.assertNotIn("--deploy", prep_cmd)
 
-        self.assertEqual(deploy_cmd[:2], ["modal", "deploy"])
-        self.assertIn("llm_launchpad/backends/modal_llamacpp_app.py", deploy_cmd)
+        self.assertEqual(deploy_cmd[:3], ["modal", "deploy", "-m"])
+        self.assertIn("llm_launchpad.backends.modal_llamacpp_app", deploy_cmd)
         self.assertIn("--name", deploy_cmd)
         self.assertIn("llamacpp-test", deploy_cmd)
 

@@ -491,6 +491,10 @@ def _resolve_or_download_model_entrypoint(
     matches = download_model.remote(repo_id, allow_patterns, revision)
     if not matches:
         _raise_missing_gguf_match(repo_id, allow_patterns, revision)
+    # The download happens in a separate Modal function with the shared Volume
+    # mounted. Reload before re-resolving so this container sees the new snapshot
+    # immediately instead of failing one startup cycle behind.
+    model_cache.reload()
     return _resolve_model_entrypoint(repo_id, revision, quant)
 
 
@@ -1181,10 +1185,11 @@ def main(
     """Configure, optionally preload weights, and optionally deploy the server.
 
     Usage examples:
-      modal run llm_launchpad/backends/modal_llamacpp_app.py::main --preset qwen2.5-coder-7b --preload True --deploy True
-      modal run llm_launchpad/backends/modal_llamacpp_app.py::main --repo-id Qwen/Qwen2.5-Coder-7B-Instruct-GGUF --quant Q4_K_M --deploy True
+      modal run -m llm_launchpad.backends.modal_llamacpp_app::main --preset qwen2.5-coder-7b --preload True --deploy True
+      modal run -m llm_launchpad.backends.modal_llamacpp_app::main --repo-id Qwen/Qwen2.5-Coder-7B-Instruct-GGUF --quant Q4_K_M --deploy True
     """
     # Lazy import here so containers importing this module don't need the package
+    from llm_launchpad.core.paths import MODAL_LLAMACPP_SCRIPT
     from llm_launchpad.presets import PRESETS
 
     # Merge preset with explicit arguments
@@ -1230,9 +1235,9 @@ def main(
             _raise_missing_gguf_match(cfg["repo_id"], allow_patterns, cfg.get("revision"))
         print(f"✅ Weights cached in Modal Volume ({len(matches)} GGUF file(s)).")
 
-    this_file = Path(__file__).resolve()
+    module_ref = MODAL_LLAMACPP_SCRIPT
     print("\nNext steps:")
-    print(f"1) Deploy the server: modal deploy {this_file}")
+    print(f"1) Deploy the server: modal deploy -m {module_ref}")
     print("2) Once deployed, curl the server (OpenAI-compatible):")
     print("   Use the exact URL from the `Created web function serve => ...` line above.")
     print("   (Modal may truncate long labels and append a hash, so guessed hostnames can be wrong.)")
@@ -1243,12 +1248,12 @@ def main(
         "https://<ACTUAL_MODAL_WEB_URL>/v1/completions"
     )
     print("3) Faster iteration (avoids nested deploy after preload):")
-    print(f"   modal run {this_file}::main --preload True")
-    print(f"   modal deploy {this_file}")
+    print(f"   modal run -m {module_ref}::main --preload True")
+    print(f"   modal deploy -m {module_ref}")
     print("4) Image cache behavior (llama.cpp backend):")
     print("   Default: reuse cached image layers for faster runs.")
     print("   Force fresh latest image pull/build: set LLAMA_CPP_IMAGE_NO_CACHE=true")
-    print("   Example: LLAMA_CPP_IMAGE_NO_CACHE=true modal deploy " + str(this_file))
+    print(f"   Example: LLAMA_CPP_IMAGE_NO_CACHE=true modal deploy -m {module_ref}")
 
     if deploy:
         try:
@@ -1257,7 +1262,7 @@ def main(
                 "\nℹ️ `--deploy` runs `modal deploy` after this `modal run`, so a second image build is expected."
             )
             print("\n🚀 Deploying...")
-            subprocess.run(["modal", "deploy", str(this_file)], check=True)
+            subprocess.run(["modal", "deploy", "-m", module_ref], check=True)
             print("✅ Deploy triggered. Check the Modal dashboard for status.")
         except Exception as e:
             print(f"⚠️ Failed to deploy automatically: {e}")

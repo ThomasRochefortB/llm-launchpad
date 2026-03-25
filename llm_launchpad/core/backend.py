@@ -224,7 +224,7 @@ class ModalBackend:
 
     @staticmethod
     def build_deploy_command(backend: BackendType, app_name: Optional[str] = None) -> List[str]:
-        cmd = ["modal", "deploy", backend.script]
+        cmd = ["modal", "deploy", "-m", backend.script]
         if app_name:
             cmd += ["--name", app_name]
         return cmd
@@ -232,9 +232,9 @@ class ModalBackend:
     @staticmethod
     def build_run_command(config: DeploymentConfig) -> List[str]:
         if config.backend == BackendType.VLLM:
-            return ["modal", "run", BackendType.VLLM.script]
+            return ["modal", "run", "-m", BackendType.VLLM.script]
 
-        args: List[str] = ["modal", "run", f"{BackendType.LLAMACPP.script}::main"]
+        args: List[str] = ["modal", "run", "-m", f"{BackendType.LLAMACPP.script}::main"]
         if config.preset:
             args += ["--preset", config.preset]
         if config.repo_id:
@@ -265,7 +265,7 @@ class ModalBackend:
         entrypoint: str,
         args: Optional[List[str]] = None,
     ) -> List[str]:
-        cmd = ["modal", "run", f"{script}::{entrypoint}"]
+        cmd = ["modal", "run", "-m", f"{script}::{entrypoint}"]
         if args:
             cmd.extend(args)
         return cmd

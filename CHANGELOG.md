@@ -7,6 +7,12 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-03-25
+
+### Fixed
+- Fixed Modal backend invocation for installed PyPI and `uv tool` environments by switching llama.cpp and vLLM entrypoints from source-tree file paths to Python module references.
+- Fixed a llama.cpp startup race after on-demand GGUF downloads by reloading the shared Hugging Face cache volume before resolving the freshly downloaded snapshot.
+
 ## [1.0.0] - 2026-03-24
 
 ### Added
@@ -32,6 +38,7 @@ and this project follows [Semantic Versioning](https://semver.org/).
 - Initial packaged release of `llm-launchpad` with the Textual TUI, headless
   CLI management commands, and Modal vLLM / llama.cpp backends.
 
-[Unreleased]: https://github.com/ThomasRochefortB/llm-launchpad/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/ThomasRochefortB/llm-launchpad/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/ThomasRochefortB/llm-launchpad/releases/tag/v1.0.1
 [1.0.0]: https://github.com/ThomasRochefortB/llm-launchpad/releases/tag/v1.0.0
 [0.0.2]: https://github.com/ThomasRochefortB/llm-launchpad/releases/tag/v0.0.2
