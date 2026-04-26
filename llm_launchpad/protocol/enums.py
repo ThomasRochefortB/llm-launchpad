@@ -53,6 +53,7 @@ class OperationType(str, Enum):
     STATUS = "status"
     STOP = "stop"
     LIST = "list"
+    BENCHMARK = "benchmark"
     STORAGE_LIST = "storage_list"
     STORAGE_PREDOWNLOAD = "storage_predownload"
     STORAGE_DELETE = "storage_delete"

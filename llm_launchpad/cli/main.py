@@ -19,6 +19,11 @@ except Exception:
     Console = None  # type: ignore
 
 from ..core.backend import ModalBackend
+from ..core.benchmark import (
+    benchmark_config_from_endpoint,
+    merge_cached_benchmark_connections,
+    parse_concurrency_values,
+)
 from ..core.config import ConfigStore
 from ..core.modal_gpu import fetch_modal_gpu_types
 from ..core.naming import (
@@ -555,6 +560,92 @@ def status(
         _print_event(event)
         if isinstance(event, OperationCompleteEvent) and not event.success:
             raise typer.Exit(code=1)
+
+
+@app.command()
+def benchmark(
+    backend: str = typer.Option("llamacpp", help="Backend: llamacpp or vllm"),
+    server_url: Optional[str] = typer.Option(None, help="Deployed web URL"),
+    model: Optional[str] = typer.Option(None, "--model", help="Served model name to benchmark"),
+    function_slug: Optional[str] = typer.Option(
+        None, help="Modal function slug suffix used in endpoint URL fallback"
+    ),
+    instance_name: Optional[str] = typer.Option(None, help="Target instance name"),
+    app_name: Optional[str] = typer.Option(None, help="Target Modal app name"),
+    concurrency: str = typer.Option(
+        "1,2,4,8,16",
+        help="Comma or space separated concurrency sweep values",
+    ),
+    request_count: Optional[int] = typer.Option(
+        None,
+        min=1,
+        help="Requests per concurrency run (default: max(24, concurrency * 4))",
+    ),
+    input_tokens: int = typer.Option(550, min=1, help="Synthetic input token mean"),
+    output_tokens: int = typer.Option(256, min=1, help="Synthetic output token mean"),
+    tokenizer: str = typer.Option("gpt2", help="AIPerf tokenizer identifier"),
+    request_timeout_seconds: int = typer.Option(
+        300,
+        min=1,
+        help="Per-request timeout passed to AIPerf",
+    ),
+    output_dir: Optional[str] = typer.Option(None, help="Benchmark run output directory"),
+    aiperf_arg: Annotated[
+        Optional[list[str]],
+        typer.Option(
+            "--aiperf-arg",
+            help="Extra argument passed through to `aiperf profile`; repeat for multiple args",
+        ),
+    ] = None,
+) -> None:
+    """Benchmark a deployed OpenAI-compatible backend with AIPerf."""
+    orch, username = _preflight()
+    _print_banner()
+    bt = BackendType(backend)
+    target_app_name = _resolve_manage_app_name(bt, app_name, instance_name)
+    rows = _load_visible_launchpad_rows() or []
+    merge_cached_benchmark_connections(rows)
+    target_row = next((row for row in rows if (row.name or "").strip() == target_app_name), None)
+    if server_url is None and target_row is None:
+        server_url = ModalBackend.default_server_url(
+            username,
+            app_name=target_app_name,
+            function_slug=function_slug or os.environ.get("MODAL_FUNCTION_SLUG"),
+        )
+
+    try:
+        concurrency_values = parse_concurrency_values(concurrency)
+    except ValueError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+    config = benchmark_config_from_endpoint(
+        target_row,
+        backend=bt,
+        username=username,
+        app_name=target_app_name,
+        instance_name=instance_name,
+        server_url=server_url,
+        model_name=model,
+        concurrency=concurrency_values,
+        request_count=request_count,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        tokenizer=tokenizer,
+        request_timeout_seconds=request_timeout_seconds,
+        output_dir=output_dir,
+        aiperf_args=list(aiperf_arg or []),
+    )
+    if not (config.server_url or "").strip():
+        typer.echo("Error: could not resolve benchmark server URL.", err=True)
+        raise typer.Exit(code=1)
+    typer.echo(
+        f"Benchmark target: backend={bt.value} app={target_app_name} "
+        f"url={config.server_url} model={config.model_name}"
+    )
+    for event in orch.benchmark(config):
+        _print_event(event)
+        _raise_on_failed_completion(event)
 
 
 @app.command()

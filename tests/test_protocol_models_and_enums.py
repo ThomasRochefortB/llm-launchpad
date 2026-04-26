@@ -4,7 +4,14 @@ import unittest
 
 from llm_launchpad.core.paths import MODAL_LLAMACPP_SCRIPT, MODAL_VLLM_SCRIPT
 from llm_launchpad.protocol.enums import BackendType, OperationType
-from llm_launchpad.protocol.models import LaunchpadSettings, StorageSnapshot, StoredModelInfo
+from llm_launchpad.protocol.models import (
+    BenchmarkConcurrencyResult,
+    BenchmarkConfig,
+    BenchmarkRunSummary,
+    LaunchpadSettings,
+    StorageSnapshot,
+    StoredModelInfo,
+)
 
 
 class LaunchpadSettingsTests(unittest.TestCase):
@@ -38,6 +45,40 @@ class ProtocolEnumsTests(unittest.TestCase):
         self.assertEqual(OperationType.STORAGE_LIST.value, "storage_list")
         self.assertEqual(OperationType.STORAGE_PREDOWNLOAD.value, "storage_predownload")
         self.assertEqual(OperationType.STORAGE_DELETE.value, "storage_delete")
+
+    def test_benchmark_operation_type_exists(self) -> None:
+        self.assertEqual(OperationType.BENCHMARK.value, "benchmark")
+
+
+class BenchmarkModelsTests(unittest.TestCase):
+    def test_benchmark_config_defaults_to_balanced_synthetic_workload(self) -> None:
+        config = BenchmarkConfig()
+
+        self.assertEqual(config.concurrency, [1, 2, 4, 8, 16])
+        self.assertEqual(config.input_tokens, 550)
+        self.assertEqual(config.output_tokens, 256)
+        self.assertEqual(config.tokenizer, "gpt2")
+        self.assertEqual(config.request_timeout_seconds, 300)
+        self.assertEqual(config.aiperf_args, [])
+
+    def test_benchmark_run_summary_stores_results(self) -> None:
+        config = BenchmarkConfig(app_name="vllm-qwen")
+        result = BenchmarkConcurrencyResult(
+            concurrency=1,
+            command=["aiperf", "profile"],
+            artifact_dir="/tmp/c1",
+            metrics={"output_token_throughput": 12.5},
+        )
+        summary = BenchmarkRunSummary(
+            config=config,
+            run_dir="/tmp/run",
+            results=[result],
+            best_concurrency=1,
+            best_output_token_throughput=12.5,
+        )
+
+        self.assertEqual(summary.results[0].concurrency, 1)
+        self.assertEqual(summary.best_concurrency, 1)
 
 
 class StorageModelsTests(unittest.TestCase):

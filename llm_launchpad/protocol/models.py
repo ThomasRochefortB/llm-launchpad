@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
 from .enums import BackendType
@@ -90,6 +90,52 @@ class EndpointInfo:
     quant: Optional[str] = None
     runtime_status: Optional[str] = None
     runtime_status_detail: Optional[str] = None
+
+
+@dataclass
+class BenchmarkConfig:
+    """Parameters for benchmarking a deployed OpenAI-compatible endpoint."""
+
+    backend: BackendType = BackendType.LLAMACPP
+    app_name: Optional[str] = None
+    instance_name: Optional[str] = None
+    server_url: Optional[str] = None
+    model_name: Optional[str] = None
+    concurrency: list[int] = field(default_factory=lambda: [1, 2, 4, 8, 16])
+    request_count: Optional[int] = None
+    input_tokens: int = 550
+    output_tokens: int = 256
+    tokenizer: str = "gpt2"
+    request_timeout_seconds: int = 300
+    output_dir: Optional[str] = None
+    aiperf_args: list[str] = field(default_factory=list)
+
+
+@dataclass
+class BenchmarkConcurrencyResult:
+    """Benchmark result for one concurrency value."""
+
+    concurrency: int
+    command: list[str]
+    artifact_dir: str
+    exit_code: int = 0
+    success: bool = True
+    detail: str = ""
+    json_export_path: Optional[str] = None
+    csv_export_path: Optional[str] = None
+    metrics: dict[str, Optional[float]] = field(default_factory=dict)
+
+
+@dataclass
+class BenchmarkRunSummary:
+    """Summary of a benchmark sweep."""
+
+    config: BenchmarkConfig
+    run_dir: str
+    results: list[BenchmarkConcurrencyResult] = field(default_factory=list)
+    success: bool = True
+    best_concurrency: Optional[int] = None
+    best_output_token_throughput: Optional[float] = None
 
 
 @dataclass

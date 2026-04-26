@@ -6,7 +6,7 @@ from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical
-from textual.widgets import Footer, Input, OptionList, Static, Switch
+from textual.widgets import Button, Footer, Input, OptionList, Static, Switch
 from textual.widgets.option_list import Option
 
 from ...protocol.models import EndpointInfo
@@ -50,6 +50,16 @@ def _build_backend_app_options(
     return options, option_to_target
 
 
+def _set_option_list_options(option_list: OptionList, options: list[Option]) -> None:
+    """Replace all options using the Textual API available across supported versions."""
+    setter = getattr(option_list, "set_options", None)
+    if callable(setter):
+        setter(options)
+        return
+    option_list.clear_options()
+    option_list.add_options(options)
+
+
 class ManageScreen(CopyEnabledScreen):
     """Manage endpoints: pick action, then pick backend and params."""
 
@@ -65,6 +75,7 @@ class ManageScreen(CopyEnabledScreen):
                 Option("  List apps                 Show active launchpad Modal apps", id="list"),
                 Option("  Status check              Probe endpoint health", id="status"),
                 Option("  Tail logs                 Stream Modal app logs", id="logs"),
+                Option("  Benchmark                 Measure endpoint throughput", id="benchmark"),
                 Option("  Stop app                  Stop an active Modal app", id="stop"),
                 id="manage-action-list",
             )
@@ -84,6 +95,8 @@ class ManageScreen(CopyEnabledScreen):
             self.app.push_screen(StatusParamsScreen())
         elif opt == "logs":
             self.app.push_screen(LogsParamsScreen())
+        elif opt == "benchmark":
+            self.app.push_screen(BenchmarkParamsScreen())
         elif opt == "stop":
             self.app.push_screen(StopParamsScreen())
 
@@ -155,12 +168,12 @@ class StatusParamsScreen(CopyEnabledScreen):
         checkable_instances = [row for row in instances if _is_stoppable_state(row.state)]
         if not checkable_instances:
             self._row_by_option_id = {}
-            instance_list.set_options([Option("  No active apps found")])
+            _set_option_list_options(instance_list, [Option("  No active apps found")])
             if instance_list.option_count > 0:
                 instance_list.highlighted = 0
             return
         options, self._row_by_option_id = _build_backend_app_options(checkable_instances)
-        instance_list.set_options(options)
+        _set_option_list_options(instance_list, options)
         if options:
             instance_list.highlighted = 0
 
@@ -215,12 +228,128 @@ class LogsParamsScreen(CopyEnabledScreen):
         loggable_instances = [row for row in instances if _is_stoppable_state(row.state)]
         if not loggable_instances:
             self._target_by_option_id = {}
-            instance_list.set_options([Option("  No active apps found")])
+            _set_option_list_options(instance_list, [Option("  No active apps found")])
             if instance_list.option_count > 0:
                 instance_list.highlighted = 0
             return
         options, self._target_by_option_id = _build_backend_app_options(loggable_instances)
-        instance_list.set_options(options)
+        _set_option_list_options(instance_list, options)
+        if options:
+            instance_list.highlighted = 0
+
+    def action_pop_screen(self) -> None:
+        self.app.pop_screen()
+
+
+class BenchmarkParamsScreen(CopyEnabledScreen):
+    """Params for running an AIPerf benchmark against an active endpoint."""
+
+    BINDINGS = [
+        Binding("escape", "pop_screen", "Back", show=True),
+        Binding("enter", "do_submit", "Benchmark", show=True),
+        Binding("ctrl+b", "do_submit", "Benchmark", show=True),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="menu-container"):
+            yield Static("[bold #7bf168]Benchmark[/]")
+            yield Static("")
+            yield Static("[bold]Choose active app[/bold]")
+            yield OptionList(id="benchmark-instance-list")
+            yield FormField(
+                "Concurrency sweep",
+                "benchmark-concurrency",
+                default="1,2,4,8,16",
+                hint="Comma or space separated values.",
+            )
+            yield FormField(
+                "Request count (optional)",
+                "benchmark-request-count",
+                hint="Blank uses max(24, concurrency * 4).",
+            )
+            yield FormField("Input tokens", "benchmark-input-tokens", default="550")
+            yield FormField("Output tokens", "benchmark-output-tokens", default="256")
+            yield FormField("Tokenizer", "benchmark-tokenizer", default="gpt2")
+            yield FormField(
+                "Output directory (optional)",
+                "benchmark-output-dir",
+                hint="Blank stores under ~/.llm_launchpad/benchmarks.",
+            )
+            yield Static("", id="benchmark-feedback")
+            yield Button("Benchmark", id="benchmark-submit", variant="primary")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._selected_row: EndpointInfo | None = None
+        self._row_by_option_id: dict[str, EndpointInfo] = {}
+        self._load_instances()
+        self.query_one("#benchmark-instance-list", OptionList).focus()
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if event.option_list.id != "benchmark-instance-list":
+            return
+        selected = str(event.option.id)
+        self._selected_row = self._row_by_option_id.get(selected)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "benchmark-submit":
+            self._submit()
+
+    def action_do_submit(self) -> None:
+        self._submit()
+
+    def _submit(self) -> None:
+        row = self._selected_row or self._highlighted_row()
+        if row is None or row.backend is None:
+            self.query_one("#benchmark-feedback", Static).update("[yellow]Choose an app first.[/yellow]")
+            return
+        request_count_text = self.query_one("#benchmark-request-count", Input).value.strip()
+        request_count: int | None = None
+        if request_count_text:
+            try:
+                request_count = int(request_count_text)
+            except ValueError:
+                self.query_one("#benchmark-feedback", Static).update(
+                    "[red]Request count must be an integer.[/red]"
+                )
+                return
+        try:
+            input_tokens = int(self.query_one("#benchmark-input-tokens", Input).value.strip() or "550")
+            output_tokens = int(self.query_one("#benchmark-output-tokens", Input).value.strip() or "256")
+        except ValueError:
+            self.query_one("#benchmark-feedback", Static).update(
+                "[red]Token lengths must be integers.[/red]"
+            )
+            return
+        self.app.begin_benchmark(  # type: ignore[attr-defined]
+            row,
+            concurrency=self.query_one("#benchmark-concurrency", Input).value,
+            request_count=request_count,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            tokenizer=self.query_one("#benchmark-tokenizer", Input).value,
+            output_dir=self.query_one("#benchmark-output-dir", Input).value.strip() or None,
+        )
+
+    def _highlighted_row(self) -> EndpointInfo | None:
+        instance_list = self.query_one("#benchmark-instance-list", OptionList)
+        highlighted = instance_list.highlighted_option
+        if highlighted is None:
+            return None
+        return self._row_by_option_id.get(str(highlighted.id))
+
+    def _load_instances(self) -> None:
+        instance_list = self.query_one("#benchmark-instance-list", OptionList)
+        instances = self.app.list_instances()  # type: ignore[attr-defined]
+        benchmarkable_instances = [row for row in instances if _is_stoppable_state(row.state)]
+        if not benchmarkable_instances:
+            self._row_by_option_id = {}
+            _set_option_list_options(instance_list, [Option("  No active apps found")])
+            if instance_list.option_count > 0:
+                instance_list.highlighted = 0
+            return
+        options, self._row_by_option_id = _build_backend_app_options(benchmarkable_instances)
+        _set_option_list_options(instance_list, options)
         if options:
             instance_list.highlighted = 0
 
@@ -295,12 +424,12 @@ class StopParamsScreen(CopyEnabledScreen):
         stoppable_instances = [row for row in instances if _is_stoppable_state(row.state)]
         if not stoppable_instances:
             self._target_by_option_id = {}
-            instance_list.set_options([Option("  No active apps found")])
+            _set_option_list_options(instance_list, [Option("  No active apps found")])
             if instance_list.option_count > 0:
                 instance_list.highlighted = 0
             return
         options, self._target_by_option_id = _build_backend_app_options(stoppable_instances)
-        instance_list.set_options(options)
+        _set_option_list_options(instance_list, options)
         if options:
             instance_list.highlighted = 0
 

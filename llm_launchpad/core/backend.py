@@ -136,6 +136,8 @@ class ModalBackend:
         served_model_name: Optional[str] = None,
     ) -> str:
         base = server_url.rstrip("/")
+        if base.endswith("/v1"):
+            base = base[: -len("/v1")].rstrip("/")
         content = "Say hello in one short sentence."
 
         def _curl_json(endpoint: str, payload: Dict[str, Any]) -> str:

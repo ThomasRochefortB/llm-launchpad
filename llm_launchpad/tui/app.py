@@ -19,6 +19,7 @@ from textual.app import App
 from textual.binding import Binding
 
 from ..core.backend import ModalBackend
+from ..core.benchmark import benchmark_config_from_endpoint, parse_concurrency_values
 from ..core.config import SETTINGS_DIR
 from ..core.hf_models import fetch_gguf_quant_metadata, list_llamacpp_candidates, list_vllm_candidates
 from ..core.naming import (
@@ -35,6 +36,7 @@ from ..core.opencode import (
 from ..core.orchestrator import Orchestrator
 from ..protocol.enums import BackendType, OperationType
 from ..protocol.events import ErrorEvent, LogEvent, OperationCompleteEvent
+from ..protocol.models import BenchmarkConfig
 from ..protocol.models import EndpointInfo
 from ..protocol.models import DeploymentConfig
 from ..protocol.models import StoredModelInfo
@@ -459,6 +461,58 @@ class TuiApp(App):
             timeout,
             served_model_name=served_model_name,
         ):
+            _dispatch_event(monitor, event)
+
+    # ------------------------------------------------------------------
+    # Manage: benchmark
+    # ------------------------------------------------------------------
+
+    def begin_benchmark(
+        self,
+        row: EndpointInfo,
+        *,
+        concurrency: str = "1,2,4,8,16",
+        request_count: int | None = None,
+        input_tokens: int = 550,
+        output_tokens: int = 256,
+        tokenizer: str = "gpt2",
+        output_dir: str | None = None,
+    ) -> None:
+        if row.backend is None:
+            self.notify("Choose a Launchpad-managed app to benchmark.", severity="error", timeout=6)
+            return
+        try:
+            concurrency_values = parse_concurrency_values(concurrency)
+        except ValueError as exc:
+            self.notify(str(exc), title="Invalid concurrency", severity="error", timeout=6)
+            return
+        config = benchmark_config_from_endpoint(
+            row,
+            backend=row.backend,
+            username=self._username,
+            app_name=row.name,
+            instance_name=row.instance_name,
+            concurrency=concurrency_values,
+            request_count=request_count,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            tokenizer=tokenizer,
+            output_dir=output_dir,
+        )
+        monitor = MonitorScreen(title="Benchmark")
+        self.push_screen(monitor)
+        self.run_worker(
+            lambda: self._run_benchmark(config, monitor),
+            name="benchmark-worker",
+            thread=True,
+        )
+
+    def _run_benchmark(
+        self,
+        config: BenchmarkConfig,
+        monitor: MonitorScreen,
+    ):  # type: ignore[return]
+        for event in self._orchestrator.benchmark(config):
             _dispatch_event(monitor, event)
 
     # ------------------------------------------------------------------
