@@ -421,8 +421,10 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
 
     def test_check_status_llamacpp_uses_served_model_name_in_probe_and_test_command(self) -> None:
         captured_payloads: list[str] = []
+        captured_urls: list[str] = []
 
-        def _post(*_args, **kwargs):
+        def _post(url, **kwargs):
+            captured_urls.append(str(url))
             captured_payloads.append(str(kwargs.get("data", "")))
             return _Response(200, '{"choices":[{"text":"ok"}]}')
 
@@ -433,19 +435,20 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
                 return_value="curl ok",
             ) as curl_mock:
                 events = list(
-                    Orchestrator().check_status(
-                        backend=BackendType.LLAMACPP,
-                        server_url="https://example.modal.run",
-                        timeout=5,
-                        served_model_name="Nanbeige4.1-3B-Q4_K_M-GGUF",
-                    )
+                            Orchestrator().check_status(
+                                backend=BackendType.LLAMACPP,
+                                server_url="https://example.modal.run/v1",
+                                timeout=5,
+                                served_model_name="Nanbeige4.1-3B-Q4_K_M-GGUF",
+                            )
                 )
 
         self.assertEqual(len(captured_payloads), 1)
+        self.assertEqual(captured_urls, ["https://example.modal.run/v1/completions"])
         self.assertIn('"model": "Nanbeige4.1-3B-Q4_K_M-GGUF"', captured_payloads[0])
         curl_mock.assert_called_once_with(
             BackendType.LLAMACPP,
-            "https://example.modal.run",
+            "https://example.modal.run/v1",
             served_model_name="Nanbeige4.1-3B-Q4_K_M-GGUF",
         )
         self.assertTrue(

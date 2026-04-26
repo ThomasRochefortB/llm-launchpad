@@ -10,6 +10,7 @@ from textual.widgets import OptionList
 from llm_launchpad.protocol.enums import BackendType
 from llm_launchpad.protocol.models import EndpointInfo
 from llm_launchpad.tui.screens.manage import (
+    BenchmarkParamsScreen,
     LogsParamsScreen,
     ManageScreen,
     StatusParamsScreen,
@@ -24,6 +25,7 @@ class _TestApp(App[None]):
         self.pushed: list[object] = []
         self.status_calls: list[tuple[BackendType, str | None, int, str | None, str | None]] = []
         self.logs_calls: list[tuple[BackendType, bool, str | None, str | None]] = []
+        self.benchmark_calls: list[tuple[EndpointInfo, str, int | None, int, int, str, str | None]] = []
         self.stop_calls: list[tuple[BackendType, str | None, str | None]] = []
         self.instances_by_backend: dict[BackendType, list[EndpointInfo]] = {
             BackendType.LLAMACPP: [],
@@ -61,6 +63,21 @@ class _TestApp(App[None]):
     ) -> None:
         self.logs_calls.append((backend, follow, app_name, app_id))
 
+    def begin_benchmark(  # type: ignore[no-untyped-def]
+        self,
+        row,
+        *,
+        concurrency="1,2,4,8,16",
+        request_count=None,
+        input_tokens=550,
+        output_tokens=256,
+        tokenizer="gpt2",
+        output_dir=None,
+    ) -> None:
+        self.benchmark_calls.append(
+            (row, concurrency, request_count, input_tokens, output_tokens, tokenizer, output_dir)
+        )
+
     def begin_stop(  # type: ignore[no-untyped-def]
         self,
         backend,
@@ -93,7 +110,7 @@ class ManageScreenRoutingTests(unittest.IsolatedAsyncioTestCase):
             screen = app.screen
             assert isinstance(screen, ManageScreen)
 
-            for option_id in ["list", "status", "logs", "stop"]:
+            for option_id in ["list", "status", "logs", "benchmark", "stop"]:
                 screen.on_option_list_option_selected(
                     SimpleNamespace(option=SimpleNamespace(id=option_id))
                 )
@@ -102,6 +119,7 @@ class ManageScreenRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app.list_called, 1)
         self.assertTrue(any(isinstance(s, StatusParamsScreen) for s in app.pushed))
         self.assertTrue(any(isinstance(s, LogsParamsScreen) for s in app.pushed))
+        self.assertTrue(any(isinstance(s, BenchmarkParamsScreen) for s in app.pushed))
         self.assertTrue(any(isinstance(s, StopParamsScreen) for s in app.pushed))
 
     async def test_status_params_menu_is_arrow_navigable(self) -> None:
@@ -153,6 +171,45 @@ class ManageScreenRoutingTests(unittest.IsolatedAsyncioTestCase):
             assert first is not None
             assert second is not None
             self.assertNotEqual(first.id, second.id)
+
+    async def test_benchmark_params_submits_selected_instance_and_defaults(self) -> None:
+        app = _TestApp()
+        app.instances_by_backend[BackendType.VLLM] = [
+            EndpointInfo(
+                name="vllm-beta",
+                app_id="ap-vllm",
+                state="deployed",
+                backend=BackendType.VLLM,
+                web_url="https://alice--vllm-beta-serve.modal.run",
+                served_model_name="Qwen3-4B",
+            ),
+        ]
+
+        async with app.run_test() as pilot:
+            app.push_screen(BenchmarkParamsScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, BenchmarkParamsScreen)
+            instance_list = screen.query_one("#benchmark-instance-list", OptionList)
+            highlighted = instance_list.highlighted_option
+            self.assertIsNotNone(highlighted)
+            screen.on_option_list_option_selected(
+                SimpleNamespace(option=highlighted, option_list=instance_list)
+            )
+            screen.action_do_submit()
+            await pilot.pause()
+
+        self.assertEqual(len(app.benchmark_calls), 1)
+        row, concurrency, request_count, input_tokens, output_tokens, tokenizer, output_dir = (
+            app.benchmark_calls[0]
+        )
+        self.assertEqual(row.name, "vllm-beta")
+        self.assertEqual(concurrency, "1,2,4,8,16")
+        self.assertIsNone(request_count)
+        self.assertEqual(input_tokens, 550)
+        self.assertEqual(output_tokens, 256)
+        self.assertEqual(tokenizer, "gpt2")
+        self.assertIsNone(output_dir)
 
     async def test_stop_params_refreshes_instances_on_resume(self) -> None:
         app = _TestApp()

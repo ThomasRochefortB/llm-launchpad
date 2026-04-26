@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import json
 import os
+from pathlib import Path
 import queue
 import re
 import subprocess
@@ -27,8 +28,20 @@ from ..protocol.events import (
     StateChangeEvent,
 )
 from ..protocol.models import DeploymentConfig, EndpointInfo
+from ..protocol.models import BenchmarkConcurrencyResult, BenchmarkConfig
 from ..protocol.models import StoredModelInfo, StorageSnapshot
 
+from .benchmark import (
+    aiperf_metrics_have_successful_requests,
+    aiperf_cli_path,
+    build_aiperf_command,
+    build_run_summary,
+    expected_export_paths,
+    format_benchmark_summary,
+    default_benchmark_run_dir,
+    parse_aiperf_summary,
+    write_run_summary,
+)
 from .backend import ModalBackend
 from .config import ConfigStore
 from .modal_auth import get_modal_auth_status
@@ -150,6 +163,20 @@ def _probe_response_is_ready(backend: BackendType, status_code: int, body: str) 
     if isinstance(payload.get("error"), dict):
         return False, "error response"
     return False, "missing completions choices"
+
+
+def _endpoint_root_url(server_url: str) -> str:
+    """Normalize an OpenAI-compatible URL to the host/function root."""
+    root = (server_url or "").strip().rstrip("/")
+    if root.endswith("/v1"):
+        return root[: -len("/v1")].rstrip("/")
+    return root
+
+
+def _status_probe_url(backend: BackendType, server_url: str) -> str:
+    """Build the readiness probe URL without duplicating API path segments."""
+    root = _endpoint_root_url(server_url)
+    return root + ("/health" if backend == BackendType.VLLM else "/v1/completions")
 
 
 class Orchestrator:
@@ -349,7 +376,7 @@ class Orchestrator:
         )
 
         is_vllm = backend == BackendType.VLLM
-        probe_url = server_url.rstrip("/") + ("/health" if is_vllm else "/v1/completions")
+        probe_url = _status_probe_url(backend, server_url)
         yield LogEvent(line=f"Probing readiness at: {probe_url}")
 
         # Start log tailing in background.
@@ -663,7 +690,7 @@ class Orchestrator:
     ) -> EventStream:
         """Probe endpoint health with backoff."""
         is_vllm = backend == BackendType.VLLM
-        probe_url = server_url.rstrip("/") + ("/health" if is_vllm else "/v1/completions")
+        probe_url = _status_probe_url(backend, server_url)
 
         yield StateChangeEvent(
             current=DeploymentState.RUNNING,
@@ -774,6 +801,184 @@ class Orchestrator:
             if ModalBackend._shutdown_event.wait(timeout=backoff):
                 return
             backoff = min(max_backoff, backoff * 1.5)
+
+    # ------------------------------------------------------------------
+    # Benchmark
+    # ------------------------------------------------------------------
+
+    def benchmark(self, config: BenchmarkConfig) -> EventStream:
+        """Run an AIPerf benchmark sweep against a deployed endpoint."""
+        executable = aiperf_cli_path()
+        if not executable:
+            message = (
+                "AIPerf CLI not found. Install benchmark support with: "
+                'uv tool install "llm-launchpad[benchmark]". '
+                "For a local checkout, run: uv sync --extra benchmark "
+                "or launch with: uv run --extra benchmark llm-launchpad"
+            )
+            yield ErrorEvent(
+                message=message,
+                operation=OperationType.BENCHMARK,
+                recoverable=False,
+            )
+            yield OperationCompleteEvent(
+                operation=OperationType.BENCHMARK,
+                success=False,
+                exit_code=1,
+                detail=message,
+            )
+            return
+
+        app_name = (config.app_name or config.instance_name or "endpoint").strip()
+        run_dir = Path(config.output_dir).expanduser() if config.output_dir else default_benchmark_run_dir(app_name)
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        yield StateChangeEvent(
+            current=DeploymentState.RUNNING,
+            operation=OperationType.BENCHMARK,
+            detail=f"Benchmarking {config.server_url}",
+        )
+        yield LogEvent(
+            line=(
+                f"Benchmark target: app={config.app_name or '-'} "
+                f"backend={config.backend.value} url={config.server_url} "
+                f"model={config.model_name}"
+            ),
+            operation=OperationType.BENCHMARK,
+        )
+        yield LogEvent(line=f"Artifact root: {run_dir}", operation=OperationType.BENCHMARK)
+
+        results: list[BenchmarkConcurrencyResult] = []
+        for concurrency in config.concurrency:
+            if ModalBackend.is_shutting_down():
+                return
+            artifact_dir = run_dir / f"c{concurrency}"
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                cmd = build_aiperf_command(
+                    config,
+                    concurrency=concurrency,
+                    artifact_dir=artifact_dir,
+                    executable=executable,
+                )
+            except Exception as exc:
+                detail = str(exc)
+                yield ErrorEvent(
+                    message=detail,
+                    operation=OperationType.BENCHMARK,
+                    exit_code=1,
+                    recoverable=False,
+                )
+                results.append(
+                    BenchmarkConcurrencyResult(
+                        concurrency=concurrency,
+                        command=[],
+                        artifact_dir=str(artifact_dir),
+                        exit_code=1,
+                        success=False,
+                        detail=detail,
+                    )
+                )
+                continue
+
+            yield StateChangeEvent(
+                current=DeploymentState.RUNNING,
+                operation=OperationType.BENCHMARK,
+                detail=f"concurrency={concurrency}",
+            )
+            yield LogEvent(
+                line=f"Running AIPerf concurrency={concurrency}: {' '.join(cmd)}",
+                operation=OperationType.BENCHMARK,
+            )
+
+            exit_code = 0
+            success = True
+            detail = ""
+            saw_completion = False
+            for event in ModalBackend.run_streaming(cmd):
+                if isinstance(event, LogEvent):
+                    yield LogEvent(
+                        line=event.line,
+                        stream=event.stream,
+                        operation=OperationType.BENCHMARK,
+                    )
+                elif isinstance(event, ErrorEvent):
+                    success = False
+                    exit_code = event.exit_code or 1
+                    detail = event.message
+                    yield ErrorEvent(
+                        message=event.message,
+                        operation=OperationType.BENCHMARK,
+                        exit_code=event.exit_code,
+                        recoverable=event.recoverable,
+                    )
+                    break
+                elif isinstance(event, OperationCompleteEvent):
+                    saw_completion = True
+                    success = event.success
+                    exit_code = event.exit_code
+                    detail = event.detail
+
+            if not saw_completion and success:
+                success = False
+                exit_code = 1
+                detail = "AIPerf command finished without a completion event."
+
+            json_path, csv_path = expected_export_paths(artifact_dir)
+            metrics: dict[str, Optional[float]] = {}
+            if success:
+                try:
+                    metrics, parsed_path = parse_aiperf_summary(json_path, csv_path)
+                    yield LogEvent(
+                        line=f"Parsed AIPerf export: {parsed_path}",
+                        operation=OperationType.BENCHMARK,
+                    )
+                    if not aiperf_metrics_have_successful_requests(metrics):
+                        success = False
+                        exit_code = 1
+                        detail = "AIPerf export did not contain completed request metrics."
+                        yield ErrorEvent(
+                            message=detail,
+                            operation=OperationType.BENCHMARK,
+                            exit_code=exit_code,
+                            recoverable=True,
+                        )
+                except Exception as exc:
+                    success = False
+                    exit_code = 1
+                    detail = f"AIPerf finished but export parsing failed: {exc}"
+                    yield ErrorEvent(
+                        message=detail,
+                        operation=OperationType.BENCHMARK,
+                        exit_code=exit_code,
+                        recoverable=True,
+                    )
+
+            results.append(
+                BenchmarkConcurrencyResult(
+                    concurrency=concurrency,
+                    command=cmd,
+                    artifact_dir=str(artifact_dir),
+                    exit_code=exit_code,
+                    success=success,
+                    detail=detail,
+                    json_export_path=str(json_path) if json_path.exists() else None,
+                    csv_export_path=str(csv_path) if csv_path.exists() else None,
+                    metrics=metrics,
+                )
+            )
+
+        summary = build_run_summary(config, run_dir, results)
+        summary_path = write_run_summary(summary)
+        for line in format_benchmark_summary(summary):
+            yield LogEvent(line=line, operation=OperationType.BENCHMARK)
+        yield OperationCompleteEvent(
+            operation=OperationType.BENCHMARK,
+            success=summary.success,
+            exit_code=0 if summary.success else 1,
+            detail="" if summary.success else f"One or more benchmark runs failed. See {summary_path}",
+            data=summary,
+        )
 
     # ------------------------------------------------------------------
     # List

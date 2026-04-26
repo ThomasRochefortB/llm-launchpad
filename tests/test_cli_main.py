@@ -494,6 +494,82 @@ class CliMainCommandTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(calls, [(BackendType.VLLM, False, "vllm-qwen3")])
 
+    def test_benchmark_maps_cli_options_to_benchmark_config(self) -> None:
+        captured = {}
+        row = EndpointInfo(
+            name="vllm-qwen3",
+            backend=BackendType.VLLM,
+            state="running",
+            web_url="https://alice--vllm-qwen3-serve.modal.run",
+            served_model_name="Qwen3-4B",
+        )
+
+        def _benchmark(config):  # type: ignore[no-untyped-def]
+            captured["config"] = config
+            return [OperationCompleteEvent(operation=OperationType.BENCHMARK, success=True, exit_code=0)]
+
+        orch = SimpleNamespace(benchmark=_benchmark)
+        with (
+            patch("llm_launchpad.cli.main._preflight", return_value=(orch, "alice")),
+            patch("llm_launchpad.cli.main._print_banner", return_value=None),
+            patch("llm_launchpad.cli.main._load_visible_launchpad_rows", return_value=[row]),
+        ):
+            result = self.runner.invoke(
+                cli_main.app,
+                [
+                    "benchmark",
+                    "--backend",
+                    "vllm",
+                    "--app-name",
+                    "vllm-qwen3",
+                    "--concurrency",
+                    "1,4",
+                    "--request-count",
+                    "33",
+                    "--input-tokens",
+                    "1024",
+                    "--output-tokens",
+                    "128",
+                    "--tokenizer",
+                    "gpt2",
+                    "--request-timeout-seconds",
+                    "45",
+                    "--output-dir",
+                    "/tmp/bench",
+                    "--aiperf-arg",
+                    "--warmup-request-count",
+                    "--aiperf-arg",
+                    "2",
+                ],
+            )
+        self.assertEqual(result.exit_code, 0)
+        config = captured["config"]
+        self.assertEqual(config.backend, BackendType.VLLM)
+        self.assertEqual(config.app_name, "vllm-qwen3")
+        self.assertEqual(config.server_url, "https://alice--vllm-qwen3-serve.modal.run")
+        self.assertEqual(config.model_name, "Qwen3-4B")
+        self.assertEqual(config.concurrency, [1, 4])
+        self.assertEqual(config.request_count, 33)
+        self.assertEqual(config.input_tokens, 1024)
+        self.assertEqual(config.output_tokens, 128)
+        self.assertEqual(config.request_timeout_seconds, 45)
+        self.assertEqual(config.output_dir, "/tmp/bench")
+        self.assertEqual(config.aiperf_args, ["--warmup-request-count", "2"])
+
+    def test_benchmark_invalid_concurrency_returns_error(self) -> None:
+        orch = SimpleNamespace(benchmark=lambda _config: [])
+        with (
+            patch("llm_launchpad.cli.main._preflight", return_value=(orch, "alice")),
+            patch("llm_launchpad.cli.main._print_banner", return_value=None),
+            patch("llm_launchpad.cli.main._load_visible_launchpad_rows", return_value=[]),
+        ):
+            result = self.runner.invoke(
+                cli_main.app,
+                ["benchmark", "--backend", "vllm", "--app-name", "vllm-qwen3", "--concurrency", "bad"],
+            )
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("Invalid concurrency", result.output)
+
     def test_stop_without_yes_can_abort(self) -> None:
         orch = SimpleNamespace(stop_app=lambda *_args, **_kwargs: [])
         with patch("llm_launchpad.cli.main._preflight", return_value=(orch, "alice")):

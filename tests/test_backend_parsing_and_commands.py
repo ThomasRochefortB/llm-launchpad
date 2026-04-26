@@ -268,11 +268,12 @@ class BackendParsingAndCommandTests(unittest.TestCase):
     def test_test_curl_command_llamacpp_is_copy_paste_ready(self) -> None:
         cmd = ModalBackend.test_curl_command(
             BackendType.LLAMACPP,
-            "https://example.modal.run/",
+            "https://example.modal.run/v1",
         )
         self.assertTrue(
             cmd.startswith("curl -s -X POST https://example.modal.run/v1/completions ")
         )
+        self.assertNotIn("/v1/v1/completions", cmd)
         self.assertIn('"prompt":"Say hello in one short sentence."', cmd)
 
     def test_test_curl_command_llamacpp_uses_served_model_name_when_provided(self) -> None:
