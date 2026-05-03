@@ -3,7 +3,6 @@ import os
 from pathlib import Path
 from typing import Any
 
-import aiohttp
 import modal
 
 
@@ -120,7 +119,6 @@ vllm_image = (
     .uv_pip_install(
         "vllm==0.13.0",
         "huggingface-hub==0.36.0",
-        "aiohttp>=3.9.5",
     )
     .env(
         {
@@ -240,61 +238,3 @@ def serve() -> None:
     print(" ", shlex.join(cmd))
     subprocess.Popen(cmd)
 
-
-@app.local_entrypoint()
-async def test(
-    test_timeout: int = 10 * MINUTES,
-    content: str | None = None,
-    twice: bool = True,
-) -> None:
-    url = serve.get_web_url()
-    served_model_name = os.environ.get("SERVED_MODEL_NAME", DEPLOY_SERVED_MODEL_NAME).strip() or DEPLOY_SERVED_MODEL_NAME
-
-    system_prompt = {
-        "role": "system",
-        "content": "You are a pirate who can't help but drop sly reminders that he went to Harvard.",
-    }
-    if content is None:
-        content = "Explain the singular value decomposition."
-
-    messages = [
-        system_prompt,
-        {"role": "user", "content": content},
-    ]
-
-    async with aiohttp.ClientSession(base_url=url) as session:
-        print(f"Running health check for server at {url}")
-        async with session.get("/health", timeout=test_timeout - 1 * MINUTES) as resp:
-            up = resp.status == 200
-        assert up, f"Failed health check for server at {url}"
-        print(f"Successful health check for server at {url}")
-
-        print(f"Sending messages to {url}:", *messages, sep="\n\t")
-        await _send_request(session, served_model_name, messages)
-        if twice:
-            messages[0]["content"] = "You are Jar Jar Binks."
-            print(f"Sending messages to {url}:", *messages, sep="\n\t")
-            await _send_request(session, served_model_name, messages)
-
-
-async def _send_request(
-    session: aiohttp.ClientSession,
-    model: str,
-    messages: list[dict[str, str]],
-) -> None:
-    payload: dict[str, Any] = {"messages": messages, "model": model, "stream": True}
-    headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
-
-    async with session.post("/v1/chat/completions", json=payload, headers=headers) as resp:
-        async for raw in resp.content:
-            resp.raise_for_status()
-            line = raw.decode().strip()
-            if not line or line == "data: [DONE]":
-                continue
-            if line.startswith("data: "):
-                line = line[len("data: ") :]
-
-            chunk = json.loads(line)
-            assert chunk["object"] == "chat.completion.chunk"
-            print(chunk["choices"][0]["delta"].get("content", ""), end="")
-    print()
