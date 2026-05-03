@@ -290,6 +290,76 @@ def _sync_opencode_cli(
         typer.echo(line)
 
 
+def _deploy_and_maybe_warmup(
+    orch: Orchestrator,
+    *,
+    username: str,
+    backend: BackendType,
+    config: DeploymentConfig,
+    server_url: Optional[str],
+    do_warmup: bool,
+    timeout: int,
+    tail_logs: bool,
+) -> None:
+    """Run deploy, optional warmup, and OpenCode sync for CLI commands."""
+    deployed_web_url: Optional[str] = None
+    deploy_succeeded = False
+    for event in orch.deploy(config):
+        if isinstance(event, LogEvent):
+            maybe_url = ModalBackend.extract_modal_web_url(event.line)
+            if maybe_url:
+                deployed_web_url = maybe_url
+        elif isinstance(event, OperationCompleteEvent) and event.operation == OperationType.DEPLOY:
+            deploy_succeeded = event.success
+        _print_event(event)
+        _raise_on_failed_completion(event)
+
+    warmup_succeeded = False
+    final_sync_url: Optional[str] = None
+    if do_warmup:
+        url = server_url or deployed_web_url or ModalBackend.default_server_url(
+            username,
+            app_name=config.app_name,
+            function_slug=config.function_slug,
+        )
+        for event in orch.warmup(
+            backend,
+            url,
+            timeout,
+            tail_logs,
+            app_name=config.app_name,
+            served_model_name=config.served_model_name,
+        ):
+            if (
+                isinstance(event, OperationCompleteEvent)
+                and event.success
+                and event.operation == OperationType.WARMUP
+            ):
+                warmup_succeeded = True
+                final_sync_url = url
+                if isinstance(event.data, dict):
+                    maybe_url = event.data.get("url")
+                    if isinstance(maybe_url, str) and maybe_url.strip():
+                        final_sync_url = maybe_url.strip()
+            _print_event(event)
+            _raise_on_failed_completion(event)
+    elif deploy_succeeded:
+        final_sync_url = server_url or deployed_web_url or ModalBackend.default_server_url(
+            username,
+            app_name=config.app_name,
+            function_slug=config.function_slug,
+        )
+
+    if (do_warmup and warmup_succeeded and final_sync_url) or (not do_warmup and final_sync_url):
+        _sync_opencode_cli(
+            target_app_name=config.app_name,
+            target_url=final_sync_url,
+            target_config=config,
+            current_rows=_load_visible_launchpad_rows(),
+            username=username,
+        )
+
+
 # -----------------------------------------------------------------------
 # TUI
 # -----------------------------------------------------------------------
@@ -414,63 +484,16 @@ def deploy(
         f"Deploy target: backend={bt.value} instance={resolved_instance} app={resolved_app_name}"
     )
 
-    deployed_web_url: Optional[str] = None
-    deploy_succeeded = False
-    for event in orch.deploy(config):
-        if isinstance(event, LogEvent):
-            maybe_url = ModalBackend.extract_modal_web_url(event.line)
-            if maybe_url:
-                deployed_web_url = maybe_url
-        elif isinstance(event, OperationCompleteEvent) and event.operation == OperationType.DEPLOY:
-            deploy_succeeded = event.success
-        _print_event(event)
-        _raise_on_failed_completion(event)
-
-    warmup_succeeded = False
-    final_sync_url: Optional[str] = None
-    if do_warmup:
-        url = server_url or deployed_web_url or ModalBackend.default_server_url(
-            username,
-            app_name=resolved_app_name,
-            function_slug=config.function_slug,
-        )
-        for event in orch.warmup(
-            bt,
-            url,
-            timeout,
-            tail_logs,
-            app_name=resolved_app_name,
-            served_model_name=config.served_model_name,
-        ):
-            if (
-                isinstance(event, OperationCompleteEvent)
-                and event.success
-                and event.operation == OperationType.WARMUP
-            ):
-                warmup_succeeded = True
-                final_sync_url = url
-                if isinstance(event.data, dict):
-                    maybe_url = event.data.get("url")
-                    if isinstance(maybe_url, str) and maybe_url.strip():
-                        final_sync_url = maybe_url.strip()
-            _print_event(event)
-            _raise_on_failed_completion(event)
-    elif deploy_succeeded:
-        final_sync_url = server_url or deployed_web_url or ModalBackend.default_server_url(
-            username,
-            app_name=resolved_app_name,
-            function_slug=config.function_slug,
-        )
-
-    if (do_warmup and warmup_succeeded and final_sync_url) or (not do_warmup and final_sync_url):
-        _sync_opencode_cli(
-            target_app_name=resolved_app_name,
-            target_url=final_sync_url,
-            target_config=config,
-            current_rows=_load_visible_launchpad_rows(),
-            username=username,
-        )
-
+    _deploy_and_maybe_warmup(
+        orch,
+        username=username,
+        backend=bt,
+        config=config,
+        server_url=server_url,
+        do_warmup=do_warmup,
+        timeout=timeout,
+        tail_logs=tail_logs,
+    )
     raise typer.Exit(code=0)
 
 
@@ -772,61 +795,17 @@ def switch(
         if preload:
             typer.echo("Note: --preload is only used by llama.cpp and is ignored for vLLM.")
         if redeploy:
-            deployed_web_url: Optional[str] = None
-            deploy_succeeded = False
             config.do_deploy = True
-            for event in orch.deploy(config):
-                if isinstance(event, LogEvent):
-                    maybe_url = ModalBackend.extract_modal_web_url(event.line)
-                    if maybe_url:
-                        deployed_web_url = maybe_url
-                elif isinstance(event, OperationCompleteEvent) and event.operation == OperationType.DEPLOY:
-                    deploy_succeeded = event.success
-                _print_event(event)
-                _raise_on_failed_completion(event)
-            warmup_succeeded = False
-            final_sync_url: Optional[str] = None
-            if do_warmup:
-                url = server_url or deployed_web_url or ModalBackend.default_server_url(
-                    username,
-                    app_name=resolved_app_name,
-                    function_slug=config.function_slug,
-                )
-                for event in orch.warmup(
-                    bt,
-                    url,
-                    timeout,
-                    tail_logs,
-                    app_name=resolved_app_name,
-                    served_model_name=config.served_model_name,
-                ):
-                    if (
-                        isinstance(event, OperationCompleteEvent)
-                        and event.success
-                        and event.operation == OperationType.WARMUP
-                    ):
-                        warmup_succeeded = True
-                        final_sync_url = url
-                        if isinstance(event.data, dict):
-                            maybe_url = event.data.get("url")
-                            if isinstance(maybe_url, str) and maybe_url.strip():
-                                final_sync_url = maybe_url.strip()
-                    _print_event(event)
-                    _raise_on_failed_completion(event)
-            elif deploy_succeeded:
-                final_sync_url = server_url or deployed_web_url or ModalBackend.default_server_url(
-                    username,
-                    app_name=resolved_app_name,
-                    function_slug=config.function_slug,
-                )
-            if (do_warmup and warmup_succeeded and final_sync_url) or (not do_warmup and final_sync_url):
-                _sync_opencode_cli(
-                    target_app_name=resolved_app_name,
-                    target_url=final_sync_url,
-                    target_config=config,
-                    current_rows=_load_visible_launchpad_rows(),
-                    username=username,
-                )
+            _deploy_and_maybe_warmup(
+                orch,
+                username=username,
+                backend=bt,
+                config=config,
+                server_url=server_url,
+                do_warmup=do_warmup,
+                timeout=timeout,
+                tail_logs=tail_logs,
+            )
         else:
             typer.echo("No deploy performed. Use --redeploy to apply vLLM model changes.")
         raise typer.Exit(code=0)
