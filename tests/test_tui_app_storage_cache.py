@@ -21,7 +21,10 @@ class TuiAppStorageCacheTests(unittest.TestCase):
         payload = tomllib.loads(pyproject.read_text(encoding="utf-8"))
 
         package_data = payload["tool"]["setuptools"]["package-data"]
+        packages = payload["tool"]["setuptools"]["packages"]
+        self.assertIn("llm_launchpad.data", packages)
         self.assertEqual(package_data["llm_launchpad.tui"], ["theme.tcss"])
+        self.assertEqual(package_data["llm_launchpad.data"], ["*.json"])
 
     def test_on_mount_launches_main_menu_without_authenticated_preflight(self) -> None:
         app = TuiApp()

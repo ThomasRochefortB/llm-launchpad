@@ -125,7 +125,7 @@ LogViewer Log {
 #quick-deploy-panel {
     width: 100%;
     height: auto;
-    min-height: 11;
+    min-height: 13;
     margin: 1 0 0 0;
     padding: 0 2;
     border: solid #2b5933;
@@ -169,10 +169,15 @@ LogViewer Log {
     border: solid #2b5933;
     background: #0b110d;
     max-height: 10;
+    text-wrap: nowrap;
 }
 
 #quick-deploy-list:focus {
     border: solid #7bf168;
+}
+
+#quick-deploy-list > .option-list--option {
+    text-wrap: nowrap;
 }
 
 #banner-text {

@@ -237,6 +237,31 @@ class HFModelsTests(unittest.TestCase):
         self.assertEqual(row["label"], "Q4_1")
         self.assertEqual(row["size"], 472704107744)
 
+    def test_extract_hardware_compatibility_vram_from_model_page_html(self) -> None:
+        html = """
+        <section>
+          <h3>Hardware compatibility</h3>
+          <p>Log In to add your hardware</p>
+          <p>4-bit</p>
+          <p>UD-Q4_K_M</p>
+          <p>140 GB UD_Q4_K_XL</p>
+          <p>141 GB</p>
+          <p>8-bit</p>
+          <p>Q8_0</p>
+          <p>243 GB</p>
+          <h2>Inference Providers</h2>
+        </section>
+        """
+
+        parsed = hf_models._extract_hardware_compatibility_quantization_data_from_model_page_html(html)
+
+        assert isinstance(parsed, dict)
+        quantizations, vram = hf_models._extract_quantizations_and_vram_from_quantization_data(parsed)
+        self.assertEqual(quantizations, ["UD-Q4_K_M", "UD-Q4_K_XL", "Q8_0"])
+        self.assertAlmostEqual(vram["UD-Q4_K_M"], 140.0, places=1)
+        self.assertAlmostEqual(vram["UD-Q4_K_XL"], 141.0, places=1)
+        self.assertAlmostEqual(vram["Q8_0"], 243.0, places=1)
+
     def test_extract_quantizations_and_vram_from_quantization_data_keeps_hf_labels(self) -> None:
         quant_data = {
             "variantsByQuantizationLevels": {
@@ -254,6 +279,41 @@ class HFModelsTests(unittest.TestCase):
         self.assertAlmostEqual(vram["MXFP4_MOE"], 410.558, places=2)
         self.assertAlmostEqual(vram["Q4_1"], 472.704, places=2)
         self.assertAlmostEqual(vram["BF16"], 1510.0, places=1)
+
+    def test_fetch_quant_metadata_prefers_hardware_compatibility_rows(self) -> None:
+        class FakeApi:
+            def model_info(self, *, repo_id: str, revision: str | None, expand: list[str]):
+                self._ = (repo_id, revision, expand)
+                return SimpleNamespace(
+                    siblings=[SimpleNamespace(rfilename="UD-Q4_K_XL/model-UD-Q4_K_XL.gguf")],
+                    gguf={},
+                )
+
+        class FakeResponse:
+            status_code = 200
+            text = (
+                '<div data-target="ModelTensorsParams" '
+                'data-props="{&quot;ggufQuantizationData&quot;:{&quot;variantsByQuantizationLevels&quot;:'
+                "{&quot;4&quot;:[{&quot;label&quot;:&quot;UD-Q4_K_XL&quot;,&quot;size&quot;:90000000000}]"
+                "}}}\"></div>"
+                "<h3>Hardware compatibility</h3>"
+                "<p>4-bit</p><p>UD-Q4_K_XL</p><p>141 GB</p>"
+                "<h2>Inference Providers</h2>"
+            )
+
+        def fake_get(url: str, timeout: float, headers: dict[str, str]):
+            self.assertIn("huggingface.co", url)
+            self.assertIn("User-Agent", headers)
+            self.assertEqual(timeout, 10.0)
+            return FakeResponse()
+
+        fake_module = types.SimpleNamespace(HfApi=FakeApi)
+        fake_requests = types.SimpleNamespace(get=fake_get)
+        with patch.dict("sys.modules", {"huggingface_hub": fake_module, "requests": fake_requests}):
+            metadata = hf_models.fetch_gguf_quant_metadata("unsloth/MiniMax-M2.7-GGUF")
+
+        self.assertEqual(metadata.quantizations, ["UD-Q4_K_XL"])
+        self.assertAlmostEqual(metadata.vram_gb_by_quant["UD-Q4_K_XL"], 141.0, places=1)
 
     def test_fetch_quant_metadata_falls_back_to_model_page_quantization_data(self) -> None:
         class FakeApi:
@@ -537,6 +597,80 @@ class HFModelsTests(unittest.TestCase):
             estimate = hf_models.fetch_vllm_memory_breakdown("zai-org/GLM-5")
         assert estimate is not None
         self.assertEqual(estimate.context_tokens, 256000)
+
+    def test_fetch_model_max_context_uses_model_info_metadata(self) -> None:
+        calls: list[tuple[str, str | None, tuple[str, ...]]] = []
+
+        class FakeApi:
+            def model_info(self, *, repo_id: str, revision: str | None, timeout: float, expand=None):
+                self._ = timeout
+                calls.append((repo_id, revision, tuple(expand or [])))
+                return SimpleNamespace(
+                    config={"max_position_embeddings": 32768},
+                    cardData={"context_window": "256K"},
+                )
+
+        fake_module = types.SimpleNamespace(HfApi=FakeApi)
+        with patch.dict("sys.modules", {"huggingface_hub": fake_module}):
+            context = hf_models.fetch_model_max_context("unsloth/Test-GGUF")
+
+        self.assertEqual(context, 256000)
+        self.assertEqual(calls[0][0], "unsloth/Test-GGUF")
+        self.assertIn("cardData", calls[0][2])
+
+    def test_fetch_model_max_context_falls_back_to_repo_json(self) -> None:
+        class FakeApi:
+            def model_info(self, *, repo_id: str, revision: str | None, expand=None):
+                self._ = (repo_id, revision, expand)
+                return SimpleNamespace(config={}, cardData={})
+
+        def fake_load(repo_id: str, revision: str | None, filename: str):
+            self.assertEqual(repo_id, "unsloth/Test-GGUF")
+            if filename == "config.json":
+                return {"max_context_tokens": "64K"}
+            if filename == "tokenizer_config.json":
+                return {"model_max_length": 32768}
+            return None
+
+        fake_module = types.SimpleNamespace(HfApi=FakeApi)
+        with (
+            patch.dict("sys.modules", {"huggingface_hub": fake_module}),
+            patch("llm_launchpad.core.hf_models._load_repo_json_file", side_effect=fake_load),
+        ):
+            context = hf_models.fetch_model_max_context("unsloth/Test-GGUF")
+
+        self.assertEqual(context, 64000)
+
+    def test_fetch_model_max_context_follows_base_model_tag(self) -> None:
+        calls: list[str] = []
+
+        class FakeApi:
+            def model_info(self, *, repo_id: str, revision: str | None, expand=None):
+                self._ = (revision, expand)
+                calls.append(repo_id)
+                if repo_id == "unsloth/Test-GGUF":
+                    return SimpleNamespace(
+                        config={},
+                        cardData={},
+                        tags=["base_model:Owner/Base-Model"],
+                    )
+                if repo_id == "Owner/Base-Model":
+                    return SimpleNamespace(
+                        config={"max_position_embeddings": 196608},
+                        cardData={},
+                        tags=[],
+                    )
+                return SimpleNamespace(config={}, cardData={}, tags=[])
+
+        fake_module = types.SimpleNamespace(HfApi=FakeApi)
+        with (
+            patch.dict("sys.modules", {"huggingface_hub": fake_module}),
+            patch("llm_launchpad.core.hf_models._load_repo_json_file", return_value=None),
+        ):
+            context = hf_models.fetch_model_max_context("unsloth/Test-GGUF")
+
+        self.assertEqual(context, 196608)
+        self.assertEqual(calls, ["unsloth/Test-GGUF", "Owner/Base-Model"])
 
 
 if __name__ == "__main__":

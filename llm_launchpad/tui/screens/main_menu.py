@@ -22,9 +22,11 @@ from ...core.hf_auth import HuggingFaceAuthStatus, get_huggingface_auth_status
 from ...core.modal_auth import ModalAuthStatus, get_modal_auth_status
 from ...core.naming import default_llamacpp_served_model_name, default_served_model_name
 from ...core.quick_deploy import (
+    QuickDeployCatalogInfo,
     QuickDeployProfile,
     format_context_length,
     format_hourly_cost,
+    get_quick_deploy_catalog_info,
     list_quick_deploy_profiles,
     quick_deploy_model_label_parts,
 )
@@ -42,7 +44,6 @@ _     _     __  __
 [/]"""
 
 PANEL_SEPARATOR = "[dim]----------------------------------------[/dim]"
-QUICK_DEPLOY_PROFILES = list_quick_deploy_profiles()
 
 
 class _LauncherOptionList(OptionList):
@@ -50,7 +51,7 @@ class _LauncherOptionList(OptionList):
 
     def __init__(
         self,
-        *content: Option,
+        *content: Option | None,
         handoff_up_target: str | None = None,
         handoff_down_target: str | None = None,
         **kwargs: object,
@@ -543,8 +544,7 @@ def _render_billing_report(payload: Any) -> str:
             return (
                 "[bold]Workspace Spend[/bold]\n"
                 "[dim]Current month spend[/dim]\n"
-                "[dim]total[/dim] [bold]$0.00[/bold]\n"
-                "[dim]No billed usage in the selected monthly period.[/dim]"
+                "[dim]total[/dim] [bold]$0.00[/bold]"
             )
 
         total = 0.0
@@ -610,15 +610,235 @@ def _render_billing_load_error(error: str) -> str:
     )
 
 
+def _quick_deploy_options(profiles: list[QuickDeployProfile]) -> list[Option | None]:
+    grouped = _has_tiered_quick_deploy_groups(profiles)
+    if not grouped:
+        return [Option(_render_quick_deploy_option(profile), id=profile.id) for profile in profiles]
+
+    options: list[Option | None] = []
+    groups = _quick_deploy_profile_groups(profiles)
+    for group_index, group in enumerate(groups):
+        if group_index > 0:
+            options.append(None)
+        options.extend(
+            Option(_render_quick_deploy_tier_row(profile, show_header=index == 0), id=profile.id)
+            for index, profile in enumerate(group)
+        )
+    return options
+
+
+def _has_tiered_quick_deploy_groups(profiles: list[QuickDeployProfile]) -> bool:
+    counts = Counter(_quick_deploy_group_key(profile) for profile in profiles)
+    return any(count > 1 for count in counts.values())
+
+
+def _quick_deploy_profile_groups(profiles: list[QuickDeployProfile]) -> list[list[QuickDeployProfile]]:
+    groups: list[list[QuickDeployProfile]] = []
+    group_by_key: dict[str, list[QuickDeployProfile]] = {}
+    for profile in profiles:
+        key = _quick_deploy_group_key(profile)
+        if key not in group_by_key:
+            group_by_key[key] = []
+            groups.append(group_by_key[key])
+        group_by_key[key].append(profile)
+    for group in groups:
+        group.sort(key=_quick_deploy_profile_sort_key)
+    groups = [
+        group
+        for _index, group in sorted(
+            enumerate(groups),
+            key=lambda index_group: _quick_deploy_group_sort_key(index_group[0], index_group[1]),
+        )
+    ]
+    return groups
+
+
+def _quick_deploy_group_key(profile: QuickDeployProfile) -> str:
+    label, _quant_suffix = quick_deploy_model_label_parts(profile)
+    return label.casefold()
+
+
+def _quick_deploy_group_sort_key(index: int, group: list[QuickDeployProfile]) -> tuple[int, float, int]:
+    score = max(
+        (profile.aa_coding_score for profile in group if profile.aa_coding_score is not None),
+        default=None,
+    )
+    if score is None:
+        return (1, 0.0, index)
+    return (0, -score, index)
+
+
+def _quick_deploy_profile_sort_key(profile: QuickDeployProfile) -> tuple[int, int, float, str]:
+    return (
+        _quick_deploy_quant_order(profile.quant),
+        _quick_deploy_tier_order(profile.resource_tier),
+        profile.approx_cost_per_hour_usd,
+        profile.id,
+    )
+
+
+def _quick_deploy_quant_order(quant: str) -> int:
+    compact = _compact_quant_label(quant).casefold()
+    if compact.startswith("q2"):
+        return 0
+    if compact.startswith("q3"):
+        return 1
+    if compact.startswith("q4"):
+        return 2
+    return 3
+
+
+def _quick_deploy_tier_order(resource_tier: str | None) -> int:
+    tier = (resource_tier or "").strip().casefold()
+    if tier == "cheap":
+        return 0
+    if tier == "rtx-pro":
+        return 1
+    if tier == "b200":
+        return 2
+    return 3
+
+
 def _render_quick_deploy_option(profile: QuickDeployProfile) -> str:
     label, quant_suffix = quick_deploy_model_label_parts(profile)
-    quant_markup = f" [dim]{_escape_markup(quant_suffix)}[/dim]" if quant_suffix else ""
+    model = _escape_markup(_clip(label, 18))
+    quant = _compact_quant_label(quant_suffix or profile.quant)
+    quant_markup = f" [dim]{_escape_markup(quant)}[/dim]" if quant else ""
+    tier_markup = _quick_deploy_tier_markup(profile)
+    gpu_shape = _escape_markup(_compact_gpu_shape(profile))
     return (
-        f"  [bold]{_escape_markup(label)}[/bold]{quant_markup}\n"
-        f"    [dim]{_escape_markup(profile.gpu_type)} x{profile.gpu_count} · "
-        f"max {_escape_markup(format_context_length(profile.max_context_tokens))} · "
-        f"{_escape_markup(format_hourly_cost(profile.approx_cost_per_hour_usd))}[/dim]"
+        f"  [bold]{model}[/bold]{quant_markup} {tier_markup}  "
+        f"[dim]{gpu_shape} · "
+        f"{_escape_markup(format_context_length(profile.max_context_tokens))} · "
+        f"{_escape_markup(_compact_hourly_cost(profile.approx_cost_per_hour_usd))}[/dim]"
     )
+
+
+def _render_quick_deploy_tier_row(profile: QuickDeployProfile, *, show_header: bool = False) -> str:
+    tier_markup = _quick_deploy_tier_markup(profile)
+    gpu_shape = _escape_markup(_compact_gpu_shape(profile))
+    quant_markup = _quick_deploy_quant_markup(profile)
+    row = (
+        f"    {quant_markup} {tier_markup}  "
+        f"[dim]{gpu_shape} · {_escape_markup(_compact_hourly_cost(profile.approx_cost_per_hour_usd))}[/dim]"
+    )
+    if not show_header:
+        return row
+
+    label, _quant_suffix = quick_deploy_model_label_parts(profile)
+    model = _escape_markup(_clip(label, 18))
+    header = f"  [bold]{model}[/bold] [dim]{_escape_markup(_quick_deploy_header_metrics(profile))}[/dim]"
+    return f"{header}\n{row}"
+
+
+def _quick_deploy_header_metrics(profile: QuickDeployProfile) -> str:
+    metrics = [format_context_length(profile.max_context_tokens)]
+    if profile.aa_coding_score is not None:
+        metrics.append(f"AA {_format_coding_index(profile.aa_coding_score)}")
+    return " · ".join(metrics)
+
+
+def _format_coding_index(value: float) -> str:
+    return f"{value:.1f}".rstrip("0").rstrip(".")
+
+
+def _compact_quant_label(value: str) -> str:
+    cleaned = value.strip().strip("()")
+    if not cleaned:
+        return ""
+    return (
+        cleaned.replace("UD-", "")
+        .replace("_K_XL", "XL")
+        .replace("_K_M", "M")
+        .replace("_K_S", "S")
+        .replace("_", "")
+        .replace("-", "")
+    )
+
+
+def _compact_gpu_shape(profile: QuickDeployProfile) -> str:
+    gpu = profile.gpu_type.strip()
+    compact = {
+        "A100-80GB": "A100",
+        "A100-40GB": "A100-40",
+        "RTX-PRO-6000": "RTX6000",
+    }.get(gpu, gpu.replace("-80GB", ""))
+    return f"{compact}x{profile.gpu_count}"
+
+
+def _compact_hourly_cost(value: float) -> str:
+    return format_hourly_cost(value).replace("/hr", "/h")
+
+
+def _quick_deploy_tier_markup(profile: QuickDeployProfile) -> str:
+    label = (profile.resource_tier_label or "").strip()
+    if label and label != _default_resource_tier_label(profile.resource_tier):
+        return _quick_deploy_tier_label_markup(label)
+
+    tier = (profile.resource_tier or "").strip().casefold()
+    if tier == "cheap":
+        return "[dim]$[/dim]"
+    if tier == "rtx-pro":
+        return "[#7bf168]$$[/]"
+    if tier == "b200":
+        return "[yellow]$$$[/yellow]"
+    label = (profile.resource_tier_label or profile.profile_label or "").strip()
+    return f"[dim]{_escape_markup(label.casefold())}[/dim]" if label else ""
+
+
+def _default_resource_tier_label(resource_tier: str | None) -> str:
+    tier = (resource_tier or "").strip().casefold()
+    if tier == "cheap":
+        return "$"
+    if tier == "rtx-pro":
+        return "$$"
+    if tier == "b200":
+        return "$$$"
+    return ""
+
+
+def _quick_deploy_tier_label_markup(label: str) -> str:
+    pieces: list[str] = []
+    for piece in label.split("/"):
+        token = piece.strip()
+        if not token:
+            continue
+        if pieces:
+            pieces.append("[dim]/[/dim]")
+        pieces.append(_quick_deploy_tier_token_markup(token))
+    return "".join(pieces) if pieces else f"[dim]{_escape_markup(label)}[/dim]"
+
+
+def _quick_deploy_tier_token_markup(token: str) -> str:
+    if token == "$":
+        return "[dim]$[/dim]"
+    if token == "$$":
+        return "[#7bf168]$$[/]"
+    if token == "$$$":
+        return "[yellow]$$$[/yellow]"
+    return f"[dim]{_escape_markup(token)}[/dim]"
+
+
+def _quick_deploy_quant_markup(profile: QuickDeployProfile) -> str:
+    quant = _compact_quant_label(profile.quant)
+    if not quant:
+        return ""
+    if quant.casefold().startswith("q2"):
+        return f"[bold #7bf168]{_escape_markup(quant)}[/]"
+    return f"[dim]{_escape_markup(quant)}[/dim]"
+
+
+def _quick_deploy_subtitle(info: QuickDeployCatalogInfo) -> str:
+    if info.is_fallback:
+        return "Curated llama.cpp coding profiles"
+    generated = (info.generated_at or "").strip()
+    if generated:
+        generated = generated.split("T", 1)[0]
+    if generated:
+        if info.source_label.casefold().startswith("artificial analysis"):
+            return f"AA coding rankings - bundled {generated}"
+        return f"{info.source_label}, bundled {generated}"
+    return info.source_label
 
 
 class MainMenuScreen(CopyEnabledScreen):
@@ -643,6 +863,8 @@ class MainMenuScreen(CopyEnabledScreen):
         self._modal_auth_refresh_inflight = False
         self._status_refresh_inflight = False
         self._billing_refresh_inflight = False
+        self._quick_deploy_profiles = list_quick_deploy_profiles()
+        self._quick_deploy_catalog_info = get_quick_deploy_catalog_info()
 
     def compose(self) -> ComposeResult:
         with Center():
@@ -674,14 +896,11 @@ class MainMenuScreen(CopyEnabledScreen):
                     with Vertical(id="quick-deploy-panel"):
                         yield Static("[bold #7bf168]Quick Deploy[/]", id="landing-quick-deploy-title")
                         yield Static(
-                            "Curated llama.cpp coding profiles",
+                            _quick_deploy_subtitle(self._quick_deploy_catalog_info),
                             id="landing-quick-deploy-subtitle",
                         )
                         yield _LauncherOptionList(
-                            *[
-                                Option(_render_quick_deploy_option(profile), id=profile.id)
-                                for profile in QUICK_DEPLOY_PROFILES
-                            ],
+                            *_quick_deploy_options(self._quick_deploy_profiles),
                             id="quick-deploy-list",
                             handoff_up_target="action-list",
                             handoff_down_target="action-list",
@@ -696,11 +915,11 @@ class MainMenuScreen(CopyEnabledScreen):
         """Focus the option list so arrow-key navigation works immediately."""
         action_list = self.query_one("#action-list", OptionList)
         if action_list.option_count > 0:
-            action_list.highlighted = 0
+            action_list.action_first()
         action_list.focus()
         quick_list = self.query_one("#quick-deploy-list", OptionList)
         if quick_list.option_count > 0:
-            quick_list.highlighted = 0
+            quick_list.action_first()
         self._refresh_modal_auth_status()
         self._refresh_hf_auth_status()
         self._refresh_panels()
@@ -865,7 +1084,9 @@ class MainMenuScreen(CopyEnabledScreen):
         option_list_id = event.option_list.id
         option_id = event.option.id
         if option_list_id == "quick-deploy-list":
-            self.app.push_quick_deploy(str(option_id))  # type: ignore[attr-defined]
+            profile = self._quick_deploy_profile_for_id(str(option_id))
+            if profile is not None:
+                self.app.push_quick_deploy(profile)  # type: ignore[attr-defined]
             return
         if option_id == "deploy":
             self.app.action_push_deploy()  # type: ignore[attr-defined]
@@ -887,6 +1108,12 @@ class MainMenuScreen(CopyEnabledScreen):
 
     def action_select_settings(self) -> None:
         self.app.action_push_settings()  # type: ignore[attr-defined]
+
+    def _quick_deploy_profile_for_id(self, profile_id: str) -> QuickDeployProfile | None:
+        for profile in self._quick_deploy_profiles:
+            if profile.id == profile_id:
+                return profile
+        return None
 
     def _focus_launcher(self, target_id: str) -> None:
         target = self.query_one(f"#{target_id}", OptionList)

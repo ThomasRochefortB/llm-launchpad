@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from textual.app import App
 from textual.widgets import Button, Input, Static, Switch
 
+from llm_launchpad.core import quick_deploy
+from llm_launchpad.core.quick_deploy import QuickDeployProfile
 from llm_launchpad.tui.screens.quick_deploy import QuickDeployScreen
 
 
@@ -18,6 +21,18 @@ class _TestApp(App[None]):
 
 
 class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._catalog_patch = patch(
+            "llm_launchpad.core.quick_deploy._read_bundled_catalog_text",
+            return_value=None,
+        )
+        self._catalog_patch.start()
+        quick_deploy._reset_quick_deploy_catalog_cache()
+
+    def tearDown(self) -> None:
+        self._catalog_patch.stop()
+        quick_deploy._reset_quick_deploy_catalog_cache()
+
     async def test_screen_renders_selected_profile_summary(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:
@@ -28,12 +43,43 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             assert isinstance(screen, QuickDeployScreen)
             summary = str(screen.query_one("#quick-deploy-profile-body", Static).content)
             title = str(screen.query_one("#quick-deploy-title", Static).content)
-            self.assertIn("Kimi K2.5 [dim](UD-Q2_K_XL)[/dim]", title)
-            self.assertIn("[bold #7bf168]Kimi K2.5[/] [dim](UD-Q2_K_XL)[/dim]", summary)
+            self.assertIn("Kimi K2.5 [dim](UD-Q4_K_XL)[/dim]", title)
+            self.assertIn("[bold #7bf168]Kimi K2.5[/] [dim](UD-Q4_K_XL)[/dim]", summary)
             self.assertIn("RTX-PRO-6000 x5", summary)
             self.assertIn("262,144 ctx", summary)
             self.assertNotIn("Cheap but good", summary)
-            self.assertIn("UD-Q2_K_XL", summary)
+            self.assertIn("UD-Q4_K_XL", summary)
+
+    async def test_screen_moves_tier_and_vram_details_to_summary(self) -> None:
+        profile = QuickDeployProfile(
+            id="minimax-m2-7-b200-b200",
+            display_name="MiniMax-M2.7",
+            repo_id="unsloth/MiniMax-M2.7-GGUF",
+            quant="UD-Q4_K_XL",
+            gpu_type="B200",
+            gpu_count=1,
+            profile_label="B200",
+            approx_cost_per_hour_usd=6.25,
+            max_context_tokens=196608,
+            instance_slug_hint="minimax-m2-7-b200",
+            summary="Generated profile.",
+            server_args=("--ctx-size", "196608"),
+            required_vram_gb=141.0,
+            resource_tier="b200",
+            resource_tier_label="$$$",
+        )
+
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(QuickDeployScreen(profile_id=profile))
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, QuickDeployScreen)
+            summary = str(screen.query_one("#quick-deploy-profile-body", Static).content)
+            self.assertIn("[bold]Tier[/bold]     $$$ B200", summary)
+            self.assertIn("[bold]VRAM[/bold]     141 GB required", summary)
+            self.assertIn("[bold]Max ctx[/bold]  196,608 ctx", summary)
 
     async def test_deploy_uses_blank_override_defaults(self) -> None:
         app = _TestApp()
