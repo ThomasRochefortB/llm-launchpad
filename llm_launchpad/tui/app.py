@@ -26,6 +26,7 @@ from ..core.naming import (
     build_app_name,
     legacy_app_name,
 )
+from ..core.quick_deploy import QuickDeployProfile
 from ..core.opencode import (
     build_openai_connection_payload,
     resolve_connection_for_app,
@@ -276,8 +277,8 @@ class TuiApp(App):
     def action_push_storage(self, backend: BackendType | None = None) -> None:
         self.push_screen(StorageScreen(initial_backend=backend))
 
-    def push_quick_deploy(self, profile_id: str) -> None:
-        self.push_screen(QuickDeployScreen(profile_id=profile_id))
+    def push_quick_deploy(self, profile: str | QuickDeployProfile) -> None:
+        self.push_screen(QuickDeployScreen(profile_id=profile))
 
     # ------------------------------------------------------------------
     # Deploy

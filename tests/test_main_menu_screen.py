@@ -135,7 +135,7 @@ class MainMenuStatusRenderTests(unittest.TestCase):
         self.assertIn("Workspace Spend", rendered)
         self.assertIn("Current month spend", rendered)
         self.assertIn("$0.00", rendered)
-        self.assertIn("No billed usage", rendered)
+        self.assertNotIn("No billed usage", rendered)
 
     def test_render_billing_load_error_escapes_rich_markup_chars(self) -> None:
         rendered = _render_billing_load_error("Usage: modal [OPTIONS] COMMAND")

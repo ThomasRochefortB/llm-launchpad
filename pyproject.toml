@@ -49,13 +49,14 @@ Changelog = "https://github.com/ThomasRochefortB/llm-launchpad/blob/main/CHANGEL
 Security = "https://github.com/ThomasRochefortB/llm-launchpad/blob/main/SECURITY.md"
 
 [tool.setuptools]
-packages = ["llm_launchpad", "llm_launchpad.backends", "llm_launchpad.cli", "llm_launchpad.core", "llm_launchpad.protocol", "llm_launchpad.tui", "llm_launchpad.tui.screens", "llm_launchpad.tui.widgets"]
+packages = ["llm_launchpad", "llm_launchpad.backends", "llm_launchpad.cli", "llm_launchpad.core", "llm_launchpad.data", "llm_launchpad.protocol", "llm_launchpad.tui", "llm_launchpad.tui.screens", "llm_launchpad.tui.widgets"]
 
 [tool.setuptools.dynamic]
 version = { attr = "llm_launchpad._version.__version__" }
 
 [tool.setuptools.package-data]
 "llm_launchpad.tui" = ["theme.tcss"]
+"llm_launchpad.data" = ["*.json"]
 
 [dependency-groups]
 dev = [

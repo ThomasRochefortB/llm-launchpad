@@ -58,7 +58,10 @@ _SORT_BY_MODE: dict[ModelRankMode, str] = {
     "trending": "trending_score",
 }
 _PREFERRED_QUANT_ORDER = [
+    "UD-Q4_K_XL",
     "Q4_K_M",
+    "UD-Q3_K_XL",
+    "UD-Q2_K_XL",
     "Q4_K_S",
     "Q5_K_M",
     "Q5_K_S",
@@ -66,12 +69,18 @@ _PREFERRED_QUANT_ORDER = [
     "Q8_0",
 ]
 _QUANT_PATTERN = re.compile(
-    r"(?i)(?<![a-z0-9])(IQ[1-4]_(?:XS|XXS|S|M|NL)|Q[2-8]_(?:K(?:_[MSXL]+)?|0|1))(?![a-z0-9])"
+    r"(?i)(?<![a-z0-9])((?:UD[-_])?(?:IQ[1-4]_(?:XXS|XS|S|M|NL)|Q[2-8]_(?:K(?:_[MSXL]+)?|0|1)))(?![a-z0-9])"
+)
+_HARDWARE_QUANT_LABEL_RE = re.compile(
+    r"(?i)(?<![a-z0-9])((?:UD[-_])?(?:IQ[1-4]_(?:XXS|XS|S|M|NL)|Q[2-8]_(?:K(?:_[MSXL]+)?|0|1))|MXFP4(?:_MOE)?|BF16|F16)(?![a-z0-9])"
 )
 _MEMORY_PATTERN = re.compile(r"(?i)^\s*([0-9]+(?:\.[0-9]+)?)\s*([KMGTP]?I?B)?\s*$")
+_MEMORY_SEARCH_PATTERN = re.compile(r"(?i)([0-9]+(?:\.[0-9]+)?)\s*([KMGTP]?I?B)")
 _MEMORY_HINTS = ("memory", "vram", "ram", "require", "required", "footprint", "size")
 _MEMORY_UNITS = ("b", "kb", "kib", "mb", "mib", "gb", "gib", "tb", "tib", "pb", "pib")
 _MODEL_TENSORS_PROPS_RE = re.compile(r'data-target="ModelTensorsParams"[^>]*data-props="([^"]+)"')
+_HTML_BLOCK_BREAK_RE = re.compile(r"(?i)<\s*(?:br|/p|/div|/li|/tr|/td|/th|/h[1-6])\b[^>]*>")
+_HTML_TAG_RE = re.compile(r"<[^>]+>")
 _PARAMS_PATTERN = re.compile(r"(?i)(\d+(?:\.\d+)?)\s*([bm])(?=$|[^a-z0-9])")
 _HF_PAGE_HEADERS = {
     "User-Agent": (
@@ -234,6 +243,119 @@ def fetch_vllm_memory_breakdown(
     )
     _VLLM_MEMORY_CACHE[cache_key] = (now, estimate)
     return estimate
+
+
+def fetch_model_max_context(repo_id: str, revision: str | None = None) -> int | None:
+    """Return the maximum context length advertised by Hugging Face metadata."""
+    return _fetch_model_max_context(repo_id=repo_id, revision=revision, visited=set())
+
+
+def _fetch_model_max_context(
+    repo_id: str,
+    revision: str | None = None,
+    visited: set[str] | None = None,
+) -> int | None:
+    from ..core.backend import ModalBackend
+    if ModalBackend.is_shutting_down():
+        return None
+    normalized_repo = repo_id.strip()
+    if not normalized_repo:
+        return None
+    visited = visited if visited is not None else set()
+    repo_key = normalized_repo.casefold()
+    if repo_key in visited:
+        return None
+    visited.add(repo_key)
+    revision_key = (revision or "").strip()
+
+    info = None
+    try:
+        from huggingface_hub import HfApi
+
+        api = HfApi()
+        try:
+            info = _call_model_info(
+                api=api,
+                repo_id=normalized_repo,
+                revision=revision_key or None,
+                expand=["cardData", "config", "tags"],
+            )
+        except Exception:
+            info = _call_model_info(
+                api=api,
+                repo_id=normalized_repo,
+                revision=revision_key or None,
+            )
+    except Exception:
+        info = None
+
+    candidates = [
+        _extract_model_max_context(getattr(info, "config", None)),
+        _extract_model_max_context(getattr(info, "cardData", None)),
+    ]
+    if any(value is not None for value in candidates):
+        return _pick_max_positive_int(*candidates)
+
+    for base_repo_id in _extract_base_model_repo_ids(info):
+        base_context = _fetch_model_max_context(
+            repo_id=base_repo_id,
+            revision=None,
+            visited=visited,
+        )
+        if base_context is not None:
+            return base_context
+
+    config = _load_repo_json_file(normalized_repo, revision_key or None, "config.json")
+    tokenizer_config = _load_repo_json_file(normalized_repo, revision_key or None, "tokenizer_config.json")
+    generation_config = _load_repo_json_file(normalized_repo, revision_key or None, "generation_config.json")
+    return _pick_max_positive_int(
+        _extract_model_max_context(config),
+        _extract_model_max_context(tokenizer_config),
+        _extract_model_max_context(generation_config),
+    )
+
+
+def _extract_base_model_repo_ids(info: Any) -> list[str]:
+    candidates: list[str] = []
+
+    def _record(value: Any) -> None:
+        if isinstance(value, str):
+            text = value.strip()
+            if text.startswith("base_model:"):
+                text = text.split(":", 1)[1].strip()
+            if _looks_like_hf_repo_id(text) and text.casefold() not in {item.casefold() for item in candidates}:
+                candidates.append(text)
+            return
+        if isinstance(value, dict):
+            for key, nested in value.items():
+                key_text = str(key).strip().casefold()
+                if key_text in {
+                    "base_model",
+                    "base_models",
+                    "base_model_name",
+                    "base_model_name_or_path",
+                    "model_name_or_path",
+                }:
+                    _record(nested)
+                elif isinstance(nested, (dict, list, tuple)):
+                    _record(nested)
+            return
+        if isinstance(value, (list, tuple)):
+            for item in value:
+                _record(item)
+
+    _record(getattr(info, "cardData", None))
+    _record(getattr(info, "tags", None))
+    return candidates
+
+
+def _looks_like_hf_repo_id(value: str) -> bool:
+    text = value.strip().removeprefix("https://huggingface.co/").strip("/")
+    if not text or "/" not in text:
+        return False
+    if any(char.isspace() for char in text):
+        return False
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", text))
 
 
 def _call_model_info(
@@ -432,7 +554,7 @@ def _extract_gguf_quantizations(siblings: Any) -> list[str]:
         if not filename or not filename.lower().endswith(".gguf"):
             continue
         for match in _QUANT_PATTERN.findall(filename):
-            detected.add(str(match).upper())
+            detected.add(_normalize_quant_label(match))
     return sorted(detected, key=_quant_sort_key)
 
 
@@ -443,7 +565,7 @@ def _extract_gguf_vram_by_quant(gguf_payload: Any) -> dict[str, float]:
     vram_gb_by_quant: dict[str, float] = {}
 
     def _record(quant: str, value: float) -> None:
-        upper_quant = quant.strip().upper()
+        upper_quant = _normalize_quant_label(quant)
         if not upper_quant:
             return
         if value <= 0:
@@ -458,7 +580,7 @@ def _extract_gguf_vram_by_quant(gguf_payload: Any) -> dict[str, float]:
         text = str(value).strip()
         if not text:
             return set()
-        return {str(match).upper() for match in _QUANT_PATTERN.findall(text)}
+        return {_normalize_quant_label(match) for match in _QUANT_PATTERN.findall(text)}
 
     def _is_memory_hint(key: str) -> bool:
         lower = key.strip().lower()
@@ -576,7 +698,7 @@ def _extract_quantizations_and_vram_from_quantization_data(quantization_data: An
         for variant in variants:
             if not isinstance(variant, dict):
                 continue
-            label = str(variant.get("label", "")).strip().upper()
+            label = _normalize_quant_label(variant.get("label"))
             if not label:
                 continue
             if label not in seen:
@@ -607,6 +729,9 @@ def _fetch_gguf_quantization_data_from_model_page(repo_id: str, timeout: float =
         return None
     if response.status_code >= 400:
         return None
+    hardware_data = _extract_hardware_compatibility_quantization_data_from_model_page_html(response.text)
+    if hardware_data is not None:
+        return hardware_data
     return _extract_gguf_quantization_data_from_model_page_html(response.text)
 
 
@@ -626,6 +751,75 @@ def _extract_gguf_quantization_data_from_model_page_html(page_html: str) -> Any:
         if quant_data is not None:
             return quant_data
     return None
+
+
+def _extract_hardware_compatibility_quantization_data_from_model_page_html(page_html: str) -> Any:
+    """Parse the visible HF Hardware compatibility quant rows into quant metadata."""
+    lines = _html_to_text_lines(page_html)
+    variants: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for index, line in enumerate(lines):
+        if line.strip().casefold() != "hardware compatibility":
+            continue
+        section: list[str] = []
+        for section_line in lines[index + 1 : index + 160]:
+            normalized = section_line.strip().casefold()
+            if normalized.startswith(("inference providers", "model tree for", "collection including")):
+                break
+            section.append(section_line)
+
+        for quant, required_vram_gb in _extract_quant_vram_pairs_from_hardware_section(section):
+            normalized_quant = _normalize_quant_label(quant)
+            if not normalized_quant or normalized_quant in seen:
+                continue
+            seen.add(normalized_quant)
+            variants.append(
+                {
+                    "label": normalized_quant,
+                    "size": int(round(required_vram_gb * 1_000_000_000)),
+                }
+            )
+
+    if not variants:
+        return None
+    return {"variantsByQuantizationLevels": {"0": variants}}
+
+
+def _html_to_text_lines(page_html: str) -> list[str]:
+    with_breaks = _HTML_BLOCK_BREAK_RE.sub("\n", page_html)
+    text = html.unescape(_HTML_TAG_RE.sub("\n", with_breaks))
+    lines: list[str] = []
+    for line in text.splitlines():
+        normalized = re.sub(r"\s+", " ", line).strip()
+        if normalized:
+            lines.append(normalized)
+    return lines
+
+
+def _extract_quant_vram_pairs_from_hardware_section(section_lines: list[str]) -> list[tuple[str, float]]:
+    section_text = " ".join(section_lines)
+    quant_matches = list(_HARDWARE_QUANT_LABEL_RE.finditer(section_text))
+    memory_matches = list(_MEMORY_SEARCH_PATTERN.finditer(section_text))
+    pairs: list[tuple[str, float]] = []
+
+    for index, quant_match in enumerate(quant_matches):
+        next_quant_start = quant_matches[index + 1].start() if index + 1 < len(quant_matches) else len(section_text)
+        memory_match = next(
+            (
+                match
+                for match in memory_matches
+                if quant_match.end() <= match.start() < next_quant_start
+            ),
+            None,
+        )
+        if memory_match is None:
+            continue
+        required_vram_gb = _parse_memory_to_gb(memory_match.group(0))
+        if required_vram_gb is None:
+            continue
+        pairs.append((_normalize_quant_label(quant_match.group(1)), required_vram_gb))
+    return pairs
 
 
 def _parse_memory_to_gb(value: Any) -> float | None:
@@ -675,10 +869,17 @@ def _parse_memory_to_gb(value: Any) -> float | None:
 
 
 def _quant_sort_key(quant: str) -> tuple[int, int, str]:
-    upper = quant.upper()
+    upper = _normalize_quant_label(quant)
     if upper in _PREFERRED_QUANT_ORDER:
         return (0, _PREFERRED_QUANT_ORDER.index(upper), upper)
     return (1, 0, upper)
+
+
+def _normalize_quant_label(value: Any) -> str:
+    upper = str(value or "").strip().upper()
+    if upper.startswith("UD_"):
+        return f"UD-{upper[3:]}"
+    return upper
 
 
 def _extract_safetensors_total_bytes(payload: Any) -> float | None:
@@ -732,6 +933,12 @@ def _extract_int_config(config: Any, *keys: str) -> int | None:
 
 def _extract_model_max_context(config: Any) -> int | None:
     keys = {
+        "context_window",
+        "context_window_tokens",
+        "input_context_window",
+        "max_context",
+        "max_context_length",
+        "max_context_tokens",
         "max_position_embeddings",
         "max_seq_len",
         "max_sequence_length",

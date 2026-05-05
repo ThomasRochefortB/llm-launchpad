@@ -34,19 +34,33 @@ def _render_profile_label(profile: QuickDeployProfile, *, accent: str = "") -> s
 
 
 def _render_profile_summary(profile: QuickDeployProfile) -> str:
-    return "\n".join(
+    lines = [
+        _render_profile_label(profile, accent="bold #7bf168"),
+        f"[dim]{_escape_markup(profile.summary)}[/dim]",
+        "",
+    ]
+    if profile.resource_tier_label:
+        tier_detail = profile.resource_tier_label
+        if profile.profile_label and profile.profile_label != profile.resource_tier_label:
+            tier_detail = f"{tier_detail} {profile.profile_label}"
+        lines.append(f"[bold]Tier[/bold]     {_escape_markup(tier_detail)}")
+    lines.extend(
         [
-            _render_profile_label(profile, accent="bold #7bf168"),
-            f"[dim]{_escape_markup(profile.summary)}[/dim]",
-            "",
             f"[bold]Quant[/bold]    {_escape_markup(profile.quant)}",
             f"[bold]GPU[/bold]      {_escape_markup(profile.gpu_type)} x{profile.gpu_count}",
+        ]
+    )
+    if profile.required_vram_gb:
+        lines.append(f"[bold]VRAM[/bold]     {profile.required_vram_gb:.0f} GB required")
+    lines.extend(
+        [
             f"[bold]Max ctx[/bold]  {_escape_markup(format_context_length(profile.max_context_tokens))}",
             f"[bold]Cost[/bold]     {_escape_markup(format_hourly_cost(profile.approx_cost_per_hour_usd))}",
             f"[bold]Repo[/bold]     {_escape_markup(profile.repo_id)}",
             f"[bold]Default slug[/bold]  {_escape_markup(profile.instance_slug_hint)}",
         ]
     )
+    return "\n".join(lines)
 
 
 class QuickDeployScreen(CopyEnabledScreen):
@@ -57,9 +71,12 @@ class QuickDeployScreen(CopyEnabledScreen):
         Binding("ctrl+d", "deploy", "Deploy", show=True),
     ]
 
-    def __init__(self, profile_id: str) -> None:
+    def __init__(self, profile_id: str | QuickDeployProfile) -> None:
         super().__init__()
-        self.profile = get_quick_deploy_profile(profile_id)
+        if isinstance(profile_id, QuickDeployProfile):
+            self.profile = profile_id
+        else:
+            self.profile = get_quick_deploy_profile(profile_id)
 
     def compose(self) -> ComposeResult:
         yield Static(

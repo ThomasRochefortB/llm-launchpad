@@ -1,0 +1,50 @@
+name: Refresh Quick Deploy Catalog
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 10 * * 1"
+
+jobs:
+  refresh:
+    name: Refresh catalog
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version-file: "pyproject.toml"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.7.4"
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --locked --group dev
+
+      - name: Refresh catalog
+        run: uv run python scripts/refresh_quick_deploy_catalog.py
+        env:
+          ARTIFICIAL_ANALYSIS_API_KEY: ${{ secrets.ARTIFICIAL_ANALYSIS_API_KEY }}
+
+      - name: Run focused tests
+        run: uv run pytest tests/test_quick_deploy.py tests/test_quick_deploy_screen.py tests/test_main_menu_quick_deploy.py
+
+      - name: Create pull request
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: automation/quick-deploy-catalog
+          commit-message: Refresh Quick Deploy catalog
+          title: Refresh Quick Deploy catalog
+          body: |
+            Updates the bundled Quick Deploy catalog from Artificial Analysis coding rankings and matching Unsloth GGUF weights.
+          labels: automation
