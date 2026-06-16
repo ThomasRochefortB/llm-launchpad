@@ -5,6 +5,7 @@ import unittest
 from textual.app import App
 from textual.widgets import Input, Static
 
+from llm_launchpad.core.config import ConfigSaveResult
 from llm_launchpad.tui.screens.settings import SettingsScreen
 
 
@@ -25,10 +26,11 @@ class SettingsScreenTests(unittest.IsolatedAsyncioTestCase):
             screen.query_one("#scaledown-window", Input).value = "900"
             saved: dict[str, object] = {}
 
-            def fake_save(settings: object) -> None:
+            def fake_save_result(settings: object) -> ConfigSaveResult:
                 saved["settings"] = settings
+                return ConfigSaveResult(success=True, path=screen._store.path)
 
-            screen._store.save = fake_save  # type: ignore[method-assign]
+            screen._store.save_result = fake_save_result  # type: ignore[method-assign]
             screen._save()
 
             saved_settings = saved.get("settings")

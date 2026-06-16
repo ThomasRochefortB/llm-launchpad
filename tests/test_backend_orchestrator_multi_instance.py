@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from llm_launchpad.core.backend import ModalBackend, _extract_modal_app_rows
+from llm_launchpad.core.backend import ModalBackend, ModalListAppsResult, _extract_modal_app_rows
 from llm_launchpad.core.orchestrator import Orchestrator
 from llm_launchpad.protocol.enums import BackendType
 from llm_launchpad.protocol.events import LogEvent, OperationCompleteEvent
@@ -155,8 +155,11 @@ class OrchestratorMultiInstanceTests(unittest.TestCase):
 
     def test_list_deployments_handles_empty_json_as_success(self) -> None:
         orch = Orchestrator()
-        with patch("llm_launchpad.core.backend.ModalBackend.list_apps", return_value=[]):
-            with patch("llm_launchpad.core.backend.ModalBackend.list_apps_raw") as raw_mock:
+        with patch(
+            "llm_launchpad.core.backend.ModalBackend.list_apps_result",
+            return_value=ModalListAppsResult(rows=[]),
+        ):
+            with patch("llm_launchpad.core.backend.ModalBackend.list_apps_raw_result") as raw_mock:
                 events = list(orch.list_deployments())
         raw_mock.assert_not_called()
         self.assertTrue(
@@ -205,7 +208,10 @@ class OrchestratorMultiInstanceTests(unittest.TestCase):
             ),
         ]
 
-        with patch("llm_launchpad.core.backend.ModalBackend.list_apps", return_value=rows):
+        with patch(
+            "llm_launchpad.core.backend.ModalBackend.list_apps_result",
+            return_value=ModalListAppsResult(rows=rows),
+        ):
             events = list(orch.list_deployments())
 
         log_lines = [event.line for event in events if isinstance(event, LogEvent)]
@@ -251,7 +257,10 @@ class OrchestratorMultiInstanceTests(unittest.TestCase):
             ),
         ]
 
-        with patch("llm_launchpad.core.backend.ModalBackend.list_apps", return_value=rows):
+        with patch(
+            "llm_launchpad.core.backend.ModalBackend.list_apps_result",
+            return_value=ModalListAppsResult(rows=rows),
+        ):
             events = list(orch.list_deployments())
 
         log_lines = [event.line for event in events if isinstance(event, LogEvent)]

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
+requires = ["setuptools>=77.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +8,8 @@ dynamic = ["version"]
 description = "Personal LLM deployments made simple."
 readme = "README.md"
 requires-python = ">=3.12"
-license = { file = "LICENSE" }
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
 authors = [{ name = "Thomas Rochefort-Beaudoin" }]
 maintainers = [{ name = "Thomas Rochefort-Beaudoin", email = "ThomasRochefortB@users.noreply.github.com" }]
 keywords = ["llm", "deployment", "modal", "agent", "chat"]
@@ -16,7 +17,6 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
-  "License :: OSI Approved :: GNU Affero General Public License v3",
   "Operating System :: OS Independent",
 ]
 
@@ -87,5 +87,4 @@ exclude = [
     "llm_launchpad/backends",
     "llm_launchpad/tui",
     "llm_launchpad/core/hf_models.py",
-    "llm_launchpad/core/modal_gpu.py",
 ]

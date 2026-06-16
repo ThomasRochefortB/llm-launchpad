@@ -24,9 +24,12 @@ class SettingsScreen(CopyEnabledScreen):
     def __init__(self) -> None:
         super().__init__()
         self._store = ConfigStore()
+        self._load_error: str | None = None
 
     def compose(self) -> ComposeResult:
-        settings = self._store.load()
+        loaded = self._store.load_result()
+        settings = loaded.settings
+        self._load_error = loaded.error
 
         with Center():
             with Vertical(id="settings-form"):
@@ -40,7 +43,12 @@ class SettingsScreen(CopyEnabledScreen):
                 )
                 yield Static("")
                 yield Button("Save", id="save-btn", variant="primary")
-                yield Static("", id="save-feedback")
+                yield Static(
+                    f"[yellow]{self._load_error} Using defaults.[/yellow]"
+                    if self._load_error
+                    else "",
+                    id="save-feedback",
+                )
         yield Footer()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -64,10 +72,15 @@ class SettingsScreen(CopyEnabledScreen):
         settings = LaunchpadSettings(
             scaledown_window=scaledown,
         )
-        self._store.save(settings)
-        self.query_one("#save-feedback", Static).update(
-            "[green]Settings saved.[/green]"
-        )
+        result = self._store.save_result(settings)
+        if result.success:
+            self.query_one("#save-feedback", Static).update(
+                "[green]Settings saved.[/green]"
+            )
+        else:
+            self.query_one("#save-feedback", Static).update(
+                f"[red]{result.error or 'Settings could not be saved.'}[/red]"
+            )
 
     def action_pop_screen(self) -> None:
         self.app.pop_screen()
