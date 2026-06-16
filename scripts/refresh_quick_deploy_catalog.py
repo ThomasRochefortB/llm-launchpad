@@ -11,6 +11,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
 from typing import Any, NamedTuple, Sequence
 
 from llm_launchpad.core.hf_models import GgufQuantMetadata, fetch_gguf_quant_metadata, fetch_model_max_context
@@ -1085,6 +1086,15 @@ def write_catalog(payload: dict[str, Any], path: Path = CATALOG_PATH) -> None:
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
+def fetch_modal_gpu_catalog_or_fallback() -> Sequence[ModalGpuSpec]:
+    """Fetch Modal GPU metadata, falling back to bundled defaults when docs block automation."""
+    try:
+        return fetch_modal_gpu_catalog()
+    except Exception as exc:
+        print(f"Warning: using fallback Modal GPU catalog because live fetch failed: {exc}", file=sys.stderr)
+        return []
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=CATALOG_PATH)
@@ -1098,7 +1108,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     from huggingface_hub import HfApi
 
     aa_payload = fetch_aa_llm_models(api_key)
-    modal_gpu_catalog = fetch_modal_gpu_catalog()
+    modal_gpu_catalog = fetch_modal_gpu_catalog_or_fallback()
     catalog = build_catalog_payload(
         aa_payload,
         hf_api=HfApi(),

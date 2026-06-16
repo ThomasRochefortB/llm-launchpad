@@ -579,6 +579,33 @@ class QuickDeployCatalogGeneratorTests(unittest.TestCase):
         assert selected is not None
         self.assertEqual(selected[0], "UD-Q4_K_XL")
 
+    def test_main_uses_fallback_modal_catalog_when_live_fetch_fails(self) -> None:
+        payload = {"data": []}
+        catalog = {
+            "schema_version": 1,
+            "generated_at": "2026-06-16T00:00:00Z",
+            "source": "Artificial Analysis coding rankings",
+            "profiles": [{"id": "profile"}],
+        }
+
+        with (
+            patch.dict(self.generator.os.environ, {"ARTIFICIAL_ANALYSIS_API_KEY": "key"}),
+            patch.object(self.generator, "fetch_aa_llm_models", return_value=payload) as fetch_aa,
+            patch.object(self.generator, "fetch_modal_gpu_catalog", side_effect=RuntimeError("HTTP 403")),
+            patch.object(self.generator, "build_catalog_payload", return_value=catalog) as build_payload,
+            patch.object(self.generator, "write_catalog") as write_catalog,
+        ):
+            result = self.generator.main(
+                ["--max-profiles", "4", "--output", "quick_deploy_catalog.json"]
+            )
+
+        self.assertEqual(result, 0)
+        fetch_aa.assert_called_once_with("key")
+        build_payload.assert_called_once()
+        self.assertEqual(build_payload.call_args.kwargs["modal_gpu_catalog"], [])
+        self.assertEqual(build_payload.call_args.kwargs["max_profiles"], 4)
+        write_catalog.assert_called_once_with(catalog, path=Path("quick_deploy_catalog.json"))
+
 
 if __name__ == "__main__":
     unittest.main()
