@@ -657,6 +657,11 @@ class TuiApp(App):
     # Storage: list
     # ------------------------------------------------------------------
 
+    def cached_storage_snapshot(self) -> StorageSnapshot | None:
+        """Return the latest cached storage snapshot, if one is available."""
+        with self._storage_refresh_lock:
+            return self._storage_snapshot_cache
+
     def begin_storage_refresh(self, receiver: object, force: bool = False) -> None:
         poster = getattr(receiver, "post_message", None)
         cache_age = time.time() - self._storage_snapshot_cached_at_epoch
