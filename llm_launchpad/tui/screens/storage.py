@@ -11,6 +11,11 @@ from textual.widget import Widget
 from textual.widgets import DataTable, Footer, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
+from ...core.storage_costs import (
+    MODAL_VOLUME_FREE_TIER_GIB_MONTH,
+    estimate_monthly_storage_cost,
+    gross_monthly_storage_cost_usd,
+)
 from ...protocol.enums import BackendType
 from ...protocol.models import StorageSnapshot, StoredModelInfo
 from ..navigation import (
@@ -31,6 +36,24 @@ def _human_bytes(size_bytes: int) -> str:
             return f"{size:.1f} {unit}"
         size /= 1024.0
     return f"{size_bytes} B"
+
+
+def _format_money(value: float) -> str:
+    return f"${value:,.2f}"
+
+
+def _format_gib(value: float) -> str:
+    if value >= 100:
+        return f"{value:,.0f} GiB"
+    if value >= 10:
+        return f"{value:,.1f} GiB"
+    return f"{value:,.2f} GiB"
+
+
+def _format_free_tier(value_gib: float) -> str:
+    if value_gib > 0 and value_gib % 1024 == 0:
+        return f"{value_gib / 1024:,.0f} TiB"
+    return _format_gib(value_gib)
 
 
 def _model_label(row: StoredModelInfo) -> str:
@@ -114,7 +137,7 @@ class StorageScreen(CopyEnabledScreen):
         table = self.query_one("#storage-table", DataTable)
         table.cursor_type = "row"
         table.zebra_stripes = True
-        table.add_columns("backend", "model", "revision", "quant", "files", "size")
+        table.add_columns("backend", "model", "revision", "quant", "files", "size", "list $/mo")
         if self._initial_backend is not None:
             self.query_one("#storage-model-backend", Input).value = self._initial_backend.value
         backend_filter = self.query_one("#storage-backend-filter", OptionList)
@@ -169,8 +192,14 @@ class StorageScreen(CopyEnabledScreen):
     def on_storage_loaded(self, message: StorageLoaded) -> None:
         self._snapshot = message.snapshot
         self._render_table()
+        estimate = estimate_monthly_storage_cost(self._snapshot)
         self.query_one("#storage-status", Static).update(
-            "[green]Storage refreshed.[/green] Use selected row or type a model to pre-download."
+            "[green]Storage refreshed.[/green] "
+            f"{_human_bytes(estimate.total_size_bytes)} cached; "
+            f"{_format_gib(estimate.billable_gib_month)} billable after "
+            f"{_format_free_tier(MODAL_VOLUME_FREE_TIER_GIB_MONTH)} free; "
+            f"est. {_format_money(estimate.estimated_monthly_cost_usd)}/mo. "
+            "Use selected row or type a model to pre-download."
         )
         should_refocus = self._initial_focus_pending
         self._initial_focus_pending = False
@@ -202,6 +231,7 @@ class StorageScreen(CopyEnabledScreen):
                 row.quant or "-",
                 str(row.file_count),
                 _human_bytes(row.size_bytes),
+                f"{_format_money(gross_monthly_storage_cost_usd(row.size_bytes))}/mo",
                 key=row_key,
             )
 

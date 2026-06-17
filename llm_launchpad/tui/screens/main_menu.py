@@ -30,8 +30,13 @@ from ...core.quick_deploy import (
     list_quick_deploy_profiles,
     quick_deploy_model_label_parts,
 )
+from ...core.storage_costs import (
+    MODAL_VOLUME_FREE_TIER_GIB_MONTH,
+    estimate_monthly_storage_cost,
+)
 from ...protocol.enums import BackendType
-from ...protocol.models import EndpointInfo
+from ...protocol.models import EndpointInfo, StorageSnapshot
+from ..workers import StorageFailed, StorageLoaded
 from .copy_enabled import CopyEnabledScreen
 
 BANNER = r"""[bold #7bf168]
@@ -118,9 +123,10 @@ class DeploymentsLoadFailed(Message):
 class BillingReportLoaded(Message):
     """Main-menu billing report fetch completed."""
 
-    def __init__(self, payload: Any) -> None:
+    def __init__(self, payload: Any, storage_snapshot: StorageSnapshot | None = None) -> None:
         super().__init__()
         self.payload = payload
+        self.storage_snapshot = storage_snapshot
 
 
 class BillingReportLoadFailed(Message):
@@ -490,6 +496,34 @@ def _format_money(value: float) -> str:
     return f"${value:,.2f}"
 
 
+def _format_gib(value: float) -> str:
+    if value >= 100:
+        return f"{value:,.0f} GiB"
+    if value >= 10:
+        return f"{value:,.1f} GiB"
+    return f"{value:,.2f} GiB"
+
+
+def _format_free_tier(value_gib: float) -> str:
+    if value_gib > 0 and value_gib % 1024 == 0:
+        return f"{value_gib / 1024:,.0f} TiB"
+    return _format_gib(value_gib)
+
+
+def _storage_estimate_lines(snapshot: StorageSnapshot | None) -> list[str]:
+    if snapshot is None:
+        return []
+    estimate = estimate_monthly_storage_cost(snapshot)
+    return [
+        f"[dim]Launchpad storage est.[/dim] {_format_money(estimate.estimated_monthly_cost_usd)}/mo",
+        (
+            f"[dim]{_format_gib(estimate.total_gib_month)} cached; "
+            f"{_format_gib(estimate.billable_gib_month)} billable after "
+            f"{_format_free_tier(MODAL_VOLUME_FREE_TIER_GIB_MONTH)} free[/dim]"
+        ),
+    ]
+
+
 def _coerce_float(value: Any) -> float | None:
     if isinstance(value, bool):
         return None
@@ -536,16 +570,21 @@ def _normalize_billing_payload(payload: Any) -> Any:
     return payload
 
 
-def _render_billing_report(payload: Any) -> str:
+def _render_billing_report(
+    payload: Any,
+    storage_snapshot: StorageSnapshot | None = None,
+) -> str:
     normalized = _normalize_billing_payload(payload)
     if isinstance(normalized, list):
         rows = [row for row in normalized if isinstance(row, dict)]
         if not rows:
-            return (
-                "[bold]Workspace Spend[/bold]\n"
-                "[dim]Current month spend[/dim]\n"
-                "[dim]total[/dim] [bold]$0.00[/bold]"
-            )
+            lines = [
+                "[bold]Workspace Spend[/bold]",
+                "[dim]Current month spend[/dim]",
+                "[dim]total[/dim] [bold]$0.00[/bold]",
+            ]
+            lines.extend(_storage_estimate_lines(storage_snapshot))
+            return "\n".join(lines)
 
         total = 0.0
         has_total = False
@@ -562,14 +601,17 @@ def _render_billing_report(payload: Any) -> str:
             lines.append(f"[dim]total[/dim] [bold]{_format_money(total)}[/bold]")
         else:
             lines.append("[dim]Total unavailable in report payload.[/dim]")
+        lines.extend(_storage_estimate_lines(storage_snapshot))
         return "\n".join(lines)
 
     if not isinstance(normalized, dict):
-        return (
-            "[bold]Workspace Spend[/bold]\n"
-            "[dim]Billing data unavailable.[/dim]\n"
-            "[dim]Check `modal billing report --json`.[/dim]"
-        )
+        lines = [
+            "[bold]Workspace Spend[/bold]",
+            "[dim]Billing data unavailable.[/dim]",
+            "[dim]Check `modal billing report --json`.[/dim]",
+        ]
+        lines.extend(_storage_estimate_lines(storage_snapshot))
+        return "\n".join(lines)
 
     total = _find_first_float(
         normalized,
@@ -599,6 +641,7 @@ def _render_billing_report(payload: Any) -> str:
         lines.append("[dim]Total unavailable in report payload.[/dim]")
     if gpu_cost is not None:
         lines.append(f"[dim]gpu[/dim] {_format_money(gpu_cost)}")
+    lines.extend(_storage_estimate_lines(storage_snapshot))
     return "\n".join(lines)
 
 
@@ -863,6 +906,8 @@ class MainMenuScreen(CopyEnabledScreen):
         self._modal_auth_refresh_inflight = False
         self._status_refresh_inflight = False
         self._billing_refresh_inflight = False
+        self._billing_payload: Any | None = None
+        self._storage_snapshot: StorageSnapshot | None = None
         self._quick_deploy_profiles = list_quick_deploy_profiles()
         self._quick_deploy_catalog_info = get_quick_deploy_catalog_info()
 
@@ -923,6 +968,7 @@ class MainMenuScreen(CopyEnabledScreen):
         self._refresh_modal_auth_status()
         self._refresh_hf_auth_status()
         self._refresh_panels()
+        self._refresh_storage_estimate()
         self.set_interval(20.0, self._refresh_panels)
 
     def _refresh_modal_auth_status(self) -> None:
@@ -1005,6 +1051,14 @@ class MainMenuScreen(CopyEnabledScreen):
         self._refresh_deployment_status()
         self._refresh_billing_report()
 
+    def _refresh_storage_estimate(self) -> None:
+        cached_storage_snapshot = getattr(self.app, "cached_storage_snapshot", None)
+        if callable(cached_storage_snapshot):
+            self._storage_snapshot = cached_storage_snapshot()
+        refresh_storage = getattr(self.app, "begin_storage_refresh", None)
+        if callable(refresh_storage):
+            refresh_storage(self, force=False)
+
     def _refresh_deployment_status(self) -> None:
         if self._status_refresh_inflight:
             return
@@ -1055,7 +1109,11 @@ class MainMenuScreen(CopyEnabledScreen):
         if payload is None:
             poster(BillingReportLoadFailed(error=error or "Could not read billing report."))
             return
-        poster(BillingReportLoaded(payload=payload))
+        storage_snapshot = None
+        cached_storage_snapshot = getattr(self.app, "cached_storage_snapshot", None)
+        if callable(cached_storage_snapshot):
+            storage_snapshot = cached_storage_snapshot()
+        poster(BillingReportLoaded(payload=payload, storage_snapshot=storage_snapshot))
 
     def on_deployments_loaded(self, message: DeploymentsLoaded) -> None:
         self._status_refresh_inflight = False
@@ -1074,11 +1132,27 @@ class MainMenuScreen(CopyEnabledScreen):
 
     def on_billing_report_loaded(self, message: BillingReportLoaded) -> None:
         self._billing_refresh_inflight = False
-        self.query_one("#billing-report-body", Static).update(_render_billing_report(message.payload))
+        self._billing_payload = message.payload
+        if message.storage_snapshot is not None:
+            self._storage_snapshot = message.storage_snapshot
+        self.query_one("#billing-report-body", Static).update(
+            _render_billing_report(message.payload, storage_snapshot=self._storage_snapshot)
+        )
 
     def on_billing_report_load_failed(self, message: BillingReportLoadFailed) -> None:
         self._billing_refresh_inflight = False
         self.query_one("#billing-report-body", Static).update(_render_billing_load_error(message.error))
+
+    def on_storage_loaded(self, message: StorageLoaded) -> None:
+        self._storage_snapshot = message.snapshot
+        if self._billing_payload is None:
+            return
+        self.query_one("#billing-report-body", Static).update(
+            _render_billing_report(self._billing_payload, storage_snapshot=self._storage_snapshot)
+        )
+
+    def on_storage_failed(self, _: StorageFailed) -> None:
+        return
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         option_list_id = event.option_list.id

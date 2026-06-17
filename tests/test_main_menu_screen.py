@@ -4,7 +4,7 @@ import unittest
 
 from llm_launchpad.core.modal_auth import ModalAuthStatus
 from llm_launchpad.protocol.enums import BackendType
-from llm_launchpad.protocol.models import EndpointInfo
+from llm_launchpad.protocol.models import EndpointInfo, StorageSnapshot, StoredModelInfo
 from llm_launchpad.tui.screens.main_menu import (
     MainMenuScreen,
     _render_auth_status_block,
@@ -16,6 +16,8 @@ from llm_launchpad.tui.screens.main_menu import (
     _should_show_in_panel,
 )
 from llm_launchpad.core.hf_auth import HuggingFaceAuthStatus
+
+_GIB = 1024**3
 
 
 class MainMenuStatusRenderTests(unittest.TestCase):
@@ -115,6 +117,38 @@ class MainMenuStatusRenderTests(unittest.TestCase):
         self.assertIn("Current month spend", rendered)
         self.assertIn("$12.50", rendered)
         self.assertIn("$8.10", rendered)
+
+    def test_render_billing_report_includes_storage_estimate_separately(self) -> None:
+        payload = {"summary": {"total_usd": 12.5, "gpu_cost_usd": 8.1}}
+        snapshot = StorageSnapshot(
+            llamacpp_models=[
+                StoredModelInfo(
+                    backend=BackendType.LLAMACPP,
+                    model_id="Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+                    size_bytes=1024 * _GIB,
+                    file_count=1,
+                    source_volume="huggingface-cache",
+                )
+            ],
+            vllm_models=[
+                StoredModelInfo(
+                    backend=BackendType.VLLM,
+                    model_id="Qwen/Qwen3-4B",
+                    size_bytes=2 * _GIB,
+                    file_count=2,
+                    source_volume="huggingface-cache",
+                )
+            ],
+        )
+
+        rendered = _render_billing_report(payload, storage_snapshot=snapshot)
+
+        self.assertIn("[dim]total[/dim] [bold]$12.50[/bold]", rendered)
+        self.assertIn("[dim]gpu[/dim] $8.10", rendered)
+        self.assertIn("Launchpad storage est.", rendered)
+        self.assertIn("$0.18/mo", rendered)
+        self.assertIn("1,026 GiB cached", rendered)
+        self.assertIn("2.00 GiB billable after 1 TiB free", rendered)
 
     def test_render_billing_report_handles_unrecognized_payload(self) -> None:
         rendered = _render_billing_report("not-json")

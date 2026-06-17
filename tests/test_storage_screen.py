@@ -3,13 +3,16 @@ from __future__ import annotations
 import unittest
 
 from textual.app import App
+from textual.coordinate import Coordinate
 from textual.screen import Screen
-from textual.widgets import DataTable, Input, OptionList
+from textual.widgets import DataTable, Input, OptionList, Static
 
 from llm_launchpad.protocol.enums import BackendType
 from llm_launchpad.protocol.models import StorageSnapshot, StoredModelInfo
 from llm_launchpad.tui.screens.storage import StorageScreen, _model_label
 from llm_launchpad.tui.workers import StorageLoaded
+
+_GIB = 1024**3
 
 
 def _sample_snapshot() -> StorageSnapshot:
@@ -20,7 +23,7 @@ def _sample_snapshot() -> StorageSnapshot:
                 model_id="Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
                 revision="main",
                 quant="Q4_K_M",
-                size_bytes=1024,
+                size_bytes=2 * _GIB,
                 file_count=1,
                 source_volume="huggingface-cache",
                 incomplete=True,
@@ -32,7 +35,7 @@ def _sample_snapshot() -> StorageSnapshot:
                 model_id="Qwen/Qwen3-4B-Thinking-2507-FP8",
                 revision=None,
                 quant=None,
-                size_bytes=2048,
+                size_bytes=3 * _GIB,
                 file_count=2,
                 source_volume="huggingface-cache",
             )
@@ -103,6 +106,15 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
             assert isinstance(screen, StorageScreen)
             table = screen.query_one("#storage-table", DataTable)
             self.assertEqual(table.row_count, 2)
+            self.assertEqual(table.get_cell_at(Coordinate(0, 6)), "$0.18/mo")
+            self.assertEqual(table.get_cell_at(Coordinate(1, 6)), "$0.27/mo")
+
+            status = screen.query_one("#storage-status", Static)
+            rendered_status = str(status.renderable)
+            self.assertIn("5.0 GB cached", rendered_status)
+            self.assertIn("0.00 GiB billable", rendered_status)
+            self.assertIn("1 TiB free", rendered_status)
+            self.assertIn("$0.00/mo", rendered_status)
 
     async def test_mount_focuses_backend_filter_menu_for_arrow_navigation(self) -> None:
         app = _TestApp()
