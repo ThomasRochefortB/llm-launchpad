@@ -87,9 +87,9 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
         fake_requests = types.SimpleNamespace(post=_post)
 
         with patch.dict("sys.modules", {"requests": fake_requests}):
-            with patch("llm_launchpad.core.orchestrator.time.sleep", return_value=None):
+            with patch("llm_launchpad.core.warmup.time.sleep", return_value=None):
                 with patch(
-                    "llm_launchpad.core.orchestrator.ModalBackend.test_curl_command",
+                    "llm_launchpad.core.warmup.ModalBackend.test_curl_command",
                     return_value="curl ok",
                 ):
                     events = list(
@@ -120,9 +120,9 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
     def test_warmup_success_vllm(self) -> None:
         fake_requests = types.SimpleNamespace(get=lambda *_args, **_kwargs: _Response(200, "ok"))
         with patch.dict("sys.modules", {"requests": fake_requests}):
-            with patch("llm_launchpad.core.orchestrator.time.sleep", return_value=None):
+            with patch("llm_launchpad.core.warmup.time.sleep", return_value=None):
                 with patch(
-                    "llm_launchpad.core.orchestrator.ModalBackend.test_curl_command",
+                    "llm_launchpad.core.warmup.ModalBackend.test_curl_command",
                     return_value="curl ok",
                 ) as curl_mock:
                     events = list(
@@ -159,8 +159,8 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
             return 0.0 if call_count["n"] <= 5 else 999.0
 
         with patch.dict("sys.modules", {"requests": fake_requests}):
-            with patch("llm_launchpad.core.orchestrator.time.time", side_effect=_fake_time):
-                with patch("llm_launchpad.core.orchestrator.time.sleep", return_value=None):
+            with patch("llm_launchpad.core.warmup.time.time", side_effect=_fake_time):
+                with patch("llm_launchpad.core.warmup.time.sleep", return_value=None):
                     events = list(
                         Orchestrator().warmup(
                             backend=BackendType.VLLM,
@@ -203,10 +203,10 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
             return time_val["t"]
 
         with patch.dict("sys.modules", {"requests": fake_requests}):
-            with patch("llm_launchpad.core.orchestrator.time.time", side_effect=_fake_time):
-                with patch("llm_launchpad.core.orchestrator.time.sleep", return_value=None):
+            with patch("llm_launchpad.core.warmup.time.time", side_effect=_fake_time):
+                with patch("llm_launchpad.core.warmup.time.sleep", return_value=None):
                     with patch(
-                        "llm_launchpad.core.orchestrator.ModalBackend.test_curl_command",
+                        "llm_launchpad.core.warmup.ModalBackend.test_curl_command",
                         return_value="curl ok",
                     ):
                         events = list(
@@ -242,12 +242,12 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
         fake_proc = _FakeProc(lines=["modal-log-line\n"])
         fake_requests = types.SimpleNamespace(get=lambda *_args, **_kwargs: _Response(200, "ok"))
         with patch.dict("sys.modules", {"requests": fake_requests}):
-            with patch("llm_launchpad.core.orchestrator.ModalBackend.logs_follow_args", return_value=["--follow"]):
-                with patch("llm_launchpad.core.orchestrator.subprocess.Popen", return_value=fake_proc) as popen_mock:
-                    with patch("llm_launchpad.core.orchestrator.threading.Thread", _SyncThread):
-                        with patch("llm_launchpad.core.orchestrator.os.environ", {}):
+            with patch("llm_launchpad.core.warmup.ModalBackend.logs_follow_args", return_value=["--follow"]):
+                with patch("llm_launchpad.core.warmup.subprocess.Popen", return_value=fake_proc) as popen_mock:
+                    with patch("llm_launchpad.core.warmup.threading.Thread", _SyncThread):
+                        with patch("llm_launchpad.core.warmup.os.environ", {}):
                             with patch(
-                                "llm_launchpad.core.orchestrator.ModalBackend.test_curl_command",
+                                "llm_launchpad.core.warmup.ModalBackend.test_curl_command",
                                 return_value="curl ok",
                             ):
                                 events = list(
@@ -286,12 +286,12 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
             return 0.0 if call_count["n"] <= 8 else 999.0
 
         with patch.dict("sys.modules", {"requests": fake_requests}):
-            with patch("llm_launchpad.core.orchestrator.ModalBackend.logs_follow_args", return_value=["--follow"]):
-                with patch("llm_launchpad.core.orchestrator.subprocess.Popen", return_value=fake_proc):
-                    with patch("llm_launchpad.core.orchestrator.threading.Thread", _SyncThread):
-                        with patch("llm_launchpad.core.orchestrator.os.environ", {}):
-                            with patch("llm_launchpad.core.orchestrator.time.time", side_effect=_fake_time):
-                                with patch("llm_launchpad.core.orchestrator.time.sleep", return_value=None):
+            with patch("llm_launchpad.core.warmup.ModalBackend.logs_follow_args", return_value=["--follow"]):
+                with patch("llm_launchpad.core.warmup.subprocess.Popen", return_value=fake_proc):
+                    with patch("llm_launchpad.core.warmup.threading.Thread", _SyncThread):
+                        with patch("llm_launchpad.core.warmup.os.environ", {}):
+                            with patch("llm_launchpad.core.warmup.time.time", side_effect=_fake_time):
+                                with patch("llm_launchpad.core.warmup.time.sleep", return_value=None):
                                     events = list(
                                         Orchestrator().warmup(
                                             backend=BackendType.VLLM,
@@ -317,8 +317,8 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
             stdout="line-A\nline-B\nline-C\n", returncode=0
         )
         seen: set[str] = {"line-A"}
-        with patch("llm_launchpad.core.orchestrator.subprocess.run", return_value=fake_run_result):
-            with patch("llm_launchpad.core.orchestrator.os.environ", {}):
+        with patch("llm_launchpad.core.warmup.subprocess.run", return_value=fake_run_result):
+            with patch("llm_launchpad.core.warmup.os.environ", {}):
                 events = list(Orchestrator._fetch_historical_logs("myapp", seen))
 
         lines = [e.line for e in events if isinstance(e, LogEvent)]
@@ -342,8 +342,8 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
 
         exc = _sp.TimeoutExpired(cmd=["modal"], timeout=15)
         exc.stdout = "partial-line\n"
-        with patch("llm_launchpad.core.orchestrator.subprocess.run", side_effect=exc):
-            with patch("llm_launchpad.core.orchestrator.os.environ", {}):
+        with patch("llm_launchpad.core.warmup.subprocess.run", side_effect=exc):
+            with patch("llm_launchpad.core.warmup.os.environ", {}):
                 events = list(Orchestrator._fetch_historical_logs("myapp", set()))
 
         lines = [e.line for e in events if isinstance(e, LogEvent)]
@@ -369,13 +369,13 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
             return 0.0 if call_count["n"] <= 10 else 999.0
 
         with patch.dict("sys.modules", {"requests": fake_requests}):
-            with patch("llm_launchpad.core.orchestrator.ModalBackend.logs_follow_args", return_value=[]):
-                with patch("llm_launchpad.core.orchestrator.subprocess.Popen", return_value=stream_proc):
-                    with patch("llm_launchpad.core.orchestrator.threading.Thread", _SyncThread):
-                        with patch("llm_launchpad.core.orchestrator.subprocess.run", return_value=hist_result):
-                            with patch("llm_launchpad.core.orchestrator.os.environ", {}):
-                                with patch("llm_launchpad.core.orchestrator.time.time", side_effect=_fake_time):
-                                    with patch("llm_launchpad.core.orchestrator.time.sleep", return_value=None):
+            with patch("llm_launchpad.core.warmup.ModalBackend.logs_follow_args", return_value=[]):
+                with patch("llm_launchpad.core.warmup.subprocess.Popen", return_value=stream_proc):
+                    with patch("llm_launchpad.core.warmup.threading.Thread", _SyncThread):
+                        with patch("llm_launchpad.core.warmup.subprocess.run", return_value=hist_result):
+                            with patch("llm_launchpad.core.warmup.os.environ", {}):
+                                with patch("llm_launchpad.core.warmup.time.time", side_effect=_fake_time):
+                                    with patch("llm_launchpad.core.warmup.time.sleep", return_value=None):
                                         events = list(
                                             Orchestrator().warmup(
                                                 backend=BackendType.VLLM,

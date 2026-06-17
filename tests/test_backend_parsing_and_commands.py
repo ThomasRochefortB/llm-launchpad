@@ -32,14 +32,59 @@ class BackendParsingAndCommandTests(unittest.TestCase):
         self.assertEqual(ModalBackend.list_apps(), [])
 
     @patch("llm_launchpad.core.backend.subprocess.run")
+    def test_list_apps_result_reports_invalid_json(self, mock_run) -> None:  # type: ignore[no-untyped-def]
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stdout = "{not-json"
+        mock_run.return_value.stderr = ""
+
+        result = ModalBackend.list_apps_result()
+
+        self.assertFalse(result.success)
+        self.assertIsNone(result.rows)
+        self.assertIsNotNone(result.error)
+        assert result.error is not None
+        self.assertIn("invalid JSON", result.error.message)
+        self.assertEqual(result.error.command, ("modal", "app", "list", "--json"))
+
+    @patch("llm_launchpad.core.backend.subprocess.run")
     def test_list_apps_returns_none_on_timeout(self, mock_run) -> None:  # type: ignore[no-untyped-def]
         mock_run.side_effect = subprocess.TimeoutExpired(cmd=["modal", "app", "list"], timeout=8)
         self.assertIsNone(ModalBackend.list_apps())
 
     @patch("llm_launchpad.core.backend.subprocess.run")
+    def test_list_apps_result_reports_timeout(self, mock_run) -> None:  # type: ignore[no-untyped-def]
+        mock_run.side_effect = subprocess.TimeoutExpired(cmd=["modal", "app", "list"], timeout=8)
+
+        result = ModalBackend.list_apps_result()
+
+        self.assertFalse(result.success)
+        self.assertIsNotNone(result.error)
+        assert result.error is not None
+        self.assertTrue(result.error.timed_out)
+        self.assertIn("Timed out", result.error.message)
+
+    @patch("llm_launchpad.core.backend.subprocess.run")
     def test_list_volume_returns_none_on_timeout(self, mock_run) -> None:  # type: ignore[no-untyped-def]
         mock_run.side_effect = subprocess.TimeoutExpired(cmd=["modal", "volume", "ls"], timeout=8)
         self.assertIsNone(ModalBackend.list_volume("huggingface-cache", "/hub"))
+
+    @patch("llm_launchpad.core.backend.subprocess.run")
+    def test_list_volume_result_reports_cli_stderr(self, mock_run) -> None:  # type: ignore[no-untyped-def]
+        mock_run.return_value = subprocess.CompletedProcess(
+            args=["modal", "volume", "ls"],
+            returncode=2,
+            stdout="",
+            stderr="Volume not found.",
+        )
+
+        result = ModalBackend.list_volume_result("missing-volume", "/hub")
+
+        self.assertFalse(result.success)
+        self.assertIsNone(result.entries)
+        self.assertIsNotNone(result.error)
+        assert result.error is not None
+        self.assertEqual(result.error.exit_code, 2)
+        self.assertIn("Volume not found", result.error.message)
 
     @patch("llm_launchpad.core.backend.subprocess.run")
     def test_billing_report_json_returns_payload(self, mock_run) -> None:  # type: ignore[no-untyped-def]

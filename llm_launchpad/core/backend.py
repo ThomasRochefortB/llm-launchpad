@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import os
 import re
@@ -20,6 +21,55 @@ from .modal_auth import get_modal_profile
 from .naming import default_served_model_name
 from .naming import infer_backend_from_app_name, infer_instance_from_app_name, legacy_app_name
 from .naming import modal_function_name
+
+
+@dataclass(frozen=True)
+class ModalCliError:
+    """Structured diagnostics for a failed Modal CLI call."""
+
+    message: str
+    command: tuple[str, ...] = ()
+    exit_code: int | None = None
+    stdout: str = ""
+    stderr: str = ""
+    timed_out: bool = False
+    exception_type: str = ""
+
+
+@dataclass(frozen=True)
+class ModalListAppsResult:
+    """Result from ``modal app list --json``."""
+
+    rows: list[EndpointInfo] | None = None
+    error: ModalCliError | None = None
+
+    @property
+    def success(self) -> bool:
+        return self.error is None
+
+
+@dataclass(frozen=True)
+class ModalTextResult:
+    """Result from a Modal CLI call that returns text."""
+
+    output: str | None = None
+    error: ModalCliError | None = None
+
+    @property
+    def success(self) -> bool:
+        return self.error is None
+
+
+@dataclass(frozen=True)
+class ModalVolumeListResult:
+    """Result from ``modal volume ls --json``."""
+
+    entries: list[dict[str, Any]] | None = None
+    error: ModalCliError | None = None
+
+    @property
+    def success(self) -> bool:
+        return self.error is None
 
 
 class ModalBackend:
@@ -305,45 +355,111 @@ class ModalBackend:
     @staticmethod
     def list_apps() -> Optional[List[EndpointInfo]]:
         """Return parsed app list (possibly empty), or None on failure."""
+        result = ModalBackend.list_apps_result()
+        return result.rows if result.success else None
+
+    @staticmethod
+    def list_apps_result() -> ModalListAppsResult:
+        """Return parsed app list plus diagnostics on failure."""
+        command = ["modal", "app", "list", "--json"]
         try:
             result = subprocess.run(
-                ModalBackend._resolve_command(["modal", "app", "list", "--json"]),
+                ModalBackend._resolve_command(command),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 timeout=ModalBackend._CLI_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired:
-            return None
-        except Exception:
-            return None
+            return ModalListAppsResult(
+                rows=None,
+                error=ModalCliError(
+                    message="Timed out while querying Modal app list.",
+                    command=tuple(command),
+                    timed_out=True,
+                ),
+            )
+        except Exception as exc:
+            return ModalListAppsResult(
+                rows=None,
+                error=ModalCliError(
+                    message=f"Failed to query Modal app list: {exc}",
+                    command=tuple(command),
+                    exception_type=type(exc).__name__,
+                ),
+            )
         if result.returncode != 0:
-            return None
+            return ModalListAppsResult(
+                rows=None,
+                error=_modal_cli_error_from_completed_process(
+                    command,
+                    result,
+                    fallback_message="Modal app list failed.",
+                ),
+            )
         try:
             payload: Any = json.loads(result.stdout or "[]")
-        except Exception:
-            return None
+        except Exception as exc:
+            return ModalListAppsResult(
+                rows=None,
+                error=ModalCliError(
+                    message=f"Modal app list returned invalid JSON: {exc}",
+                    command=tuple(command),
+                    exit_code=result.returncode,
+                    stdout=result.stdout or "",
+                    stderr=result.stderr or "",
+                    exception_type=type(exc).__name__,
+                ),
+            )
 
-        return _extract_modal_app_rows(payload)
+        return ModalListAppsResult(rows=_extract_modal_app_rows(payload), error=None)
 
     @staticmethod
     def list_apps_raw() -> Optional[str]:
         """Fallback: return raw text from ``modal app list``."""
+        result = ModalBackend.list_apps_raw_result()
+        return result.output if result.success else None
+
+    @staticmethod
+    def list_apps_raw_result() -> ModalTextResult:
+        """Fallback: return raw app-list text plus diagnostics on failure."""
+        command = ["modal", "app", "list"]
         try:
             result = subprocess.run(
-                ModalBackend._resolve_command(["modal", "app", "list"]),
+                ModalBackend._resolve_command(command),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 timeout=ModalBackend._CLI_TIMEOUT_SECONDS,
             )
             if result.returncode == 0:
-                return result.stdout or ""
+                return ModalTextResult(output=result.stdout or "", error=None)
+            return ModalTextResult(
+                output=None,
+                error=_modal_cli_error_from_completed_process(
+                    command,
+                    result,
+                    fallback_message="Modal app list failed.",
+                ),
+            )
         except subprocess.TimeoutExpired:
-            return None
-        except Exception:
-            pass
-        return None
+            return ModalTextResult(
+                output=None,
+                error=ModalCliError(
+                    message="Timed out while querying Modal app list.",
+                    command=tuple(command),
+                    timed_out=True,
+                ),
+            )
+        except Exception as exc:
+            return ModalTextResult(
+                output=None,
+                error=ModalCliError(
+                    message=f"Failed to query Modal app list: {exc}",
+                    command=tuple(command),
+                    exception_type=type(exc).__name__,
+                ),
+            )
 
     @staticmethod
     def billing_report_json() -> tuple[Optional[Any], Optional[str]]:
@@ -407,33 +523,86 @@ class ModalBackend:
     @staticmethod
     def list_volume(volume_name: str, path: str = "/") -> Optional[List[Dict[str, Any]]]:
         """List files/directories in a Modal Volume path."""
+        result = ModalBackend.list_volume_result(volume_name, path)
+        return result.entries if result.success else None
+
+    @staticmethod
+    def list_volume_result(volume_name: str, path: str = "/") -> ModalVolumeListResult:
+        """List Modal Volume entries plus diagnostics on failure."""
         if ModalBackend.is_shutting_down():
-            return []
+            return ModalVolumeListResult(entries=[], error=None)
+        command = ["modal", "volume", "ls", volume_name, path, "--json"]
         try:
             result = subprocess.run(
-                ModalBackend._resolve_command(["modal", "volume", "ls", volume_name, path, "--json"]),
+                ModalBackend._resolve_command(command),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 timeout=ModalBackend._CLI_TIMEOUT_SECONDS,
             )
         except subprocess.TimeoutExpired:
-            return None
-        except Exception:
-            return None
+            return ModalVolumeListResult(
+                entries=None,
+                error=ModalCliError(
+                    message=f"Timed out while listing Modal volume '{volume_name}' at {path}.",
+                    command=tuple(command),
+                    timed_out=True,
+                ),
+            )
+        except Exception as exc:
+            return ModalVolumeListResult(
+                entries=None,
+                error=ModalCliError(
+                    message=f"Failed to list Modal volume '{volume_name}' at {path}: {exc}",
+                    command=tuple(command),
+                    exception_type=type(exc).__name__,
+                ),
+            )
         if result.returncode != 0:
-            return None
+            return ModalVolumeListResult(
+                entries=None,
+                error=_modal_cli_error_from_completed_process(
+                    command,
+                    result,
+                    fallback_message=f"Modal volume list failed for '{volume_name}' at {path}.",
+                ),
+            )
         try:
             payload = json.loads(result.stdout or "[]")
-        except Exception:
-            return None
+        except Exception as exc:
+            return ModalVolumeListResult(
+                entries=None,
+                error=ModalCliError(
+                    message=f"Modal volume list returned invalid JSON for '{volume_name}' at {path}: {exc}",
+                    command=tuple(command),
+                    exit_code=result.returncode,
+                    stdout=result.stdout or "",
+                    stderr=result.stderr or "",
+                    exception_type=type(exc).__name__,
+                ),
+            )
         if isinstance(payload, list):
-            return [entry for entry in payload if isinstance(entry, dict)]
+            return ModalVolumeListResult(
+                entries=[entry for entry in payload if isinstance(entry, dict)],
+                error=None,
+            )
         if isinstance(payload, dict):
             nested = payload.get("entries") or payload.get("items") or []
             if isinstance(nested, list):
-                return [entry for entry in nested if isinstance(entry, dict)]
-        return None
+                return ModalVolumeListResult(
+                    entries=[entry for entry in nested if isinstance(entry, dict)],
+                    error=None,
+                )
+        return ModalVolumeListResult(
+            entries=None,
+            error=ModalCliError(
+                message=f"Modal volume list returned an unsupported JSON shape for '{volume_name}' at {path}.",
+                command=tuple(command),
+                exit_code=result.returncode,
+                stdout=result.stdout or "",
+                stderr=result.stderr or "",
+            ),
+        )
 
     # ------------------------------------------------------------------
     # Streaming subprocess execution
@@ -541,6 +710,24 @@ class ModalBackend:
 # ------------------------------------------------------------------
 # Internal helpers
 # ------------------------------------------------------------------
+
+def _modal_cli_error_from_completed_process(
+    command: list[str],
+    result: subprocess.CompletedProcess[str],
+    *,
+    fallback_message: str,
+) -> ModalCliError:
+    stderr = (result.stderr or "").strip()
+    stdout = (result.stdout or "").strip()
+    details = stderr or stdout or f"Exit code {result.returncode}"
+    return ModalCliError(
+        message=f"{fallback_message} {details}",
+        command=tuple(command),
+        exit_code=result.returncode,
+        stdout=result.stdout or "",
+        stderr=result.stderr or "",
+    )
+
 
 def _non_empty_text(value: Any) -> Optional[str]:
     if value is None:
