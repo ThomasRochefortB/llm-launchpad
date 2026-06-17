@@ -7,6 +7,20 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-06-17
+
+### Added
+- Added Modal Volume storage cost estimates to the TUI billing panel and Storage screen, using Modal's `$0.09 / GiB / month` list price and `1 TiB / month` free tier.
+- Added storage cost helpers and tests for binary GiB conversion, list-rate estimates, billable storage after the free tier, and monthly cost estimates.
+
+### Changed
+- Refreshed Quick Deploy catalog data and ranking display, including AA coding index context and score-based sorting.
+- Improved backend orchestration, configuration handling, and CI hygiene.
+- Refactored deployment flow internals for cleaner launch and management behavior.
+
+### Fixed
+- Handled Modal metadata fetch failures during Quick Deploy catalog refreshes.
+
 ## [1.0.1] - 2026-03-25
 
 ### Fixed
@@ -38,7 +52,8 @@ and this project follows [Semantic Versioning](https://semver.org/).
 - Initial packaged release of `llm-launchpad` with the Textual TUI, headless
   CLI management commands, and Modal vLLM / llama.cpp backends.
 
-[Unreleased]: https://github.com/ThomasRochefortB/llm-launchpad/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/ThomasRochefortB/llm-launchpad/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/ThomasRochefortB/llm-launchpad/releases/tag/v1.1.0
 [1.0.1]: https://github.com/ThomasRochefortB/llm-launchpad/releases/tag/v1.0.1
 [1.0.0]: https://github.com/ThomasRochefortB/llm-launchpad/releases/tag/v1.0.0
 [0.0.2]: https://github.com/ThomasRochefortB/llm-launchpad/releases/tag/v0.0.2
