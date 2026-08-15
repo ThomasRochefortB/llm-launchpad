@@ -40,7 +40,7 @@ jobs:
         run: uv run pytest tests/test_quick_deploy.py tests/test_quick_deploy_screen.py tests/test_main_menu_quick_deploy.py
 
       - name: Create pull request
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           branch: automation/quick-deploy-catalog
           commit-message: Refresh Quick Deploy catalog
