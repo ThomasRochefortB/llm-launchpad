@@ -33,7 +33,7 @@ dependencies = [
 
 [project.optional-dependencies]
 benchmark = [
-  "aiperf>=0.7,<0.8",
+  "aiperf>=0.7,<0.13",
 ]
 
 [project.scripts]
