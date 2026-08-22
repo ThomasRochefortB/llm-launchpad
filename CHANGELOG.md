@@ -7,6 +7,15 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.1] - 2026-08-22
+
+### Changed
+- Updated runtime dependencies: `huggingface-hub` to 1.27.0, `requests` to 2.34.2, and `modal` to 1.5.0; the optional `benchmark` extra now uses `aiperf` 0.12.0.
+
+### Security
+- Upgraded locked transitive dependencies to clear Dependabot advisories: aiohttp, cbor2, h2 (with hpack), idna, pydantic-settings, Pygments, setuptools, starlette, and urllib3.
+- Remaining aiohttp and Pillow advisories are pending an upstream `aiperf` release that relaxes its dependency caps (tracked in #63).
+
 ## [1.1.0] - 2026-06-17
 
 ### Added
@@ -52,7 +61,8 @@ and this project follows [Semantic Versioning](https://semver.org/).
 - Initial packaged release of `llm-launchpad` with the Textual TUI, headless
   CLI management commands, and Modal vLLM / llama.cpp backends.
 
-[Unreleased]: https://github.com/ThomasRochefortB/llm-launchpad/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/ThomasRochefortB/llm-launchpad/compare/v1.1.1...HEAD
+[1.1.1]: https://github.com/ThomasRochefortB/llm-launchpad/releases/tag/v1.1.1
 [1.1.0]: https://github.com/ThomasRochefortB/llm-launchpad/releases/tag/v1.1.0
 [1.0.1]: https://github.com/ThomasRochefortB/llm-launchpad/releases/tag/v1.0.1
 [1.0.0]: https://github.com/ThomasRochefortB/llm-launchpad/releases/tag/v1.0.0
