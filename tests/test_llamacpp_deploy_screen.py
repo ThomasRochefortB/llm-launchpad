@@ -4,13 +4,22 @@ import unittest
 from types import SimpleNamespace
 
 from textual.app import App
-from textual.widgets import Input, OptionList, Select, Static, Switch
+from textual.widgets import Button, Input, OptionList, Select, Static, Switch
 
 from llm_launchpad.core.hf_models import ModelCandidate
 from llm_launchpad.core.modal_gpu import ModalGpuSpec
-from llm_launchpad.protocol.enums import BackendType
-from llm_launchpad.protocol.models import StorageSnapshot, StoredModelInfo
-from llm_launchpad.tui.screens.deploy import GpuTypesLoaded, LlamaCppDeployScreen
+from llm_launchpad.protocol.enums import BackendType, ComputeProvider
+from llm_launchpad.protocol.models import (
+    ComputeOffer,
+    PrimeProviderOptions,
+    StorageSnapshot,
+    StoredModelInfo,
+)
+from llm_launchpad.tui.screens.deploy import (
+    GpuTypesLoaded,
+    LlamaCppDeployScreen,
+    PrimeOffersLoaded,
+)
 from llm_launchpad.tui.workers import LlamaCppModelsLoaded, LlamaCppQuantsLoaded, StorageLoaded
 
 
@@ -124,7 +133,7 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             assert highlighted is not None
             self.assertEqual(highlighted.id, "rank-trending")
 
-    async def test_down_from_quant_list_last_option_moves_focus_to_gpu_type_select(self) -> None:
+    async def test_down_from_quant_list_last_option_moves_focus_to_provider_select(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:
             app.push_screen(LlamaCppDeployScreen())
@@ -143,7 +152,7 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             quant_list = screen.query_one("#llama-quant-list", OptionList)
-            gpu_type = screen.query_one("#gpu-type-llama", Select)
+            provider = screen.query_one("#provider-llama", Select)
 
             quant_list.focus()
             quant_list.highlighted = 1
@@ -151,7 +160,7 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("down")
             await pilot.pause()
 
-            self.assertTrue(gpu_type.has_focus)
+            self.assertTrue(provider.has_focus)
 
     async def test_enter_on_model_list_commits_and_exits_to_repo_id(self) -> None:
         app = _TestApp()
@@ -220,7 +229,7 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.fetch_calls, ["downloads"])
             self.assertTrue(model_list.has_focus)
 
-    async def test_enter_on_quant_list_commits_and_exits_to_gpu_type(self) -> None:
+    async def test_enter_on_quant_list_commits_and_exits_to_provider(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:
             app.push_screen(LlamaCppDeployScreen())
@@ -240,7 +249,7 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             )
             quant_list = screen.query_one("#llama-quant-list", OptionList)
             quant_input = screen.query_one("#quant", Input)
-            gpu_type = screen.query_one("#gpu-type-llama", Select)
+            provider = screen.query_one("#provider-llama", Select)
 
             quant_list.focus()
             quant_list.highlighted = 1
@@ -250,7 +259,7 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             self.assertEqual(quant_input.value, "Q8_0")
-            self.assertTrue(gpu_type.has_focus)
+            self.assertTrue(provider.has_focus)
 
     async def test_gpu_type_dropdown_shows_hourly_price_labels(self) -> None:
         app = _TestApp()
@@ -518,6 +527,164 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(app.deployed_config.show_debug_logs)
         self.assertEqual(app.deployed_config.gpu_count, 3)
         self.assertEqual(app.deployed_config.gpu_type, "A100-80GB")
+
+    async def test_prime_offer_maps_into_llamacpp_deployment(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+            offer = ComputeOffer(
+                id="abc123",
+                cloud_id="cloud-h100",
+                provider_name="provider",
+                gpu_type="H100_80GB",
+                gpu_count=1,
+                price_per_hour=1.75,
+                security="secure_cloud",
+                stock_status="Available",
+                images=("ubuntu_22_cuda_12",),
+            )
+            screen._provider = ComputeProvider.PRIME
+            screen._sync_prime_visibility()
+            screen.on_prime_offers_loaded(PrimeOffersLoaded([offer]))
+            screen._selected_prime_offer_id = offer.id
+            screen.query_one("#repo-id", Input).value = "org/Model-GGUF"
+            screen.query_one("#quant", Input).value = "Q4_K_M"
+            screen._do_deploy()
+
+        self.assertIsNotNone(app.deployed_config)
+        config = app.deployed_config
+        self.assertEqual(config.provider, ComputeProvider.PRIME)
+        self.assertEqual(config.backend, BackendType.LLAMACPP)
+        self.assertEqual(config.gpu_type, "H100_80GB")
+        self.assertEqual(config.gpu_count, 1)
+        self.assertEqual(config.app_name, "llp-prime-llamacpp-org-model-gguf")
+        self.assertEqual(
+            config.provider_options,
+            PrimeProviderOptions(
+                offer_id="abc123",
+            ),
+        )
+
+    async def test_prime_disk_submits_through_real_form_buttons(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+            offer = ComputeOffer(
+                id="disk-offer",
+                cloud_id="cloud-rtx4000ada",
+                provider_name="provider",
+                gpu_type="RTX4000Ada_20GB",
+                gpu_count=1,
+                price_per_hour=0.30,
+                security="secure_cloud",
+                stock_status="Available",
+                images=("ubuntu_22_cuda_12",),
+            )
+            screen.query_one("#repo-id", Input).value = (
+                "bartowski/Qwen2.5-0.5B-Instruct-GGUF"
+            )
+            screen.query_one("#quant", Input).value = "Q4_K_M"
+            screen.on_prime_offers_loaded(PrimeOffersLoaded([offer]))
+            screen.query_one("#provider-llama", Select).value = "prime"
+            await pilot.pause()
+            screen.query_one("#toggle-advanced-llama", Button).press()
+            await pilot.pause()
+            screen.query_one("#prime-disk-id-llama", Input).value = "disk-1"
+            screen.query_one("#prime-insecure-http-llama", Switch).value = True
+            await pilot.pause()
+            screen.query_one("#deploy-btn", Button).press()
+            await pilot.pause()
+
+        self.assertIsNotNone(app.deployed_config)
+        config = app.deployed_config
+        self.assertEqual(config.provider, ComputeProvider.PRIME)
+        self.assertEqual(
+            config.provider_options,
+            PrimeProviderOptions(
+                offer_id="disk-offer",
+                disk_id="disk-1",
+                allow_insecure_http=True,
+            ),
+        )
+
+    async def test_prime_offers_exclude_cpu_and_follow_quant_vram(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+            screen._provider = ComputeProvider.PRIME
+            screen.query_one("#repo-id", Input).value = "org/Model-GGUF"
+            screen.query_one("#quant", Input).value = "Q4_K_M"
+            screen._repo_to_quant_vram = {
+                "org/model-gguf": {"Q4_K_M": 70.0}
+            }
+            offers = [
+                ComputeOffer(
+                    id="cpu",
+                    cloud_id="cpu",
+                    provider_name="provider",
+                    gpu_type="CPU_NODE",
+                    gpu_count=1,
+                    gpu_memory_gb=512,
+                    price_per_hour=0.05,
+                    security="secure_cloud",
+                    stock_status="Available",
+                    images=("ubuntu_22_cuda_12",),
+                ),
+                ComputeOffer(
+                    id="l4",
+                    cloud_id="l4",
+                    provider_name="provider",
+                    gpu_type="L4_24GB",
+                    gpu_count=3,
+                    gpu_memory_gb=24,
+                    price_per_hour=1.0,
+                    security="secure_cloud",
+                    stock_status="Available",
+                    images=("ubuntu_22_cuda_12",),
+                ),
+                ComputeOffer(
+                    id="h100",
+                    cloud_id="h100",
+                    provider_name="provider",
+                    gpu_type="H100_80GB",
+                    gpu_count=1,
+                    gpu_memory_gb=80,
+                    price_per_hour=2.0,
+                    security="secure_cloud",
+                    stock_status="Available",
+                    images=("ubuntu_22_cuda_12",),
+                ),
+            ]
+
+            screen.on_prime_offers_loaded(PrimeOffersLoaded(offers))
+            screen.query_one("#prime-insecure-http-llama", Switch).value = True
+
+            selector = screen.query_one("#prime-offer-llama", Select)
+            labels = [str(label) for label, _value in selector._options[1:]]
+            status = str(
+                screen.query_one("#prime-offer-status-llama", Static).content
+            )
+            self.assertEqual(len(labels), 1)
+            self.assertIn("H100_80GB", labels[0])
+            self.assertNotIn("CPU_NODE", " ".join(labels))
+            self.assertIn("~73.5 GB requirement", status)
+            self.assertNotIn("HTTP-only", status)
+
+            screen._do_deploy()
+
+        self.assertEqual(app.deployed_config.required_vram_gb, 70.0)
 
     async def test_warmup_toggle_is_hidden_by_default_and_enabled(self) -> None:
         app = _TestApp()

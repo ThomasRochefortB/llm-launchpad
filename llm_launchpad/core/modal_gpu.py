@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .shutdown import is_shutting_down
+
 from dataclasses import dataclass
 import html
 import re
@@ -64,7 +66,6 @@ def fetch_modal_gpu_catalog(
     timeout: float = 10.0,
 ) -> list[ModalGpuSpec]:
     """Fetch documented Modal GPU values with current base hourly pricing when available."""
-    from .backend import ModalBackend
 
     gpu_types = fetch_modal_gpu_types(url=gpu_guide_url, timeout=timeout)
 
@@ -72,7 +73,7 @@ def fetch_modal_gpu_catalog(
     try:
         pricing_page_text = _fetch_modal_page_text(url=pricing_url, timeout=timeout)
     except Exception:
-        if ModalBackend.is_shutting_down():
+        if is_shutting_down():
             raise
     else:
         pricing_by_gpu = _parse_modal_gpu_pricing(pricing_page_text)
@@ -204,7 +205,6 @@ def _normalize_whitespace(value: str) -> str:
 
 
 def _fetch_modal_page_text(url: str, timeout: float) -> str:
-    from .backend import ModalBackend
 
     try:
         import requests
@@ -216,7 +216,7 @@ def _fetch_modal_page_text(url: str, timeout: float) -> str:
     try:
         response = requests.get(url, timeout=timeout, headers=_REQUEST_HEADERS)
     except Exception as exc:
-        if ModalBackend.is_shutting_down():
+        if is_shutting_down():
             raise RuntimeError("Shutdown requested") from exc
         raise RuntimeError(f"Failed to fetch Modal metadata page at {url}: {exc}") from exc
 

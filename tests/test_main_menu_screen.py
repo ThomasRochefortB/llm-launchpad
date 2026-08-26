@@ -3,16 +3,21 @@ from __future__ import annotations
 import unittest
 
 from llm_launchpad.core.modal_auth import ModalAuthStatus
+from llm_launchpad.core.quick_deploy_refresh import ArtificialAnalysisAuthStatus
 from llm_launchpad.protocol.enums import BackendType
 from llm_launchpad.protocol.models import EndpointInfo, StorageSnapshot, StoredModelInfo
 from llm_launchpad.tui.screens.main_menu import (
     MainMenuScreen,
     _render_auth_status_block,
+    _render_artificial_analysis_auth_status,
     _render_billing_load_error,
     _render_billing_report,
     _render_deployment_status,
     _render_hf_auth_status,
     _render_modal_auth_status,
+    _render_prime_billing_load_error,
+    _render_prime_billing_report,
+    _render_provider_billing_body,
     _should_show_in_panel,
 )
 from llm_launchpad.core.hf_auth import HuggingFaceAuthStatus
@@ -175,6 +180,76 @@ class MainMenuStatusRenderTests(unittest.TestCase):
         rendered = _render_billing_load_error("Usage: modal [OPTIONS] COMMAND")
         self.assertIn("modal \\[OPTIONS\\] COMMAND", rendered)
 
+    def test_render_prime_billing_report_shows_balance_and_resource_totals(self) -> None:
+        payload = {
+            "wallet_id": "wallet-1",
+            "balance_usd": 41.25,
+            "currency": "USD",
+            "recent_billings": [
+                {"amount_usd": 1.25, "resource_type": "compute"},
+                {"amount_usd": 0.75, "resource_type": "compute"},
+                {"amount_usd": "0.50", "resource_type": "disks"},
+                {"amount_usd": None, "resource_type": "inference"},
+            ],
+        }
+
+        rendered = _render_prime_billing_report(payload)
+        self.assertIn("Prime Intellect Wallet", rendered)
+        self.assertIn("[dim]balance[/dim] [bold]$41.25[/bold]", rendered)
+        self.assertIn("[dim]recent charges[/dim]", rendered)
+        self.assertIn("compute $2.00", rendered)
+        self.assertIn("disks $0.50", rendered)
+        self.assertNotIn("inference", rendered)
+
+    def test_render_prime_billing_report_handles_unrecognized_payload(self) -> None:
+        rendered = _render_prime_billing_report("not-json")
+        self.assertIn("Prime Intellect Wallet", rendered)
+        self.assertIn("Wallet data unavailable", rendered)
+        self.assertIn("prime wallet", rendered)
+
+    def test_render_prime_billing_report_without_rows_shows_placeholder(self) -> None:
+        rendered = _render_prime_billing_report({"balance_usd": 5, "recent_billings": []})
+        self.assertIn("$5.00", rendered)
+        self.assertIn("No recent billing rows.", rendered)
+
+    def test_render_prime_billing_load_error_escapes_rich_markup_chars(self) -> None:
+        rendered = _render_prime_billing_load_error("denied [401]")
+        self.assertIn("denied \\[401\\]", rendered)
+
+    def test_provider_billing_body_combines_modal_and_prime_sections(self) -> None:
+        body = _render_provider_billing_body(
+            modal_payload={"summary": {"total_usd": 12.5}},
+            modal_error=None,
+            prime_state="loaded",
+            prime_payload={"balance_usd": 3},
+            prime_error=None,
+        )
+        self.assertIn("Workspace Spend", body)
+        self.assertIn("$12.50", body)
+        self.assertIn("Prime Intellect Wallet", body)
+        self.assertIn("[bold]$3.00[/bold]", body)
+
+    def test_provider_billing_body_reports_unauthenticated_prime(self) -> None:
+        body = _render_provider_billing_body(
+            modal_payload=None,
+            modal_error=None,
+            prime_state="unavailable",
+            prime_payload=None,
+            prime_error=None,
+        )
+        self.assertIn("Not authenticated (run: prime login)", body)
+
+    def test_provider_billing_body_keeps_modal_error_while_prime_loads(self) -> None:
+        body = _render_provider_billing_body(
+            modal_payload=None,
+            modal_error="Modal timed out",
+            prime_state="loading",
+            prime_payload=None,
+            prime_error=None,
+        )
+        self.assertIn("Modal timed out", body)
+        self.assertIn("Refreshing wallet...", body)
+
     def test_render_hf_auth_status_hides_authenticated_username(self) -> None:
         rendered = _render_hf_auth_status(
             HuggingFaceAuthStatus(authenticated=True, username="alice")
@@ -203,6 +278,30 @@ class MainMenuStatusRenderTests(unittest.TestCase):
         self.assertIn("Modal not authenticated", rendered)
         self.assertIn("modal setup", rendered)
 
+    def test_render_aai_auth_status_shows_authenticated_tier(self) -> None:
+        rendered = _render_artificial_analysis_auth_status(
+            ArtificialAnalysisAuthStatus(authenticated=True, tier="free")
+        )
+        self.assertIn("Artificial Analysis authenticated", rendered)
+        self.assertIn("free tier", rendered)
+
+    def test_render_aai_auth_status_shows_environment_hint_when_missing(self) -> None:
+        rendered = _render_artificial_analysis_auth_status(
+            ArtificialAnalysisAuthStatus(authenticated=False)
+        )
+        self.assertIn("Artificial Analysis not authenticated", rendered)
+        self.assertIn("ARTIFICIAL_ANALYSIS_API_KEY", rendered)
+
+    def test_render_aai_auth_status_shows_invalid_key_error(self) -> None:
+        rendered = _render_artificial_analysis_auth_status(
+            ArtificialAnalysisAuthStatus(
+                authenticated=False,
+                error="Invalid Artificial Analysis API key",
+            )
+        )
+        self.assertIn("auth check failed", rendered)
+        self.assertIn("Invalid Artificial Analysis API key", rendered)
+
     def test_render_auth_status_block_hides_modal_profile_details(self) -> None:
         rendered = _render_auth_status_block(
             username="default",
@@ -212,15 +311,17 @@ class MainMenuStatusRenderTests(unittest.TestCase):
         self.assertNotIn("Modal profile: default", rendered)
         self.assertNotIn("default", rendered)
 
-    def test_render_auth_status_block_includes_both_modal_and_hf_lines(self) -> None:
+    def test_render_auth_status_block_includes_provider_auth_lines(self) -> None:
         rendered = _render_auth_status_block(
             username="default",
             modal_status=ModalAuthStatus(authenticated=False, profile="default"),
             hf_status=HuggingFaceAuthStatus(authenticated=True, username="alice"),
+            aai_status=ArtificialAnalysisAuthStatus(authenticated=True, tier="pro"),
         )
         self.assertIn("Modal not authenticated", rendered)
         self.assertNotIn("Modal profile: default", rendered)
         self.assertIn("Hugging Face authenticated", rendered)
+        self.assertIn("Artificial Analysis authenticated", rendered)
         self.assertNotIn("alice", rendered)
 
 

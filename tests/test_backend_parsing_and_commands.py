@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 import tempfile
 import unittest
@@ -20,8 +21,8 @@ class BackendParsingAndCommandTests(unittest.TestCase):
             with open(modal_path, "w", encoding="utf-8") as fh:
                 fh.write("#!/bin/sh\n")
             with (
-                patch("llm_launchpad.core.backend.sys.prefix", tmp),
-                patch("llm_launchpad.core.backend.shutil.which", return_value=None),
+                patch("llm_launchpad.core.modal_cli.sys.prefix", tmp),
+                patch("llm_launchpad.core.modal_cli.shutil.which", return_value=None),
             ):
                 self.assertEqual(ModalBackend.modal_cli_path(), modal_path)
 
@@ -328,6 +329,16 @@ class BackendParsingAndCommandTests(unittest.TestCase):
             served_model_name="Nanbeige4.1-3B-Q4_K_M-GGUF",
         )
         self.assertIn('"model":"Nanbeige4.1-3B-Q4_K_M-GGUF"', cmd)
+
+    def test_test_curl_command_includes_copy_paste_ready_api_key(self) -> None:
+        cmd = ModalBackend.test_curl_command(
+            BackendType.LLAMACPP,
+            "https://example.modal.run",
+            api_key="endpoint-secret",
+        )
+        args = shlex.split(cmd)
+        self.assertIn("Authorization: Bearer endpoint-secret", args)
+        self.assertNotIn("LLM_LAUNCHPAD_API_KEY", cmd)
 
 
 if __name__ == "__main__":

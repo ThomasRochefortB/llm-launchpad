@@ -10,7 +10,7 @@ import shutil
 import threading
 from typing import Any, Iterable
 
-from ..protocol.enums import BackendType
+from ..protocol.enums import BackendType, ComputeProvider
 from ..protocol.models import DeploymentConfig, EndpointInfo
 from .config import SETTINGS_DIR
 from .naming import default_llamacpp_served_model_name, default_served_model_name
@@ -40,6 +40,8 @@ class OpenCodeConnection:
     model_id: str
     display_name: str
     backend: BackendType
+    provider: ComputeProvider = ComputeProvider.MODAL
+    api_key: str | None = None
 
 
 @dataclass
@@ -137,6 +139,8 @@ def build_connection_from_config(
         model_id=payload["model_id"],
         display_name=payload["display_name"],
         backend=config.backend,
+        provider=config.provider,
+        api_key=config.endpoint_api_key,
     )
 
 
@@ -195,6 +199,8 @@ def build_connection_from_endpoint(
         model_id=model_id,
         display_name=display_name,
         backend=backend,
+        provider=row.provider,
+        api_key=row.endpoint_api_key,
     )
 
 
@@ -467,12 +473,13 @@ def _prefixed_message(dry_run: bool, message: str) -> str:
 
 
 def _provider_payload(connection: OpenCodeConnection) -> dict[str, Any]:
+    options: dict[str, str] = {"baseURL": connection.base_url}
+    if connection.api_key:
+        options["apiKey"] = connection.api_key
     return {
         "npm": _MANAGED_NPM,
         "name": connection.provider_name,
-        "options": {
-            "baseURL": connection.base_url,
-        },
+        "options": options,
         "models": {
             connection.model_id: {
                 "name": connection.display_name,
@@ -487,6 +494,7 @@ def _registry_entry_for_connection(connection: OpenCodeConnection) -> dict[str, 
         "app_name": connection.app_name,
         "instance_name": connection.instance_name,
         "backend": connection.backend.value,
+        "provider": connection.provider.value,
         "base_url": connection.base_url,
         "model_id": connection.model_id,
         "display_name": connection.display_name,
@@ -514,8 +522,16 @@ def _write_opencode_config(path: Path, payload: dict[str, Any]) -> None:
         backup_path = path.with_suffix(path.suffix + ".bak")
         backup_path.parent.mkdir(parents=True, exist_ok=True)
         backup_path.write_text(current, encoding="utf-8")
+        try:
+            os.chmod(backup_path, 0o600)
+        except OSError:
+            pass
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(serialized, encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
 
 
 def _load_registry(

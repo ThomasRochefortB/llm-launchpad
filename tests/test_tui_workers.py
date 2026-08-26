@@ -27,7 +27,10 @@ class _Poster:
 class TuiWorkersDispatchTests(unittest.TestCase):
     def test_dispatch_event_maps_protocol_events(self) -> None:
         poster = _Poster()
-        _dispatch_event(poster, LogEvent(line="hello", stream="stderr"))
+        _dispatch_event(
+            poster,
+            LogEvent(line="hello", stream="stderr", is_milestone=True),
+        )
         _dispatch_event(
             poster,
             StateChangeEvent(
@@ -58,6 +61,7 @@ class TuiWorkersDispatchTests(unittest.TestCase):
         self.assertIsInstance(poster.messages[0], LogMessage)
         self.assertEqual(poster.messages[0].line, "hello")
         self.assertEqual(poster.messages[0].stream, "stderr")
+        self.assertTrue(poster.messages[0].is_milestone)
 
         self.assertIsInstance(poster.messages[1], StateChanged)
         self.assertEqual(poster.messages[1].state, DeploymentState.DEPLOYING)

@@ -8,8 +8,15 @@ from textual.app import App
 from textual.widgets import OptionList, Static
 
 from llm_launchpad.core import quick_deploy
-from llm_launchpad.core.quick_deploy import QuickDeployProfile
-from llm_launchpad.tui.screens.main_menu import MainMenuScreen, _quick_deploy_options, _render_quick_deploy_option
+from llm_launchpad.core.quick_deploy import QuickDeployProfile, quick_deploy_recipe
+from llm_launchpad.protocol.enums import BackendType, BillingModel, ComputeProvider
+from llm_launchpad.protocol.models import InferencePlan, PrimeProviderOptions, ProviderQuote
+from llm_launchpad.tui.screens.main_menu import (
+    MainMenuScreen,
+    PrimeInferencePlansLoaded,
+    _quick_deploy_options,
+    _render_quick_deploy_option,
+)
 from llm_launchpad.tui.screens.quick_deploy import QuickDeployScreen
 
 
@@ -18,8 +25,16 @@ class _TestApp(App[None]):
         super().__init__()
         self.quick_deploy_calls: list[str] = []
 
-    def push_quick_deploy(self, profile: str | QuickDeployProfile) -> None:
-        profile_id = profile.id if isinstance(profile, QuickDeployProfile) else profile
+    def push_quick_deploy(
+        self,
+        profile: str | QuickDeployProfile | InferencePlan,
+    ) -> None:
+        if isinstance(profile, QuickDeployProfile):
+            profile_id = profile.id
+        elif isinstance(profile, InferencePlan):
+            profile_id = profile.quote.id
+        else:
+            profile_id = profile
         self.quick_deploy_calls.append(profile_id)
         self.push_screen(QuickDeployScreen(profile_id=profile))
 
@@ -43,10 +58,31 @@ class MainMenuQuickDeployTests(unittest.IsolatedAsyncioTestCase):
             return_value=None,
         )
         self._catalog_patch.start()
+        self._prime_refresh_patch = patch.object(
+            MainMenuScreen,
+            "_refresh_prime_auth_status",
+            lambda self: None,
+        )
+        self._prime_refresh_patch.start()
+        self._catalog_refresh_patch = patch.object(
+            MainMenuScreen,
+            "_refresh_quick_deploy_catalog",
+            lambda self: None,
+        )
+        self._catalog_refresh_patch.start()
+        self._aai_refresh_patch = patch.object(
+            MainMenuScreen,
+            "_refresh_aai_auth_status",
+            lambda self: None,
+        )
+        self._aai_refresh_patch.start()
         quick_deploy._reset_quick_deploy_catalog_cache()
 
     def tearDown(self) -> None:
         self._catalog_patch.stop()
+        self._prime_refresh_patch.stop()
+        self._catalog_refresh_patch.stop()
+        self._aai_refresh_patch.stop()
         quick_deploy._reset_quick_deploy_catalog_cache()
 
     async def test_main_menu_renders_quick_deploy_panel(self) -> None:
@@ -63,10 +99,12 @@ class MainMenuQuickDeployTests(unittest.IsolatedAsyncioTestCase):
                 quick_list = screen.query_one("#quick-deploy-list", OptionList)
                 subtitle = str(screen.query_one("#landing-quick-deploy-subtitle", Static).content)
                 self.assertEqual(quick_list.option_count, 3)
-                self.assertIn("Curated llama.cpp coding profiles", subtitle)
+                self.assertIn("Choose an inference option", subtitle)
                 self.assertIn("Qwen3.5 397B A17B[/bold] [dim]Q4XL[/dim]", str(quick_list.get_option_at_index(0).prompt))
                 self.assertIn("cheap but good", str(quick_list.get_option_at_index(0).prompt))
                 self.assertIn("262,144 ctx", str(quick_list.get_option_at_index(0).prompt))
+                self.assertIn("Modal", str(quick_list.get_option_at_index(0).prompt))
+                self.assertIn("~$545/mo", str(quick_list.get_option_at_index(0).prompt))
                 self.assertIn("GLM-5[/bold] [dim]Q4XL[/dim]", str(quick_list.get_option_at_index(1).prompt))
                 self.assertIn("RTX6000x4", str(quick_list.get_option_at_index(1).prompt))
                 self.assertIn("202,752 ctx", str(quick_list.get_option_at_index(1).prompt))
@@ -260,6 +298,115 @@ class MainMenuQuickDeployTests(unittest.IsolatedAsyncioTestCase):
         assert options[0] is not None
         self.assertEqual(options[0].id, "higher-score")
         self.assertIn("Higher Score[/bold] [dim]131,072 ctx · AA 91.5", str(options[0].prompt))
+
+    async def test_resolved_options_render_one_row_per_provider_quote(self) -> None:
+        profile = QuickDeployProfile(
+            id="example-vllm",
+            display_name="Example Model",
+            repo_id="org/example",
+            quant="",
+            gpu_type="H100_80GB",
+            gpu_count=1,
+            profile_label="Curated",
+            approx_cost_per_hour_usd=2.0,
+            max_context_tokens=32768,
+            instance_slug_hint="example",
+            summary="Example profile.",
+            server_args=(),
+            backend=BackendType.VLLM,
+            model_name="org/example",
+        )
+        recipe = quick_deploy_recipe(profile)
+        plans = (
+            InferencePlan(
+                recipe=recipe,
+                quote=ProviderQuote(
+                    id="modal-option",
+                    recipe_id=recipe.id,
+                    provider=ComputeProvider.MODAL,
+                    provider_reference="modal-option",
+                    gpu_type="H100_80GB",
+                    gpu_count=1,
+                    price_per_hour_usd=2.0,
+                    billing_model=BillingModel.SCALE_TO_ZERO,
+                ),
+                estimated_monthly_cost_usd=120.0,
+            ),
+            InferencePlan(
+                recipe=recipe,
+                quote=ProviderQuote(
+                    id="prime-option",
+                    recipe_id=recipe.id,
+                    provider=ComputeProvider.PRIME,
+                    provider_reference="prime-option",
+                    gpu_type="H100_80GB",
+                    gpu_count=1,
+                    price_per_hour_usd=1.5,
+                    billing_model=BillingModel.PROVISIONED,
+                    is_estimate=False,
+                ),
+                estimated_monthly_cost_usd=360.0,
+            ),
+        )
+
+        options = _quick_deploy_options([profile], plans)
+
+        self.assertEqual([option.id for option in options if option], ["modal-option", "prime-option"])
+        assert options[0] is not None
+        assert options[1] is not None
+        self.assertIn("Modal", str(options[0].prompt))
+        self.assertIn("Prime Intellect", str(options[1].prompt))
+        self.assertIn("~$120/mo", str(options[0].prompt))
+        self.assertIn("~$360/mo", str(options[1].prompt))
+        self.assertIn("live", str(options[1].prompt))
+
+    async def test_live_prime_llamacpp_plan_is_added_to_popular_models(self) -> None:
+        app = _TestApp()
+        with patch.object(MainMenuScreen, "_refresh_modal_auth_status", lambda self: None), patch.object(
+            MainMenuScreen, "_refresh_hf_auth_status", lambda self: None
+        ), patch.object(MainMenuScreen, "_refresh_panels", lambda self: None):
+            async with app.run_test() as pilot:
+                app.push_screen(MainMenuScreen(username="alice", version="1.0.0"))
+                await pilot.pause()
+
+                screen = app.screen
+                assert isinstance(screen, MainMenuScreen)
+                profile = screen._quick_deploy_profiles[0]
+                recipe = quick_deploy_recipe(profile)
+                plan = InferencePlan(
+                    recipe=recipe,
+                    quote=ProviderQuote(
+                        id="prime:recipe:abc123",
+                        recipe_id=recipe.id,
+                        provider=ComputeProvider.PRIME,
+                        provider_reference="abc123",
+                        gpu_type="H100_80GB",
+                        gpu_count=4,
+                        price_per_hour_usd=7.0,
+                        billing_model=BillingModel.PROVISIONED,
+                        is_estimate=False,
+                        provider_options=PrimeProviderOptions(offer_id="abc123"),
+                    ),
+                    estimated_monthly_cost_usd=1680.0,
+                    recommendation_reason="Lowest estimated cost for this workload",
+                )
+
+                screen.on_prime_inference_plans_loaded(
+                    PrimeInferencePlansLoaded((plan,))
+                )
+
+                quick_list = screen.query_one("#quick-deploy-list", OptionList)
+                prime_option = next(
+                    quick_list.get_option_at_index(index)
+                    for index in range(quick_list.option_count)
+                    if quick_list.get_option_at_index(index).id == plan.quote.id
+                )
+                subtitle = str(
+                    screen.query_one("#landing-quick-deploy-subtitle", Static).content
+                )
+                self.assertIn("Prime Intellect", str(prime_option.prompt))
+                self.assertIn("live", str(prime_option.prompt))
+                self.assertIn("1 live Prime option", subtitle)
 
     async def test_tab_moves_focus_between_action_menu_and_quick_deploy(self) -> None:
         app = _TestApp()

@@ -10,6 +10,8 @@ import time
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from .shutdown import is_shutting_down
+
 ModelRankMode = Literal["downloads", "trending"]
 ModelDiscoveryTarget = Literal["vllm", "llamacpp"]
 
@@ -98,8 +100,7 @@ def fetch_vllm_memory_breakdown(
     context_tokens: int | None = None,
 ) -> VllmMemoryBreakdown | None:
     """Estimate vLLM memory needs using HF metadata with a repo-name fallback."""
-    from ..core.backend import ModalBackend
-    if ModalBackend.is_shutting_down():
+    if is_shutting_down():
         return None
     normalized_repo = repo_id.strip()
     if not normalized_repo:
@@ -255,8 +256,7 @@ def _fetch_model_max_context(
     revision: str | None = None,
     visited: set[str] | None = None,
 ) -> int | None:
-    from ..core.backend import ModalBackend
-    if ModalBackend.is_shutting_down():
+    if is_shutting_down():
         return None
     normalized_repo = repo_id.strip()
     if not normalized_repo:
@@ -364,8 +364,7 @@ def _call_model_info(
     revision: str | None,
     expand: list[str] | None = None,
 ) -> Any:
-    from ..core.backend import ModalBackend
-    if ModalBackend.is_shutting_down():
+    if is_shutting_down():
         raise RuntimeError("Shutdown requested")
     kwargs: dict[str, Any] = {
         "repo_id": repo_id,
@@ -376,7 +375,7 @@ def _call_model_info(
     try:
         return api.model_info(timeout=_HF_REQUEST_TIMEOUT_SECONDS, **kwargs)
     except TypeError:
-        if ModalBackend.is_shutting_down():
+        if is_shutting_down():
             raise RuntimeError("Shutdown requested")
         return api.model_info(**kwargs)
 
@@ -417,8 +416,7 @@ def list_llamacpp_candidates(mode: ModelRankMode = "downloads", limit: int = 10)
 
 def fetch_gguf_quant_metadata(repo_id: str, revision: str | None = None) -> GgufQuantMetadata:
     """Return detected GGUF quantizations and per-quant VRAM estimates in GB."""
-    from ..core.backend import ModalBackend
-    if ModalBackend.is_shutting_down():
+    if is_shutting_down():
         return GgufQuantMetadata(quantizations=[], vram_gb_by_quant={})
     normalized_repo = repo_id.strip()
     if not normalized_repo:
@@ -442,7 +440,7 @@ def fetch_gguf_quant_metadata(repo_id: str, revision: str | None = None) -> Gguf
         ) from exc
 
     api = HfApi()
-    if ModalBackend.is_shutting_down():
+    if is_shutting_down():
         return GgufQuantMetadata(quantizations=[], vram_gb_by_quant={})
     info = api.model_info(
         repo_id=normalized_repo,
@@ -704,7 +702,7 @@ def _extract_quantizations_and_vram_from_quantization_data(quantization_data: An
             if label not in seen:
                 seen.add(label)
                 quantizations.append(label)
-            parsed_size = _parse_memory_to_gb(variant.get("size"))
+            parsed_size = _parse_model_file_size_to_gb(variant.get("size"))
             if parsed_size is not None and parsed_size > 0:
                 current = vram_gb_by_quant.get(label)
                 if current is None or parsed_size > current:
@@ -714,7 +712,6 @@ def _extract_quantizations_and_vram_from_quantization_data(quantization_data: An
 
 
 def _fetch_gguf_quantization_data_from_model_page(repo_id: str, timeout: float = 10.0) -> Any:
-    from ..core.backend import ModalBackend
     try:
         import requests
     except Exception:
@@ -724,7 +721,7 @@ def _fetch_gguf_quantization_data_from_model_page(repo_id: str, timeout: float =
     try:
         response = requests.get(url, timeout=min(timeout, _HF_REQUEST_TIMEOUT_SECONDS), headers=_HF_PAGE_HEADERS)
     except Exception:
-        if ModalBackend.is_shutting_down():
+        if is_shutting_down():
             return None
         return None
     if response.status_code >= 400:
@@ -866,6 +863,17 @@ def _parse_memory_to_gb(value: Any) -> float | None:
     if multiplier is None:
         return None
     return number * multiplier
+
+
+def _parse_model_file_size_to_gb(value: Any) -> float | None:
+    """Parse HF model-page ``size`` fields, whose numeric values are bytes."""
+
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+        return number / 1_000_000_000.0 if number > 0 else None
+    return _parse_memory_to_gb(value)
 
 
 def _quant_sort_key(quant: str) -> tuple[int, int, str]:
@@ -1046,8 +1054,7 @@ def _pick_max_positive_int(*values: int | None) -> int | None:
 
 
 def _load_repo_json_file(repo_id: str, revision: str | None, filename: str) -> dict[str, Any] | None:
-    from ..core.backend import ModalBackend
-    if ModalBackend.is_shutting_down():
+    if is_shutting_down():
         return None
     normalized_repo = repo_id.strip()
     if not normalized_repo or not filename.strip():
@@ -1082,7 +1089,7 @@ def _load_repo_json_file(repo_id: str, revision: str | None, filename: str) -> d
     if not callable(hf_hub_download):
         return _fetch_and_cache_http_fallback()
 
-    if ModalBackend.is_shutting_down():
+    if is_shutting_down():
         return None
 
     try:
@@ -1100,7 +1107,7 @@ def _load_repo_json_file(repo_id: str, revision: str | None, filename: str) -> d
                 revision=revision_key or None,
             )
     except Exception:
-        if ModalBackend.is_shutting_down():
+        if is_shutting_down():
             return None
         return _fetch_and_cache_http_fallback()
 
@@ -1124,7 +1131,6 @@ def _load_repo_json_file(repo_id: str, revision: str | None, filename: str) -> d
 def _fetch_repo_json_file_via_http(
     repo_id: str, revision: str | None, filename: str, timeout: float = _HF_REQUEST_TIMEOUT_SECONDS
 ) -> dict[str, Any] | None:
-    from ..core.backend import ModalBackend
     try:
         import requests
     except Exception:
@@ -1134,7 +1140,7 @@ def _fetch_repo_json_file_via_http(
     try:
         response = requests.get(url, timeout=timeout, headers=_HF_PAGE_HEADERS)
     except Exception:
-        if ModalBackend.is_shutting_down():
+        if is_shutting_down():
             return None
         return None
     if response.status_code >= 400:

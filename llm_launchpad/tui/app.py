@@ -23,9 +23,12 @@ from ..core.benchmark import benchmark_config_from_endpoint, parse_concurrency_v
 from ..core.config import SETTINGS_DIR
 from ..core.hf_models import fetch_gguf_quant_metadata, list_llamacpp_candidates, list_vllm_candidates
 from ..core.naming import (
-    build_app_name,
+    build_deployment_name,
     legacy_app_name,
 )
+from ..core.prime_auth import get_prime_auth_status
+from ..core.prime_backend import PrimeBackend
+from ..core.provider_options import prime_provider_options
 from ..core.quick_deploy import QuickDeployProfile
 from ..core.opencode import (
     build_openai_connection_payload,
@@ -35,11 +38,12 @@ from ..core.opencode import (
     visible_launchpad_rows,
 )
 from ..core.orchestrator import Orchestrator
-from ..protocol.enums import BackendType, OperationType
+from ..protocol.enums import BackendType, ComputeProvider, OperationType
 from ..protocol.events import ErrorEvent, LogEvent, OperationCompleteEvent
 from ..protocol.models import BenchmarkConfig
 from ..protocol.models import EndpointInfo
 from ..protocol.models import DeploymentConfig
+from ..protocol.models import InferencePlan
 from ..protocol.models import StoredModelInfo
 from ..protocol.models import StorageSnapshot
 
@@ -75,7 +79,11 @@ def _deploy_connection_summary_lines(config: DeploymentConfig, server_url: str) 
         f"Base URL: {base_url}",
         f"Model ID: {model_id}",
         f"Display name: {display_name}",
-        "API key: (leave blank; no auth by default)",
+        (
+            "API key: generated and stored locally"
+            if config.endpoint_api_key
+            else "API key: (leave blank; no auth by default)"
+        ),
         "=========================",
     ]
 
@@ -106,7 +114,7 @@ class TuiApp(App):
     """llm-launchpad interactive terminal UI."""
 
     TITLE = "llm-launchpad"
-    SUB_TITLE = "Modal LLM backends"
+    SUB_TITLE = "Modal + Prime LLM backends"
 
     CSS_PATH = "theme.tcss"
 
@@ -241,19 +249,21 @@ class TuiApp(App):
             )
 
     def on_mount(self) -> None:
-        """Launch the TUI if the Modal CLI is installed.
+        """Launch the TUI when at least one compute provider is configured.
 
         Authentication is surfaced inside the main menu instead of gating startup.
         """
-        if not ModalBackend.is_cli_available():
+        modal_available = ModalBackend.is_cli_available()
+        prime_available = get_prime_auth_status().authenticated
+        if not modal_available and not prime_available:
             self.notify(
-                "Modal CLI not found. Reinstall llm-launchpad, then run: modal setup",
+                "No compute provider is configured. Run `modal setup` or `prime login`.",
                 severity="error",
                 timeout=10,
             )
             self.exit(return_code=1)
             return
-        self._username = ModalBackend.get_username() or ""
+        self._username = ModalBackend.get_username() or "" if modal_available else ""
         self.push_screen(MainMenuScreen(username=self._username, version=self._version))
         if not self.mouse_enabled:
             self.notify(
@@ -277,7 +287,10 @@ class TuiApp(App):
     def action_push_storage(self, backend: BackendType | None = None) -> None:
         self.push_screen(StorageScreen(initial_backend=backend))
 
-    def push_quick_deploy(self, profile: str | QuickDeployProfile) -> None:
+    def push_quick_deploy(
+        self,
+        profile: str | QuickDeployProfile | InferencePlan,
+    ) -> None:
         self.push_screen(QuickDeployScreen(profile_id=profile))
 
     # ------------------------------------------------------------------
@@ -287,7 +300,9 @@ class TuiApp(App):
     def begin_deploy(self, config: DeploymentConfig) -> None:
         """Start a deploy operation via a threaded worker."""
         if not config.app_name:
-            config.app_name = build_app_name(config.backend, config.instance_name)
+            config.app_name = build_deployment_name(
+                config.provider, config.backend, config.instance_name
+            )
         monitor = MonitorScreen(
             title="Deploy",
             deploy_backend=config.backend,
@@ -304,12 +319,13 @@ class TuiApp(App):
     def _run_deploy(self, config: DeploymentConfig, monitor: MonitorScreen):  # type: ignore[return]
         """Generator consumed by run_worker in a thread."""
         deployed_web_url: Optional[str] = None
+        deployed_endpoint: EndpointInfo | None = None
         deployed_web_url_priority = -1
         deploy_succeeded = False
         will_run_warmup = bool(config.do_warmup and config.do_deploy)
 
         def _emit_connection_summary(url: str) -> None:
-            self._cache_deploy_connection_summary(config, url)
+            self._cache_deploy_connection_summary(config, url, deployed_endpoint)
             for line in _deploy_connection_summary_lines(config, url):
                 _dispatch_event(monitor, LogEvent(line=line))
 
@@ -329,6 +345,13 @@ class TuiApp(App):
                         deployed_web_url_priority = priority
             elif isinstance(event, OperationCompleteEvent):
                 deploy_succeeded = event.success
+                if event.success and isinstance(event.data, EndpointInfo):
+                    deployed_endpoint = event.data
+                    deployed_web_url = event.data.web_url or deployed_web_url
+                    if event.data.web_url:
+                        self._cache_deploy_connection_summary(
+                            config, event.data.web_url, event.data
+                        )
                 # When warmup immediately follows a successful deploy in the same
                 # monitor session, suppress the intermediate completion footer
                 # ("Operation complete... Press esc") to keep the summary cleaner.
@@ -336,38 +359,61 @@ class TuiApp(App):
                     continue
                 if event.success and event.operation == OperationType.DEPLOY and config.do_deploy:
                     target_app_name = config.app_name or legacy_app_name(config.backend)
-                    url = deployed_web_url or ModalBackend.default_server_url(
-                        self._username,
-                        app_name=target_app_name,
-                        function_slug=config.function_slug,
-                    )
-                    _emit_connection_summary(url)
-                    self._sync_opencode(
-                        target_app_name=target_app_name,
-                        target_url=url,
-                        target_config=config,
-                        current_rows=self._load_visible_launchpad_rows(),
-                        monitor=monitor,
-                        emit_skipped=True,
-                    )
+                    url = deployed_web_url
+                    if not url and config.provider == ComputeProvider.MODAL:
+                        url = ModalBackend.default_server_url(
+                            self._username,
+                            app_name=target_app_name,
+                            function_slug=config.function_slug,
+                        )
+                    if url:
+                        _emit_connection_summary(url)
+                        self._sync_opencode(
+                            target_app_name=target_app_name,
+                            target_url=url,
+                            target_config=config,
+                            current_rows=self._load_visible_launchpad_rows(),
+                            monitor=monitor,
+                            emit_skipped=True,
+                        )
             _dispatch_event(monitor, event)
 
         # Warmup if requested and deploy was successful
         if config.do_warmup and config.do_deploy and deploy_succeeded:
             target_app_name = config.app_name or legacy_app_name(config.backend)
-            url = deployed_web_url or ModalBackend.default_server_url(
-                self._username,
-                app_name=target_app_name,
-                function_slug=config.function_slug,
+            url = deployed_web_url
+            if not url and config.provider == ComputeProvider.MODAL:
+                url = ModalBackend.default_server_url(
+                    self._username,
+                    app_name=target_app_name,
+                    function_slug=config.function_slug,
+                )
+            if not url:
+                _dispatch_event(monitor, ErrorEvent(message="Provider returned no endpoint URL."))
+                return
+            warmup_events = (
+                self._orchestrator.warmup(
+                    backend=config.backend,
+                    server_url=url,
+                    timeout=1800,
+                    tail_logs=True,
+                    app_name=target_app_name,
+                    served_model_name=config.served_model_name,
+                )
+                if config.provider == ComputeProvider.MODAL
+                else self._orchestrator.warmup(
+                    backend=config.backend,
+                    server_url=url,
+                    timeout=1800,
+                    tail_logs=True,
+                    app_name=target_app_name,
+                    served_model_name=config.served_model_name,
+                    provider=config.provider,
+                    api_key=config.endpoint_api_key,
+                    pod_id=deployed_endpoint.app_id if deployed_endpoint else None,
+                )
             )
-            for event in self._orchestrator.warmup(
-                backend=config.backend,
-                server_url=url,
-                timeout=1800,
-                tail_logs=True,
-                app_name=target_app_name,
-                served_model_name=config.served_model_name,
-            ):
+            for event in warmup_events:
                 if (
                     isinstance(event, OperationCompleteEvent)
                     and event.success
@@ -387,6 +433,32 @@ class TuiApp(App):
                         monitor=monitor,
                         emit_skipped=True,
                     )
+                elif (
+                    isinstance(event, OperationCompleteEvent)
+                    and not event.success
+                    and event.operation == OperationType.WARMUP
+                    and config.provider == ComputeProvider.PRIME
+                    and deployed_endpoint is not None
+                    and not prime_provider_options(config).keep_failed_resource
+                ):
+                    _dispatch_event(
+                        monitor,
+                        LogEvent(
+                            line=(
+                                "Warmup failed; terminating Prime pod "
+                                f"{deployed_endpoint.app_id}."
+                            )
+                        ),
+                    )
+                    for cleanup_event in self._orchestrator.stop_app(
+                        config.backend,
+                        app_name=target_app_name,
+                        app_id=deployed_endpoint.app_id,
+                        provider=ComputeProvider.PRIME,
+                    ):
+                        _dispatch_event(monitor, cleanup_event)
+                    self._deploy_connection_cache.pop(target_app_name, None)
+                    self._persist_deploy_connection_cache()
                 _dispatch_event(monitor, event)
 
     # ------------------------------------------------------------------
@@ -403,19 +475,34 @@ class TuiApp(App):
         )
 
     def _run_list(self, monitor: MonitorScreen):  # type: ignore[return]
-        for event in self._orchestrator.list_deployments():
-            if (
-                isinstance(event, OperationCompleteEvent)
-                and event.success
-                and isinstance(event.data, list)
-            ):
-                visible_rows = [row for row in event.data if isinstance(row, EndpointInfo)]
-                self._sync_opencode(
-                    current_rows=visible_rows,
-                    monitor=monitor,
-                    emit_skipped=True,
-                )
-            _dispatch_event(monitor, event)
+        providers = []
+        if ModalBackend.is_cli_available():
+            providers.append(ComputeProvider.MODAL)
+        if get_prime_auth_status().authenticated:
+            providers.append(ComputeProvider.PRIME)
+        visible_rows: list[EndpointInfo] = []
+        for provider in providers:
+            events = (
+                self._orchestrator.list_deployments()
+                if provider == ComputeProvider.MODAL
+                else self._orchestrator.list_deployments(provider)
+            )
+            for event in events:
+                if (
+                    isinstance(event, OperationCompleteEvent)
+                    and event.success
+                    and isinstance(event.data, list)
+                ):
+                    visible_rows.extend(
+                        row for row in event.data if isinstance(row, EndpointInfo)
+                    )
+                _dispatch_event(monitor, event)
+        self._merge_deploy_connection_cache(visible_rows)
+        self._sync_opencode(
+            current_rows=visible_rows,
+            monitor=monitor,
+            emit_skipped=True,
+        )
 
     # ------------------------------------------------------------------
     # Manage: status
@@ -428,9 +515,17 @@ class TuiApp(App):
         timeout: int = 60,
         app_name: Optional[str] = None,
         served_model_name: Optional[str] = None,
+        provider: ComputeProvider = ComputeProvider.MODAL,
+        api_key: Optional[str] = None,
+        pod_id: Optional[str] = None,
     ) -> None:
         target_app_name = app_name or legacy_app_name(backend)
-        url = server_url or ModalBackend.default_server_url(self._username, app_name=target_app_name)
+        url = server_url
+        if not url and provider == ComputeProvider.MODAL:
+            url = ModalBackend.default_server_url(self._username, app_name=target_app_name)
+        if not url:
+            self.notify("No endpoint URL is stored for this deployment.", severity="error", timeout=6)
+            return
         monitor = MonitorScreen(title="Status Check")
         self.push_screen(monitor)
         self.run_worker(
@@ -440,6 +535,9 @@ class TuiApp(App):
                 timeout,
                 target_app_name,
                 served_model_name,
+                provider,
+                api_key,
+                pod_id,
                 monitor,
             ),
             name="status-worker",
@@ -453,15 +551,31 @@ class TuiApp(App):
         timeout: int,
         app_name: str,
         served_model_name: Optional[str],
+        provider: ComputeProvider,
+        api_key: Optional[str],
+        pod_id: Optional[str],
         monitor: MonitorScreen,
     ):  # type: ignore[return]
         _dispatch_event(monitor, LogEvent(line=f"Target app: {app_name}"))
-        for event in self._orchestrator.check_status(
-            backend,
-            url,
-            timeout,
-            served_model_name=served_model_name,
-        ):
+        events = (
+            self._orchestrator.check_status(
+                backend,
+                url,
+                timeout,
+                served_model_name=served_model_name,
+            )
+            if provider == ComputeProvider.MODAL
+            else self._orchestrator.check_status(
+                backend,
+                url,
+                timeout,
+                served_model_name=served_model_name,
+                provider=provider,
+                api_key=api_key,
+                pod_id=pod_id,
+            )
+        )
+        for event in events:
             _dispatch_event(monitor, event)
 
     # ------------------------------------------------------------------
@@ -526,13 +640,16 @@ class TuiApp(App):
         follow: bool = True,
         app_name: Optional[str] = None,
         app_id: Optional[str] = None,
+        provider: ComputeProvider = ComputeProvider.MODAL,
     ) -> None:
         monitor = MonitorScreen(title="Logs")
         self.push_screen(monitor)
         target_app_name = app_name or legacy_app_name(backend)
         target_ref = (app_id or target_app_name).strip()
         self.run_worker(
-            lambda: self._run_logs(backend, follow, target_ref, target_app_name, monitor),
+            lambda: self._run_logs(
+                backend, follow, target_ref, target_app_name, monitor, provider=provider
+            ),
             name="logs-worker",
             thread=True,
         )
@@ -544,10 +661,22 @@ class TuiApp(App):
         app_ref: str,
         app_name: str,
         monitor: MonitorScreen,
+        provider: ComputeProvider = ComputeProvider.MODAL,
     ):  # type: ignore[return]
         target_label = app_name if app_ref == app_name else f"{app_name} ({app_ref})"
         _dispatch_event(monitor, LogEvent(line=f"Target app: {target_label}"))
-        for event in self._orchestrator.tail_logs(backend, follow, app_name=app_name, app_id=app_ref):
+        events = (
+            self._orchestrator.tail_logs(backend, follow, app_name=app_name, app_id=app_ref)
+            if provider == ComputeProvider.MODAL
+            else self._orchestrator.tail_logs(
+                backend,
+                follow,
+                app_name=app_name,
+                app_id=app_ref,
+                provider=provider,
+            )
+        )
+        for event in events:
             _dispatch_event(monitor, event)
 
     # ------------------------------------------------------------------
@@ -559,13 +688,16 @@ class TuiApp(App):
         backend: BackendType,
         app_name: Optional[str] = None,
         app_id: Optional[str] = None,
+        provider: ComputeProvider = ComputeProvider.MODAL,
     ) -> None:
         monitor = MonitorScreen(title="Stop")
         self.push_screen(monitor)
         target_app_name = app_name or legacy_app_name(backend)
         target_ref = (app_id or target_app_name).strip()
         self.run_worker(
-            lambda: self._run_stop(backend, target_ref, target_app_name, monitor),
+            lambda: self._run_stop(
+                backend, target_ref, target_app_name, monitor, provider=provider
+            ),
             name="stop-worker",
             thread=True,
         )
@@ -576,15 +708,28 @@ class TuiApp(App):
         app_ref: str,
         app_name: str,
         monitor: MonitorScreen,
+        provider: ComputeProvider = ComputeProvider.MODAL,
     ):  # type: ignore[return]
         target_label = app_name if app_ref == app_name else f"{app_name} ({app_ref})"
         _dispatch_event(monitor, LogEvent(line=f"Target app: {target_label}"))
-        for event in self._orchestrator.stop_app(backend, app_name=app_name, app_id=app_ref):
+        events = (
+            self._orchestrator.stop_app(backend, app_name=app_name, app_id=app_ref)
+            if provider == ComputeProvider.MODAL
+            else self._orchestrator.stop_app(
+                backend,
+                app_name=app_name,
+                app_id=app_ref,
+                provider=provider,
+            )
+        )
+        for event in events:
             if (
                 isinstance(event, OperationCompleteEvent)
                 and event.success
                 and event.operation == OperationType.STOP
             ):
+                self._deploy_connection_cache.pop(app_name, None)
+                self._persist_deploy_connection_cache()
                 self._sync_opencode(
                     current_rows=self._load_visible_launchpad_rows(),
                     remove_app_names=[app_name],
@@ -594,20 +739,27 @@ class TuiApp(App):
             _dispatch_event(monitor, event)
 
     def list_instances(self, backend: BackendType | None = None) -> list[EndpointInfo]:
-        rows = ModalBackend.list_apps()
-        if rows is None:
-            rows = []
-        else:
-            self._merge_deploy_connection_cache(rows)
-            self._sync_opencode(current_rows=visible_launchpad_rows(rows))
+        modal_rows = ModalBackend.list_apps()
+        rows = list(modal_rows or [])
+        if get_prime_auth_status().authenticated:
+            try:
+                rows.extend(PrimeBackend().list_deployments())
+            except Exception:
+                pass
+        self._merge_deploy_connection_cache(rows)
+        self._sync_opencode(current_rows=visible_launchpad_rows(rows))
         if backend is None:
             return rows
         return [row for row in rows if row.backend == backend]
 
     def _load_visible_launchpad_rows(self) -> list[EndpointInfo] | None:
-        rows = ModalBackend.list_apps()
-        if rows is None:
-            return None
+        modal_rows = ModalBackend.list_apps()
+        rows = list(modal_rows or [])
+        if get_prime_auth_status().authenticated:
+            try:
+                rows.extend(PrimeBackend().list_deployments())
+            except Exception:
+                pass
         self._merge_deploy_connection_cache(rows)
         return visible_launchpad_rows(rows)
 
@@ -795,16 +947,25 @@ class TuiApp(App):
         except Exception:
             pass
 
-    def _cache_deploy_connection_summary(self, config: DeploymentConfig, server_url: str) -> None:
+    def _cache_deploy_connection_summary(
+        self,
+        config: DeploymentConfig,
+        server_url: str,
+        endpoint: EndpointInfo | None = None,
+    ) -> None:
         app_name = (config.app_name or "").strip()
         if not app_name:
             return
         payload = _deploy_connection_summary_payload(config, server_url)
         self._deploy_connection_cache[app_name] = {
             "backend": config.backend.value,
+            "provider": config.provider.value,
+            "resource_id": endpoint.app_id if endpoint else "",
+            "instance_name": config.instance_name or (endpoint.instance_name if endpoint else ""),
             "base_url": payload["base_url"],
             "model_id": payload["model_id"],
             "display_name": payload["display_name"],
+            "api_key": config.endpoint_api_key or (endpoint.endpoint_api_key if endpoint else ""),
             "cached_at_epoch": time.time(),
         }
         self._persist_deploy_connection_cache()
@@ -814,6 +975,7 @@ class TuiApp(App):
         try:
             self._deploy_connection_cache_path.parent.mkdir(parents=True, exist_ok=True)
             self._deploy_connection_cache_path.write_text(json.dumps(payload))
+            os.chmod(self._deploy_connection_cache_path, 0o600)
         except Exception:
             pass
 
@@ -845,7 +1007,7 @@ class TuiApp(App):
             if not (row.web_url or "").strip():
                 base_url = str(cached.get("base_url", "") or "").strip()
                 if base_url:
-                    row.web_url = base_url
+                    row.web_url = base_url.removesuffix("/v1")
             if not (row.served_model_name or "").strip():
                 model_id = str(cached.get("model_id", "") or "").strip()
                 if model_id:
@@ -854,6 +1016,15 @@ class TuiApp(App):
                 display_name = str(cached.get("display_name", "") or "").strip()
                 if display_name:
                     row.display_name = display_name
+            if not row.app_id:
+                row.app_id = str(cached.get("resource_id", "") or "")
+            if not row.instance_name:
+                row.instance_name = str(cached.get("instance_name", "") or "") or None
+            if not row.endpoint_api_key:
+                row.endpoint_api_key = str(cached.get("api_key", "") or "") or None
+            provider = str(cached.get("provider", "") or "")
+            if provider in {item.value for item in ComputeProvider}:
+                row.provider = ComputeProvider(provider)
 
     def _load_persisted_storage_cache(self) -> None:
         try:

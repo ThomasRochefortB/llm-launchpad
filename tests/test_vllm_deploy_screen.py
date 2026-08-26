@@ -9,9 +9,14 @@ from textual.widgets import Input, OptionList, Select, Static, Switch
 
 from llm_launchpad.core.hf_models import ModelCandidate, VllmMemoryBreakdown
 from llm_launchpad.core.modal_gpu import ModalGpuSpec
-from llm_launchpad.protocol.enums import BackendType
-from llm_launchpad.protocol.models import StorageSnapshot, StoredModelInfo
-from llm_launchpad.tui.screens.deploy import GpuTypesLoaded, VllmDeployScreen
+from llm_launchpad.protocol.enums import BackendType, ComputeProvider
+from llm_launchpad.protocol.models import ComputeOffer, StorageSnapshot, StoredModelInfo
+from llm_launchpad.tui.screens.deploy import (
+    GpuTypesLoaded,
+    PrimeOffersLoaded,
+    VllmDeployScreen,
+    VllmMemoryLoaded,
+)
 from llm_launchpad.tui.workers import StorageLoaded, VllmModelsLoaded
 
 
@@ -672,6 +677,90 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
                 text = str(screen.query_one("#vllm-vram-status", Static).content)
                 self.assertIn("N/A", text)
+
+    async def test_prime_offers_exclude_cpu_and_follow_model_memory(self) -> None:
+        app = _TestApp()
+        estimate = VllmMemoryBreakdown(
+            total_gb=70.0,
+            weights_gb=60.0,
+            kv_cache_gb=5.0,
+            overhead_gb=5.0,
+            context_tokens=8192,
+        )
+        with patch(
+            "llm_launchpad.tui.screens.deploy.fetch_vllm_memory_breakdown",
+            return_value=estimate,
+        ):
+            async with app.run_test() as pilot:
+                app.push_screen(VllmDeployScreen())
+                await pilot.pause()
+
+                screen = app.screen
+                assert isinstance(screen, VllmDeployScreen)
+                screen._provider = ComputeProvider.PRIME
+                screen.query_one("#model-name", Input).value = "Qwen/Qwen3-8B"
+                offers = [
+                    ComputeOffer(
+                        id="cpu",
+                        cloud_id="cpu",
+                        provider_name="provider",
+                        gpu_type="CPU_NODE",
+                        gpu_count=1,
+                        gpu_memory_gb=512,
+                        price_per_hour=0.05,
+                        security="secure_cloud",
+                        stock_status="Available",
+                        images=("ubuntu_22_cuda_12",),
+                    ),
+                    ComputeOffer(
+                        id="l4",
+                        cloud_id="l4",
+                        provider_name="provider",
+                        gpu_type="L4_24GB",
+                        gpu_count=3,
+                        gpu_memory_gb=24,
+                        price_per_hour=1.0,
+                        security="secure_cloud",
+                        stock_status="Available",
+                        images=("ubuntu_22_cuda_12",),
+                    ),
+                    ComputeOffer(
+                        id="h100",
+                        cloud_id="h100",
+                        provider_name="provider",
+                        gpu_type="H100_80GB",
+                        gpu_count=1,
+                        gpu_memory_gb=80,
+                        price_per_hour=2.0,
+                        security="secure_cloud",
+                        stock_status="Available",
+                        images=("ubuntu_22_cuda_12",),
+                    ),
+                ]
+                screen.on_prime_offers_loaded(PrimeOffersLoaded(offers))
+                screen.on_vllm_memory_loaded(
+                    VllmMemoryLoaded(
+                        repo_id="Qwen/Qwen3-8B",
+                        revision=None,
+                        estimate=estimate,
+                    )
+                )
+                screen.query_one("#prime-insecure-http", Switch).value = True
+
+                selector = screen.query_one("#prime-offer-vllm", Select)
+                labels = [str(label) for label, _value in selector._options[1:]]
+                status = str(screen.query_one("#prime-offer-status", Static).content)
+                self.assertEqual(len(labels), 1)
+                self.assertIn("H100_80GB", labels[0])
+                self.assertNotIn("CPU_NODE", " ".join(labels))
+                self.assertIn("~73.5 GB requirement", status)
+                self.assertNotIn("HTTP-only", status)
+                self.assertEqual(screen.query_one("#n-gpu", Input).value, "1")
+
+                screen._do_deploy()
+
+        self.assertEqual(app.deployed_config.required_vram_gb, 70.0)
+        self.assertEqual(app.deployed_config.n_gpu, 1)
 
 
 if __name__ == "__main__":

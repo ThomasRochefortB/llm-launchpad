@@ -156,10 +156,16 @@ def predownload_model(
     return {"repo_id": repo_id, "revision": revision, "path": path}
 
 
+try:
+    _SCALEDOWN_WINDOW = int(os.environ.get("SCALEDOWN_WINDOW", str(30 * MINUTES)))
+except Exception:
+    _SCALEDOWN_WINDOW = 30 * MINUTES
+
+
 @app.function(
     image=vllm_image,
     gpu=DEPLOY_GPU_CONFIG,
-    scaledown_window=15 * MINUTES,
+    scaledown_window=_SCALEDOWN_WINDOW,
     timeout=10 * MINUTES,
     secrets=[modal.Secret.from_dict(RUNTIME_ENV)],
     volumes={

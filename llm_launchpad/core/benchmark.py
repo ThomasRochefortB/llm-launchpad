@@ -12,7 +12,7 @@ import shutil
 import sys
 from typing import Any, Iterable
 
-from ..protocol.enums import BackendType
+from ..protocol.enums import BackendType, ComputeProvider
 from ..protocol.models import (
     BenchmarkConcurrencyResult,
     BenchmarkConfig,
@@ -144,12 +144,20 @@ def benchmark_config_from_endpoint(
     request_timeout_seconds: int = DEFAULT_REQUEST_TIMEOUT_SECONDS,
     output_dir: str | None = None,
     aiperf_args: list[str] | None = None,
+    provider: ComputeProvider | None = None,
+    api_key: str | None = None,
 ) -> BenchmarkConfig:
     """Create a benchmark config from a Modal row and explicit overrides."""
     resolved_app_name = (app_name or (row.name if row else "") or "").strip()
     resolved_instance = (instance_name or (row.instance_name if row else "") or "").strip() or None
     resolved_url = (server_url or (row.web_url if row else "") or "").strip()
-    if not resolved_url and username.strip() and resolved_app_name:
+    resolved_provider = provider or (row.provider if row else ComputeProvider.MODAL)
+    if (
+        not resolved_url
+        and resolved_provider == ComputeProvider.MODAL
+        and username.strip()
+        and resolved_app_name
+    ):
         from .backend import ModalBackend
 
         resolved_url = ModalBackend.default_server_url(username.strip(), app_name=resolved_app_name)
@@ -171,6 +179,7 @@ def benchmark_config_from_endpoint(
 
     return BenchmarkConfig(
         backend=backend,
+        provider=resolved_provider,
         app_name=resolved_app_name or None,
         instance_name=resolved_instance,
         server_url=normalize_aiperf_url(resolved_url),
@@ -183,6 +192,7 @@ def benchmark_config_from_endpoint(
         request_timeout_seconds=request_timeout_seconds,
         output_dir=output_dir,
         aiperf_args=list(aiperf_args or []),
+        api_key=api_key or (row.endpoint_api_key if row else None),
     )
 
 
@@ -212,6 +222,13 @@ def merge_cached_benchmark_connections(rows: list[EndpointInfo]) -> None:
             display_name = str(cached.get("display_name", "") or "").strip()
             if display_name:
                 row.display_name = display_name
+        if row.endpoint_api_key is None:
+            key = str(cached.get("api_key", "") or "").strip()
+            if key:
+                row.endpoint_api_key = key
+        provider = str(cached.get("provider", "") or "").strip()
+        if provider in {item.value for item in ComputeProvider}:
+            row.provider = ComputeProvider(provider)
 
 
 def build_aiperf_command(
@@ -328,8 +345,10 @@ def write_run_summary(summary: BenchmarkRunSummary) -> Path:
 
 def benchmark_summary_to_dict(summary: BenchmarkRunSummary) -> dict[str, Any]:
     """Convert a benchmark run summary to JSON-serializable data."""
+    config_payload = asdict(summary.config)
+    config_payload.pop("api_key", None)
     return {
-        "config": asdict(summary.config),
+        "config": config_payload,
         "run_dir": summary.run_dir,
         "success": summary.success,
         "best_concurrency": summary.best_concurrency,

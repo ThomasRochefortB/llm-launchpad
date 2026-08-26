@@ -1,0 +1,24 @@
+{
+  "schema_version": 2,
+  "runtimes": {
+    "vllm": {
+      "runtime_version": "1",
+      "bootstrap_base_image": "ubuntu_22_cuda_12",
+      "bootstrap_container_image": "vllm/vllm-openai:v0.19.1",
+      "container_port": 8000
+    },
+    "llamacpp": {
+      "runtime_version": "1",
+      "bootstrap_base_image": "ubuntu_22_cuda_12",
+      "bootstrap_container_image": "ghcr.io/ggml-org/llama.cpp:server-cuda",
+      "container_port": 8000
+    }
+  },
+  "networking": {
+    "default": "prime_tunnel",
+    "frpc_version": "0.66.0",
+    "frpc_linux_amd64_sha256": "317a17a7adac2e6bed2d7a83dc077da91ced0d110e1636373ece8ae5ac8b578b",
+    "frpc_linux_arm64_sha256": "196ddaa51b716c2e99aeb2916b0a2bf55bb317494c4acdcefab36c383de950ba"
+  },
+  "notes": "Launchpad bootstraps the configured upstream runtime container on Prime's default CUDA image and exposes it through Prime Tunnel. Direct HTTP remains an explicit fallback."
+}

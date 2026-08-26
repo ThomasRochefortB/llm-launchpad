@@ -5,7 +5,31 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
 
-from .enums import BackendType
+from .enums import (
+    BackendType,
+    BillingModel,
+    ComputeProvider,
+    QuoteAvailability,
+)
+
+
+@dataclass(frozen=True)
+class ModalProviderOptions:
+    """Modal-specific deployment options kept behind the provider boundary."""
+
+
+@dataclass(frozen=True)
+class PrimeProviderOptions:
+    """Prime-specific deployment options kept behind the provider boundary."""
+
+    offer_id: Optional[str] = None
+    region: Optional[str] = None
+    disk_id: Optional[str] = None
+    keep_failed_resource: bool = False
+    allow_insecure_http: bool = False
+
+
+ProviderOptions = ModalProviderOptions | PrimeProviderOptions
 
 
 @dataclass
@@ -35,6 +59,7 @@ class DeploymentConfig:
     """All parameters needed to execute a deployment."""
 
     backend: BackendType = BackendType.LLAMACPP
+    provider: ComputeProvider = ComputeProvider.MODAL
 
     # llama.cpp specific
     preset: Optional[str] = None
@@ -49,6 +74,7 @@ class DeploymentConfig:
     llamacpp_image_no_cache: Optional[bool] = None
     gpu_type: Optional[str] = None
     gpu_count: Optional[int] = None
+    required_vram_gb: Optional[float] = None
 
     # vLLM specific
     model_name: Optional[str] = None
@@ -72,6 +98,86 @@ class DeploymentConfig:
     app_name: Optional[str] = None
     function_slug: Optional[str] = None
 
+    # Provider-specific settings are typed and interpreted only by the adapter.
+    provider_options: Optional[ProviderOptions] = None
+    endpoint_api_key: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ProviderCapabilities:
+    """Provider features used to filter recipes before requesting quotes."""
+
+    provider: ComputeProvider
+    supported_backends: frozenset[BackendType]
+    billing_model: BillingModel
+    live_availability: bool = False
+    supports_regions: bool = False
+    supports_spot: bool = False
+    supports_secure_cloud: bool = False
+
+    def supports_backend(self, backend: BackendType) -> bool:
+        """Return whether this provider can serve the requested runtime."""
+        return backend in self.supported_backends
+
+
+@dataclass(frozen=True)
+class InferenceRecipe:
+    """Provider-neutral description of a runnable inference configuration."""
+
+    id: str
+    model_key: str
+    display_name: str
+    backend: BackendType
+    model_id: str
+    quant: Optional[str] = None
+    max_context_tokens: Optional[int] = None
+    required_vram_gb: Optional[float] = None
+    server_args: tuple[str, ...] = ()
+    source_label: str = "Curated"
+    quality_score: Optional[float] = None
+    quality_rank: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class WorkloadProfile:
+    """Small workload description used to normalize unlike billing models."""
+
+    paid_hours_per_day: float = 8.0
+    utilization: float = 0.25
+    output_tokens_per_month: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class ProviderQuote:
+    """Normalized provider fulfillment option for an inference recipe."""
+
+    id: str
+    recipe_id: str
+    provider: ComputeProvider
+    provider_reference: str
+    gpu_type: str
+    gpu_count: int
+    price_per_hour_usd: Optional[float]
+    billing_model: BillingModel
+    availability: QuoteAvailability = QuoteAvailability.UNKNOWN
+    region: Optional[str] = None
+    security: Optional[str] = None
+    is_estimate: bool = True
+    estimated_output_tokens_per_second: Optional[float] = None
+    configuration_id: Optional[str] = None
+    provider_options: Optional[ProviderOptions] = None
+
+
+@dataclass(frozen=True)
+class InferencePlan:
+    """One deployable recipe bound to a compatible provider quote."""
+
+    recipe: InferenceRecipe
+    quote: ProviderQuote
+    estimated_monthly_cost_usd: Optional[float] = None
+    estimated_cost_per_million_output_tokens_usd: Optional[float] = None
+    recommendation_reason: Optional[str] = None
+
 
 @dataclass
 class EndpointInfo:
@@ -90,6 +196,8 @@ class EndpointInfo:
     quant: Optional[str] = None
     runtime_status: Optional[str] = None
     runtime_status_detail: Optional[str] = None
+    provider: ComputeProvider = ComputeProvider.MODAL
+    endpoint_api_key: Optional[str] = None
 
 
 @dataclass
@@ -97,6 +205,7 @@ class BenchmarkConfig:
     """Parameters for benchmarking a deployed OpenAI-compatible endpoint."""
 
     backend: BackendType = BackendType.LLAMACPP
+    provider: ComputeProvider = ComputeProvider.MODAL
     app_name: Optional[str] = None
     instance_name: Optional[str] = None
     server_url: Optional[str] = None
@@ -109,6 +218,33 @@ class BenchmarkConfig:
     request_timeout_seconds: int = 300
     output_dir: Optional[str] = None
     aiperf_args: list[str] = field(default_factory=list)
+    api_key: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ComputeOffer:
+    """Normalized GPU offer exposed by a compute provider."""
+
+    id: str
+    cloud_id: str
+    provider_name: str
+    gpu_type: str
+    gpu_count: int
+    gpu_memory_gb: Optional[float] = None
+    region: Optional[str] = None
+    data_center: Optional[str] = None
+    country: Optional[str] = None
+    socket: Optional[str] = None
+    security: Optional[str] = None
+    price_per_hour: Optional[float] = None
+    is_spot: bool = False
+    is_variable_price: bool = False
+    stock_status: Optional[str] = None
+    disk_default_gb: Optional[int] = None
+    vcpu_default: Optional[int] = None
+    memory_default_gb: Optional[int] = None
+    images: tuple[str, ...] = ()
+    raw: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
 
 @dataclass

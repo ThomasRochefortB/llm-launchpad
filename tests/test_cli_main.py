@@ -7,9 +7,9 @@ from unittest.mock import Mock, patch
 from typer.testing import CliRunner
 
 from llm_launchpad.cli import main as cli_main
-from llm_launchpad.protocol.enums import BackendType, OperationType
+from llm_launchpad.protocol.enums import BackendType, ComputeProvider, OperationType
 from llm_launchpad.protocol.events import LogEvent, OperationCompleteEvent
-from llm_launchpad.protocol.models import EndpointInfo
+from llm_launchpad.protocol.models import EndpointInfo, PrimeProviderOptions
 
 
 class CliMainHelperTests(unittest.TestCase):
@@ -50,15 +50,31 @@ class CliMainHelperTests(unittest.TestCase):
                 cli_main._ensure_tui_runtime()
         self.assertEqual(ctx.exception.exit_code, 1)
 
-    def test_ensure_tui_runtime_requires_modal_cli(self) -> None:
+    def test_ensure_tui_runtime_requires_configured_provider(self) -> None:
         with (
             patch("llm_launchpad.cli.main.sys.stdin.isatty", return_value=True),
             patch("llm_launchpad.cli.main.sys.stdout.isatty", return_value=True),
             patch("llm_launchpad.cli.main.ModalBackend.is_cli_available", return_value=False),
+            patch(
+                "llm_launchpad.cli.main.get_prime_auth_status",
+                return_value=SimpleNamespace(authenticated=False),
+            ),
         ):
             with self.assertRaises(cli_main.typer.Exit) as ctx:
                 cli_main._ensure_tui_runtime()
         self.assertEqual(ctx.exception.exit_code, 1)
+
+    def test_ensure_tui_runtime_accepts_prime_without_modal_cli(self) -> None:
+        with (
+            patch("llm_launchpad.cli.main.sys.stdin.isatty", return_value=True),
+            patch("llm_launchpad.cli.main.sys.stdout.isatty", return_value=True),
+            patch("llm_launchpad.cli.main.ModalBackend.is_cli_available", return_value=False),
+            patch(
+                "llm_launchpad.cli.main.get_prime_auth_status",
+                return_value=SimpleNamespace(authenticated=True),
+            ),
+        ):
+            cli_main._ensure_tui_runtime()
 
     def test_resolve_deploy_target_prefers_explicit_app_name(self) -> None:
         instance, app_name = cli_main._resolve_deploy_target(
@@ -233,6 +249,73 @@ class CliMainCommandTests(unittest.TestCase):
                 )
         self.assertEqual(result.exit_code, 0)
         self.assertTrue(captured["config"].trust_remote_code)
+
+    def test_deploy_prime_llamacpp_maps_gguf_and_provider_options(self) -> None:
+        captured = {}
+
+        def _deploy(config):  # type: ignore[no-untyped-def]
+            captured["config"] = config
+            return [
+                OperationCompleteEvent(
+                    operation=OperationType.DEPLOY,
+                    success=True,
+                    exit_code=0,
+                )
+            ]
+
+        orch = SimpleNamespace(deploy=_deploy)
+        with (
+            patch("llm_launchpad.cli.main._preflight", return_value=(orch, "prime-user")),
+            patch("llm_launchpad.cli.main._print_banner", return_value=None),
+        ):
+            result = self.runner.invoke(
+                cli_main.app,
+                [
+                    "deploy",
+                    "--provider",
+                    "prime",
+                    "--backend",
+                    "llamacpp",
+                    "--repo-id",
+                    "org/Model-GGUF",
+                    "--quant",
+                    "Q4_K_M",
+                    "--gpu-type",
+                    "H100_80GB",
+                    "--gpu-count",
+                    "1",
+                    "--prime-offer-id",
+                    "abc123",
+                ],
+            )
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        config = captured["config"]
+        self.assertEqual(config.provider, ComputeProvider.PRIME)
+        self.assertEqual(config.backend, BackendType.LLAMACPP)
+        self.assertEqual(config.repo_id, "org/Model-GGUF")
+        self.assertEqual(config.quant, "Q4_K_M")
+        self.assertEqual(config.app_name, "llp-prime-llamacpp-org-model-gguf")
+        self.assertEqual(
+            config.provider_options,
+            PrimeProviderOptions(
+                offer_id="abc123",
+            ),
+        )
+
+    def test_deploy_prime_llamacpp_requires_repo_id(self) -> None:
+        orch = SimpleNamespace(deploy=lambda _config: [])
+        with (
+            patch("llm_launchpad.cli.main._preflight", return_value=(orch, "prime-user")),
+            patch("llm_launchpad.cli.main._print_banner", return_value=None),
+        ):
+            result = self.runner.invoke(
+                cli_main.app,
+                ["deploy", "--provider", "prime", "--backend", "llamacpp"],
+            )
+
+        self.assertEqual(result.exit_code, 2)
+        self.assertIn("requires --repo-id", result.output)
 
     def test_deploy_warmup_prefers_deployed_web_url_from_logs(self) -> None:
         warmup_calls: list[str] = []
@@ -494,6 +577,28 @@ class CliMainCommandTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(calls, [(BackendType.VLLM, False, "vllm-qwen3")])
 
+    def test_logs_failure_propagates_operation_exit_code(self) -> None:
+        orch = SimpleNamespace(
+            tail_logs=lambda *_args, **_kwargs: [
+                OperationCompleteEvent(
+                    operation=OperationType.LOGS,
+                    success=False,
+                    exit_code=8,
+                    detail="log command failed",
+                ),
+            ]
+        )
+        with (
+            patch("llm_launchpad.cli.main._preflight", return_value=(orch, "alice")),
+            patch("llm_launchpad.cli.main._print_banner", return_value=None),
+        ):
+            result = self.runner.invoke(
+                cli_main.app,
+                ["logs", "--backend", "vllm", "--app-name", "vllm-qwen3"],
+            )
+
+        self.assertEqual(result.exit_code, 8)
+
     def test_benchmark_maps_cli_options_to_benchmark_config(self) -> None:
         captured = {}
         row = EndpointInfo(
@@ -621,6 +726,32 @@ class CliMainCommandTests(unittest.TestCase):
             remove_app_names=["vllm-test"],
             username="alice",
         )
+
+    def test_stop_failure_propagates_operation_exit_code_without_cleanup(self) -> None:
+        orch = SimpleNamespace(
+            stop_app=lambda *_args, **_kwargs: [
+                OperationCompleteEvent(
+                    operation=OperationType.STOP,
+                    success=False,
+                    exit_code=9,
+                    detail="stop command failed",
+                ),
+            ]
+        )
+        with (
+            patch("llm_launchpad.cli.main._preflight", return_value=(orch, "alice")),
+            patch("llm_launchpad.cli.main._print_banner", return_value=None),
+            patch("llm_launchpad.cli.main.remove_connection") as remove_mock,
+            patch("llm_launchpad.cli.main._sync_opencode_cli") as sync_mock,
+        ):
+            result = self.runner.invoke(
+                cli_main.app,
+                ["stop", "--backend", "vllm", "--yes", "--app-name", "vllm-test"],
+            )
+
+        self.assertEqual(result.exit_code, 9)
+        remove_mock.assert_not_called()
+        sync_mock.assert_not_called()
 
     def test_switch_llamacpp_requires_preset_or_repo(self) -> None:
         orch = SimpleNamespace(deploy=lambda *_args, **_kwargs: [])

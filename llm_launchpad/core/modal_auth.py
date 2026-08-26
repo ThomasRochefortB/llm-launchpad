@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
-import shutil
 import subprocess
-import sys
+
+from .modal_cli import _CLI_TIMEOUT_SECONDS, resolve_modal_cli_path
 
 
 @dataclass(frozen=True)
@@ -19,19 +18,8 @@ class ModalAuthStatus:
     error: str | None = None
 
 
-_CLI_TIMEOUT_SECONDS = 8.0
-
-
 def _modal_cli_path() -> str | None:
-    env_prefix = Path(sys.prefix)
-    candidates = [
-        env_prefix / "bin" / "modal",
-        env_prefix / "Scripts" / "modal.exe",
-    ]
-    for candidate in candidates:
-        if candidate.exists():
-            return str(candidate)
-    return shutil.which("modal")
+    return resolve_modal_cli_path()
 
 
 def _run_modal_command(*args: str) -> subprocess.CompletedProcess[str] | None:

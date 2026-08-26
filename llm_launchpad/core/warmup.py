@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .shutdown import is_shutting_down, shutdown_event
+
 import json
 import os
 import queue
@@ -11,7 +13,7 @@ import threading
 import time
 from typing import Generator, Optional
 
-from ..protocol.enums import BackendType, DeploymentState, OperationType
+from ..protocol.enums import BackendType, ComputeProvider, DeploymentState, OperationType
 from ..protocol.events import (
     BaseEvent,
     ErrorEvent,
@@ -21,6 +23,7 @@ from ..protocol.events import (
 )
 from .backend import ModalBackend
 from .naming import legacy_app_name
+from .prime_backend import PrimeBackend
 
 EventStream = Generator[BaseEvent, None, None]
 
@@ -108,6 +111,10 @@ class WarmupRunner:
         tail_logs: bool = True,
         app_name: Optional[str] = None,
         served_model_name: Optional[str] = None,
+        provider: ComputeProvider = ComputeProvider.MODAL,
+        api_key: Optional[str] = None,
+        pod_id: Optional[str] = None,
+        prime_backend: PrimeBackend | None = None,
     ) -> EventStream:
         """Probe endpoint readiness and optionally tail logs."""
         yield StateChangeEvent(
@@ -163,7 +170,7 @@ class WarmupRunner:
             threading.Thread(target=_reader, daemon=True).start()
             return proc
 
-        if tail_logs:
+        if tail_logs and provider == ComputeProvider.MODAL:
             try:
                 logs_proc = _start_logs_tail()
             except Exception as exc:
@@ -193,6 +200,8 @@ class WarmupRunner:
             "temperature": 0,
         }
         headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         start = time.time()
         backoff = 2.0
         max_backoff = 30.0
@@ -223,7 +232,7 @@ class WarmupRunner:
 
         while True:
             # Exit promptly if the app is shutting down.
-            if ModalBackend.is_shutting_down():
+            if is_shutting_down():
                 if logs_proc:
                     try:
                         logs_proc.terminate()
@@ -231,7 +240,12 @@ class WarmupRunner:
                         pass
                 return
 
-            if tail_logs and logs_proc is None and time.time() >= logs_retry_at:
+            if (
+                tail_logs
+                and provider == ComputeProvider.MODAL
+                and logs_proc is None
+                and time.time() >= logs_retry_at
+            ):
                 # Historical-fetch fallback: the live stream may miss the
                 # final output of a crashing container, while Modal's persisted
                 # logs still have it.
@@ -264,7 +278,7 @@ class WarmupRunner:
 
             try:
                 if is_vllm:
-                    resp = requests.get(probe_url, timeout=10)
+                    resp = requests.get(probe_url, headers=headers, timeout=10)
                 else:
                     resp = requests.post(
                         probe_url, headers=headers, data=json.dumps(payload), timeout=10
@@ -284,6 +298,7 @@ class WarmupRunner:
                         backend,
                         server_url,
                         served_model_name=served_model_name,
+                        api_key=api_key,
                     )
                     yield LogEvent(line=f"Test command:\n{curl_cmd}")
                     yield StateChangeEvent(
@@ -318,6 +333,20 @@ class WarmupRunner:
                         operation=OperationType.WARMUP,
                     )
                     last_scheduling_hint = None
+                if (
+                    tail_logs
+                    and provider == ComputeProvider.PRIME
+                    and pod_id
+                    and prime_backend is not None
+                ):
+                    try:
+                        lines = prime_backend.get_pod_logs(pod_id, tail=200)
+                        for line in lines:
+                            if line not in seen_log_lines:
+                                seen_log_lines.add(line)
+                                yield LogEvent(line=line, operation=OperationType.WARMUP)
+                    except Exception:
+                        pass
             except Exception as exc:
                 last_err = str(exc)
 
@@ -325,11 +354,11 @@ class WarmupRunner:
             # each chunk so that lines appear in the TUI promptly.
             sleep_end = time.time() + backoff
             while time.time() < sleep_end:
-                if ModalBackend.is_shutting_down():
+                if is_shutting_down():
                     break
                 chunk = min(0.5, sleep_end - time.time())
                 if chunk > 0:
-                    ModalBackend._shutdown_event.wait(timeout=chunk)
+                    shutdown_event().wait(timeout=chunk)
                 yield from _drain_queue()
             backoff = min(max_backoff, backoff * 1.5)
 
