@@ -240,7 +240,12 @@ class WarmupRunner:
                         pass
                 return
 
-            if tail_logs and logs_proc is None and time.time() >= logs_retry_at:
+            if (
+                tail_logs
+                and provider == ComputeProvider.MODAL
+                and logs_proc is None
+                and time.time() >= logs_retry_at
+            ):
                 # Historical-fetch fallback: the live stream may miss the
                 # final output of a crashing container, while Modal's persisted
                 # logs still have it.

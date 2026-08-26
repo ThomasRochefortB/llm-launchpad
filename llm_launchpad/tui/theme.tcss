@@ -6,9 +6,35 @@
 
 /* ---- Global ---- */
 
+* {
+    scrollbar-background: #0b110d;
+    scrollbar-color: #2b5933;
+    scrollbar-background-hover: #0f1812;
+    scrollbar-color-hover: #3d7a4a;
+    scrollbar-background-active: #0f1812;
+    scrollbar-color-active: #7bf168;
+    scrollbar-size: 1 1;
+    scrollbar-gutter: stable;
+}
+
 Screen {
     background: #050806;
     color: #eef7ef;
+}
+
+Vertical,
+VerticalScroll,
+OptionList,
+DataTable,
+SelectionList,
+ListView,
+#quick-deploy-list {
+    scrollbar-background: #0b110d;
+    scrollbar-color: #2b5933;
+    scrollbar-background-hover: #0f1812;
+    scrollbar-color-hover: #3d7a4a;
+    scrollbar-background-active: #0f1812;
+    scrollbar-color-active: #7bf168;
 }
 
 /* ---- Header / Footer bars ---- */
@@ -88,29 +114,36 @@ LogViewer Log {
 #menu-container {
     width: 1fr;
     min-width: 56;
-    height: auto;
+    height: 1fr;
     padding: 1 2;
+    content-align: center middle;
+    align: center middle;
 }
 
 #main-menu-layout {
     width: 100%;
     max-width: 126;
-    height: auto;
+    height: 1fr;
+    max-height: 100%;
 }
 
 #main-menu-side-column {
-    width: 50;
-    min-width: 38;
-    height: auto;
+    width: 56;
+    min-width: 42;
+    height: 1fr;
+    max-height: 100%;
     margin: 1 0 0 1;
+    overflow-y: auto;
 }
 
 #deployment-status-panel {
     width: 100%;
     height: auto;
+    max-height: 14;
+    overflow-y: auto;
     padding: 0 2;
-    border: solid #17321e;
-    background: #0b110d;
+    border: heavy #1e3a24;
+    background: #0f1410;
 }
 
 #billing-report-panel {
@@ -118,8 +151,8 @@ LogViewer Log {
     height: auto;
     margin: 1 0 0 0;
     padding: 0 2;
-    border: solid #17321e;
-    background: #0b110d;
+    border: heavy #1e3a24;
+    background: #0f1410;
 }
 
 #quick-deploy-panel {
@@ -128,8 +161,8 @@ LogViewer Log {
     min-height: 13;
     margin: 1 0 0 0;
     padding: 0 2;
-    border: solid #2b5933;
-    background: #0f1812;
+    border: heavy #2b5933;
+    background: #121b14;
 }
 
 #deployment-status-title {
@@ -139,6 +172,7 @@ LogViewer Log {
 #deployment-status-body {
     color: #eef7ef;
     text-wrap: wrap;
+    overflow-y: auto;
 }
 
 #billing-report-title {
@@ -168,8 +202,10 @@ LogViewer Log {
 #quick-deploy-list {
     border: solid #2b5933;
     background: #0b110d;
-    max-height: 10;
+    max-height: 12;
+    height: auto;
     text-wrap: nowrap;
+    overflow: hidden;
 }
 
 #quick-deploy-list:focus {
@@ -178,6 +214,9 @@ LogViewer Log {
 
 #quick-deploy-list > .option-list--option {
     text-wrap: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    width: 100%;
 }
 
 #banner-text {
@@ -501,6 +540,10 @@ VllmDeployScreen .gpu-config-panel {
     align: center middle;
     width: 100%;
     height: 100%;
+}
+
+#storage-controls {
+    height: auto;
 }
 
 #settings-form {

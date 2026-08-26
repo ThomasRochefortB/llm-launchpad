@@ -873,6 +873,75 @@ class PrimeBackendTests(unittest.TestCase):
         )
 
 
+class PrimeBillingWalletTests(unittest.TestCase):
+    def test_billing_wallet_reads_documented_wallet_endpoint(self) -> None:
+        session = _FakeSession(
+            [
+                _FakeResponse(
+                    200,
+                    {
+                        "wallet_id": "wallet-1",
+                        "team_id": None,
+                        "balance_usd": 41.25,
+                        "currency": "USD",
+                        "total_billings": 3,
+                        "recent_billings": [
+                            {
+                                "id": "b-1",
+                                "amount_usd": 1.25,
+                                "currency": "USD",
+                                "resource_type": "compute",
+                                "resource_id": "pod-1",
+                            }
+                        ],
+                    },
+                )
+            ]
+        )
+        backend = PrimeBackend(PrimeConfig(api_key="secret"), session=session)  # type: ignore[arg-type]
+
+        payload, error = backend.billing_wallet()
+
+        self.assertIsNone(error)
+        assert payload is not None
+        self.assertEqual(payload["balance_usd"], 41.25)
+        self.assertTrue(str(session.calls[0]["url"]).endswith("/api/v1/billing/wallet"))
+        self.assertEqual(session.calls[0]["params"], {"limit": 100})
+
+    def test_billing_wallet_scopes_team_wallet_and_limit_when_configured(self) -> None:
+        session = _FakeSession([_FakeResponse(200, {"balance_usd": 0})])
+        backend = PrimeBackend(  # type: ignore[arg-type]
+            PrimeConfig(api_key="secret", team_id="team-1"), session=session
+        )
+
+        payload, error = backend.billing_wallet(limit=10)
+
+        self.assertIsNone(error)
+        assert payload is not None
+        self.assertEqual(payload["balance_usd"], 0)
+        self.assertEqual(session.calls[0]["params"], {"limit": 10, "teamId": "team-1"})
+
+    def test_billing_wallet_returns_error_tuple_on_api_failure(self) -> None:
+        session = _FakeSession([_FakeResponse(401, {})])
+        backend = PrimeBackend(PrimeConfig(api_key="secret"), session=session)  # type: ignore[arg-type]
+
+        payload, error = backend.billing_wallet()
+
+        self.assertIsNone(payload)
+        assert error is not None
+        self.assertIn("authentication failed", error)
+
+    def test_billing_wallet_rejects_non_object_payload(self) -> None:
+        session = _FakeSession([_FakeResponse(200, ["unexpected"])])
+        backend = PrimeBackend(PrimeConfig(api_key="secret"), session=session)  # type: ignore[arg-type]
+
+        payload, error = backend.billing_wallet()
+
+        self.assertIsNone(payload)
+        assert error is not None
+        self.assertIn("unsupported response", error)
+
+
 class _OrchestratorPrimeBackend:
     def __init__(self) -> None:
         self.config = PrimeConfig(api_key="secret", user_id="user-1")

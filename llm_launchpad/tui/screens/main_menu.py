@@ -22,6 +22,7 @@ from ...core.hf_auth import HuggingFaceAuthStatus, get_huggingface_auth_status
 from ...core.modal_auth import ModalAuthStatus, get_modal_auth_status
 from ...core.inference_options import PrimeInferenceAdapter
 from ...core.prime_auth import PrimeAuthStatus, get_prime_auth_status
+from ...core.prime_backend import PrimeBackend
 from ...core.naming import default_llamacpp_served_model_name, default_served_model_name
 from ...core.quick_deploy import (
     QuickDeployCatalogInfo,
@@ -135,6 +136,22 @@ class BillingReportLoaded(Message):
 
 class BillingReportLoadFailed(Message):
     """Main-menu billing report fetch failed."""
+
+    def __init__(self, error: str) -> None:
+        super().__init__()
+        self.error = error
+
+
+class PrimeBillingReportLoaded(Message):
+    """Main-menu Prime billing fetch completed."""
+
+    def __init__(self, payload: Any) -> None:
+        super().__init__()
+        self.payload = payload
+
+
+class PrimeBillingReportLoadFailed(Message):
+    """Main-menu Prime billing fetch failed."""
 
     def __init__(self, error: str) -> None:
         super().__init__()
@@ -703,6 +720,95 @@ def _render_billing_load_error(error: str) -> str:
     )
 
 
+def _render_prime_billing_report(payload: Any) -> str:
+    """Render one Prime wallet billing snapshot for the shared panel."""
+
+    lines = ["[bold]Prime Intellect Wallet[/bold]"]
+    if not isinstance(payload, dict):
+        lines.append("[dim]Wallet data unavailable.[/dim]")
+        lines.append("[dim]Check `prime wallet`.[/dim]")
+        return "\n".join(lines)
+
+    balance = _coerce_float(payload.get("balance_usd"))
+    if balance is None:
+        lines.append("[dim]Balance unavailable in wallet payload.[/dim]")
+    else:
+        lines.append(f"[dim]balance[/dim] [bold]{_format_money(balance)}[/bold]")
+
+    totals: dict[str, float] = {}
+    rows = payload.get("recent_billings")
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            amount = _coerce_float(row.get("amount_usd"))
+            if amount is None:
+                continue
+            resource = str(row.get("resource_type") or "other").strip().casefold() or "other"
+            totals[resource] = totals.get(resource, 0.0) + amount
+
+    if totals:
+        summary = " · ".join(
+            f"{resource} {_format_money(amount)}" for resource, amount in sorted(totals.items())
+        )
+        lines.append(f"[dim]recent charges[/dim] {summary}")
+    else:
+        lines.append("[dim]No recent billing rows.[/dim]")
+    return "\n".join(lines)
+
+
+def _render_prime_billing_load_error(error: str) -> str:
+    return (
+        "[bold]Prime Intellect Wallet[/bold]\n"
+        "[yellow]Wallet unavailable.[/yellow]\n"
+        f"[dim]{_clip(_escape_markup(error), 80)}[/dim]"
+    )
+
+
+def _render_provider_billing_body(
+    *,
+    modal_payload: Any | None,
+    modal_error: str | None,
+    prime_state: Literal["loading", "loaded", "failed", "unavailable"],
+    prime_payload: Any | None,
+    prime_error: str | None,
+    storage_snapshot: StorageSnapshot | None = None,
+) -> str:
+    """Compose the Modal and Prime billing sections of the shared panel."""
+
+    if modal_error is not None:
+        modal_section = _render_billing_load_error(modal_error)
+    elif modal_payload is not None:
+        modal_section = _render_billing_report(
+            modal_payload,
+            storage_snapshot=storage_snapshot,
+        )
+    else:
+        modal_section = (
+            "[bold]Workspace Spend[/bold]\n"
+            "[dim]Refreshing billing report...[/dim]"
+        )
+
+    if prime_state == "unavailable":
+        prime_section = (
+            "[bold]Prime Intellect Wallet[/bold]\n"
+            "[dim]Not authenticated (run: prime login)[/dim]"
+        )
+    elif prime_state == "failed":
+        prime_section = _render_prime_billing_load_error(
+            prime_error or "Could not read Prime billing wallet."
+        )
+    elif prime_state == "loaded":
+        prime_section = _render_prime_billing_report(prime_payload)
+    else:
+        prime_section = (
+            "[bold]Prime Intellect Wallet[/bold]\n"
+            "[dim]Refreshing wallet...[/dim]"
+        )
+
+    return f"{modal_section}\n\n{prime_section}"
+
+
 def _quick_deploy_options(
     profiles: list[QuickDeployProfile],
     plans: tuple[InferencePlan, ...] | None = None,
@@ -1104,6 +1210,11 @@ class MainMenuScreen(CopyEnabledScreen):
         self._status_refresh_inflight = False
         self._billing_refresh_inflight = False
         self._billing_payload: Any | None = None
+        self._billing_error: str | None = None
+        self._prime_billing_refresh_inflight = False
+        self._prime_billing_state: Literal["loading", "loaded", "failed", "unavailable"] = "loading"
+        self._prime_billing_payload: Any | None = None
+        self._prime_billing_error: str | None = None
         self._storage_snapshot: StorageSnapshot | None = None
         self._quick_deploy_profiles = list_quick_deploy_profiles()
         self._modal_quick_deploy_plans = resolve_quick_deploy_plans(
@@ -1137,7 +1248,7 @@ class MainMenuScreen(CopyEnabledScreen):
                         yield Static("[bold #7bf168]Deployment Status[/]", id="deployment-status-title")
                         yield Static("[dim]Refreshing deployment status...[/dim]", id="deployment-status-body")
                     with Vertical(id="billing-report-panel"):
-                        yield Static("[bold #7bf168]Modal Billing Report[/]", id="billing-report-title")
+                        yield Static("[bold #7bf168]Provider Billing[/]", id="billing-report-title")
                         yield Static("[dim]Refreshing billing report...[/dim]", id="billing-report-body")
                     with Vertical(id="quick-deploy-panel"):
                         yield Static("[bold #7bf168]Popular Models[/]", id="landing-quick-deploy-title")
@@ -1242,6 +1353,12 @@ class MainMenuScreen(CopyEnabledScreen):
         )
         if message.status.authenticated:
             self._refresh_prime_inference_plans()
+            self._refresh_prime_billing_report()
+        elif self._prime_billing_state != "loaded":
+            self._prime_billing_state = "unavailable"
+            self._prime_billing_error = None
+            self._prime_billing_refresh_inflight = False
+            self._update_billing_panel()
 
     def _refresh_prime_inference_plans(self) -> None:
         if self._prime_inference_refresh_inflight:
@@ -1361,6 +1478,7 @@ class MainMenuScreen(CopyEnabledScreen):
     def _refresh_panels(self) -> None:
         self._refresh_deployment_status()
         self._refresh_billing_report()
+        self._refresh_prime_billing_report()
 
     def _refresh_storage_estimate(self) -> None:
         cached_storage_snapshot = getattr(self.app, "cached_storage_snapshot", None)
@@ -1401,11 +1519,22 @@ class MainMenuScreen(CopyEnabledScreen):
         if self._billing_refresh_inflight:
             return
         self._billing_refresh_inflight = True
-        self.query_one("#billing-report-body", Static).update("[dim]Refreshing billing report...[/dim]")
         self.run_worker(
             self._run_load_billing_report,
             name="main-menu-billing-worker",
             thread=True,
+        )
+
+    def _update_billing_panel(self) -> None:
+        self.query_one("#billing-report-body", Static).update(
+            _render_provider_billing_body(
+                modal_payload=self._billing_payload,
+                modal_error=self._billing_error,
+                prime_state=self._prime_billing_state,
+                prime_payload=self._prime_billing_payload,
+                prime_error=self._prime_billing_error,
+                storage_snapshot=self._storage_snapshot,
+            )
         )
 
     def _run_load_billing_report(self) -> None:
@@ -1426,6 +1555,42 @@ class MainMenuScreen(CopyEnabledScreen):
             storage_snapshot = cached_storage_snapshot()
         poster(BillingReportLoaded(payload=payload, storage_snapshot=storage_snapshot))
 
+    def _refresh_prime_billing_report(self) -> None:
+        if self._prime_billing_refresh_inflight:
+            return
+        status = self._prime_auth_status
+        if status is None:
+            # Auth resolution runs concurrently; fall back to the local check.
+            try:
+                status = get_prime_auth_status()
+            except Exception:
+                status = None
+        if status is not None and not status.authenticated:
+            self._prime_billing_state = "unavailable"
+            self._prime_billing_error = None
+            self._update_billing_panel()
+            return
+        self._prime_billing_refresh_inflight = True
+        self.run_worker(
+            self._run_load_prime_billing_report,
+            name="main-menu-prime-billing-worker",
+            thread=True,
+        )
+
+    def _run_load_prime_billing_report(self) -> None:
+        poster = getattr(self, "post_message", None)
+        if poster is None:
+            return
+        try:
+            payload, error = PrimeBackend().billing_wallet()
+        except Exception as exc:
+            poster(PrimeBillingReportLoadFailed(error=str(exc)))
+            return
+        if payload is None:
+            poster(PrimeBillingReportLoadFailed(error=error or "Could not read Prime billing wallet."))
+            return
+        poster(PrimeBillingReportLoaded(payload=payload))
+
     def on_deployments_loaded(self, message: DeploymentsLoaded) -> None:
         self._status_refresh_inflight = False
         visible_rows = [row for row in message.rows if _should_show_in_panel(row.state)]
@@ -1444,23 +1609,34 @@ class MainMenuScreen(CopyEnabledScreen):
     def on_billing_report_loaded(self, message: BillingReportLoaded) -> None:
         self._billing_refresh_inflight = False
         self._billing_payload = message.payload
+        self._billing_error = None
         if message.storage_snapshot is not None:
             self._storage_snapshot = message.storage_snapshot
-        self.query_one("#billing-report-body", Static).update(
-            _render_billing_report(message.payload, storage_snapshot=self._storage_snapshot)
-        )
+        self._update_billing_panel()
 
     def on_billing_report_load_failed(self, message: BillingReportLoadFailed) -> None:
         self._billing_refresh_inflight = False
-        self.query_one("#billing-report-body", Static).update(_render_billing_load_error(message.error))
+        self._billing_error = message.error
+        self._update_billing_panel()
+
+    def on_prime_billing_report_loaded(self, message: PrimeBillingReportLoaded) -> None:
+        self._prime_billing_refresh_inflight = False
+        self._prime_billing_state = "loaded"
+        self._prime_billing_payload = message.payload
+        self._prime_billing_error = None
+        self._update_billing_panel()
+
+    def on_prime_billing_report_load_failed(self, message: PrimeBillingReportLoadFailed) -> None:
+        self._prime_billing_refresh_inflight = False
+        self._prime_billing_state = "failed"
+        self._prime_billing_error = message.error
+        self._update_billing_panel()
 
     def on_storage_loaded(self, message: StorageLoaded) -> None:
         self._storage_snapshot = message.snapshot
         if self._billing_payload is None:
             return
-        self.query_one("#billing-report-body", Static).update(
-            _render_billing_report(self._billing_payload, storage_snapshot=self._storage_snapshot)
-        )
+        self._update_billing_panel()
 
     def on_storage_failed(self, _: StorageFailed) -> None:
         return

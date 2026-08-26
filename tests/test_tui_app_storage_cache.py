@@ -352,7 +352,7 @@ class TuiAppStorageCacheTests(unittest.TestCase):
             self.assertEqual(len(merged), 1)
             self.assertEqual(
                 merged[0].web_url,
-                "https://alice--llamacpp-edge-quant-serve.modal.run/v1",
+                "https://alice--llamacpp-edge-quant-serve.modal.run",
             )
             self.assertEqual(merged[0].served_model_name, "Nanbeige4.1-3B-Q4_K_M-GGUF")
             self.assertEqual(

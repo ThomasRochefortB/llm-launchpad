@@ -5,7 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from llm_launchpad.core.orchestrator import Orchestrator
-from llm_launchpad.protocol.enums import BackendType, DeploymentState, OperationType
+from llm_launchpad.protocol.enums import BackendType, ComputeProvider, DeploymentState, OperationType
 from llm_launchpad.protocol.events import ErrorEvent, LogEvent, OperationCompleteEvent, StateChangeEvent
 
 
@@ -289,6 +289,46 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
                 isinstance(e, LogEvent)
                 and e.line == "modal-log-line"
                 and e.operation == OperationType.WARMUP
+                for e in events
+            )
+        )
+
+    def test_warmup_prime_skips_modal_log_tail_and_fallback(self) -> None:
+        """Prime warmups must never launch Modal log tailing or its fallback."""
+        fake_requests = types.SimpleNamespace(get=lambda *_args, **_kwargs: _Response(200, "ok"))
+
+        def _fail_popen(*_args, **_kwargs):
+            raise AssertionError("modal app logs must not be launched for Prime warmups")
+
+        def _fail_run(*_args, **_kwargs):
+            raise AssertionError("historical modal app logs must not run for Prime warmups")
+
+        with patch.dict("sys.modules", {"requests": fake_requests}):
+            with patch("llm_launchpad.core.warmup.subprocess.Popen", side_effect=_fail_popen):
+                with patch("llm_launchpad.core.warmup.subprocess.run", side_effect=_fail_run):
+                    with patch(
+                        "llm_launchpad.core.warmup.shutdown_event",
+                        return_value=types.SimpleNamespace(wait=lambda **_kwargs: False),
+                    ):
+                        with patch(
+                            "llm_launchpad.core.warmup.ModalBackend.test_curl_command",
+                            return_value="curl ok",
+                        ):
+                            events = list(
+                                Orchestrator().warmup(
+                                    backend=BackendType.VLLM,
+                                    server_url="https://tunnel.example.com",
+                                    timeout=10,
+                                    tail_logs=True,
+                                    provider=ComputeProvider.PRIME,
+                                )
+                            )
+
+        self.assertTrue(
+            any(
+                isinstance(e, OperationCompleteEvent)
+                and e.operation == OperationType.WARMUP
+                and e.success
                 for e in events
             )
         )

@@ -1577,6 +1577,22 @@ class PrimeBackend:
         lines = (result.stdout or result.stderr).splitlines()
         return [self._redact_runtime_log(line) for line in lines]
 
+    def billing_wallet(self, *, limit: int = 100) -> tuple[Any | None, str | None]:
+        """Return the Prime wallet billing snapshot and an optional error message."""
+
+        params: dict[str, Any] = {"limit": max(1, min(int(limit), 1000))}
+        if self.config.team_id:
+            params["teamId"] = self.config.team_id
+        try:
+            payload = self._request("GET", "/billing/wallet", params=params)
+        except PrimeApiError as exc:
+            return None, str(exc)
+        except Exception as exc:
+            return None, f"Prime billing wallet request failed: {exc}"
+        if not isinstance(payload, dict):
+            return None, "Prime billing wallet returned an unsupported response."
+        return payload, None
+
     def list_pods(self) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         offset = 0

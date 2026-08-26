@@ -1007,7 +1007,7 @@ class TuiApp(App):
             if not (row.web_url or "").strip():
                 base_url = str(cached.get("base_url", "") or "").strip()
                 if base_url:
-                    row.web_url = base_url
+                    row.web_url = base_url.removesuffix("/v1")
             if not (row.served_model_name or "").strip():
                 model_id = str(cached.get("model_id", "") or "").strip()
                 if model_id:
