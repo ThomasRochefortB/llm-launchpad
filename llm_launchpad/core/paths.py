@@ -1,4 +1,5 @@
 """Canonical Python module paths for Modal entrypoint apps."""
 
-MODAL_VLLM_SCRIPT = "llm_launchpad.backends.modal_vllm_app"
-MODAL_LLAMACPP_SCRIPT = "llm_launchpad.backends.modal_llamacpp_app"
+from ..protocol.enums import MODAL_LLAMACPP_SCRIPT, MODAL_VLLM_SCRIPT
+
+__all__ = ["MODAL_LLAMACPP_SCRIPT", "MODAL_VLLM_SCRIPT"]

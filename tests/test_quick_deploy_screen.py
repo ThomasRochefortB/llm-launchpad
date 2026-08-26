@@ -7,7 +7,17 @@ from textual.app import App
 from textual.widgets import Button, Input, Static, Switch
 
 from llm_launchpad.core import quick_deploy
-from llm_launchpad.core.quick_deploy import QuickDeployProfile
+from llm_launchpad.core.quick_deploy import (
+    QuickDeployProfile,
+    get_quick_deploy_profile,
+    quick_deploy_recipe,
+)
+from llm_launchpad.protocol.enums import BackendType, BillingModel, ComputeProvider
+from llm_launchpad.protocol.models import (
+    InferencePlan,
+    PrimeProviderOptions,
+    ProviderQuote,
+)
 from llm_launchpad.tui.screens.quick_deploy import QuickDeployScreen
 
 
@@ -49,6 +59,43 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("262,144 ctx", summary)
             self.assertNotIn("Cheap but good", summary)
             self.assertIn("UD-Q4_K_XL", summary)
+            self.assertIn("[bold]Provider[/bold] Modal", summary)
+            self.assertIn("[bold]Billing[/bold]  Scale to zero", summary)
+            self.assertIn("[bold]Hourly[/bold]   ~$15.15/hr", summary)
+            self.assertIn("[bold]Monthly[/bold]  ~$909.00/mo", summary)
+            self.assertIn("llama.cpp (GGUF)", summary)
+            self.assertIn("unsloth/Kimi-K2.5-GGUF", summary)
+
+    async def test_screen_renders_vllm_recipe_without_gguf_fields(self) -> None:
+        profile = QuickDeployProfile(
+            id="example-vllm",
+            display_name="Example Model",
+            repo_id="org/example",
+            quant="",
+            gpu_type="H100",
+            gpu_count=1,
+            profile_label="Fast",
+            approx_cost_per_hour_usd=2.0,
+            max_context_tokens=32768,
+            instance_slug_hint="example-vllm",
+            summary="Example vLLM profile.",
+            server_args=(),
+            backend=BackendType.VLLM,
+            model_name="org/example",
+        )
+
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(QuickDeployScreen(profile_id=profile))
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, QuickDeployScreen)
+            summary = str(screen.query_one("#quick-deploy-profile-body", Static).content)
+
+        self.assertIn("vLLM (OpenAI-compatible)", summary)
+        self.assertIn("[bold]Model[/bold]    org/example", summary)
+        self.assertNotIn("[bold]Quant[/bold]", summary)
 
     async def test_screen_moves_tier_and_vram_details_to_summary(self) -> None:
         profile = QuickDeployProfile(
@@ -134,6 +181,59 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app.deployed_config.app_name, "llamacpp-team-alpha")
         self.assertFalse(app.deployed_config.do_warmup)
         self.assertTrue(app.deployed_config.show_debug_logs)
+
+    async def test_prime_plan_exposes_and_maps_prime_advanced_options(self) -> None:
+        profile = get_quick_deploy_profile("qwen35-397b-rtxpro")
+        recipe = quick_deploy_recipe(profile)
+        plan = InferencePlan(
+            recipe=recipe,
+            quote=ProviderQuote(
+                id="prime:recipe:abc123",
+                recipe_id=recipe.id,
+                provider=ComputeProvider.PRIME,
+                provider_reference="abc123",
+                gpu_type="H100_80GB",
+                gpu_count=4,
+                price_per_hour_usd=8.0,
+                billing_model=BillingModel.PROVISIONED,
+                is_estimate=False,
+                provider_options=PrimeProviderOptions(
+                    offer_id="abc123",
+                    region="CA",
+                ),
+            ),
+            estimated_monthly_cost_usd=1920.0,
+        )
+
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(QuickDeployScreen(profile_id=plan))
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, QuickDeployScreen)
+            for widget in screen.query(".quick-advanced"):
+                widget.remove_class("hidden")
+            screen.query_one("#quick-prime-disk-id", Input).value = "disk-1"
+            screen.query_one("#quick-prime-insecure-http", Switch).value = True
+            screen.query_one("#quick-prime-keep-failed", Switch).value = True
+            screen._deploy()
+
+        config = app.deployed_config
+        self.assertIsNotNone(config)
+        self.assertEqual(config.provider, ComputeProvider.PRIME)
+        self.assertEqual(config.backend, BackendType.LLAMACPP)
+        self.assertEqual(config.app_name, "llp-prime-llamacpp-qwen35-397b-rtxpro")
+        self.assertEqual(
+            config.provider_options,
+            PrimeProviderOptions(
+                offer_id="abc123",
+                region="CA",
+                disk_id="disk-1",
+                keep_failed_resource=True,
+                allow_insecure_http=True,
+            ),
+        )
 
 
 if __name__ == "__main__":

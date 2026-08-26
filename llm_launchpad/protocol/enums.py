@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from enum import Enum
 
+MODAL_VLLM_SCRIPT = "llm_launchpad.backends.modal_vllm_app"
+MODAL_LLAMACPP_SCRIPT = "llm_launchpad.backends.modal_llamacpp_app"
+
 
 class BackendType(str, Enum):
     """Supported serving backends."""
@@ -20,12 +23,39 @@ class BackendType(str, Enum):
 
     @property
     def script(self) -> str:
-        from ..core.paths import MODAL_LLAMACPP_SCRIPT, MODAL_VLLM_SCRIPT
-
         return {
             BackendType.LLAMACPP: MODAL_LLAMACPP_SCRIPT,
             BackendType.VLLM: MODAL_VLLM_SCRIPT,
         }[self]
+
+
+class ComputeProvider(str, Enum):
+    """Infrastructure providers used to host serving backends."""
+
+    MODAL = "modal"
+    PRIME = "prime"
+
+    @property
+    def display_name(self) -> str:
+        return {
+            ComputeProvider.MODAL: "Modal",
+            ComputeProvider.PRIME: "Prime Intellect",
+        }[self]
+
+
+class BillingModel(str, Enum):
+    """How a provider bills an inference resource."""
+
+    SCALE_TO_ZERO = "scale_to_zero"
+    PROVISIONED = "provisioned"
+
+
+class QuoteAvailability(str, Enum):
+    """Normalized availability state for a provider quote."""
+
+    AVAILABLE = "available"
+    UNAVAILABLE = "unavailable"
+    UNKNOWN = "unknown"
 
 
 class DeploymentState(str, Enum):
@@ -37,10 +67,7 @@ class DeploymentState(str, Enum):
     DEPLOYING = "deploying"
     WARMING_UP = "warming_up"
     HEALTHY = "healthy"
-    UNHEALTHY = "unhealthy"
     STOPPED = "stopped"
-    ERROR = "error"
-    CANCELLED = "cancelled"
 
 
 class OperationType(str, Enum):

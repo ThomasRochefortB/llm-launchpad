@@ -224,6 +224,86 @@ class QuickDeployCatalogGeneratorTests(unittest.TestCase):
         self.assertEqual(profile["max_context_tokens"], 32768)
         self.assertEqual(profile["server_args"], ["--ctx-size", "32768"])
 
+    def test_build_popular_catalog_payload_uses_explicit_repos_without_aa_metadata(self) -> None:
+        models = (
+            self.generator.PopularModelCandidate(
+                name="Popular 27B",
+                slug="popular-27b",
+                creator_name="Example",
+                repo_id="unsloth/Popular-27B-GGUF",
+                max_context_tokens=131072,
+            ),
+        )
+        with patch.object(
+            self.generator,
+            "fetch_gguf_quant_metadata",
+            return_value=GgufQuantMetadata(
+                quantizations=["UD-Q4_K_XL"],
+                vram_gb_by_quant={"UD-Q4_K_XL": 17.0},
+            ),
+        ):
+            payload = self.generator.build_popular_catalog_payload(
+                modal_gpu_catalog=[ModalGpuSpec(value="L4", price_per_hour_usd=0.8)],
+                generated_at="2026-08-23T00:00:00Z",
+                models=models,
+            )
+
+        self.assertEqual(payload["source"], "Curated popular open-weight models")
+        self.assertEqual(len(payload["profiles"]), 1)
+        profile = payload["profiles"][0]
+        self.assertEqual(profile["display_name"], "Popular 27B")
+        self.assertEqual(profile["repo_id"], "unsloth/Popular-27B-GGUF")
+        self.assertEqual(profile["gpu_type"], "L4")
+        self.assertEqual(profile["gpu_count"], 1)
+        self.assertEqual(profile["required_vram_gb"], 17.0)
+        self.assertEqual(profile["max_context_tokens"], 131072)
+        self.assertEqual(profile["server_args"], ["--ctx-size", "131072"])
+        self.assertEqual(profile["source_label"], "Hugging Face")
+        self.assertNotIn("aa_coding_score", profile)
+        self.assertNotIn("aa_rank", profile)
+
+    def test_popular_catalog_applies_deployment_measured_vram_floors(self) -> None:
+        models = (
+            self.generator.PopularModelCandidate(
+                name="Qwen3.8 27B",
+                slug="qwen3-8-27b",
+                creator_name="Alibaba",
+                repo_id="unsloth/Qwen3.8-27B-GGUF",
+                max_context_tokens=131072,
+                required_vram_floor_gb_by_quant=(
+                    ("UD-Q2_K_XL", 21.0),
+                    ("UD-Q4_K_XL", 29.0),
+                ),
+            ),
+        )
+        with patch.object(
+            self.generator,
+            "fetch_gguf_quant_metadata",
+            return_value=GgufQuantMetadata(
+                quantizations=["UD-Q4_K_XL", "UD-Q2_K_XL"],
+                vram_gb_by_quant={"UD-Q4_K_XL": 17.6, "UD-Q2_K_XL": 9.8},
+            ),
+        ):
+            payload = self.generator.build_popular_catalog_payload(
+                modal_gpu_catalog=[ModalGpuSpec(value="L4", price_per_hour_usd=0.8)],
+                generated_at="2026-08-24T00:00:00Z",
+                models=models,
+            )
+
+        cheap_rows = [
+            row for row in payload["profiles"] if row["resource_tier"] == "cheap"
+        ]
+        self.assertEqual(
+            [
+                (row["quant"], row["required_vram_gb"], row["gpu_type"], row["gpu_count"])
+                for row in cheap_rows
+            ],
+            [
+                ("UD-Q2_K_XL", 21.0, "L4", 1),
+                ("UD-Q4_K_XL", 29.0, "L4", 2),
+            ],
+        )
+
     def test_build_catalog_payload_keeps_newest_model_per_family_before_limit(self) -> None:
         aa_payload = {
             "data": [

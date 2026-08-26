@@ -450,7 +450,28 @@ VllmDeployScreen .gpu-config-panel {
 /* ---- Monitor screen ---- */
 
 #monitor-layout {
-    height: 100%;
+    height: 1fr;
+}
+
+#monitor-toolbar {
+    width: 100%;
+    height: 2;
+    padding: 0 2;
+    background: #070b08;
+    border-bottom: solid #17321e;
+}
+
+#monitor-title {
+    width: 1fr;
+    height: 1;
+    content-align: left middle;
+}
+
+#monitor-view-status {
+    width: auto;
+    height: 1;
+    content-align: right middle;
+    text-align: right;
 }
 
 #monitor-log {

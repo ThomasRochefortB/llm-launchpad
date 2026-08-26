@@ -8,7 +8,7 @@ from typing import Optional
 
 from coolname import generate_slug
 
-from ..protocol.enums import BackendType
+from ..protocol.enums import BackendType, ComputeProvider
 
 
 _LEGACY_APP_NAMES = {
@@ -76,11 +76,30 @@ def build_app_name(backend: BackendType, instance_name: Optional[str]) -> str:
     return f"{_BACKEND_PREFIX[backend]}-{slugify_instance_name(instance_name)}"
 
 
+def build_deployment_name(
+    provider: ComputeProvider,
+    backend: BackendType,
+    instance_name: Optional[str],
+) -> str:
+    """Compose a provider-safe deployment resource name."""
+    if provider == ComputeProvider.PRIME:
+        return f"llp-prime-{_BACKEND_PREFIX[backend]}-{slugify_instance_name(instance_name or 'default')}"
+    return build_app_name(backend, instance_name)
+
+
 def infer_backend_from_app_name(app_name: str) -> Optional[BackendType]:
     """Infer backend type from legacy or prefixed app names."""
-    if app_name == _LEGACY_APP_NAMES[BackendType.VLLM] or app_name.startswith("vllm-"):
+    if (
+        app_name == _LEGACY_APP_NAMES[BackendType.VLLM]
+        or app_name.startswith("vllm-")
+        or app_name.startswith("llp-prime-vllm-")
+    ):
         return BackendType.VLLM
-    if app_name == _LEGACY_APP_NAMES[BackendType.LLAMACPP] or app_name.startswith("llamacpp-"):
+    if (
+        app_name == _LEGACY_APP_NAMES[BackendType.LLAMACPP]
+        or app_name.startswith("llamacpp-")
+        or app_name.startswith("llp-prime-llamacpp-")
+    ):
         return BackendType.LLAMACPP
     return None
 
@@ -92,6 +111,9 @@ def infer_instance_from_app_name(app_name: str, backend: Optional[BackendType]) 
     legacy = legacy_app_name(backend)
     if app_name == legacy:
         return "default"
+    prime_prefix = f"llp-prime-{_BACKEND_PREFIX[backend]}-"
+    if app_name.startswith(prime_prefix):
+        return app_name[len(prime_prefix) :] or "default"
     prefix = _BACKEND_PREFIX[backend] + "-"
     if app_name.startswith(prefix):
         return app_name[len(prefix) :] or "default"

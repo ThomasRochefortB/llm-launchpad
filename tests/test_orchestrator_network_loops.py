@@ -85,21 +85,30 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
             return next(responses)
 
         fake_requests = types.SimpleNamespace(post=_post)
+        clock = {"time": 0.0}
+
+        def _fake_time() -> float:
+            clock["time"] += 1.0
+            return clock["time"]
 
         with patch.dict("sys.modules", {"requests": fake_requests}):
-            with patch("llm_launchpad.core.warmup.time.sleep", return_value=None):
+            with patch("llm_launchpad.core.warmup.time.time", side_effect=_fake_time):
                 with patch(
-                    "llm_launchpad.core.warmup.ModalBackend.test_curl_command",
-                    return_value="curl ok",
+                    "llm_launchpad.core.warmup.shutdown_event",
+                    return_value=types.SimpleNamespace(wait=lambda **_kwargs: False),
                 ):
-                    events = list(
-                        Orchestrator().warmup(
-                            backend=BackendType.LLAMACPP,
-                            server_url="https://example.modal.run",
-                            timeout=10,
-                            tail_logs=False,
+                    with patch(
+                        "llm_launchpad.core.warmup.ModalBackend.test_curl_command",
+                        return_value="curl ok",
+                    ):
+                        events = list(
+                            Orchestrator().warmup(
+                                backend=BackendType.LLAMACPP,
+                                server_url="https://example.modal.run",
+                                timeout=10,
+                                tail_logs=False,
+                            )
                         )
-                    )
 
         self.assertGreaterEqual(post_calls["n"], 2)
         self.assertTrue(
@@ -120,7 +129,10 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
     def test_warmup_success_vllm(self) -> None:
         fake_requests = types.SimpleNamespace(get=lambda *_args, **_kwargs: _Response(200, "ok"))
         with patch.dict("sys.modules", {"requests": fake_requests}):
-            with patch("llm_launchpad.core.warmup.time.sleep", return_value=None):
+            with patch(
+                "llm_launchpad.core.warmup.shutdown_event",
+                return_value=types.SimpleNamespace(wait=lambda **_kwargs: False),
+            ):
                 with patch(
                     "llm_launchpad.core.warmup.ModalBackend.test_curl_command",
                     return_value="curl ok",
@@ -138,6 +150,7 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
             BackendType.VLLM,
             "https://example.modal.run",
             served_model_name="Qwen3-0.6B",
+            api_key=None,
         )
 
         self.assertTrue(any(isinstance(e, StateChangeEvent) and e.current == DeploymentState.HEALTHY for e in events))
@@ -160,7 +173,10 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
 
         with patch.dict("sys.modules", {"requests": fake_requests}):
             with patch("llm_launchpad.core.warmup.time.time", side_effect=_fake_time):
-                with patch("llm_launchpad.core.warmup.time.sleep", return_value=None):
+                with patch(
+                    "llm_launchpad.core.warmup.shutdown_event",
+                    return_value=types.SimpleNamespace(wait=lambda **_kwargs: False),
+                ):
                     events = list(
                         Orchestrator().warmup(
                             backend=BackendType.VLLM,
@@ -204,7 +220,10 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
 
         with patch.dict("sys.modules", {"requests": fake_requests}):
             with patch("llm_launchpad.core.warmup.time.time", side_effect=_fake_time):
-                with patch("llm_launchpad.core.warmup.time.sleep", return_value=None):
+                with patch(
+                    "llm_launchpad.core.warmup.shutdown_event",
+                    return_value=types.SimpleNamespace(wait=lambda **_kwargs: False),
+                ):
                     with patch(
                         "llm_launchpad.core.warmup.ModalBackend.test_curl_command",
                         return_value="curl ok",
@@ -291,7 +310,10 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
                     with patch("llm_launchpad.core.warmup.threading.Thread", _SyncThread):
                         with patch("llm_launchpad.core.warmup.os.environ", {}):
                             with patch("llm_launchpad.core.warmup.time.time", side_effect=_fake_time):
-                                with patch("llm_launchpad.core.warmup.time.sleep", return_value=None):
+                                with patch(
+                                    "llm_launchpad.core.warmup.shutdown_event",
+                                    return_value=types.SimpleNamespace(wait=lambda **_kwargs: False),
+                                ):
                                     events = list(
                                         Orchestrator().warmup(
                                             backend=BackendType.VLLM,
@@ -375,7 +397,10 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
                         with patch("llm_launchpad.core.warmup.subprocess.run", return_value=hist_result):
                             with patch("llm_launchpad.core.warmup.os.environ", {}):
                                 with patch("llm_launchpad.core.warmup.time.time", side_effect=_fake_time):
-                                    with patch("llm_launchpad.core.warmup.time.sleep", return_value=None):
+                                    with patch(
+                                        "llm_launchpad.core.warmup.shutdown_event",
+                                        return_value=types.SimpleNamespace(wait=lambda **_kwargs: False),
+                                    ):
                                         events = list(
                                             Orchestrator().warmup(
                                                 backend=BackendType.VLLM,
@@ -450,6 +475,7 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
             BackendType.LLAMACPP,
             "https://example.modal.run/v1",
             served_model_name="Nanbeige4.1-3B-Q4_K_M-GGUF",
+            api_key=None,
         )
         self.assertTrue(
             any(
@@ -476,7 +502,10 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
         )
         fake_requests = types.SimpleNamespace(get=lambda *_args, **_kwargs: next(responses))
         with patch.dict("sys.modules", {"requests": fake_requests}):
-            with patch("llm_launchpad.core.orchestrator.time.sleep", return_value=None):
+            with patch(
+                "llm_launchpad.core.orchestrator.shutdown_event",
+                return_value=types.SimpleNamespace(wait=lambda **_kwargs: False),
+            ):
                 with patch("llm_launchpad.core.orchestrator.ModalBackend.test_curl_command", return_value="curl ok"):
                     events = list(
                         Orchestrator().check_status(
@@ -514,7 +543,10 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
         fake_requests = types.SimpleNamespace(get=lambda *_args, **_kwargs: _Response(503, "nope"))
         with patch.dict("sys.modules", {"requests": fake_requests}):
             with patch("llm_launchpad.core.orchestrator.time.time", side_effect=[0.0, 0.1, 999.0]):
-                with patch("llm_launchpad.core.orchestrator.time.sleep", return_value=None):
+                with patch(
+                    "llm_launchpad.core.orchestrator.shutdown_event",
+                    return_value=types.SimpleNamespace(wait=lambda **_kwargs: False),
+                ):
                     events = list(
                         Orchestrator().check_status(
                             backend=BackendType.VLLM,
@@ -540,7 +572,10 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
         fake_requests = types.SimpleNamespace(get=_raise)
         with patch.dict("sys.modules", {"requests": fake_requests}):
             with patch("llm_launchpad.core.orchestrator.time.time", side_effect=[0.0, 0.1, 999.0]):
-                with patch("llm_launchpad.core.orchestrator.time.sleep", return_value=None):
+                with patch(
+                    "llm_launchpad.core.orchestrator.shutdown_event",
+                    return_value=types.SimpleNamespace(wait=lambda **_kwargs: False),
+                ):
                     events = list(
                         Orchestrator().check_status(
                             backend=BackendType.VLLM,

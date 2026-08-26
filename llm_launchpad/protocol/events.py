@@ -23,13 +23,13 @@ class LogEvent(BaseEvent):
     line: str = ""
     stream: str = "stdout"  # "stdout" | "stderr"
     operation: Optional[OperationType] = None
+    is_milestone: bool = False
 
 
 @dataclass(frozen=True)
 class StateChangeEvent(BaseEvent):
     """Signals a transition in the deployment state machine."""
 
-    previous: Optional[DeploymentState] = None
     current: DeploymentState = DeploymentState.IDLE
     operation: Optional[OperationType] = None
     detail: str = ""

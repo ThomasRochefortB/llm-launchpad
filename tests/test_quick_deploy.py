@@ -33,7 +33,10 @@ class QuickDeployConfigTests(unittest.TestCase):
         self.assertIn("UD-Q4_K_XL", {profile.quant for profile in profiles})
         self.assertIn("UD-Q2_K_XL", {profile.quant for profile in profiles})
         self.assertFalse(get_quick_deploy_catalog_info().is_fallback)
-        self.assertEqual(get_quick_deploy_catalog_info().source_label, "Artificial Analysis coding rankings")
+        self.assertEqual(
+            get_quick_deploy_catalog_info().source_label,
+            "Curated popular open-weight models",
+        )
 
     def test_catalog_loader_accepts_generated_json(self) -> None:
         payload = {
@@ -83,6 +86,41 @@ class QuickDeployConfigTests(unittest.TestCase):
         self.assertEqual(profiles[0].server_args, ("--ctx-size", "65536"))
         self.assertEqual(get_quick_deploy_catalog_info().generated_at, "2026-05-01T12:00:00Z")
 
+    def test_catalog_loader_accepts_vllm_recipe_without_quant(self) -> None:
+        payload = {
+            "schema_version": 1,
+            "source": "Curated models",
+            "profiles": [
+                {
+                    "id": "test-vllm",
+                    "display_name": "Test vLLM Model",
+                    "repo_id": "",
+                    "model_name": "org/Test-Model",
+                    "backend": "vllm",
+                    "quant": "",
+                    "gpu_type": "H100_80GB",
+                    "gpu_count": 1,
+                    "profile_label": "Fast",
+                    "approx_cost_per_hour_usd": 2.0,
+                    "max_context_tokens": 32768,
+                    "instance_slug_hint": "test-vllm",
+                    "summary": "Generated vLLM recipe.",
+                    "server_args": [],
+                }
+            ],
+        }
+
+        with patch(
+            "llm_launchpad.core.quick_deploy._read_bundled_catalog_text",
+            return_value=json.dumps(payload),
+        ):
+            quick_deploy._reset_quick_deploy_catalog_cache()
+            profile = list_quick_deploy_profiles()[0]
+
+        self.assertEqual(profile.backend, BackendType.VLLM)
+        self.assertEqual(profile.model_name, "org/Test-Model")
+        self.assertEqual(profile.quant, "")
+
     def test_catalog_loader_falls_back_when_file_missing(self) -> None:
         with patch("llm_launchpad.core.quick_deploy._read_bundled_catalog_text", return_value=None):
             quick_deploy._reset_quick_deploy_catalog_cache()
@@ -121,6 +159,7 @@ class QuickDeployConfigTests(unittest.TestCase):
         self.assertEqual(config.quant, "UD-Q4_K_XL")
         self.assertEqual(config.gpu_type, "RTX-PRO-6000")
         self.assertEqual(config.gpu_count, 3)
+        self.assertEqual(config.required_vram_gb, profile.required_vram_gb)
         self.assertEqual(profile.max_context_tokens, 262144)
         self.assertTrue(config.preload)
         self.assertTrue(config.do_deploy)

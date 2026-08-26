@@ -280,6 +280,20 @@ class HFModelsTests(unittest.TestCase):
         self.assertAlmostEqual(vram["Q4_1"], 472.704, places=2)
         self.assertAlmostEqual(vram["BF16"], 1510.0, places=1)
 
+    def test_quantization_page_treats_sub_gigabyte_numeric_size_as_bytes(self) -> None:
+        quantizations, vram = (
+            hf_models._extract_quantizations_and_vram_from_quantization_data(
+                {
+                    "variantsByQuantizationLevels": {
+                        "4": [{"label": "Q4_K_M", "size": 398_000_000}],
+                    }
+                }
+            )
+        )
+
+        self.assertEqual(quantizations, ["Q4_K_M"])
+        self.assertAlmostEqual(vram["Q4_K_M"], 0.398, places=3)
+
     def test_fetch_quant_metadata_prefers_hardware_compatibility_rows(self) -> None:
         class FakeApi:
             def model_info(self, *, repo_id: str, revision: str | None, expand: list[str]):

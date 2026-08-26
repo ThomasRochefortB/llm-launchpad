@@ -11,10 +11,11 @@ from llm_launchpad.tui.screens.manage import (
 
 class ManageScreenHelpersTests(unittest.TestCase):
     def test_is_stoppable_state_includes_active_in_progress_states(self) -> None:
+        self.assertTrue(_is_stoppable_state("active"))
         self.assertTrue(_is_stoppable_state("deployed"))
-        self.assertTrue(_is_stoppable_state("ephemeral"))
         self.assertTrue(_is_stoppable_state("queued"))
         self.assertTrue(_is_stoppable_state("running"))
+        self.assertFalse(_is_stoppable_state("ephemeral"))
         self.assertFalse(_is_stoppable_state("stopped"))
         self.assertFalse(_is_stoppable_state("unknown"))
 

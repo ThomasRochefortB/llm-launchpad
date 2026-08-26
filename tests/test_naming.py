@@ -42,6 +42,12 @@ class NamingTests(unittest.TestCase):
         self.assertEqual(backend, BackendType.VLLM)
         self.assertEqual(infer_instance_from_app_name(app_name, backend), "qwen3-coder")
 
+    def test_infer_prime_llamacpp_backend_and_instance(self) -> None:
+        app_name = "llp-prime-llamacpp-qwen3-gguf"
+        backend = infer_backend_from_app_name(app_name)
+        self.assertEqual(backend, BackendType.LLAMACPP)
+        self.assertEqual(infer_instance_from_app_name(app_name, backend), "qwen3-gguf")
+
     def test_legacy_app_name_roundtrip(self) -> None:
         app_name = legacy_app_name(BackendType.LLAMACPP)
         backend = infer_backend_from_app_name(app_name)

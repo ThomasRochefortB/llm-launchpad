@@ -6,8 +6,8 @@ from unittest.mock import patch
 
 from llm_launchpad.core.backend import ModalBackend, ModalListAppsResult, _extract_modal_app_rows
 from llm_launchpad.core.orchestrator import Orchestrator
-from llm_launchpad.protocol.enums import BackendType
-from llm_launchpad.protocol.events import LogEvent, OperationCompleteEvent
+from llm_launchpad.protocol.enums import BackendType, OperationType
+from llm_launchpad.protocol.events import ErrorEvent, LogEvent, OperationCompleteEvent
 from llm_launchpad.protocol.models import DeploymentConfig, EndpointInfo, LaunchpadSettings
 
 
@@ -120,6 +120,33 @@ class OrchestratorMultiInstanceTests(unittest.TestCase):
         self.assertTrue(captured)
         self.assertEqual(captured[0], ["modal", "app", "logs", "ap-123"])
 
+    def test_tail_logs_tags_generic_subprocess_events_as_logs(self) -> None:
+        stream = iter(
+            [
+                LogEvent(line="line"),
+                OperationCompleteEvent(success=True, exit_code=0),
+            ]
+        )
+        with (
+            patch("llm_launchpad.core.backend.ModalBackend.logs_follow_args", return_value=[]),
+            patch("llm_launchpad.core.backend.ModalBackend.run_streaming", return_value=stream),
+        ):
+            events = list(
+                Orchestrator().tail_logs(
+                    BackendType.VLLM,
+                    follow=False,
+                    app_name="vllm-qwen3",
+                )
+            )
+
+        subprocess_events = [
+            event for event in events if isinstance(event, (LogEvent, OperationCompleteEvent))
+        ]
+        self.assertTrue(subprocess_events)
+        self.assertTrue(
+            all(event.operation == OperationType.LOGS for event in subprocess_events)
+        )
+
     def test_stop_app_targets_explicit_app_name(self) -> None:
         orch = Orchestrator()
         captured: list[list[str]] = []
@@ -152,6 +179,35 @@ class OrchestratorMultiInstanceTests(unittest.TestCase):
             list(orch.stop_app(BackendType.VLLM, app_name="vllm-qwen2-5", app_id="ap-123"))
         self.assertTrue(captured)
         self.assertEqual(captured[0], ["modal", "app", "stop", "ap-123"])
+
+    def test_stop_app_tags_generic_subprocess_events_as_stop(self) -> None:
+        stream = iter(
+            [
+                LogEvent(line="stopping"),
+                ErrorEvent(message="failed", exit_code=9),
+                OperationCompleteEvent(success=False, exit_code=9),
+            ]
+        )
+        with patch(
+            "llm_launchpad.core.backend.ModalBackend.run_streaming",
+            return_value=stream,
+        ):
+            events = list(
+                Orchestrator().stop_app(
+                    BackendType.VLLM,
+                    app_name="vllm-qwen3",
+                )
+            )
+
+        subprocess_events = [
+            event
+            for event in events
+            if isinstance(event, (LogEvent, ErrorEvent, OperationCompleteEvent))
+        ]
+        self.assertTrue(subprocess_events)
+        self.assertTrue(
+            all(event.operation == OperationType.STOP for event in subprocess_events)
+        )
 
     def test_list_deployments_handles_empty_json_as_success(self) -> None:
         orch = Orchestrator()

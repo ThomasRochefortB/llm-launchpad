@@ -26,6 +26,9 @@ from llm_launchpad.core.quick_deploy import (
 AA_LLM_MODELS_URL = "https://artificialanalysis.ai/api/v2/data/llms/models"
 CATALOG_PATH = Path(__file__).resolve().parents[1] / "llm_launchpad" / "data" / "quick_deploy_catalog.json"
 ATTRIBUTION = "Benchmark data sourced from Artificial Analysis: https://artificialanalysis.ai/"
+POPULAR_ATTRIBUTION = (
+    "Model metadata sourced from Hugging Face: https://huggingface.co/unsloth"
+)
 DEFAULT_MAX_PROFILES = 3
 MATCH_THRESHOLD = 90.0
 AMBIGUITY_MARGIN = 5.0
@@ -145,6 +148,47 @@ class AAModelCandidate:
     coding_score: float
     rank: int
     max_context_tokens: int | None = None
+
+
+@dataclass(frozen=True)
+class PopularModelCandidate:
+    """Curated, deployment-tested model shown in the Popular Models panel."""
+
+    name: str
+    slug: str
+    creator_name: str
+    repo_id: str
+    max_context_tokens: int
+    required_vram_floor_gb_by_quant: tuple[tuple[str, float], ...] = ()
+
+
+POPULAR_MODEL_CANDIDATES: tuple[PopularModelCandidate, ...] = (
+    PopularModelCandidate(
+        name="Qwen3.8 27B",
+        slug="qwen3-8-27b",
+        creator_name="Alibaba",
+        repo_id="unsloth/Qwen3.8-27B-GGUF",
+        max_context_tokens=131072,
+        required_vram_floor_gb_by_quant=(
+            ("UD-Q2_K_XL", 21.0),
+            ("UD-Q4_K_XL", 29.0),
+        ),
+    ),
+    PopularModelCandidate(
+        name="DeepSeek V4 Flash 0731",
+        slug="deepseek-v4-flash-0731",
+        creator_name="DeepSeek",
+        repo_id="unsloth/DeepSeek-V4-Flash-0731-GGUF",
+        max_context_tokens=131072,
+    ),
+    PopularModelCandidate(
+        name="GLM-5.2",
+        slug="glm-5-2",
+        creator_name="Z.ai",
+        repo_id="unsloth/GLM-5.2-GGUF",
+        max_context_tokens=131072,
+    ),
+)
 
 
 @dataclass(frozen=True)
@@ -295,6 +339,84 @@ def build_catalog_payload(
         "attribution": ATTRIBUTION,
         "profiles": profiles,
     }
+
+
+def build_popular_catalog_payload(
+    *,
+    modal_gpu_catalog: Sequence[ModalGpuSpec],
+    generated_at: str | None = None,
+    models: Sequence[PopularModelCandidate] = POPULAR_MODEL_CANDIDATES,
+) -> dict[str, Any]:
+    """Build the deployment-tested Popular Models catalog from explicit HF repos."""
+    profiles: list[dict[str, Any]] = []
+    for rank, model in enumerate(models, start=1):
+        candidate = AAModelCandidate(
+            aa_model_id="",
+            name=model.name,
+            slug=model.slug,
+            creator_name=model.creator_name,
+            coding_score=0.0,
+            rank=rank,
+            max_context_tokens=model.max_context_tokens,
+        )
+        metadata = fetch_gguf_quant_metadata(model.repo_id)
+        metadata = _apply_required_vram_floors(
+            metadata,
+            model.required_vram_floor_gb_by_quant,
+        )
+        rows = build_profile_rows(
+            candidate,
+            model.repo_id,
+            metadata=metadata,
+            modal_gpu_catalog=modal_gpu_catalog,
+        )
+        for row in rows:
+            for key in (
+                "aa_model_id",
+                "aa_model_name",
+                "aa_model_slug",
+                "aa_coding_score",
+                "aa_rank",
+            ):
+                row.pop(key, None)
+            row["source_label"] = "Hugging Face"
+            row["summary"] = (
+                "Curated popular open-weight model with verified llama.cpp GGUF weights."
+            )
+            row["max_context_tokens"] = model.max_context_tokens
+            row["server_args"] = ["--ctx-size", str(model.max_context_tokens)]
+        profiles.extend(rows)
+
+    return {
+        "schema_version": 1,
+        "generated_at": generated_at or _utc_now_iso(),
+        "source": "Curated popular open-weight models",
+        "attribution": POPULAR_ATTRIBUTION,
+        "profiles": profiles,
+    }
+
+
+def _apply_required_vram_floors(
+    metadata: GgufQuantMetadata,
+    floors: Sequence[tuple[str, float]],
+) -> GgufQuantMetadata:
+    """Apply deployment-measured runtime floors before selecting GPU shapes."""
+
+    values = dict(metadata.vram_gb_by_quant)
+    for quant, floor in floors:
+        parsed_floor = _optional_float(floor)
+        if parsed_floor is None or parsed_floor <= 0:
+            continue
+        expected = _quant_key(quant)
+        matching_key = next(
+            (candidate for candidate in values if _quant_key(candidate) == expected),
+            quant,
+        )
+        values[matching_key] = max(values.get(matching_key, 0.0), parsed_floor)
+    return GgufQuantMetadata(
+        quantizations=list(metadata.quantizations),
+        vram_gb_by_quant=values,
+    )
 
 
 def _latest_family_candidates(candidates: Sequence[AAModelCandidate]) -> list[AAModelCandidate]:
@@ -697,15 +819,10 @@ def _resolve_max_context_tokens(
     *,
     fallback: int,
 ) -> int:
-    values: list[int | None] = []
+    values: list[int | None] = [candidate.max_context_tokens]
     for base_repo_id in _base_context_repo_candidates(candidate, repo_id):
         values.append(fetch_model_max_context(base_repo_id))
-    values.extend(
-        [
-            fetch_model_max_context(repo_id),
-            candidate.max_context_tokens,
-        ]
-    )
+    values.append(fetch_model_max_context(repo_id))
     for value in values:
         if value is not None and value > 0:
             return value
@@ -1099,22 +1216,30 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=CATALOG_PATH)
     parser.add_argument("--max-profiles", type=int, default=DEFAULT_MAX_PROFILES)
+    parser.add_argument(
+        "--popular",
+        action="store_true",
+        help="Build the curated Popular Models catalog without an Artificial Analysis API key.",
+    )
     args = parser.parse_args(argv)
 
-    api_key = os.environ.get("ARTIFICIAL_ANALYSIS_API_KEY", "").strip()
-    if not api_key:
-        raise SystemExit("ARTIFICIAL_ANALYSIS_API_KEY is required for maintainer catalog refresh")
-
-    from huggingface_hub import HfApi
-
-    aa_payload = fetch_aa_llm_models(api_key)
     modal_gpu_catalog = fetch_modal_gpu_catalog_or_fallback()
-    catalog = build_catalog_payload(
-        aa_payload,
-        hf_api=HfApi(),
-        modal_gpu_catalog=modal_gpu_catalog,
-        max_profiles=args.max_profiles,
-    )
+    if args.popular:
+        catalog = build_popular_catalog_payload(modal_gpu_catalog=modal_gpu_catalog)
+    else:
+        api_key = os.environ.get("ARTIFICIAL_ANALYSIS_API_KEY", "").strip()
+        if not api_key:
+            raise SystemExit("ARTIFICIAL_ANALYSIS_API_KEY is required for maintainer catalog refresh")
+
+        from huggingface_hub import HfApi
+
+        aa_payload = fetch_aa_llm_models(api_key)
+        catalog = build_catalog_payload(
+            aa_payload,
+            hf_api=HfApi(),
+            modal_gpu_catalog=modal_gpu_catalog,
+            max_profiles=args.max_profiles,
+        )
     if not catalog["profiles"]:
         raise SystemExit("No Quick Deploy profiles were generated")
     write_catalog(catalog, path=args.output)

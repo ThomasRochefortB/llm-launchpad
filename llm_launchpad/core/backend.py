@@ -7,17 +7,18 @@ import json
 import os
 import re
 import shlex
-import shutil
 import subprocess
-import sys
 import threading
-from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional
 
 from ..protocol.enums import BackendType
 from ..protocol.events import ErrorEvent, LogEvent, OperationCompleteEvent
 from ..protocol.models import DeploymentConfig, EndpointInfo, LaunchpadSettings
 from .modal_auth import get_modal_profile
+from .modal_cli import _CLI_TIMEOUT_SECONDS as _MODAL_CLI_TIMEOUT_SECONDS
+from .modal_cli import resolve_modal_cli_path
+from .shutdown import is_shutting_down as _is_shutting_down
+from .shutdown import shutdown_event
 from .naming import default_served_model_name
 from .naming import infer_backend_from_app_name, infer_instance_from_app_name, legacy_app_name
 from .naming import modal_function_name
@@ -33,7 +34,6 @@ class ModalCliError:
     stdout: str = ""
     stderr: str = ""
     timed_out: bool = False
-    exception_type: str = ""
 
 
 @dataclass(frozen=True)
@@ -81,21 +81,13 @@ class ModalBackend:
 
     _active_procs: set[subprocess.Popen] = set()
     _active_procs_lock = threading.Lock()
-    _shutdown_event = threading.Event()
-    _CLI_TIMEOUT_SECONDS = 8.0
+    _shutdown_event = shutdown_event()
+    _CLI_TIMEOUT_SECONDS = _MODAL_CLI_TIMEOUT_SECONDS
 
     @staticmethod
     def modal_cli_path() -> Optional[str]:
         """Resolve the Modal CLI, preferring the active environment's scripts dir."""
-        env_prefix = Path(sys.prefix)
-        candidates = [
-            env_prefix / "bin" / "modal",
-            env_prefix / "Scripts" / "modal.exe",
-        ]
-        for candidate in candidates:
-            if candidate.exists():
-                return str(candidate)
-        return shutil.which("modal")
+        return resolve_modal_cli_path()
 
     @classmethod
     def _resolve_command(cls, command: List[str]) -> List[str]:
@@ -124,7 +116,9 @@ class ModalBackend:
         Called on app exit to unblock any worker threads that are waiting
         on subprocess I/O so Python can shut down cleanly.
         """
-        cls._shutdown_event.set()
+        from .shutdown import request_shutdown
+
+        request_shutdown()
         import time
         time.sleep(0.05)
         with cls._active_procs_lock:
@@ -143,7 +137,7 @@ class ModalBackend:
     @classmethod
     def is_shutting_down(cls) -> bool:
         """Return True if a shutdown has been requested."""
-        return cls._shutdown_event.is_set()
+        return _is_shutting_down()
 
     # ------------------------------------------------------------------
     # Pre-flight checks
@@ -184,6 +178,7 @@ class ModalBackend:
         backend: BackendType,
         server_url: str,
         served_model_name: Optional[str] = None,
+        api_key: Optional[str] = None,
     ) -> str:
         base = server_url.rstrip("/")
         if base.endswith("/v1"):
@@ -192,10 +187,13 @@ class ModalBackend:
 
         def _curl_json(endpoint: str, payload: Dict[str, Any]) -> str:
             body = shlex.quote(json.dumps(payload, separators=(",", ":")))
+            auth_header = ""
+            if api_key:
+                auth_header = f" -H {shlex.quote(f'Authorization: Bearer {api_key}')}"
             return (
                 f"curl -s -X POST {base}{endpoint} "
                 "-H 'Content-Type: application/json' "
-                f"-d {body}"
+                f"-d {body}{auth_header}"
             )
 
         if backend == BackendType.VLLM:
@@ -385,7 +383,6 @@ class ModalBackend:
                 error=ModalCliError(
                     message=f"Failed to query Modal app list: {exc}",
                     command=tuple(command),
-                    exception_type=type(exc).__name__,
                 ),
             )
         if result.returncode != 0:
@@ -408,17 +405,10 @@ class ModalBackend:
                     exit_code=result.returncode,
                     stdout=result.stdout or "",
                     stderr=result.stderr or "",
-                    exception_type=type(exc).__name__,
                 ),
             )
 
         return ModalListAppsResult(rows=_extract_modal_app_rows(payload), error=None)
-
-    @staticmethod
-    def list_apps_raw() -> Optional[str]:
-        """Fallback: return raw text from ``modal app list``."""
-        result = ModalBackend.list_apps_raw_result()
-        return result.output if result.success else None
 
     @staticmethod
     def list_apps_raw_result() -> ModalTextResult:
@@ -457,7 +447,6 @@ class ModalBackend:
                 error=ModalCliError(
                     message=f"Failed to query Modal app list: {exc}",
                     command=tuple(command),
-                    exception_type=type(exc).__name__,
                 ),
             )
 
@@ -529,7 +518,7 @@ class ModalBackend:
     @staticmethod
     def list_volume_result(volume_name: str, path: str = "/") -> ModalVolumeListResult:
         """List Modal Volume entries plus diagnostics on failure."""
-        if ModalBackend.is_shutting_down():
+        if _is_shutting_down():
             return ModalVolumeListResult(entries=[], error=None)
         command = ["modal", "volume", "ls", volume_name, path, "--json"]
         try:
@@ -555,7 +544,6 @@ class ModalBackend:
                 error=ModalCliError(
                     message=f"Failed to list Modal volume '{volume_name}' at {path}: {exc}",
                     command=tuple(command),
-                    exception_type=type(exc).__name__,
                 ),
             )
         if result.returncode != 0:
@@ -578,7 +566,6 @@ class ModalBackend:
                     exit_code=result.returncode,
                     stdout=result.stdout or "",
                     stderr=result.stderr or "",
-                    exception_type=type(exc).__name__,
                 ),
             )
         if isinstance(payload, list):

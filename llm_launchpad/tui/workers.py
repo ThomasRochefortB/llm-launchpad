@@ -28,10 +28,16 @@ from ..protocol.models import StorageSnapshot
 class LogMessage(Message):
     """A log line from an operation."""
 
-    def __init__(self, line: str, stream: str = "stdout") -> None:
+    def __init__(
+        self,
+        line: str,
+        stream: str = "stdout",
+        is_milestone: bool = False,
+    ) -> None:
         super().__init__()
         self.line = line
         self.stream = stream
+        self.is_milestone = is_milestone
 
 
 class StateChanged(Message):
@@ -168,7 +174,13 @@ def _dispatch_event(app_or_widget: object, event: BaseEvent) -> None:
         return
 
     if isinstance(event, LogEvent):
-        poster(LogMessage(line=event.line, stream=event.stream))
+        poster(
+            LogMessage(
+                line=event.line,
+                stream=event.stream,
+                is_milestone=event.is_milestone,
+            )
+        )
     elif isinstance(event, StateChangeEvent):
         poster(StateChanged(state=event.current, operation=event.operation, detail=event.detail))
     elif isinstance(event, OperationCompleteEvent):

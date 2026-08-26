@@ -3,14 +3,26 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 from importlib import resources
 import json
 import shlex
-from typing import Any
+from typing import Any, Sequence
 
-from ..protocol.enums import BackendType
-from ..protocol.models import DeploymentConfig
-from .naming import build_app_name, infer_instance_from_app_name, slugify_instance_name
+from ..protocol.enums import BackendType, ComputeProvider
+from ..protocol.models import (
+    DeploymentConfig,
+    InferencePlan,
+    InferenceRecipe,
+    WorkloadProfile,
+)
+from .inference_options import (
+    InferenceProviderAdapter,
+    ModalCatalogOption,
+    ModalInferenceAdapter,
+    resolve_inference_plans,
+)
+from .naming import build_deployment_name, infer_instance_from_app_name, slugify_instance_name
 
 
 @dataclass(frozen=True)
@@ -38,6 +50,21 @@ class QuickDeployProfile:
     aa_model_slug: str | None = None
     aa_coding_score: float | None = None
     aa_rank: int | None = None
+    backend: BackendType = BackendType.LLAMACPP
+    model_name: str | None = None
+
+
+@dataclass(frozen=True)
+class QuickDeployModel:
+    """Model-first view over one or more deployable inference recipes."""
+
+    id: str
+    display_name: str
+    recipes: tuple[InferenceRecipe, ...]
+    profiles: tuple[QuickDeployProfile, ...]
+    max_context_tokens: int
+    quality_score: float | None = None
+    quality_rank: int | None = None
 
 
 @dataclass(frozen=True)
@@ -144,7 +171,6 @@ _STATIC_QUICK_DEPLOY_PROFILES: tuple[QuickDeployProfile, ...] = (
     ),
 )
 
-QUICK_DEPLOY_PROFILES = _STATIC_QUICK_DEPLOY_PROFILES
 _STATIC_CATALOG_INFO = QuickDeployCatalogInfo(
     source_label="Curated llama.cpp coding profiles",
     is_fallback=True,
@@ -243,6 +269,7 @@ def _profile_from_catalog_row(payload: Any) -> QuickDeployProfile | None:
     profile_id = _clean_string(payload.get("id"))
     display_name = _clean_string(payload.get("display_name"))
     repo_id = _clean_string(payload.get("repo_id"))
+    model_name = _clean_string(payload.get("model_name"))
     quant = _clean_string(payload.get("quant"))
     gpu_type = _clean_string(payload.get("gpu_type"))
     profile_label = _clean_string(payload.get("profile_label"))
@@ -252,8 +279,25 @@ def _profile_from_catalog_row(payload: Any) -> QuickDeployProfile | None:
     gpu_count = _positive_int(payload.get("gpu_count"))
     approx_cost = _nonnegative_float(payload.get("approx_cost_per_hour_usd"))
     max_context = _positive_int(payload.get("max_context_tokens"))
+    backend_value = _clean_string(payload.get("backend")) or BackendType.LLAMACPP.value
+    try:
+        backend = BackendType(backend_value)
+    except ValueError:
+        return None
 
-    if not all([profile_id, display_name, repo_id, quant, gpu_type, profile_label, instance_slug_hint, summary]):
+    common_required = [
+        profile_id,
+        display_name,
+        gpu_type,
+        profile_label,
+        instance_slug_hint,
+        summary,
+    ]
+    if not all(common_required):
+        return None
+    if backend == BackendType.LLAMACPP and not (repo_id and quant):
+        return None
+    if backend == BackendType.VLLM and not (model_name or repo_id):
         return None
     if server_args is None or gpu_count is None or approx_cost is None or max_context is None:
         return None
@@ -280,6 +324,8 @@ def _profile_from_catalog_row(payload: Any) -> QuickDeployProfile | None:
         aa_model_slug=_clean_string(payload.get("aa_model_slug")) or None,
         aa_coding_score=_optional_float(payload.get("aa_coding_score")),
         aa_rank=_positive_int(payload.get("aa_rank")),
+        backend=backend,
+        model_name=model_name or None,
     )
 
 
@@ -353,21 +399,199 @@ def quick_deploy_model_label_parts(profile: QuickDeployProfile) -> tuple[str, st
     return (profile.display_name, f"({quant})")
 
 
+def quick_deploy_model_key(profile: QuickDeployProfile) -> str:
+    """Return a stable model identity independent of provider fulfillment."""
+
+    return (
+        (profile.aa_model_id or "").strip()
+        or (profile.aa_model_slug or "").strip().casefold()
+        or profile.display_name.strip().casefold()
+    )
+
+
+def quick_deploy_recipe(profile: QuickDeployProfile) -> InferenceRecipe:
+    """Convert a legacy quick-deploy bundle into a provider-neutral recipe."""
+
+    model_key = quick_deploy_model_key(profile)
+    model_id = (profile.model_name or profile.repo_id).strip()
+    fingerprint = "\0".join(
+        (
+            model_key,
+            profile.backend.value,
+            model_id,
+            profile.quant,
+            str(profile.max_context_tokens),
+            *profile.server_args,
+        )
+    )
+    digest = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:10]
+    recipe_id = f"{slugify_instance_name(profile.display_name)}-{profile.backend.value}-{digest}"
+    return InferenceRecipe(
+        id=recipe_id,
+        model_key=model_key,
+        display_name=profile.display_name,
+        backend=profile.backend,
+        model_id=model_id,
+        quant=profile.quant or None,
+        max_context_tokens=profile.max_context_tokens,
+        required_vram_gb=profile.required_vram_gb,
+        server_args=profile.server_args,
+        source_label=profile.source_label,
+        quality_score=profile.aa_coding_score,
+        quality_rank=profile.aa_rank,
+    )
+
+
+def list_quick_deploy_recipes(
+    profiles: Sequence[QuickDeployProfile] | None = None,
+) -> tuple[InferenceRecipe, ...]:
+    """Return unique provider-neutral recipes represented by the catalog."""
+
+    rows = tuple(profiles) if profiles is not None else list_quick_deploy_profiles()
+    recipes: list[InferenceRecipe] = []
+    seen: set[str] = set()
+    for profile in rows:
+        recipe = quick_deploy_recipe(profile)
+        if recipe.id in seen:
+            continue
+        seen.add(recipe.id)
+        recipes.append(recipe)
+    return tuple(recipes)
+
+
+def list_quick_deploy_models(
+    profiles: Sequence[QuickDeployProfile] | None = None,
+) -> tuple[QuickDeployModel, ...]:
+    """Group deployable recipes into model-first catalog entries."""
+
+    rows = tuple(profiles) if profiles is not None else list_quick_deploy_profiles()
+    grouped: dict[str, list[QuickDeployProfile]] = {}
+    order: list[str] = []
+    for profile in rows:
+        key = quick_deploy_model_key(profile)
+        if key not in grouped:
+            grouped[key] = []
+            order.append(key)
+        grouped[key].append(profile)
+
+    models: list[QuickDeployModel] = []
+    for key in order:
+        model_profiles = tuple(grouped[key])
+        recipes = list_quick_deploy_recipes(model_profiles)
+        scores = [row.aa_coding_score for row in model_profiles if row.aa_coding_score is not None]
+        ranks = [row.aa_rank for row in model_profiles if row.aa_rank is not None]
+        models.append(
+            QuickDeployModel(
+                id=key,
+                display_name=model_profiles[0].display_name,
+                recipes=recipes,
+                profiles=model_profiles,
+                max_context_tokens=max(row.max_context_tokens for row in model_profiles),
+                quality_score=max(scores) if scores else None,
+                quality_rank=min(ranks) if ranks else None,
+            )
+        )
+    models.sort(
+        key=lambda model: (
+            model.quality_rank is None,
+            model.quality_rank if model.quality_rank is not None else 10**9,
+            -(model.quality_score or 0.0),
+            model.display_name.casefold(),
+        )
+    )
+    return tuple(models)
+
+
+def resolve_quick_deploy_plans(
+    profiles: Sequence[QuickDeployProfile] | None = None,
+    *,
+    adapters: Sequence[InferenceProviderAdapter] | None = None,
+    workload: WorkloadProfile | None = None,
+) -> tuple[InferencePlan, ...]:
+    """Resolve provider-agnostic plans while preserving existing bundle IDs."""
+
+    rows = tuple(profiles) if profiles is not None else list_quick_deploy_profiles()
+    recipes = list_quick_deploy_recipes(rows)
+    if adapters is None:
+        options = [
+            ModalCatalogOption(
+                id=profile.id,
+                recipe_id=quick_deploy_recipe(profile).id,
+                gpu_type=profile.gpu_type,
+                gpu_count=profile.gpu_count,
+                price_per_hour_usd=profile.approx_cost_per_hour_usd,
+            )
+            for profile in rows
+        ]
+        adapters = (ModalInferenceAdapter(options),)
+    return tuple(resolve_inference_plans(recipes, adapters, workload))
+
+
+def get_quick_deploy_plan(
+    plan_id: str,
+    profiles: Sequence[QuickDeployProfile] | None = None,
+) -> InferencePlan:
+    """Resolve one provider plan by its stable option identifier."""
+
+    plans = {plan.quote.id: plan for plan in resolve_quick_deploy_plans(profiles)}
+    try:
+        return plans[plan_id]
+    except KeyError as exc:
+        raise KeyError(f"Unknown quick deploy plan: {plan_id}") from exc
+
+
+def quick_deploy_profile_for_plan(
+    plan: InferencePlan,
+    profiles: Sequence[QuickDeployProfile] | None = None,
+) -> QuickDeployProfile:
+    """Return the catalog profile carrying deployment details for a plan."""
+
+    rows = tuple(profiles) if profiles is not None else list_quick_deploy_profiles()
+    configuration_id = (plan.quote.configuration_id or "").strip()
+    if configuration_id:
+        match = next((profile for profile in rows if profile.id == configuration_id), None)
+        if match is not None:
+            return match
+    match = next(
+        (profile for profile in rows if quick_deploy_recipe(profile).id == plan.recipe.id),
+        None,
+    )
+    if match is None:
+        raise KeyError(f"No quick deploy profile supplies recipe {plan.recipe.id!r}.")
+    return match
+
+
 def build_quick_deploy_config(
     profile: QuickDeployProfile,
     *,
+    plan: InferencePlan | None = None,
     instance_name: str = "",
     app_name: str = "",
     do_warmup: bool = True,
     show_debug_logs: bool = False,
 ) -> DeploymentConfig:
-    """Build a llama.cpp deployment config for a curated quick-deploy profile."""
-    config = DeploymentConfig(backend=BackendType.LLAMACPP)
-    config.repo_id = profile.repo_id
-    config.quant = profile.quant
-    config.gpu_type = profile.gpu_type
-    config.gpu_count = profile.gpu_count
-    config.server_args = shlex.join(profile.server_args)
+    """Build a deployment config from a recipe bound to a provider quote."""
+
+    recipe = quick_deploy_recipe(profile)
+    if plan is not None and (
+        plan.recipe.id != recipe.id or plan.quote.recipe_id != recipe.id
+    ):
+        raise ValueError(
+            f"Quick deploy plan {plan.quote.id!r} does not match profile {profile.id!r}."
+        )
+    provider = plan.quote.provider if plan is not None else ComputeProvider.MODAL
+    config = DeploymentConfig(backend=profile.backend, provider=provider)
+    if profile.backend == BackendType.LLAMACPP:
+        config.repo_id = profile.repo_id
+        config.quant = profile.quant
+        config.server_args = shlex.join(profile.server_args)
+    else:
+        config.model_name = profile.model_name or profile.repo_id
+        config.n_gpu = plan.quote.gpu_count if plan is not None else profile.gpu_count
+    config.gpu_type = plan.quote.gpu_type if plan is not None else profile.gpu_type
+    config.gpu_count = plan.quote.gpu_count if plan is not None else profile.gpu_count
+    config.required_vram_gb = profile.required_vram_gb
+    config.provider_options = plan.quote.provider_options if plan is not None else None
     config.preload = True
     config.do_deploy = True
     config.do_warmup = do_warmup
@@ -381,8 +605,8 @@ def build_quick_deploy_config(
         config.instance_name = slugify_instance_name(instance_override or inferred_instance or app_override)
     elif instance_override:
         config.instance_name = slugify_instance_name(instance_override)
-        config.app_name = build_app_name(config.backend, config.instance_name)
+        config.app_name = build_deployment_name(provider, config.backend, config.instance_name)
     else:
         config.instance_name = slugify_instance_name(profile.instance_slug_hint)
-        config.app_name = build_app_name(config.backend, config.instance_name)
+        config.app_name = build_deployment_name(provider, config.backend, config.instance_name)
     return config

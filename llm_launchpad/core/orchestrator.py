@@ -7,15 +7,18 @@ CLI both consume these generators.
 
 from __future__ import annotations
 
+from .shutdown import is_shutting_down, shutdown_event
+
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import json
 from pathlib import Path
 import re
+import secrets
 import time
 from typing import Any, Generator, List, Optional
 
-from ..protocol.enums import BackendType, DeploymentState, OperationType
+from ..protocol.enums import BackendType, ComputeProvider, DeploymentState, OperationType
 from ..protocol.events import (
     BaseEvent,
     ErrorEvent,
@@ -45,6 +48,13 @@ from .naming import legacy_app_name
 from .naming import default_llamacpp_served_model_name
 from .naming import random_function_slug
 from .paths import MODAL_LLAMACPP_SCRIPT, MODAL_VLLM_SCRIPT
+from .prime_backend import (
+    PrimeApiError,
+    PrimeBackend,
+    resolve_prime_launch_spec,
+    select_prime_offer,
+)
+from .provider_options import prime_provider_options
 from .warmup import WarmupRunner, fetch_historical_logs
 from .warmup import modal_gpu_scheduling_hint as _modal_gpu_scheduling_hint
 from .warmup import probe_response_is_ready as _probe_response_is_ready
@@ -58,6 +68,15 @@ _SIZE_TOKEN_RE = re.compile(r"^\s*(?P<num>\d+(?:\.\d+)?)\s*(?P<unit>[A-Za-z]+)?\
 _LLAMACPP_MIN_PLAUSIBLE_GGUF_BYTES = 1024 * 1024
 _LLAMACPP_STORAGE_JSON_BEGIN = "LLM_LAUNCHPAD_STORAGE_JSON_BEGIN"
 _LLAMACPP_STORAGE_JSON_END = "LLM_LAUNCHPAD_STORAGE_JSON_END"
+
+
+def _tag_operation(events: EventStream, operation: OperationType) -> EventStream:
+    """Attach the owning workflow to events from a generic subprocess stream."""
+    for event in events:
+        if isinstance(event, (LogEvent, ErrorEvent, OperationCompleteEvent, StateChangeEvent)):
+            yield replace(event, operation=operation)
+        else:
+            yield event
 
 
 def _is_historical_modal_app_state(state: str) -> bool:
@@ -116,19 +135,34 @@ class Orchestrator:
         self,
         config_store: ConfigStore | None = None,
         backend: ModalBackend | None = None,
+        prime_backend: PrimeBackend | None = None,
     ) -> None:
         self.config_store = config_store or ConfigStore()
         self.backend = backend or ModalBackend()
+        self._prime_backend = prime_backend
+
+    @property
+    def prime_backend(self) -> PrimeBackend:
+        """Lazily construct the Prime client so Modal-only use needs no Prime config."""
+        if self._prime_backend is None:
+            self._prime_backend = PrimeBackend()
+        return self._prime_backend
 
     # ------------------------------------------------------------------
     # Pre-flight
     # ------------------------------------------------------------------
 
-    def preflight(self) -> tuple[bool, str, str]:
-        """Check Modal CLI availability and auth.
+    def preflight(
+        self,
+        provider: ComputeProvider = ComputeProvider.MODAL,
+    ) -> tuple[bool, str, str]:
+        """Check the selected provider's local authentication.
 
         Returns ``(ok, username, error_message)``.
         """
+        if provider == ComputeProvider.PRIME:
+            ok, error = self.prime_backend.preflight()
+            return ok, self.prime_backend.config.user_id or "", error
         if not ModalBackend.is_cli_available():
             return False, "", "Modal CLI not found. Reinstall llm-launchpad, then run: modal setup"
         status = get_modal_auth_status()
@@ -142,13 +176,16 @@ class Orchestrator:
 
     def deploy(self, config: DeploymentConfig) -> EventStream:
         """Run a full deploy workflow (optional preload + deploy + warmup)."""
-        if config.do_deploy and config.backend != BackendType.VLLM and not config.function_slug:
-            config.function_slug = random_function_slug()
         if config.backend == BackendType.LLAMACPP and not (config.served_model_name or "").strip():
             config.served_model_name = default_llamacpp_served_model_name(
                 config.repo_id,
                 config.quant,
             )
+        if config.provider == ComputeProvider.PRIME:
+            yield from self._deploy_prime(config)
+            return
+        if config.do_deploy and config.backend != BackendType.VLLM and not config.function_slug:
+            config.function_slug = random_function_slug()
         settings = self.config_store.load()
         env = ModalBackend.build_full_env(settings, config)
 
@@ -156,6 +193,285 @@ class Orchestrator:
             yield from self._deploy_vllm(config, env)
         else:
             yield from self._deploy_llamacpp(config, env)
+
+    def _deploy_prime(self, config: DeploymentConfig) -> EventStream:
+        """Provision a Prime pod and resolve its public inference endpoint."""
+        options = prime_provider_options(config)
+        if config.backend == BackendType.VLLM and not (config.model_name or "").strip():
+            message = "Prime vLLM deployment requires --model-name."
+            yield ErrorEvent(message=message, operation=OperationType.DEPLOY, recoverable=False)
+            yield OperationCompleteEvent(
+                operation=OperationType.DEPLOY, success=False, exit_code=2, detail=message
+            )
+            return
+        if config.backend == BackendType.LLAMACPP and not (config.repo_id or "").strip():
+            message = "Prime llama.cpp deployment requires --repo-id."
+            yield ErrorEvent(message=message, operation=OperationType.DEPLOY, recoverable=False)
+            yield OperationCompleteEvent(
+                operation=OperationType.DEPLOY, success=False, exit_code=2, detail=message
+            )
+            return
+        if config.backend == BackendType.LLAMACPP and (config.revision or "").strip():
+            message = "Prime llama.cpp currently supports only the default Hugging Face revision."
+            yield ErrorEvent(message=message, operation=OperationType.DEPLOY, recoverable=False)
+            yield OperationCompleteEvent(
+                operation=OperationType.DEPLOY, success=False, exit_code=2, detail=message
+            )
+            return
+
+        config.endpoint_api_key = config.endpoint_api_key or secrets.token_urlsafe(32)
+        pod_id = ""
+        try:
+            launch = resolve_prime_launch_spec(config)
+            yield StateChangeEvent(
+                current=DeploymentState.QUEUED,
+                operation=OperationType.DEPLOY,
+                detail="Fetching Prime GPU availability",
+            )
+            offers = self.prime_backend.list_offers(
+                gpu_type=config.gpu_type,
+                gpu_count=config.gpu_count,
+                region=options.region,
+                disk_id=options.disk_id,
+            )
+            offer = select_prime_offer(
+                offers,
+                offer_id=options.offer_id,
+                gpu_type=config.gpu_type,
+                gpu_count=config.gpu_count,
+                region=options.region,
+                required_vram_gb=config.required_vram_gb,
+                required_image=launch.offer_image,
+            )
+            price = (
+                f"${offer.price_per_hour:.2f}/hr"
+                if offer.price_per_hour is not None
+                else "price unavailable"
+            )
+            yield LogEvent(
+                line=(
+                    f"Selected Prime offer {offer.id}: {offer.gpu_count}x {offer.gpu_type} "
+                    f"via {offer.provider_name} ({offer.country or offer.region or '-'}, {price})"
+                ),
+                operation=OperationType.DEPLOY,
+                is_milestone=True,
+            )
+            yield LogEvent(
+                line=f"Prime runtime: portable bootstrap on {launch.offer_image}",
+                operation=OperationType.DEPLOY,
+                is_milestone=True,
+            )
+            yield StateChangeEvent(
+                current=DeploymentState.DEPLOYING,
+                operation=OperationType.DEPLOY,
+                detail=f"Provisioning Prime pod {config.app_name or ''}".strip(),
+            )
+            created = self.prime_backend.create_pod(config, offer)
+            pod_id = str(created.get("id") or "").strip()
+            if not pod_id:
+                raise PrimeApiError("Prime did not return a pod ID.")
+            yield LogEvent(
+                line=f"Prime pod created: {pod_id}",
+                operation=OperationType.DEPLOY,
+                is_milestone=True,
+            )
+
+            deadline = time.monotonic() + 1800
+            last_state = ""
+            pod = created
+            while time.monotonic() < deadline:
+                pod = self.prime_backend.get_pod(pod_id)
+                state = str(pod.get("status") or "unknown").upper()
+                install = str(pod.get("installationStatus") or "").upper()
+                progress = pod.get("installationProgress")
+                state_detail = f"{state}/{install or '-'}"
+                if progress is not None:
+                    state_detail += f" ({progress}%)"
+                if state_detail != last_state:
+                    yield LogEvent(
+                        line=f"Prime pod state: {state_detail}",
+                        operation=OperationType.DEPLOY,
+                        is_milestone=True,
+                    )
+                    last_state = state_detail
+                if state in {"ERROR", "TERMINATED"} or install == "FAILED":
+                    failure = str(pod.get("installationFailure") or state_detail)
+                    raise PrimeApiError(f"Prime pod provisioning failed: {failure}")
+                ssh_ready = bool(pod.get("sshConnection"))
+                if (
+                    state == "ACTIVE"
+                    and install in {"", "FINISHED"}
+                    and ssh_ready
+                ):
+                    break
+                if shutdown_event().wait(timeout=5):
+                    raise PrimeApiError("Prime deployment cancelled during provisioning.")
+            else:
+                raise PrimeApiError("Timed out waiting for the Prime pod to become active.")
+
+            yield StateChangeEvent(
+                current=DeploymentState.DEPLOYING,
+                operation=OperationType.DEPLOY,
+                detail="Installing the portable Prime inference runtime",
+            )
+            self.prime_backend.start_bootstrap_runtime(config, pod)
+            runtime_deadline = time.monotonic() + 1800
+            last_runtime_detail = ""
+            while time.monotonic() < runtime_deadline:
+                ready, failed, detail = self.prime_backend.bootstrap_runtime_status(pod)
+                if detail and detail != last_runtime_detail:
+                    yield LogEvent(
+                        line=f"Prime runtime: {detail}",
+                        operation=OperationType.DEPLOY,
+                        is_milestone=True,
+                    )
+                    last_runtime_detail = detail
+                if failed:
+                    raise PrimeApiError(f"Prime runtime bootstrap failed: {detail}")
+                if ready:
+                    break
+                if shutdown_event().wait(timeout=10):
+                    raise PrimeApiError("Prime deployment cancelled during runtime startup.")
+            else:
+                raise PrimeApiError("Timed out waiting for the Prime runtime to load.")
+
+            if options.allow_insecure_http:
+                endpoint = self.prime_backend.endpoint_url(
+                    pod,
+                    allow_insecure_http=True,
+                    allow_direct_ip=True,
+                )
+                yield LogEvent(
+                    line="Prime networking: direct HTTP fallback enabled",
+                    operation=OperationType.DEPLOY,
+                    is_milestone=True,
+                )
+            else:
+                yield StateChangeEvent(
+                    current=DeploymentState.DEPLOYING,
+                    operation=OperationType.DEPLOY,
+                    detail="Creating a secure Prime Tunnel endpoint",
+                )
+                tunnel = self.prime_backend.create_tunnel(
+                    pod_id,
+                    name=config.app_name or f"llm-launchpad-{pod_id}",
+                )
+                self.prime_backend.start_tunnel(pod, tunnel)
+                tunnel_deadline = time.monotonic() + 120
+                last_tunnel_detail = ""
+                while time.monotonic() < tunnel_deadline:
+                    ready, failed, detail = self.prime_backend.tunnel_runtime_status(
+                        pod,
+                        tunnel.tunnel_id,
+                    )
+                    if detail and detail != last_tunnel_detail:
+                        yield LogEvent(
+                            line=f"Prime Tunnel: {detail}",
+                            operation=OperationType.DEPLOY,
+                            is_milestone=True,
+                        )
+                        last_tunnel_detail = detail
+                    if failed:
+                        raise PrimeApiError(f"Prime Tunnel failed: {detail}")
+                    if ready:
+                        break
+                    if shutdown_event().wait(timeout=2):
+                        raise PrimeApiError(
+                            "Prime deployment cancelled during tunnel startup."
+                        )
+                else:
+                    raise PrimeApiError("Timed out waiting for Prime Tunnel to connect.")
+                endpoint = tunnel.url
+                tunnel_expiry = (
+                    f"; registration expires {tunnel.expires_at}"
+                    if tunnel.expires_at
+                    else ""
+                )
+                yield LogEvent(
+                    line=(
+                        f"Prime networking: secure tunnel {tunnel.tunnel_id}"
+                        f"{tunnel_expiry}"
+                    ),
+                    operation=OperationType.DEPLOY,
+                    is_milestone=True,
+                )
+
+            yield StateChangeEvent(
+                current=DeploymentState.DEPLOYING,
+                operation=OperationType.DEPLOY,
+                detail="Waiting for the public inference endpoint",
+            )
+            public_deadline = time.monotonic() + 120
+            public_error = "endpoint did not respond"
+            while time.monotonic() < public_deadline:
+                public_ready, public_error = self.prime_backend.public_endpoint_ready(
+                    endpoint,
+                    config.endpoint_api_key,
+                )
+                if public_ready:
+                    break
+                if shutdown_event().wait(timeout=5):
+                    raise PrimeApiError("Prime deployment cancelled during endpoint startup.")
+            else:
+                raise PrimeApiError(
+                    "Prime runtime is healthy inside the pod, but its public endpoint "
+                    f"is unreachable: {public_error}"
+                )
+            info = EndpointInfo(
+                name=config.app_name or "",
+                app_id=pod_id,
+                state="running",
+                backend=config.backend,
+                instance_name=config.instance_name,
+                web_url=endpoint,
+                served_model_name=config.served_model_name,
+                model_name=config.model_name,
+                repo_id=config.repo_id,
+                quant=config.quant,
+                provider=ComputeProvider.PRIME,
+                endpoint_api_key=config.endpoint_api_key,
+            )
+            yield LogEvent(
+                line=f"Prime endpoint: {endpoint}",
+                operation=OperationType.DEPLOY,
+                is_milestone=True,
+            )
+            yield OperationCompleteEvent(
+                operation=OperationType.DEPLOY,
+                success=True,
+                data=info,
+            )
+        except Exception as exc:
+            message = str(exc)
+            if pod_id:
+                try:
+                    for line in self.prime_backend.get_pod_logs(pod_id):
+                        yield LogEvent(line=line, operation=OperationType.DEPLOY)
+                except Exception:
+                    pass
+                if options.keep_failed_resource:
+                    yield LogEvent(
+                        line=f"Keeping failed Prime pod {pod_id}; billing may continue.",
+                        operation=OperationType.DEPLOY,
+                        is_milestone=True,
+                    )
+                else:
+                    try:
+                        self.prime_backend.delete_pod(pod_id)
+                        yield LogEvent(
+                            line=f"Terminated failed Prime pod {pod_id}.",
+                            operation=OperationType.DEPLOY,
+                            is_milestone=True,
+                        )
+                    except Exception as cleanup_exc:
+                        message = f"{message} Cleanup also failed: {cleanup_exc}"
+            yield ErrorEvent(message=message, operation=OperationType.DEPLOY)
+            yield OperationCompleteEvent(
+                operation=OperationType.DEPLOY,
+                success=False,
+                exit_code=1,
+                detail=message,
+            )
 
     def _deploy_vllm(
         self, config: DeploymentConfig, env: dict[str, str]
@@ -170,7 +486,10 @@ class Orchestrator:
             yield LogEvent(line=f"Running: {' '.join(cmd)}")
             if env:
                 yield LogEvent(line=f"  env: {', '.join(f'{k}={v}' for k, v in env.items())}")
-            yield from ModalBackend.run_streaming(cmd, env=env)
+            yield from _tag_operation(
+                ModalBackend.run_streaming(cmd, env=env),
+                OperationType.DEPLOY,
+            )
         elif config.run_smoke:
             cmd = ["modal", "run", BackendType.VLLM.script]
             yield StateChangeEvent(
@@ -179,7 +498,10 @@ class Orchestrator:
                 detail=" ".join(cmd),
             )
             yield LogEvent(line=f"Running: {' '.join(cmd)}")
-            yield from ModalBackend.run_streaming(cmd, env=env)
+            yield from _tag_operation(
+                ModalBackend.run_streaming(cmd, env=env),
+                OperationType.SMOKE_TEST,
+            )
 
     def _deploy_llamacpp(
         self, config: DeploymentConfig, env: dict[str, str]
@@ -290,6 +612,9 @@ class Orchestrator:
         tail_logs: bool = True,
         app_name: Optional[str] = None,
         served_model_name: Optional[str] = None,
+        provider: ComputeProvider = ComputeProvider.MODAL,
+        api_key: Optional[str] = None,
+        pod_id: Optional[str] = None,
     ) -> EventStream:
         """Probe endpoint readiness and optionally tail logs."""
         yield from WarmupRunner().run(
@@ -299,6 +624,10 @@ class Orchestrator:
             tail_logs=tail_logs,
             app_name=app_name,
             served_model_name=served_model_name,
+            provider=provider,
+            api_key=api_key,
+            pod_id=pod_id,
+            prime_backend=self.prime_backend if provider == ComputeProvider.PRIME else None,
         )
 
     # ------------------------------------------------------------------
@@ -323,8 +652,48 @@ class Orchestrator:
         follow: bool = True,
         app_name: Optional[str] = None,
         app_id: Optional[str] = None,
+        provider: ComputeProvider = ComputeProvider.MODAL,
     ) -> EventStream:
-        """Tail Modal logs for the given backend."""
+        """Tail logs for the selected provider and backend."""
+        if provider == ComputeProvider.PRIME:
+            pod_id = (app_id or "").strip()
+            if not pod_id:
+                message = "Prime log retrieval requires a pod ID."
+                yield ErrorEvent(message=message, operation=OperationType.LOGS)
+                yield OperationCompleteEvent(
+                    operation=OperationType.LOGS, success=False, exit_code=2, detail=message
+                )
+                return
+            seen: list[str] = []
+            yield StateChangeEvent(
+                current=DeploymentState.RUNNING,
+                operation=OperationType.LOGS,
+                detail=f"Reading Prime pod logs for {pod_id}",
+            )
+            while True:
+                try:
+                    lines = self.prime_backend.get_pod_logs(pod_id, tail=500)
+                except Exception as exc:
+                    yield ErrorEvent(message=str(exc), operation=OperationType.LOGS)
+                    yield OperationCompleteEvent(
+                        operation=OperationType.LOGS, success=False, exit_code=1, detail=str(exc)
+                    )
+                    return
+                common = 0
+                limit = min(len(seen), len(lines))
+                for count in range(limit, -1, -1):
+                    if count == 0 or seen[-count:] == lines[:count]:
+                        common = count
+                        break
+                for line in lines[common:]:
+                    yield LogEvent(line=line, operation=OperationType.LOGS)
+                seen = lines
+                if not follow:
+                    yield OperationCompleteEvent(operation=OperationType.LOGS, success=True)
+                    return
+                if shutdown_event().wait(timeout=2):
+                    return
+
         target_app_name = (app_id or app_name or legacy_app_name(backend)).strip()
         cmd: List[str] = ["modal", "app", "logs"]
         if follow:
@@ -336,7 +705,10 @@ class Orchestrator:
             operation=OperationType.LOGS,
             detail=" ".join(cmd),
         )
-        yield from ModalBackend.run_streaming(cmd)
+        yield from _tag_operation(
+            ModalBackend.run_streaming(cmd),
+            OperationType.LOGS,
+        )
 
     # ------------------------------------------------------------------
     # Status
@@ -348,6 +720,9 @@ class Orchestrator:
         server_url: str,
         timeout: int = 60,
         served_model_name: Optional[str] = None,
+        provider: ComputeProvider = ComputeProvider.MODAL,
+        api_key: Optional[str] = None,
+        pod_id: Optional[str] = None,
     ) -> EventStream:
         """Probe endpoint health with backoff."""
         is_vllm = backend == BackendType.VLLM
@@ -382,6 +757,8 @@ class Orchestrator:
             "temperature": 0,
         }
         headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
         start = time.time()
         backoff = 2.0
         max_backoff = 15.0
@@ -389,7 +766,7 @@ class Orchestrator:
         last_scheduling_hint: Optional[str] = None
 
         while True:
-            if ModalBackend.is_shutting_down():
+            if is_shutting_down():
                 return
 
             if time.time() - start > timeout:
@@ -403,8 +780,14 @@ class Orchestrator:
                 return
 
             try:
+                if provider == ComputeProvider.PRIME and pod_id:
+                    pod = self.prime_backend.get_pod(pod_id)
+                    pod_state = str(pod.get("status") or "unknown").upper()
+                    if pod_state in {"ERROR", "TERMINATED"}:
+                        last_err = f"Prime pod state: {pod_state}"
+                        raise RuntimeError(last_err)
                 if is_vllm:
-                    resp = requests.get(probe_url, timeout=10)
+                    resp = requests.get(probe_url, headers=headers, timeout=10)
                 else:
                     resp = requests.post(
                         probe_url, headers=headers, data=_json.dumps(payload), timeout=10
@@ -418,6 +801,7 @@ class Orchestrator:
                         backend,
                         server_url,
                         served_model_name=served_model_name,
+                        api_key=api_key,
                     )
                     yield LogEvent(
                         line=f"Status: healthy (backend={backend.value}, url={server_url})"
@@ -459,7 +843,7 @@ class Orchestrator:
                 last_err = str(exc)
 
             # Interruptible sleep: wakes immediately on shutdown.
-            if ModalBackend._shutdown_event.wait(timeout=backoff):
+            if shutdown_event().wait(timeout=backoff):
                 return
             backoff = min(max_backoff, backoff * 1.5)
 
@@ -511,7 +895,7 @@ class Orchestrator:
 
         results: list[BenchmarkConcurrencyResult] = []
         for concurrency in config.concurrency:
-            if ModalBackend.is_shutting_down():
+            if is_shutting_down():
                 return
             artifact_dir = run_dir / f"c{concurrency}"
             artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -556,7 +940,13 @@ class Orchestrator:
             success = True
             detail = ""
             saw_completion = False
-            for event in ModalBackend.run_streaming(cmd):
+            benchmark_env = {"OPENAI_API_KEY": config.api_key} if config.api_key else None
+            benchmark_events = (
+                ModalBackend.run_streaming(cmd, env=benchmark_env)
+                if benchmark_env
+                else ModalBackend.run_streaming(cmd)
+            )
+            for event in benchmark_events:
                 if isinstance(event, LogEvent):
                     yield LogEvent(
                         line=event.line,
@@ -645,11 +1035,43 @@ class Orchestrator:
     # List
     # ------------------------------------------------------------------
 
-    def list_deployments(self) -> EventStream:
-        """List launchpad-related Modal apps."""
+    def list_deployments(
+        self,
+        provider: ComputeProvider = ComputeProvider.MODAL,
+    ) -> EventStream:
+        """List launchpad deployments for one compute provider."""
         yield StateChangeEvent(
             current=DeploymentState.RUNNING, operation=OperationType.LIST
         )
+
+        if provider == ComputeProvider.PRIME:
+            try:
+                rows = self.prime_backend.list_deployments()
+            except Exception as exc:
+                message = f"Failed to query Prime pods: {exc}"
+                yield ErrorEvent(message=message, operation=OperationType.LIST)
+                yield OperationCompleteEvent(
+                    operation=OperationType.LIST,
+                    success=False,
+                    exit_code=1,
+                    detail=message,
+                )
+                return
+            if not rows:
+                yield LogEvent(line="No Prime launchpad deployments found.")
+            else:
+                yield LogEvent(line="Prime launchpad deployments:")
+                for info in rows:
+                    yield LogEvent(
+                        line=(
+                            f"  provider=prime backend="
+                            f"{info.backend.value if info.backend else 'unknown'} "
+                            f"instance={info.instance_name or '-'} "
+                            f"pod={info.name} state={info.state} ({info.app_id})"
+                        )
+                    )
+            yield OperationCompleteEvent(operation=OperationType.LIST, success=True, data=rows)
+            return
 
         apps_result = ModalBackend.list_apps_result()
         if apps_result.success and apps_result.rows is not None:
@@ -1253,8 +1675,41 @@ class Orchestrator:
         backend: BackendType,
         app_name: Optional[str] = None,
         app_id: Optional[str] = None,
+        provider: ComputeProvider = ComputeProvider.MODAL,
     ) -> EventStream:
         """Stop a deployed app."""
+        if provider == ComputeProvider.PRIME:
+            pod_id = (app_id or "").strip()
+            if not pod_id:
+                message = "Prime termination requires a pod ID."
+                yield ErrorEvent(message=message, operation=OperationType.STOP)
+                yield OperationCompleteEvent(
+                    operation=OperationType.STOP, success=False, exit_code=2, detail=message
+                )
+                return
+            yield StateChangeEvent(
+                current=DeploymentState.RUNNING,
+                operation=OperationType.STOP,
+                detail=f"Terminating Prime pod {pod_id}",
+            )
+            try:
+                self.prime_backend.delete_pod(pod_id)
+            except Exception as exc:
+                yield ErrorEvent(message=str(exc), operation=OperationType.STOP)
+                yield OperationCompleteEvent(
+                    operation=OperationType.STOP, success=False, exit_code=1, detail=str(exc)
+                )
+                return
+            yield LogEvent(
+                line=f"Terminated Prime pod: {pod_id}",
+                operation=OperationType.STOP,
+            )
+            yield StateChangeEvent(
+                current=DeploymentState.STOPPED,
+                operation=OperationType.STOP,
+            )
+            yield OperationCompleteEvent(operation=OperationType.STOP, success=True)
+            return
         target_app_name = (app_id or app_name or legacy_app_name(backend)).strip()
         cmd = ["modal", "app", "stop", target_app_name]
         yield StateChangeEvent(
@@ -1262,5 +1717,11 @@ class Orchestrator:
             operation=OperationType.STOP,
             detail=f"Stopping {target_app_name}",
         )
-        yield LogEvent(line=f"Stopping app: {target_app_name}")
-        yield from ModalBackend.run_streaming(cmd)
+        yield LogEvent(
+            line=f"Stopping app: {target_app_name}",
+            operation=OperationType.STOP,
+        )
+        yield from _tag_operation(
+            ModalBackend.run_streaming(cmd),
+            OperationType.STOP,
+        )

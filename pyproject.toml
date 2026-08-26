@@ -20,9 +20,10 @@ classifiers = [
   "Operating System :: OS Independent",
 ]
 
-# Minimal runtime dependencies for using the Modal application entrypoints
+# Runtime dependencies for the CLI, TUI, and compute-provider integrations
 dependencies = [
   "modal>=1.3.3",
+  "prime>=0.4.12,<0.5",
   "coolname>=2.2.0",
   "typer>=0.12.3",
   "rich>=13.7.1",
@@ -39,6 +40,7 @@ benchmark = [
 [project.scripts]
 llm-launchpad = "llm_launchpad.cli.main:main"
 modal = "modal.__main__:main"
+prime = "prime_cli.main:run"
 
 [project.urls]
 Homepage = "https://github.com/ThomasRochefortB/llm-launchpad"

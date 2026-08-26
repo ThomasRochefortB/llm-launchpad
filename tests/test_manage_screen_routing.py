@@ -7,7 +7,7 @@ from textual.app import App
 from textual.screen import Screen
 from textual.widgets import OptionList
 
-from llm_launchpad.protocol.enums import BackendType
+from llm_launchpad.protocol.enums import BackendType, ComputeProvider
 from llm_launchpad.protocol.models import EndpointInfo
 from llm_launchpad.tui.screens.manage import (
     BenchmarkParamsScreen,
@@ -244,6 +244,37 @@ class ManageScreenRoutingTests(unittest.IsolatedAsyncioTestCase):
             assert highlighted is not None
             self.assertEqual(str(highlighted.id), "app-id:ap-llama")
 
+    async def test_stop_params_hides_ephemeral_modal_helpers(self) -> None:
+        app = _TestApp()
+        app.instances_by_backend[BackendType.LLAMACPP] = [
+            EndpointInfo(
+                name="llamacpp-server",
+                app_id="ap-helper",
+                state="ephemeral",
+                backend=BackendType.LLAMACPP,
+                provider=ComputeProvider.MODAL,
+            ),
+            EndpointInfo(
+                name="llp-prime-llamacpp-qwen3",
+                app_id="pod-prime",
+                state="active",
+                backend=BackendType.LLAMACPP,
+                provider=ComputeProvider.PRIME,
+            ),
+        ]
+
+        async with app.run_test() as pilot:
+            app.push_screen(StopParamsScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, StopParamsScreen)
+            instance_list = screen.query_one("#stop-instance-list", OptionList)
+            self.assertEqual(instance_list.option_count, 1)
+            highlighted = instance_list.highlighted_option
+            self.assertIsNotNone(highlighted)
+            assert highlighted is not None
+            self.assertEqual(str(highlighted.id), "app-id:pod-prime")
+
     async def test_status_params_uses_selected_instance_web_url_and_served_model_name(self) -> None:
         app = _TestApp()
         app.instances_by_backend[BackendType.LLAMACPP] = [
@@ -289,14 +320,14 @@ class ManageScreenRoutingTests(unittest.IsolatedAsyncioTestCase):
             EndpointInfo(
                 name="llamacpp-glm5-rtxpro",
                 app_id="ap-first",
-                state="ephemeral",
+                state="running",
                 backend=BackendType.LLAMACPP,
                 instance_name="glm5-rtxpro",
             ),
             EndpointInfo(
                 name="llamacpp-glm5-rtxpro",
                 app_id="ap-second",
-                state="ephemeral",
+                state="running",
                 backend=BackendType.LLAMACPP,
                 instance_name="glm5-rtxpro",
             ),

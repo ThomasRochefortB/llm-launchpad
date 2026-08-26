@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from llm_launchpad.core.prime_auth import PrimeAuthStatus
 from llm_launchpad.protocol.enums import BackendType, OperationType
 from llm_launchpad.protocol.events import LogEvent, OperationCompleteEvent
 from llm_launchpad.protocol.models import DeploymentConfig
@@ -339,7 +340,13 @@ class TuiAppStorageCacheTests(unittest.TestCase):
                     instance_name="edge-quant",
                 )
             ]
-            with patch("llm_launchpad.tui.app.ModalBackend.list_apps", return_value=rows):
+            with (
+                patch("llm_launchpad.tui.app.ModalBackend.list_apps", return_value=rows),
+                patch(
+                    "llm_launchpad.tui.app.get_prime_auth_status",
+                    return_value=PrimeAuthStatus(authenticated=False),
+                ),
+            ):
                 merged = app.list_instances()
 
             self.assertEqual(len(merged), 1)
@@ -366,6 +373,10 @@ class TuiAppStorageCacheTests(unittest.TestCase):
         ]
         with (
             patch("llm_launchpad.tui.app.ModalBackend.list_apps", return_value=rows),
+            patch(
+                "llm_launchpad.tui.app.get_prime_auth_status",
+                return_value=PrimeAuthStatus(authenticated=False),
+            ),
             patch.object(app, "_sync_opencode") as sync_mock,
         ):
             app.list_instances()

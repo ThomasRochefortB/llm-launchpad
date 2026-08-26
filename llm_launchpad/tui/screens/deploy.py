@@ -29,12 +29,23 @@ from ...core.hf_models import ModelCandidate, VllmMemoryBreakdown, fetch_vllm_me
 from ...core.modal_gpu import ModalGpuSpec, fetch_modal_gpu_catalog
 from ...core.naming import (
     auto_instance_name_for_backend,
-    build_app_name,
+    build_deployment_name,
     default_served_model_name,
     slugify_instance_name,
 )
-from ...protocol.enums import BackendType
-from ...protocol.models import DeploymentConfig, StorageSnapshot
+from ...core.prime_backend import (
+    PRIME_VRAM_HEADROOM_FACTOR,
+    PrimeBackend,
+    is_compatible_prime_offer,
+    preferred_prime_offer_image,
+)
+from ...protocol.enums import BackendType, ComputeProvider
+from ...protocol.models import (
+    ComputeOffer,
+    DeploymentConfig,
+    PrimeProviderOptions,
+    StorageSnapshot,
+)
 from ..gpu_config import (
     DEFAULT_GPU_COUNT,
     DEFAULT_GPU_TYPE,
@@ -67,6 +78,22 @@ class GpuTypesLoaded(Message):
 
 class GpuTypesFailed(Message):
     """GPU type option fetch failed."""
+
+    def __init__(self, error: str) -> None:
+        super().__init__()
+        self.error = error
+
+
+class PrimeOffersLoaded(Message):
+    """Prime availability was fetched successfully."""
+
+    def __init__(self, offers: list[ComputeOffer]) -> None:
+        super().__init__()
+        self.offers = offers
+
+
+class PrimeOffersFailed(Message):
+    """Prime availability fetch failed."""
 
     def __init__(self, error: str) -> None:
         super().__init__()
@@ -169,6 +196,86 @@ def _format_quant_with_vram(quant: str, vram_gb_by_quant: dict[str, float]) -> s
     return f"{quant} (~{_format_vram_gb(vram_gb)})"
 
 
+def _compatible_prime_offers(
+    offers: list[ComputeOffer],
+    required_vram_gb: float | None,
+    backend: BackendType = BackendType.LLAMACPP,
+) -> list[ComputeOffer]:
+    """Return fixed-price GPU offers that fit one model requirement."""
+
+    required_image = preferred_prime_offer_image(backend)
+    compatible = [
+        offer
+        for offer in offers
+        if is_compatible_prime_offer(
+            offer,
+            required_vram_gb,
+            required_image=required_image,
+        )
+    ]
+    compatible.sort(
+        key=lambda offer: (
+            offer.price_per_hour is None,
+            offer.price_per_hour
+            if offer.price_per_hour is not None
+            else float("inf"),
+            offer.gpu_count,
+            offer.id,
+        )
+    )
+    return compatible
+
+
+def _prime_offer_options(
+    offers: list[ComputeOffer],
+) -> list[tuple[str, str]]:
+    options: list[tuple[str, str]] = []
+    for offer in offers:
+        location = offer.country or offer.region or offer.data_center or "-"
+        price = (
+            f"${offer.price_per_hour:.3f}/hr"
+            if offer.price_per_hour is not None
+            else "price n/a"
+        )
+        options.append(
+            (
+                f"{offer.id} · {offer.gpu_count}x {offer.gpu_type} · "
+                f"{location} · {price}",
+                offer.id,
+            )
+        )
+    return options
+
+
+def _prime_offer_status(
+    offer_count: int,
+    required_vram_gb: float | None,
+    backend: BackendType = BackendType.LLAMACPP,
+) -> str:
+    strategy = f"portable {preferred_prime_offer_image(backend)}"
+    if required_vram_gb is None:
+        if offer_count:
+            return (
+                f"[dim]{offer_count} live {strategy} GPU offers. "
+                "Model VRAM is not known yet; "
+                "choose a model to narrow them.[/dim]"
+            )
+        return (
+            f"[yellow]No secure on-demand {strategy} GPU offers are "
+            "currently available.[/yellow]"
+        )
+    required_with_headroom = required_vram_gb * PRIME_VRAM_HEADROOM_FACTOR
+    if offer_count:
+        return (
+            f"[dim]{offer_count} live {strategy} GPU offers fit this model's "
+            f"~{required_with_headroom:.1f} GB requirement.[/dim]"
+        )
+    return (
+        f"[yellow]No live {strategy} GPU offer has enough memory for this model's "
+        f"~{required_with_headroom:.1f} GB requirement.[/yellow]"
+    )
+
+
 def _advance_deploy_focus(screen: CopyEnabledScreen, navigation_order: tuple[str, ...]) -> None:
     """Advance focus to the next visible deploy form widget."""
     move_focus_across_widgets(
@@ -230,6 +337,8 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
         "repo-id",
         "quant",
         "llama-quant-list",
+        "provider-llama",
+        "prime-offer-llama",
         "gpu-type-llama",
         "gpu-count-llama",
         "toggle-advanced-llama",
@@ -271,11 +380,31 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
             yield OptionList(id="llama-quant-list")
             yield Static("")
 
+            yield Static("Compute provider", classes="form-label")
+            yield Select(
+                options=[("Modal", "modal"), ("Prime Intellect", "prime")],
+                value="modal",
+                allow_blank=False,
+                id="provider-llama",
+            )
+            yield Static("Prime GPU offer", classes="form-label prime-only")
+            yield Select(
+                options=[],
+                prompt="Select an exact live Prime offer",
+                id="prime-offer-llama",
+                classes="prime-only",
+            )
+            yield Static(
+                "[dim]Prime offers are secure, on-demand availability sorted by price.[/dim]",
+                id="prime-offer-status-llama",
+                classes="prime-only",
+            )
+
             # Options
             with Vertical(classes="gpu-config-panel"):
                 yield Static("GPU configuration", classes="form-section-title")
                 yield Static(
-                    "Select the deployment GPU shape. Base Modal hourly price per GPU is shown when available.",
+                    "Select a Modal GPU shape or bind an exact live Prime offer.",
                     classes="form-section-subtitle",
                 )
                 with Horizontal(id="gpu-config-row-llama", classes="gpu-config-main-row"):
@@ -302,6 +431,23 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
             yield Button("Advanced options...", id="toggle-advanced-llama", variant="default")
             yield ToggleField("Warm up after deploy", "warmup", default=True, classes="llama-advanced")
             yield FormField("HF revision (optional)", "revision", classes="llama-advanced")
+            yield FormField(
+                "Existing Prime disk ID (optional)",
+                "prime-disk-id-llama",
+                classes="llama-advanced prime-only",
+            )
+            yield ToggleField(
+                "Use direct HTTP fallback (insecure)",
+                "prime-insecure-http-llama",
+                default=False,
+                classes="llama-advanced prime-only",
+            )
+            yield ToggleField(
+                "Keep failed Prime pod (billing may continue)",
+                "prime-keep-failed-llama",
+                default=False,
+                classes="llama-advanced prime-only",
+            )
             yield FormField(
                 "Server args",
                 "server-args",
@@ -338,7 +484,7 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
             yield FormField(
                 "App name override (optional)",
                 "app-name-llama",
-                hint="Advanced: explicit Modal app name",
+                hint="Advanced: explicit provider resource name",
                 classes="llama-advanced",
             )
             yield Static(
@@ -362,7 +508,12 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
         self._updating_quant_input = False
         self._quant_touched = False
         self._selected_gpu_type = DEFAULT_GPU_TYPE
+        self._provider = ComputeProvider.MODAL
+        self._prime_offers: dict[str, ComputeOffer] = {}
+        self._selected_prime_offer_id: str | None = None
         for widget in self.query(".llama-advanced"):
+            widget.add_class("hidden")
+        for widget in self.query(".prime-only"):
             widget.add_class("hidden")
         rank_mode_list = self.query_one("#llama-rank-mode", OptionList)
         if rank_mode_list.option_count > 0:
@@ -415,6 +566,7 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
         if event.button.id == "toggle-advanced-llama":
             for widget in self.query(".llama-advanced"):
                 widget.toggle_class("hidden")
+            self._sync_prime_visibility()
         elif event.button.id == "deploy-btn":
             self._do_deploy()
 
@@ -425,12 +577,104 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
             self._refresh_app_preview()
         if event.input.id in {"repo-id", "revision"}:
             self._lookup_quantizations_for_current_repo()
+        if event.input.id in {"repo-id", "quant"} and self._prime_offers:
+            self._refresh_prime_offer_options()
 
     def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "provider-llama":
+            if not isinstance(event.value, str):
+                return
+            self._provider = ComputeProvider(event.value)
+            self._sync_prime_visibility()
+            if self._provider == ComputeProvider.PRIME and not self._prime_offers:
+                self._refresh_prime_offers()
+            elif self._provider == ComputeProvider.MODAL:
+                self._refresh_gpu_types()
+            self._refresh_app_preview()
+            return
+        if event.select.id == "prime-offer-llama":
+            if not isinstance(event.value, str):
+                return
+            self._selected_prime_offer_id = event.value
+            offer = self._prime_offers.get(event.value)
+            if offer is not None:
+                self._selected_gpu_type = offer.gpu_type
+                self.query_one("#gpu-type-llama", Select).set_options(
+                    [(offer.gpu_type, offer.gpu_type)]
+                )
+                self.query_one("#gpu-type-llama", Select).value = offer.gpu_type
+                self.query_one("#gpu-count-llama", Input).value = str(offer.gpu_count)
+            return
         if event.select.id != "gpu-type-llama":
             return
         if isinstance(event.value, str) and event.value.strip():
             self._selected_gpu_type = normalize_gpu_type(event.value)
+
+    def _sync_prime_visibility(self) -> None:
+        advanced_visible = not self.query_one("#warmup").has_class("hidden")
+        for widget in self.query(".prime-only"):
+            hide = self._provider != ComputeProvider.PRIME
+            if widget.has_class("llama-advanced") and not advanced_visible:
+                hide = True
+            widget.set_class(hide, "hidden")
+
+    def _refresh_prime_offers(self) -> None:
+        self.query_one("#prime-offer-status-llama", Static).update(
+            "[dim]Loading Prime offers...[/dim]"
+        )
+        self.run_worker(
+            self._run_fetch_prime_offers,
+            name="llamacpp-fetch-prime-offers",
+            thread=True,
+        )
+
+    def _run_fetch_prime_offers(self) -> None:
+        try:
+            offers = PrimeBackend().list_offers()
+        except Exception as exc:
+            self.post_message(PrimeOffersFailed(str(exc)))
+            return
+        self.post_message(PrimeOffersLoaded(offers))
+
+    def on_prime_offers_loaded(self, message: PrimeOffersLoaded) -> None:
+        self._prime_offers = {offer.id: offer for offer in message.offers}
+        self._refresh_prime_offer_options()
+
+    def _current_llamacpp_required_vram(self) -> float | None:
+        repo_key = self.query_one("#repo-id", Input).value.strip().casefold()
+        quant_key = self.query_one("#quant", Input).value.strip().upper()
+        if not repo_key or not quant_key:
+            return None
+        return self._repo_to_quant_vram.get(repo_key, {}).get(quant_key)
+
+    def _refresh_prime_offer_options(self) -> None:
+        required_vram_gb = self._current_llamacpp_required_vram()
+        offers = _compatible_prime_offers(
+            list(self._prime_offers.values()),
+            required_vram_gb,
+            BackendType.LLAMACPP,
+        )
+        options = _prime_offer_options(offers)
+        selector = self.query_one("#prime-offer-llama", Select)
+        selector.set_options(options)
+        status = self.query_one("#prime-offer-status-llama", Static)
+        if options:
+            self._selected_prime_offer_id = options[0][1]
+            selector.value = options[0][1]
+        else:
+            self._selected_prime_offer_id = None
+        status.update(
+            _prime_offer_status(
+                len(options),
+                required_vram_gb,
+                BackendType.LLAMACPP,
+            )
+        )
+
+    def on_prime_offers_failed(self, message: PrimeOffersFailed) -> None:
+        self.query_one("#prime-offer-status-llama", Static).update(
+            f"[red]Could not load Prime offers:[/red] {message.error}"
+        )
 
     def _refresh_gpu_types(self) -> None:
         self.run_worker(
@@ -528,6 +772,8 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
             auto_select=not self._quant_touched,
             vram_gb_by_quant=self._repo_to_quant_vram[repo_key],
         )
+        if self._prime_offers:
+            self._refresh_prime_offer_options()
 
     def on_llama_cpp_quants_failed(self, message: LlamaCppQuantsFailed) -> None:
         current_repo = self.query_one("#repo-id", Input).value.strip()
@@ -561,9 +807,13 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
         )
 
     def _do_deploy(self) -> None:
-        config = DeploymentConfig(backend=BackendType.LLAMACPP)
+        config = DeploymentConfig(
+            backend=BackendType.LLAMACPP,
+            provider=self._provider,
+        )
         config.repo_id = self.query_one("#repo-id", Input).value.strip() or None
         config.quant = self.query_one("#quant", Input).value.strip() or None
+        config.required_vram_gb = self._current_llamacpp_required_vram()
         rev = self.query_one("#revision", Input).value.strip()
         config.revision = rev or None
 
@@ -582,6 +832,31 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
             return
         config.gpu_type = gpu_type
         config.gpu_count = gpu_count
+        if self._provider == ComputeProvider.PRIME:
+            offer = self._prime_offers.get(self._selected_prime_offer_id or "")
+            if offer is None:
+                self.app.notify("Select a live Prime GPU offer.", severity="error", timeout=5)
+                return
+            if config.revision:
+                self.app.notify(
+                    "Prime llama.cpp currently supports only the default HF revision.",
+                    severity="error",
+                    timeout=5,
+                )
+                return
+            config.gpu_type = offer.gpu_type
+            config.gpu_count = offer.gpu_count
+            allow_insecure_http = self.query_one(
+                "#prime-insecure-http-llama", Switch
+            ).value
+            config.provider_options = PrimeProviderOptions(
+                offer_id=offer.id,
+                disk_id=self.query_one("#prime-disk-id-llama", Input).value.strip() or None,
+                allow_insecure_http=allow_insecure_http,
+                keep_failed_resource=self.query_one(
+                    "#prime-keep-failed-llama", Switch
+                ).value,
+            )
 
         # Advanced
         adv_visible = not self.query(".llama-advanced").first().has_class("hidden")
@@ -612,10 +887,14 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
             config.instance_name = slugify_instance_name(instance_override or app_override)
         elif instance_override:
             config.instance_name = slugify_instance_name(instance_override)
-            config.app_name = build_app_name(config.backend, config.instance_name)
+            config.app_name = build_deployment_name(
+                config.provider, config.backend, config.instance_name
+            )
         else:
             config.instance_name = auto_instance_name_for_backend(config.backend, model_hint)
-            config.app_name = build_app_name(config.backend, config.instance_name)
+            config.app_name = build_deployment_name(
+                config.provider, config.backend, config.instance_name
+            )
 
         self.app.begin_deploy(config)  # type: ignore[attr-defined]
 
@@ -783,9 +1062,14 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
         if app_override:
             preview = app_override
         elif instance_override:
-            preview = build_app_name(BackendType.LLAMACPP, instance_override)
+            preview = build_deployment_name(
+                self._provider,
+                BackendType.LLAMACPP,
+                instance_override,
+            )
         else:
-            preview = build_app_name(
+            preview = build_deployment_name(
+                self._provider,
                 BackendType.LLAMACPP,
                 auto_instance_name_for_backend(BackendType.LLAMACPP, model_hint),
             )
@@ -848,6 +1132,8 @@ class VllmDeployScreen(CopyEnabledScreen):
         "gpu-type-vllm",
         "gpu-count-vllm",
         "n-gpu",
+        "provider-vllm",
+        "prime-offer-vllm",
         "toggle-advanced-vllm",
         "model-revision",
         "smoke-only-vllm",
@@ -884,6 +1170,25 @@ class VllmDeployScreen(CopyEnabledScreen):
                 "model-name",
             )
             yield Static("[dim]Estimated VRAM: enter model name to compute[/dim]", id="vllm-vram-status")
+            yield Static("Compute provider", classes="form-label")
+            yield Select(
+                options=[("Modal", "modal"), ("Prime Intellect", "prime")],
+                value="modal",
+                allow_blank=False,
+                id="provider-vllm",
+            )
+            yield Static("Prime GPU offer", classes="form-label prime-only")
+            yield Select(
+                options=[],
+                prompt="Select an exact live Prime offer",
+                id="prime-offer-vllm",
+                classes="prime-only",
+            )
+            yield Static(
+                "[dim]Prime offers are secure, on-demand availability sorted by price.[/dim]",
+                id="prime-offer-status",
+                classes="prime-only",
+            )
             with Vertical(classes="gpu-config-panel"):
                 yield Static("GPU configuration", classes="form-section-title")
                 yield Static(
@@ -920,6 +1225,23 @@ class VllmDeployScreen(CopyEnabledScreen):
                 "model-revision",
                 hint="Leave blank to use default branch",
                 classes="vllm-advanced",
+            )
+            yield FormField(
+                "Existing Prime disk ID (optional)",
+                "prime-disk-id",
+                classes="vllm-advanced prime-only",
+            )
+            yield ToggleField(
+                "Use direct HTTP fallback (insecure)",
+                "prime-insecure-http",
+                default=False,
+                classes="vllm-advanced prime-only",
+            )
+            yield ToggleField(
+                "Keep failed Prime pod (billing may continue)",
+                "prime-keep-failed",
+                default=False,
+                classes="vllm-advanced prime-only",
             )
             yield ToggleField(
                 "Smoke test only (no deploy)",
@@ -979,7 +1301,7 @@ class VllmDeployScreen(CopyEnabledScreen):
             yield FormField(
                 "App name override (optional)",
                 "app-name-vllm",
-                hint="Advanced: explicit Modal app name",
+                hint="Advanced: explicit deployment name",
                 classes="vllm-advanced",
             )
             yield Static("[dim]App name preview: auto[/dim]", id="vllm-app-preview")
@@ -994,12 +1316,17 @@ class VllmDeployScreen(CopyEnabledScreen):
         self._cached_models: list[ModelCandidate] = []
         self._has_cached_snapshot = False
         self._selected_gpu_type = DEFAULT_GPU_TYPE
+        self._provider = ComputeProvider.MODAL
+        self._prime_offers: dict[str, ComputeOffer] = {}
+        self._selected_prime_offer_id: str | None = None
         self._served_alias_touched = False
         self._updating_served_alias = False
         self._last_auto_served_alias = ""
         self._model_to_memory_estimate: dict[str, VllmMemoryBreakdown | None] = {}
         self._last_memory_lookup: tuple[str, str] | None = None
         for widget in self.query(".vllm-advanced"):
+            widget.add_class("hidden")
+        for widget in self.query(".prime-only"):
             widget.add_class("hidden")
         rank_mode_list = self.query_one("#vllm-rank-mode", OptionList)
         if rank_mode_list.option_count > 0:
@@ -1049,6 +1376,7 @@ class VllmDeployScreen(CopyEnabledScreen):
         if event.button.id == "toggle-advanced-vllm":
             for widget in self.query(".vllm-advanced"):
                 widget.toggle_class("hidden")
+            self._sync_prime_visibility()
         elif event.button.id == "deploy-vllm-btn":
             self._do_deploy()
 
@@ -1064,12 +1392,104 @@ class VllmDeployScreen(CopyEnabledScreen):
             self._served_alias_touched = event.input.value.strip() != self._last_auto_served_alias
         if event.input.id in {"model-name", "instance-name-vllm", "app-name-vllm"}:
             self._refresh_app_preview()
+        if event.input.id in {"model-name", "model-revision"} and self._prime_offers:
+            self._refresh_prime_offer_options()
 
     def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "provider-vllm":
+            if not isinstance(event.value, str):
+                return
+            self._provider = ComputeProvider(event.value)
+            self._sync_prime_visibility()
+            if self._provider == ComputeProvider.PRIME and not self._prime_offers:
+                self._refresh_prime_offers()
+            elif self._provider == ComputeProvider.MODAL:
+                self._refresh_gpu_types()
+            self._refresh_app_preview()
+            return
+        if event.select.id == "prime-offer-vllm":
+            if not isinstance(event.value, str):
+                return
+            self._selected_prime_offer_id = event.value
+            offer = self._prime_offers.get(event.value)
+            if offer is not None:
+                self._selected_gpu_type = offer.gpu_type
+                self.query_one("#gpu-type-vllm", Select).set_options(
+                    [(offer.gpu_type, offer.gpu_type)]
+                )
+                self.query_one("#gpu-type-vllm", Select).value = offer.gpu_type
+                self.query_one("#gpu-count-vllm", Input).value = str(offer.gpu_count)
+                self.query_one("#n-gpu", Input).value = str(offer.gpu_count)
+            return
         if event.select.id != "gpu-type-vllm":
             return
         if isinstance(event.value, str) and event.value.strip():
             self._selected_gpu_type = normalize_gpu_type(event.value)
+
+    def _sync_prime_visibility(self) -> None:
+        advanced_visible = not self.query_one("#model-revision").has_class("hidden")
+        for widget in self.query(".prime-only"):
+            hide = self._provider != ComputeProvider.PRIME
+            if widget.has_class("vllm-advanced") and not advanced_visible:
+                hide = True
+            widget.set_class(hide, "hidden")
+
+    def _refresh_prime_offers(self) -> None:
+        self.query_one("#prime-offer-status", Static).update("[dim]Loading Prime offers...[/dim]")
+        self.run_worker(
+            self._run_fetch_prime_offers,
+            name="vllm-fetch-prime-offers",
+            thread=True,
+        )
+
+    def _run_fetch_prime_offers(self) -> None:
+        try:
+            offers = PrimeBackend().list_offers()
+        except Exception as exc:
+            self.post_message(PrimeOffersFailed(str(exc)))
+            return
+        self.post_message(PrimeOffersLoaded(offers))
+
+    def on_prime_offers_loaded(self, message: PrimeOffersLoaded) -> None:
+        self._prime_offers = {offer.id: offer for offer in message.offers}
+        self._refresh_prime_offer_options()
+
+    def _current_vllm_required_vram(self) -> float | None:
+        repo_id, revision = self._current_memory_lookup()
+        if not repo_id:
+            return None
+        estimate = self._model_to_memory_estimate.get(
+            self._memory_cache_key(repo_id, revision)
+        )
+        return estimate.total_gb if estimate is not None else None
+
+    def _refresh_prime_offer_options(self) -> None:
+        required_vram_gb = self._current_vllm_required_vram()
+        offers = _compatible_prime_offers(
+            list(self._prime_offers.values()),
+            required_vram_gb,
+            BackendType.VLLM,
+        )
+        options = _prime_offer_options(offers)
+        selector = self.query_one("#prime-offer-vllm", Select)
+        selector.set_options(options)
+        if options:
+            self._selected_prime_offer_id = options[0][1]
+            selector.value = options[0][1]
+        else:
+            self._selected_prime_offer_id = None
+        self.query_one("#prime-offer-status", Static).update(
+            _prime_offer_status(
+                len(options),
+                required_vram_gb,
+                BackendType.VLLM,
+            )
+        )
+
+    def on_prime_offers_failed(self, message: PrimeOffersFailed) -> None:
+        self.query_one("#prime-offer-status", Static).update(
+            f"[red]Could not load Prime offers:[/red] {message.error}"
+        )
 
     def _refresh_gpu_types(self) -> None:
         self.run_worker(
@@ -1287,6 +1707,8 @@ class VllmDeployScreen(CopyEnabledScreen):
         if self._memory_cache_key(current_repo, current_revision) != cache_key:
             return
         self._render_vllm_memory_status(message.estimate)
+        if self._prime_offers:
+            self._refresh_prime_offer_options()
 
     def on_vllm_memory_failed(self, _: VllmMemoryFailed) -> None:
         current_repo, current_revision = self._current_memory_lookup()
@@ -1295,6 +1717,8 @@ class VllmDeployScreen(CopyEnabledScreen):
         cache_key = self._memory_cache_key(current_repo, current_revision)
         self._model_to_memory_estimate.setdefault(cache_key, None)
         self._render_vllm_memory_status(None)
+        if self._prime_offers:
+            self._refresh_prime_offer_options()
 
     def _highlighted_ranked_model(self) -> ModelCandidate | None:
         highlighted = self.query_one("#vllm-model-list", OptionList).highlighted_option
@@ -1308,18 +1732,20 @@ class VllmDeployScreen(CopyEnabledScreen):
         if app_override:
             preview = app_override
         elif instance_override:
-            preview = build_app_name(BackendType.VLLM, instance_override)
+            preview = build_deployment_name(self._provider, BackendType.VLLM, instance_override)
         else:
-            preview = build_app_name(
+            preview = build_deployment_name(
+                self._provider,
                 BackendType.VLLM,
                 auto_instance_name_for_backend(BackendType.VLLM, model_name),
             )
         self.query_one("#vllm-app-preview", Static).update(f"[dim]App name preview: {preview}[/dim]")
 
     def _do_deploy(self) -> None:
-        config = DeploymentConfig(backend=BackendType.VLLM)
+        config = DeploymentConfig(backend=BackendType.VLLM, provider=self._provider)
         config.model_name = self.query_one("#model-name", Input).value.strip() or None
         config.model_revision = self.query_one("#model-revision", Input).value.strip() or None
+        config.required_vram_gb = self._current_vllm_required_vram()
         gpu_type = normalize_gpu_type(self._selected_gpu_type)
         if not gpu_type:
             self.app.notify("GPU type is required.", severity="error", timeout=5)
@@ -1330,15 +1756,32 @@ class VllmDeployScreen(CopyEnabledScreen):
             return
         config.gpu_type = gpu_type
         config.gpu_count = gpu_count
+        if self._provider == ComputeProvider.PRIME:
+            offer = self._prime_offers.get(self._selected_prime_offer_id or "")
+            if offer is None:
+                self.app.notify("Select a live Prime GPU offer.", severity="error", timeout=5)
+                return
+            config.gpu_type = offer.gpu_type
+            config.gpu_count = offer.gpu_count
+            allow_insecure_http = self.query_one("#prime-insecure-http", Switch).value
+            config.provider_options = PrimeProviderOptions(
+                offer_id=offer.id,
+                disk_id=self.query_one("#prime-disk-id", Input).value.strip() or None,
+                allow_insecure_http=allow_insecure_http,
+                keep_failed_resource=self.query_one("#prime-keep-failed", Switch).value,
+            )
         alias = self.query_one("#served-model-name", Input).value.strip()
         config.served_model_name = alias or default_served_model_name(config.model_name)
         config.fast_boot = self.query_one("#fast-boot", Switch).value
         config.trust_remote_code = self.query_one("#trust-remote-code", Switch).value
-        n_gpu_str = self.query_one("#n-gpu", Input).value.strip()
-        try:
-            config.n_gpu = int(n_gpu_str) if n_gpu_str else 1
-        except ValueError:
-            config.n_gpu = 1
+        if self._provider == ComputeProvider.PRIME:
+            config.n_gpu = config.gpu_count
+        else:
+            n_gpu_str = self.query_one("#n-gpu", Input).value.strip()
+            try:
+                config.n_gpu = int(n_gpu_str) if n_gpu_str else 1
+            except ValueError:
+                config.n_gpu = 1
         adv_visible = not self.query(".vllm-advanced").first().has_class("hidden")
         if adv_visible:
             config.reasoning_parser = self.query_one("#reasoning-parser", Input).value.strip() or None
@@ -1363,6 +1806,9 @@ class VllmDeployScreen(CopyEnabledScreen):
                 return
             config.default_chat_template_kwargs = kwargs_raw
         smoke_only = self.query_one("#smoke-only-vllm", Switch).value
+        if smoke_only and self._provider == ComputeProvider.PRIME:
+            self.app.notify("Prime does not support smoke-test-only mode.", severity="error", timeout=5)
+            return
         config.do_deploy = not smoke_only
         config.run_smoke = smoke_only
         config.do_warmup = self.query_one("#warmup-vllm", Switch).value if config.do_deploy else False
@@ -1374,10 +1820,14 @@ class VllmDeployScreen(CopyEnabledScreen):
             config.instance_name = slugify_instance_name(instance_override or app_override)
         elif instance_override:
             config.instance_name = slugify_instance_name(instance_override)
-            config.app_name = build_app_name(config.backend, config.instance_name)
+            config.app_name = build_deployment_name(
+                config.provider, config.backend, config.instance_name
+            )
         else:
             config.instance_name = auto_instance_name_for_backend(config.backend, config.model_name)
-            config.app_name = build_app_name(config.backend, config.instance_name)
+            config.app_name = build_deployment_name(
+                config.provider, config.backend, config.instance_name
+            )
 
         self.app.begin_deploy(config)  # type: ignore[attr-defined]
 

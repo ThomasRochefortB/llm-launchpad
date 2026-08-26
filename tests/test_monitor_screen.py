@@ -34,10 +34,11 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("first line", content)
             self.assertIn("stderr | stderr line", content)
             title = screen.query_one("#monitor-title", Static)
-            self.assertIn(
-                "ctrl+shift+c copy  y fallback  ctrl+t terminal copy  ctrl+c exits  ctrl+l clear",
-                str(title.content),
-            )
+            self.assertIn("Logs", str(title.content))
+            self.assertIn("MOUSE", str(title.content))
+            view_status = screen.query_one("#monitor-view-status", Static)
+            self.assertIn("FOLLOWING", str(view_status.content))
+            self.assertIn("2 lines", str(view_status.content))
 
     async def test_title_mentions_terminal_selection_when_mouse_disabled(self) -> None:
         app = _TestApp()
@@ -49,10 +50,35 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             screen = app.screen
             assert isinstance(screen, MonitorScreen)
             title = screen.query_one("#monitor-title", Static)
-            self.assertIn(
-                "terminal selection mode  use your terminal copy shortcut  ctrl+t mouse  ctrl+c exits",
-                str(title.content),
-            )
+            self.assertIn("TERMINAL SELECT", str(title.content))
+
+    async def test_title_shows_paused_follow_state_and_unseen_lines(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(MonitorScreen(title="Logs"))
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, MonitorScreen)
+            for index in range(40):
+                screen.on_log_message(LogMessage(f"line {index}"))
+            await pilot.pause()
+
+            log = screen.log_viewer.log_widget
+            log.scroll_home(animate=False, immediate=True, x_axis=False)
+            await pilot.pause()
+            screen.on_log_message(LogMessage("new while paused"))
+            await pilot.pause()
+
+            view_status = screen.query_one("#monitor-view-status", Static)
+            self.assertIn("PAUSED", str(view_status.content))
+            self.assertIn("1 new line", str(view_status.content))
+            self.assertIn("41 lines", str(view_status.content))
+
+            screen.action_resume_follow()
+            await pilot.pause()
+            self.assertIn("FOLLOWING", str(view_status.content))
+            self.assertNotIn("new line", str(view_status.content))
 
     async def test_log_lines_strip_ansi_escape_sequences(self) -> None:
         app = _TestApp()
@@ -85,6 +111,9 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             screen.action_clear_log()
             await pilot.pause()
             self.assertEqual(screen.log_viewer.log_widget.line_count, 0)
+            view_status = screen.query_one("#monitor-view-status", Static)
+            self.assertIn("FOLLOWING", str(view_status.content))
+            self.assertIn("0 lines", str(view_status.content))
 
     async def test_operation_messages_render_without_markup(self) -> None:
         app = _TestApp()
@@ -141,8 +170,44 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
 
             content = "\n".join(screen.log_viewer.log_widget.lines)
             self.assertIn("Log view: summary (normalized milestones; raw backend logs hidden)", content)
+            self.assertIn("Preparing deployment...", content)
+            self.assertIn("warming", content)
             self.assertIn("Starting server", content)
             self.assertNotIn("vLLM API server version", content)
+            self.assertEqual(screen.status_header.backend, "vllm")
+            self.assertEqual(screen.status_header.state, "warming_up")
+            self.assertIs(screen.status_header.parent, screen.query_one("#monitor-layout"))
+            title = screen.query_one("#monitor-title", Static)
+            self.assertGreater(screen.status_header.region.height, 0)
+            self.assertLess(screen.status_header.region.y, title.region.y)
+
+    async def test_summary_mode_shows_explicit_milestones_but_hides_raw_logs(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(
+                MonitorScreen(
+                    title="Deploy",
+                    deploy_backend=BackendType.VLLM,
+                    summarize_backend_logs=True,
+                    show_debug_logs=False,
+                )
+            )
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, MonitorScreen)
+            screen.on_log_message(
+                LogMessage(
+                    "Selected provider offer: 1x GPU ($0.50/hr)",
+                    is_milestone=True,
+                )
+            )
+            screen.on_log_message(LogMessage("unclassified backend chatter"))
+            await pilot.pause()
+
+            content = "\n".join(screen.log_viewer.log_widget.lines)
+            self.assertIn("Selected provider offer: 1x GPU ($0.50/hr)", content)
+            self.assertNotIn("unclassified backend chatter", content)
 
     async def test_debug_mode_preserves_raw_backend_log_lines(self) -> None:
         app = _TestApp()
@@ -257,6 +322,16 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             copy_binding.key,
             "ctrl+shift+c,super+c,meta+c,cmd+c,command+c",
         )
+
+    def test_footer_includes_log_navigation_bindings(self) -> None:
+        visible_bindings = {
+            binding.key: binding.description
+            for binding in MonitorScreen.BINDINGS
+            if binding.show
+        }
+        self.assertEqual(visible_bindings["pageup"], "Page up")
+        self.assertEqual(visible_bindings["pagedown"], "Page down")
+        self.assertEqual(visible_bindings["end"], "Follow")
 
 
 if __name__ == "__main__":

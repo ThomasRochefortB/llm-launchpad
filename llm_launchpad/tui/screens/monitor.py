@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import re
 
+from rich.markup import escape
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical
+from textual.containers import Horizontal, Vertical
 from textual.widgets import Footer, Static
 
-from ...protocol.enums import BackendType, OperationType
+from ...protocol.enums import BackendType, DeploymentState, OperationType
 from ..deploy_log_summary import DeployLogSummarizer
 from .copy_enabled import CopyEnabledScreen
 from ..widgets.log_viewer import LogViewer
@@ -29,6 +30,8 @@ def _strip_ansi(text: str) -> str:
 
 class MonitorScreen(CopyEnabledScreen):
     """Full-screen operation monitor with streaming logs."""
+
+    AUTO_FOCUS = "#log-output"
 
     BINDINGS = [
         Binding("escape", "go_back", "Back", show=True),
@@ -46,6 +49,9 @@ class MonitorScreen(CopyEnabledScreen):
             "Copy",
             show=False,
         ),
+        Binding("pageup", "page_up_log", "Page up", show=True, priority=True),
+        Binding("pagedown", "page_down_log", "Page down", show=True, priority=True),
+        Binding("end", "resume_follow", "Follow", show=True, priority=True),
         Binding("ctrl+l", "clear_log", "Clear log", show=True),
     ]
 
@@ -63,6 +69,10 @@ class MonitorScreen(CopyEnabledScreen):
         self._summarize_backend_logs = summarize_backend_logs
         self._show_debug_logs = show_debug_logs
         self._current_operation: OperationType | None = None
+        self._last_summary_state_detail = ""
+        self._following = True
+        self._unseen_lines = 0
+        self._line_count = 0
         self._deploy_summarizer = (
             DeployLogSummarizer(deploy_backend)
             if deploy_backend is not None and summarize_backend_logs and not show_debug_logs
@@ -70,38 +80,40 @@ class MonitorScreen(CopyEnabledScreen):
         )
 
     def compose(self) -> ComposeResult:
-        copy_help = self._copy_help_text()
-        yield StatusHeader(id="monitor-status-header")
         with Vertical(id="monitor-layout"):
-            yield Static(
-                (
-                    f"[bold #7bf168]{self._title}[/]  "
-                    f"[dim]{copy_help}  ctrl+l clear  esc to return[/dim]"
-                ),
-                id="monitor-title",
-            )
+            yield StatusHeader(id="monitor-status-header")
+            with Horizontal(id="monitor-toolbar"):
+                yield Static(self._title_markup(), id="monitor-title")
+                yield Static(self._view_status_markup(), id="monitor-view-status")
             yield LogViewer(id="monitor-log-viewer")
         yield Footer()
 
-    def _copy_help_text(self) -> str:
+    def _title_markup(self) -> str:
+        """Render a compact operation title and input-mode badge."""
         mouse_enabled = getattr(self.app, "mouse_enabled", True)
-        if not mouse_enabled:
-            return (
-                "terminal selection mode  use your terminal copy shortcut  "
-                "ctrl+t mouse  ctrl+c exits"
-            )
+        mode = "MOUSE" if mouse_enabled else "TERMINAL SELECT"
         return (
-            "drag to select, dbl-click for line  ctrl+shift+c copy  "
-            "y fallback  ctrl+t terminal copy  ctrl+c exits"
+            f"[bold #7bf168]{escape(self._title)}[/]  "
+            f"[dim]·[/dim]  [#93a596]{mode}[/]"
         )
 
-    def refresh_copy_help(self) -> None:
-        title = self.query_one("#monitor-title", Static)
-        title.update(
-            (
-                f"[bold cyan]{self._title}[/bold cyan]  "
-                f"[dim]{self._copy_help_text()}  ctrl+l clear  esc to return[/dim]"
+    def _view_status_markup(self) -> str:
+        """Render live follow and line-count state for the log viewport."""
+        line_label = "line" if self._line_count == 1 else "lines"
+        if self._following:
+            state = "[bold #7bf168]FOLLOWING[/]"
+        else:
+            new_label = "line" if self._unseen_lines == 1 else "lines"
+            state = (
+                f"[bold yellow]PAUSED[/]  [yellow]· {self._unseen_lines} new {new_label}[/]"
             )
+        return f"{state}  [dim]· {self._line_count} {line_label}[/dim]"
+
+    def refresh_copy_help(self) -> None:
+        """Refresh compact chrome after toggling app/terminal mouse mode."""
+        self.query_one("#monitor-title", Static).update(self._title_markup())
+        self.query_one("#monitor-view-status", Static).update(
+            self._view_status_markup()
         )
 
     @property
@@ -120,16 +132,27 @@ class MonitorScreen(CopyEnabledScreen):
 
     def on_mount(self) -> None:
         if self._summary_mode_enabled:
+            self.status_header.update_from_event(
+                state=DeploymentState.QUEUED,
+                backend=self._deploy_backend,
+                operation=OperationType.DEPLOY,
+                detail="Preparing deployment",
+            )
             self.log_viewer.write_line(
                 "Log view: summary (normalized milestones; raw backend logs hidden)"
             )
             self.log_viewer.write_line("")
+            self.log_viewer.write_line("Preparing deployment...")
+            self._last_summary_state_detail = "Preparing deployment"
 
     def on_log_message(self, message: LogMessage) -> None:
         prefix = "stderr | " if message.stream == "stderr" else ""
         if self._summary_mode_enabled:
             assert self._deploy_summarizer is not None
             cleaned = _strip_ansi(message.line)
+            if message.is_milestone:
+                self.log_viewer.write_line(f"{prefix}{cleaned}" if prefix else cleaned)
+                return
             for line in self._deploy_summarizer.transform(cleaned, self._current_operation):
                 self.log_viewer.write_line(f"{prefix}{line}" if prefix else line)
             return
@@ -148,6 +171,14 @@ class MonitorScreen(CopyEnabledScreen):
             operation=message.operation,
             detail=message.detail,
         )
+        detail = _strip_ansi(message.detail).strip()
+        if (
+            self._summary_mode_enabled
+            and detail
+            and detail != self._last_summary_state_detail
+        ):
+            self.log_viewer.write_line(detail)
+            self._last_summary_state_detail = detail
 
     def on_operation_done(self, message: OperationDone) -> None:
         self._done = True
@@ -171,6 +202,15 @@ class MonitorScreen(CopyEnabledScreen):
     def on_operation_error(self, message: OperationError) -> None:
         self.log_viewer.write_line(f"Error: {message.message}")
 
+    def on_log_viewer_status_changed(self, message: LogViewer.StatusChanged) -> None:
+        """Keep compact monitor chrome synchronized with the log viewport."""
+        self._following = message.following
+        self._unseen_lines = message.unseen_lines
+        self._line_count = message.line_count
+        self.query_one("#monitor-view-status", Static).update(
+            self._view_status_markup()
+        )
+
     def _selected_text_for_copy(self) -> str | None:
         """Return selected log text before falling back to screen selections."""
         log_widget = self.log_viewer.log_widget
@@ -185,5 +225,20 @@ class MonitorScreen(CopyEnabledScreen):
     def action_go_back(self) -> None:
         self.app.pop_screen()
 
+    def action_page_up_log(self) -> None:
+        self.log_viewer.page_up()
+
+    def action_page_down_log(self) -> None:
+        self.log_viewer.page_down()
+
+    def action_resume_follow(self) -> None:
+        self.log_viewer.resume_following()
+
     def action_clear_log(self) -> None:
         self.log_viewer.clear()
+        self._following = True
+        self._unseen_lines = 0
+        self._line_count = 0
+        self.query_one("#monitor-view-status", Static).update(
+            self._view_status_markup()
+        )

@@ -9,6 +9,7 @@ from textual.containers import Vertical
 from textual.widgets import Button, Footer, Input, OptionList, Static, Switch
 from textual.widgets.option_list import Option
 
+from ...protocol.enums import ComputeProvider
 from ...protocol.models import EndpointInfo
 from ..widgets.input_form import FormField, ToggleField
 from .copy_enabled import CopyEnabledScreen
@@ -17,10 +18,10 @@ from .copy_enabled import CopyEnabledScreen
 def _is_stoppable_state(state: str) -> bool:
     """Return True when the app state should appear in the manage UI."""
     return state.strip().lower() in {
+        "active",
         "building",
         "deployed",
         "deploying",
-        "ephemeral",
         "initializing",
         "pending",
         "queued",
@@ -40,7 +41,8 @@ def _build_backend_app_options(
         if row.backend is None:
             continue
         option_id = f"app-id:{row.app_id}" if row.app_id else f"app-name:{row.name}:{index}"
-        label = f"  [{row.backend.value}] {row.name}  ({row.state}"
+        provider = getattr(row, "provider", ComputeProvider.MODAL)
+        label = f"  [{provider.value}/{row.backend.value}] {row.name}  ({row.state}"
         if row.app_id:
             label += f", {row.app_id}"
         label += ")"
@@ -72,11 +74,11 @@ class ManageScreen(CopyEnabledScreen):
             yield Static("[bold #7bf168]Manage Endpoints[/]")
             yield Static("")
             yield OptionList(
-                Option("  List apps                 Show active launchpad Modal apps", id="list"),
+                Option("  List apps                 Show active launchpad deployments", id="list"),
                 Option("  Status check              Probe endpoint health", id="status"),
-                Option("  Tail logs                 Stream Modal app logs", id="logs"),
+                Option("  Tail logs                 Stream provider logs", id="logs"),
                 Option("  Benchmark                 Measure endpoint throughput", id="benchmark"),
-                Option("  Stop app                  Stop an active Modal app", id="stop"),
+                Option("  Stop app                  Stop an active deployment", id="stop"),
                 id="manage-action-list",
             )
         yield Footer()
@@ -154,12 +156,21 @@ class StatusParamsScreen(CopyEnabledScreen):
             timeout = int(timeout_str) if timeout_str else 60
         except ValueError:
             timeout = 60
+        kwargs = {
+            "app_name": self._selected_row.name,
+            "served_model_name": self._selected_row.served_model_name,
+        }
+        if self._selected_row.provider == ComputeProvider.PRIME:
+            kwargs.update(
+                provider=self._selected_row.provider,
+                api_key=self._selected_row.endpoint_api_key,
+                pod_id=self._selected_row.app_id or None,
+            )
         self.app.begin_status(  # type: ignore[attr-defined]
             self._selected_row.backend,
             url,
             timeout,
-            app_name=self._selected_row.name,
-            served_model_name=self._selected_row.served_model_name,
+            **kwargs,
         )
 
     def _load_instances(self) -> None:
@@ -215,11 +226,16 @@ class LogsParamsScreen(CopyEnabledScreen):
         if self._selected_row is None or self._selected_row.backend is None:
             return
         follow = self.query_one("#logs-follow", Switch).value
+        kwargs = {
+            "app_name": self._selected_row.name,
+            "app_id": self._selected_row.app_id or None,
+        }
+        if self._selected_row.provider == ComputeProvider.PRIME:
+            kwargs["provider"] = self._selected_row.provider
         self.app.begin_logs(  # type: ignore[attr-defined]
             self._selected_row.backend,
             follow,
-            app_name=self._selected_row.name,
-            app_id=self._selected_row.app_id or None,
+            **kwargs,
         )
 
     def _load_instances(self) -> None:
@@ -372,7 +388,7 @@ class StopParamsScreen(CopyEnabledScreen):
             yield Static("[bold]Choose active app[/bold]")
             yield OptionList(id="stop-instance-list")
             yield Static("")
-            yield Static("[yellow]Warning:[/yellow] This will stop the selected Modal app.")
+            yield Static("[yellow]Warning:[/yellow] This will stop the selected deployment.")
             yield Static("[dim]Select an app to confirm and stop.[/dim]")
         yield Footer()
 
@@ -382,11 +398,10 @@ class StopParamsScreen(CopyEnabledScreen):
             row = self._target_by_option_id.get(selected)
             if row is None or row.backend is None:
                 return
-            self.app.begin_stop(  # type: ignore[attr-defined]
-                row.backend,
-                app_name=row.name,
-                app_id=row.app_id or None,
-            )
+            kwargs = {"app_name": row.name, "app_id": row.app_id or None}
+            if row.provider == ComputeProvider.PRIME:
+                kwargs["provider"] = row.provider
+            self.app.begin_stop(row.backend, **kwargs)  # type: ignore[attr-defined]
 
     def on_mount(self) -> None:
         self._target_by_option_id: dict[str, EndpointInfo] = {}
@@ -412,11 +427,10 @@ class StopParamsScreen(CopyEnabledScreen):
         row = self._target_by_option_id.get(selected)
         if row is None or row.backend is None:
             return
-        self.app.begin_stop(  # type: ignore[attr-defined]
-            row.backend,
-            app_name=row.name,
-            app_id=row.app_id or None,
-        )
+        kwargs = {"app_name": row.name, "app_id": row.app_id or None}
+        if row.provider == ComputeProvider.PRIME:
+            kwargs["provider"] = row.provider
+        self.app.begin_stop(row.backend, **kwargs)  # type: ignore[attr-defined]
 
     def _load_instances(self) -> None:
         instance_list = self.query_one("#stop-instance-list", OptionList)
