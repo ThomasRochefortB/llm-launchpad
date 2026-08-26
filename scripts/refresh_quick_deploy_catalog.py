@@ -467,23 +467,6 @@ def _extract_family_version(value: str) -> tuple[str, tuple[int, ...]] | None:
     return None
 
 
-def build_profile_row(
-    candidate: AAModelCandidate,
-    repo_id: str,
-    *,
-    metadata: GgufQuantMetadata,
-    modal_gpu_catalog: Sequence[ModalGpuSpec],
-) -> dict[str, Any] | None:
-    """Build one QuickDeployProfile-compatible JSON object."""
-    rows = build_profile_rows(
-        candidate,
-        repo_id,
-        metadata=metadata,
-        modal_gpu_catalog=modal_gpu_catalog,
-    )
-    return rows[0] if rows else None
-
-
 def build_profile_rows(
     candidate: AAModelCandidate,
     repo_id: str,

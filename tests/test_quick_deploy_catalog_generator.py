@@ -412,14 +412,14 @@ class QuickDeployCatalogGeneratorTests(unittest.TestCase):
         )
 
         with patch.object(self.generator, "fetch_model_max_context", return_value=262144):
-            profile = self.generator.build_profile_row(
+            profiles = self.generator.build_profile_rows(
                 candidate,
                 "unsloth/Qwen3.5-397B-A17B-GGUF",
                 metadata=GgufQuantMetadata(quantizations=[], vram_gb_by_quant={}),
                 modal_gpu_catalog=[ModalGpuSpec(value="RTX-PRO-6000", price_per_hour_usd=3.0312)],
             )
 
-        assert profile is not None
+        profile = profiles[0]
         self.assertEqual(profile["id"], "qwen35-397b-rtxpro-q4xl-cheap-rtx-pro-6000")
         self.assertEqual(profile["quant"], "UD-Q4_K_XL")
         self.assertEqual(profile["gpu_count"], 3)
@@ -437,7 +437,7 @@ class QuickDeployCatalogGeneratorTests(unittest.TestCase):
         )
 
         with patch.object(self.generator, "fetch_model_max_context", return_value=262144):
-            profile = self.generator.build_profile_row(
+            profiles = self.generator.build_profile_rows(
                 candidate,
                 "unsloth/Qwen3.5-397B-A17B-GGUF",
                 metadata=GgufQuantMetadata(
@@ -450,7 +450,7 @@ class QuickDeployCatalogGeneratorTests(unittest.TestCase):
                 ],
             )
 
-        assert profile is not None
+        profile = profiles[0]
         self.assertEqual(profile["id"], "qwen3-5-397b-a17b-q4xl-cheap-a100-80gb")
         self.assertEqual(profile["gpu_type"], "A100-80GB")
         self.assertEqual(profile["gpu_count"], 2)

@@ -230,23 +230,6 @@ def _resolve_hub_snapshot_dir(repo_id: str, revision: Optional[str]) -> Optional
     return snapshots[0]
 
 
-def _collect_hub_gguf_matches(
-    repo_id: str,
-    revision: Optional[str],
-    allow_patterns: list[str],
-) -> list[str]:
-    snapshot_dir = _resolve_hub_snapshot_dir(repo_id, revision)
-    if snapshot_dir is None:
-        return []
-    matched_candidates = _matched_snapshot_gguf_candidates(snapshot_dir, allow_patterns)
-    complete_candidates, _ = _partition_complete_gguf_candidates(matched_candidates)
-    matches: list[str] = []
-    for gguf in complete_candidates:
-        matches.append(str(gguf.relative_to(cache_dir)))
-    matches.sort()
-    return matches
-
-
 def _fetch_expected_gguf_sizes(
     repo_id: str,
     revision: Optional[str],

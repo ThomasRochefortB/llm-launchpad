@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from llm_launchpad.core.orchestrator import Orchestrator
+from llm_launchpad.core.warmup import fetch_historical_logs
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider, DeploymentState, OperationType
 from llm_launchpad.protocol.events import ErrorEvent, LogEvent, OperationCompleteEvent, StateChangeEvent
 
@@ -374,14 +375,14 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
         self.assertIn("third", warmup_logs)
 
     def test_fetch_historical_logs_yields_unseen_lines(self) -> None:
-        """_fetch_historical_logs returns only lines not already in *seen*."""
+        """fetch_historical_logs returns only lines not already in *seen*."""
         fake_run_result = types.SimpleNamespace(
             stdout="line-A\nline-B\nline-C\n", returncode=0
         )
         seen: set[str] = {"line-A"}
         with patch("llm_launchpad.core.warmup.subprocess.run", return_value=fake_run_result):
             with patch("llm_launchpad.core.warmup.os.environ", {}):
-                events = list(Orchestrator._fetch_historical_logs("myapp", seen))
+                events = list(fetch_historical_logs("myapp", seen))
 
         lines = [e.line for e in events if isinstance(e, LogEvent)]
         # The header line plus the two new content lines
@@ -406,7 +407,7 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
         exc.stdout = "partial-line\n"
         with patch("llm_launchpad.core.warmup.subprocess.run", side_effect=exc):
             with patch("llm_launchpad.core.warmup.os.environ", {}):
-                events = list(Orchestrator._fetch_historical_logs("myapp", set()))
+                events = list(fetch_historical_logs("myapp", set()))
 
         lines = [e.line for e in events if isinstance(e, LogEvent)]
         self.assertIn("partial-line", lines)

@@ -55,7 +55,7 @@ from .prime_backend import (
     select_prime_offer,
 )
 from .provider_options import prime_provider_options
-from .warmup import WarmupRunner, fetch_historical_logs
+from .warmup import WarmupRunner
 from .warmup import modal_gpu_scheduling_hint as _modal_gpu_scheduling_hint
 from .warmup import probe_response_is_ready as _probe_response_is_ready
 from .warmup import status_probe_url as _status_probe_url
@@ -629,18 +629,6 @@ class Orchestrator:
             pod_id=pod_id,
             prime_backend=self.prime_backend if provider == ComputeProvider.PRIME else None,
         )
-
-    # ------------------------------------------------------------------
-    # Historical log fetch (fallback for crash output)
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _fetch_historical_logs(
-        app_name: str,
-        seen: set[str],
-    ) -> EventStream:
-        """Re-run ``modal app logs`` to capture persisted crash output."""
-        yield from fetch_historical_logs(app_name, seen)
 
     # ------------------------------------------------------------------
     # Logs

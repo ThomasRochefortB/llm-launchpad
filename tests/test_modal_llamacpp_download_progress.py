@@ -101,28 +101,6 @@ class LlamacppDownloadProgressTests(unittest.TestCase):
 
             self.assertEqual(selected.name, "GLM-5-Q4_K_M-00001-of-00011.gguf")
 
-    def test_collect_hub_gguf_matches_ignores_incomplete_split_set(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            hub_dir = Path(tmp) / "hub"
-            model_dir = hub_dir / "models--unsloth--GLM-5-GGUF"
-            snapshot_dir = model_dir / "snapshots" / "abc123" / "UD-Q2_K_XL"
-            refs_dir = model_dir / "refs"
-            snapshot_dir.mkdir(parents=True, exist_ok=True)
-            refs_dir.mkdir(parents=True, exist_ok=True)
-            (refs_dir / "main").write_text("abc123\n", encoding="utf-8")
-            (snapshot_dir / "GLM-5-UD-Q2_K_XL-00001-of-00003.gguf").write_bytes(b"a" * 10)
-            (snapshot_dir / "GLM-5-UD-Q2_K_XL-00003-of-00003.gguf").write_bytes(b"b" * 10)
-
-            with patch.object(modal_llamacpp_app, "HF_HUB_DIR", hub_dir):
-                with patch.object(modal_llamacpp_app, "cache_dir", str(Path(tmp))):
-                    matches = modal_llamacpp_app._collect_hub_gguf_matches(
-                        repo_id="unsloth/GLM-5-GGUF",
-                        revision=None,
-                        allow_patterns=["*UD-Q2_K_XL*.gguf"],
-                    )
-
-            self.assertEqual(matches, [])
-
     def test_validate_cached_gguf_matches_rejects_size_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             hub_dir = Path(tmp) / "hub"
@@ -218,21 +196,13 @@ class LlamacppDownloadProgressTests(unittest.TestCase):
             gguf.write_bytes(b"x" * 10)
 
             with patch.object(modal_llamacpp_app, "HF_HUB_DIR", hub_dir):
-                with patch.object(modal_llamacpp_app, "cache_dir", str(Path(tmp))):
-                    selected = modal_llamacpp_app._resolve_model_entrypoint(
-                        repo_id="Edge-Quant/Nanbeige4.1-3B-Q4_K_M-GGUF",
-                        revision=None,
-                        quant="Q4_K_M",
-                    )
-                    matches = modal_llamacpp_app._collect_hub_gguf_matches(
-                        repo_id="Edge-Quant/Nanbeige4.1-3B-Q4_K_M-GGUF",
-                        revision=None,
-                        allow_patterns=["*Q4_K_M*.gguf"],
-                    )
+                selected = modal_llamacpp_app._resolve_model_entrypoint(
+                    repo_id="Edge-Quant/Nanbeige4.1-3B-Q4_K_M-GGUF",
+                    revision=None,
+                    quant="Q4_K_M",
+                )
 
             self.assertEqual(selected.name, gguf.name)
-            self.assertEqual(len(matches), 1)
-            self.assertTrue(matches[0].endswith("nanbeige4.1-3b-q4_k_m.gguf"))
 
     def test_resolve_or_download_model_entrypoint_skips_download_on_cache_hit(self) -> None:
         cached_path = Path("/tmp/cached-model.gguf")
