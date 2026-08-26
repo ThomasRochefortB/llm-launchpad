@@ -64,11 +64,25 @@ class MainMenuQuickDeployTests(unittest.IsolatedAsyncioTestCase):
             lambda self: None,
         )
         self._prime_refresh_patch.start()
+        self._catalog_refresh_patch = patch.object(
+            MainMenuScreen,
+            "_refresh_quick_deploy_catalog",
+            lambda self: None,
+        )
+        self._catalog_refresh_patch.start()
+        self._aai_refresh_patch = patch.object(
+            MainMenuScreen,
+            "_refresh_aai_auth_status",
+            lambda self: None,
+        )
+        self._aai_refresh_patch.start()
         quick_deploy._reset_quick_deploy_catalog_cache()
 
     def tearDown(self) -> None:
         self._catalog_patch.stop()
         self._prime_refresh_patch.stop()
+        self._catalog_refresh_patch.stop()
+        self._aai_refresh_patch.stop()
         quick_deploy._reset_quick_deploy_catalog_cache()
 
     async def test_main_menu_renders_quick_deploy_panel(self) -> None:

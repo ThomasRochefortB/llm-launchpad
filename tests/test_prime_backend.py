@@ -103,6 +103,15 @@ class PrimeOfferTests(unittest.TestCase):
         row = parse_prime_offer(_offer_payload())
         self.assertIs(select_prime_offer([row], offer_id=row.id), row)
 
+    def test_out_of_stock_offer_is_not_deployable(self) -> None:
+        row = parse_prime_offer(_offer_payload(stockStatus="out_of_stock"))
+        available = parse_prime_offer(_offer_payload(cloudId="available"))
+
+        self.assertFalse(is_compatible_prime_offer(row))
+        with self.assertRaisesRegex(ValueError, "unavailable"):
+            select_prime_offer([row], offer_id=row.id)
+        self.assertIs(select_prime_offer([row, available]), available)
+
     def test_automatic_selection_excludes_cpu_nodes(self) -> None:
         cpu = parse_prime_offer(
             _offer_payload(

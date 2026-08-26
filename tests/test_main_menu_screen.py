@@ -3,11 +3,13 @@ from __future__ import annotations
 import unittest
 
 from llm_launchpad.core.modal_auth import ModalAuthStatus
+from llm_launchpad.core.quick_deploy_refresh import ArtificialAnalysisAuthStatus
 from llm_launchpad.protocol.enums import BackendType
 from llm_launchpad.protocol.models import EndpointInfo, StorageSnapshot, StoredModelInfo
 from llm_launchpad.tui.screens.main_menu import (
     MainMenuScreen,
     _render_auth_status_block,
+    _render_artificial_analysis_auth_status,
     _render_billing_load_error,
     _render_billing_report,
     _render_deployment_status,
@@ -276,6 +278,30 @@ class MainMenuStatusRenderTests(unittest.TestCase):
         self.assertIn("Modal not authenticated", rendered)
         self.assertIn("modal setup", rendered)
 
+    def test_render_aai_auth_status_shows_authenticated_tier(self) -> None:
+        rendered = _render_artificial_analysis_auth_status(
+            ArtificialAnalysisAuthStatus(authenticated=True, tier="free")
+        )
+        self.assertIn("Artificial Analysis authenticated", rendered)
+        self.assertIn("free tier", rendered)
+
+    def test_render_aai_auth_status_shows_environment_hint_when_missing(self) -> None:
+        rendered = _render_artificial_analysis_auth_status(
+            ArtificialAnalysisAuthStatus(authenticated=False)
+        )
+        self.assertIn("Artificial Analysis not authenticated", rendered)
+        self.assertIn("ARTIFICIAL_ANALYSIS_API_KEY", rendered)
+
+    def test_render_aai_auth_status_shows_invalid_key_error(self) -> None:
+        rendered = _render_artificial_analysis_auth_status(
+            ArtificialAnalysisAuthStatus(
+                authenticated=False,
+                error="Invalid Artificial Analysis API key",
+            )
+        )
+        self.assertIn("auth check failed", rendered)
+        self.assertIn("Invalid Artificial Analysis API key", rendered)
+
     def test_render_auth_status_block_hides_modal_profile_details(self) -> None:
         rendered = _render_auth_status_block(
             username="default",
@@ -285,15 +311,17 @@ class MainMenuStatusRenderTests(unittest.TestCase):
         self.assertNotIn("Modal profile: default", rendered)
         self.assertNotIn("default", rendered)
 
-    def test_render_auth_status_block_includes_both_modal_and_hf_lines(self) -> None:
+    def test_render_auth_status_block_includes_provider_auth_lines(self) -> None:
         rendered = _render_auth_status_block(
             username="default",
             modal_status=ModalAuthStatus(authenticated=False, profile="default"),
             hf_status=HuggingFaceAuthStatus(authenticated=True, username="alice"),
+            aai_status=ArtificialAnalysisAuthStatus(authenticated=True, tier="pro"),
         )
         self.assertIn("Modal not authenticated", rendered)
         self.assertNotIn("Modal profile: default", rendered)
         self.assertIn("Hugging Face authenticated", rendered)
+        self.assertIn("Artificial Analysis authenticated", rendered)
         self.assertNotIn("alice", rendered)
 
 

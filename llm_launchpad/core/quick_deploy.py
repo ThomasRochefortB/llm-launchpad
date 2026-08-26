@@ -50,6 +50,7 @@ class QuickDeployProfile:
     aa_model_slug: str | None = None
     aa_coding_score: float | None = None
     aa_rank: int | None = None
+    model_size_label: str | None = None
     backend: BackendType = BackendType.LLAMACPP
     model_name: str | None = None
 
@@ -75,6 +76,7 @@ class QuickDeployCatalogInfo:
     generated_at: str | None = None
     attribution: str | None = None
     is_fallback: bool = False
+    is_live: bool = False
 
 
 _BUNDLED_CATALOG_PACKAGE = "llm_launchpad.data"
@@ -195,6 +197,20 @@ def get_quick_deploy_profile(profile_id: str) -> QuickDeployProfile:
         return profiles_by_id[profile_id]
     except KeyError as exc:
         raise KeyError(f"Unknown quick deploy profile: {profile_id}") from exc
+
+
+def activate_quick_deploy_catalog(
+    info: QuickDeployCatalogInfo,
+    profiles: Sequence[QuickDeployProfile],
+) -> tuple[QuickDeployCatalogInfo, tuple[QuickDeployProfile, ...]]:
+    """Activate a catalog rebuilt by the TUI startup worker."""
+
+    global _CATALOG_CACHE
+    catalog = (info, tuple(profiles))
+    if not catalog[1]:
+        raise ValueError("Cannot activate an empty quick-deploy catalog")
+    _CATALOG_CACHE = catalog
+    return catalog
 
 
 def _load_quick_deploy_catalog() -> tuple[QuickDeployCatalogInfo, tuple[QuickDeployProfile, ...]]:
@@ -324,6 +340,7 @@ def _profile_from_catalog_row(payload: Any) -> QuickDeployProfile | None:
         aa_model_slug=_clean_string(payload.get("aa_model_slug")) or None,
         aa_coding_score=_optional_float(payload.get("aa_coding_score")),
         aa_rank=_positive_int(payload.get("aa_rank")),
+        model_size_label=_clean_string(payload.get("model_size_label")) or None,
         backend=backend,
         model_name=model_name or None,
     )

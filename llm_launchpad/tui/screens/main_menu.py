@@ -27,6 +27,7 @@ from ...core.naming import default_llamacpp_served_model_name, default_served_mo
 from ...core.quick_deploy import (
     QuickDeployCatalogInfo,
     QuickDeployProfile,
+    activate_quick_deploy_catalog,
     format_context_length,
     format_hourly_cost,
     get_quick_deploy_catalog_info,
@@ -34,6 +35,11 @@ from ...core.quick_deploy import (
     quick_deploy_profile_for_plan,
     quick_deploy_model_label_parts,
     resolve_quick_deploy_plans,
+)
+from ...core.quick_deploy_refresh import (
+    ArtificialAnalysisAuthStatus,
+    build_live_quick_deploy_catalog,
+    get_artificial_analysis_auth_status,
 )
 from ...core.storage_costs import (
     MODAL_VOLUME_FREE_TIER_GIB_MONTH,
@@ -166,6 +172,14 @@ class HuggingFaceAuthLoaded(Message):
         self.status = status
 
 
+class ArtificialAnalysisAuthLoaded(Message):
+    """Main-menu Artificial Analysis auth check completed."""
+
+    def __init__(self, status: ArtificialAnalysisAuthStatus) -> None:
+        super().__init__()
+        self.status = status
+
+
 class ModalAuthLoaded(Message):
     """Main-menu Modal auth check completed."""
 
@@ -192,6 +206,27 @@ class PrimeInferencePlansLoaded(Message):
 
 class PrimeInferencePlansLoadFailed(Message):
     """Live Prime inference option lookup failed."""
+
+    def __init__(self, error: str) -> None:
+        super().__init__()
+        self.error = error
+
+
+class QuickDeployCatalogLoaded(Message):
+    """A refreshed Recommended Models catalog was loaded."""
+
+    def __init__(
+        self,
+        info: QuickDeployCatalogInfo,
+        profiles: tuple[QuickDeployProfile, ...],
+    ) -> None:
+        super().__init__()
+        self.info = info
+        self.profiles = profiles
+
+
+class QuickDeployCatalogLoadFailed(Message):
+    """The live Recommended Models refresh failed; keep the bundled catalog."""
 
     def __init__(self, error: str) -> None:
         super().__init__()
@@ -245,15 +280,35 @@ def _render_prime_auth_status(status: PrimeAuthStatus | None = None) -> str:
     return "[yellow]◆ Prime Intellect not authenticated (run: prime login)[/yellow]"
 
 
+def _render_artificial_analysis_auth_status(
+    status: ArtificialAnalysisAuthStatus | None = None,
+) -> str:
+    if status is None:
+        return "[dim]◈ Checking Artificial Analysis auth...[/dim]"
+    if status.authenticated:
+        tier = f" ({_escape_markup(status.tier)} tier)" if status.tier else ""
+        return f"[green]◈ Artificial Analysis authenticated{tier}[/green]"
+    if status.error:
+        color = "red" if "invalid" in status.error.casefold() else "yellow"
+        detail = _escape_markup(_clip(status.error, 72))
+        return f"[{color}]◈ Artificial Analysis auth check failed: {detail}[/{color}]"
+    return (
+        "[yellow]◈ Artificial Analysis not authenticated "
+        "(set: ARTIFICIAL_ANALYSIS_API_KEY)[/yellow]"
+    )
+
+
 def _render_auth_status_block(
     username: str = "",
     modal_status: ModalAuthStatus | None = None,
     hf_status: HuggingFaceAuthStatus | None = None,
     prime_status: PrimeAuthStatus | None = None,
+    aai_status: ArtificialAnalysisAuthStatus | None = None,
 ) -> str:
     lines: list[str] = [_render_modal_auth_status(modal_status)]
     lines.append(_render_prime_auth_status(prime_status))
     lines.append(_render_hf_auth_status(hf_status))
+    lines.append(_render_artificial_analysis_auth_status(aai_status))
     return "\n".join(lines)
 
 
@@ -947,14 +1002,32 @@ def _quick_deploy_group_key(profile: QuickDeployProfile) -> str:
     return label.casefold()
 
 
-def _quick_deploy_group_sort_key(index: int, group: list[QuickDeployProfile]) -> tuple[int, float, int]:
+def _quick_deploy_group_sort_key(
+    index: int,
+    group: list[QuickDeployProfile],
+) -> tuple[int, int, float, int]:
+    size_order = min(
+        (_quick_deploy_size_order(profile.model_size_label) for profile in group),
+        default=3,
+    )
     score = max(
         (profile.aa_coding_score for profile in group if profile.aa_coding_score is not None),
         default=None,
     )
     if score is None:
-        return (1, 0.0, index)
-    return (0, -score, index)
+        return (size_order, 1, 0.0, index)
+    return (size_order, 0, -score, index)
+
+
+def _quick_deploy_size_order(label: str | None) -> int:
+    normalized = (label or "").strip().casefold()
+    if normalized.startswith("compact"):
+        return 0
+    if normalized.startswith("medium"):
+        return 1
+    if normalized.startswith("large"):
+        return 2
+    return 3
 
 
 def _quick_deploy_profile_sort_key(profile: QuickDeployProfile) -> tuple[int, int, float, str]:
@@ -1037,6 +1110,8 @@ def _quick_deploy_header_metrics(profile: QuickDeployProfile) -> str:
     metrics = [format_context_length(profile.max_context_tokens)]
     if profile.aa_coding_score is not None:
         metrics.append(f"AA {_format_coding_index(profile.aa_coding_score)}")
+    if profile.model_size_label:
+        metrics.append(profile.model_size_label)
     return " · ".join(metrics)
 
 
@@ -1176,10 +1251,19 @@ def _quick_deploy_subtitle(info: QuickDeployCatalogInfo) -> str:
     if generated:
         generated = generated.split("T", 1)[0]
     if generated:
+        catalog_origin = "live" if info.is_live else "bundled"
         if info.source_label.casefold().startswith("artificial analysis"):
-            source = f"AA coding rankings, bundled {generated}"
+            benchmark_state = (
+                "cached benchmarks"
+                if "(cached" in info.source_label.casefold()
+                else "fresh benchmarks"
+            )
+            source = (
+                f"AA size leaders ({benchmark_state}), "
+                f"{catalog_origin} {generated}"
+            )
         else:
-            source = f"{info.source_label}, bundled {generated}"
+            source = f"{info.source_label}, {catalog_origin} {generated}"
         return f"Choose an inference option · {source}"
     return f"Choose an inference option · {info.source_label}"
 
@@ -1203,10 +1287,13 @@ class MainMenuScreen(CopyEnabledScreen):
         self._modal_auth_status: ModalAuthStatus | None = None
         self._prime_auth_status: PrimeAuthStatus | None = None
         self._hf_auth_status: HuggingFaceAuthStatus | None = None
+        self._aai_auth_status: ArtificialAnalysisAuthStatus | None = None
         self._hf_auth_refresh_inflight = False
+        self._aai_auth_refresh_inflight = False
         self._modal_auth_refresh_inflight = False
         self._prime_auth_refresh_inflight = False
         self._prime_inference_refresh_inflight = False
+        self._quick_deploy_catalog_refresh_inflight = False
         self._status_refresh_inflight = False
         self._billing_refresh_inflight = False
         self._billing_payload: Any | None = None
@@ -1251,7 +1338,10 @@ class MainMenuScreen(CopyEnabledScreen):
                         yield Static("[bold #7bf168]Provider Billing[/]", id="billing-report-title")
                         yield Static("[dim]Refreshing billing report...[/dim]", id="billing-report-body")
                     with Vertical(id="quick-deploy-panel"):
-                        yield Static("[bold #7bf168]Popular Models[/]", id="landing-quick-deploy-title")
+                        yield Static(
+                            "[bold #7bf168]Recommended Models[/]",
+                            id="landing-quick-deploy-title",
+                        )
                         yield Static(
                             _quick_deploy_subtitle(self._quick_deploy_catalog_info),
                             id="landing-quick-deploy-subtitle",
@@ -1280,12 +1370,68 @@ class MainMenuScreen(CopyEnabledScreen):
         quick_list = self.query_one("#quick-deploy-list", OptionList)
         if quick_list.option_count > 0:
             quick_list.action_first()
+        self._refresh_quick_deploy_catalog()
         self._refresh_modal_auth_status()
         self._refresh_prime_auth_status()
         self._refresh_hf_auth_status()
+        self._refresh_aai_auth_status()
         self._refresh_panels()
         self._refresh_storage_estimate()
         self.set_interval(20.0, self._refresh_panels)
+
+    def _refresh_quick_deploy_catalog(self) -> None:
+        if self._quick_deploy_catalog_refresh_inflight:
+            return
+        self._quick_deploy_catalog_refresh_inflight = True
+        self.query_one("#landing-quick-deploy-subtitle", Static).update(
+            f"{_quick_deploy_subtitle(self._quick_deploy_catalog_info)} · refreshing"
+        )
+        self.run_worker(
+            self._run_refresh_quick_deploy_catalog,
+            name="main-menu-quick-deploy-catalog-worker",
+            thread=True,
+        )
+
+    def _run_refresh_quick_deploy_catalog(self) -> None:
+        try:
+            info, profiles = build_live_quick_deploy_catalog()
+        except Exception as exc:
+            self.post_message(QuickDeployCatalogLoadFailed(error=str(exc)))
+            return
+        self.post_message(QuickDeployCatalogLoaded(info=info, profiles=profiles))
+
+    def on_quick_deploy_catalog_loaded(
+        self,
+        message: QuickDeployCatalogLoaded,
+    ) -> None:
+        self._quick_deploy_catalog_refresh_inflight = False
+        info, profiles = activate_quick_deploy_catalog(
+            message.info,
+            message.profiles,
+        )
+        self._quick_deploy_catalog_info = info
+        self._quick_deploy_profiles = profiles
+        self._modal_quick_deploy_plans = resolve_quick_deploy_plans(
+            self._quick_deploy_profiles
+        )
+        self._quick_deploy_plans = self._modal_quick_deploy_plans
+        self._replace_quick_deploy_options()
+        self.query_one("#landing-quick-deploy-subtitle", Static).update(
+            _quick_deploy_subtitle(self._quick_deploy_catalog_info)
+        )
+        if self._prime_auth_status is not None and self._prime_auth_status.authenticated:
+            self._refresh_prime_inference_plans()
+
+    def on_quick_deploy_catalog_load_failed(
+        self,
+        _: QuickDeployCatalogLoadFailed,
+    ) -> None:
+        self._quick_deploy_catalog_refresh_inflight = False
+        self.query_one("#landing-quick-deploy-subtitle", Static).update(
+            _quick_deploy_subtitle(self._quick_deploy_catalog_info)
+        )
+        if self._prime_auth_status is not None and self._prime_auth_status.authenticated:
+            self._refresh_prime_inference_plans()
 
     def _refresh_modal_auth_status(self) -> None:
         if self._modal_auth_refresh_inflight:
@@ -1297,6 +1443,7 @@ class MainMenuScreen(CopyEnabledScreen):
                 modal_status=self._modal_auth_status,
                 hf_status=self._hf_auth_status,
                 prime_status=self._prime_auth_status,
+                aai_status=self._aai_auth_status,
             )
         )
         self.run_worker(
@@ -1324,6 +1471,7 @@ class MainMenuScreen(CopyEnabledScreen):
                 modal_status=self._modal_auth_status,
                 hf_status=self._hf_auth_status,
                 prime_status=self._prime_auth_status,
+                aai_status=self._aai_auth_status,
             )
         )
 
@@ -1349,10 +1497,12 @@ class MainMenuScreen(CopyEnabledScreen):
                 modal_status=self._modal_auth_status,
                 hf_status=self._hf_auth_status,
                 prime_status=self._prime_auth_status,
+                aai_status=self._aai_auth_status,
             )
         )
         if message.status.authenticated:
-            self._refresh_prime_inference_plans()
+            if not self._quick_deploy_catalog_refresh_inflight:
+                self._refresh_prime_inference_plans()
             self._refresh_prime_billing_report()
         elif self._prime_billing_state != "loaded":
             self._prime_billing_state = "unavailable"
@@ -1445,6 +1595,7 @@ class MainMenuScreen(CopyEnabledScreen):
                 modal_status=self._modal_auth_status,
                 hf_status=self._hf_auth_status,
                 prime_status=self._prime_auth_status,
+                aai_status=self._aai_auth_status,
             )
         )
         self.run_worker(
@@ -1472,6 +1623,46 @@ class MainMenuScreen(CopyEnabledScreen):
                 modal_status=self._modal_auth_status,
                 hf_status=self._hf_auth_status,
                 prime_status=self._prime_auth_status,
+                aai_status=self._aai_auth_status,
+            )
+        )
+
+    def _refresh_aai_auth_status(self) -> None:
+        if self._aai_auth_refresh_inflight:
+            return
+        self._aai_auth_refresh_inflight = True
+        self.run_worker(
+            self._run_load_aai_auth_status,
+            name="main-menu-aai-auth-worker",
+            thread=True,
+        )
+
+    def _run_load_aai_auth_status(self) -> None:
+        poster = getattr(self, "post_message", None)
+        if poster is None:
+            return
+        try:
+            status = get_artificial_analysis_auth_status()
+        except Exception as exc:
+            status = ArtificialAnalysisAuthStatus(
+                authenticated=False,
+                error=str(exc),
+            )
+        poster(ArtificialAnalysisAuthLoaded(status=status))
+
+    def on_artificial_analysis_auth_loaded(
+        self,
+        message: ArtificialAnalysisAuthLoaded,
+    ) -> None:
+        self._aai_auth_refresh_inflight = False
+        self._aai_auth_status = message.status
+        self.query_one("#auth-status-block", Static).update(
+            _render_auth_status_block(
+                username=self.username,
+                modal_status=self._modal_auth_status,
+                hf_status=self._hf_auth_status,
+                prime_status=self._prime_auth_status,
+                aai_status=self._aai_auth_status,
             )
         )
 

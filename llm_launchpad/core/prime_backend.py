@@ -367,6 +367,21 @@ def is_prime_gpu_offer(offer: ComputeOffer) -> bool:
     )
 
 
+def _is_prime_offer_unavailable(stock_status: str | None) -> bool:
+    """Return whether Prime marks an offer as unavailable under a known spelling."""
+
+    normalized = re.sub(r"[^a-z0-9]+", "_", (stock_status or "").casefold()).strip("_")
+    return normalized in {
+        "unavailable",
+        "out_of_stock",
+        "outofstock",
+        "sold_out",
+        "soldout",
+        "not_available",
+        "notavailable",
+    }
+
+
 def supports_prime_image(offer: ComputeOffer, image: str) -> bool:
     """Return whether an availability row advertises one Prime image type."""
 
@@ -418,7 +433,7 @@ def is_compatible_prime_offer(
         and not offer.is_spot
         and not offer.is_variable_price
         and (offer.security or "").casefold() == "secure_cloud"
-        and (offer.stock_status or "available").casefold() != "unavailable"
+        and not _is_prime_offer_unavailable(offer.stock_status)
     )
 
 
@@ -457,7 +472,7 @@ def select_prime_offer(
             raise ValueError(f"Prime offer {offer_id} has variable pricing.")
         if (match.security or "").casefold() != "secure_cloud":
             raise ValueError(f"Prime offer {offer_id} is not secure_cloud.")
-        if (match.stock_status or "available").casefold() == "unavailable":
+        if _is_prime_offer_unavailable(match.stock_status):
             raise ValueError(f"Prime offer {offer_id} is unavailable.")
         return match
 
@@ -477,7 +492,7 @@ def select_prime_offer(
     matches = [
         row for row in matches if prime_offer_satisfies_vram(row, required_vram_gb)
     ]
-    matches = [row for row in matches if (row.stock_status or "available").casefold() != "unavailable"]
+    matches = [row for row in matches if not _is_prime_offer_unavailable(row.stock_status)]
     if not matches:
         raise ValueError(
             f"No secure on-demand Prime GPU offer supporting {required_image} "

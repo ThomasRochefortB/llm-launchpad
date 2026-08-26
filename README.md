@@ -50,7 +50,7 @@ From the TUI you can:
 - Manage multiple deployed instances and inspect their status
 - Integrate the final OpenAI-compatible base URL and model ID into your workflows like OpenCode after deployment.
 
-The Popular Models panel is model-first: each model can have multiple runtime
+The Recommended Models panel is model-first: each model can have multiple runtime
 recipes and each recipe can receive quotes from any compatible provider adapter.
 Quotes normalize GPU shape, availability, hourly price, billing model, and a
 workload-based monthly estimate. Existing Quick Deploy bundles supply the
@@ -58,6 +58,25 @@ curated recipes and Modal estimates; both llama.cpp and vLLM recipes can also
 use live Prime Intellect offers through the same plan-to-deployment path. Prime
 CPU rows are excluded, and live GPU options are filtered per model using its
 estimated VRAM requirement plus safety headroom.
+
+When the TUI opens, it renders the bundled catalog immediately, then rebuilds
+Recommended Models in the background. With `ARTIFICIAL_ANALYSIS_API_KEY` set, it
+selects the strongest deployable open-weight model in three capability bands
+(Compact ≤40B, Medium 40–150B, and Large >150B), ranked primarily by Artificial
+Analysis coding and agentic scores. Hugging Face verifies matching GGUF weights
+and memory requirements, while Modal supplies current GPU availability and
+pricing.
+
+Artificial Analysis responses are cached for 24 hours under
+`~/.llm_launchpad/artificial_analysis_models.json`; the API key is read only
+from the environment and is never persisted. A one-way key fingerprint lets
+the TUI reuse a recent successful validation safely. The authentication footer
+shows the AAI status and account tier alongside Modal, Prime Intellect, and
+Hugging Face. Modal prices and Hugging Face GGUF metadata are still refreshed
+on each launch. Free AAI keys are supported, with model size inferred when the
+free response omits parameter counts. Without a key or cached AAI response,
+startup falls back to Hugging Face trending GGUF models; fully offline launches
+keep the bundled catalog.
 
 ## Headless CLI examples
 

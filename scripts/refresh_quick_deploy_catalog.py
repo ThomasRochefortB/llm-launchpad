@@ -22,8 +22,8 @@ from llm_launchpad.core.quick_deploy import (
     KIMI_K25_SERVER_ARGS,
     QWEN35_397B_SERVER_ARGS,
 )
+from llm_launchpad.core.quick_deploy_refresh import fetch_artificial_analysis_models
 
-AA_LLM_MODELS_URL = "https://artificialanalysis.ai/api/v2/data/llms/models"
 CATALOG_PATH = Path(__file__).resolve().parents[1] / "llm_launchpad" / "data" / "quick_deploy_catalog.json"
 ATTRIBUTION = "Benchmark data sourced from Artificial Analysis: https://artificialanalysis.ai/"
 POPULAR_ATTRIBUTION = (
@@ -211,19 +211,7 @@ class ResourceSelection(NamedTuple):
 
 def fetch_aa_llm_models(api_key: str, timeout: float = 20.0) -> dict[str, Any]:
     """Fetch AA LLM benchmark data using the maintainer API key."""
-    import requests
-
-    response = requests.get(
-        AA_LLM_MODELS_URL,
-        headers={"x-api-key": api_key, "Accept": "application/json"},
-        timeout=timeout,
-    )
-    if response.status_code >= 400:
-        raise RuntimeError(f"Artificial Analysis API returned HTTP {response.status_code}")
-    payload = response.json()
-    if not isinstance(payload, dict):
-        raise RuntimeError("Artificial Analysis API returned a non-object payload")
-    return payload
+    return fetch_artificial_analysis_models(api_key, timeout=timeout)
 
 
 def normalize_aa_candidates(payload: Any, limit: int = 50) -> list[AAModelCandidate]:
