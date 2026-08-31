@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-08-23T21:32:41Z",
+  "generated_at": "2026-08-31T17:38:00Z",
   "source": "Curated popular open-weight models",
   "attribution": "Model metadata sourced from Hugging Face: https://huggingface.co/unsloth",
   "profiles": [
@@ -68,16 +68,16 @@
       "required_vram_gb": 21.0
     },
     {
-      "id": "qwen3-8-27b-q4xl-cheap-l4",
+      "id": "qwen3-8-27b-q4xl-cheap-t4",
       "display_name": "Qwen3.8 27B",
       "repo_id": "unsloth/Qwen3.8-27B-GGUF",
       "quant": "UD-Q4_K_XL",
-      "gpu_type": "L4",
+      "gpu_type": "T4",
       "gpu_count": 2,
       "profile_label": "Slow but cheap",
       "resource_tier": "cheap",
       "resource_tier_label": "$",
-      "approx_cost_per_hour_usd": 1.6,
+      "approx_cost_per_hour_usd": 1.18,
       "max_context_tokens": 131072,
       "instance_slug_hint": "qwen3-8-27b-q4xl-cheap",
       "summary": "Curated popular open-weight model with verified llama.cpp GGUF weights.",
