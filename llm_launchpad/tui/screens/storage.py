@@ -7,6 +7,7 @@ from textual.actions import SkipAction
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.widget import Widget
 from textual.widgets import DataTable, Footer, Input, OptionList, Static
 from textual.widgets.option_list import Option
@@ -25,6 +26,8 @@ from ..navigation import (
     move_focus_across_widgets,
 )
 from ..workers import StorageFailed, StorageLoaded
+from ..responsive import ViewportProfile, WidthMode
+from ..widgets.adaptive_table import AdaptiveColumn, AdaptiveDataTable
 from .copy_enabled import CopyEnabledScreen
 
 
@@ -62,6 +65,87 @@ def _model_label(row: StoredModelInfo) -> str:
     return row.model_id
 
 
+def _storage_row_key(row: StoredModelInfo) -> str:
+    """Build a stable identity that survives table presentation changes."""
+    return ":".join(
+        (
+            row.backend.value,
+            row.model_id,
+            row.revision or "",
+            row.quant or "",
+        )
+    )
+
+
+_WIDE = WidthMode.WIDE
+_STANDARD = WidthMode.STANDARD
+_COMPACT = WidthMode.COMPACT
+_MINIMAL = WidthMode.MINIMAL
+
+_STORAGE_COLUMNS = (
+    AdaptiveColumn.visible(
+        "backend",
+        "backend",
+        lambda row: row.backend.value,
+        _WIDE,
+        _STANDARD,
+    ),
+    AdaptiveColumn.visible(
+        "model",
+        "model",
+        _model_label,
+        _WIDE,
+        _STANDARD,
+        _COMPACT,
+        _MINIMAL,
+    ),
+    AdaptiveColumn.visible(
+        "revision",
+        "revision",
+        lambda row: row.revision or "-",
+        _WIDE,
+    ),
+    AdaptiveColumn.visible(
+        "quant",
+        "quant",
+        lambda row: row.quant or "-",
+        _WIDE,
+        _STANDARD,
+    ),
+    AdaptiveColumn.visible(
+        "files",
+        "files",
+        lambda row: str(row.file_count),
+        _WIDE,
+    ),
+    AdaptiveColumn.visible(
+        "size",
+        "size",
+        lambda row: _human_bytes(row.size_bytes),
+        _WIDE,
+        _STANDARD,
+        _COMPACT,
+    ),
+    AdaptiveColumn.visible(
+        "cost",
+        "list $/mo",
+        lambda row: f"{_format_money(gross_monthly_storage_cost_usd(row.size_bytes))}/mo",
+        _WIDE,
+        _STANDARD,
+        _COMPACT,
+    ),
+    AdaptiveColumn.visible(
+        "summary",
+        "details",
+        lambda row: (
+            f"{row.backend.value} · {_human_bytes(row.size_bytes)} · "
+            f"{_format_money(gross_monthly_storage_cost_usd(row.size_bytes))}/mo"
+        ),
+        _MINIMAL,
+    ),
+)
+
+
 def _is_focusable_for_arrow_navigation(widget: Widget) -> bool:
     return is_focusable_for_navigation(widget, check_size=True)
 
@@ -92,7 +176,7 @@ class StorageScreen(CopyEnabledScreen):
         self._initial_backend = initial_backend
 
     def compose(self) -> ComposeResult:
-        with VerticalScroll(id="menu-container"):
+        with VerticalScroll(classes="screen-scroll"):
             yield Static("[bold #7bf168]Storage[/]  [dim]Cached models and pre-download[/dim]")
             yield Static("[dim]Storage status appears here.[/dim]", id="storage-status")
             yield Static("")
@@ -114,7 +198,7 @@ class StorageScreen(CopyEnabledScreen):
                 )
             yield Static("")
             yield Static("[bold]Model inventory[/bold]")
-            yield DataTable(id="storage-table")
+            yield AdaptiveDataTable(id="storage-table")
             yield Static("[dim]Tip: select a row to prefill model fields.[/dim]", id="storage-hint")
             yield Static("")
             yield Input(placeholder="Model id (e.g. Qwen/Qwen3-4B-Thinking-2507-FP8)", id="storage-model-id")
@@ -134,10 +218,14 @@ class StorageScreen(CopyEnabledScreen):
         self._selected_model: StoredModelInfo | None = None
         self._was_suspended = False
         self._initial_focus_pending = True
-        table = self.query_one("#storage-table", DataTable)
+        table = self.query_one("#storage-table", AdaptiveDataTable)
         table.cursor_type = "row"
         table.zebra_stripes = True
-        table.add_columns("backend", "model", "revision", "quant", "files", "size", "list $/mo")
+        table.configure(
+            _STORAGE_COLUMNS,
+            row_key=_storage_row_key,
+            profile=self.viewport_profile,
+        )
         if self._initial_backend is not None:
             self.query_one("#storage-model-backend", Input).value = self._initial_backend.value
         backend_filter = self.query_one("#storage-backend-filter", OptionList)
@@ -161,6 +249,19 @@ class StorageScreen(CopyEnabledScreen):
         if self._was_suspended:
             self._was_suspended = False
             self._refresh_storage_snapshot()
+
+    def viewport_profile_changed(
+        self,
+        profile: ViewportProfile,
+        previous: ViewportProfile | None,
+    ) -> None:
+        """Change table columns while keeping the highlighted model."""
+        _ = previous
+        try:
+            table = self.query_one("#storage-table", AdaptiveDataTable)
+        except NoMatches:
+            return
+        table.set_viewport_profile(profile)
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option_list.id == "storage-backend-filter":
@@ -213,27 +314,12 @@ class StorageScreen(CopyEnabledScreen):
         )
 
     def _render_table(self) -> None:
-        table = self.query_one("#storage-table", DataTable)
-        table.clear(columns=False)
-        self._rows_by_key = {}
-
+        table = self.query_one("#storage-table", AdaptiveDataTable)
         rows = self._snapshot.llamacpp_models + self._snapshot.vllm_models
         if self._selected_filter is not None:
             rows = [row for row in rows if row.backend == self._selected_filter]
-
-        for index, row in enumerate(rows):
-            row_key = f"{row.backend.value}:{index}:{row.model_id}"
-            self._rows_by_key[row_key] = row
-            table.add_row(
-                row.backend.value,
-                _model_label(row),
-                row.revision or "-",
-                row.quant or "-",
-                str(row.file_count),
-                _human_bytes(row.size_bytes),
-                f"{_format_money(gross_monthly_storage_cost_usd(row.size_bytes))}/mo",
-                key=row_key,
-            )
+        self._rows_by_key = {_storage_row_key(row): row for row in rows}
+        table.set_rows(rows)
 
     def _apply_row_selection(self, row_key: str) -> None:
         selected = self._rows_by_key.get(row_key)

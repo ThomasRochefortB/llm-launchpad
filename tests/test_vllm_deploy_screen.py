@@ -15,6 +15,7 @@ from llm_launchpad.tui.screens.deploy import (
     GpuTypesLoaded,
     PrimeOffersLoaded,
     VllmDeployScreen,
+    VllmMemoryFailed,
     VllmMemoryLoaded,
 )
 from llm_launchpad.tui.workers import StorageLoaded, VllmModelsLoaded
@@ -52,6 +53,66 @@ class _TestApp(App[None]):
 
 
 class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
+    async def test_qwen_model_prefills_tool_parser_and_deploys_while_advanced_hidden(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+            screen.query_one("#model-name", Input).value = "Qwen/Qwen3-0.6B"
+            await pilot.pause()
+
+            parser_input = screen.query_one("#tool-call-parser", Input)
+            self.assertEqual(parser_input.value, "hermes")
+            self.assertIsNotNone(parser_input.parent)
+            assert parser_input.parent is not None
+            self.assertTrue(parser_input.parent.has_class("hidden"))
+            screen._do_deploy()
+
+            self.assertIsNotNone(app.deployed_config)
+            self.assertEqual(app.deployed_config.tool_call_parser, "hermes")
+
+    async def test_explicit_tool_parser_clear_is_preserved_across_qwen_model_change(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+            model_input = screen.query_one("#model-name", Input)
+            parser_input = screen.query_one("#tool-call-parser", Input)
+            model_input.value = "Qwen/Qwen3-0.6B"
+            await pilot.pause()
+            self.assertEqual(parser_input.value, "hermes")
+
+            parser_input.value = ""
+            await pilot.pause()
+            model_input.value = "Qwen/Qwen3-1.7B"
+            await pilot.pause()
+
+            self.assertEqual(parser_input.value, "")
+
+    async def test_qwen3_coder_prefills_xml_tool_parser(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+            screen.query_one("#model-name", Input).value = (
+                "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+            )
+            await pilot.pause()
+
+            self.assertEqual(
+                screen.query_one("#tool-call-parser", Input).value,
+                "qwen3_xml",
+            )
+
     async def test_down_from_rank_mode_last_option_moves_focus_to_model_list(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:
@@ -657,7 +718,7 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 assert isinstance(screen, VllmDeployScreen)
                 screen.query_one("#model-name", Input).value = "Qwen/Qwen3-8B"
                 screen.query_one("#n-gpu", Input).value = "2"
-                await pilot.pause()
+                await pilot.pause(0.4)
 
                 text = str(screen.query_one("#vllm-vram-status", Static).content)
                 self.assertIn("Estimated VRAM", text)
@@ -673,10 +734,60 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 screen = app.screen
                 assert isinstance(screen, VllmDeployScreen)
                 screen.query_one("#model-name", Input).value = "custom/model-no-metadata"
-                await pilot.pause()
+                await pilot.pause(0.4)
 
                 text = str(screen.query_one("#vllm-vram-status", Static).content)
                 self.assertIn("N/A", text)
+
+    async def test_vllm_model_input_debounces_partial_memory_lookups(self) -> None:
+        app = _TestApp()
+        estimate = VllmMemoryBreakdown(
+            total_gb=24.0,
+            weights_gb=20.0,
+            kv_cache_gb=2.0,
+            overhead_gb=2.0,
+            context_tokens=8192,
+        )
+        with patch(
+            "llm_launchpad.tui.screens.deploy.fetch_vllm_memory_breakdown",
+            return_value=estimate,
+        ) as fetch_memory:
+            async with app.run_test() as pilot:
+                app.push_screen(VllmDeployScreen())
+                await pilot.pause()
+                screen = app.screen
+                assert isinstance(screen, VllmDeployScreen)
+                model_input = screen.query_one("#model-name", Input)
+
+                for value in ("Qwe", "Qwen/", "Qwen/Qwen3", "Qwen/Qwen3-8B"):
+                    model_input.value = value
+                    await pilot.pause(0.05)
+                await pilot.pause(0.4)
+
+                fetch_memory.assert_called_once_with(
+                    repo_id="Qwen/Qwen3-8B",
+                    revision=None,
+                )
+
+    async def test_stale_memory_failure_does_not_replace_current_model_status(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+            screen.query_one("#model-name", Input).value = "Qwen/current-model"
+            screen._model_to_memory_estimate = {}
+
+            screen.on_vllm_memory_failed(
+                VllmMemoryFailed(
+                    repo_id="Qwen/previous-model",
+                    revision=None,
+                    error="not found",
+                )
+            )
+
+            self.assertEqual(screen._model_to_memory_estimate, {})
 
     async def test_prime_offers_exclude_cpu_and_follow_model_memory(self) -> None:
         app = _TestApp()

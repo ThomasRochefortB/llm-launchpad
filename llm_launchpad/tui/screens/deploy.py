@@ -13,6 +13,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
+from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import (
     Button,
@@ -26,6 +27,7 @@ from textual.widgets import (
 from textual.widgets.option_list import Option
 
 from ...core.hf_models import ModelCandidate, VllmMemoryBreakdown, fetch_vllm_memory_breakdown
+from ...core.inference_options import recommended_vllm_tool_call_parser
 from ...core.modal_gpu import ModalGpuSpec, fetch_modal_gpu_catalog
 from ...core.naming import (
     auto_instance_name_for_backend,
@@ -66,6 +68,21 @@ from ..workers import (
 )
 from ..widgets.input_form import FormField, ToggleField
 from .copy_enabled import CopyEnabledScreen
+
+
+_MODEL_LOOKUP_DEBOUNCE_SECONDS = 0.35
+
+
+def _is_plausible_model_lookup(value: str) -> bool:
+    """Return whether a partial model value is worth resolving remotely."""
+    normalized = value.strip()
+    owner, separator, model = normalized.partition("/")
+    return bool(
+        separator
+        and owner
+        and model
+        and not any(character.isspace() for character in normalized)
+    )
 
 
 class GpuTypesLoaded(Message):
@@ -294,8 +311,8 @@ class BackendSelectScreen(CopyEnabledScreen):
     ]
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="menu-container"):
-            yield Static("[bold #7bf168]Deploy[/]  [dim]Step 1: Choose backend[/dim]")
+        with VerticalScroll(classes="screen-scroll"):
+            yield Static("[bold #7bf168]Custom deploy[/]  [dim]Step 1: Choose backend[/dim]")
             yield Static("")
             yield OptionList(
                 Option("  llama.cpp (GGUF) ( Recommended )", id="llamacpp"),
@@ -356,8 +373,8 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
     )
 
     def compose(self) -> ComposeResult:
-        with VerticalScroll(id="menu-container"):
-            yield Static("[bold #7bf168]Deploy llama.cpp[/]  [dim]Step 2: Model & options[/dim]")
+        with VerticalScroll(classes="screen-scroll"):
+            yield Static("[bold #7bf168]Custom deploy llama.cpp[/]  [dim]Step 2: Model & options[/dim]")
             yield Static("")
 
             yield Static("[bold]Model ranking[/bold]  [dim](Top 10 GGUF text-generation models)[/dim]")
@@ -431,9 +448,16 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
             yield Button("Advanced options...", id="toggle-advanced-llama", variant="default")
             yield ToggleField("Warm up after deploy", "warmup", default=True, classes="llama-advanced")
             yield FormField("HF revision (optional)", "revision", classes="llama-advanced")
+            yield ToggleField(
+                "Attach persistent cache disk",
+                "prime-auto-disk-llama",
+                default=True,
+                classes="llama-advanced prime-only",
+            )
             yield FormField(
-                "Existing Prime disk ID (optional)",
+                "Prime disk ID (optional)",
                 "prime-disk-id-llama",
+                hint="Leave blank to auto-attach a persistent cache disk",
                 classes="llama-advanced prime-only",
             )
             yield ToggleField(
@@ -504,7 +528,12 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
         self._has_cached_snapshot = False
         self._repo_to_quants: dict[str, tuple[str, ...]] = {}
         self._repo_to_quant_vram: dict[str, dict[str, float]] = {}
+        self._repo_to_architecture: dict[tuple[str, str], str | None] = {}
+        self._repo_to_compatibility: dict[
+            tuple[str, str], tuple[str, str, str | None]
+        ] = {}
         self._last_quant_lookup: tuple[str, str] | None = None
+        self._quant_lookup_timer: Timer | None = None
         self._updating_quant_input = False
         self._quant_touched = False
         self._selected_gpu_type = DEFAULT_GPU_TYPE
@@ -576,7 +605,7 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
         if event.input.id in {"repo-id", "instance-name-llama", "app-name-llama"}:
             self._refresh_app_preview()
         if event.input.id in {"repo-id", "revision"}:
-            self._lookup_quantizations_for_current_repo()
+            self._schedule_quantization_lookup()
         if event.input.id in {"repo-id", "quant"} and self._prime_offers:
             self._refresh_prime_offer_options()
 
@@ -767,11 +796,39 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
         repo_key = current_repo.casefold()
         self._repo_to_quants[repo_key] = tuple(message.quantizations)
         self._repo_to_quant_vram[repo_key] = _normalize_vram_map(message.vram_gb_by_quant)
+        metadata_key = (repo_key, (message.revision or "").strip())
+        self._repo_to_architecture[metadata_key] = message.architecture
+        self._repo_to_compatibility[metadata_key] = (
+            message.compatibility_status,
+            message.compatibility_message,
+            message.llamacpp_runtime_id,
+        )
         self._apply_quantizations(
             self._display_quantizations_for_repo(repo_key, list(message.quantizations)),
             auto_select=not self._quant_touched,
             vram_gb_by_quant=self._repo_to_quant_vram[repo_key],
         )
+        architecture_label = message.architecture or "unknown"
+        if message.compatibility_status == "supported":
+            self._set_quant_status(
+                "[dim]Quantizations:[/dim] "
+                f"[green]Compatible architecture={architecture_label}[/green]"
+            )
+        elif message.compatibility_status == "unsupported":
+            self._set_quant_status(
+                "[dim]Quantizations:[/dim] "
+                f"[red]Unsupported architecture {architecture_label}:[/red] "
+                f"{message.compatibility_message}"
+            )
+        else:
+            detail = (
+                message.compatibility_message
+                or "GGUF architecture metadata was not available."
+            )
+            self._set_quant_status(
+                f"[dim]Quantizations:[/dim] "
+                f"[yellow]Compatibility unknown:[/yellow] {detail}"
+            )
         if self._prime_offers:
             self._refresh_prime_offer_options()
 
@@ -816,6 +873,16 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
         config.required_vram_gb = self._current_llamacpp_required_vram()
         rev = self.query_one("#revision", Input).value.strip()
         config.revision = rev or None
+        repo_key = (config.repo_id or "").casefold()
+        metadata_key = (repo_key, rev)
+        config.gguf_architecture = self._repo_to_architecture.get(metadata_key)
+        compatibility = self._repo_to_compatibility.get(metadata_key)
+        if compatibility is not None:
+            status, message, runtime_id = compatibility
+            config.llamacpp_runtime_id = runtime_id
+            if status == "unsupported":
+                self.app.notify(message, severity="error", timeout=8)
+                return
 
         config.preload = False
         config.do_deploy = True
@@ -856,6 +923,7 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
                 keep_failed_resource=self.query_one(
                     "#prime-keep-failed-llama", Switch
                 ).value,
+                auto_disk=self.query_one("#prime-auto-disk-llama", Switch).value,
             )
 
         # Advanced
@@ -973,6 +1041,7 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
         return list(cached_quants)
 
     def _lookup_quantizations_for_current_repo(self, force_refresh: bool = False) -> None:
+        self._cancel_quantization_lookup()
         repo_id = self.query_one("#repo-id", Input).value.strip()
         revision = self.query_one("#revision", Input).value.strip()
         if not repo_id:
@@ -1000,6 +1069,33 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
 
         self._set_quant_status("[dim]Loading quantizations...[/dim]")
         self.app.begin_fetch_llamacpp_quants(repo_id, revision or None, self)  # type: ignore[attr-defined]
+
+    def _cancel_quantization_lookup(self) -> None:
+        timer = self._quant_lookup_timer
+        self._quant_lookup_timer = None
+        if timer is not None:
+            timer.stop()
+
+    def _schedule_quantization_lookup(self) -> None:
+        """Debounce remote GGUF metadata lookups while the user is typing."""
+        self._cancel_quantization_lookup()
+        repo_id = self.query_one("#repo-id", Input).value.strip()
+        if not repo_id:
+            self._lookup_quantizations_for_current_repo()
+            return
+        if not _is_plausible_model_lookup(repo_id):
+            self._last_quant_lookup = None
+            self._set_quant_status("[dim]Quantizations: finish entering the repo-id[/dim]")
+            return
+        self._quant_lookup_timer = self.set_timer(
+            _MODEL_LOOKUP_DEBOUNCE_SECONDS,
+            self._run_scheduled_quantization_lookup,
+            name="llamacpp-quantization-lookup-debounce",
+        )
+
+    def _run_scheduled_quantization_lookup(self) -> None:
+        self._quant_lookup_timer = None
+        self._lookup_quantizations_for_current_repo()
 
     def _apply_quantizations(
         self,
@@ -1143,6 +1239,7 @@ class VllmDeployScreen(CopyEnabledScreen):
         "show-debug-logs-vllm",
         "served-model-name",
         "reasoning-parser",
+        "tool-call-parser",
         "chat-template-kwargs",
         "instance-name-vllm",
         "app-name-vllm",
@@ -1150,8 +1247,8 @@ class VllmDeployScreen(CopyEnabledScreen):
     )
 
     def compose(self) -> ComposeResult:
-        with VerticalScroll(id="menu-container"):
-            yield Static("[bold #7bf168]Deploy vLLM[/]  [dim]Step 2: Model & options[/dim]")
+        with VerticalScroll(classes="screen-scroll"):
+            yield Static("[bold #7bf168]Custom deploy vLLM[/]  [dim]Step 2: Model & options[/dim]")
             yield Static("")
 
             yield Static("[bold]Model ranking[/bold]  [dim](Top 10 text-generation models)[/dim]")
@@ -1226,9 +1323,16 @@ class VllmDeployScreen(CopyEnabledScreen):
                 hint="Leave blank to use default branch",
                 classes="vllm-advanced",
             )
+            yield ToggleField(
+                "Attach persistent cache disk",
+                "prime-auto-disk",
+                default=True,
+                classes="vllm-advanced prime-only",
+            )
             yield FormField(
-                "Existing Prime disk ID (optional)",
+                "Prime disk ID (optional)",
                 "prime-disk-id",
+                hint="Leave blank to auto-attach a persistent cache disk",
                 classes="vllm-advanced prime-only",
             )
             yield ToggleField(
@@ -1322,8 +1426,12 @@ class VllmDeployScreen(CopyEnabledScreen):
         self._served_alias_touched = False
         self._updating_served_alias = False
         self._last_auto_served_alias = ""
+        self._tool_call_parser_touched = False
+        self._updating_tool_call_parser = False
+        self._last_auto_tool_call_parser = ""
         self._model_to_memory_estimate: dict[str, VllmMemoryBreakdown | None] = {}
         self._last_memory_lookup: tuple[str, str] | None = None
+        self._memory_lookup_timer: Timer | None = None
         for widget in self.query(".vllm-advanced"):
             widget.add_class("hidden")
         for widget in self.query(".prime-only"):
@@ -1336,6 +1444,7 @@ class VllmDeployScreen(CopyEnabledScreen):
         self._set_model_status("[dim]Loading cached models from storage...[/dim]")
         self._refresh_cached_models_from_storage()
         self._sync_served_alias_from_model(force=True)
+        self._sync_tool_call_parser_from_model(force=True)
         self._refresh_app_preview()
         self._refresh_vllm_memory_status()
 
@@ -1383,13 +1492,18 @@ class VllmDeployScreen(CopyEnabledScreen):
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "model-name":
             self._sync_served_alias_from_model()
-            self._refresh_vllm_memory_status()
+            self._sync_tool_call_parser_from_model()
+            self._schedule_vllm_memory_refresh()
         elif event.input.id == "model-revision":
-            self._refresh_vllm_memory_status()
+            self._schedule_vllm_memory_refresh()
         elif event.input.id == "n-gpu":
             self._refresh_vllm_memory_status(from_cache_only=True)
         elif event.input.id == "served-model-name" and not self._updating_served_alias:
             self._served_alias_touched = event.input.value.strip() != self._last_auto_served_alias
+        elif event.input.id == "tool-call-parser" and not self._updating_tool_call_parser:
+            self._tool_call_parser_touched = (
+                event.input.value.strip() != self._last_auto_tool_call_parser
+            )
         if event.input.id in {"model-name", "instance-name-vllm", "app-name-vllm"}:
             self._refresh_app_preview()
         if event.input.id in {"model-name", "model-revision"} and self._prime_offers:
@@ -1542,6 +1656,29 @@ class VllmDeployScreen(CopyEnabledScreen):
             self._updating_served_alias = False
         self._last_auto_served_alias = next_alias
 
+    def _sync_tool_call_parser_from_model(self, force: bool = False) -> None:
+        """Prefill known-safe tool calling without overwriting a user choice."""
+
+        parser_input = self.query_one("#tool-call-parser", Input)
+        next_parser = recommended_vllm_tool_call_parser(
+            self.query_one("#model-name", Input).value
+        ) or ""
+        current_parser = parser_input.value.strip()
+        should_update = (
+            force
+            or not self._tool_call_parser_touched
+            or current_parser == self._last_auto_tool_call_parser
+        )
+        if not should_update or current_parser == next_parser:
+            self._last_auto_tool_call_parser = next_parser
+            return
+        self._updating_tool_call_parser = True
+        try:
+            parser_input.value = next_parser
+        finally:
+            self._updating_tool_call_parser = False
+        self._last_auto_tool_call_parser = next_parser
+
     def on_vllm_models_loaded(self, message: VllmModelsLoaded) -> None:
         if message.mode != self._rank_mode:
             return
@@ -1666,6 +1803,8 @@ class VllmDeployScreen(CopyEnabledScreen):
         )
 
     def _refresh_vllm_memory_status(self, from_cache_only: bool = False) -> None:
+        if not from_cache_only:
+            self._cancel_vllm_memory_refresh()
         repo_id, revision = self._current_memory_lookup()
         if not repo_id:
             self._set_vllm_memory_status("[dim]Estimated VRAM: enter model name to compute[/dim]")
@@ -1689,6 +1828,33 @@ class VllmDeployScreen(CopyEnabledScreen):
             thread=True,
         )
 
+    def _cancel_vllm_memory_refresh(self) -> None:
+        timer = self._memory_lookup_timer
+        self._memory_lookup_timer = None
+        if timer is not None:
+            timer.stop()
+
+    def _schedule_vllm_memory_refresh(self) -> None:
+        """Debounce remote vLLM metadata lookups while the model field changes."""
+        self._cancel_vllm_memory_refresh()
+        repo_id, _revision = self._current_memory_lookup()
+        if not repo_id:
+            self._refresh_vllm_memory_status()
+            return
+        if not _is_plausible_model_lookup(repo_id):
+            self._last_memory_lookup = None
+            self._set_vllm_memory_status("[dim]Estimated VRAM: finish entering the model name[/dim]")
+            return
+        self._memory_lookup_timer = self.set_timer(
+            _MODEL_LOOKUP_DEBOUNCE_SECONDS,
+            self._run_scheduled_vllm_memory_refresh,
+            name="vllm-memory-lookup-debounce",
+        )
+
+    def _run_scheduled_vllm_memory_refresh(self) -> None:
+        self._memory_lookup_timer = None
+        self._refresh_vllm_memory_status()
+
     def _run_fetch_vllm_memory(self, repo_id: str, revision: str | None) -> None:
         poster = getattr(self, "post_message", None)
         if poster is None:
@@ -1710,11 +1876,13 @@ class VllmDeployScreen(CopyEnabledScreen):
         if self._prime_offers:
             self._refresh_prime_offer_options()
 
-    def on_vllm_memory_failed(self, _: VllmMemoryFailed) -> None:
+    def on_vllm_memory_failed(self, message: VllmMemoryFailed) -> None:
         current_repo, current_revision = self._current_memory_lookup()
         if not current_repo:
             return
-        cache_key = self._memory_cache_key(current_repo, current_revision)
+        cache_key = self._memory_cache_key(message.repo_id, message.revision)
+        if self._memory_cache_key(current_repo, current_revision) != cache_key:
+            return
         self._model_to_memory_estimate.setdefault(cache_key, None)
         self._render_vllm_memory_status(None)
         if self._prime_offers:
@@ -1769,6 +1937,7 @@ class VllmDeployScreen(CopyEnabledScreen):
                 disk_id=self.query_one("#prime-disk-id", Input).value.strip() or None,
                 allow_insecure_http=allow_insecure_http,
                 keep_failed_resource=self.query_one("#prime-keep-failed", Switch).value,
+                auto_disk=self.query_one("#prime-auto-disk", Switch).value,
             )
         alias = self.query_one("#served-model-name", Input).value.strip()
         config.served_model_name = alias or default_served_model_name(config.model_name)
@@ -1783,9 +1952,9 @@ class VllmDeployScreen(CopyEnabledScreen):
             except ValueError:
                 config.n_gpu = 1
         adv_visible = not self.query(".vllm-advanced").first().has_class("hidden")
+        config.tool_call_parser = self.query_one("#tool-call-parser", Input).value.strip() or None
         if adv_visible:
             config.reasoning_parser = self.query_one("#reasoning-parser", Input).value.strip() or None
-            config.tool_call_parser = self.query_one("#tool-call-parser", Input).value.strip() or None
         kwargs_raw = self.query_one("#chat-template-kwargs", Input).value.strip() if adv_visible else ""
         if kwargs_raw:
             try:

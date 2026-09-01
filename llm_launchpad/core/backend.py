@@ -21,7 +21,7 @@ from .shutdown import is_shutting_down as _is_shutting_down
 from .shutdown import shutdown_event
 from .naming import default_served_model_name
 from .naming import infer_backend_from_app_name, infer_instance_from_app_name, legacy_app_name
-from .naming import modal_function_name
+from .naming import modal_function_name, modal_web_label
 
 
 @dataclass(frozen=True)
@@ -134,11 +134,6 @@ class ModalBackend:
             except Exception:
                 pass
 
-    @classmethod
-    def is_shutting_down(cls) -> bool:
-        """Return True if a shutdown has been requested."""
-        return _is_shutting_down()
-
     # ------------------------------------------------------------------
     # Pre-flight checks
     # ------------------------------------------------------------------
@@ -163,7 +158,13 @@ class ModalBackend:
         app_name: Optional[str] = None,
         function_slug: Optional[str] = None,
     ) -> str:
-        resolved = app_name or legacy_app_name(backend or BackendType.LLAMACPP)
+        resolved_backend = backend or infer_backend_from_app_name(app_name or "")
+        if resolved_backend is None:
+            resolved_backend = BackendType.LLAMACPP
+        resolved = app_name or legacy_app_name(resolved_backend)
+        if resolved_backend == BackendType.LLAMACPP and function_slug:
+            label = modal_web_label(resolved, function_slug)
+            return f"https://{username}--{label}.modal.run"
         serve_name = modal_function_name("serve", function_slug)
         return f"https://{username}--{resolved}-{serve_name}.modal.run"
 

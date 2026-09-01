@@ -20,9 +20,11 @@ from .inference_options import (
     InferenceProviderAdapter,
     ModalCatalogOption,
     ModalInferenceAdapter,
+    recommended_vllm_tool_call_parser,
     resolve_inference_plans,
 )
 from .naming import build_deployment_name, infer_instance_from_app_name, slugify_instance_name
+from .runtime_support import evaluate_llamacpp_architecture
 
 
 @dataclass(frozen=True)
@@ -49,10 +51,13 @@ class QuickDeployProfile:
     aa_model_name: str | None = None
     aa_model_slug: str | None = None
     aa_coding_score: float | None = None
+    aa_intelligence_score: float | None = None
     aa_rank: int | None = None
     model_size_label: str | None = None
     backend: BackendType = BackendType.LLAMACPP
     model_name: str | None = None
+    gguf_architecture: str | None = None
+    llamacpp_runtime_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -254,19 +259,27 @@ def _profiles_from_catalog_payload(
     if not isinstance(raw_profiles, list):
         return None
 
+    schema_version = _positive_int(payload.get("schema_version")) or 1
     profiles: list[QuickDeployProfile] = []
     seen_ids: set[str] = set()
     for raw_profile in raw_profiles:
         profile = _profile_from_catalog_row(raw_profile)
         if profile is None or profile.id in seen_ids:
             continue
+        if profile.backend == BackendType.LLAMACPP and schema_version >= 2:
+            compatibility = evaluate_llamacpp_architecture(profile.gguf_architecture)
+            if not compatibility.is_supported:
+                continue
         seen_ids.add(profile.id)
         profiles.append(profile)
 
     if not profiles:
         return None
 
-    source = _clean_string(payload.get("source")) or "Artificial Analysis coding rankings"
+    source = (
+        _clean_string(payload.get("source"))
+        or "Artificial Analysis Intelligence Index rankings"
+    )
     generated_at = _clean_string(payload.get("generated_at")) or None
     attribution = _clean_string(payload.get("attribution")) or None
     info = QuickDeployCatalogInfo(
@@ -339,10 +352,13 @@ def _profile_from_catalog_row(payload: Any) -> QuickDeployProfile | None:
         aa_model_name=_clean_string(payload.get("aa_model_name")) or None,
         aa_model_slug=_clean_string(payload.get("aa_model_slug")) or None,
         aa_coding_score=_optional_float(payload.get("aa_coding_score")),
+        aa_intelligence_score=_optional_float(payload.get("aa_intelligence_score")),
         aa_rank=_positive_int(payload.get("aa_rank")),
         model_size_label=_clean_string(payload.get("model_size_label")) or None,
         backend=backend,
         model_name=model_name or None,
+        gguf_architecture=_clean_string(payload.get("gguf_architecture")) or None,
+        llamacpp_runtime_id=_clean_string(payload.get("llamacpp_runtime_id")) or None,
     )
 
 
@@ -426,6 +442,14 @@ def quick_deploy_model_key(profile: QuickDeployProfile) -> str:
     )
 
 
+def quick_deploy_quality_score(profile: QuickDeployProfile) -> float | None:
+    """Return AAI Intelligence Index, with coding score for legacy catalogs."""
+
+    if profile.aa_intelligence_score is not None:
+        return profile.aa_intelligence_score
+    return profile.aa_coding_score
+
+
 def quick_deploy_recipe(profile: QuickDeployProfile) -> InferenceRecipe:
     """Convert a legacy quick-deploy bundle into a provider-neutral recipe."""
 
@@ -454,7 +478,7 @@ def quick_deploy_recipe(profile: QuickDeployProfile) -> InferenceRecipe:
         required_vram_gb=profile.required_vram_gb,
         server_args=profile.server_args,
         source_label=profile.source_label,
-        quality_score=profile.aa_coding_score,
+        quality_score=quick_deploy_quality_score(profile),
         quality_rank=profile.aa_rank,
     )
 
@@ -495,7 +519,11 @@ def list_quick_deploy_models(
     for key in order:
         model_profiles = tuple(grouped[key])
         recipes = list_quick_deploy_recipes(model_profiles)
-        scores = [row.aa_coding_score for row in model_profiles if row.aa_coding_score is not None]
+        scores = [
+            score
+            for row in model_profiles
+            if (score := quick_deploy_quality_score(row)) is not None
+        ]
         ranks = [row.aa_rank for row in model_profiles if row.aa_rank is not None]
         models.append(
             QuickDeployModel(
@@ -601,13 +629,25 @@ def build_quick_deploy_config(
     if profile.backend == BackendType.LLAMACPP:
         config.repo_id = profile.repo_id
         config.quant = profile.quant
+        config.gguf_architecture = profile.gguf_architecture
+        config.llamacpp_runtime_id = profile.llamacpp_runtime_id
         config.server_args = shlex.join(profile.server_args)
     else:
         config.model_name = profile.model_name or profile.repo_id
         config.n_gpu = plan.quote.gpu_count if plan is not None else profile.gpu_count
+        config.tool_call_parser = recommended_vllm_tool_call_parser(config.model_name)
     config.gpu_type = plan.quote.gpu_type if plan is not None else profile.gpu_type
     config.gpu_count = plan.quote.gpu_count if plan is not None else profile.gpu_count
-    config.required_vram_gb = profile.required_vram_gb
+    config.required_vram_gb = (
+        plan.recipe.required_vram_gb
+        if plan is not None
+        else profile.required_vram_gb
+    )
+    config.max_context_tokens = (
+        plan.recipe.max_context_tokens
+        if plan is not None
+        else profile.max_context_tokens
+    )
     config.provider_options = plan.quote.provider_options if plan is not None else None
     config.preload = True
     config.do_deploy = True

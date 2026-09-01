@@ -27,7 +27,14 @@ from ..core.benchmark import (
     parse_concurrency_values,
 )
 from ..core.config import ConfigStore
-from ..core.connection_store import merge_connections, remove_connection, save_connection
+from ..core.connection_store import (
+    merge_connections,
+    remove_connection,
+    rows_from_connection_cache,
+    save_connection,
+)
+from ..core.deploy_log_summary import DeployLogSummarizer, beautify_summary_line
+from ..core.hf_models import fetch_gguf_quant_metadata
 from ..core.modal_gpu import fetch_modal_gpu_types
 from ..core.naming import (
     auto_instance_name_for_backend,
@@ -46,8 +53,18 @@ from ..core.opencode import (
     visible_launchpad_rows,
 )
 from ..core.orchestrator import Orchestrator
+from ..core.runtime_support import (
+    evaluate_llamacpp_architecture,
+    load_llamacpp_support_manifest,
+)
 from ..protocol.enums import BackendType, ComputeProvider, OperationType
-from ..protocol.events import ErrorEvent, LogEvent, OperationCompleteEvent, StateChangeEvent
+from ..protocol.events import (
+    EndpointAvailableEvent,
+    ErrorEvent,
+    LogEvent,
+    OperationCompleteEvent,
+    StateChangeEvent,
+)
 from ..protocol.models import DeploymentConfig, EndpointInfo, PrimeProviderOptions
 
 app = typer.Typer(
@@ -56,6 +73,8 @@ app = typer.Typer(
 )
 opencode_app = typer.Typer(help="OpenCode integration commands.")
 app.add_typer(opencode_app, name="opencode")
+aai_auth_app = typer.Typer(help="Manage the stored Artificial Analysis API key.")
+app.add_typer(aai_auth_app, name="aai-auth")
 
 
 @app.callback()
@@ -70,8 +89,34 @@ def _default(ctx: typer.Context) -> None:
 # -----------------------------------------------------------------------
 
 
-def _print_event(event: object) -> None:
+def _print_event(
+    event: object,
+    summarizer: DeployLogSummarizer | None = None,
+) -> None:
     """Print a protocol event to stdout/stderr for headless mode."""
+    if summarizer is not None:
+        if isinstance(event, LogEvent):
+            for line in summarizer.transform(event.line, event.operation):
+                typer.echo(beautify_summary_line(line))
+            return
+        if isinstance(event, StateChangeEvent):
+            for line in summarizer.transform_state(event.detail, event.operation):
+                typer.echo(beautify_summary_line(line))
+            return
+        if isinstance(event, ErrorEvent):
+            typer.echo(beautify_summary_line(f"Error: {event.message}"), err=True)
+            return
+        if isinstance(event, OperationCompleteEvent):
+            if event.success:
+                typer.echo(beautify_summary_line(f"Done ({event.operation.value})."))
+            else:
+                typer.echo(
+                    beautify_summary_line(
+                        f"Failed ({event.operation.value}): {event.detail}"
+                    ),
+                    err=True,
+                )
+            return
     if isinstance(event, LogEvent):
         typer.echo(event.line)
     elif isinstance(event, StateChangeEvent):
@@ -283,6 +328,18 @@ def _print_banner() -> None:
     console.print(Panel.fit("llm-launchpad", subtitle=subtitle, border_style="cyan"))
 
 
+def _connected_compute_providers() -> tuple[ComputeProvider, ...]:
+    providers: list[ComputeProvider] = []
+    if ModalBackend.is_cli_available():
+        providers.append(ComputeProvider.MODAL)
+    try:
+        if get_prime_auth_status().authenticated:
+            providers.append(ComputeProvider.PRIME)
+    except Exception:
+        pass
+    return tuple(providers)
+
+
 def _load_visible_launchpad_rows(
     provider: ComputeProvider = ComputeProvider.MODAL,
 ) -> list[EndpointInfo] | None:
@@ -296,6 +353,57 @@ def _load_visible_launchpad_rows(
     return visible_launchpad_rows(merge_connections(rows))
 
 
+def _list_provider_deployments(provider: ComputeProvider) -> list[EndpointInfo] | None:
+    """List deployments for one provider; ``None`` when the listing is unavailable."""
+    try:
+        rows = (
+            ModalBackend.list_apps()
+            if provider == ComputeProvider.MODAL
+            else PrimeBackend().list_deployments()
+        )
+    except Exception:
+        return None
+    return rows
+
+
+def _load_rows_for_opencode_sync(
+    provider: ComputeProvider | None = None,
+) -> tuple[list[EndpointInfo] | None, tuple[ComputeProvider, ...], list[str]]:
+    """Load deployments for OpenCode sync and the providers that were listed.
+
+    Returns ``(rows, live_listed_providers, fallback_notes)``. When a provider
+    listing is unavailable its cached connection summaries are used instead so
+    known deployments stay in scope; only successfully listed providers are
+    returned as prune scope. ``None`` rows mean no deployment source was found.
+    """
+    connected = _connected_compute_providers()
+    providers = (
+        (provider,)
+        if provider is not None
+        else (connected or (ComputeProvider.MODAL, ComputeProvider.PRIME))
+    )
+    collected: list[EndpointInfo] = []
+    listed: list[ComputeProvider] = []
+    notes: list[str] = []
+    for compute_provider in providers:
+        rows = _list_provider_deployments(compute_provider)
+        if rows is not None:
+            collected.extend(rows)
+            listed.append(compute_provider)
+            continue
+        cached_rows = [row for row in rows_from_connection_cache() if row.provider == compute_provider]
+        if cached_rows:
+            collected.extend(cached_rows)
+            notes.append(f"{compute_provider.value.title()} listing failed; using cached connection summaries.")
+        else:
+            notes.append(
+                f"{compute_provider.value.title()} listing failed and no cached connections are available."
+            )
+    if not listed and not collected:
+        return None, (), notes
+    return visible_launchpad_rows(merge_connections(collected)), tuple(listed), notes
+
+
 def _sync_opencode_cli(
     *,
     target_app_name: Optional[str] = None,
@@ -303,6 +411,7 @@ def _sync_opencode_cli(
     target_config: Optional[DeploymentConfig] = None,
     current_rows: list[EndpointInfo] | None = None,
     remove_app_names: list[str] | None = None,
+    prune_providers: tuple[ComputeProvider, ...] | None = None,
     username: str = "",
     dry_run: bool = False,
     fail_on_error: bool = False,
@@ -325,6 +434,7 @@ def _sync_opencode_cli(
             targets=targets,
             current_rows=current_rows,
             remove_app_names=remove_app_names,
+            prune_providers=prune_providers,
             dry_run=dry_run,
         )
     except Exception as exc:
@@ -349,22 +459,48 @@ def _deploy_and_maybe_warmup(
     do_warmup: bool,
     timeout: int,
     tail_logs: bool,
+    debug_logs: bool = False,
 ) -> None:
     """Run deploy, optional warmup, and OpenCode sync for CLI commands."""
     deployed_web_url: Optional[str] = None
     deployed_endpoint: Optional[EndpointInfo] = None
     deploy_succeeded = False
+    opencode_synced = False
+    summarizer = None if debug_logs else DeployLogSummarizer(backend)
     for event in orch.deploy(config):
         if isinstance(event, LogEvent):
             maybe_url = ModalBackend.extract_modal_web_url(event.line)
             if maybe_url:
                 deployed_web_url = maybe_url
+        elif isinstance(event, EndpointAvailableEvent):
+            deployed_endpoint = event.endpoint
+            deployed_web_url = event.endpoint.web_url or deployed_web_url
+            if deployed_web_url:
+                save_connection(config, event.endpoint)
+                _sync_opencode_cli(
+                    target_app_name=config.app_name,
+                    target_url=deployed_web_url,
+                    target_config=config,
+                    current_rows=_load_visible_launchpad_rows(config.provider),
+                    prune_providers=(config.provider,),
+                    username=username,
+                )
+                opencode_synced = True
         elif isinstance(event, OperationCompleteEvent) and event.operation == OperationType.DEPLOY:
             deploy_succeeded = event.success
             if event.success and isinstance(event.data, EndpointInfo):
                 deployed_endpoint = event.data
                 deployed_web_url = event.data.web_url or deployed_web_url
-        _print_event(event)
+            elif not event.success and opencode_synced:
+                remove_connection(config.app_name or "")
+                _sync_opencode_cli(
+                    current_rows=_load_visible_launchpad_rows(config.provider),
+                    remove_app_names=[config.app_name or ""],
+                    prune_providers=(config.provider,),
+                    username=username,
+                )
+                opencode_synced = False
+        _print_event(event, summarizer=summarizer)
         _raise_on_failed_completion(event)
 
     if deploy_succeeded and deployed_endpoint and deployed_web_url:
@@ -419,7 +555,7 @@ def _deploy_and_maybe_warmup(
                     maybe_url = event.data.get("url")
                     if isinstance(maybe_url, str) and maybe_url.strip():
                         final_sync_url = maybe_url.strip()
-            _print_event(event)
+            _print_event(event, summarizer=summarizer)
             if (
                 isinstance(event, OperationCompleteEvent)
                 and not event.success
@@ -437,8 +573,15 @@ def _deploy_and_maybe_warmup(
                     app_id=deployed_endpoint.app_id,
                     provider=ComputeProvider.PRIME,
                 ):
-                    _print_event(cleanup_event)
+                    _print_event(cleanup_event, summarizer=summarizer)
                 remove_connection(config.app_name or "")
+                _sync_opencode_cli(
+                    current_rows=_load_visible_launchpad_rows(config.provider),
+                    remove_app_names=[config.app_name or ""],
+                    prune_providers=(config.provider,),
+                    username=username,
+                )
+                opencode_synced = False
             _raise_on_failed_completion(event)
     elif deploy_succeeded:
         final_sync_url = server_url or deployed_web_url
@@ -449,6 +592,8 @@ def _deploy_and_maybe_warmup(
                 function_slug=config.function_slug,
             )
 
+    if opencode_synced:
+        return
     if (do_warmup and warmup_succeeded and final_sync_url) or (not do_warmup and final_sync_url):
         endpoint = deployed_endpoint or EndpointInfo(
             name=config.app_name or "",
@@ -464,6 +609,7 @@ def _deploy_and_maybe_warmup(
             target_url=final_sync_url,
             target_config=config,
             current_rows=_load_visible_launchpad_rows(config.provider),
+            prune_providers=(config.provider,),
             username=username,
         )
 
@@ -525,6 +671,70 @@ def gpu_types(
         typer.echo(value)
 
 
+@app.command("llamacpp-support")
+def llamacpp_support(
+    repo_id: Optional[str] = typer.Option(
+        None,
+        help="Hugging Face GGUF repo to check against the pinned llama.cpp runtime",
+    ),
+    revision: Optional[str] = typer.Option(None, help="Optional Hugging Face revision"),
+    architecture: Optional[str] = typer.Option(
+        None,
+        help="GGUF general.architecture value to check directly",
+    ),
+    output_json: bool = typer.Option(False, "--json", help="Print machine-readable JSON"),
+) -> None:
+    """List supported llama.cpp architectures or preflight one GGUF repo."""
+
+    manifest = load_llamacpp_support_manifest()
+    resolved_architecture = architecture
+    if repo_id:
+        try:
+            metadata = fetch_gguf_quant_metadata(repo_id, revision=revision)
+        except Exception as exc:
+            typer.echo(f"Error: could not inspect {repo_id}: {exc}", err=True)
+            raise typer.Exit(code=1)
+        resolved_architecture = metadata.architecture
+
+    if repo_id or architecture:
+        decision = evaluate_llamacpp_architecture(resolved_architecture, manifest=manifest)
+        payload = {
+            "repo_id": repo_id,
+            "architecture": decision.architecture,
+            "status": decision.status.value,
+            "runtime_id": decision.runtime_id,
+            "image_ref": decision.image_ref,
+            "message": decision.message,
+        }
+        if output_json:
+            typer.echo(json.dumps(payload, indent=2))
+        else:
+            if repo_id:
+                typer.echo(f"repo: {repo_id}")
+            typer.echo(f"architecture: {decision.architecture or 'unknown'}")
+            typer.echo(f"status: {decision.status.value}")
+            typer.echo(f"runtime: {decision.runtime_id}")
+            typer.echo(decision.message)
+        return
+
+    payload = {
+        "runtime_id": manifest.runtime_id,
+        "runtime_build": manifest.runtime_build,
+        "image_ref": manifest.image_ref,
+        "image_digest": manifest.image_digest,
+        "source_revision": manifest.source_revision,
+        "architectures": sorted(manifest.architectures),
+    }
+    if output_json:
+        typer.echo(json.dumps(payload, indent=2))
+        return
+    typer.echo(f"runtime: {manifest.runtime_id}")
+    typer.echo(f"image: {manifest.image_ref}@{manifest.image_digest}")
+    typer.echo("supported general.architecture values:")
+    for value in sorted(manifest.architectures):
+        typer.echo(value)
+
+
 @app.command("offers")
 def prime_offers(
     gpu_type: Optional[str] = typer.Option(None, help="GPU type filter"),
@@ -582,7 +792,7 @@ def deploy(
     quant: Optional[str] = typer.Option(None, help="llama.cpp GGUF quantization"),
     revision: Optional[str] = typer.Option(None, help="llama.cpp HF revision (Modal only)"),
     server_args: Optional[str] = typer.Option(None, help="Additional llama-server arguments"),
-    n_gpu_layers: Optional[int] = typer.Option(None, help="llama.cpp GPU layers (default: all)"),
+    n_gpu_layers: Optional[int] = typer.Option(None, help="llama.cpp GPU layers (default: auto)"),
     model_name: Optional[str] = typer.Option(None, help="vLLM MODEL_NAME"),
     model_revision: Optional[str] = typer.Option(None, help="vLLM MODEL_REVISION"),
     served_model_name: Optional[str] = typer.Option(None, help="vLLM SERVED_MODEL_NAME"),
@@ -595,6 +805,11 @@ def deploy(
     ),
     prime_region: Optional[str] = typer.Option(None, help="Prime region or country filter"),
     prime_disk_id: Optional[str] = typer.Option(None, help="Existing Prime disk ID to attach"),
+    prime_disk: bool = typer.Option(
+        True,
+        "--prime-disk/--no-prime-disk",
+        help="Auto-attach a persistent Prime disk so model weights survive redeploys",
+    ),
     keep_failed_pod: bool = typer.Option(
         False, help="Keep a failed Prime pod instead of terminating it"
     ),
@@ -627,6 +842,11 @@ def deploy(
     server_url: Optional[str] = typer.Option(None, help="Deployed web URL"),
     timeout: int = typer.Option(1800, help="Warmup timeout seconds"),
     tail_logs: bool = typer.Option(True, help="Tail logs during warmup"),
+    debug_logs: bool = typer.Option(
+        False,
+        "--debug-logs/--summary-logs",
+        help="Show raw backend logs instead of the concise progress view",
+    ),
 ) -> None:
     """Deploy a server to Modal or Prime Intellect."""
     compute_provider = ComputeProvider(provider)
@@ -678,6 +898,7 @@ def deploy(
                 disk_id=prime_disk_id,
                 keep_failed_resource=keep_failed_pod,
                 allow_insecure_http=allow_insecure_http,
+                auto_disk=prime_disk,
             )
             if compute_provider == ComputeProvider.PRIME
             else None
@@ -697,6 +918,7 @@ def deploy(
         do_warmup=do_warmup,
         timeout=timeout,
         tail_logs=tail_logs,
+        debug_logs=debug_logs,
     )
     raise typer.Exit(code=0)
 
@@ -712,6 +934,11 @@ def warmup(
     ),
     timeout: int = typer.Option(1800, help="Seconds to wait"),
     tail_logs: bool = typer.Option(True, help="Tail logs during warmup"),
+    debug_logs: bool = typer.Option(
+        False,
+        "--debug-logs/--summary-logs",
+        help="Show raw backend logs instead of the concise progress view",
+    ),
     instance_name: Optional[str] = typer.Option(None, help="Target instance name"),
     app_name: Optional[str] = typer.Option(None, help="Target deployment name"),
 ) -> None:
@@ -764,8 +991,9 @@ def warmup(
             pod_id=target.app_id,
         )
     )
+    summarizer = None if debug_logs else DeployLogSummarizer(bt)
     for event in warmup_events:
-        _print_event(event)
+        _print_event(event, summarizer=summarizer)
         _raise_on_failed_completion(event)
 
 
@@ -793,7 +1021,12 @@ def list_apps(
                 [row for row in event.data if isinstance(row, EndpointInfo)]
             )
         _print_event(event)
-    _sync_opencode_cli(current_rows=visible_rows, username=username)
+    if visible_rows is not None:
+        _sync_opencode_cli(
+            current_rows=visible_rows,
+            username=username,
+            prune_providers=(compute_provider,),
+        )
 
 
 @app.command()
@@ -1017,6 +1250,7 @@ def stop(
         _sync_opencode_cli(
             current_rows=_load_visible_launchpad_rows(compute_provider),
             remove_app_names=[target_app_name],
+            prune_providers=(compute_provider,),
             username=username,
         )
 
@@ -1039,6 +1273,11 @@ def switch(
     prime_offer_id: Optional[str] = typer.Option(None, help="Exact Prime availability offer ID"),
     prime_region: Optional[str] = typer.Option(None, help="Prime region or country filter"),
     prime_disk_id: Optional[str] = typer.Option(None, help="Existing Prime disk ID to attach"),
+    prime_disk: bool = typer.Option(
+        True,
+        "--prime-disk/--no-prime-disk",
+        help="Auto-attach a persistent Prime disk so model weights survive redeploys",
+    ),
     keep_failed_pod: bool = typer.Option(False, help="Keep a failed Prime pod"),
     allow_insecure_http: bool = typer.Option(
         False,
@@ -1109,6 +1348,7 @@ def switch(
                 disk_id=prime_disk_id,
                 keep_failed_resource=keep_failed_pod,
                 allow_insecure_http=allow_insecure_http,
+                auto_disk=prime_disk,
             )
             if compute_provider == ComputeProvider.PRIME
             else None
@@ -1216,7 +1456,8 @@ def switch(
                 target_app_name=resolved_app_name,
                 target_url=final_sync_url,
                 target_config=config,
-                current_rows=_load_visible_launchpad_rows(),
+                current_rows=_load_visible_launchpad_rows(compute_provider),
+                prune_providers=(compute_provider,),
                 username=username,
             )
 
@@ -1230,27 +1471,62 @@ def switch(
 
 @opencode_app.command("sync")
 def opencode_sync(
-    provider: str = typer.Option("modal", help="Compute provider: modal or prime"),
+    provider: Optional[str] = typer.Option(
+        None,
+        help="Limit to modal or prime. Default: every connected compute provider.",
+    ),
     backend: Optional[str] = typer.Option(None, help="Backend: llamacpp or vllm"),
     instance_name: Optional[str] = typer.Option(None, help="Target instance name"),
     app_name: Optional[str] = typer.Option(None, help="Target deployment name"),
     dry_run: bool = typer.Option(False, help="Print the intended sync changes without writing files"),
 ) -> None:
     """Sync Launchpad-managed deployments into OpenCode config."""
-    compute_provider = ComputeProvider(provider)
-    _, username = _preflight(compute_provider)
+    compute_provider = ComputeProvider(provider) if provider else None
+    if compute_provider is not None:
+        _, username = _preflight(compute_provider)
+    else:
+        try:
+            username = ModalBackend.get_username() or ""
+        except Exception:
+            username = ""
     _print_banner()
 
+    current_rows, listed_providers, fallback_notes = _load_rows_for_opencode_sync(compute_provider)
+    for note in fallback_notes:
+        typer.echo(note)
     target_app_name = (app_name or "").strip() or None
     if target_app_name is None and instance_name:
         if not backend:
             typer.echo("Specify --backend when using --instance-name.", err=True)
             raise typer.Exit(code=1)
-        target_app_name = _resolve_manage_app_name(
-            BackendType(backend), None, instance_name, compute_provider
-        )
+        backend_type = BackendType(backend)
+        wanted_instance = instance_name.strip()
+        if compute_provider is not None:
+            target_app_name = _resolve_manage_app_name(
+                backend_type, None, wanted_instance, compute_provider
+            )
+        else:
+            matches = [
+                row
+                for row in (current_rows or [])
+                if row.backend == backend_type
+                and (row.instance_name or "").strip() == wanted_instance
+            ]
+            if len(matches) == 1:
+                target_app_name = matches[0].name
+            elif len(matches) > 1:
+                typer.echo(
+                    "Multiple matching instances found. Specify --provider or --app-name.",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+            else:
+                typer.echo(
+                    f"OpenCode sync target instance '{wanted_instance}' was not found.",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
 
-    current_rows = _load_visible_launchpad_rows(compute_provider)
     if target_app_name:
         if current_rows is None:
             typer.echo("Could not load deployments to resolve the requested sync target.", err=True)
@@ -1258,14 +1534,114 @@ def opencode_sync(
         if not any((row.name or "").strip() == target_app_name for row in current_rows):
             typer.echo(f"OpenCode sync target '{target_app_name}' was not found.", err=True)
             raise typer.Exit(code=1)
+    elif current_rows is None:
+        typer.echo(
+            "Could not load deployments for OpenCode sync. Check provider auth (`modal setup`, `prime login`) and retry.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
 
     _sync_opencode_cli(
         target_app_name=target_app_name,
         current_rows=current_rows,
+        # An empty tuple is meaningful here: cached rows are useful for
+        # upserting connections, but they are not evidence that a provider's
+        # live deployment list was successfully queried. Passing ``None``
+        # would make sync_opencode_config infer a prune scope from those
+        # cached rows and could remove valid entries while the provider is
+        # temporarily unavailable.
+        prune_providers=listed_providers,
         username=username,
         dry_run=dry_run,
         fail_on_error=True,
     )
+
+
+# -----------------------------------------------------------------------
+# Artificial Analysis
+# -----------------------------------------------------------------------
+
+
+@aai_auth_app.command("login")
+def aai_auth_login(
+    api_key: Optional[str] = typer.Argument(
+        None, help="Artificial Analysis API key (prompts when omitted)"
+    ),
+    no_verify: Annotated[
+        bool,
+        typer.Option("--no-verify", help="Store the key without validating it"),
+    ] = False,
+) -> None:
+    """Store an Artificial Analysis API key for llm-launchpad."""
+    from ..core.artificial_analysis_auth import save_artificial_analysis_api_key
+    from ..core.quick_deploy_refresh import get_artificial_analysis_auth_status
+
+    key = (api_key or "").strip()
+    if not key and sys.stdin.isatty():
+        key = typer.prompt("Artificial Analysis API key", hide_input=True).strip()
+    if not key:
+        typer.echo("Error: an Artificial Analysis API key is required.", err=True)
+        raise typer.Exit(code=1)
+
+    if not no_verify:
+        status = get_artificial_analysis_auth_status(api_key=key)
+        if not status.authenticated:
+            typer.echo(
+                f"Error: {status.error or 'Artificial Analysis auth check failed'}",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+    saved_path = save_artificial_analysis_api_key(key)
+    if no_verify:
+        typer.echo(f"Artificial Analysis API key stored at {saved_path} without verification.")
+        return
+    tier_suffix = f" ({status.tier} tier)" if status.tier else ""
+    typer.echo(f"Artificial Analysis API key stored at {saved_path}. Authenticated{tier_suffix}.")
+
+
+@aai_auth_app.command("status")
+def aai_auth_status() -> None:
+    """Show the Artificial Analysis API key source and auth status."""
+    from ..core.artificial_analysis_auth import (
+        AAI_API_KEY_ENV,
+        load_saved_artificial_analysis_api_key,
+    )
+    from ..core.quick_deploy_refresh import get_artificial_analysis_auth_status
+
+    env_key = os.getenv(AAI_API_KEY_ENV, "").strip()
+    stored_key = load_saved_artificial_analysis_api_key()
+    if env_key:
+        source = "environment"
+    elif stored_key:
+        source = "stored"
+    else:
+        typer.echo(
+            "No Artificial Analysis API key configured. "
+            "Run `llm-launchpad aai-auth login` to store one.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    status = get_artificial_analysis_auth_status()
+    if not status.authenticated:
+        typer.echo(
+            f"Artificial Analysis auth check failed for the {source} key: "
+            f"{status.error or 'unknown error'}",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    tier_suffix = f" ({status.tier} tier)" if status.tier else ""
+    typer.echo(f"AAI API key source: {source}. Authenticated{tier_suffix}.")
+
+
+@aai_auth_app.command("clear")
+def aai_auth_clear() -> None:
+    """Remove the stored Artificial Analysis API key."""
+    from ..core.artificial_analysis_auth import clear_artificial_analysis_api_key
+
+    if not clear_artificial_analysis_api_key():
+        typer.echo("No stored Artificial Analysis API key to remove.", err=True)
+        raise typer.Exit(code=1)
+    typer.echo("Stored Artificial Analysis API key removed.")
 
 
 # -----------------------------------------------------------------------

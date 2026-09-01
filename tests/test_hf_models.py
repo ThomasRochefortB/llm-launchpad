@@ -183,6 +183,7 @@ class HFModelsTests(unittest.TestCase):
                         SimpleNamespace(rfilename="Q6_K/model-Q6_K.gguf"),
                     ],
                     gguf={
+                        "architecture": "qwen35",
                         "compatibility": [
                             {"quantization": "Q4_K_M", "memory": "4.66 GB"},
                             {"quantization": "Q6_K", "memory": "7.2 GB"},
@@ -203,6 +204,8 @@ class HFModelsTests(unittest.TestCase):
         self.assertEqual(second.quantizations, ["Q4_K_M", "Q6_K"])
         self.assertAlmostEqual(first.vram_gb_by_quant["Q4_K_M"], 4.66, places=2)
         self.assertAlmostEqual(first.vram_gb_by_quant["Q6_K"], 7.2, places=2)
+        self.assertEqual(first.architecture, "qwen35")
+        self.assertEqual(second.architecture, "qwen35")
         self.assertNotIn("Q5_K_M", first.vram_gb_by_quant)
         self.assertEqual(calls, [("Qwen/Qwen3-Coder-Next-GGUF", None)])
 
@@ -392,6 +395,30 @@ class HFModelsTests(unittest.TestCase):
         self.assertEqual(calls, [("Qwen/Qwen3-8B-Instruct", None)])
         self.assertGreater(estimate.total_gb, estimate.weights_gb)
         self.assertEqual(estimate.context_tokens, 32768)
+
+    def test_fetch_vllm_memory_breakdown_honors_requested_context(self) -> None:
+        class FakeApi:
+            def model_info(self, *, repo_id: str, revision: str | None, expand: list[str]):
+                self._ = (repo_id, revision, expand)
+                return SimpleNamespace(
+                    config={
+                        "num_hidden_layers": 32,
+                        "hidden_size": 4096,
+                        "max_position_embeddings": 32768,
+                    },
+                    safetensors={"total": 16_000_000_000},
+                    tags=["text-generation", "bf16"],
+                )
+
+        fake_module = types.SimpleNamespace(HfApi=FakeApi)
+        with patch.dict("sys.modules", {"huggingface_hub": fake_module}):
+            estimate = hf_models.fetch_vllm_memory_breakdown(
+                "Qwen/Qwen3-8B-Instruct",
+                context_tokens=8192,
+            )
+
+        assert estimate is not None
+        self.assertEqual(estimate.context_tokens, 8192)
 
     def test_fetch_vllm_memory_breakdown_uses_timeout_and_card_data_expand(self) -> None:
         calls: list[tuple[float, tuple[str, ...]]] = []
@@ -667,6 +694,39 @@ class HFModelsTests(unittest.TestCase):
                         config={},
                         cardData={},
                         tags=["base_model:Owner/Base-Model"],
+                    )
+                if repo_id == "Owner/Base-Model":
+                    return SimpleNamespace(
+                        config={"max_position_embeddings": 196608},
+                        cardData={},
+                        tags=[],
+                    )
+                return SimpleNamespace(config={}, cardData={}, tags=[])
+
+        fake_module = types.SimpleNamespace(HfApi=FakeApi)
+        with (
+            patch.dict("sys.modules", {"huggingface_hub": fake_module}),
+            patch("llm_launchpad.core.hf_models._load_repo_json_file", return_value=None),
+        ):
+            context = hf_models.fetch_model_max_context("unsloth/Test-GGUF")
+
+        self.assertEqual(context, 196608)
+        self.assertEqual(calls, ["unsloth/Test-GGUF", "Owner/Base-Model"])
+
+    def test_fetch_model_max_context_normalizes_base_model_url(self) -> None:
+        calls: list[str] = []
+
+        class FakeApi:
+            def model_info(self, *, repo_id: str, revision: str | None, expand=None):
+                self._ = (revision, expand)
+                calls.append(repo_id)
+                if repo_id == "unsloth/Test-GGUF":
+                    return SimpleNamespace(
+                        config={},
+                        cardData={
+                            "base_model": "https://huggingface.co/Owner/Base-Model/"
+                        },
+                        tags=[],
                     )
                 if repo_id == "Owner/Base-Model":
                     return SimpleNamespace(

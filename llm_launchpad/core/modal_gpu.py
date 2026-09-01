@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+import threading
+import time
+
 from .shutdown import is_shutting_down
 
-from dataclasses import dataclass
 import html
 import re
 from typing import Final
@@ -36,6 +40,7 @@ _PRICING_ROW_RE: Final[re.Pattern[str]] = re.compile(
 )
 _WHITESPACE_RE: Final[re.Pattern[str]] = re.compile(r"\s+")
 _SECONDS_PER_HOUR: Final[float] = 3600.0
+_CATALOG_CACHE_TTL_SECONDS: Final[float] = 600.0
 
 
 @dataclass(frozen=True)
@@ -44,6 +49,23 @@ class ModalGpuSpec:
 
     value: str
     price_per_hour_usd: float | None = None
+
+
+@dataclass
+class _CatalogFlight:
+    """One shared in-flight catalog request."""
+
+    completed: threading.Event
+    result: tuple[ModalGpuSpec, ...] | None = None
+    error: BaseException | None = None
+
+
+_CATALOG_CACHE: dict[
+    tuple[str, str],
+    tuple[float, tuple[ModalGpuSpec, ...]],
+] = {}
+_CATALOG_FLIGHTS: dict[tuple[str, str], _CatalogFlight] = {}
+_CATALOG_LOCK = threading.Lock()
 
 
 def fetch_modal_gpu_types(
@@ -64,19 +86,115 @@ def fetch_modal_gpu_catalog(
     gpu_guide_url: str = MODAL_GPU_GUIDE_URL,
     pricing_url: str = MODAL_PRICING_URL,
     timeout: float = 10.0,
+    *,
+    force_refresh: bool = False,
 ) -> list[ModalGpuSpec]:
-    """Fetch documented Modal GPU values with current base hourly pricing when available."""
+    """Fetch Modal GPU metadata with a shared TTL cache and stale fallback."""
 
-    gpu_types = fetch_modal_gpu_types(url=gpu_guide_url, timeout=timeout)
+    cache_key = (gpu_guide_url, pricing_url)
+    now = time.monotonic()
+    with _CATALOG_LOCK:
+        cached = _CATALOG_CACHE.get(cache_key)
+        if (
+            not force_refresh
+            and cached is not None
+            and now - cached[0] <= _CATALOG_CACHE_TTL_SECONDS
+        ):
+            return list(cached[1])
+        flight = _CATALOG_FLIGHTS.get(cache_key)
+        if flight is None:
+            flight = _CatalogFlight(completed=threading.Event())
+            _CATALOG_FLIGHTS[cache_key] = flight
+            is_leader = True
+        else:
+            is_leader = False
 
-    pricing_by_gpu: dict[str, float] = {}
+    if not is_leader:
+        flight.completed.wait()
+        if flight.result is not None:
+            return list(flight.result)
+        assert flight.error is not None
+        raise RuntimeError(str(flight.error)) from flight.error
+
+    stale_catalog = cached[1] if cached is not None else None
     try:
-        pricing_page_text = _fetch_modal_page_text(url=pricing_url, timeout=timeout)
-    except Exception:
-        if is_shutting_down():
+        catalog = tuple(
+            _fetch_modal_gpu_catalog_uncached(
+                gpu_guide_url=gpu_guide_url,
+                pricing_url=pricing_url,
+                timeout=timeout,
+            )
+        )
+        if stale_catalog is not None:
+            stale_prices = {
+                item.value: item.price_per_hour_usd
+                for item in stale_catalog
+                if item.price_per_hour_usd is not None
+            }
+            catalog = tuple(
+                ModalGpuSpec(
+                    value=item.value,
+                    price_per_hour_usd=(
+                        item.price_per_hour_usd
+                        if item.price_per_hour_usd is not None
+                        else stale_prices.get(item.value)
+                    ),
+                )
+                for item in catalog
+            )
+    except BaseException as exc:
+        if not isinstance(exc, Exception):
+            flight.error = exc
             raise
-    else:
-        pricing_by_gpu = _parse_modal_gpu_pricing(pricing_page_text)
+        if stale_catalog is None or is_shutting_down():
+            flight.error = exc
+            raise
+        catalog = stale_catalog
+    finally:
+        with _CATALOG_LOCK:
+            if flight.error is None and "catalog" in locals():
+                _CATALOG_CACHE[cache_key] = (time.monotonic(), catalog)
+                flight.result = catalog
+            _CATALOG_FLIGHTS.pop(cache_key, None)
+            flight.completed.set()
+
+    return list(catalog)
+
+
+def _fetch_modal_gpu_catalog_uncached(
+    *,
+    gpu_guide_url: str,
+    pricing_url: str,
+    timeout: float,
+) -> list[ModalGpuSpec]:
+    """Fetch and combine the public GPU guide and pricing pages."""
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        guide_future = executor.submit(
+            _fetch_modal_page_text,
+            url=gpu_guide_url,
+            timeout=timeout,
+        )
+        pricing_future = executor.submit(
+            _fetch_modal_page_text,
+            url=pricing_url,
+            timeout=timeout,
+        )
+        guide_page_text = guide_future.result()
+        gpu_types = _parse_modal_gpu_types(guide_page_text)
+        if not gpu_types:
+            raise RuntimeError(
+                "Could not parse GPU types from Modal docs page. The page format may have changed."
+            )
+
+        pricing_by_gpu: dict[str, float] = {}
+        try:
+            pricing_page_text = pricing_future.result()
+        except Exception:
+            if is_shutting_down():
+                raise
+        else:
+            pricing_by_gpu = _parse_modal_gpu_pricing(pricing_page_text)
 
     return [
         ModalGpuSpec(
@@ -85,6 +203,12 @@ def fetch_modal_gpu_catalog(
         )
         for gpu_type in gpu_types
     ]
+
+
+def _reset_modal_gpu_catalog_cache() -> None:
+    """Clear process-local catalog state for tests and explicit refresh tooling."""
+    with _CATALOG_LOCK:
+        _CATALOG_CACHE.clear()
 
 
 def _parse_modal_gpu_types(page_text: str) -> list[str]:

@@ -10,6 +10,7 @@ from textual.widgets import DataTable, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
 from llm_launchpad.tui.app import TuiApp, _osc_52_sequence, _screen_passthrough_sequence, _tmux_passthrough_sequence
+from llm_launchpad.tui import clipboard as tui_clipboard
 from llm_launchpad.tui.screens.copy_enabled import CopyEnabledScreen
 from llm_launchpad.tui.screens.deploy import (
     BackendSelectScreen,
@@ -18,10 +19,10 @@ from llm_launchpad.tui.screens.deploy import (
 )
 from llm_launchpad.tui.screens.main_menu import MainMenuScreen
 from llm_launchpad.tui.screens.manage import (
-    LogsParamsScreen,
+    BenchmarkOptionsScreen,
     ManageScreen,
-    StatusParamsScreen,
-    StopParamsScreen,
+    StatusOptionsScreen,
+    StopConfirmScreen,
 )
 from llm_launchpad.tui.screens.monitor import MonitorScreen
 from llm_launchpad.tui.screens.settings import SettingsScreen
@@ -121,7 +122,54 @@ class _MouseDriverStub:
         self.disable_calls += 1
 
 
+class _TuiClipboardApp(TuiApp):
+    """TuiApp test shell without provider checks or terminal CSS setup."""
+
+    CSS_PATH = None
+
+    def on_mount(self) -> None:
+        pass
+
+
 class CopyEnabledScreenTests(unittest.IsolatedAsyncioTestCase):
+    async def test_tui_ctrl_c_copies_selected_input_instead_of_quitting(self) -> None:
+        app = _TuiClipboardApp()
+        with (
+            patch.object(TuiApp, "on_mount", lambda self: None),
+            patch("llm_launchpad.tui.app.write_system_clipboard"),
+        ):
+            async with app.run_test() as pilot:
+                app.push_screen(_InputFallbackScreen())
+                await pilot.pause()
+
+                input_widget = app.screen.query_one("#copy-input", Input)
+                input_widget.action_select_all()
+                await pilot.press("ctrl+c")
+                await pilot.pause()
+
+                self.assertEqual(app.clipboard, "Qwen/Qwen3-8B")
+                self.assertEqual(app._ctrl_c_last_requested_at, 0.0)
+
+    async def test_tui_ctrl_v_pastes_from_host_clipboard(self) -> None:
+        app = _TuiClipboardApp()
+        with (
+            patch.object(TuiApp, "on_mount", lambda self: None),
+            patch(
+                "llm_launchpad.tui.app.read_system_clipboard",
+                return_value="pasted from outside llm-launchpad",
+            ),
+        ):
+            async with app.run_test() as pilot:
+                app.push_screen(_InputFallbackScreen())
+                await pilot.pause()
+
+                input_widget = app.screen.query_one("#copy-input", Input)
+                input_widget.action_select_all()
+                await pilot.press("ctrl+v")
+                await pilot.pause()
+
+                self.assertEqual(input_widget.value, "pasted from outside llm-launchpad")
+
     async def test_selection_copy_from_static_writes_to_clipboard(self) -> None:
         app = _CopyTestApp()
         async with app.run_test() as pilot:
@@ -289,8 +337,10 @@ class TuiAppClipboardTests(unittest.TestCase):
     def test_copy_to_clipboard_uses_pbcopy_on_darwin(self) -> None:
         app = TuiApp()
         with (
-            patch("llm_launchpad.tui.app.sys.platform", "darwin"),
-            patch("llm_launchpad.tui.app.subprocess.run") as run_mock,
+            patch("llm_launchpad.tui.clipboard.sys.platform", "darwin"),
+            patch("llm_launchpad.tui.clipboard.shutil.which", return_value="/usr/bin/pbcopy"),
+            patch.dict("llm_launchpad.tui.clipboard.os.environ", {}, clear=True),
+            patch("llm_launchpad.tui.clipboard.subprocess.run") as run_mock,
         ):
             app.copy_to_clipboard("copied text")
         self.assertEqual(app.clipboard, "copied text")
@@ -298,7 +348,34 @@ class TuiAppClipboardTests(unittest.TestCase):
             ["pbcopy"],
             input=b"copied text",
             check=True,
-            timeout=2,
+            timeout=1.0,
+            stdout=tui_clipboard.subprocess.DEVNULL,
+            stderr=tui_clipboard.subprocess.DEVNULL,
+        )
+
+    def test_read_system_clipboard_uses_first_available_provider(self) -> None:
+        with (
+            patch("llm_launchpad.tui.clipboard.sys.platform", "linux"),
+            patch(
+                "llm_launchpad.tui.clipboard.shutil.which",
+                side_effect=lambda command: "/usr/bin/xclip" if command == "xclip" else None,
+            ),
+            patch.dict("llm_launchpad.tui.clipboard.os.environ", {"DISPLAY": ":0"}, clear=True),
+            patch(
+                "llm_launchpad.tui.clipboard.subprocess.run",
+                return_value=SimpleNamespace(stdout="outside text"),
+            ) as run_mock,
+        ):
+            self.assertEqual(tui_clipboard.read_system_clipboard(), "outside text")
+
+        run_mock.assert_called_once_with(
+            ["xclip", "-selection", "clipboard", "-o"],
+            check=True,
+            timeout=1.0,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
 
     def test_copy_to_clipboard_writes_tmux_passthrough_sequence(self) -> None:
@@ -409,9 +486,9 @@ class CopyEnabledScreenInheritanceTests(unittest.TestCase):
             VllmDeployScreen,
             StorageScreen,
             ManageScreen,
-            StatusParamsScreen,
-            LogsParamsScreen,
-            StopParamsScreen,
+            StatusOptionsScreen,
+            BenchmarkOptionsScreen,
+            StopConfirmScreen,
         ]
         for screen_class in screen_classes:
             self.assertTrue(issubclass(screen_class, CopyEnabledScreen), screen_class.__name__)

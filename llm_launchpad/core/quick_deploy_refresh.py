@@ -1,4 +1,4 @@
-"""Build a live Recommended Models catalog for the TUI."""
+"""Build a live Deploy catalog for the TUI."""
 
 from __future__ import annotations
 
@@ -8,13 +8,13 @@ from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 import hashlib
 import json
-import os
 from pathlib import Path
 import re
 from threading import Lock
 from typing import Any, Literal, Sequence
 from urllib.parse import urlparse
 
+from .artificial_analysis_auth import resolve_artificial_analysis_api_key
 from .config import SETTINGS_DIR
 from .hf_models import (
     GgufQuantMetadata,
@@ -26,9 +26,12 @@ from .hf_models import (
 from .modal_gpu import ModalGpuSpec, fetch_modal_gpu_catalog
 from .naming import slugify_instance_name
 from .quick_deploy import QuickDeployCatalogInfo, QuickDeployProfile
+from .runtime_support import evaluate_llamacpp_architecture
 
 DEFAULT_MODEL_LIMIT = 3
-DEFAULT_CANDIDATE_LIMIT = 6
+DEFAULT_CANDIDATE_LIMIT = 80
+_AA_RESOLUTION_WORKERS = 8
+_FALLBACK_TRENDING_LIMIT = 8
 DEFAULT_CONTEXT_TOKENS = 65_536
 LOW_VRAM_QUANT = "UD-Q2_K_XL"
 AA_PRO_MODELS_URL = "https://artificialanalysis.ai/api/v2/language/models"
@@ -110,16 +113,14 @@ class _GpuSelection:
 
 @dataclass(frozen=True)
 class AAModelCandidate:
-    """Normalized Artificial Analysis capability row."""
+    """Normalized Artificial Analysis Intelligence Index row."""
 
     aa_model_id: str
     name: str
     slug: str
     creator_name: str
     coding_score: float | None
-    agentic_score: float | None
-    intelligence_score: float | None
-    capability_score: float
+    intelligence_score: float
     rank: int
     parameter_count_b: float | None = None
     max_context_tokens: int | None = None
@@ -152,6 +153,7 @@ class _AACacheEntry:
 @dataclass(frozen=True)
 class _ResolvedAAModel:
     candidate: AAModelCandidate
+    repo_id: str
     size_bucket: ModelSizeBucket
     profiles: tuple[QuickDeployProfile, ...]
 
@@ -164,7 +166,7 @@ def build_live_quick_deploy_catalog(
     model_limit: int = DEFAULT_MODEL_LIMIT,
     candidate_limit: int = DEFAULT_CANDIDATE_LIMIT,
 ) -> tuple[QuickDeployCatalogInfo, tuple[QuickDeployProfile, ...]]:
-    """Rebuild Recommended Models from AAI capability leaders and live pricing."""
+    """Rebuild the Deploy catalog from the top AAI open models and live pricing."""
 
     normalized_model_limit = max(1, int(model_limit))
     normalized_candidate_limit = max(
@@ -174,7 +176,7 @@ def build_live_quick_deploy_catalog(
     with ThreadPoolExecutor(max_workers=2) as executor:
         rankings_future = executor.submit(
             _load_aa_rankings,
-            api_key=os.environ.get("ARTIFICIAL_ANALYSIS_API_KEY", "").strip(),
+            api_key=resolve_artificial_analysis_api_key(),
             cache_path=AA_CACHE_PATH,
         )
         gpu_future = executor.submit(_fetch_modal_gpu_catalog_or_fallback)
@@ -192,7 +194,7 @@ def build_live_quick_deploy_catalog(
             tier_suffix = f", {rankings.tier} tier" if rankings.tier else ""
             info = QuickDeployCatalogInfo(
                 source_label=(
-                    "Artificial Analysis size leaders "
+                    "Artificial Analysis top open models "
                     f"({rankings.freshness}{tier_suffix}) + "
                     f"{'live' if has_live_modal_pricing else 'fallback'} Modal pricing"
                 ),
@@ -207,7 +209,6 @@ def build_live_quick_deploy_catalog(
 
     return _build_trending_fallback_catalog(
         model_limit=normalized_model_limit,
-        candidate_limit=normalized_candidate_limit,
         modal_gpu_catalog=modal_gpu_catalog,
         has_live_modal_pricing=has_live_modal_pricing,
     )
@@ -232,7 +233,7 @@ def fetch_artificial_analysis_models(
 
 
 def normalize_aa_model_candidates(payload: Any) -> tuple[AAModelCandidate, ...]:
-    """Normalize, deduplicate, and rank AAI rows by coding/agentic capability."""
+    """Normalize, deduplicate, and rank AAI rows by Intelligence Index."""
 
     rows = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(rows, list):
@@ -251,18 +252,10 @@ def normalize_aa_model_candidates(payload: Any) -> tuple[AAModelCandidate, ...]:
         coding_score = _optional_float(
             evaluations.get("artificial_analysis_coding_index")
         )
-        agentic_score = _optional_float(
-            evaluations.get("artificial_analysis_agentic_index")
-        )
         intelligence_score = _optional_float(
             evaluations.get("artificial_analysis_intelligence_index")
         )
-        capability_score = _weighted_capability_score(
-            coding_score=coding_score,
-            agentic_score=agentic_score,
-            intelligence_score=intelligence_score,
-        )
-        if capability_score is None:
+        if intelligence_score is None:
             continue
         creator = row.get("model_creator")
         creator_name = (
@@ -274,9 +267,7 @@ def normalize_aa_model_candidates(payload: Any) -> tuple[AAModelCandidate, ...]:
             slug=slug,
             creator_name=creator_name,
             coding_score=coding_score,
-            agentic_score=agentic_score,
             intelligence_score=intelligence_score,
-            capability_score=capability_score,
             rank=0,
             parameter_count_b=_extract_parameter_count_b(row),
             max_context_tokens=_extract_context_tokens(row),
@@ -284,12 +275,12 @@ def normalize_aa_model_candidates(payload: Any) -> tuple[AAModelCandidate, ...]:
         )
         key = slug.casefold() or _model_key(name)
         existing = deduplicated.get(key)
-        if existing is None or candidate.capability_score > existing.capability_score:
+        if existing is None or candidate.intelligence_score > existing.intelligence_score:
             deduplicated[key] = candidate
 
     ranked = sorted(
         deduplicated.values(),
-        key=lambda candidate: (-candidate.capability_score, candidate.name.casefold()),
+        key=lambda candidate: (-candidate.intelligence_score, candidate.name.casefold()),
     )
     return tuple(replace(candidate, rank=index + 1) for index, candidate in enumerate(ranked))
 
@@ -393,9 +384,7 @@ def get_artificial_analysis_auth_status(
     """Validate the configured AAI key through the shared catalog cache path."""
 
     normalized_key = (
-        os.environ.get("ARTIFICIAL_ANALYSIS_API_KEY", "")
-        if api_key is None
-        else api_key
+        resolve_artificial_analysis_api_key() if api_key is None else api_key
     ).strip()
     if not normalized_key:
         return ArtificialAnalysisAuthStatus(authenticated=False)
@@ -426,94 +415,88 @@ def _profiles_from_aa_rankings(
     model_limit: int,
     candidate_limit: int,
 ) -> tuple[QuickDeployProfile, ...]:
-    candidates_by_bucket = {
-        bucket: [
-            candidate
-            for candidate in candidates
-            if _size_bucket_for_parameters(candidate.parameter_count_b) == bucket
-        ][:candidate_limit]
-        for bucket in _MODEL_SIZE_BUCKETS
+    """Select the top `model_limit` unique open models in each size bucket."""
+
+    window = _aa_candidate_window(candidates, candidate_limit)
+    selected_by_bucket: dict[ModelSizeBucket, list[_ResolvedAAModel]] = {
+        bucket: [] for bucket in _MODEL_SIZE_BUCKETS
     }
-
-    selected: dict[ModelSizeBucket, _ResolvedAAModel] = {}
-    with ThreadPoolExecutor(max_workers=len(_MODEL_SIZE_BUCKETS)) as executor:
-        futures = {
-            bucket: executor.submit(
-                _first_deployable_aa_model,
-                bucket_candidates,
+    seen_repos: set[str] = set()
+    repo_by_model_key: dict[str, str] = {}
+    executor = ThreadPoolExecutor(max_workers=_AA_RESOLUTION_WORKERS)
+    try:
+        futures = [
+            executor.submit(
+                _resolve_aa_model,
+                candidate,
                 modal_gpu_catalog,
-                expected_bucket=bucket,
+                repo_by_model_key=repo_by_model_key,
             )
-            for bucket, bucket_candidates in candidates_by_bucket.items()
-            if bucket_candidates
-        }
-        for bucket, future in futures.items():
+            for candidate in window
+        ]
+        for future in futures:
             resolved = future.result()
-            if resolved is not None:
-                selected[bucket] = resolved
-
-    missing = [bucket for bucket in _MODEL_SIZE_BUCKETS if bucket not in selected]
-    if missing:
-        known_ids = {
-            candidate.aa_model_id or candidate.slug
-            for bucket_candidates in candidates_by_bucket.values()
-            for candidate in bucket_candidates
-        }
-        unknown_candidates = [
-            candidate
-            for candidate in candidates
-            if _size_bucket_for_parameters(candidate.parameter_count_b) is None
-            and (candidate.aa_model_id or candidate.slug) not in known_ids
-        ][:candidate_limit]
-        if unknown_candidates:
-            with ThreadPoolExecutor(max_workers=min(4, len(unknown_candidates))) as executor:
-                resolved_unknown = list(
-                    executor.map(
-                        lambda candidate: _resolve_aa_model(
-                            candidate,
-                            modal_gpu_catalog,
-                        ),
-                        unknown_candidates,
-                    )
-                )
-            for resolved in resolved_unknown:
-                if (
-                    resolved is not None
-                    and resolved.size_bucket in missing
-                    and resolved.size_bucket not in selected
-                ):
-                    selected[resolved.size_bucket] = resolved
+            if resolved is None or not resolved.repo_id or resolved.repo_id in seen_repos:
+                continue
+            seen_repos.add(resolved.repo_id)
+            bucket_models = selected_by_bucket[resolved.size_bucket]
+            if len(bucket_models) >= model_limit:
+                continue
+            bucket_models.append(resolved)
+            if all(
+                len(selected_by_bucket[bucket]) >= model_limit
+                for bucket in _MODEL_SIZE_BUCKETS
+            ):
+                break
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
     profiles: list[QuickDeployProfile] = []
     for bucket in _MODEL_SIZE_BUCKETS:
-        resolved = selected.get(bucket)
-        if resolved is None:
-            continue
-        profiles.extend(resolved.profiles)
-        if len(selected) >= model_limit and len(
-            {profile.model_size_label for profile in profiles}
-        ) >= model_limit:
-            break
+        for resolved in selected_by_bucket[bucket]:
+            profiles.extend(resolved.profiles)
     return tuple(profiles)
 
 
-def _first_deployable_aa_model(
+def _aa_candidate_window(
     candidates: Sequence[AAModelCandidate],
-    modal_gpu_catalog: Sequence[ModalGpuSpec],
-    *,
-    expected_bucket: ModelSizeBucket,
-) -> _ResolvedAAModel | None:
+    candidate_limit: int,
+) -> tuple[AAModelCandidate, ...]:
+    """Keep a ranked candidate budget for every known size bucket."""
+
+    candidates_by_bucket: dict[ModelSizeBucket, list[AAModelCandidate]] = {
+        bucket: [] for bucket in _MODEL_SIZE_BUCKETS
+    }
+    unknown_size_candidates: list[AAModelCandidate] = []
+    selected_ids: set[int] = set()
     for candidate in candidates:
-        resolved = _resolve_aa_model(candidate, modal_gpu_catalog)
-        if resolved is not None and resolved.size_bucket == expected_bucket:
-            return resolved
-    return None
+        bucket = _size_bucket_for_parameters(candidate.parameter_count_b)
+        if bucket is None:
+            if len(unknown_size_candidates) < candidate_limit:
+                unknown_size_candidates.append(candidate)
+                selected_ids.add(id(candidate))
+            continue
+        bucket_candidates = candidates_by_bucket[bucket]
+        if len(bucket_candidates) < candidate_limit:
+            bucket_candidates.append(candidate)
+            selected_ids.add(id(candidate))
+
+    return tuple(candidate for candidate in candidates if id(candidate) in selected_ids)
 
 
 def _resolve_aa_model(
     candidate: AAModelCandidate,
     modal_gpu_catalog: Sequence[ModalGpuSpec],
+    *,
+    repo_by_model_key: dict[str, str] | None = None,
 ) -> _ResolvedAAModel | None:
+    model_key = _model_key(candidate.name) or _model_key(candidate.slug)
+    if repo_by_model_key is not None and model_key in repo_by_model_key:
+        return _build_resolved_aa_model(
+            candidate,
+            modal_gpu_catalog,
+            repo_by_model_key[model_key],
+        )
     try:
         from huggingface_hub import HfApi
 
@@ -522,6 +505,17 @@ def _resolve_aa_model(
         return None
     if repo_id is None:
         return None
+    resolved = _build_resolved_aa_model(candidate, modal_gpu_catalog, repo_id)
+    if resolved is not None and repo_by_model_key is not None and model_key:
+        repo_by_model_key[model_key] = repo_id
+    return resolved
+
+
+def _build_resolved_aa_model(
+    candidate: AAModelCandidate,
+    modal_gpu_catalog: Sequence[ModalGpuSpec],
+    repo_id: str,
+) -> _ResolvedAAModel | None:
     try:
         metadata = fetch_gguf_quant_metadata(repo_id)
     except Exception:
@@ -543,6 +537,7 @@ def _resolve_aa_model(
         return None
     return _ResolvedAAModel(
         candidate=candidate,
+        repo_id=repo_id,
         size_bucket=size_bucket,
         profiles=tuple(profiles),
     )
@@ -551,11 +546,10 @@ def _resolve_aa_model(
 def _build_trending_fallback_catalog(
     *,
     model_limit: int,
-    candidate_limit: int,
     modal_gpu_catalog: Sequence[ModalGpuSpec],
     has_live_modal_pricing: bool,
 ) -> tuple[QuickDeployCatalogInfo, tuple[QuickDeployProfile, ...]]:
-    models = list_llamacpp_candidates(mode="trending", limit=candidate_limit)
+    models = list_llamacpp_candidates(mode="trending", limit=_FALLBACK_TRENDING_LIMIT)
     if not models:
         raise RuntimeError(
             "Neither Artificial Analysis rankings nor Hugging Face trending models "
@@ -717,24 +711,6 @@ def _reset_artificial_analysis_auth_status_cache() -> None:
         _AA_AUTH_STATUS_BY_KEY.clear()
 
 
-def _weighted_capability_score(
-    *,
-    coding_score: float | None,
-    agentic_score: float | None,
-    intelligence_score: float | None,
-) -> float | None:
-    weighted_values = (
-        (coding_score, 0.45),
-        (agentic_score, 0.35),
-        (intelligence_score, 0.20),
-    )
-    available = [(value, weight) for value, weight in weighted_values if value is not None]
-    if not available:
-        return None
-    total_weight = sum(weight for _value, weight in available)
-    return sum(value * weight for value, weight in available) / total_weight
-
-
 def _is_explicitly_closed_weight(row: dict[str, Any]) -> bool:
     licensing = row.get("licensing")
     if isinstance(licensing, dict) and licensing.get("is_open_weights") is False:
@@ -785,13 +761,26 @@ def _parameter_count_from_name(value: str) -> float | None:
     if not value:
         return None
     mixture = re.search(
-        r"(?i)(\d+(?:\.\d+)?)\s*[x×]\s*(\d+(?:\.\d+)?)\s*b(?:illion)?\b",
+        r"(?i)(\d+(?:\.\d+)?)\s*[x×]\s*(\d+(?:\.\d+)?)\s*([bt])(?:illion|rillion)?\b",
         value,
     )
     if mixture:
-        return float(mixture.group(1)) * float(mixture.group(2))
-    match = re.search(r"(?i)(\d+(?:\.\d+)?)\s*b(?:illion)?\b", value)
-    return float(match.group(1)) if match else None
+        multiplier = 1_000.0 if mixture.group(3).casefold() == "t" else 1.0
+        return float(mixture.group(1)) * float(mixture.group(2)) * multiplier
+    compact_moe = re.search(
+        r"(?i)(?<![a-z0-9])(\d+(?:\.\d+)?)\s*a\s*\d+(?:\.\d+)?\s*b\b",
+        value,
+    )
+    if compact_moe:
+        return float(compact_moe.group(1))
+    match = re.search(
+        r"(?i)(?<![a-z0-9])(\d+(?:\.\d+)?)\s*([bt])(?:illion|rillion)?\b",
+        value,
+    )
+    if match is None:
+        return None
+    multiplier = 1_000.0 if match.group(2).casefold() == "t" else 1.0
+    return float(match.group(1)) * multiplier
 
 
 def _extract_context_tokens(row: dict[str, Any]) -> int | None:
@@ -866,11 +855,23 @@ def _find_unsloth_gguf_match(
     if direct_repo and direct_repo.casefold().endswith("-gguf"):
         return direct_repo
 
+    for repo_id in _canonical_unsloth_gguf_repo_ids(candidate):
+        try:
+            row = hf_api.model_info(repo_id=repo_id)
+        except Exception:
+            continue
+        resolved_repo_id = _repo_id_from_hf_row(row) or repo_id
+        if (
+            resolved_repo_id.casefold().startswith("unsloth/")
+            and resolved_repo_id.casefold().endswith("-gguf")
+            and _aa_hf_match_score(candidate, resolved_repo_id) >= 90.0
+        ):
+            return resolved_repo_id
+
     rows: list[Any] = []
     for search in _hf_search_terms(candidate):
         kwargs = {
             "author": "unsloth",
-            "filter": ["text-generation", "gguf"],
             "search": search,
             "limit": 25,
             "full": True,
@@ -899,10 +900,59 @@ def _find_unsloth_gguf_match(
             scored.append((score, repo_id))
     if not scored:
         return None
-    scored.sort(key=lambda item: (-item[0], item[1].casefold()))
-    if len(scored) > 1 and scored[0][0] - scored[1][0] < 5.0:
-        return None
-    return scored[0][1]
+    best = min(scored, key=lambda item: _aa_hf_match_rank_key(candidate, item[1]))
+    return best[1]
+
+
+def _aa_hf_match_rank_key(
+    candidate: AAModelCandidate,
+    repo_id: str,
+) -> tuple[float, int, str]:
+    """Deterministic order: score, then fewest extra tokens, then name."""
+
+    repo_key = _model_key(_repo_model_name(repo_id))
+    candidate_keys = {
+        key
+        for key in (
+            _model_key(candidate.name),
+            _model_key(candidate.slug),
+            _model_key(
+                _repo_model_name(
+                    _repo_id_from_huggingface_url(candidate.huggingface_url) or ""
+                )
+            ),
+        )
+        if key
+    }
+    extra_tokens = min(
+        (abs(len(repo_key) - len(key)) for key in candidate_keys),
+        default=len(repo_key),
+    )
+    return (-_aa_hf_match_score(candidate, repo_id), extra_tokens, repo_id.casefold())
+
+
+def _canonical_unsloth_gguf_repo_ids(
+    candidate: AAModelCandidate,
+) -> tuple[str, ...]:
+    values = [
+        _repo_model_name(
+            _repo_id_from_huggingface_url(candidate.huggingface_url) or ""
+        ),
+        _strip_creator_prefix(candidate.name, candidate.creator_name),
+        candidate.name,
+    ]
+    repo_ids: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        cleaned = re.sub(r"\s*\([^)]*\)\s*$", "", value).strip()
+        cleaned = re.sub(r"(?i)-gguf$", "", cleaned)
+        repo_name = re.sub(r"[-_\s/]+", "-", cleaned).strip("-")
+        repo_id = f"unsloth/{repo_name}-GGUF" if repo_name else ""
+        key = repo_id.casefold()
+        if repo_id and key not in seen:
+            seen.add(key)
+            repo_ids.append(repo_id)
+    return tuple(repo_ids)
 
 
 def _hf_search_terms(candidate: AAModelCandidate) -> list[str]:
@@ -1021,6 +1071,9 @@ def _profiles_for_model(
             metadata = fetch_gguf_quant_metadata(model.repo_id)
         except Exception:
             return []
+    compatibility = evaluate_llamacpp_architecture(metadata.architecture)
+    if not compatibility.is_supported:
+        return []
     quants = _selected_quants(metadata)
     if not quants:
         return []
@@ -1046,6 +1099,7 @@ def _profiles_for_model(
                 modal_gpu_catalog=modal_gpu_catalog,
                 aa_candidate=aa_candidate,
                 size_bucket=size_bucket,
+                llamacpp_runtime_id=compatibility.runtime_id,
             )
         )
     return profiles
@@ -1084,6 +1138,7 @@ def _profiles_for_quant(
     modal_gpu_catalog: Sequence[ModalGpuSpec],
     aa_candidate: AAModelCandidate | None = None,
     size_bucket: ModelSizeBucket | None = None,
+    llamacpp_runtime_id: str,
 ) -> list[QuickDeployProfile]:
     required_vram_gb = _required_vram_for_quant(metadata, quant)
     if required_vram_gb is None:
@@ -1168,10 +1223,15 @@ def _profiles_for_quant(
                 aa_model_name=aa_candidate.name if aa_candidate else None,
                 aa_model_slug=aa_candidate.slug or None if aa_candidate else None,
                 aa_coding_score=aa_candidate.coding_score if aa_candidate else None,
+                aa_intelligence_score=(
+                    aa_candidate.intelligence_score if aa_candidate else None
+                ),
                 aa_rank=aa_candidate.rank if aa_candidate else None,
                 model_size_label=(
                     _MODEL_SIZE_LABELS[size_bucket] if size_bucket is not None else None
                 ),
+                gguf_architecture=metadata.architecture,
+                llamacpp_runtime_id=llamacpp_runtime_id,
             )
         )
     return profiles

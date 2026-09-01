@@ -10,7 +10,7 @@
     "llamacpp": {
       "runtime_version": "1",
       "bootstrap_base_image": "ubuntu_22_cuda_12",
-      "bootstrap_container_image": "ghcr.io/ggml-org/llama.cpp:server-cuda",
+      "bootstrap_container_image": "ghcr.io/ggml-org/llama.cpp:server-cuda-b10689",
       "container_port": 8000
     }
   },

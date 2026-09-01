@@ -5,10 +5,12 @@ import json
 import os
 import time
 import fnmatch
+import hashlib
 import re
 import shutil
 import subprocess
 import sys
+import unicodedata
 from uuid import uuid4
 
 import modal
@@ -29,6 +31,22 @@ def _slugify_name(raw: str) -> str:
     return "".join(ch if ch.isalnum() or ch == "-" else "-" for ch in raw.lower()).strip("-")
 
 
+def _modal_web_label(app_name: str, function_slug: str) -> str:
+    """Build a short deterministic web label without importing CLI dependencies."""
+    normalized = unicodedata.normalize("NFKD", app_name or "")
+    app_slug = re.sub(
+        r"-{2,}",
+        "-",
+        re.sub(r"[^a-z0-9-]+", "-", normalized.encode("ascii", "ignore").decode("ascii").lower()),
+    ).strip("-") or "default"
+    function_name = "serve"
+    function_slug = _slugify_name(function_slug)
+    if function_slug:
+        function_name = f"{function_name}-{function_slug}"
+    digest = hashlib.sha256(f"{app_slug}:{function_name}".encode()).hexdigest()[:12]
+    return f"llp-lc-{digest}"
+
+
 def _read_function_slug() -> str:
     raw = os.environ.get("MODAL_FUNCTION_SLUG", "").strip()
     if raw:
@@ -39,6 +57,7 @@ def _read_function_slug() -> str:
 
 
 FUNCTION_SLUG = _read_function_slug()
+WEB_LABEL = _modal_web_label(APP_NAME, FUNCTION_SLUG)
 
 
 def _function_name(base_name: str) -> str:
@@ -106,8 +125,11 @@ DOWNLOAD_CPU = _read_int_env("HF_DOWNLOAD_CPU", 4)
 HF_HUB_DISABLE_XET_DEFAULT = _read_bool_env("HF_HUB_DISABLE_XET", True)
 HF_XET_HIGH_PERFORMANCE_DEFAULT = _read_optional_bool_env("HF_XET_HIGH_PERFORMANCE")
 LLAMA_CPP_IMAGE_REF = (
-    os.environ.get("LLAMA_CPP_IMAGE_REF", "ghcr.io/ggml-org/llama.cpp:server-cuda").strip()
-    or "ghcr.io/ggml-org/llama.cpp:server-cuda"
+    os.environ.get(
+        "LLAMA_CPP_IMAGE_REF",
+        "ghcr.io/ggml-org/llama.cpp:server-cuda-b10689",
+    ).strip()
+    or "ghcr.io/ggml-org/llama.cpp:server-cuda-b10689"
 )
 LLAMA_CPP_IMAGE_NO_CACHE = _read_optional_bool_env("LLAMA_CPP_IMAGE_NO_CACHE")
 # Prefer cached image layers by default. Set LLAMA_CPP_IMAGE_NO_CACHE=true (or LLAMA_CPP_IMAGE_FORCE_BUILD=true)
@@ -1080,7 +1102,7 @@ except Exception:
     scaledown_window=SCALEDOWN_WINDOW,  # keep container warm after requests (overridable via env)
     max_containers=1,  # cap number of containers (replicas) to 1
 )
-@modal.web_server(8080, startup_timeout=30 * 60)
+@modal.web_server(8080, startup_timeout=30 * 60, label=WEB_LABEL)
 def serve():
     """Run llama.cpp's HTTP server for the specified model.
 
@@ -1104,9 +1126,10 @@ def serve():
     model_path = _resolve_or_download_model_entrypoint(model_repo_id, revision, quant)
     print(f"🦙 using model file: {model_path}")
 
-    # offload all layers to GPU if configured, or use explicit override
+    # Leave GPU layer placement unset by default so llama.cpp can fit the
+    # requested context into available device memory. Only an explicit user
+    # override should disable that automatic placement.
     n_gpu_layers_cfg = cfg.get("n_gpu_layers")
-    n_gpu_layers = int(n_gpu_layers_cfg) if n_gpu_layers_cfg is not None else (9999 if GPU_CONFIG else 0)
     server_bin = _resolve_llama_server_binary()
     server_env, server_cwd = _llama_server_runtime_env(server_bin)
     print(f"🦙 using llama-server binary: {server_bin}")
@@ -1118,14 +1141,14 @@ def serve():
         server_bin,
         "--model",
         str(model_path),
-        "--n-gpu-layers",
-        str(n_gpu_layers),
         "--host",
         host,
         "--port",
         str(port),
         "--metrics",  # Enable metrics endpoint
     ]
+    if n_gpu_layers_cfg is not None:
+        command += ["--n-gpu-layers", str(int(n_gpu_layers_cfg))]
     if not _server_args_define_alias(server_args):
         command += ["--alias", served_model_name]
     command += server_args

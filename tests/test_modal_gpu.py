@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+import threading
+import time
 import types
 import unittest
 from unittest.mock import patch
@@ -84,6 +87,12 @@ CPU
 
 
 class ModalGpuTypesTests(unittest.TestCase):
+    def setUp(self) -> None:
+        modal_gpu._reset_modal_gpu_catalog_cache()
+
+    def tearDown(self) -> None:
+        modal_gpu._reset_modal_gpu_catalog_cache()
+
     def test_parse_modal_gpu_types_from_docs_snippet(self) -> None:
         parsed = modal_gpu._parse_modal_gpu_types(_DOC_SNIPPET)
         self.assertEqual(
@@ -190,6 +199,78 @@ class ModalGpuTypesTests(unittest.TestCase):
 
         self.assertEqual(catalog[0].value, "T4")
         self.assertIsNone(catalog[0].price_per_hour_usd)
+
+    def test_fetch_modal_gpu_catalog_reuses_cached_result(self) -> None:
+        class FakeResponse:
+            def __init__(self, text: str) -> None:
+                self.status_code = 200
+                self.text = text
+
+        requested_urls: list[str] = []
+
+        def fake_get(url: str, **_kwargs: object) -> FakeResponse:
+            requested_urls.append(url)
+            if url == modal_gpu.MODAL_GPU_GUIDE_URL:
+                return FakeResponse(_DOC_SNIPPET)
+            return FakeResponse(_PRICING_SNIPPET)
+
+        fake_requests = types.SimpleNamespace(get=fake_get)
+        with patch.dict("sys.modules", {"requests": fake_requests}):
+            first = modal_gpu.fetch_modal_gpu_catalog()
+            second = modal_gpu.fetch_modal_gpu_catalog()
+
+        self.assertEqual(first, second)
+        self.assertCountEqual(
+            requested_urls,
+            [modal_gpu.MODAL_GPU_GUIDE_URL, modal_gpu.MODAL_PRICING_URL],
+        )
+
+    def test_fetch_modal_gpu_catalog_shares_inflight_refresh(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        call_count = 0
+
+        def fake_fetch(**_kwargs: object) -> list[modal_gpu.ModalGpuSpec]:
+            nonlocal call_count
+            call_count += 1
+            started.set()
+            release.wait(timeout=2.0)
+            return [modal_gpu.ModalGpuSpec("H100", 3.95)]
+
+        with patch.object(modal_gpu, "_fetch_modal_gpu_catalog_uncached", fake_fetch):
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                first = executor.submit(
+                    modal_gpu.fetch_modal_gpu_catalog,
+                    force_refresh=True,
+                )
+                self.assertTrue(started.wait(timeout=1.0))
+                second = executor.submit(
+                    modal_gpu.fetch_modal_gpu_catalog,
+                    force_refresh=True,
+                )
+                time.sleep(0.05)
+                release.set()
+                self.assertEqual(first.result(), second.result())
+
+        self.assertEqual(call_count, 1)
+
+    def test_fetch_modal_gpu_catalog_uses_stale_result_after_refresh_error(self) -> None:
+        expected = [modal_gpu.ModalGpuSpec("H100", 3.95)]
+        with patch.object(
+            modal_gpu,
+            "_fetch_modal_gpu_catalog_uncached",
+            return_value=expected,
+        ):
+            self.assertEqual(modal_gpu.fetch_modal_gpu_catalog(), expected)
+
+        with patch.object(
+            modal_gpu,
+            "_fetch_modal_gpu_catalog_uncached",
+            side_effect=RuntimeError("temporary outage"),
+        ):
+            actual = modal_gpu.fetch_modal_gpu_catalog(force_refresh=True)
+
+        self.assertEqual(actual, expected)
 
     def test_fetch_modal_gpu_types_raises_on_http_error(self) -> None:
         class FakeResponse:

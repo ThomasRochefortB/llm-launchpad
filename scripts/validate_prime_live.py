@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from dataclasses import replace
 import json
 import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -19,10 +21,12 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 
 import requests
-from textual.widgets import Button, Input, Select, Switch
+from textual.widgets import Button, Input, OptionList, Select, Switch
 
 from llm_launchpad.core.backend import ModalBackend
+from llm_launchpad.core.compute_availability import aggregate_compute_availability
 from llm_launchpad.core.naming import build_deployment_name
+from llm_launchpad.core.opencode import provider_id_for_app
 from llm_launchpad.core.prime_backend import (
     PRIME_DEFAULT_BOOTSTRAP_IMAGE,
     PrimeBackend,
@@ -42,15 +46,14 @@ from llm_launchpad.core.prime_live import (
 from llm_launchpad.core.provider_options import prime_provider_options
 from llm_launchpad.core.quick_deploy import (
     get_quick_deploy_profile,
-    quick_deploy_recipe,
+    list_quick_deploy_models,
 )
-from llm_launchpad.protocol.enums import BackendType, BillingModel, ComputeProvider
+from llm_launchpad.protocol.enums import BackendType, ComputeProvider
 from llm_launchpad.protocol.models import (
+    ComputeAvailabilitySnapshot,
     ComputeOffer,
     DeploymentConfig,
     InferencePlan,
-    PrimeProviderOptions,
-    ProviderQuote,
     StorageSnapshot,
 )
 from llm_launchpad.tui.app import TuiApp
@@ -58,6 +61,10 @@ from llm_launchpad.tui.screens.deploy import (
     LlamaCppDeployScreen,
     PrimeOffersLoaded,
     VllmDeployScreen,
+)
+from llm_launchpad.tui.screens.fast_deploy import (
+    FastDeployAvailabilityLoaded,
+    FastDeployScreen,
 )
 from llm_launchpad.tui.screens.monitor import MonitorScreen
 from llm_launchpad.tui.screens.quick_deploy import QuickDeployScreen
@@ -96,6 +103,23 @@ class CaptureMonitorScreen(MonitorScreen):
         super().on_operation_done(message)
 
 
+class LiveFastDeployScreen(FastDeployScreen):
+    """Fast Deploy screen backed by one already-fetched live snapshot."""
+
+    def __init__(self, snapshot: ComputeAvailabilitySnapshot) -> None:
+        super().__init__()
+        self.live_snapshot = snapshot
+
+    def _run_load_availability(self, request_id: int, *, purpose: str = "infra") -> None:
+        self.post_message(
+            FastDeployAvailabilityLoaded(
+                self.live_snapshot,
+                request_id=request_id,
+                purpose=purpose,
+            )
+        )
+
+
 class LiveTuiApp(TuiApp):
     """Real TUI deployment flow with deterministic test-only routing."""
 
@@ -106,15 +130,24 @@ class LiveTuiApp(TuiApp):
         backend: BackendType,
         *,
         quick_plan: InferencePlan | None = None,
+        fast_snapshot: ComputeAvailabilitySnapshot | None = None,
+        fast_provider: ComputeProvider | None = None,
+        fast_profile_id: str | None = None,
     ) -> None:
         super().__init__(mouse_enabled=False)
         self.live_backend = backend
         self.quick_plan = quick_plan
+        self.fast_snapshot = fast_snapshot
+        self.fast_provider = fast_provider
+        self.fast_profile_id = fast_profile_id
         self.deployed_config: DeploymentConfig | None = None
         self.capture_monitor: CaptureMonitorScreen | None = None
         self.live_notifications: list[tuple[str, str]] = []
 
     def on_mount(self) -> None:
+        if self.fast_snapshot is not None:
+            self.push_screen(LiveFastDeployScreen(self.fast_snapshot))
+            return
         if self.quick_plan is not None:
             self.push_screen(QuickDeployScreen(self.quick_plan))
             return
@@ -391,12 +424,21 @@ async def _configure_and_start(
     disk_id: str | None,
     vllm_model: str = VLLM_MODEL,
     quick_plan: InferencePlan | None = None,
+    fast_provider: ComputeProvider | None = None,
+    fast_profile_id: str | None = None,
 ) -> None:
     screen: object = app.screen
-    deploy_screens = (VllmDeployScreen, LlamaCppDeployScreen, QuickDeployScreen)
+    deploy_screens = (
+        VllmDeployScreen,
+        LlamaCppDeployScreen,
+        QuickDeployScreen,
+        FastDeployScreen,
+    )
     if not isinstance(screen, deploy_screens):
         app.push_screen(
-            QuickDeployScreen(quick_plan)
+            LiveFastDeployScreen(app.fast_snapshot)
+            if app.fast_snapshot is not None
+            else QuickDeployScreen(quick_plan)
             if quick_plan is not None
             else (
                 VllmDeployScreen()
@@ -412,6 +454,71 @@ async def _configure_and_start(
         screen = app.screen
     else:
         raise RuntimeError(f"TUI deploy form did not mount; current screen is {type(screen).__name__}.")
+
+    if isinstance(screen, FastDeployScreen):
+        if fast_provider is None or not fast_profile_id:
+            raise RuntimeError("Fast Deploy validation requires a provider and profile ID.")
+        models = list_quick_deploy_models()
+        model = next(
+            (
+                candidate
+                for candidate in models
+                if any(profile.id == fast_profile_id for profile in candidate.profiles)
+            ),
+            None,
+        )
+        if model is None:
+            raise RuntimeError(f"Fast Deploy model for {fast_profile_id!r} was not found.")
+        option_list = screen.query_one("#fast-deploy-list", OptionList)
+        model_index = next(
+            (
+                index
+                for index in range(option_list.option_count)
+                if option_list.get_option_at_index(index).id == model.id
+            ),
+            None,
+        )
+        if model_index is None:
+            raise RuntimeError("Qwen3.8 did not appear in the Fast Deploy model picker.")
+        option_list.highlighted = model_index
+        await pilot.press("enter")
+        for _ in range(50):
+            await pilot.pause()
+            if screen._phase == "infra" and screen._infra_rows:
+                break
+            await asyncio.sleep(0.1)
+        else:
+            raise RuntimeError("Fast Deploy infrastructure choices did not load.")
+        selected = next(
+            (
+                row
+                for row in screen._infra_rows.values()
+                if row.plan.quote.provider == fast_provider
+                and row.profile.id == fast_profile_id
+            ),
+            None,
+        )
+        if selected is None:
+            raise RuntimeError(
+                f"Fast Deploy did not show {fast_provider.display_name} for {fast_profile_id}."
+            )
+        option_list = screen.query_one("#fast-deploy-list", OptionList)
+        infra_index = next(
+            index
+            for index in range(option_list.option_count)
+            if option_list.get_option_at_index(index).id == selected.plan.quote.id
+        )
+        option_list.highlighted = infra_index
+        await pilot.press("enter")
+        for _ in range(50):
+            await pilot.pause()
+            if isinstance(app.screen, QuickDeployScreen):
+                screen = app.screen
+                break
+            await asyncio.sleep(0.1)
+        else:
+            raise RuntimeError("Fast Deploy did not open its confirmation screen.")
+
     instance_name = f"{run_id}-{stage_slug}"
     if isinstance(screen, QuickDeployScreen):
         screen.query_one("#toggle-advanced-quick", Button).press()
@@ -420,6 +527,7 @@ async def _configure_and_start(
         screen.query_one("#quick-warmup", Switch).value = True
         screen.query_one("#quick-prime-insecure-http", Switch).value = False
         screen.query_one("#quick-prime-keep-failed", Switch).value = False
+        screen.query_one("#quick-prime-auto-disk", Switch).value = False
         screen.query_one("#quick-deploy-btn", Button).press()
     elif isinstance(screen, VllmDeployScreen):
         screen.query_one("#model-name", Input).value = vllm_model
@@ -487,6 +595,9 @@ async def _run_tui_stage(
     inspect_stops_pod: bool = False,
     secrets: list[str] | None = None,
     quick_plan: InferencePlan | None = None,
+    fast_snapshot: ComputeAvailabilitySnapshot | None = None,
+    fast_provider: ComputeProvider | None = None,
+    fast_profile_id: str | None = None,
 ) -> tuple[dict[str, Any], DeploymentConfig]:
     budget.require_capacity(
         hourly_rate_usd=offer.price_per_hour or 0.0,
@@ -494,7 +605,13 @@ async def _run_tui_stage(
         description=stage.name,
     )
     started = time.monotonic()
-    app = LiveTuiApp(backend, quick_plan=quick_plan)
+    app = LiveTuiApp(
+        backend,
+        quick_plan=quick_plan,
+        fast_snapshot=fast_snapshot,
+        fast_provider=fast_provider,
+        fast_profile_id=fast_profile_id,
+    )
     pod: dict[str, Any] = {}
     config: DeploymentConfig | None = None
     try:
@@ -507,6 +624,8 @@ async def _run_tui_stage(
                 stage_slug=stage_slug,
                 disk_id=disk_id,
                 quick_plan=quick_plan,
+                fast_provider=fast_provider,
+                fast_profile_id=fast_profile_id,
             )
             config, pod, log_lines = await _wait_for_deploy(
                 app,
@@ -739,12 +858,188 @@ main()
     return evidence
 
 
+def _run_isolated_opencode(
+    config: DeploymentConfig,
+    *,
+    opencode_root: Path,
+    secrets: tuple[str, ...],
+    timeout: int = 240,
+) -> dict[str, Any]:
+    """Send a real prompt through the isolated Launchpad OpenCode provider."""
+
+    executable = shutil.which("opencode")
+    if not executable:
+        raise RuntimeError("OpenCode is not installed for live validation.")
+
+    app_name = str(config.app_name or "").strip()
+    model_id = str(config.served_model_name or config.model_name or "").strip()
+    if not app_name or not model_id:
+        raise RuntimeError("OpenCode validation requires an app name and served model.")
+    provider_id = provider_id_for_app(app_name)
+    model_reference = f"{provider_id}/{model_id}"
+
+    env = os.environ.copy()
+    env["OPENCODE_CONFIG"] = str(opencode_root / "opencode.json")
+    env["XDG_CONFIG_HOME"] = str(opencode_root / "xdg-config")
+    env["XDG_DATA_HOME"] = str(opencode_root / "xdg-data")
+    env["XDG_CACHE_HOME"] = str(opencode_root / "xdg-cache")
+    env["XDG_STATE_HOME"] = str(opencode_root / "xdg-state")
+    env["NO_COLOR"] = "1"
+
+    models = subprocess.run(
+        [executable, "models", provider_id],
+        cwd=opencode_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=timeout,
+    )
+    models_output = "\n".join(
+        part for part in (models.stdout, models.stderr) if part
+    ).strip()
+    if models.returncode != 0:
+        detail = redact_live_value(models_output or "no command output", secrets)
+        raise RuntimeError(f"opencode models failed: {detail}")
+    if model_reference not in models_output:
+        raise AssertionError(
+            f"OpenCode did not list the synced model {model_reference}."
+        )
+
+    sentinel = f"PRIME-OPENCODE-{int(time.time())}"
+    prompt = f"Reply with exactly this identifier and nothing else: {sentinel}"
+    run_result = subprocess.run(
+        [
+            executable,
+            "run",
+            "--pure",
+            "--format",
+            "json",
+            "--model",
+            model_reference,
+            prompt,
+        ],
+        cwd=opencode_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=timeout,
+    )
+    combined = "\n".join(
+        part for part in (run_result.stdout, run_result.stderr) if part
+    ).strip()
+    redacted_lines = [
+        redact_live_value(line, secrets)
+        for line in combined.splitlines()
+        if line.strip()
+    ]
+    if run_result.returncode != 0:
+        detail = redacted_lines[-1] if redacted_lines else "no command output"
+        raise RuntimeError(f"opencode run failed: {detail}")
+    if sentinel not in combined:
+        raise AssertionError("OpenCode did not return the requested sentinel.")
+    return {
+        "model_reference": model_reference,
+        "models_exit_code": models.returncode,
+        "run_exit_code": run_result.returncode,
+        "chat_sentinel": sentinel,
+        "output_tail": redacted_lines[-20:],
+    }
+
+
+def _llamacpp_management_evidence(
+    config: DeploymentConfig,
+    *,
+    provider: ComputeProvider,
+) -> dict[str, Any]:
+    """Exercise fresh-process management commands and a real OpenCode request."""
+
+    app_name = str(config.app_name or "").strip()
+    api_key = str(config.endpoint_api_key or "").strip()
+    if not app_name:
+        raise RuntimeError("Management validation requires an app name.")
+    secrets = (api_key,) if api_key else ()
+    command_evidence: dict[str, Any] = {}
+    with tempfile.TemporaryDirectory(
+        prefix=f"llm-launchpad-{provider.value}-llamacpp-cli-"
+    ) as temp_root:
+        opencode_root = Path(temp_root)
+        command_specs = {
+            "list": ["list", "--provider", provider.value],
+            "status": [
+                "status",
+                "--provider",
+                provider.value,
+                "--backend",
+                BackendType.LLAMACPP.value,
+                "--app-name",
+                app_name,
+                "--timeout",
+                "180",
+            ],
+            "logs": [
+                "logs",
+                "--provider",
+                provider.value,
+                "--backend",
+                BackendType.LLAMACPP.value,
+                "--app-name",
+                app_name,
+                "--no-follow",
+            ],
+            "warmup": [
+                "warmup",
+                "--provider",
+                provider.value,
+                "--backend",
+                BackendType.LLAMACPP.value,
+                "--app-name",
+                app_name,
+                "--timeout",
+                "180",
+                "--no-tail-logs",
+            ],
+            "opencode_dry_run": [
+                "opencode",
+                "sync",
+                "--provider",
+                provider.value,
+                "--app-name",
+                app_name,
+                "--dry-run",
+            ],
+            "opencode_sync": [
+                "opencode",
+                "sync",
+                "--provider",
+                provider.value,
+                "--app-name",
+                app_name,
+            ],
+        }
+        for name, cli_args in command_specs.items():
+            command_evidence[name] = _run_isolated_cli(
+                cli_args,
+                opencode_root=opencode_root,
+                secrets=secrets,
+                timeout=300,
+            )
+        command_evidence["opencode_run"] = _run_isolated_opencode(
+            config,
+            opencode_root=opencode_root,
+            secrets=secrets,
+            timeout=300,
+        )
+    return command_evidence
+
+
 def _management_and_tunnel_recovery_evidence(
     prime: PrimeBackend,
     config: DeploymentConfig,
     pod: dict[str, Any],
 ) -> dict[str, Any]:
-    """Exercise management in fresh processes and recover a killed tunnel client."""
+    """Exercise management and OpenCode, then recover a killed tunnel client."""
 
     app_name = str(config.app_name or "")
     pod_id = str(pod.get("id") or "")
@@ -825,6 +1120,10 @@ def _management_and_tunnel_recovery_evidence(
                 "opencode", "sync", "--provider", "prime",
                 "--app-name", app_name, "--dry-run",
             ],
+            "opencode_sync": [
+                "opencode", "sync", "--provider", "prime",
+                "--app-name", app_name,
+            ],
         }
         for name, cli_args in command_specs.items():
             command_evidence[name] = _run_isolated_cli(
@@ -832,6 +1131,11 @@ def _management_and_tunnel_recovery_evidence(
                 opencode_root=opencode_root,
                 secrets=(api_key,),
             )
+        command_evidence["opencode_run"] = _run_isolated_opencode(
+            config,
+            opencode_root=opencode_root,
+            secrets=(api_key,),
+        )
         command_evidence["stop"] = _run_isolated_cli(
             [
                 "stop", "--provider", "prime", "--backend", "vllm",
@@ -872,6 +1176,8 @@ def _qwen38_quick_deploy_evidence(
     options = prime_provider_options(config)
     if options.offer_id != expected_offer_id:
         raise AssertionError("Qwen3.8 quick deploy did not preserve the selected Prime offer.")
+    if options.auto_disk:
+        raise AssertionError("The disposable live validation unexpectedly enabled a cache disk.")
 
     gpu = prime._run_ssh(
         pod,
@@ -898,6 +1204,10 @@ def _qwen38_quick_deploy_evidence(
         "selected_offer_id": options.offer_id,
         "nvidia_smi": gpu_rows,
         "model_log_verified": True,
+        "fresh_process_commands": _llamacpp_management_evidence(
+            config,
+            provider=ComputeProvider.PRIME,
+        ),
     }
 
 
@@ -1343,26 +1653,9 @@ async def run(args: argparse.Namespace) -> int:
                 gpu_count=profile.gpu_count,
                 required_vram_gb=profile.required_vram_gb,
             )
-            recipe = quick_deploy_recipe(profile)
-            plan = InferencePlan(
-                recipe=recipe,
-                quote=ProviderQuote(
-                    id=f"prime:{recipe.id}:{offer.id}",
-                    recipe_id=recipe.id,
-                    provider=ComputeProvider.PRIME,
-                    provider_reference=offer.id,
-                    gpu_type=offer.gpu_type,
-                    gpu_count=offer.gpu_count,
-                    price_per_hour_usd=offer.price_per_hour,
-                    billing_model=BillingModel.PROVISIONED,
-                    is_estimate=False,
-                    provider_options=PrimeProviderOptions(offer_id=offer.id),
-                ),
-                estimated_monthly_cost_usd=(
-                    offer.price_per_hour * 8 * 30
-                    if offer.price_per_hour is not None
-                    else None
-                ),
+            snapshot = replace(
+                aggregate_compute_availability(prime_offers=(offer,)),
+                providers=(ComputeProvider.PRIME,),
             )
             stage = PrimeLiveStage(
                 name="qwen38_27b_quick_deploy",
@@ -1390,7 +1683,9 @@ async def run(args: argparse.Namespace) -> int:
                         expected_offer_id=offer.id,
                     ),
                     secrets=secrets,
-                    quick_plan=plan,
+                    fast_snapshot=snapshot,
+                    fast_provider=ComputeProvider.PRIME,
+                    fast_profile_id=profile.id,
                 ),
             )
     except Exception as exc:

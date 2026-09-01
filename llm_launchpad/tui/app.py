@@ -7,20 +7,23 @@ the screen stack and bridges user actions to Core via threaded workers.
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import json
 import os
-import subprocess
-import sys
 import threading
 import time
+from dataclasses import replace
+from pathlib import Path
 from typing import Optional
 
 from textual.app import App
 from textual.binding import Binding
+from textual.filter import Monochrome
+from textual.widgets import Input, TextArea
 
 from ..core.backend import ModalBackend
 from ..core.benchmark import benchmark_config_from_endpoint, parse_concurrency_values
-from ..core.config import SETTINGS_DIR
+from ..core.config import ConfigStore, SETTINGS_DIR
 from ..core.hf_models import fetch_gguf_quant_metadata, list_llamacpp_candidates, list_vllm_candidates
 from ..core.naming import (
     build_deployment_name,
@@ -30,6 +33,7 @@ from ..core.prime_auth import get_prime_auth_status
 from ..core.prime_backend import PrimeBackend
 from ..core.provider_options import prime_provider_options
 from ..core.quick_deploy import QuickDeployProfile
+from ..core.runtime_support import evaluate_llamacpp_architecture
 from ..core.opencode import (
     build_openai_connection_payload,
     resolve_connection_for_app,
@@ -39,7 +43,12 @@ from ..core.opencode import (
 )
 from ..core.orchestrator import Orchestrator
 from ..protocol.enums import BackendType, ComputeProvider, OperationType
-from ..protocol.events import ErrorEvent, LogEvent, OperationCompleteEvent
+from ..protocol.events import (
+    EndpointAvailableEvent,
+    ErrorEvent,
+    LogEvent,
+    OperationCompleteEvent,
+)
 from ..protocol.models import BenchmarkConfig
 from ..protocol.models import EndpointInfo
 from ..protocol.models import DeploymentConfig
@@ -49,16 +58,27 @@ from ..protocol.models import StorageSnapshot
 
 from .screens.main_menu import MainMenuScreen
 from .screens.deploy import BackendSelectScreen
+from .screens.fast_deploy import FastDeployScreen
 from .screens.manage import ManageScreen
 from .screens.monitor import MonitorScreen
 from .screens.quick_deploy import QuickDeployScreen
 from .screens.storage import StorageScreen
 from .screens.settings import SettingsScreen
+from .clipboard import read_system_clipboard, write_system_clipboard
+from .visual import (
+    LAUNCHPAD_THEMES,
+    normalize_tui_density,
+    normalize_tui_theme,
+)
 from .workers import (
+    ConnectionSummaryReady,
+    EndpointsFailed,
+    EndpointsLoaded,
     LlamaCppModelsFailed,
     LlamaCppModelsLoaded,
     LlamaCppQuantsFailed,
     LlamaCppQuantsLoaded,
+    ModalUsernameLoaded,
     StorageFailed,
     StorageLoaded,
     VllmModelsFailed,
@@ -96,6 +116,16 @@ def _deploy_connection_summary_payload(
     return build_openai_connection_payload(config, server_url)
 
 
+def _deploy_connection_card_payload(
+    config: DeploymentConfig,
+    server_url: str,
+) -> dict[str, str]:
+    """Connection card fields, including the generated endpoint API key."""
+    payload = dict(_deploy_connection_summary_payload(config, server_url))
+    payload["api_key"] = config.endpoint_api_key or ""
+    return payload
+
+
 def _osc_52_sequence(text: str) -> str:
     payload = base64.b64encode(text.encode("utf-8")).decode("ascii")
     return f"\x1b]52;c;{payload}\a"
@@ -116,22 +146,43 @@ class TuiApp(App):
     TITLE = "llm-launchpad"
     SUB_TITLE = "Modal + Prime LLM backends"
 
-    CSS_PATH = "theme.tcss"
+    CSS_PATH = Path(__file__).with_name("theme.tcss")
 
     BINDINGS = [
         Binding("ctrl+c", "request_quit", show=False, priority=True, system=True),
+        Binding(
+            "ctrl+v,ctrl+shift+v,super+v,meta+v,cmd+v,command+v",
+            "paste_from_clipboard",
+            show=False,
+            priority=True,
+        ),
         Binding("ctrl+t", "toggle_mouse_mode", "Mouse", show=True),
     ]
     _CTRL_C_CONFIRM_WINDOW_SECONDS = 10.0
+    _ENDPOINT_CACHE_TTL_SECONDS = 20.0
     _STORAGE_CACHE_TTL_SECONDS = 20.0
 
     def __init__(self, *, mouse_enabled: bool = True, **kwargs: object) -> None:
         super().__init__(**kwargs)
+        for theme in LAUNCHPAD_THEMES:
+            self.register_theme(theme)
+        visual_settings = ConfigStore().load()
+        self.theme = normalize_tui_theme(visual_settings.tui_theme)
+        self.tui_density = normalize_tui_density(visual_settings.tui_density)
+        self._monochrome_filter = Monochrome(
+            enabled=self.theme == "launchpad-monochrome"
+        )
+        self._filters.append(self._monochrome_filter)
         self.mouse_enabled = mouse_enabled
         self._ctrl_c_last_requested_at = 0.0
         self._orchestrator = Orchestrator()
         self._username: str = ""
         self._version: str = ""
+        self._endpoint_snapshot_cache: list[EndpointInfo] | None = None
+        self._endpoint_snapshot_cached_at_epoch: float = 0.0
+        self._endpoint_refresh_inflight = False
+        self._endpoint_refresh_lock = threading.Lock()
+        self._endpoint_refresh_receivers: list[object] = []
         self._storage_snapshot_cache: StorageSnapshot | None = None
         self._storage_snapshot_cached_at_epoch: float = 0.0
         self._storage_refresh_inflight = False
@@ -148,8 +199,23 @@ class TuiApp(App):
         except Exception:
             pass
 
+    def apply_visual_preferences(self, theme: str, density: str) -> None:
+        """Apply persisted visual preferences without restarting the TUI."""
+        self.theme = normalize_tui_theme(theme)
+        self.tui_density = normalize_tui_density(density)
+        self._monochrome_filter.enabled = self.theme == "launchpad-monochrome"
+        try:
+            screen = self.screen
+        except Exception:
+            return
+        refresher = getattr(screen, "refresh_visual_preferences", None)
+        if callable(refresher):
+            refresher()
+        else:
+            screen.refresh(repaint=True, layout=True)
+
     def copy_to_clipboard(self, text: str) -> None:
-        """Copy text via OSC 52, including tmux/screen passthrough variants."""
+        """Copy text via OSC 52 and the host clipboard when available."""
         super().copy_to_clipboard(text)
         driver = getattr(self, "_driver", None)
         if driver is not None:
@@ -162,16 +228,52 @@ class TuiApp(App):
                     driver.write(_screen_passthrough_sequence(text))
             except Exception:
                 pass
-        if sys.platform == "darwin":
-            try:
-                subprocess.run(
-                    ["pbcopy"],
-                    input=text.encode(),
-                    check=True,
-                    timeout=2,
-                )
-            except Exception:
-                pass
+        # OSC 52 handles remote terminals; a local clipboard provider covers
+        # terminals that don't implement OSC 52.
+        write_system_clipboard(text)
+
+    def paste_from_clipboard(self) -> str | None:
+        """Refresh the app clipboard from the host clipboard when possible."""
+        text = read_system_clipboard()
+        if text is not None:
+            self._clipboard = text
+        return text
+
+    def action_paste_from_clipboard(self) -> None:
+        """Paste host clipboard text into the focused editable widget."""
+        try:
+            focused = self.focused
+        except Exception:
+            focused = None
+        if not isinstance(focused, (Input, TextArea)):
+            return
+        self.paste_from_clipboard()
+        action_paste = getattr(focused, "action_paste", None)
+        if callable(action_paste):
+            action_paste()
+
+    def _copy_current_selection(self) -> bool:
+        """Copy a real selection, returning whether one was available."""
+        try:
+            focused = self.focused
+        except Exception:
+            focused = None
+        if isinstance(focused, (Input, TextArea)):
+            selected_text = getattr(focused, "selected_text", "")
+            if selected_text:
+                self.copy_to_clipboard(selected_text.rstrip("\n"))
+                return True
+
+        try:
+            selected_text = self.screen.get_selected_text()
+        except Exception:
+            selected_text = None
+        if selected_text:
+            normalized = selected_text.rstrip("\n")
+            if normalized:
+                self.copy_to_clipboard(normalized)
+                return True
+        return False
 
     def _set_mouse_mode(self, enabled: bool) -> None:
         """Enable or disable driver mouse reporting at runtime."""
@@ -214,6 +316,8 @@ class TuiApp(App):
 
     async def action_request_quit(self) -> None:
         """Require a second Ctrl+C press before quitting the TUI."""
+        if self._copy_current_selection():
+            return
         now = time.monotonic()
         if (
             self._ctrl_c_last_requested_at > 0.0
@@ -263,20 +367,56 @@ class TuiApp(App):
             )
             self.exit(return_code=1)
             return
-        self._username = ModalBackend.get_username() or "" if modal_available else ""
-        self.push_screen(MainMenuScreen(username=self._username, version=self._version))
+        self.push_screen(MainMenuScreen(username="", version=self._version))
+        if modal_available:
+            self.run_worker(
+                self._run_load_modal_username,
+                name="modal-username-worker",
+                thread=True,
+            )
         if not self.mouse_enabled:
             self.notify(
                 "Terminal copy mode active. Press Ctrl+T to enable mouse.",
                 timeout=4,
             )
 
+    def _run_load_modal_username(self) -> None:
+        self.post_message(ModalUsernameLoaded(ModalBackend.get_username() or ""))
+
+    def on_modal_username_loaded(self, message: ModalUsernameLoaded) -> None:
+        self._username = message.username
+        for screen in self.screen_stack:
+            setter = getattr(screen, "set_modal_username", None)
+            if callable(setter):
+                setter(message.username)
+
     # ------------------------------------------------------------------
     # Actions called by screens
     # ------------------------------------------------------------------
 
     def action_push_deploy(self) -> None:
+        current_screen = self.screen
+        if isinstance(current_screen, MainMenuScreen):
+            current_screen.ensure_quick_deploy_catalog_refresh()
+        self.push_screen(FastDeployScreen())
+
+    def quick_deploy_catalog_updated(self) -> None:
+        """Notify the active model picker that the shared catalog changed."""
+        try:
+            screen = self.screen
+        except Exception:
+            return
+        refresher = getattr(screen, "refresh_quick_deploy_catalog", None)
+        if callable(refresher):
+            refresher()
+
+    def action_push_custom_deploy(self) -> None:
         self.push_screen(BackendSelectScreen())
+
+    def pop_to_main_menu(self) -> None:
+        """Pop nested deploy/monitor screens until the home menu is current."""
+        while len(self.screen_stack) > 1 and not isinstance(self.screen, MainMenuScreen):
+            self.pop_screen()
 
     def action_push_manage(self) -> None:
         self.push_screen(ManageScreen())
@@ -290,8 +430,15 @@ class TuiApp(App):
     def push_quick_deploy(
         self,
         profile: str | QuickDeployProfile | InferencePlan,
+        *,
+        alternative_plans: tuple[InferencePlan, ...] | None = None,
     ) -> None:
-        self.push_screen(QuickDeployScreen(profile_id=profile))
+        self.push_screen(
+            QuickDeployScreen(
+                profile_id=profile,
+                alternative_plans=alternative_plans,
+            )
+        )
 
     # ------------------------------------------------------------------
     # Deploy
@@ -322,12 +469,31 @@ class TuiApp(App):
         deployed_endpoint: EndpointInfo | None = None
         deployed_web_url_priority = -1
         deploy_succeeded = False
+        opencode_synced = False
         will_run_warmup = bool(config.do_warmup and config.do_deploy)
 
         def _emit_connection_summary(url: str) -> None:
             self._cache_deploy_connection_summary(config, url, deployed_endpoint)
             for line in _deploy_connection_summary_lines(config, url):
                 _dispatch_event(monitor, LogEvent(line=line))
+            poster = getattr(monitor, "post_message", None)
+            if callable(poster):
+                poster(ConnectionSummaryReady(_deploy_connection_card_payload(config, url)))
+
+        def _sync_now(url: str) -> None:
+            nonlocal opencode_synced
+            target_app_name = config.app_name or legacy_app_name(config.backend)
+            live_rows, prune_providers = self._visible_rows_and_prune_scope()
+            self._sync_opencode(
+                target_app_name=target_app_name,
+                target_url=url,
+                target_config=config,
+                current_rows=live_rows,
+                prune_providers=prune_providers,
+                monitor=monitor,
+                emit_skipped=True,
+            )
+            opencode_synced = True
 
         for event in self._orchestrator.deploy(config):
             if isinstance(event, LogEvent):
@@ -343,8 +509,18 @@ class TuiApp(App):
                     if priority >= deployed_web_url_priority:
                         deployed_web_url = maybe_url
                         deployed_web_url_priority = priority
+            elif isinstance(event, EndpointAvailableEvent):
+                deployed_endpoint = event.endpoint
+                self._invalidate_endpoint_snapshot()
+                if event.endpoint.web_url:
+                    deployed_web_url = event.endpoint.web_url
+                    deployed_web_url_priority = max(deployed_web_url_priority, 2)
+                    _emit_connection_summary(event.endpoint.web_url)
+                    _sync_now(event.endpoint.web_url)
             elif isinstance(event, OperationCompleteEvent):
                 deploy_succeeded = event.success
+                if event.operation == OperationType.DEPLOY:
+                    self._invalidate_endpoint_snapshot()
                 if event.success and isinstance(event.data, EndpointInfo):
                     deployed_endpoint = event.data
                     deployed_web_url = event.data.web_url or deployed_web_url
@@ -352,12 +528,31 @@ class TuiApp(App):
                         self._cache_deploy_connection_summary(
                             config, event.data.web_url, event.data
                         )
+                elif (
+                    not event.success
+                    and event.operation == OperationType.DEPLOY
+                    and opencode_synced
+                ):
+                    target_app_name = config.app_name or legacy_app_name(config.backend)
+                    live_rows, prune_providers = self._visible_rows_and_prune_scope()
+                    self._sync_opencode(
+                        current_rows=live_rows,
+                        remove_app_names=[target_app_name],
+                        prune_providers=prune_providers,
+                        monitor=monitor,
+                    )
+                    opencode_synced = False
                 # When warmup immediately follows a successful deploy in the same
                 # monitor session, suppress the intermediate completion footer
                 # ("Operation complete... Press esc") to keep the summary cleaner.
                 if will_run_warmup and event.success and event.operation == OperationType.DEPLOY:
                     continue
-                if event.success and event.operation == OperationType.DEPLOY and config.do_deploy:
+                if (
+                    event.success
+                    and event.operation == OperationType.DEPLOY
+                    and config.do_deploy
+                    and not opencode_synced
+                ):
                     target_app_name = config.app_name or legacy_app_name(config.backend)
                     url = deployed_web_url
                     if not url and config.provider == ComputeProvider.MODAL:
@@ -368,14 +563,7 @@ class TuiApp(App):
                         )
                     if url:
                         _emit_connection_summary(url)
-                        self._sync_opencode(
-                            target_app_name=target_app_name,
-                            target_url=url,
-                            target_config=config,
-                            current_rows=self._load_visible_launchpad_rows(),
-                            monitor=monitor,
-                            emit_skipped=True,
-                        )
+                        _sync_now(url)
             _dispatch_event(monitor, event)
 
         # Warmup if requested and deploy was successful
@@ -425,14 +613,8 @@ class TuiApp(App):
                         if isinstance(maybe_url, str) and maybe_url.strip():
                             completed_url = maybe_url.strip()
                     _emit_connection_summary(completed_url)
-                    self._sync_opencode(
-                        target_app_name=target_app_name,
-                        target_url=completed_url,
-                        target_config=config,
-                        current_rows=self._load_visible_launchpad_rows(),
-                        monitor=monitor,
-                        emit_skipped=True,
-                    )
+                    if not opencode_synced or completed_url != url:
+                        _sync_now(completed_url)
                 elif (
                     isinstance(event, OperationCompleteEvent)
                     and not event.success
@@ -459,50 +641,14 @@ class TuiApp(App):
                         _dispatch_event(monitor, cleanup_event)
                     self._deploy_connection_cache.pop(target_app_name, None)
                     self._persist_deploy_connection_cache()
-                _dispatch_event(monitor, event)
-
-    # ------------------------------------------------------------------
-    # Manage: list
-    # ------------------------------------------------------------------
-
-    def begin_list(self) -> None:
-        monitor = MonitorScreen(title="List Deployments")
-        self.push_screen(monitor)
-        self.run_worker(
-            lambda: self._run_list(monitor),
-            name="list-worker",
-            thread=True,
-        )
-
-    def _run_list(self, monitor: MonitorScreen):  # type: ignore[return]
-        providers = []
-        if ModalBackend.is_cli_available():
-            providers.append(ComputeProvider.MODAL)
-        if get_prime_auth_status().authenticated:
-            providers.append(ComputeProvider.PRIME)
-        visible_rows: list[EndpointInfo] = []
-        for provider in providers:
-            events = (
-                self._orchestrator.list_deployments()
-                if provider == ComputeProvider.MODAL
-                else self._orchestrator.list_deployments(provider)
-            )
-            for event in events:
-                if (
-                    isinstance(event, OperationCompleteEvent)
-                    and event.success
-                    and isinstance(event.data, list)
-                ):
-                    visible_rows.extend(
-                        row for row in event.data if isinstance(row, EndpointInfo)
+                    live_rows, prune_providers = self._visible_rows_and_prune_scope()
+                    self._sync_opencode(
+                        current_rows=live_rows,
+                        remove_app_names=[target_app_name],
+                        prune_providers=prune_providers,
+                        monitor=monitor,
                     )
                 _dispatch_event(monitor, event)
-        self._merge_deploy_connection_cache(visible_rows)
-        self._sync_opencode(
-            current_rows=visible_rows,
-            monitor=monitor,
-            emit_skipped=True,
-        )
 
     # ------------------------------------------------------------------
     # Manage: status
@@ -510,18 +656,17 @@ class TuiApp(App):
 
     def begin_status(
         self,
-        backend: BackendType,
-        server_url: Optional[str] = None,
+        endpoint: EndpointInfo,
+        url_override: Optional[str] = None,
         timeout: int = 60,
-        app_name: Optional[str] = None,
-        served_model_name: Optional[str] = None,
-        provider: ComputeProvider = ComputeProvider.MODAL,
-        api_key: Optional[str] = None,
-        pod_id: Optional[str] = None,
     ) -> None:
-        target_app_name = app_name or legacy_app_name(backend)
-        url = server_url
-        if not url and provider == ComputeProvider.MODAL:
+        """Probe one selected endpoint, resolving provider details centrally."""
+        if endpoint.backend is None:
+            self.notify("This endpoint has no recognized backend.", severity="error", timeout=6)
+            return
+        target_app_name = endpoint.name or legacy_app_name(endpoint.backend)
+        url = url_override or endpoint.web_url
+        if not url and endpoint.provider == ComputeProvider.MODAL:
             url = ModalBackend.default_server_url(self._username, app_name=target_app_name)
         if not url:
             self.notify("No endpoint URL is stored for this deployment.", severity="error", timeout=6)
@@ -530,14 +675,14 @@ class TuiApp(App):
         self.push_screen(monitor)
         self.run_worker(
             lambda: self._run_status(
-                backend,
+                endpoint.backend,
                 url,
                 timeout,
                 target_app_name,
-                served_model_name,
-                provider,
-                api_key,
-                pod_id,
+                endpoint.served_model_name,
+                endpoint.provider,
+                endpoint.endpoint_api_key,
+                endpoint.app_id or None,
                 monitor,
             ),
             name="status-worker",
@@ -636,19 +781,25 @@ class TuiApp(App):
 
     def begin_logs(
         self,
-        backend: BackendType,
+        endpoint: EndpointInfo,
         follow: bool = True,
-        app_name: Optional[str] = None,
-        app_id: Optional[str] = None,
-        provider: ComputeProvider = ComputeProvider.MODAL,
     ) -> None:
+        """Tail logs for one selected endpoint."""
+        if endpoint.backend is None:
+            self.notify("This endpoint has no recognized backend.", severity="error", timeout=6)
+            return
         monitor = MonitorScreen(title="Logs")
         self.push_screen(monitor)
-        target_app_name = app_name or legacy_app_name(backend)
-        target_ref = (app_id or target_app_name).strip()
+        target_app_name = endpoint.name or legacy_app_name(endpoint.backend)
+        target_ref = (endpoint.app_id or target_app_name).strip()
         self.run_worker(
             lambda: self._run_logs(
-                backend, follow, target_ref, target_app_name, monitor, provider=provider
+                endpoint.backend,
+                follow,
+                target_ref,
+                target_app_name,
+                monitor,
+                provider=endpoint.provider,
             ),
             name="logs-worker",
             thread=True,
@@ -685,18 +836,23 @@ class TuiApp(App):
 
     def begin_stop(
         self,
-        backend: BackendType,
-        app_name: Optional[str] = None,
-        app_id: Optional[str] = None,
-        provider: ComputeProvider = ComputeProvider.MODAL,
+        endpoint: EndpointInfo,
     ) -> None:
+        """Stop one explicitly confirmed endpoint."""
+        if endpoint.backend is None:
+            self.notify("This endpoint has no recognized backend.", severity="error", timeout=6)
+            return
         monitor = MonitorScreen(title="Stop")
         self.push_screen(monitor)
-        target_app_name = app_name or legacy_app_name(backend)
-        target_ref = (app_id or target_app_name).strip()
+        target_app_name = endpoint.name or legacy_app_name(endpoint.backend)
+        target_ref = (endpoint.app_id or target_app_name).strip()
         self.run_worker(
             lambda: self._run_stop(
-                backend, target_ref, target_app_name, monitor, provider=provider
+                endpoint.backend,
+                target_ref,
+                target_app_name,
+                monitor,
+                provider=endpoint.provider,
             ),
             name="stop-worker",
             thread=True,
@@ -730,38 +886,129 @@ class TuiApp(App):
             ):
                 self._deploy_connection_cache.pop(app_name, None)
                 self._persist_deploy_connection_cache()
+                live_rows, prune_providers = self._visible_rows_and_prune_scope()
+                self._cache_endpoint_snapshot(live_rows)
                 self._sync_opencode(
-                    current_rows=self._load_visible_launchpad_rows(),
+                    current_rows=live_rows,
+                    prune_providers=prune_providers,
                     remove_app_names=[app_name],
                     monitor=monitor,
                     emit_skipped=True,
                 )
             _dispatch_event(monitor, event)
 
+    def _cache_endpoint_snapshot(self, rows: list[EndpointInfo]) -> None:
+        with self._endpoint_refresh_lock:
+            self._endpoint_snapshot_cache = [replace(row) for row in rows]
+            self._endpoint_snapshot_cached_at_epoch = time.time()
+
+    def _invalidate_endpoint_snapshot(self) -> None:
+        with self._endpoint_refresh_lock:
+            self._endpoint_snapshot_cached_at_epoch = 0.0
+
+    def begin_endpoint_refresh(self, receiver: object, force: bool = False) -> None:
+        """Load endpoints once and deliver the result to every waiting screen."""
+        poster = getattr(receiver, "post_message", None)
+        if poster is None:
+            return
+
+        now = time.time()
+        cached_rows: list[EndpointInfo] | None = None
+        cache_is_fresh = False
+        start_worker = False
+        with self._endpoint_refresh_lock:
+            if self._endpoint_snapshot_cache is not None:
+                cached_rows = [replace(row) for row in self._endpoint_snapshot_cache]
+                cache_age = now - self._endpoint_snapshot_cached_at_epoch
+                cache_is_fresh = not force and cache_age <= self._ENDPOINT_CACHE_TTL_SECONDS
+
+            if not cache_is_fresh:
+                if not any(
+                    candidate is receiver for candidate in self._endpoint_refresh_receivers
+                ):
+                    self._endpoint_refresh_receivers.append(receiver)
+                if not self._endpoint_refresh_inflight:
+                    self._endpoint_refresh_inflight = True
+                    start_worker = True
+
+        if cached_rows is not None:
+            poster(EndpointsLoaded(rows=cached_rows, is_stale=not cache_is_fresh))
+        if cache_is_fresh:
+            return
+        if start_worker:
+            self.run_worker(
+                self._run_endpoint_refresh,
+                name="endpoint-refresh-worker",
+                thread=True,
+            )
+
+    def _run_endpoint_refresh(self) -> None:
+        try:
+            rows, _prune_providers = self._visible_rows_and_prune_scope()
+        except Exception as exc:
+            self._finish_endpoint_refresh(error=str(exc))
+            return
+
+        self._cache_endpoint_snapshot(rows)
+        self._finish_endpoint_refresh(rows=rows)
+
+    def _finish_endpoint_refresh(
+        self,
+        *,
+        rows: list[EndpointInfo] | None = None,
+        error: str | None = None,
+    ) -> None:
+        with self._endpoint_refresh_lock:
+            receivers = self._endpoint_refresh_receivers
+            self._endpoint_refresh_receivers = []
+            self._endpoint_refresh_inflight = False
+
+        for receiver in receivers:
+            poster = getattr(receiver, "post_message", None)
+            if poster is None:
+                continue
+            if error is not None:
+                poster(EndpointsFailed(error=error))
+            else:
+                poster(EndpointsLoaded(rows=[replace(row) for row in rows or []]))
+
     def list_instances(self, backend: BackendType | None = None) -> list[EndpointInfo]:
-        modal_rows = ModalBackend.list_apps()
-        rows = list(modal_rows or [])
-        if get_prime_auth_status().authenticated:
-            try:
-                rows.extend(PrimeBackend().list_deployments())
-            except Exception:
-                pass
-        self._merge_deploy_connection_cache(rows)
-        self._sync_opencode(current_rows=visible_launchpad_rows(rows))
+        """Synchronously discover endpoints without unrelated configuration writes."""
+        rows, _prune_providers = self._visible_rows_and_prune_scope()
         if backend is None:
-            return rows
+            return list(rows)
         return [row for row in rows if row.backend == backend]
 
-    def _load_visible_launchpad_rows(self) -> list[EndpointInfo] | None:
-        modal_rows = ModalBackend.list_apps()
-        rows = list(modal_rows or [])
-        if get_prime_auth_status().authenticated:
+    def _visible_rows_and_prune_scope(
+        self,
+    ) -> tuple[list[EndpointInfo], tuple[ComputeProvider, ...]]:
+        rows: list[EndpointInfo] = []
+        prune_providers: list[ComputeProvider] = []
+        prime_enabled = get_prime_auth_status().authenticated
+        with ThreadPoolExecutor(max_workers=2 if prime_enabled else 1) as executor:
+            modal_future = executor.submit(ModalBackend.list_apps)
+            prime_future = (
+                executor.submit(PrimeBackend().list_deployments)
+                if prime_enabled
+                else None
+            )
             try:
-                rows.extend(PrimeBackend().list_deployments())
+                modal_rows = modal_future.result()
             except Exception:
-                pass
+                modal_rows = None
+            try:
+                prime_rows = prime_future.result() if prime_future is not None else None
+            except Exception:
+                prime_rows = None
+
+        if modal_rows is not None:
+            rows.extend(modal_rows)
+            prune_providers.append(ComputeProvider.MODAL)
+        if prime_rows is not None:
+            rows.extend(prime_rows)
+            prune_providers.append(ComputeProvider.PRIME)
         self._merge_deploy_connection_cache(rows)
-        return visible_launchpad_rows(rows)
+        return visible_launchpad_rows(rows), tuple(prune_providers)
 
     def _sync_opencode(
         self,
@@ -771,6 +1018,7 @@ class TuiApp(App):
         target_config: DeploymentConfig | None = None,
         current_rows: list[EndpointInfo] | None = None,
         remove_app_names: list[str] | None = None,
+        prune_providers: tuple[ComputeProvider, ...] | None = None,
         monitor: MonitorScreen | None = None,
         emit_skipped: bool = False,
     ) -> None:
@@ -792,6 +1040,7 @@ class TuiApp(App):
                 targets=targets,
                 current_rows=current_rows,
                 remove_app_names=remove_app_names,
+                prune_providers=prune_providers,
             )
         except Exception as exc:
             if monitor is not None:
@@ -1173,11 +1422,16 @@ class TuiApp(App):
         except Exception as exc:
             poster(LlamaCppQuantsFailed(repo_id=repo_id, revision=revision, error=str(exc)))
             return
+        compatibility = evaluate_llamacpp_architecture(metadata.architecture)
         poster(
             LlamaCppQuantsLoaded(
                 repo_id=repo_id,
                 revision=revision,
                 quantizations=list(metadata.quantizations),
                 vram_gb_by_quant=dict(metadata.vram_gb_by_quant),
+                architecture=metadata.architecture,
+                compatibility_status=compatibility.status.value,
+                compatibility_message=compatibility.message,
+                llamacpp_runtime_id=compatibility.runtime_id,
             )
         )

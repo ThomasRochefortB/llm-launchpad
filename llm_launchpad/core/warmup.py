@@ -12,6 +12,7 @@ import subprocess
 import threading
 import time
 from typing import Generator, Optional
+from urllib.parse import urlsplit
 
 from ..protocol.enums import BackendType, ComputeProvider, DeploymentState, OperationType
 from ..protocol.events import (
@@ -100,6 +101,32 @@ def status_probe_url(backend: BackendType, server_url: str) -> str:
     return root + ("/health" if backend == BackendType.VLLM else "/v1/completions")
 
 
+def endpoint_url_error(server_url: str) -> str | None:
+    """Return a useful error when an endpoint cannot be represented in DNS."""
+    try:
+        parsed = urlsplit(server_url)
+        hostname = parsed.hostname or ""
+    except ValueError as exc:
+        return f"invalid hostname: {exc}"
+    if parsed.scheme not in {"http", "https"}:
+        return "URL must use http or https"
+    if not hostname:
+        return "URL has no hostname"
+    raw_oversized = next((label for label in hostname.split(".") if len(label) > 63), None)
+    if raw_oversized is not None:
+        return f"DNS label is {len(raw_oversized)} characters; maximum is 63"
+    try:
+        ascii_hostname = hostname.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        return f"invalid hostname: {exc}"
+    oversized = next((label for label in ascii_hostname.split(".") if len(label) > 63), None)
+    if oversized is not None:
+        return f"DNS label is {len(oversized)} characters; maximum is 63"
+    if len(ascii_hostname) > 253:
+        return f"hostname is {len(ascii_hostname)} characters; maximum is 253"
+    return None
+
+
 class WarmupRunner:
     """Probe endpoint readiness while optionally tailing Modal logs."""
 
@@ -126,6 +153,19 @@ class WarmupRunner:
         is_vllm = backend == BackendType.VLLM
         probe_url = status_probe_url(backend, server_url)
         yield LogEvent(line=f"Probing readiness at: {probe_url}")
+        url_error = endpoint_url_error(probe_url)
+        if url_error:
+            yield ErrorEvent(
+                message=f"Invalid endpoint URL: {url_error}",
+                operation=OperationType.WARMUP,
+                recoverable=False,
+            )
+            yield OperationCompleteEvent(
+                operation=OperationType.WARMUP,
+                success=False,
+                exit_code=2,
+            )
+            return
 
         # Start log tailing in background.
         # We use a dedicated reader thread + queue.Queue so that every
@@ -300,6 +340,8 @@ class WarmupRunner:
                         served_model_name=served_model_name,
                         api_key=api_key,
                     )
+                    if api_key:
+                        curl_cmd = curl_cmd.replace(api_key, "$LLM_LAUNCHPAD_API_KEY")
                     yield LogEvent(line=f"Test command:\n{curl_cmd}")
                     yield StateChangeEvent(
                         current=DeploymentState.HEALTHY, operation=OperationType.WARMUP

@@ -62,6 +62,8 @@ def save_connection(
         "base_url": payload["base_url"],
         "model_id": payload["model_id"],
         "display_name": payload["display_name"],
+        "max_context_tokens": payload.get("context_limit"),
+        "max_output_tokens": payload.get("output_limit"),
         "api_key": config.endpoint_api_key or endpoint.endpoint_api_key or "",
         "cached_at_epoch": time.time(),
     }
@@ -84,6 +86,12 @@ def merge_connections(
         row.endpoint_api_key = row.endpoint_api_key or str(cached.get("api_key") or "") or None
         row.app_id = row.app_id or str(cached.get("resource_id") or "")
         row.instance_name = row.instance_name or str(cached.get("instance_name") or "") or None
+        row.max_context_tokens = row.max_context_tokens or _positive_int(
+            cached.get("max_context_tokens")
+        )
+        row.max_output_tokens = row.max_output_tokens or _positive_int(
+            cached.get("max_output_tokens")
+        )
         provider = str(cached.get("provider") or "")
         if provider in {item.value for item in ComputeProvider}:
             row.provider = ComputeProvider(provider)
@@ -91,6 +99,60 @@ def merge_connections(
         if backend in {item.value for item in BackendType}:
             row.backend = BackendType(backend)
     return rows
+
+
+def rows_from_connection_cache(
+    path: Path = CONNECTIONS_PATH,
+) -> list[EndpointInfo]:
+    """Build endpoint rows from locally persisted connection metadata."""
+    entries = load_connection_entries(path)
+    rows: list[EndpointInfo] = []
+    for app_name, entry in entries.items():
+        base_url = str(entry.get("base_url") or "").removesuffix("/v1")
+        if not base_url:
+            continue
+        provider_value = str(entry.get("provider") or "")
+        backend_value = str(entry.get("backend") or "")
+        rows.append(
+            EndpointInfo(
+                name=app_name,
+                app_id=str(entry.get("resource_id") or ""),
+                backend=(
+                    BackendType(backend_value)
+                    if backend_value in {item.value for item in BackendType}
+                    else None
+                ),
+                instance_name=str(entry.get("instance_name") or "") or None,
+                web_url=base_url,
+                served_model_name=str(entry.get("model_id") or "") or None,
+                display_name=str(entry.get("display_name") or "") or None,
+                provider=(
+                    ComputeProvider(provider_value)
+                    if provider_value in {item.value for item in ComputeProvider}
+                    else ComputeProvider.MODAL
+                ),
+                endpoint_api_key=str(entry.get("api_key") or "") or None,
+                max_context_tokens=_positive_int(entry.get("max_context_tokens")),
+                max_output_tokens=_positive_int(entry.get("max_output_tokens")),
+            )
+        )
+    return rows
+
+
+def _positive_int(value: object) -> int | None:
+    """Parse a positive integer from untrusted persisted connection metadata."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = int(value)
+        except ValueError:
+            return None
+    else:
+        return None
+    return parsed if parsed > 0 else None
 
 
 def remove_connection(app_name: str, path: Path = CONNECTIONS_PATH) -> None:

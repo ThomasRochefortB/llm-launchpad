@@ -8,12 +8,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from difflib import SequenceMatcher
 import json
-import os
 from pathlib import Path
 import re
 import sys
 from typing import Any, NamedTuple, Sequence
 
+from llm_launchpad.core.artificial_analysis_auth import resolve_artificial_analysis_api_key
 from llm_launchpad.core.hf_models import GgufQuantMetadata, fetch_gguf_quant_metadata, fetch_model_max_context
 from llm_launchpad.core.modal_gpu import ModalGpuSpec, fetch_modal_gpu_catalog
 from llm_launchpad.core.naming import slugify_instance_name
@@ -23,6 +23,7 @@ from llm_launchpad.core.quick_deploy import (
     QWEN35_397B_SERVER_ARGS,
 )
 from llm_launchpad.core.quick_deploy_refresh import fetch_artificial_analysis_models
+from llm_launchpad.core.runtime_support import evaluate_llamacpp_architecture
 
 CATALOG_PATH = Path(__file__).resolve().parents[1] / "llm_launchpad" / "data" / "quick_deploy_catalog.json"
 ATTRIBUTION = "Benchmark data sourced from Artificial Analysis: https://artificialanalysis.ai/"
@@ -145,9 +146,10 @@ class AAModelCandidate:
     name: str
     slug: str
     creator_name: str
-    coding_score: float
+    coding_score: float | None
     rank: int
     max_context_tokens: int | None = None
+    intelligence_score: float | None = None
 
 
 @dataclass(frozen=True)
@@ -215,7 +217,7 @@ def fetch_aa_llm_models(api_key: str, timeout: float = 20.0) -> dict[str, Any]:
 
 
 def normalize_aa_candidates(payload: Any, limit: int = 50) -> list[AAModelCandidate]:
-    """Return AA rows ranked by Coding Index, excluding known proprietary rows."""
+    """Return AA rows ranked by Intelligence Index, excluding proprietary rows."""
     rows = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(rows, list):
         return []
@@ -224,9 +226,18 @@ def normalize_aa_candidates(payload: Any, limit: int = 50) -> list[AAModelCandid
     for row in rows:
         if not isinstance(row, dict):
             continue
-        score = _optional_float(_nested_value(row, "evaluations", "artificial_analysis_coding_index"))
-        if score is None:
+        intelligence_score = _optional_float(
+            _nested_value(
+                row,
+                "evaluations",
+                "artificial_analysis_intelligence_index",
+            )
+        )
+        if intelligence_score is None:
             continue
+        coding_score = _optional_float(
+            _nested_value(row, "evaluations", "artificial_analysis_coding_index")
+        )
         open_status = _open_weight_status(row)
         if open_status is False:
             continue
@@ -242,13 +253,20 @@ def normalize_aa_candidates(payload: Any, limit: int = 50) -> list[AAModelCandid
                 name=name or slug,
                 slug=slug,
                 creator_name=creator_name,
-                coding_score=score,
+                coding_score=coding_score,
                 rank=0,
                 max_context_tokens=_extract_aa_max_context(row),
+                intelligence_score=intelligence_score,
             )
         )
 
-    ranked = sorted(candidates, key=lambda candidate: (-candidate.coding_score, candidate.name.casefold()))
+    ranked = sorted(
+        candidates,
+        key=lambda candidate: (
+            -_candidate_ranking_score(candidate),
+            candidate.name.casefold(),
+        ),
+    )
     return [
         AAModelCandidate(
             aa_model_id=candidate.aa_model_id,
@@ -258,6 +276,7 @@ def normalize_aa_candidates(payload: Any, limit: int = 50) -> list[AAModelCandid
             coding_score=candidate.coding_score,
             rank=index + 1,
             max_context_tokens=candidate.max_context_tokens,
+            intelligence_score=candidate.intelligence_score,
         )
         for index, candidate in enumerate(ranked[: max(1, int(limit))])
     ]
@@ -321,9 +340,9 @@ def build_catalog_payload(
             break
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": generated_at or _utc_now_iso(),
-        "source": "Artificial Analysis coding rankings",
+        "source": "Artificial Analysis Intelligence Index rankings",
         "attribution": ATTRIBUTION,
         "profiles": profiles,
     }
@@ -346,6 +365,7 @@ def build_popular_catalog_payload(
             coding_score=0.0,
             rank=rank,
             max_context_tokens=model.max_context_tokens,
+            intelligence_score=0.0,
         )
         metadata = fetch_gguf_quant_metadata(model.repo_id)
         metadata = _apply_required_vram_floors(
@@ -364,6 +384,7 @@ def build_popular_catalog_payload(
                 "aa_model_name",
                 "aa_model_slug",
                 "aa_coding_score",
+                "aa_intelligence_score",
                 "aa_rank",
             ):
                 row.pop(key, None)
@@ -376,7 +397,7 @@ def build_popular_catalog_payload(
         profiles.extend(rows)
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "generated_at": generated_at or _utc_now_iso(),
         "source": "Curated popular open-weight models",
         "attribution": POPULAR_ATTRIBUTION,
@@ -404,6 +425,7 @@ def _apply_required_vram_floors(
     return GgufQuantMetadata(
         quantizations=list(metadata.quantizations),
         vram_gb_by_quant=values,
+        architecture=metadata.architecture,
     )
 
 
@@ -417,7 +439,11 @@ def _latest_family_candidates(candidates: Sequence[AAModelCandidate]) -> list[AA
             latest_by_family[family_key] = candidate
     return sorted(
         latest_by_family.values(),
-        key=lambda candidate: (-candidate.coding_score, candidate.rank, candidate.name.casefold()),
+        key=lambda candidate: (
+            -_candidate_ranking_score(candidate),
+            candidate.rank,
+            candidate.name.casefold(),
+        ),
     )
 
 
@@ -431,7 +457,20 @@ def _candidate_family_key(candidate: AAModelCandidate) -> str:
 
 def _candidate_recency_key(candidate: AAModelCandidate) -> tuple[int, tuple[int, ...], float, int]:
     _family, version = _candidate_family_and_version(candidate)
-    return (1 if version else 0, version, candidate.coding_score, -candidate.rank)
+    return (
+        1 if version else 0,
+        version,
+        _candidate_ranking_score(candidate),
+        -candidate.rank,
+    )
+
+
+def _candidate_ranking_score(candidate: AAModelCandidate) -> float:
+    if candidate.intelligence_score is not None:
+        return candidate.intelligence_score
+    if candidate.coding_score is not None:
+        return candidate.coding_score
+    return float("-inf")
 
 
 def _candidate_family_and_version(candidate: AAModelCandidate) -> tuple[str, tuple[int, ...]]:
@@ -475,6 +514,9 @@ def build_profile_rows(
     modal_gpu_catalog: Sequence[ModalGpuSpec],
 ) -> list[dict[str, Any]]:
     """Build tiered QuickDeployProfile-compatible JSON rows for one model."""
+    compatibility = evaluate_llamacpp_architecture(metadata.architecture)
+    if not compatibility.is_supported:
+        return []
     override = _manual_override_for(candidate, repo_id)
     price_by_gpu = _price_by_gpu(modal_gpu_catalog)
     display_name = _display_name_for_candidate(candidate, repo_id)
@@ -496,7 +538,7 @@ def build_profile_rows(
             repo_id,
             fallback=int(override["max_context_tokens"]),
         )
-        return _profile_rows_for_quant_variants(
+        rows = _profile_rows_for_quant_variants(
             candidate,
             repo_id,
             metadata=metadata,
@@ -508,23 +550,27 @@ def build_profile_rows(
             primary_quant=quant,
             primary_cheap=cheap,
         )
-
-    selected = _select_quant_and_gpu(metadata, modal_gpu_catalog)
-    if selected is None:
-        return []
-    max_context_tokens = _resolve_max_context_tokens(candidate, repo_id, fallback=65536)
-    return _profile_rows_for_quant_variants(
-        candidate,
-        repo_id,
-        metadata=metadata,
-        modal_gpu_catalog=modal_gpu_catalog,
-        display_name=display_name,
-        slug_hint=slug_hint,
-        max_context_tokens=max_context_tokens,
-        server_args=["--ctx-size", str(max_context_tokens)],
-        primary_quant=selected.quant,
-        primary_cheap=selected,
-    )
+    else:
+        selected = _select_quant_and_gpu(metadata, modal_gpu_catalog)
+        if selected is None:
+            return []
+        max_context_tokens = _resolve_max_context_tokens(candidate, repo_id, fallback=65536)
+        rows = _profile_rows_for_quant_variants(
+            candidate,
+            repo_id,
+            metadata=metadata,
+            modal_gpu_catalog=modal_gpu_catalog,
+            display_name=display_name,
+            slug_hint=slug_hint,
+            max_context_tokens=max_context_tokens,
+            server_args=["--ctx-size", str(max_context_tokens)],
+            primary_quant=selected.quant,
+            primary_cheap=selected,
+        )
+    for row in rows:
+        row["gguf_architecture"] = compatibility.architecture
+        row["llamacpp_runtime_id"] = compatibility.runtime_id
+    return rows
 
 
 def _profile_rows_for_quant_variants(
@@ -683,19 +729,20 @@ def _profile_row_from_selection(
         "quant": selection.quant,
         "gpu_type": selection.gpu_type,
         "gpu_count": selection.gpu_count,
-        "profile_label": _RESOURCE_TIER_DESCRIPTIONS.get(resource_tier, "AA Coding"),
+        "profile_label": _RESOURCE_TIER_DESCRIPTIONS.get(resource_tier, "AA Intelligence"),
         "resource_tier": resource_tier,
         "resource_tier_label": _RESOURCE_TIER_LABELS.get(resource_tier, resource_tier),
         "approx_cost_per_hour_usd": round(selection.cost_per_hour_usd, 2),
         "max_context_tokens": max_context_tokens,
         "instance_slug_hint": f"{slug_hint}-{quant_slug}-{resource_tier}",
-        "summary": "Artificial Analysis-ranked open-weight coding profile matched to Unsloth GGUF weights.",
+        "summary": "Artificial Analysis Intelligence Index-ranked open-weight profile matched to Unsloth GGUF weights.",
         "server_args": list(server_args),
         "source_label": "Artificial Analysis",
         "aa_model_id": candidate.aa_model_id or None,
         "aa_model_name": candidate.name,
         "aa_model_slug": candidate.slug or None,
         "aa_coding_score": candidate.coding_score,
+        "aa_intelligence_score": candidate.intelligence_score,
         "aa_rank": candidate.rank,
     }
     _maybe_add_required_vram(row, selection.required_vram_gb)
@@ -790,13 +837,15 @@ def _resolve_max_context_tokens(
     *,
     fallback: int,
 ) -> int:
-    values: list[int | None] = [candidate.max_context_tokens]
+    if candidate.max_context_tokens is not None and candidate.max_context_tokens > 0:
+        return candidate.max_context_tokens
     for base_repo_id in _base_context_repo_candidates(candidate, repo_id):
-        values.append(fetch_model_max_context(base_repo_id))
-    values.append(fetch_model_max_context(repo_id))
-    for value in values:
+        value = fetch_model_max_context(base_repo_id)
         if value is not None and value > 0:
             return value
+    repo_context = fetch_model_max_context(repo_id)
+    if repo_context is not None and repo_context > 0:
+        return repo_context
     return max(1, int(fallback))
 
 
@@ -1198,9 +1247,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.popular:
         catalog = build_popular_catalog_payload(modal_gpu_catalog=modal_gpu_catalog)
     else:
-        api_key = os.environ.get("ARTIFICIAL_ANALYSIS_API_KEY", "").strip()
+        api_key = resolve_artificial_analysis_api_key()
         if not api_key:
-            raise SystemExit("ARTIFICIAL_ANALYSIS_API_KEY is required for maintainer catalog refresh")
+            raise SystemExit(
+                "An Artificial Analysis API key is required for maintainer catalog refresh. "
+                "Set ARTIFICIAL_ANALYSIS_API_KEY or run llm-launchpad aai-auth login."
+            )
 
         from huggingface_hub import HfApi
 

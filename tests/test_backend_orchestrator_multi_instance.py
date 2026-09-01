@@ -44,6 +44,20 @@ class BackendMultiInstanceTests(unittest.TestCase):
         parsed = ModalBackend.extract_modal_web_url(line)
         self.assertEqual(parsed, "https://alice--vllm-minimax-m2-5-serve-disc-42c728.modal.run")
 
+    def test_default_llamacpp_url_uses_dns_safe_custom_label(self) -> None:
+        url = ModalBackend.default_server_url(
+            "thomasrochefortb",
+            app_name="llamacpp-glm-5-3-flash-q2xl-cheap",
+            function_slug="adaptable-cockatrice",
+        )
+
+        self.assertEqual(
+            url,
+            "https://thomasrochefortb--llp-lc-19d04acfa30d.modal.run",
+        )
+        dns_label = url.removeprefix("https://").split(".", 1)[0]
+        self.assertLessEqual(len(dns_label), 63)
+
 
 class OrchestratorMultiInstanceTests(unittest.TestCase):
     def test_deploy_assigns_and_forwards_function_slug_for_non_vllm(self) -> None:
@@ -161,7 +175,7 @@ class OrchestratorMultiInstanceTests(unittest.TestCase):
         with patch("llm_launchpad.core.backend.ModalBackend.run_streaming", side_effect=_fake_run_streaming):
             events = list(orch.stop_app(BackendType.VLLM, app_name="vllm-qwen2-5"))
         self.assertTrue(captured)
-        self.assertEqual(captured[0], ["modal", "app", "stop", "vllm-qwen2-5"])
+        self.assertEqual(captured[0], ["modal", "app", "stop", "--yes", "vllm-qwen2-5"])
         self.assertTrue(any(isinstance(event, LogEvent) for event in events))
 
     def test_stop_app_prefers_explicit_app_id(self) -> None:
@@ -178,7 +192,7 @@ class OrchestratorMultiInstanceTests(unittest.TestCase):
         with patch("llm_launchpad.core.backend.ModalBackend.run_streaming", side_effect=_fake_run_streaming):
             list(orch.stop_app(BackendType.VLLM, app_name="vllm-qwen2-5", app_id="ap-123"))
         self.assertTrue(captured)
-        self.assertEqual(captured[0], ["modal", "app", "stop", "ap-123"])
+        self.assertEqual(captured[0], ["modal", "app", "stop", "--yes", "ap-123"])
 
     def test_stop_app_tags_generic_subprocess_events_as_stop(self) -> None:
         stream = iter(

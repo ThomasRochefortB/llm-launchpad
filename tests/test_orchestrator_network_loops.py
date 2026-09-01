@@ -72,6 +72,37 @@ class _SyncThread:
 
 
 class OrchestratorNetworkLoopTests(unittest.TestCase):
+    def test_warmup_rejects_oversized_dns_label_without_retrying(self) -> None:
+        invalid_url = (
+            "https://thomasrochefortb--llamacpp-glm-5-3-flash-q2xl-cheap-"
+            "serve-adaptable-cockatrice.modal.run"
+        )
+
+        events = list(
+            Orchestrator().warmup(
+                backend=BackendType.LLAMACPP,
+                server_url=invalid_url,
+                timeout=1800,
+                tail_logs=False,
+            )
+        )
+
+        self.assertTrue(
+            any(
+                isinstance(event, ErrorEvent)
+                and "DNS label is 78 characters; maximum is 63" in event.message
+                for event in events
+            )
+        )
+        self.assertTrue(
+            any(
+                isinstance(event, OperationCompleteEvent)
+                and not event.success
+                and event.exit_code == 2
+                for event in events
+            )
+        )
+
     def test_warmup_llamacpp_requires_completion_payload_not_any_http_200(self) -> None:
         responses = iter(
             [
@@ -163,6 +194,37 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
                 for e in events
             )
         )
+
+    def test_warmup_redacts_api_key_in_logged_test_command(self) -> None:
+        fake_requests = types.SimpleNamespace(
+            post=lambda *_args, **_kwargs: _Response(200, '{"choices":[{"text":"ok"}]}')
+        )
+        with patch.dict("sys.modules", {"requests": fake_requests}):
+            with patch(
+                "llm_launchpad.core.warmup.shutdown_event",
+                return_value=types.SimpleNamespace(wait=lambda **_kwargs: False),
+            ):
+                with patch(
+                    "llm_launchpad.core.warmup.ModalBackend.test_curl_command",
+                    return_value="curl ok -H 'Authorization: Bearer super-secret'",
+                ):
+                    events = list(
+                        Orchestrator().warmup(
+                            backend=BackendType.LLAMACPP,
+                            server_url="https://example.modal.run",
+                            timeout=10,
+                            tail_logs=False,
+                            api_key="super-secret",
+                        )
+                    )
+        test_lines = [
+            event.line
+            for event in events
+            if isinstance(event, LogEvent) and event.line.startswith("Test command:")
+        ]
+        self.assertEqual(len(test_lines), 1)
+        self.assertIn("$LLM_LAUNCHPAD_API_KEY", test_lines[0])
+        self.assertNotIn("super-secret", test_lines[0])
 
     def test_warmup_timeout_after_non_200_responses(self) -> None:
         fake_requests = types.SimpleNamespace(get=lambda *_args, **_kwargs: _Response(503, "not ready"))

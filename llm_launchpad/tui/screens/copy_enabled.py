@@ -6,10 +6,22 @@ from typing import Any
 
 from rich.errors import MarkupError
 from rich.markup import render as render_markup
+from textual import events
 from textual.binding import Binding
+from textual.css.query import NoMatches
+from textual.geometry import Size
 from textual.selection import Selection
 from textual.screen import Screen
+from textual.widget import Widget
 from textual.widgets import DataTable, Input, OptionList, Select, Static
+
+from ..responsive import (
+    MIN_TERMINAL_HEIGHT,
+    MIN_TERMINAL_WIDTH,
+    RESPONSIVE_CLASS_NAMES,
+    ViewportProfile,
+)
+from ..visual import DEFAULT_TUI_DENSITY, DEFAULT_TUI_THEME, TUI_THEME_OPTIONS
 
 
 class CopyEnabledScreen(Screen):
@@ -29,6 +41,85 @@ class CopyEnabledScreen(Screen):
         super().__init__(*args, **kwargs)
         self._selection_sync_scheduled = False
         self._last_synced_selection: str | None = None
+        self._viewport_profile: ViewportProfile | None = None
+        self._focus_before_size_gate: Widget | None = None
+
+    async def on_resize(self, event: events.Resize) -> None:
+        """Apply responsive classes and gate terminals below the supported floor."""
+        await self._apply_viewport_size(event.size)
+
+    async def _apply_viewport_size(self, size: Size) -> None:
+        profile = ViewportProfile.from_size(size)
+        previous = self._viewport_profile
+
+        if profile != previous:
+            active_classes = set(profile.class_names)
+            for class_name in RESPONSIVE_CLASS_NAMES:
+                self.set_class(class_name in active_classes, class_name)
+            self._viewport_profile = profile
+            self._sync_visual_classes()
+            self.refresh(repaint=True, layout=True)
+            self.viewport_profile_changed(profile, previous)
+
+        try:
+            overlay = self.query_one("#minimum-size-overlay", Static)
+        except NoMatches:
+            overlay = Static("", id="minimum-size-overlay")
+            await self.mount(overlay)
+
+        overlay.update(
+            "[bold #7bf168]Terminal too small[/]\n"
+            f"Current: {size.width}×{size.height}  ·  "
+            f"Minimum: {MIN_TERMINAL_WIDTH}×{MIN_TERMINAL_HEIGHT}\n"
+            "[dim]Resize the terminal to continue.[/dim]"
+        )
+        overlay.display = profile.too_small
+
+        if profile.too_small:
+            if self.focused is not None:
+                self._focus_before_size_gate = self.focused
+            self.set_focus(None)
+        elif self._focus_before_size_gate is not None:
+            previous_focus = self._focus_before_size_gate
+            self._focus_before_size_gate = None
+            if previous_focus.is_mounted and previous_focus.can_focus:
+                previous_focus.focus()
+
+    @property
+    def viewport_profile(self) -> ViewportProfile:
+        """Return the latest profile, classifying current size if necessary."""
+        if self._viewport_profile is not None:
+            return self._viewport_profile
+        return ViewportProfile.from_size(self.size)
+
+    def viewport_profile_changed(
+        self,
+        profile: ViewportProfile,
+        previous: ViewportProfile | None,
+    ) -> None:
+        """Allow screens to adapt content after responsive classes change."""
+        _ = (profile, previous)
+
+    def refresh_visual_preferences(self) -> None:
+        """Reapply app-level theme and density classes immediately."""
+        self._sync_visual_classes()
+        self.refresh(repaint=True, layout=True)
+
+    def _sync_visual_classes(self) -> None:
+        app_theme = str(getattr(self.app, "theme", DEFAULT_TUI_THEME))
+        for _, theme_name in TUI_THEME_OPTIONS:
+            self.set_class(app_theme == theme_name, f"theme-{theme_name}")
+        density = str(getattr(self.app, "tui_density", DEFAULT_TUI_DENSITY))
+        self.set_class(density == "compact", "density-compact")
+
+    def on_key(self, event: events.Key) -> None:
+        """Block clipped controls while the minimum-size overlay is active."""
+        if not self.has_class("viewport-too-small"):
+            return
+        if event.key in {"escape", "q", "ctrl+c"}:
+            return
+        event.prevent_default()
+        event.stop()
 
     def action_copy_text(self) -> None:
         """Copy selected or focused text to the clipboard."""

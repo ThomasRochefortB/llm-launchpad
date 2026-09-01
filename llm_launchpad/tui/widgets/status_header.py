@@ -15,8 +15,8 @@ class StatusHeader(Static):
     StatusHeader {
         height: 3;
         padding: 0 2;
-        background: #070b08;
-        border-bottom: solid #17321e;
+        background: $surface;
+        border-bottom: solid $border;
     }
     """
 
@@ -27,15 +27,23 @@ class StatusHeader(Static):
 
     def render(self) -> str:
         state_icon = _state_icon(self.state)
+        compact = self.screen.has_class("viewport-compact")
+        short = self.screen.has_class("viewport-short")
         parts = [
-            f"[bold #7bf168]backend:[/] {self.backend}",
-            f"  {state_icon} [bold #7bf168]state:[/] {self.state}",
+            f"[bold]backend:[/] {self.backend}",
+            f"  {state_icon} [bold]state:[/] {self.state}",
         ]
-        if self.operation and self.operation != "--":
-            parts.append(f"  [bold #7bf168]op:[/] {self.operation}")
-        if self.detail:
+        if not compact and self.operation and self.operation != "--":
+            parts.append(f"  [bold]op:[/] {self.operation}")
+        if not compact and not short and self.detail:
             parts.append(f"  [dim]{self.detail}[/]")
         return " ".join(parts)
+
+    def watch_state(self, state: str) -> None:
+        """Expose semantic state to CSS without relying on color alone."""
+        for name in DeploymentState:
+            self.remove_class(f"state-{name.value.replace('_', '-')}")
+        self.add_class(f"state-{state.replace('_', '-')}")
 
     def update_from_event(
         self,
@@ -58,8 +66,8 @@ def _state_icon(state: str) -> str:
     icons = {
         "idle": "[dim]o[/]",
         "queued": "[yellow]~[/]",
-        "running": "[#7bf168]>[/]",
-        "deploying": "[#7bf168]>>[/]",
+        "running": "[green]>[/]",
+        "deploying": "[green]>>[/]",
         "warming_up": "[yellow]*[/]",
         "healthy": "[green]OK[/]",
         "unhealthy": "[red]X[/]",

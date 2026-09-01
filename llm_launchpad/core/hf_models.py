@@ -29,10 +29,11 @@ class ModelCandidate:
 
 @dataclass(frozen=True)
 class GgufQuantMetadata:
-    """Quantization list plus optional VRAM estimates in GB."""
+    """GGUF architecture, quantizations, and optional VRAM estimates in GB."""
 
     quantizations: list[str]
     vram_gb_by_quant: dict[str, float]
+    architecture: str | None = None
 
 
 @dataclass(frozen=True)
@@ -323,8 +324,11 @@ def _extract_base_model_repo_ids(info: Any) -> list[str]:
             text = value.strip()
             if text.startswith("base_model:"):
                 text = text.split(":", 1)[1].strip()
-            if _looks_like_hf_repo_id(text) and text.casefold() not in {item.casefold() for item in candidates}:
-                candidates.append(text)
+            repo_id = _normalize_hf_repo_id(text)
+            if repo_id and repo_id.casefold() not in {
+                item.casefold() for item in candidates
+            }:
+                candidates.append(repo_id)
             return
         if isinstance(value, dict):
             for key, nested in value.items():
@@ -350,12 +354,26 @@ def _extract_base_model_repo_ids(info: Any) -> list[str]:
 
 
 def _looks_like_hf_repo_id(value: str) -> bool:
-    text = value.strip().removeprefix("https://huggingface.co/").strip("/")
+    return _normalize_hf_repo_id(value) is not None
+
+
+def _normalize_hf_repo_id(value: str) -> str | None:
+    """Return an ``owner/model`` ID from a Hub repo ID or canonical URL."""
+    text = value.strip()
+    prefix = "https://huggingface.co/"
+    if text.casefold().startswith(prefix):
+        text = text[len(prefix) :]
+    text = text.strip("/")
     if not text or "/" not in text:
-        return False
+        return None
     if any(char.isspace() for char in text):
-        return False
-    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", text))
+        return None
+    if not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*",
+        text,
+    ):
+        return None
+    return text
 
 
 def _call_model_info(
@@ -430,6 +448,7 @@ def fetch_gguf_quant_metadata(repo_id: str, revision: str | None = None) -> Gguf
         return GgufQuantMetadata(
             quantizations=list(cached_metadata.quantizations),
             vram_gb_by_quant=dict(cached_metadata.vram_gb_by_quant),
+            architecture=cached_metadata.architecture,
         )
 
     try:
@@ -442,13 +461,16 @@ def fetch_gguf_quant_metadata(repo_id: str, revision: str | None = None) -> Gguf
     api = HfApi()
     if is_shutting_down():
         return GgufQuantMetadata(quantizations=[], vram_gb_by_quant={})
-    info = api.model_info(
+    info = _call_model_info(
+        api=api,
         repo_id=normalized_repo,
         revision=revision_key or None,
         expand=["siblings", "gguf"],
     )
     quantizations = _extract_gguf_quantizations(getattr(info, "siblings", None))
-    vram_gb_by_quant = _extract_gguf_vram_by_quant(getattr(info, "gguf", None))
+    gguf_payload = getattr(info, "gguf", None)
+    architecture = _extract_gguf_architecture(gguf_payload)
+    vram_gb_by_quant = _extract_gguf_vram_by_quant(gguf_payload)
     page_quant_data = _fetch_gguf_quantization_data_from_model_page(normalized_repo)
     page_quantizations, page_vram_gb_by_quant = _extract_quantizations_and_vram_from_quantization_data(page_quant_data)
     if page_quantizations:
@@ -462,11 +484,13 @@ def fetch_gguf_quant_metadata(repo_id: str, revision: str | None = None) -> Gguf
     metadata = GgufQuantMetadata(
         quantizations=list(quantizations),
         vram_gb_by_quant=dict(vram_gb_by_quant),
+        architecture=architecture,
     )
     _GGUF_QUANT_METADATA_CACHE[cache_key] = (now, metadata)
     return GgufQuantMetadata(
         quantizations=list(metadata.quantizations),
         vram_gb_by_quant=dict(metadata.vram_gb_by_quant),
+        architecture=metadata.architecture,
     )
 
 
@@ -554,6 +578,30 @@ def _extract_gguf_quantizations(siblings: Any) -> list[str]:
         for match in _QUANT_PATTERN.findall(filename):
             detected.add(_normalize_quant_label(match))
     return sorted(detected, key=_quant_sort_key)
+
+
+def _extract_gguf_architecture(gguf_payload: Any) -> str | None:
+    """Read the GGUF ``general.architecture`` value exposed by the Hub API."""
+
+    if not isinstance(gguf_payload, dict):
+        return None
+    candidates = [
+        gguf_payload.get("architecture"),
+        gguf_payload.get("general.architecture"),
+    ]
+    metadata = gguf_payload.get("metadata")
+    if isinstance(metadata, dict):
+        candidates.extend(
+            [
+                metadata.get("architecture"),
+                metadata.get("general.architecture"),
+            ]
+        )
+    for candidate in candidates:
+        architecture = str(candidate or "").strip().casefold()
+        if architecture:
+            return architecture
+    return None
 
 
 def _extract_gguf_vram_by_quant(gguf_payload: Any) -> dict[str, float]:
@@ -1219,10 +1267,13 @@ def _approx_transformer_shape(parameter_count: float) -> tuple[int, int]:
 
 
 def _resolve_context_tokens(requested: int | None, model_max: int | None) -> int:
+    if requested is not None:
+        requested_context = max(1, int(requested))
+        if model_max is not None and model_max > 0:
+            return min(requested_context, int(model_max))
+        return requested_context
     if model_max is not None and model_max > 0:
         return int(model_max)
-    if requested is not None:
-        return max(1, int(requested))
     return _DEFAULT_CONTEXT_TOKENS
 
 

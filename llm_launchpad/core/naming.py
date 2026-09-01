@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 import unicodedata
 from typing import Optional
@@ -87,6 +88,18 @@ def build_deployment_name(
     return build_app_name(backend, instance_name)
 
 
+def infer_provider_from_app_name(app_name: str) -> Optional[ComputeProvider]:
+    """Infer compute provider from a Launchpad deployment name."""
+    name = (app_name or "").strip()
+    if not name:
+        return None
+    if name.startswith("llp-prime-"):
+        return ComputeProvider.PRIME
+    if infer_backend_from_app_name(name) is not None:
+        return ComputeProvider.MODAL
+    return None
+
+
 def infer_backend_from_app_name(app_name: str) -> Optional[BackendType]:
     """Infer backend type from legacy or prefixed app names."""
     if (
@@ -131,3 +144,17 @@ def modal_function_name(base_name: str, function_slug: Optional[str]) -> str:
     if not slug:
         return base_name
     return f"{base_name}-{slug}"
+
+
+def modal_web_label(app_name: str, function_slug: Optional[str]) -> str:
+    """Return a short, stable label for a llama.cpp Modal web endpoint.
+
+    Modal's default web label concatenates the App and Function names. Large
+    model-derived App names can make the resulting DNS label exceed 63
+    characters. A compact explicit label keeps the public hostname valid while
+    leaving the full App and Function names available for management and logs.
+    """
+    app_slug = slugify_instance_name(app_name)
+    function_name = modal_function_name("serve", function_slug)
+    digest = hashlib.sha256(f"{app_slug}:{function_name}".encode()).hexdigest()[:12]
+    return f"llp-lc-{digest}"

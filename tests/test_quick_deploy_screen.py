@@ -4,7 +4,7 @@ import unittest
 from unittest.mock import patch
 
 from textual.app import App
-from textual.widgets import Button, Input, Static, Switch
+from textual.widgets import Button, Input, Select, Static, Switch
 
 from llm_launchpad.core import quick_deploy
 from llm_launchpad.core.quick_deploy import (
@@ -15,9 +15,11 @@ from llm_launchpad.core.quick_deploy import (
 from llm_launchpad.protocol.enums import BackendType, BillingModel, ComputeProvider
 from llm_launchpad.protocol.models import (
     InferencePlan,
+    ModalProviderOptions,
     PrimeProviderOptions,
     ProviderQuote,
 )
+from llm_launchpad.tui.app import TuiApp
 from llm_launchpad.tui.screens.quick_deploy import QuickDeployScreen
 
 
@@ -28,6 +30,10 @@ class _TestApp(App[None]):
 
     def begin_deploy(self, config) -> None:  # type: ignore[no-untyped-def]
         self.deployed_config = config
+
+
+class _StyledApp(_TestApp):
+    CSS_PATH = TuiApp.CSS_PATH
 
 
 class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
@@ -55,7 +61,7 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             title = str(screen.query_one("#quick-deploy-title", Static).content)
             self.assertIn("Kimi K2.5 [dim](UD-Q4_K_XL)[/dim]", title)
             self.assertIn("[bold #7bf168]Kimi K2.5[/] [dim](UD-Q4_K_XL)[/dim]", summary)
-            self.assertIn("RTX-PRO-6000 x5", summary)
+            self.assertIn("RTX PRO 6000 96GB x5", summary)
             self.assertIn("262,144 ctx", summary)
             self.assertNotIn("Cheap but good", summary)
             self.assertIn("UD-Q4_K_XL", summary)
@@ -159,6 +165,20 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(instance_input.parent.has_class("hidden"))
             self.assertTrue(screen.query_one("#quick-deploy-btn", Button).has_focus)
 
+    async def test_deploy_button_stays_visible_on_compact_terminals(self) -> None:
+        app = _StyledApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.push_screen(QuickDeployScreen(profile_id="kimi25-rtxpro"))
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, QuickDeployScreen)
+            card = screen.query_one("#quick-deploy-profile-card")
+            button = screen.query_one("#quick-deploy-btn", Button)
+            self.assertGreaterEqual(card.region.y, 0)
+            self.assertLessEqual(button.region.bottom, 24)
+            self.assertTrue(button.has_focus)
+
     async def test_deploy_maps_override_fields_into_config(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:
@@ -234,6 +254,74 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 allow_insecure_http=True,
             ),
         )
+
+    async def test_compute_flow_can_change_fulfillment_during_review(self) -> None:
+        profile = get_quick_deploy_profile("qwen35-397b-rtxpro")
+        recipe = quick_deploy_recipe(profile)
+        prime_plan = InferencePlan(
+            recipe=recipe,
+            quote=ProviderQuote(
+                id="prime:compute:abc123",
+                recipe_id=recipe.id,
+                provider=ComputeProvider.PRIME,
+                provider_reference="abc123",
+                gpu_type="H100_80GB",
+                gpu_count=4,
+                price_per_hour_usd=8.0,
+                billing_model=BillingModel.PROVISIONED,
+                region="CA",
+                is_estimate=False,
+                provider_options=PrimeProviderOptions(offer_id="abc123"),
+            ),
+            estimated_monthly_cost_usd=1920.0,
+        )
+        modal_plan = InferencePlan(
+            recipe=recipe,
+            quote=ProviderQuote(
+                id="modal:compute:h100",
+                recipe_id=recipe.id,
+                provider=ComputeProvider.MODAL,
+                provider_reference="H100",
+                gpu_type="H100",
+                gpu_count=4,
+                price_per_hour_usd=15.8,
+                billing_model=BillingModel.SCALE_TO_ZERO,
+                is_estimate=True,
+                provider_options=ModalProviderOptions(),
+            ),
+            estimated_monthly_cost_usd=948.0,
+        )
+
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(
+                QuickDeployScreen(
+                    profile_id=prime_plan,
+                    alternative_plans=(prime_plan, modal_plan),
+                )
+            )
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, QuickDeployScreen)
+            selector = screen.query_one("#quick-fulfillment", Select)
+            self.assertEqual(len(selector._options), 2)
+            self.assertIn(
+                "Prime Intellect",
+                str(screen.query_one("#quick-deploy-profile-body", Static).content),
+            )
+
+            selector.value = modal_plan.quote.id
+            await pilot.pause()
+
+            summary = str(
+                screen.query_one("#quick-deploy-profile-body", Static).content
+            )
+            self.assertIn("[bold]Provider[/bold] Modal", summary)
+            screen._deploy()
+
+        self.assertIsNotNone(app.deployed_config)
+        self.assertEqual(app.deployed_config.provider, ComputeProvider.MODAL)
 
 
 if __name__ == "__main__":

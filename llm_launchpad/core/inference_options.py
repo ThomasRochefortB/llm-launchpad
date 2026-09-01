@@ -23,6 +23,27 @@ from .prime_backend import (
 )
 
 
+def recommended_vllm_tool_call_parser(model_name: str | None) -> str | None:
+    """Return a conservative tool parser recommendation for known Qwen models.
+
+    Standard Qwen 2.5/QwQ/Qwen3 chat templates emit Hermes-style JSON inside
+    ``<tool_call>`` tags. Qwen3-Coder uses vLLM's distinct XML parser. Models
+    with separate embedding, reranking, or vision runtimes are intentionally
+    left alone instead of guessing.
+    """
+
+    model_id = (model_name or "").strip().rsplit("/", 1)[-1].casefold()
+    if not model_id:
+        return None
+    if model_id.startswith("qwen3-coder-"):
+        return "qwen3_xml"
+    if any(marker in model_id for marker in ("embedding", "reranker", "-vl")):
+        return None
+    if model_id.startswith(("qwen3-", "qwen2.5-", "qwq-")):
+        return "hermes"
+    return None
+
+
 class InferenceProviderAdapter(Protocol):
     """Translate provider-neutral recipes into provider quotes."""
 

@@ -12,6 +12,7 @@ from llm_launchpad.core.connection_store import (
     load_connection_entries,
     merge_connections,
     remove_connection,
+    rows_from_connection_cache,
     save_connection,
 )
 from llm_launchpad.core.orchestrator import Orchestrator
@@ -26,11 +27,14 @@ from llm_launchpad.core.prime_backend import (
     is_compatible_prime_offer,
     parse_prime_offer,
     preferred_prime_offer_image,
+    prime_offer_gpu_memory_gb,
     resolve_prime_launch_spec,
     select_prime_offer,
 )
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider, OperationType
-from llm_launchpad.protocol.events import LogEvent, OperationCompleteEvent
+from llm_launchpad.core.prime_disks import remember_prime_disk, StoredPrimeDisk
+from llm_launchpad.core.provider_options import prime_provider_options
+from llm_launchpad.protocol.events import EndpointAvailableEvent, LogEvent, OperationCompleteEvent
 from llm_launchpad.protocol.models import (
     ComputeOffer,
     DeploymentConfig,
@@ -86,6 +90,13 @@ class PrimeOfferTests(unittest.TestCase):
         self.assertEqual(offer.gpu_memory_gb, 80.0)
         self.assertEqual(offer.price_per_hour, 1.9)
         self.assertEqual(offer.data_center, "CANADA-1")
+
+    def test_offer_memory_uses_per_gpu_size_when_payload_is_aggregate(self) -> None:
+        offer = parse_prime_offer(
+            _offer_payload(gpuType="A100_80GB", gpuCount=8, gpuMemory=640)
+        )
+        self.assertEqual(offer.gpu_memory_gb, 640.0)
+        self.assertEqual(prime_offer_gpu_memory_gb(offer), 80.0)
 
     def test_automatic_selection_uses_cheapest_fixed_secure_on_demand_offer(self) -> None:
         rows = [
@@ -677,17 +688,54 @@ class PrimeBackendTests(unittest.TestCase):
         )
 
         config = PrimeBackend._tunnel_config(tunnel)
-        script = PrimeBackend._tunnel_bootstrap_script()
+        script = PrimeBackend._tunnel_start_script()
 
         self.assertIn('auth.token = "frp-secret"', config)
         self.assertIn('metadatas.binding_secret = "binding-secret"', config)
         self.assertIn('localIP = "127.0.0.1"', config)
         self.assertIn("localPort = 8000", config)
-        self.assertIn("sha256sum --check --status", script)
-        self.assertIn('frpc_version="0.66.0"', script)
-        self.assertIn("frp_${frpc_version}_linux_${frpc_arch}.tar.gz", script)
+        self.assertIn("/opt/llm-launchpad/frpc", script)
+        self.assertNotIn("github.com", script)
         self.assertNotIn("frp-secret", script)
         self.assertNotIn("binding-secret", script)
+
+    def test_start_tunnel_uses_cached_client_instead_of_github(self) -> None:
+        backend = PrimeBackend(PrimeConfig(api_key="secret"))
+        tunnel = PrimeTunnel(
+            tunnel_id="t-0-abc",
+            hostname="t-0-abc.tunnel.pinfra.io",
+            url="https://t-0-abc.tunnel.pinfra.io",
+            frp_token="frp-secret",
+            binding_secret="binding-secret",
+            server_host="tunnel.pinfra.io",
+            server_port=7000,
+        )
+        uploaded: list[str] = []
+
+        def write_file(
+            _pod: dict[str, object],
+            filename: str,
+            _content: str,
+            *,
+            mode: str,
+        ) -> None:
+            uploaded.append(filename)
+
+        with (
+            patch.object(backend, "_write_remote_runtime_file", side_effect=write_file),
+            patch.object(backend, "_ensure_remote_frpc") as ensure_frpc,
+            patch.object(backend, "_pod_frpc_arch", return_value="amd64"),
+            patch.object(
+                backend,
+                "_run_privileged_ssh",
+                return_value=subprocess.CompletedProcess([], 0, "", ""),
+            ),
+        ):
+            backend.start_tunnel({"id": "pod-1"}, tunnel)
+
+        ensure_frpc.assert_called_once()
+        self.assertEqual(uploaded, ["tunnel.toml", "tunnel-bootstrap.sh"])
+        self.assertNotIn("github.com", PrimeBackend._tunnel_start_script())
 
     def test_tunnel_runtime_status_accepts_connected_prime_status(self) -> None:
         backend = PrimeBackend(PrimeConfig(api_key="secret"))
@@ -752,6 +800,39 @@ class PrimeBackendTests(unittest.TestCase):
             command,
         )
 
+    def test_llamacpp_portable_bootstrap_leaves_gpu_layers_unset_for_auto_fit(self) -> None:
+        config = DeploymentConfig(
+            backend=BackendType.LLAMACPP,
+            provider=ComputeProvider.PRIME,
+            repo_id="unsloth/Qwen3.8-Flash-Next-GGUF",
+            quant="UD-Q2_K_XL",
+            endpoint_api_key="endpoint-secret",
+            provider_options=PrimeProviderOptions(),
+        )
+        launch = resolve_prime_launch_spec(config)
+
+        env = PrimeBackend.runtime_env(config)
+        command = PrimeBackend._bootstrap_docker_command(config, launch)
+
+        self.assertNotIn("N_GPU_LAYERS", env)
+        self.assertNotIn("--n-gpu-layers", command[-1])
+
+    def test_llamacpp_portable_bootstrap_preserves_gpu_layer_override(self) -> None:
+        config = DeploymentConfig(
+            backend=BackendType.LLAMACPP,
+            provider=ComputeProvider.PRIME,
+            repo_id="unsloth/Qwen3.8-Flash-Next-GGUF",
+            quant="UD-Q2_K_XL",
+            endpoint_api_key="endpoint-secret",
+            n_gpu_layers=42,
+            provider_options=PrimeProviderOptions(),
+        )
+        launch = resolve_prime_launch_spec(config)
+
+        command = PrimeBackend._bootstrap_docker_command(config, launch)
+
+        self.assertIn("--n-gpu-layers 42", command[-1])
+
     def test_portable_bootstrap_rejects_missing_endpoint_key(self) -> None:
         config = DeploymentConfig(
             backend=BackendType.LLAMACPP,
@@ -797,6 +878,44 @@ class PrimeBackendTests(unittest.TestCase):
         self.assertEqual(
             detail,
             "runtime container is loading the model (network 1.2GB / 8GB)",
+        )
+
+    def test_portable_runtime_status_reports_download_percent(self) -> None:
+        backend = PrimeBackend(PrimeConfig(api_key="secret"))
+        probe = subprocess.CompletedProcess([], 22, "", "not ready")
+        state = subprocess.CompletedProcess([], 0, "running|0|0\n", "")
+        stats = subprocess.CompletedProcess(
+            [],
+            0,
+            "61.7GB / 551MB\nCACHE:59000000000\nEXPECTED:78900000000\n",
+            "",
+        )
+
+        with patch.object(backend, "_run_ssh", side_effect=[probe, state, stats]):
+            ready, failed, detail = backend.bootstrap_runtime_status({"id": "pod-1"})
+
+        self.assertFalse(ready)
+        self.assertFalse(failed)
+        self.assertEqual(detail, "runtime container is downloading the model (74%)")
+
+    def test_runtime_load_detail_helpers_parse_progress(self) -> None:
+        self.assertEqual(PrimeBackend._expected_model_bytes(
+            DeploymentConfig(required_vram_gb=78.9)
+        ), 78_900_000_000)
+        self.assertEqual(PrimeBackend._parse_docker_byte_count("61.7GB"), 61_700_000_000)
+        network, cache_bytes, expected_bytes = PrimeBackend._parse_runtime_progress_output(
+            "61.7GB / 551MB\nCACHE:59000000000\nEXPECTED:78900000000\n"
+        )
+        self.assertEqual(network, "61.7GB / 551MB")
+        self.assertEqual(cache_bytes, 59_000_000_000)
+        self.assertEqual(expected_bytes, 78_900_000_000)
+        self.assertEqual(
+            PrimeBackend._runtime_load_detail(
+                network=network,
+                cache_bytes=cache_bytes,
+                expected_bytes=expected_bytes,
+            ),
+            "runtime container is downloading the model (74%)",
         )
 
     def test_portable_runtime_status_reports_exit_code_without_logs(self) -> None:
@@ -963,6 +1082,9 @@ class _OrchestratorPrimeBackend:
     def list_offers(self, **_kwargs: object) -> list[ComputeOffer]:
         return [self.offer]
 
+    def list_disk_offers(self) -> list[object]:
+        return []
+
     def create_pod(self, _config: DeploymentConfig, _offer: ComputeOffer) -> dict[str, object]:
         return {"id": "pod-1", "status": "PROVISIONING"}
 
@@ -1049,6 +1171,50 @@ class _PortableOrchestratorPrimeBackend(_OrchestratorPrimeBackend):
         _tunnel_id: str,
     ) -> tuple[bool, bool, str]:
         return True, False, "secure HTTPS tunnel is connected"
+
+
+class _DiskOrchestratorPrimeBackend(_PortableOrchestratorPrimeBackend):
+    def __init__(self) -> None:
+        super().__init__()
+        self.created_disks: list[tuple[object, int, str]] = []
+        self.create_pod_disk_ids: list[str | None] = []
+        self.list_offers_calls: list[object] = []
+        self.disk_offer = PrimeDiskOffer(
+            cloud_id="n3-H100x1",
+            provider_name="hyperstack",
+            data_center="CANADA-1",
+            country="CA",
+            region="canada",
+            stock_status="Available",
+            price_per_gb_hour=0.0001,
+            minimum_size_gb=30,
+            maximum_size_gb=1000,
+            raw={},
+        )
+
+    def list_offers(self, **kwargs: object) -> list[ComputeOffer]:
+        self.list_offers_calls.append(kwargs.get("disk_id"))
+        return [self.offer]
+
+    def list_disk_offers(self) -> list[PrimeDiskOffer]:
+        return [self.disk_offer]
+
+    def create_disk(
+        self,
+        offer: PrimeDiskOffer,
+        *,
+        size_gb: int,
+        name: str,
+    ) -> dict[str, str]:
+        self.created_disks.append((offer, size_gb, name))
+        return {"id": "disk-auto"}
+
+    def get_disk(self, disk_id: str) -> dict[str, str]:
+        return {"id": disk_id, "status": "UNATTACHED"}
+
+    def create_pod(self, config: DeploymentConfig, offer: ComputeOffer) -> dict[str, object]:
+        self.create_pod_disk_ids.append(prime_provider_options(config).disk_id)
+        return super().create_pod(config, offer)
 
 
 class PrimeOrchestratorTests(unittest.TestCase):
@@ -1173,6 +1339,115 @@ class PrimeOrchestratorTests(unittest.TestCase):
         self.assertEqual(backend.tunnel_started, 1)
         self.assertEqual(backend.endpoint_kwargs, {})
         self.assertEqual(backend.deleted, [])
+        available = next(
+            event for event in events if isinstance(event, EndpointAvailableEvent)
+        )
+        self.assertEqual(available.endpoint.web_url, "https://t-0-abc.tunnel.pinfra.io")
+
+    def test_prime_tunnel_starts_before_runtime_is_ready(self) -> None:
+        class _OverlapBackend(_PortableOrchestratorPrimeBackend):
+            def __init__(self) -> None:
+                super().__init__()
+                self.tunnel_started_during_bootstrap: list[int] = []
+                self._polls = 0
+
+            def bootstrap_runtime_status(
+                self,
+                _pod: dict[str, object],
+            ) -> tuple[bool, bool, str]:
+                self.tunnel_started_during_bootstrap.append(self.tunnel_started)
+                self._polls += 1
+                if self._polls < 2:
+                    return False, False, "loading the model"
+                return True, False, "OpenAI-compatible endpoint is ready"
+
+        backend = _OverlapBackend()
+        config = DeploymentConfig(
+            backend=BackendType.LLAMACPP,
+            provider=ComputeProvider.PRIME,
+            app_name="llp-prime-llamacpp-qwen",
+            repo_id="unsloth/Qwen3.8-27B-GGUF",
+            quant="UD-Q2_K_XL",
+            provider_options=PrimeProviderOptions(),
+        )
+        with patch(
+            "llm_launchpad.core.orchestrator.shutdown_event",
+            return_value=SimpleNamespace(wait=lambda **_kwargs: False),
+        ):
+            events = list(Orchestrator(prime_backend=backend).deploy(config))  # type: ignore[arg-type]
+
+        complete = next(event for event in events if isinstance(event, OperationCompleteEvent))
+        self.assertTrue(complete.success)
+        self.assertIn(1, backend.tunnel_started_during_bootstrap)
+        available_index = next(
+            index
+            for index, event in enumerate(events)
+            if isinstance(event, EndpointAvailableEvent)
+        )
+        complete_index = next(
+            index
+            for index, event in enumerate(events)
+            if isinstance(event, OperationCompleteEvent)
+        )
+        self.assertLess(available_index, complete_index)
+
+    def test_prime_deploy_creates_and_attaches_cache_disk(self) -> None:
+        backend = _DiskOrchestratorPrimeBackend()
+        config = DeploymentConfig(
+            backend=BackendType.VLLM,
+            provider=ComputeProvider.PRIME,
+            app_name="llp-prime-vllm-qwen",
+            model_name="Qwen/Qwen3-4B",
+            provider_options=PrimeProviderOptions(),
+        )
+        events = list(Orchestrator(prime_backend=backend).deploy(config))  # type: ignore[arg-type]
+        complete = next(event for event in events if isinstance(event, OperationCompleteEvent))
+        self.assertTrue(complete.success)
+        self.assertEqual(backend.created_disks[0][1], 100)
+        self.assertEqual(backend.create_pod_disk_ids, ["disk-auto"])
+        self.assertTrue(
+            any("Created Prime cache disk disk-auto" in event.line for event in events if isinstance(event, LogEvent))
+        )
+
+    def test_prime_deploy_reuses_stored_cache_disk(self) -> None:
+        backend = _DiskOrchestratorPrimeBackend()
+        remember_prime_disk(
+            StoredPrimeDisk(
+                id="disk-existing",
+                provider_name="hyperstack",
+                data_center="CANADA-1",
+                cloud_id="n3-H100x1",
+                size_gb=100,
+            )
+        )
+        config = DeploymentConfig(
+            backend=BackendType.VLLM,
+            provider=ComputeProvider.PRIME,
+            app_name="llp-prime-vllm-qwen",
+            model_name="Qwen/Qwen3-4B",
+            provider_options=PrimeProviderOptions(),
+        )
+        events = list(Orchestrator(prime_backend=backend).deploy(config))  # type: ignore[arg-type]
+        complete = next(event for event in events if isinstance(event, OperationCompleteEvent))
+        self.assertTrue(complete.success)
+        self.assertEqual(backend.created_disks, [])
+        self.assertEqual(backend.create_pod_disk_ids, ["disk-existing"])
+        self.assertIn("disk-existing", backend.list_offers_calls)
+
+    def test_prime_deploy_can_skip_auto_disk(self) -> None:
+        backend = _DiskOrchestratorPrimeBackend()
+        config = DeploymentConfig(
+            backend=BackendType.VLLM,
+            provider=ComputeProvider.PRIME,
+            app_name="llp-prime-vllm-qwen",
+            model_name="Qwen/Qwen3-4B",
+            provider_options=PrimeProviderOptions(auto_disk=False),
+        )
+        events = list(Orchestrator(prime_backend=backend).deploy(config))  # type: ignore[arg-type]
+        complete = next(event for event in events if isinstance(event, OperationCompleteEvent))
+        self.assertTrue(complete.success)
+        self.assertEqual(backend.created_disks, [])
+        self.assertEqual(backend.create_pod_disk_ids, [None])
 
     def test_prime_llamacpp_rejects_non_default_revision(self) -> None:
         backend = _PortableOrchestratorPrimeBackend()
@@ -1272,6 +1547,42 @@ class ConnectionStoreTests(unittest.TestCase):
             self.assertEqual(row.app_id, "pod-1")
             remove_connection(endpoint.name, path)
             self.assertEqual(load_connection_entries(path), {})
+
+    def test_rows_from_connection_cache_rebuilds_endpoint_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "connections.json"
+            config = DeploymentConfig(
+                backend=BackendType.LLAMACPP,
+                provider=ComputeProvider.MODAL,
+                app_name="llamacpp-qwen",
+                model_name="Qwen/Qwen3-4B",
+                served_model_name="Qwen3-4B",
+                endpoint_api_key="endpoint-secret",
+                server_args="--ctx-size 131072",
+                max_context_tokens=131072,
+                max_output_tokens=32768,
+            )
+            endpoint = EndpointInfo(
+                name=config.app_name or "",
+                app_id="app-1",
+                backend=BackendType.LLAMACPP,
+                provider=ComputeProvider.MODAL,
+                web_url="https://alice--llamacpp-qwen.modal.run/v1",
+                served_model_name="Qwen3-4B",
+            )
+            save_connection(config, endpoint, path)
+            rows = rows_from_connection_cache(path)
+            self.assertEqual(len(rows), 1)
+            row = rows[0]
+            self.assertEqual(row.name, "llamacpp-qwen")
+            self.assertEqual(row.backend, BackendType.LLAMACPP)
+            self.assertEqual(row.provider, ComputeProvider.MODAL)
+            self.assertEqual(row.web_url, "https://alice--llamacpp-qwen.modal.run")
+            self.assertEqual(row.served_model_name, "Qwen3-4B")
+            self.assertEqual(row.endpoint_api_key, "endpoint-secret")
+            self.assertEqual(row.app_id, "app-1")
+            self.assertEqual(row.max_context_tokens, 131072)
+            self.assertEqual(row.max_output_tokens, 32768)
 
     def test_merge_connections_restores_llamacpp_backend(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
