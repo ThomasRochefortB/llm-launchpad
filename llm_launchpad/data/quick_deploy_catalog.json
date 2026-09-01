@@ -1,6 +1,6 @@
 {
-  "schema_version": 1,
-  "generated_at": "2026-08-23T21:32:41Z",
+  "schema_version": 2,
+  "generated_at": "2026-08-30T13:48:52Z",
   "source": "Curated popular open-weight models",
   "attribution": "Model metadata sourced from Hugging Face: https://huggingface.co/unsloth",
   "profiles": [
@@ -23,7 +23,9 @@
         "131072"
       ],
       "source_label": "Hugging Face",
-      "required_vram_gb": 21.0
+      "required_vram_gb": 21.0,
+      "gguf_architecture": "qwen35",
+      "llamacpp_runtime_id": "llama.cpp-b10689-cuda12"
     },
     {
       "id": "qwen3-8-27b-q2xl-rtx-pro-rtx-pro-6000",
@@ -44,7 +46,9 @@
         "131072"
       ],
       "source_label": "Hugging Face",
-      "required_vram_gb": 21.0
+      "required_vram_gb": 21.0,
+      "gguf_architecture": "qwen35",
+      "llamacpp_runtime_id": "llama.cpp-b10689-cuda12"
     },
     {
       "id": "qwen3-8-27b-q2xl-b200-b200",
@@ -65,19 +69,21 @@
         "131072"
       ],
       "source_label": "Hugging Face",
-      "required_vram_gb": 21.0
+      "required_vram_gb": 21.0,
+      "gguf_architecture": "qwen35",
+      "llamacpp_runtime_id": "llama.cpp-b10689-cuda12"
     },
     {
-      "id": "qwen3-8-27b-q4xl-cheap-l4",
+      "id": "qwen3-8-27b-q4xl-cheap-t4",
       "display_name": "Qwen3.8 27B",
       "repo_id": "unsloth/Qwen3.8-27B-GGUF",
       "quant": "UD-Q4_K_XL",
-      "gpu_type": "L4",
+      "gpu_type": "T4",
       "gpu_count": 2,
       "profile_label": "Slow but cheap",
       "resource_tier": "cheap",
       "resource_tier_label": "$",
-      "approx_cost_per_hour_usd": 1.6,
+      "approx_cost_per_hour_usd": 1.18,
       "max_context_tokens": 131072,
       "instance_slug_hint": "qwen3-8-27b-q4xl-cheap",
       "summary": "Curated popular open-weight model with verified llama.cpp GGUF weights.",
@@ -86,7 +92,9 @@
         "131072"
       ],
       "source_label": "Hugging Face",
-      "required_vram_gb": 29.0
+      "required_vram_gb": 29.0,
+      "gguf_architecture": "qwen35",
+      "llamacpp_runtime_id": "llama.cpp-b10689-cuda12"
     },
     {
       "id": "qwen3-8-27b-q4xl-rtx-pro-rtx-pro-6000",
@@ -107,7 +115,9 @@
         "131072"
       ],
       "source_label": "Hugging Face",
-      "required_vram_gb": 29.0
+      "required_vram_gb": 29.0,
+      "gguf_architecture": "qwen35",
+      "llamacpp_runtime_id": "llama.cpp-b10689-cuda12"
     },
     {
       "id": "qwen3-8-27b-q4xl-b200-b200",
@@ -128,7 +138,9 @@
         "131072"
       ],
       "source_label": "Hugging Face",
-      "required_vram_gb": 29.0
+      "required_vram_gb": 29.0,
+      "gguf_architecture": "qwen35",
+      "llamacpp_runtime_id": "llama.cpp-b10689-cuda12"
     },
     {
       "id": "deepseek-v4-flash-0731-q2xl-cheap-l4",
@@ -149,7 +161,9 @@
         "131072"
       ],
       "source_label": "Hugging Face",
-      "required_vram_gb": 96.8
+      "required_vram_gb": 96.8,
+      "gguf_architecture": "deepseek4",
+      "llamacpp_runtime_id": "llama.cpp-b10689-cuda12"
     },
     {
       "id": "deepseek-v4-flash-0731-q2xl-rtx-pro-rtx-pro-6000",
@@ -170,7 +184,9 @@
         "131072"
       ],
       "source_label": "Hugging Face",
-      "required_vram_gb": 96.8
+      "required_vram_gb": 96.8,
+      "gguf_architecture": "deepseek4",
+      "llamacpp_runtime_id": "llama.cpp-b10689-cuda12"
     },
     {
       "id": "deepseek-v4-flash-0731-q2xl-b200-b200",
@@ -191,7 +207,9 @@
         "131072"
       ],
       "source_label": "Hugging Face",
-      "required_vram_gb": 96.8
+      "required_vram_gb": 96.8,
+      "gguf_architecture": "deepseek4",
+      "llamacpp_runtime_id": "llama.cpp-b10689-cuda12"
     },
     {
       "id": "deepseek-v4-flash-0731-q4xl-cheap-l4",
@@ -212,7 +230,9 @@
         "131072"
       ],
       "source_label": "Hugging Face",
-      "required_vram_gb": 155.0
+      "required_vram_gb": 155.0,
+      "gguf_architecture": "deepseek4",
+      "llamacpp_runtime_id": "llama.cpp-b10689-cuda12"
     },
     {
       "id": "deepseek-v4-flash-0731-q4xl-rtx-pro-rtx-pro-6000",
@@ -233,7 +253,9 @@
         "131072"
       ],
       "source_label": "Hugging Face",
-      "required_vram_gb": 155.0
+      "required_vram_gb": 155.0,
+      "gguf_architecture": "deepseek4",
+      "llamacpp_runtime_id": "llama.cpp-b10689-cuda12"
     },
     {
       "id": "deepseek-v4-flash-0731-q4xl-b200-b200",
@@ -254,7 +276,9 @@
         "131072"
       ],
       "source_label": "Hugging Face",
-      "required_vram_gb": 155.0
+      "required_vram_gb": 155.0,
+      "gguf_architecture": "deepseek4",
+      "llamacpp_runtime_id": "llama.cpp-b10689-cuda12"
     },
     {
       "id": "glm-5-2-q2xl-cheap-h200",
@@ -275,7 +299,9 @@
         "131072"
       ],
       "source_label": "Hugging Face",
-      "required_vram_gb": 254.0
+      "required_vram_gb": 254.0,
+      "gguf_architecture": "glm-dsa",
+      "llamacpp_runtime_id": "llama.cpp-b10689-cuda12"
     },
     {
       "id": "glm-5-2-q2xl-rtx-pro-rtx-pro-6000",
@@ -296,7 +322,9 @@
         "131072"
       ],
       "source_label": "Hugging Face",
-      "required_vram_gb": 254.0
+      "required_vram_gb": 254.0,
+      "gguf_architecture": "glm-dsa",
+      "llamacpp_runtime_id": "llama.cpp-b10689-cuda12"
     },
     {
       "id": "glm-5-2-q2xl-b200-b200",
@@ -317,7 +345,9 @@
         "131072"
       ],
       "source_label": "Hugging Face",
-      "required_vram_gb": 254.0
+      "required_vram_gb": 254.0,
+      "gguf_architecture": "glm-dsa",
+      "llamacpp_runtime_id": "llama.cpp-b10689-cuda12"
     },
     {
       "id": "glm-5-2-q4xl-cheap-a100-80gb",
@@ -338,7 +368,9 @@
         "131072"
       ],
       "source_label": "Hugging Face",
-      "required_vram_gb": 467.0
+      "required_vram_gb": 467.0,
+      "gguf_architecture": "glm-dsa",
+      "llamacpp_runtime_id": "llama.cpp-b10689-cuda12"
     },
     {
       "id": "glm-5-2-q4xl-rtx-pro-rtx-pro-6000",
@@ -359,7 +391,9 @@
         "131072"
       ],
       "source_label": "Hugging Face",
-      "required_vram_gb": 467.0
+      "required_vram_gb": 467.0,
+      "gguf_architecture": "glm-dsa",
+      "llamacpp_runtime_id": "llama.cpp-b10689-cuda12"
     },
     {
       "id": "glm-5-2-q4xl-b200-b200",
@@ -380,7 +414,9 @@
         "131072"
       ],
       "source_label": "Hugging Face",
-      "required_vram_gb": 467.0
+      "required_vram_gb": 467.0,
+      "gguf_architecture": "glm-dsa",
+      "llamacpp_runtime_id": "llama.cpp-b10689-cuda12"
     }
   ]
 }

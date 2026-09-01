@@ -27,6 +27,7 @@ class PrimeProviderOptions:
     disk_id: Optional[str] = None
     keep_failed_resource: bool = False
     allow_insecure_http: bool = False
+    auto_disk: bool = True
 
 
 ProviderOptions = ModalProviderOptions | PrimeProviderOptions
@@ -37,6 +38,8 @@ class LaunchpadSettings:
     """Persisted user settings (scaledown, etc.)."""
 
     scaledown_window: int = 1800  # seconds (30 minutes)
+    tui_theme: str = "launchpad-dark"
+    tui_density: str = "comfortable"
 
     def to_env(self) -> Dict[str, str]:
         """Derive Modal environment variables from settings."""
@@ -46,12 +49,20 @@ class LaunchpadSettings:
         return env
 
     def to_dict(self) -> Dict[str, Any]:
-        return {"SCALEDOWN_WINDOW": self.scaledown_window}
+        return {
+            "SCALEDOWN_WINDOW": self.scaledown_window,
+            "tui_theme": self.tui_theme,
+            "tui_density": self.tui_density,
+        }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> LaunchpadSettings:
         raw_value = data.get("SCALEDOWN_WINDOW", data.get("scaledown_window", 1800))
-        return cls(scaledown_window=int(raw_value))
+        return cls(
+            scaledown_window=int(raw_value),
+            tui_theme=str(data.get("tui_theme", "launchpad-dark")),
+            tui_density=str(data.get("tui_density", "comfortable")),
+        )
 
 
 @dataclass
@@ -75,6 +86,12 @@ class DeploymentConfig:
     gpu_type: Optional[str] = None
     gpu_count: Optional[int] = None
     required_vram_gb: Optional[float] = None
+    gguf_architecture: Optional[str] = None
+    llamacpp_runtime_id: Optional[str] = None
+
+    # Model limits advertised to OpenAI-compatible clients such as OpenCode.
+    max_context_tokens: Optional[int] = None
+    max_output_tokens: Optional[int] = None
 
     # vLLM specific
     model_name: Optional[str] = None
@@ -179,6 +196,116 @@ class InferencePlan:
     recommendation_reason: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class ComputePlacement:
+    """One provider fulfillment option behind an aggregated GPU type."""
+
+    id: str
+    provider: ComputeProvider
+    provider_reference: str
+    gpu_type: str
+    gpu_memory_gb: float
+    gpu_count_min: int
+    gpu_count_max: int
+    price_per_hour_usd: Optional[float]
+    billing_model: BillingModel
+    availability: QuoteAvailability
+    supported_backends: frozenset[BackendType]
+    region: Optional[str] = None
+    security: Optional[str] = None
+    is_estimate: bool = False
+    price_is_per_gpu: bool = False
+    is_spot: bool = False
+    provider_options: Optional[ProviderOptions] = None
+
+
+@dataclass(frozen=True)
+class ComputeConfiguration:
+    """Provider-neutral GPU type with all compatible fulfillment placements."""
+
+    id: str
+    gpu_type: str
+    gpu_memory_gb: float
+    placements: tuple[ComputePlacement, ...]
+
+    def _fulfillable_placements(self) -> tuple[ComputePlacement, ...]:
+        """Return deployable rows, falling back to spot-only catalogs."""
+
+        deployable = tuple(row for row in self.placements if not row.is_spot)
+        return deployable or self.placements
+
+    @property
+    def gpu_count_min(self) -> int:
+        return min(
+            (row.gpu_count_min for row in self._fulfillable_placements()),
+            default=1,
+        )
+
+    @property
+    def gpu_count_max(self) -> int:
+        return max(
+            (row.gpu_count_max for row in self._fulfillable_placements()),
+            default=1,
+        )
+
+    @property
+    def total_vram_max_gb(self) -> float:
+        return self.gpu_memory_gb * self.gpu_count_max
+
+    @property
+    def live_placement_count(self) -> int:
+        return sum(
+            row.availability == QuoteAvailability.AVAILABLE and not row.is_spot
+            for row in self.placements
+        )
+
+    @property
+    def has_on_demand_capacity(self) -> bool:
+        return any(
+            row.availability == QuoteAvailability.UNKNOWN and not row.is_spot
+            for row in self.placements
+        )
+
+    @property
+    def spot_placement_count(self) -> int:
+        return sum(row.is_spot for row in self.placements)
+
+    @property
+    def source_count(self) -> int:
+        return len({row.provider for row in self.placements})
+
+    @property
+    def regions(self) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                {
+                    row.region.strip()
+                    for row in self.placements
+                    if row.region and row.region.strip()
+                },
+                key=str.casefold,
+            )
+        )
+
+    @property
+    def minimum_price_per_hour_usd(self) -> Optional[float]:
+        prices = [
+            row.price_per_hour_usd
+            for row in self._fulfillable_placements()
+            if row.price_per_hour_usd is not None
+        ]
+        return min(prices) if prices else None
+
+
+@dataclass(frozen=True)
+class ComputeAvailabilitySnapshot:
+    """Aggregated compute availability plus connected provider metadata."""
+
+    configurations: tuple[ComputeConfiguration, ...]
+    errors: tuple[str, ...] = ()
+    providers: Optional[tuple[ComputeProvider, ...]] = None
+
+
 @dataclass
 class EndpointInfo:
     """A single row from `modal app list`."""
@@ -198,6 +325,8 @@ class EndpointInfo:
     runtime_status_detail: Optional[str] = None
     provider: ComputeProvider = ComputeProvider.MODAL
     endpoint_api_key: Optional[str] = None
+    max_context_tokens: Optional[int] = None
+    max_output_tokens: Optional[int] = None
 
 
 @dataclass

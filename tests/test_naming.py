@@ -8,11 +8,13 @@ from llm_launchpad.core.naming import (
     default_served_model_name,
     infer_backend_from_app_name,
     infer_instance_from_app_name,
+    infer_provider_from_app_name,
     legacy_app_name,
     modal_function_name,
+    modal_web_label,
     slugify_instance_name,
 )
-from llm_launchpad.protocol.enums import BackendType
+from llm_launchpad.protocol.enums import BackendType, ComputeProvider
 
 
 class NamingTests(unittest.TestCase):
@@ -48,6 +50,14 @@ class NamingTests(unittest.TestCase):
         self.assertEqual(backend, BackendType.LLAMACPP)
         self.assertEqual(infer_instance_from_app_name(app_name, backend), "qwen3-gguf")
 
+    def test_infer_provider_from_app_name(self) -> None:
+        self.assertEqual(infer_provider_from_app_name("vllm-qwen3"), ComputeProvider.MODAL)
+        self.assertEqual(
+            infer_provider_from_app_name("llp-prime-llamacpp-qwen3-gguf"),
+            ComputeProvider.PRIME,
+        )
+        self.assertIsNone(infer_provider_from_app_name("custom-app"))
+
     def test_legacy_app_name_roundtrip(self) -> None:
         app_name = legacy_app_name(BackendType.LLAMACPP)
         backend = infer_backend_from_app_name(app_name)
@@ -57,6 +67,13 @@ class NamingTests(unittest.TestCase):
     def test_modal_function_name_appends_slug(self) -> None:
         self.assertEqual(modal_function_name("serve", "alpha-bravo"), "serve-alpha-bravo")
         self.assertEqual(modal_function_name("serve", None), "serve")
+
+    def test_modal_web_label_is_short_stable_and_app_specific(self) -> None:
+        label = modal_web_label("llamacpp-glm-5-3-flash-q2xl-cheap", "adaptable-cockatrice")
+
+        self.assertEqual(label, "llp-lc-19d04acfa30d")
+        self.assertLessEqual(len(label), 63)
+        self.assertNotEqual(label, modal_web_label("llamacpp-other", "adaptable-cockatrice"))
 
 
 if __name__ == "__main__":

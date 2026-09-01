@@ -66,6 +66,7 @@ class QuickDeployConfigTests(unittest.TestCase):
                     "aa_model_name": "Test Model",
                     "aa_model_slug": "test-model",
                     "aa_coding_score": 42.5,
+                    "aa_intelligence_score": 38.5,
                     "aa_rank": 1,
                 }
             ],
@@ -80,6 +81,7 @@ class QuickDeployConfigTests(unittest.TestCase):
 
         self.assertEqual([profile.id for profile in profiles], ["test-model"])
         self.assertEqual(profiles[0].aa_coding_score, 42.5)
+        self.assertEqual(profiles[0].aa_intelligence_score, 38.5)
         self.assertEqual(profiles[0].required_vram_gb, 88.5)
         self.assertEqual(profiles[0].resource_tier, "rtx-pro")
         self.assertEqual(profiles[0].resource_tier_label, "$$")
@@ -161,6 +163,7 @@ class QuickDeployConfigTests(unittest.TestCase):
         self.assertEqual(config.gpu_count, 3)
         self.assertEqual(config.required_vram_gb, profile.required_vram_gb)
         self.assertEqual(profile.max_context_tokens, 262144)
+        self.assertEqual(config.max_context_tokens, 262144)
         self.assertTrue(config.preload)
         self.assertTrue(config.do_deploy)
         self.assertTrue(config.do_warmup)

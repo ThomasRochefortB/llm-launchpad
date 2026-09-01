@@ -7,6 +7,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 from .enums import DeploymentState, OperationType
+from .models import EndpointInfo
 
 
 @dataclass(frozen=True)
@@ -54,3 +55,11 @@ class OperationCompleteEvent(BaseEvent):
     exit_code: int = 0
     detail: str = ""
     data: Optional[Any] = None
+
+
+@dataclass(frozen=True)
+class EndpointAvailableEvent(BaseEvent):
+    """Public inference URL is known. The runtime may still be loading weights."""
+
+    endpoint: EndpointInfo = field(default_factory=EndpointInfo)
+    operation: Optional[OperationType] = None

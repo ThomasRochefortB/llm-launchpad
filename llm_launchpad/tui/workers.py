@@ -17,7 +17,7 @@ from ..protocol.events import (
     OperationCompleteEvent,
     StateChangeEvent,
 )
-from ..protocol.models import StorageSnapshot
+from ..protocol.models import EndpointInfo, StorageSnapshot
 
 
 # -----------------------------------------------------------------------
@@ -128,12 +128,20 @@ class LlamaCppQuantsLoaded(Message):
         revision: str | None,
         quantizations: list[str],
         vram_gb_by_quant: dict[str, float] | None = None,
+        architecture: str | None = None,
+        compatibility_status: str = "unknown",
+        compatibility_message: str = "",
+        llamacpp_runtime_id: str | None = None,
     ) -> None:
         super().__init__()
         self.repo_id = repo_id
         self.revision = revision
         self.quantizations = quantizations
         self.vram_gb_by_quant = dict(vram_gb_by_quant or {})
+        self.architecture = architecture
+        self.compatibility_status = compatibility_status
+        self.compatibility_message = compatibility_message
+        self.llamacpp_runtime_id = llamacpp_runtime_id
 
 
 class LlamaCppQuantsFailed(Message):
@@ -154,12 +162,45 @@ class StorageLoaded(Message):
         self.snapshot = snapshot
 
 
+class ConnectionSummaryReady(Message):
+    """OpenAI-compatible connection details for a finished deploy."""
+
+    def __init__(self, payload: dict[str, str]) -> None:
+        super().__init__()
+        self.payload = payload
+
+
 class StorageFailed(Message):
     """Storage listing failed."""
 
     def __init__(self, error: str) -> None:
         super().__init__()
         self.error = error
+
+
+class EndpointsLoaded(Message):
+    """Managed endpoint discovery completed successfully."""
+
+    def __init__(self, rows: list[EndpointInfo], *, is_stale: bool = False) -> None:
+        super().__init__()
+        self.rows = rows
+        self.is_stale = is_stale
+
+
+class EndpointsFailed(Message):
+    """Managed endpoint discovery failed."""
+
+    def __init__(self, error: str) -> None:
+        super().__init__()
+        self.error = error
+
+
+class ModalUsernameLoaded(Message):
+    """The local Modal profile name was resolved after first paint."""
+
+    def __init__(self, username: str) -> None:
+        super().__init__()
+        self.username = username
 
 
 # -----------------------------------------------------------------------

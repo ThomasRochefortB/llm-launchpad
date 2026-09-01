@@ -23,6 +23,29 @@ def _load_generator_module():
 
 
 class QuickDeployCatalogGeneratorTests(unittest.TestCase):
+    def test_build_profile_rows_excludes_unsupported_gguf_architecture(self) -> None:
+        candidate = self.generator.AAModelCandidate(
+            aa_model_id="aa-glm53",
+            name="GLM-5.3 Flash",
+            slug="glm-5-3-flash",
+            creator_name="Z.ai",
+            coding_score=90.0,
+            rank=1,
+        )
+
+        rows = self.generator.build_profile_rows(
+            candidate,
+            "unsloth/GLM-5.3-Flash-GGUF",
+            metadata=GgufQuantMetadata(
+                quantizations=["UD-Q2_K_XL"],
+                vram_gb_by_quant={"UD-Q2_K_XL": 100.0},
+                architecture="glm5next",
+            ),
+            modal_gpu_catalog=[ModalGpuSpec(value="B200", price_per_hour_usd=6.25)],
+        )
+
+        self.assertEqual(rows, [])
+
     def setUp(self) -> None:
         self.generator = _load_generator_module()
 
@@ -34,20 +57,20 @@ class QuickDeployCatalogGeneratorTests(unittest.TestCase):
                     "name": "Closed Code",
                     "slug": "closed-code",
                     "open_weights": False,
-                    "evaluations": {"artificial_analysis_coding_index": 99.0},
+                    "evaluations": {"artificial_analysis_intelligence_index": 99.0},
                 },
                 {
                     "id": "open",
                     "name": "Open Code",
                     "slug": "open-code",
                     "open_weights": True,
-                    "evaluations": {"artificial_analysis_coding_index": 50.0},
+                    "evaluations": {"artificial_analysis_intelligence_index": 50.0},
                 },
                 {
                     "id": "unknown",
                     "name": "Unknown Code",
                     "slug": "unknown-code",
-                    "evaluations": {"artificial_analysis_coding_index": 75.0},
+                    "evaluations": {"artificial_analysis_intelligence_index": 75.0},
                 },
                 {
                     "id": "hosted-open",
@@ -55,7 +78,7 @@ class QuickDeployCatalogGeneratorTests(unittest.TestCase):
                     "slug": "hosted-open-code",
                     "provider": {"availability": "API only"},
                     "license": "MIT",
-                    "evaluations": {"artificial_analysis_coding_index": 90.0},
+                    "evaluations": {"artificial_analysis_intelligence_index": 90.0},
                 },
             ]
         }
@@ -139,7 +162,10 @@ class QuickDeployCatalogGeneratorTests(unittest.TestCase):
                     "slug": "alpha-code",
                     "open_weights": True,
                     "context_window": "128K",
-                    "evaluations": {"artificial_analysis_coding_index": 88.0},
+                    "evaluations": {
+                        "artificial_analysis_coding_index": 77.0,
+                        "artificial_analysis_intelligence_index": 88.0,
+                    },
                 }
             ]
         }
@@ -155,6 +181,7 @@ class QuickDeployCatalogGeneratorTests(unittest.TestCase):
                 return_value=GgufQuantMetadata(
                     quantizations=["Q4_K_M", "Q8_0"],
                     vram_gb_by_quant={"Q4_K_M": 40.0, "Q8_0": 80.0},
+                    architecture="llama",
                 ),
             ),
             patch.object(self.generator, "fetch_model_max_context", return_value=None),
@@ -180,7 +207,8 @@ class QuickDeployCatalogGeneratorTests(unittest.TestCase):
         self.assertEqual(profile["resource_tier"], "cheap")
         self.assertEqual(profile["resource_tier_label"], "$")
         self.assertEqual(profile["approx_cost_per_hour_usd"], 2.0)
-        self.assertEqual(profile["aa_coding_score"], 88.0)
+        self.assertEqual(profile["aa_coding_score"], 77.0)
+        self.assertEqual(profile["aa_intelligence_score"], 88.0)
         self.assertEqual(profile["required_vram_gb"], 40.0)
         self.assertEqual(profile["max_context_tokens"], 128000)
         self.assertEqual(profile["server_args"], ["--ctx-size", "128000"])
@@ -193,7 +221,7 @@ class QuickDeployCatalogGeneratorTests(unittest.TestCase):
                     "name": "Beta Code",
                     "slug": "beta-code",
                     "open_weights": True,
-                    "evaluations": {"artificial_analysis_coding_index": 80.0},
+                    "evaluations": {"artificial_analysis_intelligence_index": 80.0},
                 }
             ]
         }
@@ -209,6 +237,7 @@ class QuickDeployCatalogGeneratorTests(unittest.TestCase):
                 return_value=GgufQuantMetadata(
                     quantizations=["Q4_K_M"],
                     vram_gb_by_quant={"Q4_K_M": 40.0},
+                    architecture="llama",
                 ),
             ),
             patch.object(self.generator, "fetch_model_max_context", return_value=32768),
@@ -234,13 +263,17 @@ class QuickDeployCatalogGeneratorTests(unittest.TestCase):
                 max_context_tokens=131072,
             ),
         )
-        with patch.object(
-            self.generator,
-            "fetch_gguf_quant_metadata",
-            return_value=GgufQuantMetadata(
-                quantizations=["UD-Q4_K_XL"],
-                vram_gb_by_quant={"UD-Q4_K_XL": 17.0},
+        with (
+            patch.object(
+                self.generator,
+                "fetch_gguf_quant_metadata",
+                return_value=GgufQuantMetadata(
+                    quantizations=["UD-Q4_K_XL"],
+                    vram_gb_by_quant={"UD-Q4_K_XL": 17.0},
+                    architecture="llama",
+                ),
             ),
+            patch.object(self.generator, "fetch_model_max_context") as context_mock,
         ):
             payload = self.generator.build_popular_catalog_payload(
                 modal_gpu_catalog=[ModalGpuSpec(value="L4", price_per_hour_usd=0.8)],
@@ -248,6 +281,7 @@ class QuickDeployCatalogGeneratorTests(unittest.TestCase):
                 models=models,
             )
 
+        context_mock.assert_not_called()
         self.assertEqual(payload["source"], "Curated popular open-weight models")
         self.assertEqual(len(payload["profiles"]), 1)
         profile = payload["profiles"][0]
@@ -260,6 +294,7 @@ class QuickDeployCatalogGeneratorTests(unittest.TestCase):
         self.assertEqual(profile["server_args"], ["--ctx-size", "131072"])
         self.assertEqual(profile["source_label"], "Hugging Face")
         self.assertNotIn("aa_coding_score", profile)
+        self.assertNotIn("aa_intelligence_score", profile)
         self.assertNotIn("aa_rank", profile)
 
     def test_popular_catalog_applies_deployment_measured_vram_floors(self) -> None:
@@ -282,6 +317,7 @@ class QuickDeployCatalogGeneratorTests(unittest.TestCase):
             return_value=GgufQuantMetadata(
                 quantizations=["UD-Q4_K_XL", "UD-Q2_K_XL"],
                 vram_gb_by_quant={"UD-Q4_K_XL": 17.6, "UD-Q2_K_XL": 9.8},
+                architecture="llama",
             ),
         ):
             payload = self.generator.build_popular_catalog_payload(
@@ -313,7 +349,7 @@ class QuickDeployCatalogGeneratorTests(unittest.TestCase):
                     "slug": "kimi-k2-6",
                     "open_weights": True,
                     "model_creator": {"name": "Moonshot AI"},
-                    "evaluations": {"artificial_analysis_coding_index": 99.0},
+                    "evaluations": {"artificial_analysis_intelligence_index": 99.0},
                 },
                 {
                     "id": "aa-glm5",
@@ -321,7 +357,7 @@ class QuickDeployCatalogGeneratorTests(unittest.TestCase):
                     "slug": "glm-5",
                     "open_weights": True,
                     "model_creator": {"name": "Z.ai"},
-                    "evaluations": {"artificial_analysis_coding_index": 95.0},
+                    "evaluations": {"artificial_analysis_intelligence_index": 95.0},
                 },
                 {
                     "id": "aa-glm51",
@@ -329,7 +365,7 @@ class QuickDeployCatalogGeneratorTests(unittest.TestCase):
                     "slug": "glm-5-1",
                     "open_weights": True,
                     "model_creator": {"name": "Z.ai"},
-                    "evaluations": {"artificial_analysis_coding_index": 94.0},
+                    "evaluations": {"artificial_analysis_intelligence_index": 94.0},
                 },
                 {
                     "id": "aa-minimax",
@@ -337,7 +373,7 @@ class QuickDeployCatalogGeneratorTests(unittest.TestCase):
                     "slug": "minimax-m2-7",
                     "open_weights": True,
                     "model_creator": {"name": "MiniMax"},
-                    "evaluations": {"artificial_analysis_coding_index": 90.0},
+                    "evaluations": {"artificial_analysis_intelligence_index": 90.0},
                 },
             ]
         }
@@ -360,6 +396,7 @@ class QuickDeployCatalogGeneratorTests(unittest.TestCase):
                 return_value=GgufQuantMetadata(
                     quantizations=["UD-Q4_K_XL"],
                     vram_gb_by_quant={"UD-Q4_K_XL": 40.0},
+                    architecture="llama",
                 ),
             ),
             patch.object(self.generator, "fetch_model_max_context", return_value=65536),
@@ -415,7 +452,11 @@ class QuickDeployCatalogGeneratorTests(unittest.TestCase):
             profiles = self.generator.build_profile_rows(
                 candidate,
                 "unsloth/Qwen3.5-397B-A17B-GGUF",
-                metadata=GgufQuantMetadata(quantizations=[], vram_gb_by_quant={}),
+                metadata=GgufQuantMetadata(
+                    quantizations=[],
+                    vram_gb_by_quant={},
+                    architecture="llama",
+                ),
                 modal_gpu_catalog=[ModalGpuSpec(value="RTX-PRO-6000", price_per_hour_usd=3.0312)],
             )
 
@@ -443,6 +484,7 @@ class QuickDeployCatalogGeneratorTests(unittest.TestCase):
                 metadata=GgufQuantMetadata(
                     quantizations=["UD-Q4_K_XL"],
                     vram_gb_by_quant={"UD-Q4_K_XL": 141.0},
+                    architecture="llama",
                 ),
                 modal_gpu_catalog=[
                     ModalGpuSpec(value="A100-80GB", price_per_hour_usd=2.5),
@@ -476,6 +518,7 @@ class QuickDeployCatalogGeneratorTests(unittest.TestCase):
                 metadata=GgufQuantMetadata(
                     quantizations=["UD-Q4_K_XL"],
                     vram_gb_by_quant={"UD-Q4_K_XL": 466.0},
+                    architecture="llama",
                 ),
                 modal_gpu_catalog=[
                     ModalGpuSpec(value="A100-80GB", price_per_hour_usd=2.4984),
@@ -512,6 +555,7 @@ class QuickDeployCatalogGeneratorTests(unittest.TestCase):
                 metadata=GgufQuantMetadata(
                     quantizations=["UD-Q4_K_XL"],
                     vram_gb_by_quant={"UD-Q4_K_XL": 141.0},
+                    architecture="llama",
                 ),
                 modal_gpu_catalog=[
                     ModalGpuSpec(value="A100-80GB", price_per_hour_usd=2.5),
@@ -552,6 +596,7 @@ class QuickDeployCatalogGeneratorTests(unittest.TestCase):
                 metadata=GgufQuantMetadata(
                     quantizations=["UD-Q4_K_XL", "UD-Q2_K_XL"],
                     vram_gb_by_quant={"UD-Q4_K_XL": 141.0, "UD-Q2_K_XL": 70.0},
+                    architecture="llama",
                 ),
                 modal_gpu_catalog=[
                     ModalGpuSpec(value="A100-80GB", price_per_hour_usd=2.5),
@@ -601,6 +646,7 @@ class QuickDeployCatalogGeneratorTests(unittest.TestCase):
                 metadata=GgufQuantMetadata(
                     quantizations=["UD-Q4_K_XL", "UD-Q2_K_XL"],
                     vram_gb_by_quant={"UD-Q4_K_XL": 584.0, "UD-Q2_K_XL": 340.0},
+                    architecture="llama",
                 ),
                 modal_gpu_catalog=[
                     ModalGpuSpec(value="A100-80GB", price_per_hour_usd=2.5),
@@ -646,6 +692,7 @@ class QuickDeployCatalogGeneratorTests(unittest.TestCase):
         metadata = GgufQuantMetadata(
             quantizations=["UD-Q2_K_XL", "UD-Q4_K_XL"],
             vram_gb_by_quant={"UD-Q2_K_XL": 20.0, "UD-Q4_K_XL": 80.0},
+            architecture="llama",
         )
 
         selected = self.generator._select_quant_and_gpu(
@@ -669,7 +716,7 @@ class QuickDeployCatalogGeneratorTests(unittest.TestCase):
         }
 
         with (
-            patch.dict(self.generator.os.environ, {"ARTIFICIAL_ANALYSIS_API_KEY": "key"}),
+            patch.dict("os.environ", {"ARTIFICIAL_ANALYSIS_API_KEY": "key"}),
             patch.object(self.generator, "fetch_aa_llm_models", return_value=payload) as fetch_aa,
             patch.object(self.generator, "fetch_modal_gpu_catalog", side_effect=RuntimeError("HTTP 403")),
             patch.object(self.generator, "build_catalog_payload", return_value=catalog) as build_payload,

@@ -341,18 +341,37 @@ def parse_prime_offer(payload: dict[str, Any]) -> ComputeOffer:
     )
 
 
-def prime_offer_gpu_memory_gb(offer: ComputeOffer) -> float | None:
-    """Return per-GPU memory from Prime metadata or its canonical GPU name."""
+def _gpu_type_memory_gb(gpu_type: str) -> float | None:
+    """Parse a per-GPU memory size encoded in a Prime GPU type name."""
 
-    if offer.gpu_memory_gb is not None and offer.gpu_memory_gb > 0:
-        return offer.gpu_memory_gb
-    normalized = re.sub(r"[^A-Z0-9]+", "_", offer.gpu_type.upper()).strip("_")
+    normalized = re.sub(r"[^A-Z0-9]+", "_", gpu_type.upper()).strip("_")
     if normalized == "CPU_NODE" or normalized.startswith("CPU_"):
         return None
     match = re.search(r"(?:^|_)(\d{1,3})GB(?:_|$)", normalized)
-    if match is None:
-        return None
-    return float(match.group(1))
+    return float(match.group(1)) if match is not None else None
+
+
+def prime_offer_gpu_memory_gb(offer: ComputeOffer) -> float | None:
+    """Return per-GPU memory from Prime metadata or its canonical GPU name.
+
+    Prime sometimes reports aggregate node memory (for example 640 GB on an
+    8x A100_80GB offer). Identity and VRAM math always use the per-GPU size.
+    """
+
+    named = _gpu_type_memory_gb(offer.gpu_type)
+    reported = (
+        float(offer.gpu_memory_gb)
+        if offer.gpu_memory_gb is not None and offer.gpu_memory_gb > 0
+        else None
+    )
+    count = max(1, int(offer.gpu_count or 1))
+    if named is not None:
+        if reported is None:
+            return named
+        if abs(reported - named) < 1.0 or abs(reported - named * count) < 1.0:
+            return named
+        return named
+    return reported
 
 
 def is_prime_gpu_offer(offer: ComputeOffer) -> bool:
@@ -955,14 +974,11 @@ class PrimeBackend:
                 "REPO_ID": (config.repo_id or "").strip(),
                 "QUANT": (config.quant or "").strip(),
                 "SERVED_MODEL_NAME": (config.served_model_name or "").strip(),
-                "N_GPU_LAYERS": (
-                    str(config.n_gpu_layers)
-                    if config.n_gpu_layers is not None
-                    else "all"
-                ),
                 "LLAMACPP_API_KEY": (config.endpoint_api_key or "").strip(),
                 "LLAMACPP_SERVER_ARGS": "\n".join(extra_args),
             }
+            if config.n_gpu_layers is not None:
+                env["N_GPU_LAYERS"] = str(config.n_gpu_layers)
             if options.disk_id:
                 env["LLAMA_CACHE"] = "/data/llama.cpp"
         try:
@@ -1045,6 +1061,27 @@ class PrimeBackend:
         except subprocess.TimeoutExpired as exc:
             raise RuntimeError("Timed out connecting to the Prime pod over SSH.") from exc
 
+    def _run_ssh_bytes(
+        self,
+        pod: dict[str, Any],
+        command: str,
+        *,
+        input_data: bytes | None = None,
+        timeout: float = 60.0,
+    ) -> subprocess.CompletedProcess[bytes]:
+        try:
+            return subprocess.run(
+                [*self._ssh_args(pod), command],
+                input=input_data,
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+            )
+        except FileNotFoundError as exc:
+            raise RuntimeError("OpenSSH is required for Prime portable launches.") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("Timed out connecting to the Prime pod over SSH.") from exc
+
     @staticmethod
     def _privileged_shell_command(command: str) -> str:
         """Run as root directly, or use passwordless sudo for non-root images."""
@@ -1072,6 +1109,23 @@ class PrimeBackend:
             pod,
             self._privileged_shell_command(command),
             input_text=input_text,
+            timeout=timeout,
+        )
+
+    def _run_privileged_ssh_bytes(
+        self,
+        pod: dict[str, Any],
+        command: str,
+        *,
+        input_data: bytes | None = None,
+        timeout: float = 60.0,
+    ) -> subprocess.CompletedProcess[bytes]:
+        """Run a privileged command with a binary stdin payload."""
+
+        return self._run_ssh_bytes(
+            pod,
+            self._privileged_shell_command(command),
+            input_data=input_data,
             timeout=timeout,
         )
 
@@ -1105,6 +1159,43 @@ class PrimeBackend:
                 f"Could not upload {filename} to the Prime pod: "
                 f"{(written.stderr or written.stdout).strip()}"
             )
+        changed = self._run_privileged_ssh(pod, f"chmod {mode} {path}")
+        if changed.returncode != 0:
+            raise RuntimeError(f"Could not secure {filename} on the Prime pod.")
+
+    def _write_remote_runtime_bytes(
+        self,
+        pod: dict[str, Any],
+        filename: str,
+        content: bytes,
+        *,
+        mode: str,
+        timeout: float = 180.0,
+    ) -> None:
+        if not re.fullmatch(r"[a-z][a-z0-9_.-]*", filename):
+            raise ValueError(f"Invalid Prime runtime filename: {filename}")
+        directory = self._run_privileged_ssh(
+            pod,
+            f"install -d -m 700 {PRIME_RUNTIME_ROOT}",
+        )
+        if directory.returncode != 0:
+            raise RuntimeError(
+                "Could not prepare the Prime runtime directory: "
+                f"{(directory.stderr or directory.stdout).strip()}"
+            )
+        path = f"{PRIME_RUNTIME_ROOT}/{filename}"
+        written = self._run_privileged_ssh_bytes(
+            pod,
+            f"umask 077; cat > {path}",
+            input_data=content,
+            timeout=timeout,
+        )
+        if written.returncode != 0:
+            detail = (written.stderr or written.stdout or b"").decode(
+                "utf-8",
+                "replace",
+            ).strip()
+            raise RuntimeError(f"Could not upload {filename} to the Prime pod: {detail}")
         changed = self._run_privileged_ssh(pod, f"chmod {mode} {path}")
         if changed.returncode != 0:
             raise RuntimeError(f"Could not secure {filename} on the Prime pod.")
@@ -1179,16 +1270,23 @@ class PrimeBackend:
                 "/app/llama-server",
                 "--hf-repo",
                 hf_repo,
-                "--n-gpu-layers",
-                str(config.n_gpu_layers) if config.n_gpu_layers is not None else "all",
-                *shlex.split(config.server_args or ""),
-                "--host",
-                "0.0.0.0",
-                "--port",
-                "8000",
-                "--alias",
-                str(config.served_model_name or repo.rsplit("/", 1)[-1]),
             ]
+            # Leave GPU placement unset by default so llama.cpp can reserve
+            # enough device memory for the context and compute buffers. An
+            # explicit override intentionally disables that automatic fit.
+            if config.n_gpu_layers is not None:
+                llama_args.extend(["--n-gpu-layers", str(config.n_gpu_layers)])
+            llama_args.extend(
+                [
+                    *shlex.split(config.server_args or ""),
+                    "--host",
+                    "0.0.0.0",
+                    "--port",
+                    "8000",
+                    "--alias",
+                    str(config.served_model_name or repo.rsplit("/", 1)[-1]),
+                ]
+            )
             inner = f'exec {shlex.join(llama_args)} --api-key "$LLAMA_ARG_API_KEY"'
             if not options.disk_id:
                 command.extend(
@@ -1292,6 +1390,12 @@ class PrimeBackend:
         )
         self._write_remote_runtime_file(
             pod,
+            "expected-bytes",
+            f"{self._expected_model_bytes(config)}\n",
+            mode="644",
+        )
+        self._write_remote_runtime_file(
+            pod,
             "probe.curl",
             self._probe_config(config),
             mode="600",
@@ -1352,57 +1456,71 @@ class PrimeBackend:
             ]
         )
 
-    @staticmethod
-    def _tunnel_bootstrap_script() -> str:
-        """Download Prime's pinned frpc build, verify it, and start the tunnel."""
+    def _pod_frpc_arch(self, pod: dict[str, Any]) -> str:
+        """Return the frp architecture name for one Prime pod."""
 
-        networking = prime_networking_runtime()
-        version = str(networking.get("frpc_version") or "").strip()
-        amd64_checksum = str(
-            networking.get("frpc_linux_amd64_sha256") or ""
-        ).strip()
-        arm64_checksum = str(
-            networking.get("frpc_linux_arm64_sha256") or ""
-        ).strip()
-        if not re.fullmatch(r"\d+\.\d+\.\d+", version):
-            raise ValueError("Prime Tunnel frpc version is not configured correctly.")
-        for checksum in (amd64_checksum, arm64_checksum):
-            if not re.fullmatch(r"[0-9a-f]{64}", checksum):
-                raise ValueError("Prime Tunnel frpc checksum is not configured correctly.")
+        from .prime_frpc import normalize_frpc_arch
+
+        result = self._run_privileged_ssh(pod, "uname -m", timeout=20)
+        if result.returncode != 0:
+            raise RuntimeError(
+                "Could not detect the Prime pod architecture: "
+                f"{(result.stderr or result.stdout).strip()}"
+            )
+        return normalize_frpc_arch((result.stdout or "").strip())
+
+    def _ensure_remote_frpc(self, pod: dict[str, Any], arch: str) -> None:
+        """Reuse a cached frpc binary on the pod, or copy Launchpad's local build."""
+
+        from .prime_frpc import ensure_cached_frpc
+
+        probe = self._run_privileged_ssh(
+            pod,
+            (
+                f"if [ -x {PRIME_RUNTIME_ROOT}/frpc ]; then echo ready; "
+                f"elif [ -x /data/llm-launchpad/frpc ]; then "
+                f"install -d -m 700 {PRIME_RUNTIME_ROOT}; "
+                f"cp /data/llm-launchpad/frpc {PRIME_RUNTIME_ROOT}/frpc; "
+                "echo ready; else echo missing; fi"
+            ),
+            timeout=30,
+        )
+        if probe.returncode == 0 and "ready" in (probe.stdout or ""):
+            return
+        binary = ensure_cached_frpc(arch)
+        self._write_remote_runtime_bytes(
+            pod,
+            "frpc",
+            binary.read_bytes(),
+            mode="755",
+            timeout=180,
+        )
+
+    @staticmethod
+    def _tunnel_start_script() -> str:
+        """Start a preinstalled frpc binary and cache it on an attached disk."""
+
         return "\n".join(
             [
                 "#!/usr/bin/env bash",
                 "set -euo pipefail",
-                f'frpc_version="{version}"',
-                'case "$(uname -m)" in',
-                f'  x86_64|amd64) frpc_arch="amd64"; frpc_sha256="{amd64_checksum}" ;;',
-                f'  aarch64|arm64) frpc_arch="arm64"; frpc_sha256="{arm64_checksum}" ;;',
-                '  *) echo "Unsupported Prime Tunnel architecture: $(uname -m)" >&2; exit 1 ;;',
-                "esac",
-                'work_dir="$(mktemp -d /tmp/llm-launchpad-frpc.XXXXXX)"',
-                'trap \'rm -rf "$work_dir"\' EXIT',
-                'archive="$work_dir/frp.tar.gz"',
-                (
-                    'curl --fail --location --retry 3 --proto "=https" '
-                    '--proto-redir "=https" --output "$archive" '
-                    '"https://github.com/fatedier/frp/releases/download/v${frpc_version}/'
-                    'frp_${frpc_version}_linux_${frpc_arch}.tar.gz"'
-                ),
-                'printf "%s  %s\\n" "$frpc_sha256" "$archive" | sha256sum --check --status',
-                (
-                    'tar -xzf "$archive" -C "$work_dir" --strip-components=1 '
-                    '"frp_${frpc_version}_linux_${frpc_arch}/frpc"'
-                ),
-                f'install -m 755 "$work_dir/frpc" {PRIME_RUNTIME_ROOT}/frpc',
-                f'if [ -s {PRIME_TUNNEL_PID_PATH} ]; then',
+                f"if [ ! -x {PRIME_RUNTIME_ROOT}/frpc ]; then",
+                '  echo "Prime Tunnel client is missing" >&2',
+                "  exit 127",
+                "fi",
+                f"if [ -s {PRIME_TUNNEL_PID_PATH} ]; then",
                 f'  old_pid="$(cat {PRIME_TUNNEL_PID_PATH})"',
                 '  if kill -0 "$old_pid" 2>/dev/null; then kill "$old_pid"; fi',
                 "fi",
                 (
-                    f'nohup {PRIME_RUNTIME_ROOT}/frpc -c {PRIME_RUNTIME_ROOT}/tunnel.toml '
-                    f'> {PRIME_TUNNEL_LOG_PATH} 2>&1 </dev/null &'
+                    f"nohup {PRIME_RUNTIME_ROOT}/frpc -c {PRIME_RUNTIME_ROOT}/tunnel.toml "
+                    f"> {PRIME_TUNNEL_LOG_PATH} 2>&1 </dev/null &"
                 ),
                 f'printf "%s\\n" "$!" > {PRIME_TUNNEL_PID_PATH}',
+                "if [ -d /data ]; then",
+                "  install -d -m 700 /data/llm-launchpad",
+                f"  cp -f {PRIME_RUNTIME_ROOT}/frpc /data/llm-launchpad/frpc",
+                "fi",
                 "",
             ]
         )
@@ -1414,7 +1532,7 @@ class PrimeBackend:
         *,
         local_port: int = 8000,
     ) -> None:
-        """Install and asynchronously start Prime's reverse-tunnel client."""
+        """Copy the cached tunnel client to the pod and start it."""
 
         self._write_remote_runtime_file(
             pod,
@@ -1422,16 +1540,18 @@ class PrimeBackend:
             self._tunnel_config(tunnel, local_port=local_port),
             mode="600",
         )
+        arch = self._pod_frpc_arch(pod)
+        self._ensure_remote_frpc(pod, arch)
         self._write_remote_runtime_file(
             pod,
             "tunnel-bootstrap.sh",
-            self._tunnel_bootstrap_script(),
+            self._tunnel_start_script(),
             mode="700",
         )
         started = self._run_privileged_ssh(
             pod,
             f"{PRIME_RUNTIME_ROOT}/tunnel-bootstrap.sh",
-            timeout=180,
+            timeout=60,
         )
         if started.returncode != 0:
             detail = (started.stderr or started.stdout).strip()
@@ -1505,6 +1625,96 @@ class PrimeBackend:
         )
         return value
 
+    @staticmethod
+    def _expected_model_bytes(config: DeploymentConfig) -> int:
+        """Best-effort download size used for Prime model-load percentages."""
+        gb = config.required_vram_gb
+        if gb is None or gb <= 0:
+            return 0
+        return int(float(gb) * (1000**3))
+
+    @staticmethod
+    def _parse_docker_byte_count(value: str) -> int | None:
+        """Parse docker stats sizes such as ``61.7GB`` or ``551MiB``."""
+        match = re.fullmatch(
+            r"\s*([0-9]+(?:\.[0-9]+)?)\s*([KMGTPE]i?B|B)\s*",
+            value or "",
+            flags=re.IGNORECASE,
+        )
+        if match is None:
+            return None
+        try:
+            amount = float(match.group(1))
+        except ValueError:
+            return None
+        unit = match.group(2).upper()
+        multipliers = {
+            "B": 1,
+            "KB": 1000,
+            "MB": 1000**2,
+            "GB": 1000**3,
+            "TB": 1000**4,
+            "PB": 1000**5,
+            "EB": 1000**6,
+            "KIB": 1024,
+            "MIB": 1024**2,
+            "GIB": 1024**3,
+            "TIB": 1024**4,
+            "PIB": 1024**5,
+            "EIB": 1024**6,
+        }
+        multiplier = multipliers.get(unit)
+        if multiplier is None:
+            return None
+        return int(amount * multiplier)
+
+    @staticmethod
+    def _parse_runtime_progress_output(stdout: str) -> tuple[str, int, int]:
+        """Parse docker stats plus cache/expected byte counters."""
+        network = ""
+        cache_bytes = 0
+        expected_bytes = 0
+        for raw_line in (stdout or "").splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("CACHE:"):
+                try:
+                    cache_bytes = max(0, int(float(line.split(":", 1)[1].strip() or "0")))
+                except ValueError:
+                    cache_bytes = 0
+                continue
+            if line.startswith("EXPECTED:"):
+                try:
+                    expected_bytes = max(0, int(float(line.split(":", 1)[1].strip() or "0")))
+                except ValueError:
+                    expected_bytes = 0
+                continue
+            if not network:
+                network = line
+        return network, cache_bytes, expected_bytes
+
+    @staticmethod
+    def _runtime_load_detail(
+        *,
+        network: str,
+        cache_bytes: int,
+        expected_bytes: int,
+    ) -> str:
+        """Describe model download/load using cache bytes when a size is known."""
+        downloaded = max(0, cache_bytes)
+        rx_token = (network or "").split("/", 1)[0].strip()
+        rx_bytes = PrimeBackend._parse_docker_byte_count(rx_token)
+        if downloaded <= 0 and rx_bytes:
+            downloaded = rx_bytes
+        download_complete = expected_bytes > 0 and downloaded >= int(expected_bytes * 0.98)
+        if expected_bytes > 0 and downloaded > 0 and not download_complete:
+            percent = max(0, min(99, int(downloaded * 100 / expected_bytes)))
+            return f"runtime container is downloading the model ({percent}%)"
+        if network.strip():
+            return f"runtime container is loading the model (network {network.strip()})"
+        return "runtime container is loading the model"
+
     def bootstrap_runtime_status(self, pod: dict[str, Any]) -> tuple[bool, bool, str]:
         """Return ``(ready, failed, detail)`` for a portable runtime."""
 
@@ -1553,18 +1763,32 @@ class PrimeBackend:
             )
             return False, True, detail
         if container_state == "running":
-            network = self._run_privileged_ssh(
+            progress = self._run_privileged_ssh(
                 pod,
                 (
                     "docker stats --no-stream --format='{{.NetIO}}' "
-                    f"{PRIME_RUNTIME_CONTAINER_NAME}"
+                    f"{PRIME_RUNTIME_CONTAINER_NAME}; "
+                    f"echo CACHE:$(docker exec {PRIME_RUNTIME_CONTAINER_NAME} sh -lc "
+                    "'du -sb /root/.cache/huggingface /root/.cache/llama.cpp "
+                    "/data/huggingface /data/llama.cpp 2>/dev/null | "
+                    "awk \"{s+=$1} END {print s+0}\"'); "
+                    f"echo EXPECTED:$(cat {PRIME_RUNTIME_ROOT}/expected-bytes "
+                    "2>/dev/null || echo 0)"
                 ),
                 timeout=20,
             )
-            detail = "runtime container is loading the model"
-            if network.returncode == 0 and network.stdout.strip():
-                detail += f" (network {network.stdout.strip()})"
-            return False, False, detail
+            network = ""
+            cache_bytes = 0
+            expected_bytes = 0
+            if progress.returncode == 0:
+                network, cache_bytes, expected_bytes = self._parse_runtime_progress_output(
+                    progress.stdout or ""
+                )
+            return False, False, self._runtime_load_detail(
+                network=network,
+                cache_bytes=cache_bytes,
+                expected_bytes=expected_bytes,
+            )
 
         bootstrap_exit = self._run_privileged_ssh(
             pod,

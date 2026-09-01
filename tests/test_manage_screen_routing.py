@@ -1,377 +1,310 @@
 from __future__ import annotations
 
 import unittest
-from types import SimpleNamespace
 
 from textual.app import App
-from textual.screen import Screen
-from textual.widgets import OptionList
+from textual.widgets import Button, Input, Static
 
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider
 from llm_launchpad.protocol.models import EndpointInfo
 from llm_launchpad.tui.screens.manage import (
-    BenchmarkParamsScreen,
-    LogsParamsScreen,
+    BenchmarkOptionsScreen,
+    EndpointActionsScreen,
     ManageScreen,
-    StatusParamsScreen,
-    StopParamsScreen,
+    StatusOptionsScreen,
+    StopConfirmScreen,
 )
+from llm_launchpad.tui.widgets.adaptive_table import AdaptiveDataTable
+from llm_launchpad.tui.workers import EndpointsLoaded
 
 
 class _TestApp(App[None]):
     def __init__(self) -> None:
         super().__init__()
-        self.list_called = 0
         self.pushed: list[object] = []
-        self.status_calls: list[tuple[BackendType, str | None, int, str | None, str | None]] = []
-        self.logs_calls: list[tuple[BackendType, bool, str | None, str | None]] = []
-        self.benchmark_calls: list[tuple[EndpointInfo, str, int | None, int, int, str, str | None]] = []
-        self.stop_calls: list[tuple[BackendType, str | None, str | None]] = []
-        self.instances_by_backend: dict[BackendType, list[EndpointInfo]] = {
-            BackendType.LLAMACPP: [],
-            BackendType.VLLM: [],
-        }
+        self.refresh_forces: list[bool] = []
+        self.instances: list[EndpointInfo] = []
+        self.status_calls: list[tuple[EndpointInfo, str | None, int]] = []
+        self.logs_calls: list[tuple[EndpointInfo, bool]] = []
+        self.benchmark_calls: list[
+            tuple[EndpointInfo, str, int | None, int, int, str, str | None]
+        ] = []
+        self.stop_calls: list[EndpointInfo] = []
 
-    def begin_list(self) -> None:
-        self.list_called += 1
-
-    def list_instances(self, _backend=None):  # type: ignore[no-untyped-def]
-        if _backend is None:
-            return self.instances_by_backend[BackendType.LLAMACPP] + self.instances_by_backend[BackendType.VLLM]
-        return self.instances_by_backend.get(_backend, [])
+    def begin_endpoint_refresh(self, receiver: object, force: bool = False) -> None:
+        self.refresh_forces.append(force)
+        receiver.post_message(EndpointsLoaded(rows=list(self.instances)))  # type: ignore[attr-defined]
 
     def push_screen(self, screen, *args, **kwargs):  # type: ignore[no-untyped-def]
         self.pushed.append(screen)
         return super().push_screen(screen, *args, **kwargs)
 
-    def begin_status(  # type: ignore[no-untyped-def]
+    def begin_status(
         self,
-        backend,
-        server_url=None,
-        timeout=60,
-        app_name=None,
-        served_model_name=None,
+        endpoint: EndpointInfo,
+        url_override: str | None = None,
+        timeout: int = 60,
     ) -> None:
-        self.status_calls.append((backend, server_url, timeout, app_name, served_model_name))
+        self.status_calls.append((endpoint, url_override, timeout))
 
-    def begin_logs(  # type: ignore[no-untyped-def]
-        self,
-        backend,
-        follow=True,
-        app_name=None,
-        app_id=None,
-    ) -> None:
-        self.logs_calls.append((backend, follow, app_name, app_id))
+    def begin_logs(self, endpoint: EndpointInfo, follow: bool = True) -> None:
+        self.logs_calls.append((endpoint, follow))
 
-    def begin_benchmark(  # type: ignore[no-untyped-def]
+    def begin_benchmark(
         self,
-        row,
+        endpoint: EndpointInfo,
         *,
-        concurrency="1,2,4,8,16",
-        request_count=None,
-        input_tokens=550,
-        output_tokens=256,
-        tokenizer="gpt2",
-        output_dir=None,
+        concurrency: str = "1,2,4,8,16",
+        request_count: int | None = None,
+        input_tokens: int = 550,
+        output_tokens: int = 256,
+        tokenizer: str = "gpt2",
+        output_dir: str | None = None,
     ) -> None:
         self.benchmark_calls.append(
-            (row, concurrency, request_count, input_tokens, output_tokens, tokenizer, output_dir)
+            (
+                endpoint,
+                concurrency,
+                request_count,
+                input_tokens,
+                output_tokens,
+                tokenizer,
+                output_dir,
+            )
         )
 
-    def begin_stop(  # type: ignore[no-untyped-def]
-        self,
-        backend,
-        app_name=None,
-        app_id=None,
-    ) -> None:
-        self.stop_calls.append((backend, app_name, app_id))
+    def begin_stop(self, endpoint: EndpointInfo) -> None:
+        self.stop_calls.append(endpoint)
+
+
+def _endpoint(
+    name: str,
+    app_id: str,
+    *,
+    state: str = "running",
+    backend: BackendType = BackendType.VLLM,
+    provider: ComputeProvider = ComputeProvider.MODAL,
+) -> EndpointInfo:
+    return EndpointInfo(
+        name=name,
+        app_id=app_id,
+        state=state,
+        backend=backend,
+        provider=provider,
+        web_url=f"https://example.test/{app_id}" if state in {"running", "deployed", "active"} else None,
+    )
 
 
 class ManageScreenRoutingTests(unittest.IsolatedAsyncioTestCase):
-    async def test_manage_screen_focuses_action_menu(self) -> None:
+    async def test_manage_screen_loads_once_and_focuses_endpoint_table(self) -> None:
         app = _TestApp()
-        async with app.run_test() as pilot:
-            app.push_screen(ManageScreen())
-            await pilot.pause()
-            screen = app.screen
-            assert isinstance(screen, ManageScreen)
-            action_list = screen.query_one("#manage-action-list", OptionList)
-            self.assertTrue(action_list.has_focus)
-            highlighted = action_list.highlighted_option
-            self.assertIsNotNone(highlighted)
-            assert highlighted is not None
-            self.assertEqual(highlighted.id, "list")
-
-    async def test_manage_screen_action_routing(self) -> None:
-        app = _TestApp()
-        async with app.run_test() as pilot:
-            app.push_screen(ManageScreen())
-            await pilot.pause()
-            screen = app.screen
-            assert isinstance(screen, ManageScreen)
-
-            for option_id in ["list", "status", "logs", "benchmark", "stop"]:
-                screen.on_option_list_option_selected(
-                    SimpleNamespace(option=SimpleNamespace(id=option_id))
-                )
-                await pilot.pause()
-
-        self.assertEqual(app.list_called, 1)
-        self.assertTrue(any(isinstance(s, StatusParamsScreen) for s in app.pushed))
-        self.assertTrue(any(isinstance(s, LogsParamsScreen) for s in app.pushed))
-        self.assertTrue(any(isinstance(s, BenchmarkParamsScreen) for s in app.pushed))
-        self.assertTrue(any(isinstance(s, StopParamsScreen) for s in app.pushed))
-
-    async def test_status_params_menu_is_arrow_navigable(self) -> None:
-        app = _TestApp()
-        app.instances_by_backend[BackendType.LLAMACPP] = [
-            EndpointInfo(name="llamacpp-alpha", app_id="ap-llama", state="running", backend=BackendType.LLAMACPP),
-        ]
-        app.instances_by_backend[BackendType.VLLM] = [
-            EndpointInfo(name="vllm-beta", app_id="ap-vllm", state="deployed", backend=BackendType.VLLM),
-        ]
-        async with app.run_test() as pilot:
-            app.push_screen(StatusParamsScreen())
-            await pilot.pause()
-            screen = app.screen
-            assert isinstance(screen, StatusParamsScreen)
-            instance_list = screen.query_one("#status-instance-list", OptionList)
-            self.assertTrue(instance_list.has_focus)
-            first = instance_list.highlighted_option
-            self.assertIsNotNone(first)
-            await pilot.press("down")
-            await pilot.pause()
-            second = instance_list.highlighted_option
-            self.assertIsNotNone(second)
-            assert first is not None
-            assert second is not None
-            self.assertNotEqual(first.id, second.id)
-
-    async def test_logs_params_menu_is_arrow_navigable(self) -> None:
-        app = _TestApp()
-        app.instances_by_backend[BackendType.LLAMACPP] = [
-            EndpointInfo(name="llamacpp-alpha", app_id="ap-llama", state="running", backend=BackendType.LLAMACPP),
-        ]
-        app.instances_by_backend[BackendType.VLLM] = [
-            EndpointInfo(name="vllm-beta", app_id="ap-vllm", state="deployed", backend=BackendType.VLLM),
-        ]
-        async with app.run_test() as pilot:
-            app.push_screen(LogsParamsScreen())
-            await pilot.pause()
-            screen = app.screen
-            assert isinstance(screen, LogsParamsScreen)
-            instance_list = screen.query_one("#logs-instance-list", OptionList)
-            self.assertTrue(instance_list.has_focus)
-            first = instance_list.highlighted_option
-            self.assertIsNotNone(first)
-            await pilot.press("down")
-            await pilot.pause()
-            second = instance_list.highlighted_option
-            self.assertIsNotNone(second)
-            assert first is not None
-            assert second is not None
-            self.assertNotEqual(first.id, second.id)
-
-    async def test_benchmark_params_submits_selected_instance_and_defaults(self) -> None:
-        app = _TestApp()
-        app.instances_by_backend[BackendType.VLLM] = [
-            EndpointInfo(
-                name="vllm-beta",
-                app_id="ap-vllm",
-                state="deployed",
-                backend=BackendType.VLLM,
-                web_url="https://alice--vllm-beta-serve.modal.run",
-                served_model_name="Qwen3-4B",
+        app.instances = [
+            _endpoint("vllm-beta", "ap-vllm", state="deployed"),
+            _endpoint(
+                "llamacpp-alpha",
+                "ap-llama",
+                backend=BackendType.LLAMACPP,
             ),
+            _endpoint("failed-app", "ap-failed", state="failed"),
         ]
 
         async with app.run_test() as pilot:
-            app.push_screen(BenchmarkParamsScreen())
+            app.push_screen(ManageScreen())
             await pilot.pause()
             screen = app.screen
-            assert isinstance(screen, BenchmarkParamsScreen)
-            instance_list = screen.query_one("#benchmark-instance-list", OptionList)
-            highlighted = instance_list.highlighted_option
-            self.assertIsNotNone(highlighted)
-            screen.on_option_list_option_selected(
-                SimpleNamespace(option=highlighted, option_list=instance_list)
-            )
+            assert isinstance(screen, ManageScreen)
+            table = screen.query_one("#manage-endpoint-table", AdaptiveDataTable)
+
+            self.assertTrue(table.has_focus)
+            self.assertEqual(table.row_count, 3)
+            self.assertEqual(app.refresh_forces, [False])
+            self.assertIn("3 managed endpoints", str(screen.query_one("#manage-status", Static).content))
+
+    async def test_selected_endpoint_routes_status_logs_benchmark_and_stop(self) -> None:
+        first = _endpoint("alpha", "ap-first")
+        second = _endpoint("beta", "ap-second")
+        app = _TestApp()
+        app.instances = [first, second]
+
+        async with app.run_test() as pilot:
+            app.push_screen(ManageScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, ManageScreen)
+            await pilot.press("down")
+            await pilot.pause()
+
+            screen.action_logs_selected()
+            self.assertEqual(app.logs_calls, [(second, True)])
+
+            screen.action_status_selected()
+            await pilot.pause()
+            self.assertIsInstance(app.screen, StatusOptionsScreen)
+            assert isinstance(app.screen, StatusOptionsScreen)
+            self.assertIs(app.screen.endpoint, second)
+            app.pop_screen()
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, ManageScreen)
+            screen.action_benchmark_selected()
+            await pilot.pause()
+            self.assertIsInstance(app.screen, BenchmarkOptionsScreen)
+            assert isinstance(app.screen, BenchmarkOptionsScreen)
+            self.assertIs(app.screen.endpoint, second)
+            app.pop_screen()
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, ManageScreen)
+            screen.action_stop_selected()
+            await pilot.pause()
+            self.assertIsInstance(app.screen, StopConfirmScreen)
+            assert isinstance(app.screen, StopConfirmScreen)
+            self.assertIs(app.screen.endpoint, second)
+
+    async def test_enter_opens_action_menu_and_menu_routes_logs(self) -> None:
+        endpoint = _endpoint("active-endpoint", "ap-active")
+        app = _TestApp()
+        app.instances = [endpoint]
+
+        async with app.run_test() as pilot:
+            app.push_screen(ManageScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, ManageScreen)
+            await pilot.press("enter")
+            await pilot.pause()
+
+            self.assertIsInstance(app.screen, EndpointActionsScreen)
+            await pilot.press("down")
+            await pilot.press("enter")
+            await pilot.pause()
+
+        self.assertEqual(app.logs_calls, [(endpoint, True)])
+
+    async def test_failed_endpoint_keeps_logs_but_blocks_runtime_actions(self) -> None:
+        failed = _endpoint("failed-app", "ap-failed", state="failed")
+        app = _TestApp()
+        app.instances = [failed]
+
+        async with app.run_test() as pilot:
+            app.push_screen(ManageScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, ManageScreen)
+
+            screen.action_logs_selected()
+            screen.action_status_selected()
+            screen.action_benchmark_selected()
+            screen.action_stop_selected()
+            await pilot.pause()
+
+            self.assertEqual(app.logs_calls, [(failed, True)])
+            self.assertIs(app.screen, screen)
+            self.assertEqual(app.stop_calls, [])
+
+    async def test_status_options_submits_override_for_preselected_endpoint(self) -> None:
+        endpoint = _endpoint("llamacpp-alpha", "ap-llama", backend=BackendType.LLAMACPP)
+        app = _TestApp()
+
+        async with app.run_test() as pilot:
+            app.push_screen(StatusOptionsScreen(endpoint))
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, StatusOptionsScreen)
+            screen.query_one("#status-url", Input).value = "https://override.test"
+            screen.query_one("#status-timeout", Input).value = "15"
             screen.action_do_submit()
             await pilot.pause()
 
-        self.assertEqual(len(app.benchmark_calls), 1)
-        row, concurrency, request_count, input_tokens, output_tokens, tokenizer, output_dir = (
-            app.benchmark_calls[0]
-        )
-        self.assertEqual(row.name, "vllm-beta")
-        self.assertEqual(concurrency, "1,2,4,8,16")
-        self.assertIsNone(request_count)
-        self.assertEqual(input_tokens, 550)
-        self.assertEqual(output_tokens, 256)
-        self.assertEqual(tokenizer, "gpt2")
-        self.assertIsNone(output_dir)
+        self.assertEqual(app.status_calls, [(endpoint, "https://override.test", 15)])
 
-    async def test_stop_params_refreshes_instances_on_resume(self) -> None:
+    async def test_status_options_rejects_invalid_timeout_without_submitting(self) -> None:
+        endpoint = _endpoint("alpha", "ap-alpha")
         app = _TestApp()
-        app.instances_by_backend[BackendType.LLAMACPP] = [
-            EndpointInfo(name="llamacpp-alpha", app_id="ap-llama", state="running", backend=BackendType.LLAMACPP),
-        ]
-        app.instances_by_backend[BackendType.VLLM] = [
-            EndpointInfo(name="vllm-beta", app_id="ap-vllm", state="deployed", backend=BackendType.VLLM),
-        ]
 
         async with app.run_test() as pilot:
-            app.push_screen(StopParamsScreen())
+            app.push_screen(StatusOptionsScreen(endpoint))
             await pilot.pause()
             screen = app.screen
-            assert isinstance(screen, StopParamsScreen)
-            instance_list = screen.query_one("#stop-instance-list", OptionList)
-            self.assertEqual(instance_list.option_count, 2)
-
-            app.push_screen(Screen())
+            assert isinstance(screen, StatusOptionsScreen)
+            screen.query_one("#status-timeout", Input).value = "later"
+            screen.action_do_submit()
             await pilot.pause()
 
-            app.instances_by_backend[BackendType.VLLM] = []
+            self.assertEqual(app.status_calls, [])
+            self.assertIn("integer", str(screen.query_one("#status-feedback", Static).content))
+
+    async def test_benchmark_options_submits_selected_endpoint_and_defaults(self) -> None:
+        endpoint = _endpoint("vllm-beta", "ap-vllm", state="deployed")
+        app = _TestApp()
+
+        async with app.run_test() as pilot:
+            app.push_screen(BenchmarkOptionsScreen(endpoint))
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, BenchmarkOptionsScreen)
+            screen.action_do_submit()
+            await pilot.pause()
+
+        self.assertEqual(
+            app.benchmark_calls,
+            [(endpoint, "1,2,4,8,16", None, 550, 256, "gpt2", None)],
+        )
+
+    async def test_stop_confirmation_is_arrow_navigable_and_defaults_to_cancel(self) -> None:
+        endpoint = _endpoint("vllm-beta", "ap-vllm")
+        app = _TestApp()
+
+        async with app.run_test() as pilot:
+            app.push_screen(StopConfirmScreen(endpoint))
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, StopConfirmScreen)
+
+            self.assertEqual(app.stop_calls, [])
+            self.assertTrue(screen.query_one("#stop-cancel", Button).has_focus)
+            await pilot.press("right")
+            await pilot.pause()
+            self.assertTrue(screen.query_one("#stop-confirm", Button).has_focus)
+            await pilot.press("enter")
+            await pilot.pause()
+
+        self.assertEqual(app.stop_calls, [endpoint])
+
+    async def test_duplicate_names_route_by_exact_app_id(self) -> None:
+        first = _endpoint("duplicate", "ap-first")
+        second = _endpoint("duplicate", "ap-second")
+        app = _TestApp()
+        app.instances = [first, second]
+
+        async with app.run_test() as pilot:
+            app.push_screen(ManageScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, ManageScreen)
+            await pilot.press("down")
+            await pilot.pause()
+            screen.action_logs_selected()
+
+        self.assertEqual(app.logs_calls, [(second, True)])
+
+    async def test_manage_refreshes_after_returning_from_child_screen(self) -> None:
+        app = _TestApp()
+        app.instances = [_endpoint("alpha", "ap-alpha")]
+
+        async with app.run_test() as pilot:
+            app.push_screen(ManageScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, ManageScreen)
+            screen.action_status_selected()
+            await pilot.pause()
             app.pop_screen()
             await pilot.pause()
 
-            screen = app.screen
-            assert isinstance(screen, StopParamsScreen)
-            instance_list = screen.query_one("#stop-instance-list", OptionList)
-            self.assertEqual(instance_list.option_count, 1)
-            highlighted = instance_list.highlighted_option
-            self.assertIsNotNone(highlighted)
-            assert highlighted is not None
-            self.assertEqual(str(highlighted.id), "app-id:ap-llama")
-
-    async def test_stop_params_hides_ephemeral_modal_helpers(self) -> None:
-        app = _TestApp()
-        app.instances_by_backend[BackendType.LLAMACPP] = [
-            EndpointInfo(
-                name="llamacpp-server",
-                app_id="ap-helper",
-                state="ephemeral",
-                backend=BackendType.LLAMACPP,
-                provider=ComputeProvider.MODAL,
-            ),
-            EndpointInfo(
-                name="llp-prime-llamacpp-qwen3",
-                app_id="pod-prime",
-                state="active",
-                backend=BackendType.LLAMACPP,
-                provider=ComputeProvider.PRIME,
-            ),
-        ]
-
-        async with app.run_test() as pilot:
-            app.push_screen(StopParamsScreen())
-            await pilot.pause()
-            screen = app.screen
-            assert isinstance(screen, StopParamsScreen)
-            instance_list = screen.query_one("#stop-instance-list", OptionList)
-            self.assertEqual(instance_list.option_count, 1)
-            highlighted = instance_list.highlighted_option
-            self.assertIsNotNone(highlighted)
-            assert highlighted is not None
-            self.assertEqual(str(highlighted.id), "app-id:pod-prime")
-
-    async def test_status_params_uses_selected_instance_web_url_and_served_model_name(self) -> None:
-        app = _TestApp()
-        app.instances_by_backend[BackendType.LLAMACPP] = [
-            EndpointInfo(
-                name="llamacpp-nanbeige",
-                app_id="ap-llama",
-                state="running",
-                backend=BackendType.LLAMACPP,
-                web_url="https://alice--llamacpp-nanbeige-serve-alpha-bravo.modal.run",
-                served_model_name="Nanbeige4.1-3B-Q4_K_M-GGUF",
-            ),
-        ]
-
-        async with app.run_test() as pilot:
-            app.push_screen(StatusParamsScreen())
-            await pilot.pause()
-            screen = app.screen
-            assert isinstance(screen, StatusParamsScreen)
-            instance_list = screen.query_one("#status-instance-list", OptionList)
-            highlighted = instance_list.highlighted_option
-            self.assertIsNotNone(highlighted)
-            assert highlighted is not None
-            screen.on_option_list_option_selected(
-                SimpleNamespace(option=highlighted, option_list=instance_list)
-            )
-            await pilot.pause()
-
-        self.assertEqual(
-            app.status_calls,
-            [
-                (
-                    BackendType.LLAMACPP,
-                    "https://alice--llamacpp-nanbeige-serve-alpha-bravo.modal.run",
-                    60,
-                    "llamacpp-nanbeige",
-                    "Nanbeige4.1-3B-Q4_K_M-GGUF",
-                )
-            ],
-        )
-
-    async def test_logs_and_stop_use_exact_duplicate_app_id(self) -> None:
-        duplicate_rows = [
-            EndpointInfo(
-                name="llamacpp-glm5-rtxpro",
-                app_id="ap-first",
-                state="running",
-                backend=BackendType.LLAMACPP,
-                instance_name="glm5-rtxpro",
-            ),
-            EndpointInfo(
-                name="llamacpp-glm5-rtxpro",
-                app_id="ap-second",
-                state="running",
-                backend=BackendType.LLAMACPP,
-                instance_name="glm5-rtxpro",
-            ),
-        ]
-        app = _TestApp()
-        app.instances_by_backend[BackendType.LLAMACPP] = duplicate_rows
-
-        async with app.run_test() as pilot:
-            app.push_screen(LogsParamsScreen())
-            await pilot.pause()
-            screen = app.screen
-            assert isinstance(screen, LogsParamsScreen)
-            instance_list = screen.query_one("#logs-instance-list", OptionList)
-            option = next(
-                candidate for candidate in instance_list._options if str(candidate.id) == "app-id:ap-second"
-            )
-            screen.on_option_list_option_selected(
-                SimpleNamespace(option=option, option_list=instance_list)
-            )
-            await pilot.pause()
-
-            app.pop_screen()
-            await pilot.pause()
-            app.push_screen(StopParamsScreen())
-            await pilot.pause()
-            screen = app.screen
-            assert isinstance(screen, StopParamsScreen)
-            instance_list = screen.query_one("#stop-instance-list", OptionList)
-            option = next(
-                candidate for candidate in instance_list._options if str(candidate.id) == "app-id:ap-second"
-            )
-            screen.on_option_list_option_selected(
-                SimpleNamespace(option=option, option_list=instance_list)
-            )
-            await pilot.pause()
-
-        self.assertEqual(
-            app.logs_calls,
-            [(BackendType.LLAMACPP, True, "llamacpp-glm5-rtxpro", "ap-second")],
-        )
-        self.assertEqual(
-            app.stop_calls,
-            [(BackendType.LLAMACPP, "llamacpp-glm5-rtxpro", "ap-second")],
-        )
+        self.assertEqual(app.refresh_forces, [False, True])
 
 
 if __name__ == "__main__":

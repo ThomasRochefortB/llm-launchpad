@@ -12,6 +12,7 @@ from .shutdown import is_shutting_down, shutdown_event
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import json
+import os
 from pathlib import Path
 import re
 import secrets
@@ -21,6 +22,7 @@ from typing import Any, Generator, List, Optional
 from ..protocol.enums import BackendType, ComputeProvider, DeploymentState, OperationType
 from ..protocol.events import (
     BaseEvent,
+    EndpointAvailableEvent,
     ErrorEvent,
     LogEvent,
     OperationCompleteEvent,
@@ -43,18 +45,26 @@ from .benchmark import (
 )
 from .backend import ModalBackend
 from .config import ConfigStore
+from .hf_models import fetch_gguf_quant_metadata
 from .modal_auth import get_modal_auth_status
 from .naming import legacy_app_name
 from .naming import default_llamacpp_served_model_name
 from .naming import random_function_slug
 from .paths import MODAL_LLAMACPP_SCRIPT, MODAL_VLLM_SCRIPT
 from .prime_backend import (
+    default_prime_container_image,
     PrimeApiError,
     PrimeBackend,
     resolve_prime_launch_spec,
-    select_prime_offer,
 )
+from .prime_disks import bind_prime_disk, resolve_prime_offer_and_disk
 from .provider_options import prime_provider_options
+from .runtime_support import (
+    DEFAULT_LLAMACPP_IMAGE_REF,
+    RuntimeCompatibility,
+    RuntimeCompatibilityDecision,
+    evaluate_llamacpp_architecture,
+)
 from .warmup import WarmupRunner
 from .warmup import modal_gpu_scheduling_hint as _modal_gpu_scheduling_hint
 from .warmup import probe_response_is_ready as _probe_response_is_ready
@@ -77,6 +87,31 @@ def _tag_operation(events: EventStream, operation: OperationType) -> EventStream
             yield replace(event, operation=operation)
         else:
             yield event
+
+
+def _prime_endpoint_info(
+    config: DeploymentConfig,
+    pod_id: str,
+    endpoint: str,
+) -> EndpointInfo:
+    """Build the OpenCode-facing endpoint descriptor for a Prime pod."""
+
+    return EndpointInfo(
+        name=config.app_name or "",
+        app_id=pod_id,
+        state="running",
+        backend=config.backend,
+        instance_name=config.instance_name,
+        web_url=endpoint,
+        served_model_name=config.served_model_name,
+        model_name=config.model_name,
+        repo_id=config.repo_id,
+        quant=config.quant,
+        provider=ComputeProvider.PRIME,
+        endpoint_api_key=config.endpoint_api_key,
+        max_context_tokens=config.max_context_tokens,
+        max_output_tokens=config.max_output_tokens,
+    )
 
 
 def _is_historical_modal_app_state(state: str) -> bool:
@@ -181,6 +216,41 @@ class Orchestrator:
                 config.repo_id,
                 config.quant,
             )
+        if config.backend == BackendType.LLAMACPP:
+            compatibility, lookup_error = self._llamacpp_compatibility(config)
+            if compatibility.status == RuntimeCompatibility.UNSUPPORTED:
+                message = (
+                    f"Cannot deploy {config.repo_id or config.preset or 'this GGUF'}: "
+                    f"{compatibility.message} Select a GGUF whose general.architecture "
+                    "is present in llm_launchpad/data/llamacpp_runtime_support.json, "
+                    "or explicitly configure a llama.cpp image that supports this architecture."
+                )
+                yield ErrorEvent(
+                    message=message,
+                    operation=OperationType.DEPLOY,
+                    recoverable=False,
+                )
+                yield OperationCompleteEvent(
+                    operation=OperationType.DEPLOY,
+                    success=False,
+                    exit_code=2,
+                    detail=message,
+                )
+                return
+            if compatibility.status == RuntimeCompatibility.SUPPORTED:
+                yield LogEvent(
+                    line=f"Compatibility preflight: {compatibility.message}",
+                    operation=OperationType.DEPLOY,
+                    is_milestone=True,
+                )
+            else:
+                detail = compatibility.message
+                if lookup_error:
+                    detail = f"{detail} Metadata lookup failed: {lookup_error}"
+                yield LogEvent(
+                    line=f"Compatibility preflight warning: {detail} Continuing unverified.",
+                    operation=OperationType.DEPLOY,
+                )
         if config.provider == ComputeProvider.PRIME:
             yield from self._deploy_prime(config)
             return
@@ -193,6 +263,39 @@ class Orchestrator:
             yield from self._deploy_vllm(config, env)
         else:
             yield from self._deploy_llamacpp(config, env)
+
+    def _llamacpp_compatibility(
+        self,
+        config: DeploymentConfig,
+    ) -> tuple[RuntimeCompatibilityDecision, str | None]:
+        """Resolve GGUF metadata and check it before allocating remote compute."""
+
+        architecture = (config.gguf_architecture or "").strip() or None
+        lookup_error: str | None = None
+        if architecture is None and (config.repo_id or "").strip():
+            try:
+                metadata = fetch_gguf_quant_metadata(
+                    config.repo_id or "",
+                    revision=config.revision,
+                )
+                architecture = metadata.architecture
+                config.gguf_architecture = architecture
+            except Exception as exc:
+                lookup_error = str(exc)
+
+        if config.provider == ComputeProvider.PRIME:
+            image_ref = default_prime_container_image(BackendType.LLAMACPP)
+        else:
+            image_ref = (
+                os.environ.get("LLAMA_CPP_IMAGE_REF", "").strip()
+                or DEFAULT_LLAMACPP_IMAGE_REF
+            )
+        decision = evaluate_llamacpp_architecture(
+            architecture,
+            image_ref=image_ref,
+        )
+        config.llamacpp_runtime_id = decision.runtime_id
+        return decision, lookup_error
 
     def _deploy_prime(self, config: DeploymentConfig) -> EventStream:
         """Provision a Prime pod and resolve its public inference endpoint."""
@@ -228,21 +331,13 @@ class Orchestrator:
                 operation=OperationType.DEPLOY,
                 detail="Fetching Prime GPU availability",
             )
-            offers = self.prime_backend.list_offers(
-                gpu_type=config.gpu_type,
-                gpu_count=config.gpu_count,
-                region=options.region,
-                disk_id=options.disk_id,
-            )
-            offer = select_prime_offer(
-                offers,
-                offer_id=options.offer_id,
-                gpu_type=config.gpu_type,
-                gpu_count=config.gpu_count,
-                region=options.region,
-                required_vram_gb=config.required_vram_gb,
+            offer, disk_id, disk_messages = resolve_prime_offer_and_disk(
+                self.prime_backend,
+                config,
                 required_image=launch.offer_image,
             )
+            bind_prime_disk(config, disk_id)
+            options = prime_provider_options(config)
             price = (
                 f"${offer.price_per_hour:.2f}/hr"
                 if offer.price_per_hour is not None
@@ -256,6 +351,12 @@ class Orchestrator:
                 operation=OperationType.DEPLOY,
                 is_milestone=True,
             )
+            for line in disk_messages:
+                yield LogEvent(
+                    line=line,
+                    operation=OperationType.DEPLOY,
+                    is_milestone=True,
+                )
             yield LogEvent(
                 line=f"Prime runtime: portable bootstrap on {launch.offer_image}",
                 operation=OperationType.DEPLOY,
@@ -315,26 +416,11 @@ class Orchestrator:
                 detail="Installing the portable Prime inference runtime",
             )
             self.prime_backend.start_bootstrap_runtime(config, pod)
-            runtime_deadline = time.monotonic() + 1800
-            last_runtime_detail = ""
-            while time.monotonic() < runtime_deadline:
-                ready, failed, detail = self.prime_backend.bootstrap_runtime_status(pod)
-                if detail and detail != last_runtime_detail:
-                    yield LogEvent(
-                        line=f"Prime runtime: {detail}",
-                        operation=OperationType.DEPLOY,
-                        is_milestone=True,
-                    )
-                    last_runtime_detail = detail
-                if failed:
-                    raise PrimeApiError(f"Prime runtime bootstrap failed: {detail}")
-                if ready:
-                    break
-                if shutdown_event().wait(timeout=10):
-                    raise PrimeApiError("Prime deployment cancelled during runtime startup.")
-            else:
-                raise PrimeApiError("Timed out waiting for the Prime runtime to load.")
 
+            endpoint = ""
+            announced: EndpointInfo | None = None
+            tunnel_id = ""
+            tunnel_ready = False
             if options.allow_insecure_http:
                 endpoint = self.prime_backend.endpoint_url(
                     pod,
@@ -346,6 +432,17 @@ class Orchestrator:
                     operation=OperationType.DEPLOY,
                     is_milestone=True,
                 )
+                announced = _prime_endpoint_info(config, pod_id, endpoint)
+                yield LogEvent(
+                    line=f"Prime endpoint URL ready: {endpoint}",
+                    operation=OperationType.DEPLOY,
+                    is_milestone=True,
+                )
+                yield EndpointAvailableEvent(
+                    endpoint=announced,
+                    operation=OperationType.DEPLOY,
+                )
+                tunnel_ready = True
             else:
                 yield StateChangeEvent(
                     current=DeploymentState.DEPLOYING,
@@ -357,30 +454,7 @@ class Orchestrator:
                     name=config.app_name or f"llm-launchpad-{pod_id}",
                 )
                 self.prime_backend.start_tunnel(pod, tunnel)
-                tunnel_deadline = time.monotonic() + 120
-                last_tunnel_detail = ""
-                while time.monotonic() < tunnel_deadline:
-                    ready, failed, detail = self.prime_backend.tunnel_runtime_status(
-                        pod,
-                        tunnel.tunnel_id,
-                    )
-                    if detail and detail != last_tunnel_detail:
-                        yield LogEvent(
-                            line=f"Prime Tunnel: {detail}",
-                            operation=OperationType.DEPLOY,
-                            is_milestone=True,
-                        )
-                        last_tunnel_detail = detail
-                    if failed:
-                        raise PrimeApiError(f"Prime Tunnel failed: {detail}")
-                    if ready:
-                        break
-                    if shutdown_event().wait(timeout=2):
-                        raise PrimeApiError(
-                            "Prime deployment cancelled during tunnel startup."
-                        )
-                else:
-                    raise PrimeApiError("Timed out waiting for Prime Tunnel to connect.")
+                tunnel_id = tunnel.tunnel_id
                 endpoint = tunnel.url
                 tunnel_expiry = (
                     f"; registration expires {tunnel.expires_at}"
@@ -395,6 +469,59 @@ class Orchestrator:
                     operation=OperationType.DEPLOY,
                     is_milestone=True,
                 )
+
+            runtime_ready = False
+            last_runtime_detail = ""
+            last_tunnel_detail = ""
+            wait_deadline = time.monotonic() + 1800
+            while time.monotonic() < wait_deadline:
+                if not runtime_ready:
+                    ready, failed, detail = self.prime_backend.bootstrap_runtime_status(pod)
+                    if detail and detail != last_runtime_detail:
+                        yield LogEvent(
+                            line=f"Prime runtime: {detail}",
+                            operation=OperationType.DEPLOY,
+                            is_milestone=True,
+                        )
+                        last_runtime_detail = detail
+                    if failed:
+                        raise PrimeApiError(f"Prime runtime bootstrap failed: {detail}")
+                    if ready:
+                        runtime_ready = True
+                if not tunnel_ready:
+                    ready, failed, detail = self.prime_backend.tunnel_runtime_status(
+                        pod,
+                        tunnel_id,
+                    )
+                    if detail and detail != last_tunnel_detail:
+                        yield LogEvent(
+                            line=f"Prime Tunnel: {detail}",
+                            operation=OperationType.DEPLOY,
+                            is_milestone=True,
+                        )
+                        last_tunnel_detail = detail
+                    if failed:
+                        raise PrimeApiError(f"Prime Tunnel failed: {detail}")
+                    if ready:
+                        tunnel_ready = True
+                        announced = _prime_endpoint_info(config, pod_id, endpoint)
+                        yield LogEvent(
+                            line=f"Prime endpoint URL ready: {endpoint}",
+                            operation=OperationType.DEPLOY,
+                            is_milestone=True,
+                        )
+                        yield EndpointAvailableEvent(
+                            endpoint=announced,
+                            operation=OperationType.DEPLOY,
+                        )
+                if runtime_ready and tunnel_ready:
+                    break
+                if shutdown_event().wait(timeout=5):
+                    raise PrimeApiError("Prime deployment cancelled during runtime startup.")
+            else:
+                if not runtime_ready:
+                    raise PrimeApiError("Timed out waiting for the Prime runtime to load.")
+                raise PrimeApiError("Timed out waiting for Prime Tunnel to connect.")
 
             yield StateChangeEvent(
                 current=DeploymentState.DEPLOYING,
@@ -417,20 +544,9 @@ class Orchestrator:
                     "Prime runtime is healthy inside the pod, but its public endpoint "
                     f"is unreachable: {public_error}"
                 )
-            info = EndpointInfo(
-                name=config.app_name or "",
-                app_id=pod_id,
-                state="running",
-                backend=config.backend,
-                instance_name=config.instance_name,
-                web_url=endpoint,
-                served_model_name=config.served_model_name,
-                model_name=config.model_name,
-                repo_id=config.repo_id,
-                quant=config.quant,
-                provider=ComputeProvider.PRIME,
-                endpoint_api_key=config.endpoint_api_key,
-            )
+            info = announced or _prime_endpoint_info(config, pod_id, endpoint)
+            info.web_url = endpoint
+            info.state = "running"
             yield LogEvent(
                 line=f"Prime endpoint: {endpoint}",
                 operation=OperationType.DEPLOY,
@@ -791,6 +907,8 @@ class Orchestrator:
                         served_model_name=served_model_name,
                         api_key=api_key,
                     )
+                    if api_key:
+                        curl_cmd = curl_cmd.replace(api_key, "$LLM_LAUNCHPAD_API_KEY")
                     yield LogEvent(
                         line=f"Status: healthy (backend={backend.value}, url={server_url})"
                     )
@@ -1699,7 +1817,7 @@ class Orchestrator:
             yield OperationCompleteEvent(operation=OperationType.STOP, success=True)
             return
         target_app_name = (app_id or app_name or legacy_app_name(backend)).strip()
-        cmd = ["modal", "app", "stop", target_app_name]
+        cmd = ["modal", "app", "stop", "--yes", target_app_name]
         yield StateChangeEvent(
             current=DeploymentState.RUNNING,
             operation=OperationType.STOP,

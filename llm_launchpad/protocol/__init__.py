@@ -7,6 +7,7 @@ dependencies and defines the strict communication contract.
 from .enums import BackendType, DeploymentState, OperationType
 from .events import (
     BaseEvent,
+    EndpointAvailableEvent,
     ErrorEvent,
     LogEvent,
     OperationCompleteEvent,
@@ -25,6 +26,7 @@ __all__ = [
     "BaseEvent",
     "DeploymentConfig",
     "DeploymentState",
+    "EndpointAvailableEvent",
     "EndpointInfo",
     "ErrorEvent",
     "LaunchpadSettings",

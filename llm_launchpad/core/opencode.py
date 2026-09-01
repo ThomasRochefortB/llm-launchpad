@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import threading
 from typing import Any, Iterable
@@ -13,7 +14,11 @@ from typing import Any, Iterable
 from ..protocol.enums import BackendType, ComputeProvider
 from ..protocol.models import DeploymentConfig, EndpointInfo
 from .config import SETTINGS_DIR
-from .naming import default_llamacpp_served_model_name, default_served_model_name
+from .naming import (
+    default_llamacpp_served_model_name,
+    default_served_model_name,
+    infer_provider_from_app_name,
+)
 
 OPENCODE_CONFIG_PATH = Path.home() / ".config" / "opencode" / "opencode.json"
 OPENCODE_JSONC_CONFIG_PATH = Path.home() / ".config" / "opencode" / "opencode.jsonc"
@@ -25,6 +30,8 @@ _PROVIDER_NAME = "llm-launchpad"
 _LEGACY_PROVIDER_NAME_PREFIX = "llm-launchpad: "
 _MANAGED_NPM = "@ai-sdk/openai-compatible"
 _REMOVABLE_STATES = {"stopped", "stopping", "terminated", "archived"}
+_DEFAULT_MODAL_LLAMACPP_CONTEXT_TOKENS = 32_768
+_DEFAULT_OPENCODE_OUTPUT_TOKENS = 32_768
 _SYNC_LOCK = threading.Lock()
 
 
@@ -42,6 +49,8 @@ class OpenCodeConnection:
     backend: BackendType
     provider: ComputeProvider = ComputeProvider.MODAL
     api_key: str | None = None
+    context_limit: int | None = None
+    output_limit: int | None = None
 
 
 @dataclass
@@ -94,10 +103,97 @@ def _format_opencode_display_name(source: str, quant: str = "") -> str:
     return f"{base} ({quant_text})" if quant_text else base
 
 
+def _positive_token_limit(value: object) -> int | None:
+    """Normalize an optional token limit from config or persisted metadata."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = int(value)
+        except ValueError:
+            return None
+    else:
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _llamacpp_context_from_server_args(server_args: str | None) -> int | None:
+    """Read the effective llama.cpp context size from a server argument string."""
+    text = (server_args or "").strip()
+    if not text:
+        return None
+    try:
+        tokens = shlex.split(text)
+    except ValueError:
+        return None
+
+    context_limit: int | None = None
+    for index, token in enumerate(tokens):
+        raw_value: str | None = None
+        if token in {"-c", "--ctx-size"}:
+            if index + 1 < len(tokens):
+                raw_value = tokens[index + 1]
+        else:
+            for prefix in ("-c=", "--ctx-size="):
+                if token.startswith(prefix):
+                    raw_value = token.removeprefix(prefix)
+                    break
+        parsed = _positive_token_limit(raw_value)
+        if parsed is not None:
+            context_limit = parsed
+    return context_limit
+
+
+def _model_limits(
+    context_limit: object,
+    output_limit: object = None,
+) -> tuple[int | None, int | None]:
+    """Return a valid OpenCode context/output limit pair.
+
+    When the backend has no explicit generation cap, reserve a bounded quarter
+    of the context window for output. This gives OpenCode enough information to
+    compact before a request reaches the server's hard context boundary.
+    """
+    context = _positive_token_limit(context_limit)
+    if context is None:
+        return None, None
+
+    output = _positive_token_limit(output_limit)
+    if output is None:
+        output = min(_DEFAULT_OPENCODE_OUTPUT_TOKENS, max(1, context // 4))
+    else:
+        output = min(output, context)
+    return context, output
+
+
+def _model_limits_from_config(
+    config: DeploymentConfig,
+) -> tuple[int | None, int | None]:
+    """Resolve the actual deployed context window and OpenCode output reserve."""
+    declared_context = _positive_token_limit(config.max_context_tokens)
+    runtime_context: int | None = None
+    if config.backend == BackendType.LLAMACPP:
+        runtime_context = _llamacpp_context_from_server_args(config.server_args)
+        if (
+            runtime_context is None
+            and not (config.server_args or "").strip()
+            and config.provider == ComputeProvider.MODAL
+        ):
+            runtime_context = _DEFAULT_MODAL_LLAMACPP_CONTEXT_TOKENS
+
+    known_contexts = [
+        value for value in (declared_context, runtime_context) if value is not None
+    ]
+    effective_context = min(known_contexts) if known_contexts else None
+    return _model_limits(effective_context, config.max_output_tokens)
+
+
 def build_openai_connection_payload(
     config: DeploymentConfig,
     server_url: str,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Return a shared OpenAI-compatible connection summary payload."""
     base_root = server_url.rstrip("/")
     base_url = base_root if base_root.endswith("/v1") else f"{base_root}/v1"
@@ -112,11 +208,17 @@ def build_openai_connection_payload(
         )
         display_name = _format_opencode_display_name(config.repo_id or "llama.cpp GGUF", config.quant or "")
 
-    return {
+    context_limit, output_limit = _model_limits_from_config(config)
+    payload: dict[str, Any] = {
         "base_url": base_url,
         "model_id": model_id,
         "display_name": display_name,
     }
+    if context_limit is not None:
+        payload["context_limit"] = context_limit
+    if output_limit is not None:
+        payload["output_limit"] = output_limit
+    return payload
 
 
 def build_connection_from_config(
@@ -141,6 +243,8 @@ def build_connection_from_config(
         backend=config.backend,
         provider=config.provider,
         api_key=config.endpoint_api_key,
+        context_limit=payload.get("context_limit"),
+        output_limit=payload.get("output_limit"),
     )
 
 
@@ -190,6 +294,11 @@ def build_connection_from_endpoint(
         else:
             display_name = _format_opencode_display_name(display_name)
 
+    context_limit, output_limit = _model_limits(
+        row.max_context_tokens,
+        row.max_output_tokens,
+    )
+
     return OpenCodeConnection(
         app_name=app_name,
         instance_name=instance_name,
@@ -201,6 +310,8 @@ def build_connection_from_endpoint(
         backend=backend,
         provider=row.provider,
         api_key=row.endpoint_api_key,
+        context_limit=context_limit,
+        output_limit=output_limit,
     )
 
 
@@ -285,9 +396,15 @@ def sync_opencode_config(
     targets: Iterable[OpenCodeConnection] | None = None,
     current_rows: Iterable[EndpointInfo] | None = None,
     remove_app_names: Iterable[str] | None = None,
+    prune_providers: Iterable[ComputeProvider] | None = None,
     dry_run: bool = False,
 ) -> OpenCodeSyncResult:
-    """Upsert the target provider and prune stale Launchpad-managed providers."""
+    """Upsert the target provider and prune stale Launchpad-managed providers.
+
+    ``current_rows`` only prunes deployments for the compute providers that
+    were actually listed. Pass ``prune_providers`` when a successful list can
+    be empty so those providers are still in scope.
+    """
     result = OpenCodeSyncResult(
         detected=False,
         config_path=resolve_opencode_config_path(),
@@ -417,6 +534,7 @@ def sync_opencode_config(
                 row_name = str(row.name or "").strip()
                 if row_name:
                     visible_by_name[row_name] = row
+            prune_scope = _prune_scope(visible_rows, prune_providers)
 
             for app_name in sorted(list(registry.keys())):
                 entry = registry.get(app_name)
@@ -428,12 +546,21 @@ def sync_opencode_config(
                     continue
 
                 row = visible_by_name.get(app_name)
-                if row is None and app_name not in protected_app_names:
+                entry_provider = _compute_provider_for_registry_entry(app_name, entry)
+                if (
+                    row is None
+                    and app_name not in protected_app_names
+                    and _provider_in_prune_scope(entry_provider, prune_scope)
+                ):
                     provider_map.pop(provider_id, None)
                     registry.pop(app_name, None)
                     result.removed_provider_ids.append(provider_id)
                     result.messages.append(
-                        _prefixed_message(dry_run, f"remove stale provider {provider_id} (missing in Modal app list)")
+                        _prefixed_message(
+                            dry_run,
+                            f"remove stale provider {provider_id} "
+                            f"(missing from the {_provider_list_label(entry_provider)})",
+                        )
                     )
                     config_changed = True
                     registry_changed = True
@@ -472,18 +599,63 @@ def _prefixed_message(dry_run: bool, message: str) -> str:
     return f"{prefix} {message}"
 
 
+def _prune_scope(
+    visible_rows: Iterable[EndpointInfo],
+    prune_providers: Iterable[ComputeProvider] | None,
+) -> frozenset[ComputeProvider]:
+    if prune_providers is not None:
+        return frozenset(prune_providers)
+    return frozenset(row.provider for row in visible_rows)
+
+
+def _compute_provider_for_registry_entry(
+    app_name: str,
+    entry: dict[str, Any],
+) -> ComputeProvider | None:
+    raw = str(entry.get("provider", "") or "").strip()
+    if raw:
+        try:
+            return ComputeProvider(raw)
+        except ValueError:
+            pass
+    return infer_provider_from_app_name(app_name)
+
+
+def _provider_in_prune_scope(
+    entry_provider: ComputeProvider | None,
+    prune_scope: frozenset[ComputeProvider],
+) -> bool:
+    if not prune_scope or entry_provider is None:
+        return False
+    return entry_provider in prune_scope
+
+
+def _provider_list_label(provider: ComputeProvider | None) -> str:
+    if provider is None:
+        return "deployment list"
+    return f"{provider.display_name} deployment list"
+
+
 def _provider_payload(connection: OpenCodeConnection) -> dict[str, Any]:
     options: dict[str, str] = {"baseURL": connection.base_url}
     if connection.api_key:
         options["apiKey"] = connection.api_key
+    model: dict[str, Any] = {"name": connection.display_name}
+    context_limit, output_limit = _model_limits(
+        connection.context_limit,
+        connection.output_limit,
+    )
+    if context_limit is not None and output_limit is not None:
+        model["limit"] = {
+            "context": context_limit,
+            "output": output_limit,
+        }
     return {
         "npm": _MANAGED_NPM,
         "name": connection.provider_name,
         "options": options,
         "models": {
-            connection.model_id: {
-                "name": connection.display_name,
-            }
+            connection.model_id: model,
         },
     }
 
@@ -498,6 +670,8 @@ def _registry_entry_for_connection(connection: OpenCodeConnection) -> dict[str, 
         "base_url": connection.base_url,
         "model_id": connection.model_id,
         "display_name": connection.display_name,
+        "context_limit": connection.context_limit,
+        "output_limit": connection.output_limit,
     }
 
 
@@ -596,11 +770,13 @@ def _bootstrap_registry_from_config(config: dict[str, Any]) -> dict[str, dict[st
                 if isinstance(model_value, dict):
                     display_name = str(model_value.get("name", "") or "").strip()
                 break
+        inferred_provider = infer_provider_from_app_name(app_name)
         adopted[app_name] = {
             "provider_id": key,
             "app_name": app_name,
             "instance_name": instance_name,
             "backend": "",
+            "provider": inferred_provider.value if inferred_provider is not None else "",
             "base_url": base_url,
             "model_id": model_id,
             "display_name": display_name,

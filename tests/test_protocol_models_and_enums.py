@@ -20,14 +20,22 @@ class LaunchpadSettingsTests(unittest.TestCase):
         self.assertEqual(env["SCALEDOWN_WINDOW"], "1800")
 
     def test_to_dict_from_dict_roundtrip(self) -> None:
-        original = LaunchpadSettings(scaledown_window=600)
+        original = LaunchpadSettings(
+            scaledown_window=600,
+            tui_theme="launchpad-high-contrast",
+            tui_density="compact",
+        )
         serialized = original.to_dict()
         restored = LaunchpadSettings.from_dict(serialized)
         self.assertEqual(restored.scaledown_window, 600)
+        self.assertEqual(restored.tui_theme, "launchpad-high-contrast")
+        self.assertEqual(restored.tui_density, "compact")
 
     def test_from_dict_accepts_legacy_lowercase_key(self) -> None:
         restored = LaunchpadSettings.from_dict({"scaledown_window": 900})
         self.assertEqual(restored.scaledown_window, 900)
+        self.assertEqual(restored.tui_theme, "launchpad-dark")
+        self.assertEqual(restored.tui_density, "comfortable")
 
     def test_to_env_omits_non_positive_scaledown(self) -> None:
         env = LaunchpadSettings(scaledown_window=0).to_env()

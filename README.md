@@ -46,31 +46,37 @@ Get up and running in four steps:
 Setting up LLM endpoints usually means juggling model names, container images, GPU choices, warmup checks, logs, and endpoint details across several commands. The TUI keeps that flow in one place.
 
 From the TUI you can:
-- Browse popular models, compare compatible inference options, and deploy without memorizing provider-specific commands
+- Deploy a popular model by picking it, choosing live GPU placement, and confirming
+- Use Custom deploy for arbitrary Hugging Face llama.cpp or vLLM setups
 - Manage multiple deployed instances and inspect their status
-- Integrate the final OpenAI-compatible base URL and model ID into your workflows like OpenCode after deployment.
+- Copy the OpenAI-compatible base URL, model ID, and API key after a successful deploy
 
-The Recommended Models panel is model-first: each model can have multiple runtime
-recipes and each recipe can receive quotes from any compatible provider adapter.
-Quotes normalize GPU shape, availability, hourly price, billing model, and a
-workload-based monthly estimate. Existing Quick Deploy bundles supply the
+Deploy is model-first: each model can have multiple runtime recipes and each
+recipe can receive quotes from any compatible provider adapter. Quotes normalize
+GPU shape, availability, hourly price, billing model, and a workload-based
+monthly estimate. A GPU filter on the Deploy screen narrows the catalog to
+models that fit a selected GPU type. Existing Quick Deploy bundles supply the
 curated recipes and Modal estimates; both llama.cpp and vLLM recipes can also
 use live Prime Intellect offers through the same plan-to-deployment path. Prime
 CPU rows are excluded, and live GPU options are filtered per model using its
 estimated VRAM requirement plus safety headroom.
 
 When the TUI opens, it renders the bundled catalog immediately, then rebuilds
-Recommended Models in the background. With `ARTIFICIAL_ANALYSIS_API_KEY` set, it
-selects the strongest deployable open-weight model in three capability bands
-(Compact ≤40B, Medium 40–150B, and Large >150B), ranked primarily by Artificial
-Analysis coding and agentic scores. Hugging Face verifies matching GGUF weights
+the Deploy catalog in the background. With an Artificial Analysis API key
+configured (`ARTIFICIAL_ANALYSIS_API_KEY` or `llm-launchpad aai-auth login`),
+it selects the top three deployable open-weight models in each of three size
+bands (Compact ≤40B, Medium 40–150B, and Large >150B), ranked by the Artificial
+Analysis Intelligence Index. Hugging Face verifies matching GGUF weights
 and memory requirements, while Modal supplies current GPU availability and
-pricing.
+pricing. GGUF recommendations are also filtered by their `general.architecture`
+against a generated support manifest for the exact pinned llama.cpp image. Models
+with missing or unsupported architecture metadata are not recommended.
 
 Artificial Analysis responses are cached for 24 hours under
-`~/.llm_launchpad/artificial_analysis_models.json`; the API key is read only
-from the environment and is never persisted. A one-way key fingerprint lets
-the TUI reuse a recent successful validation safely. The authentication footer
+`~/.llm_launchpad/artificial_analysis_models.json`; the API key resolves from
+`ARTIFICIAL_ANALYSIS_API_KEY` first, then from an owner-only file written by
+`llm-launchpad aai-auth login` under `~/.llm_launchpad/`. A one-way key
+fingerprint lets the TUI reuse a recent successful validation safely. The authentication footer
 shows the AAI status and account tier alongside Modal, Prime Intellect, and
 Hugging Face. Modal prices and Hugging Face GGUF metadata are still refreshed
 on each launch. Free AAI keys are supported, with model size inferred when the
@@ -106,6 +112,7 @@ llm-launchpad deploy \
 
 Deploy a llama.cpp GGUF endpoint on Prime with the same offer selection:
 ```bash
+llm-launchpad llamacpp-support --repo-id unsloth/Qwen3-4B-GGUF
 llm-launchpad deploy \
   --provider prime \
   --backend llamacpp \
@@ -115,6 +122,13 @@ llm-launchpad deploy \
   --gpu-count 1 \
   --do-warmup
 ```
+
+Run `llm-launchpad llamacpp-support` without a repo to list every supported GGUF
+architecture. Launchpad repeats this preflight before allocating Modal or Prime
+compute and blocks known-incompatible models with the architecture and pinned
+runtime build in the error. Setting a custom `LLAMA_CPP_IMAGE_REF` is still
+supported, but its compatibility is reported as unverified because the bundled
+manifest only describes the pinned default image.
 
 Prime support uses the REST API and the credentials written by `prime login`
 (`PRIME_API_KEY` takes precedence). Launchpad resolves the Prime runtime behind
@@ -137,6 +151,14 @@ it expires if the serving session needs to continue.
 
 Prime llama.cpp uses the default Hugging Face revision and accepts a quant label
 such as `Q4_K_M`.
+
+Prime deploys create or reuse a 100 GB persistent cache disk by default. The disk
+stores Hugging Face and llama.cpp caches so later pods can reuse downloaded model
+weights. Use `--no-prime-disk` to opt out, or provide `--prime-disk-id` to attach
+an existing disk. Persistent disks remain billable after a pod stops; remove an
+unused Launchpad cache disk from the Prime dashboard. Launchpad also caches its
+pinned, checksum-verified Prime Tunnel client locally and on the persistent disk,
+so pods do not repeatedly download it from GitHub.
 
 The generated endpoint bearer key is stored with mode `0600` in
 `~/.llm_launchpad/deployment_connection_summaries.json` and is reused by status,
@@ -213,7 +235,7 @@ LLM-Launchpad automatically detects local installation of OpenCode and will set 
 - Hugging Face download errors: run `huggingface-cli login` and verify the model license or gated-repo access in your Hugging Face account.
 - Warmup stays queued: Modal may still be scheduling the requested GPU. Try a smaller GPU configuration or wait for capacity.
 - Endpoint status fails after deploy: inspect `llm-launchpad logs --backend <backend> --instance-name <name>` for backend startup errors.
-- SSH copy or selection feels wrong in the TUI: start with `llm-launchpad tui --no-mouse` to let the terminal handle native text selection.
+- TUI copy/paste: select text by dragging in mouse mode, then use `Ctrl/Cmd+C`; `Ctrl/Cmd+V` pastes the host clipboard into focused fields. Over SSH, start with `llm-launchpad tui --no-mouse` to let the terminal handle native text selection.
 
 ## Development setup
 

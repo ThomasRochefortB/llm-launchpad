@@ -484,7 +484,23 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             screen = app.screen
             assert isinstance(screen, LlamaCppDeployScreen)
             screen.query_one("#repo-id", Input).value = "new-author/new-model-GGUF"
+            await pilot.pause(0.4)
+            self.assertEqual(app.quant_fetch_calls, [("new-author/new-model-GGUF", None)])
+
+    async def test_repo_input_debounces_partial_metadata_lookups(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(LlamaCppDeployScreen())
             await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+            repo_input = screen.query_one("#repo-id", Input)
+
+            for value in ("new", "new-author/", "new-author/new", "new-author/new-model-GGUF"):
+                repo_input.value = value
+                await pilot.pause(0.05)
+            await pilot.pause(0.4)
+
             self.assertEqual(app.quant_fetch_calls, [("new-author/new-model-GGUF", None)])
 
     async def test_repo_quant_and_advanced_fields_map_into_config(self) -> None:

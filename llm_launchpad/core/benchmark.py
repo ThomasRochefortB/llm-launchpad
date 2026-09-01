@@ -288,14 +288,19 @@ def expected_export_paths(artifact_dir: Path) -> tuple[Path, Path]:
 
 def parse_aiperf_summary(json_path: Path, csv_path: Path) -> tuple[dict[str, float | None], str]:
     """Parse AIPerf exports, preferring JSON and falling back to CSV."""
+    json_metrics: dict[str, float | None] | None = None
     if json_path.exists():
         try:
             payload = json.loads(json_path.read_text())
-            return _extract_metrics_from_json(payload), str(json_path)
+            json_metrics = _extract_metrics_from_json(payload)
+            if any(value is not None for value in json_metrics.values()):
+                return json_metrics, str(json_path)
         except Exception:
             pass
     if csv_path.exists():
         return _extract_metrics_from_csv(csv_path), str(csv_path)
+    if json_metrics is not None:
+        return json_metrics, str(json_path)
     raise FileNotFoundError(f"No AIPerf summary export found in {json_path.parent}")
 
 

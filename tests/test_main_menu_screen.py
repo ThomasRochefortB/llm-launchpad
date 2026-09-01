@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import Mock, patch
 
 from llm_launchpad.core.modal_auth import ModalAuthStatus
 from llm_launchpad.core.quick_deploy_refresh import ArtificialAnalysisAuthStatus
@@ -26,6 +27,22 @@ _GIB = 1024**3
 
 
 class MainMenuStatusRenderTests(unittest.TestCase):
+    def test_resume_cancels_deferred_timer_before_starting_secondary_refresh(self) -> None:
+        screen = MainMenuScreen(username="alice")
+        secondary_timer = Mock()
+        screen._secondary_refresh_timer = secondary_timer
+        screen._was_suspended = True
+
+        with patch.object(screen, "_resume_refresh_timers"), patch.object(
+            screen,
+            "_refresh_panels",
+        ), patch.object(screen, "_refresh_secondary_panels") as refresh_secondary:
+            screen.on_screen_resume(Mock())
+
+        secondary_timer.stop.assert_called_once_with()
+        self.assertIsNone(screen._secondary_refresh_timer)
+        refresh_secondary.assert_called_once_with()
+
     def test_main_menu_bindings_do_not_include_q_quit(self) -> None:
         self.assertFalse(any(binding.key == "q" for binding in MainMenuScreen.BINDINGS))
 
@@ -285,12 +302,12 @@ class MainMenuStatusRenderTests(unittest.TestCase):
         self.assertIn("Artificial Analysis authenticated", rendered)
         self.assertIn("free tier", rendered)
 
-    def test_render_aai_auth_status_shows_environment_hint_when_missing(self) -> None:
+    def test_render_aai_auth_status_shows_login_hint_when_missing(self) -> None:
         rendered = _render_artificial_analysis_auth_status(
             ArtificialAnalysisAuthStatus(authenticated=False)
         )
         self.assertIn("Artificial Analysis not authenticated", rendered)
-        self.assertIn("ARTIFICIAL_ANALYSIS_API_KEY", rendered)
+        self.assertIn("llm-launchpad aai-auth login", rendered)
 
     def test_render_aai_auth_status_shows_invalid_key_error(self) -> None:
         rendered = _render_artificial_analysis_auth_status(

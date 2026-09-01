@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from types import SimpleNamespace
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from typing import Any, Sequence
 import unittest
 from unittest.mock import patch
 
@@ -12,6 +13,7 @@ from llm_launchpad.core.modal_gpu import ModalGpuSpec
 from llm_launchpad.core.quick_deploy_refresh import (
     AAModelCandidate,
     _AARankings,
+    _find_unsloth_gguf_match,
     _load_aa_rankings,
     _write_aa_cache,
     build_live_quick_deploy_catalog,
@@ -24,6 +26,7 @@ def _aa_candidate(
     name: str,
     parameter_count_b: float,
     score: float,
+    rank: int = 1,
 ) -> AAModelCandidate:
     slug = name.casefold().replace(" ", "-")
     return AAModelCandidate(
@@ -32,32 +35,105 @@ def _aa_candidate(
         slug=slug,
         creator_name="Test Org",
         coding_score=score,
-        agentic_score=score - 1,
-        intelligence_score=score - 2,
-        capability_score=score - 0.75,
-        rank=1,
+        intelligence_score=score,
+        rank=rank,
         parameter_count_b=parameter_count_b,
         max_context_tokens=131_072,
     )
 
 
+def _ordered_unique_names(profiles: Sequence[object]) -> list[str]:
+    names: list[str] = []
+    for profile in profiles:
+        if profile.display_name not in names:
+            names.append(str(profile.display_name))
+    return names
+
+
 class QuickDeployRefreshTests(unittest.TestCase):
-    def test_live_catalog_selects_one_aa_leader_per_model_size(self) -> None:
+    def test_live_catalog_selects_top_open_models_in_rank_order(self) -> None:
         candidates = (
-            _aa_candidate("Compact Model 8B", 8, 80),
-            _aa_candidate("Medium Model 70B", 70, 90),
-            _aa_candidate("Large Model 300B", 300, 95),
+            _aa_candidate("Closed Model 8B", 8, 99, rank=1),
+            _aa_candidate("Open Model One 8B", 8, 95, rank=2),
+            _aa_candidate("Open Model Two 70B", 70, 90, rank=3),
+            _aa_candidate("Open Model Three 300B", 300, 85, rank=4),
         )
         rankings = _AARankings(candidates=candidates, freshness="live", tier="pro")
         metadata = GgufQuantMetadata(
             quantizations=["UD-Q2_K_XL", "UD-Q4_K_XL"],
             vram_gb_by_quant={"UD-Q2_K_XL": 20.0, "UD-Q4_K_XL": 30.0},
+            architecture="llama",
         )
         gpu_catalog = [
             ModalGpuSpec("L4", 0.5),
             ModalGpuSpec("RTX-PRO-6000", 2.0),
             ModalGpuSpec("B200", 5.0),
         ]
+
+        def matched_repo(candidate: AAModelCandidate, _api: object) -> str | None:
+            if candidate.name.startswith("Closed"):
+                return None
+            return f"unsloth/{candidate.name.replace(' ', '-')}-GGUF"
+
+        with patch(
+            "llm_launchpad.core.quick_deploy_refresh._load_aa_rankings",
+            return_value=rankings,
+        ), patch(
+            "llm_launchpad.core.quick_deploy_refresh.fetch_modal_gpu_catalog",
+            return_value=gpu_catalog,
+        ), patch(
+            "llm_launchpad.core.quick_deploy_refresh._find_unsloth_gguf_match",
+            side_effect=matched_repo,
+        ) as match_mock, patch(
+            "llm_launchpad.core.quick_deploy_refresh.fetch_gguf_quant_metadata",
+            return_value=metadata,
+        ):
+            info, profiles = build_live_quick_deploy_catalog()
+
+        self.assertTrue(info.is_live)
+        self.assertIn("Artificial Analysis top open models", info.source_label)
+        self.assertIn("live Modal pricing", info.source_label)
+        self.assertEqual(
+            _ordered_unique_names(profiles),
+            [
+                "Open Model One 8B",
+                "Open Model Two 70B",
+                "Open Model Three 300B",
+            ],
+        )
+        self.assertEqual(
+            {profile.model_size_label for profile in profiles},
+            {"Compact ≤40B", "Medium 40–150B", "Large >150B"},
+        )
+        self.assertEqual({profile.source_label for profile in profiles}, {"Artificial Analysis"})
+        self.assertEqual({profile.max_context_tokens for profile in profiles}, {131_072})
+        self.assertEqual(match_mock.call_count, len(candidates))
+
+        compact_q4 = next(
+            profile
+            for profile in profiles
+            if profile.model_size_label == "Compact ≤40B"
+            and profile.quant == "UD-Q4_K_XL"
+            and profile.resource_tier == "cheap"
+        )
+        self.assertEqual(compact_q4.gpu_type, "L4")
+        self.assertEqual(compact_q4.gpu_count, 2)
+        self.assertEqual(compact_q4.approx_cost_per_hour_usd, 1.0)
+        self.assertEqual(compact_q4.aa_coding_score, 95)
+        self.assertEqual(compact_q4.aa_intelligence_score, 95)
+
+    def test_live_catalog_caps_selection_at_model_limit(self) -> None:
+        candidates = tuple(
+            _aa_candidate(f"Open Model {index} 8B", 8, 90 - index, rank=index)
+            for index in range(1, 5)
+        )
+        rankings = _AARankings(candidates=candidates, freshness="live")
+        metadata = GgufQuantMetadata(
+            quantizations=["UD-Q2_K_XL"],
+            vram_gb_by_quant={"UD-Q2_K_XL": 20.0},
+            architecture="llama",
+        )
+        gpu_catalog = [ModalGpuSpec("L4", 0.5)]
 
         def matched_repo(candidate: AAModelCandidate, _api: object) -> str:
             return f"unsloth/{candidate.name.replace(' ', '-')}-GGUF"
@@ -75,35 +151,202 @@ class QuickDeployRefreshTests(unittest.TestCase):
             "llm_launchpad.core.quick_deploy_refresh.fetch_gguf_quant_metadata",
             return_value=metadata,
         ):
-            info, profiles = build_live_quick_deploy_catalog()
+            _info, profiles = build_live_quick_deploy_catalog(model_limit=2)
 
-        self.assertTrue(info.is_live)
-        self.assertIn("Artificial Analysis size leaders", info.source_label)
-        self.assertIn("live Modal pricing", info.source_label)
         self.assertEqual(
-            {profile.model_size_label for profile in profiles},
-            {"Compact ≤40B", "Medium 40–150B", "Large >150B"},
+            _ordered_unique_names(profiles),
+            ["Open Model 1 8B", "Open Model 2 8B"],
         )
-        self.assertEqual({profile.source_label for profile in profiles}, {"Artificial Analysis"})
-        self.assertEqual({profile.max_context_tokens for profile in profiles}, {131_072})
 
-        compact_q4 = next(
-            profile
-            for profile in profiles
-            if profile.model_size_label == "Compact ≤40B"
-            and profile.quant == "UD-Q4_K_XL"
-            and profile.resource_tier == "cheap"
+    def test_live_catalog_selects_top_models_in_each_size_bucket(self) -> None:
+        candidates: list[AAModelCandidate] = []
+        rank = 1
+        for parameter_count_b, prefix in (
+            (8, "Compact"),
+            (70, "Medium"),
+            (300, "Large"),
+        ):
+            for index in range(1, 5):
+                candidates.append(
+                    _aa_candidate(
+                        f"{prefix} Model {index} {parameter_count_b}B",
+                        parameter_count_b,
+                        100 - rank,
+                        rank=rank,
+                    )
+                )
+                rank += 1
+        rankings = _AARankings(candidates=tuple(candidates), freshness="live")
+        metadata = GgufQuantMetadata(
+            quantizations=["UD-Q2_K_XL"],
+            vram_gb_by_quant={"UD-Q2_K_XL": 20.0},
+            architecture="llama",
         )
-        self.assertEqual(compact_q4.gpu_type, "L4")
-        self.assertEqual(compact_q4.gpu_count, 2)
-        self.assertEqual(compact_q4.approx_cost_per_hour_usd, 1.0)
-        self.assertEqual(compact_q4.aa_coding_score, 80)
+        gpu_catalog = [ModalGpuSpec("L4", 0.5)]
+
+        def matched_repo(candidate: AAModelCandidate, _api: object) -> str:
+            return f"unsloth/{candidate.name.replace(' ', '-')}-GGUF"
+
+        with patch(
+            "llm_launchpad.core.quick_deploy_refresh._load_aa_rankings",
+            return_value=rankings,
+        ), patch(
+            "llm_launchpad.core.quick_deploy_refresh.fetch_modal_gpu_catalog",
+            return_value=gpu_catalog,
+        ), patch(
+            "llm_launchpad.core.quick_deploy_refresh._find_unsloth_gguf_match",
+            side_effect=matched_repo,
+        ), patch(
+            "llm_launchpad.core.quick_deploy_refresh.fetch_gguf_quant_metadata",
+            return_value=metadata,
+        ):
+            _info, profiles = build_live_quick_deploy_catalog()
+
+        self.assertEqual(
+            _ordered_unique_names(profiles),
+            [
+                "Compact Model 1 8B",
+                "Compact Model 2 8B",
+                "Compact Model 3 8B",
+                "Medium Model 1 70B",
+                "Medium Model 2 70B",
+                "Medium Model 3 70B",
+                "Large Model 1 300B",
+                "Large Model 2 300B",
+                "Large Model 3 300B",
+            ],
+        )
+
+    def test_live_catalog_keeps_size_buckets_beyond_global_rank_window(self) -> None:
+        candidates: list[AAModelCandidate] = [
+            _aa_candidate(
+                f"Compact Model {index} 8B",
+                8,
+                100 - index,
+                rank=index,
+            )
+            for index in range(1, 81)
+        ]
+        candidates.extend(
+            _aa_candidate(f"Medium Model {index} 70B", 70, 10 - index, rank=80 + index)
+            for index in range(1, 4)
+        )
+        candidates.extend(
+            _aa_candidate(f"Large Model {index} 300B", 300, 5 - index, rank=83 + index)
+            for index in range(1, 4)
+        )
+        rankings = _AARankings(candidates=tuple(candidates), freshness="live")
+        metadata = GgufQuantMetadata(
+            quantizations=["UD-Q2_K_XL"],
+            vram_gb_by_quant={"UD-Q2_K_XL": 20.0},
+            architecture="llama",
+        )
+        gpu_catalog = [ModalGpuSpec("L4", 0.5)]
+
+        def matched_repo(candidate: AAModelCandidate, _api: object) -> str:
+            return f"unsloth/{candidate.name.replace(' ', '-')}-GGUF"
+
+        with patch(
+            "llm_launchpad.core.quick_deploy_refresh._load_aa_rankings",
+            return_value=rankings,
+        ), patch(
+            "llm_launchpad.core.quick_deploy_refresh.fetch_modal_gpu_catalog",
+            return_value=gpu_catalog,
+        ), patch(
+            "llm_launchpad.core.quick_deploy_refresh._find_unsloth_gguf_match",
+            side_effect=matched_repo,
+        ), patch(
+            "llm_launchpad.core.quick_deploy_refresh.fetch_gguf_quant_metadata",
+            return_value=metadata,
+        ):
+            _info, profiles = build_live_quick_deploy_catalog()
+
+        names = _ordered_unique_names(profiles)
+        self.assertEqual(len(names), 9)
+        self.assertEqual(names[:3], [f"Compact Model {index} 8B" for index in range(1, 4)])
+        self.assertEqual(names[3:6], [f"Medium Model {index} 70B" for index in range(1, 4)])
+        self.assertEqual(names[6:], [f"Large Model {index} 300B" for index in range(1, 4)])
+
+    def test_live_catalog_deduplicates_variants_sharing_a_gguf_repo(self) -> None:
+        candidates = (
+            _aa_candidate("Open Model One 8B", 8, 95, rank=1),
+            _aa_candidate("Open Model One (low) 8B", 8, 90, rank=2),
+            _aa_candidate("Open Model Two 70B", 70, 85, rank=3),
+        )
+        rankings = _AARankings(candidates=candidates, freshness="live")
+        metadata = GgufQuantMetadata(
+            quantizations=["UD-Q2_K_XL"],
+            vram_gb_by_quant={"UD-Q2_K_XL": 20.0},
+            architecture="llama",
+        )
+        gpu_catalog = [ModalGpuSpec("L4", 0.5)]
+
+        def matched_repo(candidate: AAModelCandidate, _api: object) -> str:
+            if "One" in candidate.name:
+                return "unsloth/Open-Model-One-GGUF"
+            return f"unsloth/{candidate.name.replace(' ', '-')}-GGUF"
+
+        with patch(
+            "llm_launchpad.core.quick_deploy_refresh._load_aa_rankings",
+            return_value=rankings,
+        ), patch(
+            "llm_launchpad.core.quick_deploy_refresh.fetch_modal_gpu_catalog",
+            return_value=gpu_catalog,
+        ), patch(
+            "llm_launchpad.core.quick_deploy_refresh._find_unsloth_gguf_match",
+            side_effect=matched_repo,
+        ) as match_mock, patch(
+            "llm_launchpad.core.quick_deploy_refresh.fetch_gguf_quant_metadata",
+            return_value=metadata,
+        ):
+            _info, profiles = build_live_quick_deploy_catalog()
+
+        self.assertEqual(
+            {profile.repo_id for profile in profiles},
+            {
+                "unsloth/Open-Model-One-GGUF",
+                "unsloth/Open-Model-Two-70B-GGUF",
+            },
+        )
+        self.assertEqual(
+            _ordered_unique_names(profiles),
+            ["Open Model One 8B", "Open Model Two 70B"],
+        )
+        self.assertEqual(match_mock.call_count, 2)
+
+    def test_find_unsloth_gguf_match_finds_untagged_fresh_repos(self) -> None:
+        class _FakeHfApi:
+            def __init__(self) -> None:
+                self.last_search_kwargs: dict[str, object] = {}
+
+            def model_info(self, repo_id: str) -> object:
+                raise RuntimeError(f"404 {repo_id}")
+
+            def list_models(self, **kwargs: Any) -> list[dict[str, str]]:
+                self.last_search_kwargs = kwargs
+                if "gguf" in [str(tag) for tag in kwargs.get("filter", ())]:
+                    # Fresh unsloth repos lack the gguf tag, so a hard
+                    # filter excludes them from HF search results.
+                    return []
+                return [
+                    {"id": "unsloth/Fresh Model 8B"},
+                    {"id": "unsloth/Fresh Model 8B-GGUF"},
+                ]
+
+        candidate = _aa_candidate("Fresh Model 8B", 8, 90, rank=1)
+        api = _FakeHfApi()
+
+        repo_id = _find_unsloth_gguf_match(candidate, api)
+
+        self.assertEqual(repo_id, "unsloth/Fresh Model 8B-GGUF")
+        self.assertNotIn("filter", api.last_search_kwargs)
 
     def test_fallback_catalog_uses_trending_models_without_aa_data(self) -> None:
         models = [ModelCandidate(repo_id="unsloth/Test-Model-GGUF")]
         metadata = GgufQuantMetadata(
             quantizations=["Q4_K_M"],
             vram_gb_by_quant={"Q4_K_M": 10.0},
+            architecture="llama",
         )
         with patch(
             "llm_launchpad.core.quick_deploy_refresh._load_aa_rankings",
@@ -123,7 +366,7 @@ class QuickDeployRefreshTests(unittest.TestCase):
         ):
             info, profiles = build_live_quick_deploy_catalog(model_limit=1)
 
-        list_models.assert_called_once_with(mode="trending", limit=6)
+        list_models.assert_called_once_with(mode="trending", limit=8)
         self.assertIn("Hugging Face trending", info.source_label)
         self.assertEqual({profile.repo_id for profile in profiles}, {models[0].repo_id})
         self.assertEqual({profile.max_context_tokens for profile in profiles}, {65_536})
@@ -140,6 +383,7 @@ class QuickDeployRefreshTests(unittest.TestCase):
             return GgufQuantMetadata(
                 quantizations=["Q4_K_M"],
                 vram_gb_by_quant={"Q4_K_M": 10.0},
+                architecture="llama",
             )
 
         with patch(
@@ -176,7 +420,7 @@ class QuickDeployRefreshTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Neither Artificial Analysis"):
                 build_live_quick_deploy_catalog()
 
-    def test_normalize_aa_candidates_deduplicates_variants_and_weights_scores(self) -> None:
+    def test_normalize_aa_candidates_deduplicates_variants_by_intelligence_index(self) -> None:
         payload = {
             "data": [
                 {
@@ -218,7 +462,7 @@ class QuickDeployRefreshTests(unittest.TestCase):
         self.assertEqual(candidates[0].aa_model_id, "high")
         self.assertEqual(candidates[0].parameter_count_b, 8)
         self.assertEqual(candidates[0].max_context_tokens, 131_072)
-        self.assertAlmostEqual(candidates[0].capability_score, 72.5)
+        self.assertAlmostEqual(candidates[0].intelligence_score, 60.0)
         self.assertEqual(candidates[0].rank, 1)
 
     def test_fresh_aa_cache_avoids_api_request(self) -> None:
@@ -230,7 +474,7 @@ class QuickDeployRefreshTests(unittest.TestCase):
                     "id": "cached",
                     "name": "Cached 8B",
                     "slug": "cached-8b",
-                    "evaluations": {"artificial_analysis_coding_index": 50},
+                    "evaluations": {"artificial_analysis_intelligence_index": 50},
                 }
             ],
         }
@@ -264,7 +508,7 @@ class QuickDeployRefreshTests(unittest.TestCase):
                     "id": "stale",
                     "name": "Stale 8B",
                     "slug": "stale-8b",
-                    "evaluations": {"artificial_analysis_coding_index": 40},
+                    "evaluations": {"artificial_analysis_intelligence_index": 40},
                 }
             ]
         }
@@ -276,7 +520,7 @@ class QuickDeployRefreshTests(unittest.TestCase):
                     "name": "Live 70B",
                     "slug": "live-70b",
                     "parameters": {"total": 70},
-                    "evaluations": {"artificial_analysis_coding_index": 90},
+                    "evaluations": {"artificial_analysis_intelligence_index": 90},
                 }
             ],
         }
@@ -343,7 +587,7 @@ class QuickDeployRefreshTests(unittest.TestCase):
                     "id": "stale",
                     "name": "Stale 8B",
                     "slug": "stale-8b",
-                    "evaluations": {"artificial_analysis_coding_index": 40},
+                    "evaluations": {"artificial_analysis_intelligence_index": 40},
                 }
             ]
         }

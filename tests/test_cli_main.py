@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from typer.testing import CliRunner
 
 from llm_launchpad.cli import main as cli_main
+from llm_launchpad.core.artificial_analysis_auth import save_artificial_analysis_api_key
+from llm_launchpad.core.quick_deploy_refresh import ArtificialAnalysisAuthStatus
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider, OperationType
-from llm_launchpad.protocol.events import LogEvent, OperationCompleteEvent
+from llm_launchpad.protocol.events import EndpointAvailableEvent, LogEvent, OperationCompleteEvent
 from llm_launchpad.protocol.models import EndpointInfo, PrimeProviderOptions
 
 
@@ -143,6 +147,16 @@ class CliMainHelperTests(unittest.TestCase):
 class CliMainCommandTests(unittest.TestCase):
     def setUp(self) -> None:
         self.runner = CliRunner()
+        for target in (
+            "llm_launchpad.cli.main._provider_instances",
+            "llm_launchpad.cli.main._load_visible_launchpad_rows",
+        ):
+            discovery_patch = patch(target, return_value=[])
+            discovery_patch.start()
+            self.addCleanup(discovery_patch.stop)
+        save_connection_patch = patch("llm_launchpad.cli.main.save_connection")
+        save_connection_patch.start()
+        self.addCleanup(save_connection_patch.stop)
 
     def test_main_defaults_to_tui_subcommand_when_no_args(self) -> None:
         fake_app = Mock()
@@ -225,6 +239,56 @@ class CliMainCommandTests(unittest.TestCase):
             with patch("llm_launchpad.cli.main._print_banner", return_value=None):
                 result = self.runner.invoke(cli_main.app, ["deploy", "--backend", "vllm"])
         self.assertEqual(result.exit_code, 9)
+
+    def test_deploy_cli_summarizes_verbose_backend_logs_by_default(self) -> None:
+        orch = SimpleNamespace(
+            deploy=lambda _config: [
+                LogEvent(
+                    line="Running: modal run -m llm_launchpad.backends.modal_llamacpp_app::main --preload"
+                ),
+                LogEvent(line="  env: SCALEDOWN_WINDOW=1800, GPU_CONFIG=T4:1"),
+                LogEvent(line="print_info: n_embd = 896"),
+                LogEvent(line="Server is ready!"),
+                OperationCompleteEvent(operation=OperationType.DEPLOY, success=True, exit_code=0),
+            ]
+        )
+        with patch("llm_launchpad.cli.main._preflight", return_value=(orch, "alice")):
+            with patch("llm_launchpad.cli.main._print_banner", return_value=None):
+                result = self.runner.invoke(
+                    cli_main.app,
+                    ["deploy", "--backend", "llamacpp", "--repo-id", "org/model"],
+                )
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Preparing model cache", result.output)
+        self.assertIn("Server is ready!", result.output)
+        self.assertNotIn("env: SCALEDOWN_WINDOW", result.output)
+        self.assertNotIn("print_info:", result.output)
+        self.assertNotIn("Running: modal run", result.output)
+
+    def test_deploy_cli_debug_logs_keep_raw_backend_output(self) -> None:
+        orch = SimpleNamespace(
+            deploy=lambda _config: [
+                LogEvent(line="  env: SCALEDOWN_WINDOW=1800, GPU_CONFIG=T4:1"),
+                LogEvent(line="print_info: n_embd = 896"),
+                OperationCompleteEvent(operation=OperationType.DEPLOY, success=True, exit_code=0),
+            ]
+        )
+        with patch("llm_launchpad.cli.main._preflight", return_value=(orch, "alice")):
+            with patch("llm_launchpad.cli.main._print_banner", return_value=None):
+                result = self.runner.invoke(
+                    cli_main.app,
+                    [
+                        "deploy",
+                        "--backend",
+                        "llamacpp",
+                        "--repo-id",
+                        "org/model",
+                        "--debug-logs",
+                    ],
+                )
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("env: SCALEDOWN_WINDOW=1800, GPU_CONFIG=T4:1", result.output)
+        self.assertIn("print_info: n_embd = 896", result.output)
 
     def test_deploy_vllm_maps_trust_remote_code_flag(self) -> None:
         captured = {}
@@ -377,6 +441,98 @@ class CliMainCommandTests(unittest.TestCase):
         self.assertEqual(sync_mock.call_args.kwargs["target_url"], "https://alice--vllm-test-serve.modal.run")
         self.assertEqual(sync_mock.call_args.kwargs["username"], "alice")
 
+    def test_deploy_syncs_opencode_when_prime_endpoint_url_is_available(self) -> None:
+        endpoint = EndpointInfo(
+            name="llp-prime-vllm-qwen",
+            app_id="pod-1",
+            web_url="https://t-0-abc.tunnel.pinfra.io",
+            backend=BackendType.VLLM,
+            provider=ComputeProvider.PRIME,
+            endpoint_api_key="secret",
+        )
+        orch = SimpleNamespace(
+            deploy=lambda _config: [
+                EndpointAvailableEvent(endpoint=endpoint, operation=OperationType.DEPLOY),
+                OperationCompleteEvent(
+                    operation=OperationType.DEPLOY,
+                    success=True,
+                    exit_code=0,
+                    data=endpoint,
+                ),
+            ],
+            warmup=lambda *_args, **_kwargs: [
+                OperationCompleteEvent(
+                    operation=OperationType.WARMUP,
+                    success=True,
+                    data={"url": "https://t-0-abc.tunnel.pinfra.io"},
+                )
+            ],
+        )
+        with (
+            patch("llm_launchpad.cli.main._preflight", return_value=(orch, "alice")),
+            patch("llm_launchpad.cli.main._print_banner", return_value=None),
+            patch("llm_launchpad.cli.main._load_visible_launchpad_rows", return_value=[]),
+            patch("llm_launchpad.cli.main.save_connection") as save_mock,
+            patch("llm_launchpad.cli.main._sync_opencode_cli") as sync_mock,
+        ):
+            result = self.runner.invoke(
+                cli_main.app,
+                [
+                    "deploy",
+                    "--provider",
+                    "prime",
+                    "--backend",
+                    "vllm",
+                    "--model-name",
+                    "Qwen/Qwen3-4B",
+                    "--app-name",
+                    "llp-prime-vllm-qwen",
+                    "--do-warmup",
+                ],
+            )
+        self.assertEqual(result.exit_code, 0, result.output)
+        sync_mock.assert_called_once()
+        self.assertEqual(sync_mock.call_args.kwargs["target_app_name"], "llp-prime-vllm-qwen")
+        self.assertEqual(
+            sync_mock.call_args.kwargs["target_url"],
+            "https://t-0-abc.tunnel.pinfra.io",
+        )
+        save_mock.assert_called()
+
+    def test_deploy_no_prime_disk_sets_auto_disk_false(self) -> None:
+        captured: dict[str, object] = {}
+
+        def _deploy(config):  # type: ignore[no-untyped-def]
+            captured["config"] = config
+            return [
+                OperationCompleteEvent(operation=OperationType.DEPLOY, success=True, exit_code=0),
+            ]
+
+        orch = SimpleNamespace(deploy=_deploy)
+        with (
+            patch("llm_launchpad.cli.main._preflight", return_value=(orch, "alice")),
+            patch("llm_launchpad.cli.main._print_banner", return_value=None),
+            patch("llm_launchpad.cli.main._load_visible_launchpad_rows", return_value=[]),
+            patch("llm_launchpad.cli.main._sync_opencode_cli"),
+        ):
+            result = self.runner.invoke(
+                cli_main.app,
+                [
+                    "deploy",
+                    "--provider",
+                    "prime",
+                    "--backend",
+                    "vllm",
+                    "--model-name",
+                    "Qwen/Qwen3-4B",
+                    "--no-prime-disk",
+                ],
+            )
+        self.assertEqual(result.exit_code, 0, result.output)
+        config = captured["config"]
+        assert isinstance(config.provider_options, PrimeProviderOptions)
+        self.assertFalse(config.provider_options.auto_disk)
+
     def test_deploy_warmup_uses_function_slug_when_url_not_in_logs(self) -> None:
         warmup_calls: list[str] = []
 
@@ -405,7 +561,7 @@ class CliMainCommandTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(
             warmup_calls,
-            ["https://alice--llamacpp-test-serve-alpha-bravo.modal.run"],
+            ["https://alice--llp-lc-c0e8ad06e105.modal.run"],
         )
 
     def test_status_failure_returns_exit_code_1(self) -> None:
@@ -529,7 +685,11 @@ class CliMainCommandTests(unittest.TestCase):
         ):
             result = self.runner.invoke(cli_main.app, ["list"])
         self.assertEqual(result.exit_code, 0)
-        sync_mock.assert_called_once_with(current_rows=visible_rows, username="alice")
+        sync_mock.assert_called_once_with(
+            current_rows=visible_rows,
+            username="alice",
+            prune_providers=(ComputeProvider.MODAL,),
+        )
 
     def test_deploy_warmup_failure_returns_nonzero_exit_code(self) -> None:
         orch = SimpleNamespace(
@@ -724,6 +884,7 @@ class CliMainCommandTests(unittest.TestCase):
         sync_mock.assert_called_once_with(
             current_rows=[],
             remove_app_names=["vllm-test"],
+            prune_providers=(ComputeProvider.MODAL,),
             username="alice",
         )
 
@@ -801,7 +962,7 @@ class CliMainCommandTests(unittest.TestCase):
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(
             warmup_calls,
-            ["https://alice--llamacpp-qwen2-5-coder-7b-instruct-q4km-serve-alpha-bravo.modal.run"],
+            ["https://alice--llp-lc-f16f2cc918bf.modal.run"],
         )
 
     def test_switch_llamacpp_redeploy_sets_instance_name_and_app_name(self) -> None:
@@ -839,9 +1000,16 @@ class CliMainCommandTests(unittest.TestCase):
     def test_opencode_sync_command_uses_target_rows_and_dry_run(self) -> None:
         rows = [SimpleNamespace(name="vllm-qwen3")]
         with (
-            patch("llm_launchpad.cli.main._preflight", return_value=(SimpleNamespace(), "alice")),
             patch("llm_launchpad.cli.main._print_banner", return_value=None),
-            patch("llm_launchpad.cli.main._load_visible_launchpad_rows", return_value=rows),
+            patch(
+                "llm_launchpad.cli.main._connected_compute_providers",
+                return_value=(ComputeProvider.MODAL, ComputeProvider.PRIME),
+            ),
+            patch("llm_launchpad.cli.main.ModalBackend.get_username", return_value=""),
+            patch(
+                "llm_launchpad.cli.main._load_rows_for_opencode_sync",
+                return_value=(rows, (ComputeProvider.MODAL, ComputeProvider.PRIME), []),
+            ),
             patch("llm_launchpad.cli.main._sync_opencode_cli") as sync_mock,
         ):
             result = self.runner.invoke(
@@ -852,10 +1020,162 @@ class CliMainCommandTests(unittest.TestCase):
         sync_mock.assert_called_once_with(
             target_app_name="vllm-qwen3",
             current_rows=rows,
+            prune_providers=(ComputeProvider.MODAL, ComputeProvider.PRIME),
+            username="",
+            dry_run=True,
+            fail_on_error=True,
+        )
+
+    def test_opencode_sync_command_can_limit_to_one_provider(self) -> None:
+        rows = [SimpleNamespace(name="vllm-qwen3")]
+        with (
+            patch("llm_launchpad.cli.main._preflight", return_value=(SimpleNamespace(), "alice")),
+            patch("llm_launchpad.cli.main._print_banner", return_value=None),
+            patch(
+                "llm_launchpad.cli.main._load_rows_for_opencode_sync",
+                return_value=(rows, (ComputeProvider.MODAL,), []),
+            ),
+            patch("llm_launchpad.cli.main._sync_opencode_cli") as sync_mock,
+        ):
+            result = self.runner.invoke(
+                cli_main.app,
+                ["opencode", "sync", "--provider", "modal", "--dry-run"],
+            )
+        self.assertEqual(result.exit_code, 0)
+        sync_mock.assert_called_once_with(
+            target_app_name=None,
+            current_rows=rows,
+            prune_providers=(ComputeProvider.MODAL,),
             username="alice",
             dry_run=True,
             fail_on_error=True,
         )
+
+    def test_opencode_sync_upserts_cached_connections_when_listing_fails(self) -> None:
+        rows = [SimpleNamespace(name="llamacpp-qwen")]
+        with (
+            patch("llm_launchpad.cli.main._print_banner", return_value=None),
+            patch(
+                "llm_launchpad.cli.main._connected_compute_providers",
+                return_value=(ComputeProvider.MODAL, ComputeProvider.PRIME),
+            ),
+            patch("llm_launchpad.cli.main.ModalBackend.get_username", return_value=""),
+            patch(
+                "llm_launchpad.cli.main._load_rows_for_opencode_sync",
+                return_value=(rows, (), ["Modal listing failed; using cached connection summaries."]),
+            ),
+            patch("llm_launchpad.cli.main._sync_opencode_cli") as sync_mock,
+        ):
+            result = self.runner.invoke(cli_main.app, ["opencode", "sync"])
+        self.assertEqual(result.exit_code, 0)
+        sync_mock.assert_called_once_with(
+            target_app_name=None,
+            current_rows=rows,
+            # Cached rows must never become prune authorization when no live
+            # provider listing succeeded.
+            prune_providers=(),
+            username="",
+            dry_run=False,
+            fail_on_error=True,
+        )
+
+    def test_opencode_sync_fails_loudly_when_no_deployment_source_is_available(self) -> None:
+        with (
+            patch("llm_launchpad.cli.main._print_banner", return_value=None),
+            patch(
+                "llm_launchpad.cli.main._connected_compute_providers",
+                return_value=(ComputeProvider.MODAL, ComputeProvider.PRIME),
+            ),
+            patch("llm_launchpad.cli.main.ModalBackend.get_username", return_value=""),
+            patch(
+                "llm_launchpad.cli.main._load_rows_for_opencode_sync",
+                return_value=(None, (), ["Modal listing failed and no cached connections are available."]),
+            ),
+        ):
+            result = self.runner.invoke(cli_main.app, ["opencode", "sync"])
+        self.assertEqual(result.exit_code, 1)
+
+    def test_load_rows_for_opencode_sync_falls_back_to_cached_connections(self) -> None:
+        cached = [
+            EndpointInfo(
+                name="llamacpp-qwen",
+                backend=BackendType.LLAMACPP,
+                provider=ComputeProvider.MODAL,
+                web_url="https://cached.modal.run",
+                served_model_name="Qwen3-4B",
+            )
+        ]
+        with (
+            patch(
+                "llm_launchpad.cli.main._connected_compute_providers",
+                return_value=(ComputeProvider.MODAL,),
+            ),
+            patch("llm_launchpad.cli.main.ModalBackend.list_apps", return_value=None),
+            patch("llm_launchpad.cli.main.merge_connections", side_effect=lambda rows: rows),
+            patch(
+                "llm_launchpad.cli.main.rows_from_connection_cache",
+                return_value=cached,
+            ),
+        ):
+            rows, listed, notes = cli_main._load_rows_for_opencode_sync()
+        self.assertIsNotNone(rows)
+        self.assertEqual([row.name for row in rows or []], ["llamacpp-qwen"])
+        self.assertEqual(listed, ())
+        self.assertTrue(any("using cached connection summaries" in note for note in notes))
+
+    def test_load_rows_for_opencode_sync_keeps_live_listed_providers_as_prune_scope(self) -> None:
+        live_prime = [
+            EndpointInfo(
+                name="llp-prime-vllm-qwen",
+                backend=BackendType.VLLM,
+                provider=ComputeProvider.PRIME,
+                web_url="https://prime.example",
+            )
+        ]
+        cached_modal = [
+            EndpointInfo(
+                name="llamacpp-qwen",
+                backend=BackendType.LLAMACPP,
+                provider=ComputeProvider.MODAL,
+                web_url="https://cached.modal.run",
+            )
+        ]
+        with (
+            patch(
+                "llm_launchpad.cli.main._connected_compute_providers",
+                return_value=(ComputeProvider.MODAL, ComputeProvider.PRIME),
+            ),
+            patch("llm_launchpad.cli.main.ModalBackend.list_apps", return_value=None),
+            patch("llm_launchpad.cli.main.PrimeBackend") as prime_mock,
+            patch("llm_launchpad.cli.main.merge_connections", side_effect=lambda rows: rows),
+            patch(
+                "llm_launchpad.cli.main.rows_from_connection_cache",
+                return_value=cached_modal,
+            ),
+        ):
+            prime_mock.return_value.list_deployments.return_value = live_prime
+            rows, listed, notes = cli_main._load_rows_for_opencode_sync()
+        self.assertEqual(listed, (ComputeProvider.PRIME,))
+        self.assertEqual(
+            sorted(row.name for row in rows or []),
+            ["llamacpp-qwen", "llp-prime-vllm-qwen"],
+        )
+        self.assertTrue(any("using cached connection summaries" in note for note in notes))
+
+    def test_load_rows_for_opencode_sync_reports_no_source_when_listing_fails_and_cache_is_empty(self) -> None:
+        with (
+            patch(
+                "llm_launchpad.cli.main._connected_compute_providers",
+                return_value=(ComputeProvider.MODAL,),
+            ),
+            patch("llm_launchpad.cli.main.ModalBackend.list_apps", return_value=None),
+            patch("llm_launchpad.cli.main.merge_connections", side_effect=lambda rows: rows),
+            patch("llm_launchpad.cli.main.rows_from_connection_cache", return_value=[]),
+        ):
+            rows, listed, notes = cli_main._load_rows_for_opencode_sync()
+        self.assertIsNone(rows)
+        self.assertEqual(listed, ())
+        self.assertTrue(any("no cached connections are available" in note for note in notes))
 
     def test_sync_opencode_cli_backfills_visible_rows_when_target_is_omitted(self) -> None:
         rows = [
@@ -878,6 +1198,111 @@ class CliMainCommandTests(unittest.TestCase):
         self.assertEqual(len(targets), 1)
         self.assertEqual(targets[0].app_name, "vllm-qwen3")
         self.assertEqual(targets[0].base_url, "https://alice--vllm-qwen3-serve.modal.run/v1")
+
+
+class CliMainAaiAuthCommandTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.runner = CliRunner()
+
+    def test_login_stores_validated_key(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            key_path = Path(temporary_directory) / "aa.json"
+            with (
+                patch(
+                    "llm_launchpad.core.artificial_analysis_auth.AAI_AUTH_PATH",
+                    key_path,
+                ),
+                patch(
+                    "llm_launchpad.core.quick_deploy_refresh.get_artificial_analysis_auth_status",
+                    return_value=ArtificialAnalysisAuthStatus(authenticated=True, tier="pro"),
+                ),
+            ):
+                result = self.runner.invoke(cli_main.app, ["aai-auth", "login", "secret-key"])
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn("Authenticated (pro tier)", result.output)
+            self.assertTrue(key_path.exists())
+
+    def test_login_rejects_invalid_key_without_storing(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            key_path = Path(temporary_directory) / "aa.json"
+            with (
+                patch(
+                    "llm_launchpad.core.artificial_analysis_auth.AAI_AUTH_PATH",
+                    key_path,
+                ),
+                patch(
+                    "llm_launchpad.core.quick_deploy_refresh.get_artificial_analysis_auth_status",
+                    return_value=ArtificialAnalysisAuthStatus(
+                        authenticated=False,
+                        error="Invalid Artificial Analysis API key",
+                    ),
+                ),
+            ):
+                result = self.runner.invoke(cli_main.app, ["aai-auth", "login", "bad-key"])
+
+            self.assertEqual(result.exit_code, 1)
+            self.assertIn("Invalid Artificial Analysis API key", result.output)
+            self.assertFalse(key_path.exists())
+
+    def test_status_reports_stored_key_source_and_tier(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            key_path = Path(temporary_directory) / "aa.json"
+            save_artificial_analysis_api_key("secret-key", path=key_path)
+            with (
+                patch.dict("os.environ", {}, clear=True),
+                patch(
+                    "llm_launchpad.core.artificial_analysis_auth.AAI_AUTH_PATH",
+                    key_path,
+                ),
+                patch(
+                    "llm_launchpad.core.quick_deploy_refresh.get_artificial_analysis_auth_status",
+                    return_value=ArtificialAnalysisAuthStatus(authenticated=True, tier="free"),
+                ),
+            ):
+                result = self.runner.invoke(cli_main.app, ["aai-auth", "status"])
+
+        self.assertEqual(result.exit_code, 0)
+        self.assertIn("AAI API key source: stored. Authenticated (free tier).", result.output)
+
+    def test_status_reports_missing_key(self) -> None:
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch(
+                "llm_launchpad.core.artificial_analysis_auth.load_saved_artificial_analysis_api_key",
+                return_value="",
+            ),
+        ):
+            result = self.runner.invoke(cli_main.app, ["aai-auth", "status"])
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("llm-launchpad aai-auth login", result.output)
+
+    def test_clear_removes_stored_key(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            key_path = Path(temporary_directory) / "aa.json"
+            save_artificial_analysis_api_key("secret-key", path=key_path)
+            with patch(
+                "llm_launchpad.core.artificial_analysis_auth.AAI_AUTH_PATH",
+                key_path,
+            ):
+                result = self.runner.invoke(cli_main.app, ["aai-auth", "clear"])
+
+            self.assertEqual(result.exit_code, 0)
+            self.assertIn("removed", result.output)
+            self.assertFalse(key_path.exists())
+
+    def test_clear_without_stored_key_fails(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            key_path = Path(temporary_directory) / "aa.json"
+            with patch(
+                "llm_launchpad.core.artificial_analysis_auth.AAI_AUTH_PATH",
+                key_path,
+            ):
+                result = self.runner.invoke(cli_main.app, ["aai-auth", "clear"])
+
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("No stored Artificial Analysis API key to remove.", result.output)
 
 
 if __name__ == "__main__":

@@ -7,6 +7,7 @@ from llm_launchpad.core.inference_options import (
     ModalInferenceAdapter,
     PrimeInferenceAdapter,
     estimate_monthly_compute_cost,
+    recommended_vllm_tool_call_parser,
     resolve_inference_plans,
 )
 from llm_launchpad.core.provider_options import prime_provider_options
@@ -72,6 +73,24 @@ class _FakePrimeBackend:
 
 
 class InferenceRecipeTests(unittest.TestCase):
+    def test_recommends_only_known_qwen_tool_parsers(self) -> None:
+        self.assertEqual(
+            recommended_vllm_tool_call_parser("Qwen/Qwen3-0.6B"),
+            "hermes",
+        )
+        self.assertEqual(
+            recommended_vllm_tool_call_parser(
+                "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+            ),
+            "qwen3_xml",
+        )
+        self.assertIsNone(
+            recommended_vllm_tool_call_parser("Qwen/Qwen3-VL-8B-Instruct")
+        )
+        self.assertIsNone(
+            recommended_vllm_tool_call_parser("meta-llama/Llama-3.1-8B-Instruct")
+        )
+
     def test_quick_deploy_separates_one_recipe_from_multiple_modal_quotes(self) -> None:
         profiles = (
             _profile("example-cheap", gpu_type="L40S", price=1.5),

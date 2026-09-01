@@ -18,11 +18,13 @@ class FormField(Vertical):
     }
     FormField .form-label {
         color: #c8d6c9;
-        height: 1;
+        height: auto;
+        text-wrap: wrap;
     }
     FormField .form-hint {
         color: #7f9082;
-        height: 1;
+        height: auto;
+        text-wrap: wrap;
     }
     """
 
@@ -73,7 +75,8 @@ class ToggleField(Vertical):
     }
     ToggleField .form-label {
         color: #c8d6c9;
-        height: 1;
+        height: auto;
+        text-wrap: wrap;
     }
     """
 

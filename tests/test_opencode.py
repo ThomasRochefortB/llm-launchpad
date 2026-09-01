@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from llm_launchpad.core import opencode
 from llm_launchpad.protocol.models import DeploymentConfig
-from llm_launchpad.protocol.enums import BackendType
+from llm_launchpad.protocol.enums import BackendType, ComputeProvider
 from llm_launchpad.protocol.models import EndpointInfo
 
 
@@ -20,6 +20,9 @@ def _connection(
     model_id: str = "Qwen3-4B",
     display_name: str = "Qwen3-4B",
     backend: BackendType = BackendType.VLLM,
+    provider: ComputeProvider = ComputeProvider.MODAL,
+    context_limit: int | None = None,
+    output_limit: int | None = None,
 ) -> opencode.OpenCodeConnection:
     return opencode.OpenCodeConnection(
         app_name=app_name,
@@ -30,15 +33,24 @@ def _connection(
         model_id=model_id,
         display_name=display_name,
         backend=backend,
+        provider=provider,
+        context_limit=context_limit,
+        output_limit=output_limit,
     )
 
 
 def _provider_payload(connection: opencode.OpenCodeConnection) -> dict[str, object]:
+    model: dict[str, object] = {"name": connection.display_name}
+    if connection.context_limit is not None and connection.output_limit is not None:
+        model["limit"] = {
+            "context": connection.context_limit,
+            "output": connection.output_limit,
+        }
     return {
         "npm": "@ai-sdk/openai-compatible",
         "name": connection.provider_name,
         "options": {"baseURL": connection.base_url},
-        "models": {connection.model_id: {"name": connection.display_name}},
+        "models": {connection.model_id: model},
     }
 
 
@@ -48,12 +60,14 @@ def _endpoint(
     state: str,
     backend: BackendType = BackendType.VLLM,
     instance_name: str | None = None,
+    provider: ComputeProvider = ComputeProvider.MODAL,
 ) -> EndpointInfo:
     return EndpointInfo(
         name=name,
         state=state,
         backend=backend,
         instance_name=instance_name or name.removeprefix(f"{backend.value}-"),
+        provider=provider,
     )
 
 
@@ -159,6 +173,67 @@ class OpenCodeSyncTests(unittest.TestCase):
 
         self.assertEqual(payload["display_name"], "GLM-4.7-Flash-GGUF (Q4_K_M)")
 
+    def test_build_connection_from_config_advertises_effective_llamacpp_limits(self) -> None:
+        config = DeploymentConfig(
+            backend=BackendType.LLAMACPP,
+            app_name="llamacpp-qwen",
+            instance_name="qwen",
+            repo_id="unsloth/Qwen3.8-Flash-Next-GGUF",
+            quant="UD-Q2_K_XL",
+            server_args="--ctx-size 131072 --parallel 1",
+            max_context_tokens=262144,
+        )
+
+        connection = opencode.build_connection_from_config(
+            config,
+            "https://example.com",
+        )
+
+        self.assertIsNotNone(connection)
+        assert connection is not None
+        self.assertEqual(connection.context_limit, 131072)
+        self.assertEqual(connection.output_limit, 32768)
+        self.assertEqual(
+            opencode._provider_payload(connection)["models"][connection.model_id]["limit"],
+            {"context": 131072, "output": 32768},
+        )
+
+    def test_build_connection_uses_smaller_runtime_window_and_output_reserve(self) -> None:
+        config = DeploymentConfig(
+            backend=BackendType.LLAMACPP,
+            app_name="llamacpp-kimi",
+            repo_id="unsloth/Kimi-K2.5-GGUF",
+            quant="UD-Q4_K_XL",
+            server_args="--ctx-size=98304",
+            max_context_tokens=262144,
+        )
+
+        connection = opencode.build_connection_from_config(
+            config,
+            "https://example.com/v1",
+        )
+
+        self.assertIsNotNone(connection)
+        assert connection is not None
+        self.assertEqual(connection.context_limit, 98304)
+        self.assertEqual(connection.output_limit, 24576)
+
+    def test_sync_persists_model_limits_in_opencode_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "opencode.json"
+            target = _connection(context_limit=262144, output_limit=32768)
+            with self._patched_paths(tmp)[0], self._patched_paths(tmp)[1], self._patched_paths(tmp)[2], patch(
+                "llm_launchpad.core.opencode.shutil.which", return_value="/usr/bin/opencode"
+            ):
+                opencode.sync_opencode_config(target=target)
+
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+            model = payload["provider"][target.provider_id]["models"][target.model_id]
+            self.assertEqual(
+                model["limit"],
+                {"context": 262144, "output": 32768},
+            )
+
     def test_build_connection_from_endpoint_strips_hf_owner_from_vllm_display_name(self) -> None:
         row = EndpointInfo(
             name="vllm-glm",
@@ -243,6 +318,71 @@ class OpenCodeSyncTests(unittest.TestCase):
             self.assertEqual(set(result.removed_provider_ids), {stopped.provider_id, missing.provider_id})
             self.assertEqual(payload["provider"], {"custom-provider": {"name": "keep"}})
             self.assertEqual(registry["entries"], {})
+            self.assertTrue(
+                any("Modal deployment list" in line for line in result.messages)
+            )
+
+    def test_sync_does_not_prune_other_compute_providers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "opencode.json"
+            registry_path = Path(tmp) / "opencode_registry.json"
+            modal_missing = _connection(app_name="vllm-missing", instance_name="missing")
+            prime_live = _connection(
+                app_name="llp-prime-llamacpp-qwen",
+                instance_name="qwen",
+                backend=BackendType.LLAMACPP,
+                provider=ComputeProvider.PRIME,
+                base_url="https://example.tunnel.pinfra.io/v1",
+                model_id="Qwen-GGUF",
+                display_name="Qwen GGUF",
+            )
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "$schema": opencode.OPENCODE_SCHEMA_URL,
+                        "provider": {
+                            modal_missing.provider_id: _provider_payload(modal_missing),
+                            prime_live.provider_id: _provider_payload(prime_live),
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            registry_path.write_text(
+                json.dumps(
+                    {
+                        "entries": {
+                            modal_missing.app_name: {
+                                "provider_id": modal_missing.provider_id,
+                                "provider": "modal",
+                            },
+                            prime_live.app_name: {
+                                "provider_id": prime_live.provider_id,
+                                "provider": "prime",
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self._patched_paths(tmp)[0], self._patched_paths(tmp)[1], self._patched_paths(tmp)[2], patch(
+                "llm_launchpad.core.opencode.shutil.which", return_value="/usr/bin/opencode"
+            ):
+                result = opencode.sync_opencode_config(
+                    current_rows=[],
+                    prune_providers=(ComputeProvider.MODAL,),
+                )
+
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+            registry = json.loads(registry_path.read_text(encoding="utf-8"))
+            self.assertEqual(result.removed_provider_ids, [modal_missing.provider_id])
+            self.assertNotIn(modal_missing.provider_id, payload["provider"])
+            self.assertIn(prime_live.provider_id, payload["provider"])
+            self.assertIn(prime_live.app_name, registry["entries"])
+            self.assertTrue(
+                any("Modal deployment list" in line for line in result.messages)
+            )
 
     def test_sync_retains_failed_and_deploying_entries(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -376,7 +516,9 @@ class OpenCodeSyncTests(unittest.TestCase):
         adopted = opencode._bootstrap_registry_from_config(payload)
 
         self.assertEqual(adopted["vllm-qwen3"]["instance_name"], "vllm-qwen3")
+        self.assertEqual(adopted["vllm-qwen3"]["provider"], "modal")
         self.assertEqual(adopted["llamacpp-phi"]["instance_name"], "phi")
+        self.assertEqual(adopted["llamacpp-phi"]["provider"], "modal")
 
     def test_sync_migrates_legacy_launchpad_provider_names_to_flat_name(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

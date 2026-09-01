@@ -8,19 +8,22 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
+from dataclasses import replace
+import time
 from typing import Any, Literal
 
+from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Center, Horizontal, Vertical
+from textual.containers import Center, Horizontal, Vertical, VerticalScroll
 from textual.message import Message
+from textual.timer import Timer
 from textual.widgets import Footer, OptionList, Static
 from textual.widgets.option_list import Option
 
 from ...core.backend import ModalBackend
 from ...core.hf_auth import HuggingFaceAuthStatus, get_huggingface_auth_status
 from ...core.modal_auth import ModalAuthStatus, get_modal_auth_status
-from ...core.inference_options import PrimeInferenceAdapter
 from ...core.prime_auth import PrimeAuthStatus, get_prime_auth_status
 from ...core.prime_backend import PrimeBackend
 from ...core.naming import default_llamacpp_served_model_name, default_served_model_name
@@ -28,13 +31,6 @@ from ...core.quick_deploy import (
     QuickDeployCatalogInfo,
     QuickDeployProfile,
     activate_quick_deploy_catalog,
-    format_context_length,
-    format_hourly_cost,
-    get_quick_deploy_catalog_info,
-    list_quick_deploy_profiles,
-    quick_deploy_profile_for_plan,
-    quick_deploy_model_label_parts,
-    resolve_quick_deploy_plans,
 )
 from ...core.quick_deploy_refresh import (
     ArtificialAnalysisAuthStatus,
@@ -46,8 +42,9 @@ from ...core.storage_costs import (
     estimate_monthly_storage_cost,
 )
 from ...protocol.enums import BackendType, ComputeProvider
-from ...protocol.models import EndpointInfo, InferencePlan, StorageSnapshot
-from ..workers import StorageFailed, StorageLoaded
+from ...protocol.models import EndpointInfo, StorageSnapshot
+from ..workers import EndpointsFailed, EndpointsLoaded, StorageFailed, StorageLoaded
+from ..responsive import ViewportProfile
 from .copy_enabled import CopyEnabledScreen
 
 BANNER = r"""[bold #7bf168]
@@ -60,59 +57,6 @@ _     _     __  __
 [/]"""
 
 PANEL_SEPARATOR = "[dim]----------------------------------------[/dim]"
-
-
-class _LauncherOptionList(OptionList):
-    """OptionList with cross-panel arrow navigation at list boundaries."""
-
-    def __init__(
-        self,
-        *content: Option | None,
-        handoff_up_target: str | None = None,
-        handoff_down_target: str | None = None,
-        **kwargs: object,
-    ) -> None:
-        self._handoff_up_target = handoff_up_target
-        self._handoff_down_target = handoff_down_target
-        super().__init__(*content, **kwargs)
-
-    def _has_enabled_neighbor(self, direction: Literal[-1, 1]) -> bool:
-        highlighted = self.highlighted
-        if highlighted is None:
-            return False
-        if direction == -1:
-            indexes = range(highlighted - 1, -1, -1)
-        else:
-            indexes = range(highlighted + 1, self.option_count)
-        return any(not self.get_option_at_index(index).disabled for index in indexes)
-
-    def _handoff_focus(self, target_id: str | None, position: Literal["first", "last"]) -> bool:
-        if not target_id:
-            return False
-        try:
-            target = self.screen.query_one(f"#{target_id}", OptionList)
-        except Exception:
-            return False
-        if target.option_count <= 0:
-            return False
-        if position == "first":
-            target.action_first()
-        else:
-            target.action_last()
-        target.focus()
-        return True
-
-    def action_cursor_up(self) -> None:
-        if self.highlighted is not None and not self._has_enabled_neighbor(-1):
-            if self._handoff_focus(self._handoff_up_target, "last"):
-                return
-        super().action_cursor_up()
-
-    def action_cursor_down(self) -> None:
-        if self.highlighted is not None and not self._has_enabled_neighbor(1):
-            if self._handoff_focus(self._handoff_down_target, "first"):
-                return
-        super().action_cursor_down()
 
 
 class DeploymentsLoaded(Message):
@@ -196,24 +140,8 @@ class PrimeAuthLoaded(Message):
         self.status = status
 
 
-class PrimeInferencePlansLoaded(Message):
-    """Live Prime inference options were resolved for popular models."""
-
-    def __init__(self, plans: tuple[InferencePlan, ...]) -> None:
-        super().__init__()
-        self.plans = plans
-
-
-class PrimeInferencePlansLoadFailed(Message):
-    """Live Prime inference option lookup failed."""
-
-    def __init__(self, error: str) -> None:
-        super().__init__()
-        self.error = error
-
-
 class QuickDeployCatalogLoaded(Message):
-    """A refreshed Recommended Models catalog was loaded."""
+    """A refreshed Deploy catalog was loaded."""
 
     def __init__(
         self,
@@ -226,7 +154,7 @@ class QuickDeployCatalogLoaded(Message):
 
 
 class QuickDeployCatalogLoadFailed(Message):
-    """The live Recommended Models refresh failed; keep the bundled catalog."""
+    """The live Deploy catalog refresh failed; keep the bundled catalog."""
 
     def __init__(self, error: str) -> None:
         super().__init__()
@@ -294,7 +222,7 @@ def _render_artificial_analysis_auth_status(
         return f"[{color}]◈ Artificial Analysis auth check failed: {detail}[/{color}]"
     return (
         "[yellow]◈ Artificial Analysis not authenticated "
-        "(set: ARTIFICIAL_ANALYSIS_API_KEY)[/yellow]"
+        "(run: llm-launchpad aai-auth login)[/yellow]"
     )
 
 
@@ -864,421 +792,22 @@ def _render_provider_billing_body(
     return f"{modal_section}\n\n{prime_section}"
 
 
-def _quick_deploy_options(
-    profiles: list[QuickDeployProfile],
-    plans: tuple[InferencePlan, ...] | None = None,
-) -> list[Option | None]:
-    if plans is not None:
-        return _resolved_quick_deploy_options(profiles, plans)
-
-    grouped = _has_tiered_quick_deploy_groups(profiles)
-    if not grouped:
-        return [
-            Option(
-                _render_quick_deploy_option(profile),
-                id=profile.id,
-            )
-            for profile in profiles
-        ]
-
-    options: list[Option | None] = []
-    groups = _quick_deploy_profile_groups(profiles)
-    for group_index, group in enumerate(groups):
-        if group_index > 0:
-            options.append(None)
-        options.extend(
-            Option(
-                _render_quick_deploy_tier_row(
-                    profile,
-                    show_header=index == 0,
-                ),
-                id=profile.id,
-            )
-            for index, profile in enumerate(group)
-        )
-    return options
-
-
-def _resolved_quick_deploy_options(
-    profiles: list[QuickDeployProfile],
-    plans: tuple[InferencePlan, ...],
-) -> list[Option | None]:
-    """Render one selectable row per provider quote, grouped by model."""
-
-    rows: list[tuple[QuickDeployProfile, InferencePlan]] = []
-    for plan in plans:
-        try:
-            profile = quick_deploy_profile_for_plan(plan, profiles)
-        except KeyError:
-            continue
-        rows.append((profile, plan))
-    if not rows:
-        return []
-
-    group_by_key: dict[str, list[tuple[QuickDeployProfile, InferencePlan]]] = {}
-    group_order: list[str] = []
-    for profile, plan in rows:
-        key = _quick_deploy_group_key(profile)
-        if key not in group_by_key:
-            group_by_key[key] = []
-            group_order.append(key)
-        group_by_key[key].append((profile, plan))
-
-    groups = [group_by_key[key] for key in group_order]
-    for group in groups:
-        group.sort(key=_resolved_quick_deploy_sort_key)
-    groups = [
-        group
-        for _index, group in sorted(
-            enumerate(groups),
-            key=lambda item: _quick_deploy_group_sort_key(
-                item[0],
-                [profile for profile, _plan in item[1]],
-            ),
-        )
-    ]
-
-    show_rows = any(len(group) > 1 for group in groups)
-    options: list[Option | None] = []
-    for group_index, group in enumerate(groups):
-        if group_index > 0 and show_rows:
-            options.append(None)
-        for row_index, (profile, plan) in enumerate(group):
-            prompt = (
-                _render_quick_deploy_tier_row(
-                    profile,
-                    show_header=row_index == 0,
-                    plan=plan,
-                )
-                if show_rows
-                else _render_quick_deploy_option(profile, plan)
-            )
-            options.append(Option(prompt, id=plan.quote.id))
-    return options
-
-
-def _resolved_quick_deploy_sort_key(
-    row: tuple[QuickDeployProfile, InferencePlan],
-) -> tuple[int, int, float, str, str]:
-    profile, plan = row
-    monthly = plan.estimated_monthly_cost_usd
-    return (
-        _quick_deploy_quant_order(profile.quant),
-        1 if monthly is None else 0,
-        monthly if monthly is not None else float("inf"),
-        plan.quote.provider.value,
-        plan.quote.id,
-    )
-
-
-def _has_tiered_quick_deploy_groups(profiles: list[QuickDeployProfile]) -> bool:
-    counts = Counter(_quick_deploy_group_key(profile) for profile in profiles)
-    return any(count > 1 for count in counts.values())
-
-
-def _quick_deploy_profile_groups(profiles: list[QuickDeployProfile]) -> list[list[QuickDeployProfile]]:
-    groups: list[list[QuickDeployProfile]] = []
-    group_by_key: dict[str, list[QuickDeployProfile]] = {}
-    for profile in profiles:
-        key = _quick_deploy_group_key(profile)
-        if key not in group_by_key:
-            group_by_key[key] = []
-            groups.append(group_by_key[key])
-        group_by_key[key].append(profile)
-    for group in groups:
-        group.sort(key=_quick_deploy_profile_sort_key)
-    groups = [
-        group
-        for _index, group in sorted(
-            enumerate(groups),
-            key=lambda index_group: _quick_deploy_group_sort_key(index_group[0], index_group[1]),
-        )
-    ]
-    return groups
-
-
-def _quick_deploy_group_key(profile: QuickDeployProfile) -> str:
-    label, _quant_suffix = quick_deploy_model_label_parts(profile)
-    return label.casefold()
-
-
-def _quick_deploy_group_sort_key(
-    index: int,
-    group: list[QuickDeployProfile],
-) -> tuple[int, int, float, int]:
-    size_order = min(
-        (_quick_deploy_size_order(profile.model_size_label) for profile in group),
-        default=3,
-    )
-    score = max(
-        (profile.aa_coding_score for profile in group if profile.aa_coding_score is not None),
-        default=None,
-    )
-    if score is None:
-        return (size_order, 1, 0.0, index)
-    return (size_order, 0, -score, index)
-
-
-def _quick_deploy_size_order(label: str | None) -> int:
-    normalized = (label or "").strip().casefold()
-    if normalized.startswith("compact"):
-        return 0
-    if normalized.startswith("medium"):
-        return 1
-    if normalized.startswith("large"):
-        return 2
-    return 3
-
-
-def _quick_deploy_profile_sort_key(profile: QuickDeployProfile) -> tuple[int, int, float, str]:
-    return (
-        _quick_deploy_quant_order(profile.quant),
-        _quick_deploy_tier_order(profile.resource_tier),
-        profile.approx_cost_per_hour_usd,
-        profile.id,
-    )
-
-
-def _quick_deploy_quant_order(quant: str) -> int:
-    compact = _compact_quant_label(quant).casefold()
-    if compact.startswith("q2"):
-        return 0
-    if compact.startswith("q3"):
-        return 1
-    if compact.startswith("q4"):
-        return 2
-    return 3
-
-
-def _quick_deploy_tier_order(resource_tier: str | None) -> int:
-    tier = (resource_tier or "").strip().casefold()
-    if tier == "cheap":
-        return 0
-    if tier == "rtx-pro":
-        return 1
-    if tier == "b200":
-        return 2
-    return 3
-
-
-def _render_quick_deploy_option(
-    profile: QuickDeployProfile,
-    plan: InferencePlan | None = None,
-) -> str:
-    label, quant_suffix = quick_deploy_model_label_parts(profile)
-    model = _escape_markup(_clip(label, 18))
-    quant = _compact_quant_label(quant_suffix or profile.quant)
-    quant_markup = f" [dim]{_escape_markup(quant)}[/dim]" if quant else ""
-    tier_markup = _quick_deploy_plan_tier_markup(profile, plan)
-    gpu_shape = _escape_markup(_compact_plan_gpu_shape(profile, plan))
-    cost = _compact_plan_cost(profile, plan)
-    provider = f" · {plan.quote.provider.display_name}" if plan else ""
-    return (
-        f"  [bold]{model}[/bold]{quant_markup} {tier_markup}  "
-        f"[dim]{gpu_shape} · "
-        f"{_escape_markup(format_context_length(profile.max_context_tokens))} · "
-        f"{_escape_markup(cost)}{_escape_markup(provider)}[/dim]"
-    )
-
-
-def _render_quick_deploy_tier_row(
-    profile: QuickDeployProfile,
-    *,
-    show_header: bool = False,
-    plan: InferencePlan | None = None,
-) -> str:
-    tier_markup = _quick_deploy_plan_tier_markup(profile, plan)
-    gpu_shape = _escape_markup(_compact_plan_gpu_shape(profile, plan))
-    quant_markup = _quick_deploy_quant_markup(profile)
-    cost = _compact_plan_cost(profile, plan)
-    provider = f" · {plan.quote.provider.display_name}" if plan else ""
-    row = (
-        f"    {quant_markup} {tier_markup}  "
-        f"[dim]{gpu_shape} · {_escape_markup(cost)}"
-        f"{_escape_markup(provider)}[/dim]"
-    )
-    if not show_header:
-        return row
-
-    label, _quant_suffix = quick_deploy_model_label_parts(profile)
-    model = _escape_markup(_clip(label, 18))
-    header = f"  [bold]{model}[/bold] [dim]{_escape_markup(_quick_deploy_header_metrics(profile))}[/dim]"
-    return f"{header}\n{row}"
-
-
-def _quick_deploy_header_metrics(profile: QuickDeployProfile) -> str:
-    metrics = [format_context_length(profile.max_context_tokens)]
-    if profile.aa_coding_score is not None:
-        metrics.append(f"AA {_format_coding_index(profile.aa_coding_score)}")
-    if profile.model_size_label:
-        metrics.append(profile.model_size_label)
-    return " · ".join(metrics)
-
-
-def _format_coding_index(value: float) -> str:
-    return f"{value:.1f}".rstrip("0").rstrip(".")
-
-
-def _compact_quant_label(value: str) -> str:
-    cleaned = value.strip().strip("()")
-    if not cleaned:
-        return ""
-    return (
-        cleaned.replace("UD-", "")
-        .replace("_K_XL", "XL")
-        .replace("_K_M", "M")
-        .replace("_K_S", "S")
-        .replace("_", "")
-        .replace("-", "")
-    )
-
-
-def _compact_gpu_shape(profile: QuickDeployProfile) -> str:
-    gpu = profile.gpu_type.strip()
-    compact = {
-        "A100-80GB": "A100",
-        "A100-40GB": "A100-40",
-        "RTX-PRO-6000": "RTX6000",
-    }.get(gpu, gpu.replace("-80GB", ""))
-    return f"{compact}x{profile.gpu_count}"
-
-
-def _compact_plan_gpu_shape(
-    profile: QuickDeployProfile,
-    plan: InferencePlan | None,
-) -> str:
-    if plan is None:
-        return _compact_gpu_shape(profile)
-    gpu = plan.quote.gpu_type.strip()
-    compact = {
-        "A100-80GB": "A100",
-        "A100-40GB": "A100-40",
-        "RTX-PRO-6000": "RTX6000",
-    }.get(gpu, gpu.replace("-80GB", ""))
-    return f"{compact}x{plan.quote.gpu_count}"
-
-
-def _compact_hourly_cost(value: float) -> str:
-    return format_hourly_cost(value).replace("/hr", "/h")
-
-
-def _compact_plan_cost(
-    profile: QuickDeployProfile,
-    plan: InferencePlan | None,
-) -> str:
-    value = (
-        plan.quote.price_per_hour_usd
-        if plan is not None and plan.quote.price_per_hour_usd is not None
-        else profile.approx_cost_per_hour_usd
-    )
-    hourly = _compact_hourly_cost(value)
-    if plan is None or plan.estimated_monthly_cost_usd is None:
-        return hourly
-    return f"{hourly} · ~${plan.estimated_monthly_cost_usd:,.0f}/mo"
-
-
-def _quick_deploy_plan_tier_markup(
-    profile: QuickDeployProfile,
-    plan: InferencePlan | None,
-) -> str:
-    if plan is not None and plan.quote.configuration_id is None:
-        return "[#7bf168]live[/]" if not plan.quote.is_estimate else "[dim]estimate[/dim]"
-    return _quick_deploy_tier_markup(profile)
-
-
-def _quick_deploy_tier_markup(profile: QuickDeployProfile) -> str:
-    label = (profile.resource_tier_label or "").strip()
-    if label and label != _default_resource_tier_label(profile.resource_tier):
-        return _quick_deploy_tier_label_markup(label)
-
-    tier = (profile.resource_tier or "").strip().casefold()
-    if tier == "cheap":
-        return "[dim]$[/dim]"
-    if tier == "rtx-pro":
-        return "[#7bf168]$$[/]"
-    if tier == "b200":
-        return "[yellow]$$$[/yellow]"
-    label = (profile.resource_tier_label or profile.profile_label or "").strip()
-    return f"[dim]{_escape_markup(label.casefold())}[/dim]" if label else ""
-
-
-def _default_resource_tier_label(resource_tier: str | None) -> str:
-    tier = (resource_tier or "").strip().casefold()
-    if tier == "cheap":
-        return "$"
-    if tier == "rtx-pro":
-        return "$$"
-    if tier == "b200":
-        return "$$$"
-    return ""
-
-
-def _quick_deploy_tier_label_markup(label: str) -> str:
-    pieces: list[str] = []
-    for piece in label.split("/"):
-        token = piece.strip()
-        if not token:
-            continue
-        if pieces:
-            pieces.append("[dim]/[/dim]")
-        pieces.append(_quick_deploy_tier_token_markup(token))
-    return "".join(pieces) if pieces else f"[dim]{_escape_markup(label)}[/dim]"
-
-
-def _quick_deploy_tier_token_markup(token: str) -> str:
-    if token == "$":
-        return "[dim]$[/dim]"
-    if token == "$$":
-        return "[#7bf168]$$[/]"
-    if token == "$$$":
-        return "[yellow]$$$[/yellow]"
-    return f"[dim]{_escape_markup(token)}[/dim]"
-
-
-def _quick_deploy_quant_markup(profile: QuickDeployProfile) -> str:
-    quant = _compact_quant_label(profile.quant)
-    if not quant:
-        return ""
-    if quant.casefold().startswith("q2"):
-        return f"[bold #7bf168]{_escape_markup(quant)}[/]"
-    return f"[dim]{_escape_markup(quant)}[/dim]"
-
-
-def _quick_deploy_subtitle(info: QuickDeployCatalogInfo) -> str:
-    if info.is_fallback:
-        return "Choose an inference option · curated coding models"
-    generated = (info.generated_at or "").strip()
-    if generated:
-        generated = generated.split("T", 1)[0]
-    if generated:
-        catalog_origin = "live" if info.is_live else "bundled"
-        if info.source_label.casefold().startswith("artificial analysis"):
-            benchmark_state = (
-                "cached benchmarks"
-                if "(cached" in info.source_label.casefold()
-                else "fresh benchmarks"
-            )
-            source = (
-                f"AA size leaders ({benchmark_state}), "
-                f"{catalog_origin} {generated}"
-            )
-        else:
-            source = f"{info.source_label}, {catalog_origin} {generated}"
-        return f"Choose an inference option · {source}"
-    return f"Choose an inference option · {info.source_label}"
-
-
 class MainMenuScreen(CopyEnabledScreen):
-    """Top-level menu: deploy, manage, settings."""
+    """Top-level menu: deploy a model, custom deploy, manage, storage, settings."""
 
     BINDINGS = [
         Binding("d", "select_deploy", "Deploy", show=True),
+        Binding("c", "select_custom_deploy", "Custom", show=True),
         Binding("m", "select_manage", "Manage", show=True),
         Binding("t", "select_storage", "Storage", show=True),
         Binding("s", "select_settings", "Settings", show=True),
-        Binding("tab", "focus_next_launcher", show=False),
-        Binding("shift+tab", "focus_previous_launcher", show=False),
+        Binding("i", "toggle_details", "Details", show=True),
+        Binding("escape", "close_details", show=False),
     ]
+    _ENDPOINT_REFRESH_INTERVAL_SECONDS = 20.0
+    _BILLING_REFRESH_INTERVAL_SECONDS = 300.0
+    _SECONDARY_REFRESH_DELAY_SECONDS = 0.5
+    _RUNTIME_STATUS_CACHE_TTL_SECONDS = 20.0
 
     def __init__(self, username: str = "", version: str = "") -> None:
         super().__init__()
@@ -1292,7 +821,6 @@ class MainMenuScreen(CopyEnabledScreen):
         self._aai_auth_refresh_inflight = False
         self._modal_auth_refresh_inflight = False
         self._prime_auth_refresh_inflight = False
-        self._prime_inference_refresh_inflight = False
         self._quick_deploy_catalog_refresh_inflight = False
         self._status_refresh_inflight = False
         self._billing_refresh_inflight = False
@@ -1303,62 +831,56 @@ class MainMenuScreen(CopyEnabledScreen):
         self._prime_billing_payload: Any | None = None
         self._prime_billing_error: str | None = None
         self._storage_snapshot: StorageSnapshot | None = None
-        self._quick_deploy_profiles = list_quick_deploy_profiles()
-        self._modal_quick_deploy_plans = resolve_quick_deploy_plans(
-            self._quick_deploy_profiles
-        )
-        self._quick_deploy_plans = self._modal_quick_deploy_plans
-        self._quick_deploy_catalog_info = get_quick_deploy_catalog_info()
+        self._was_suspended = False
+        self._secondary_refresh_started = False
+        self._last_billing_refresh_at = 0.0
+        self._endpoint_refresh_timer: Timer | None = None
+        self._billing_refresh_timer: Timer | None = None
+        self._secondary_refresh_timer: Timer | None = None
+        self._runtime_rows: list[EndpointInfo] = []
+        self._runtime_rows_fingerprint: tuple[tuple[object, ...], ...] = ()
+        self._runtime_rows_cached_at = 0.0
 
     def compose(self) -> ComposeResult:
-        with Center():
-            with Horizontal(id="main-menu-layout"):
-                with Vertical(id="menu-container"):
-                    yield Static(BANNER, id="banner-text")
-                    version_text = f"v{self.version}  " if self.version else ""
-                    yield Static(
-                        f"[bold]{version_text}[/bold][dim]Modal + Prime LLM backends[/dim]",
-                        classes="centered",
-                    )
-                    yield Static("")  # spacer
-                    yield _LauncherOptionList(
-                        Option("  Deploy            Launch a new LLM backend", id="deploy"),
-                        Option("  Manage            List, status, logs, stop", id="manage"),
-                        Option("  Storage           Cached models and pre-download", id="storage"),
-                        Option("  Settings          Scaledown defaults", id="settings"),
-                        id="action-list",
-                        handoff_up_target="quick-deploy-list",
-                        handoff_down_target="quick-deploy-list",
-                    )
-                with Vertical(id="main-menu-side-column"):
-                    with Vertical(id="deployment-status-panel"):
-                        yield Static("[bold #7bf168]Deployment Status[/]", id="deployment-status-title")
-                        yield Static("[dim]Refreshing deployment status...[/dim]", id="deployment-status-body")
-                    with Vertical(id="billing-report-panel"):
-                        yield Static("[bold #7bf168]Provider Billing[/]", id="billing-report-title")
-                        yield Static("[dim]Refreshing billing report...[/dim]", id="billing-report-body")
-                    with Vertical(id="quick-deploy-panel"):
+        with Vertical(id="main-menu-root"):
+            with Center(id="main-menu-center"):
+                with Horizontal(id="main-menu-layout"):
+                    with VerticalScroll(id="main-menu-primary"):
+                        yield Static(BANNER, id="banner-text")
+                        version_text = f"v{self.version}  " if self.version else ""
                         yield Static(
-                            "[bold #7bf168]Recommended Models[/]",
-                            id="landing-quick-deploy-title",
+                            "[bold]LLM Launchpad[/bold]\n"
+                            f"[dim]{version_text}Deploy and manage inference endpoints[/dim]",
+                            id="compact-menu-header",
                         )
                         yield Static(
-                            _quick_deploy_subtitle(self._quick_deploy_catalog_info),
-                            id="landing-quick-deploy-subtitle",
+                            f"[bold]{version_text}[/bold][dim]Modal + Prime LLM backends[/dim]",
+                            classes="centered main-menu-version",
                         )
-                        yield _LauncherOptionList(
-                            *_quick_deploy_options(
-                                self._quick_deploy_profiles,
-                                self._quick_deploy_plans,
-                            ),
-                            id="quick-deploy-list",
-                            handoff_up_target="action-list",
-                            handoff_down_target="action-list",
+                        yield Static("", classes="decorative-spacer")
+                        yield OptionList(
+                            Option("  Deploy            Pick a model and live placement", id="deploy"),
+                            Option("  Custom deploy     llama.cpp or vLLM expert form", id="custom-deploy"),
+                            Option("  Manage            List, status, logs, stop", id="manage"),
+                            Option("  Storage           Cached models and pre-download", id="storage"),
+                            Option("  Settings          Scaledown defaults", id="settings"),
+                            id="action-list",
                         )
-        yield Static(
-            _render_auth_status_block(username=self.username),
-            id="auth-status-block",
-        )
+                        yield Static(
+                            "[dim]↑/↓ select · enter open · i details[/dim]",
+                            id="compact-menu-help",
+                        )
+                    with Vertical(id="main-menu-side-column"):
+                        with Vertical(id="deployment-status-panel"):
+                            yield Static("[bold #7bf168]Deployment Status[/]", id="deployment-status-title")
+                            yield Static("[dim]Refreshing deployment status...[/dim]", id="deployment-status-body")
+                        with Vertical(id="billing-report-panel"):
+                            yield Static("[bold #7bf168]Provider Billing[/]", id="billing-report-title")
+                            yield Static("[dim]Refreshing billing report...[/dim]", id="billing-report-body")
+            yield Static(
+                _render_auth_status_block(username=self.username),
+                id="auth-status-block",
+            )
         yield Footer()
 
     def on_mount(self) -> None:
@@ -1367,30 +889,141 @@ class MainMenuScreen(CopyEnabledScreen):
         if action_list.option_count > 0:
             action_list.action_first()
         action_list.focus()
-        quick_list = self.query_one("#quick-deploy-list", OptionList)
-        if quick_list.option_count > 0:
-            quick_list.action_first()
-        self._refresh_quick_deploy_catalog()
         self._refresh_modal_auth_status()
         self._refresh_prime_auth_status()
         self._refresh_hf_auth_status()
         self._refresh_aai_auth_status()
         self._refresh_panels()
-        self._refresh_storage_estimate()
-        self.set_interval(20.0, self._refresh_panels)
+        self._secondary_refresh_timer = self.set_timer(
+            self._SECONDARY_REFRESH_DELAY_SECONDS,
+            self._refresh_secondary_panels,
+            name="main-menu-secondary-refresh-delay",
+        )
+        self._endpoint_refresh_timer = self.set_interval(
+            self._ENDPOINT_REFRESH_INTERVAL_SECONDS,
+            self._refresh_panels,
+            name="main-menu-endpoint-refresh",
+        )
+        self._billing_refresh_timer = self.set_interval(
+            self._BILLING_REFRESH_INTERVAL_SECONDS,
+            self._refresh_billing_panels,
+            name="main-menu-billing-refresh",
+        )
+
+    def on_screen_suspend(self, _: events.ScreenSuspend) -> None:
+        self._was_suspended = True
+        self._pause_refresh_timers()
+
+    def on_screen_resume(self, _: events.ScreenResume) -> None:
+        """Refresh fleet and billing when returning from a nested flow."""
+        if not self._was_suspended:
+            return
+        self._was_suspended = False
+        self._resume_refresh_timers()
+        self._refresh_panels()
+        if not self._secondary_refresh_started:
+            if self._secondary_refresh_timer is not None:
+                self._secondary_refresh_timer.stop()
+                self._secondary_refresh_timer = None
+            self._refresh_secondary_panels()
+        elif (
+            time.monotonic() - self._last_billing_refresh_at
+            >= self._BILLING_REFRESH_INTERVAL_SECONDS
+        ):
+            self._refresh_billing_panels()
+
+    def _pause_refresh_timers(self) -> None:
+        for timer in (
+            self._secondary_refresh_timer,
+            self._endpoint_refresh_timer,
+            self._billing_refresh_timer,
+        ):
+            if timer is not None:
+                timer.pause()
+
+    def _resume_refresh_timers(self) -> None:
+        for timer in (
+            self._secondary_refresh_timer,
+            self._endpoint_refresh_timer,
+            self._billing_refresh_timer,
+        ):
+            if timer is not None:
+                timer.resume()
+
+    def set_modal_username(self, username: str) -> None:
+        """Apply the asynchronously resolved profile name to connection URLs."""
+        if username == self.username:
+            return
+        self.username = username
+        if self._runtime_rows:
+            self._show_deployments(self._runtime_rows)
+
+    def viewport_profile_changed(
+        self,
+        profile: ViewportProfile,
+        previous: ViewportProfile | None,
+    ) -> None:
+        """Dismiss the narrow detail drawer once both panels fit again."""
+        _ = previous
+        self._refresh_action_labels(profile)
+        if not profile.narrow and not profile.short:
+            self.remove_class("show-secondary-panel")
+
+    def _refresh_action_labels(self, profile: ViewportProfile) -> None:
+        """Use concise action records when descriptive columns no longer fit."""
+        try:
+            action_list = self.query_one("#action-list", OptionList)
+        except Exception:
+            return
+        highlighted = action_list.highlighted_option
+        selected_id = str(highlighted.id) if highlighted is not None else "deploy"
+        if profile.compact:
+            labels = (
+                ("deploy", "  Deploy model"),
+                ("custom-deploy", "  Custom deployment"),
+                ("manage", "  Manage endpoints"),
+                ("storage", "  Storage"),
+                ("settings", "  Settings"),
+            )
+        else:
+            labels = (
+                ("deploy", "  Deploy            Pick a model and live placement"),
+                ("custom-deploy", "  Custom deploy     llama.cpp or vLLM expert form"),
+                ("manage", "  Manage            List, status, logs, stop"),
+                ("storage", "  Storage           Cached models and pre-download"),
+                ("settings", "  Settings          Scaledown defaults"),
+            )
+        action_list.set_options(
+            [Option(label, id=option_id) for option_id, label in labels]
+        )
+        for index, (option_id, _) in enumerate(labels):
+            if option_id == selected_id:
+                action_list.highlighted = index
+                break
+
+    def action_toggle_details(self) -> None:
+        """Expose secondary fleet and billing panels as a narrow drawer."""
+        if not self.viewport_profile.narrow and not self.viewport_profile.short:
+            return
+        self.toggle_class("show-secondary-panel")
+
+    def action_close_details(self) -> None:
+        """Close the narrow details drawer without changing screens."""
+        self.remove_class("show-secondary-panel")
 
     def _refresh_quick_deploy_catalog(self) -> None:
         if self._quick_deploy_catalog_refresh_inflight:
             return
         self._quick_deploy_catalog_refresh_inflight = True
-        self.query_one("#landing-quick-deploy-subtitle", Static).update(
-            f"{_quick_deploy_subtitle(self._quick_deploy_catalog_info)} · refreshing"
-        )
         self.run_worker(
             self._run_refresh_quick_deploy_catalog,
             name="main-menu-quick-deploy-catalog-worker",
             thread=True,
         )
+
+    def ensure_quick_deploy_catalog_refresh(self) -> None:
+        """Start the live model-catalog refresh before opening the picker."""
+        self._refresh_quick_deploy_catalog()
 
     def _run_refresh_quick_deploy_catalog(self) -> None:
         try:
@@ -1405,33 +1038,19 @@ class MainMenuScreen(CopyEnabledScreen):
         message: QuickDeployCatalogLoaded,
     ) -> None:
         self._quick_deploy_catalog_refresh_inflight = False
-        info, profiles = activate_quick_deploy_catalog(
+        activate_quick_deploy_catalog(
             message.info,
             message.profiles,
         )
-        self._quick_deploy_catalog_info = info
-        self._quick_deploy_profiles = profiles
-        self._modal_quick_deploy_plans = resolve_quick_deploy_plans(
-            self._quick_deploy_profiles
-        )
-        self._quick_deploy_plans = self._modal_quick_deploy_plans
-        self._replace_quick_deploy_options()
-        self.query_one("#landing-quick-deploy-subtitle", Static).update(
-            _quick_deploy_subtitle(self._quick_deploy_catalog_info)
-        )
-        if self._prime_auth_status is not None and self._prime_auth_status.authenticated:
-            self._refresh_prime_inference_plans()
+        notifier = getattr(self.app, "quick_deploy_catalog_updated", None)
+        if callable(notifier):
+            notifier()
 
     def on_quick_deploy_catalog_load_failed(
         self,
         _: QuickDeployCatalogLoadFailed,
     ) -> None:
         self._quick_deploy_catalog_refresh_inflight = False
-        self.query_one("#landing-quick-deploy-subtitle", Static).update(
-            _quick_deploy_subtitle(self._quick_deploy_catalog_info)
-        )
-        if self._prime_auth_status is not None and self._prime_auth_status.authenticated:
-            self._refresh_prime_inference_plans()
 
     def _refresh_modal_auth_status(self) -> None:
         if self._modal_auth_refresh_inflight:
@@ -1501,89 +1120,13 @@ class MainMenuScreen(CopyEnabledScreen):
             )
         )
         if message.status.authenticated:
-            if not self._quick_deploy_catalog_refresh_inflight:
-                self._refresh_prime_inference_plans()
-            self._refresh_prime_billing_report()
+            if self._secondary_refresh_started:
+                self._refresh_prime_billing_report()
         elif self._prime_billing_state != "loaded":
             self._prime_billing_state = "unavailable"
             self._prime_billing_error = None
             self._prime_billing_refresh_inflight = False
             self._update_billing_panel()
-
-    def _refresh_prime_inference_plans(self) -> None:
-        if self._prime_inference_refresh_inflight:
-            return
-        self._prime_inference_refresh_inflight = True
-        self.query_one("#landing-quick-deploy-subtitle", Static).update(
-            f"{_quick_deploy_subtitle(self._quick_deploy_catalog_info)} · checking Prime"
-        )
-        self.run_worker(
-            self._run_load_prime_inference_plans,
-            name="main-menu-prime-inference-worker",
-            thread=True,
-        )
-
-    def _run_load_prime_inference_plans(self) -> None:
-        try:
-            plans = resolve_quick_deploy_plans(
-                self._quick_deploy_profiles,
-                adapters=(PrimeInferenceAdapter(),),
-            )
-        except Exception as exc:
-            self.post_message(PrimeInferencePlansLoadFailed(error=str(exc)))
-            return
-        # The full marketplace remains available in manual deploy. Popular
-        # Models shows the lowest-cost compatible Prime option per recipe.
-        recommended = tuple(
-            plan for plan in plans if plan.recommendation_reason is not None
-        )
-        self.post_message(PrimeInferencePlansLoaded(plans=recommended))
-
-    def on_prime_inference_plans_loaded(
-        self,
-        message: PrimeInferencePlansLoaded,
-    ) -> None:
-        self._prime_inference_refresh_inflight = False
-        self._quick_deploy_plans = self._modal_quick_deploy_plans + message.plans
-        self._replace_quick_deploy_options()
-        suffix = (
-            f" · {len(message.plans)} live Prime option"
-            f"{'s' if len(message.plans) != 1 else ''}"
-            if message.plans
-            else " · no compatible Prime offers live"
-        )
-        self.query_one("#landing-quick-deploy-subtitle", Static).update(
-            f"{_quick_deploy_subtitle(self._quick_deploy_catalog_info)}{suffix}"
-        )
-
-    def on_prime_inference_plans_load_failed(
-        self,
-        _: PrimeInferencePlansLoadFailed,
-    ) -> None:
-        self._prime_inference_refresh_inflight = False
-        self.query_one("#landing-quick-deploy-subtitle", Static).update(
-            f"{_quick_deploy_subtitle(self._quick_deploy_catalog_info)} · Prime pricing unavailable"
-        )
-
-    def _replace_quick_deploy_options(self) -> None:
-        option_list = self.query_one("#quick-deploy-list", OptionList)
-        selected_id = (
-            option_list.highlighted_option.id
-            if option_list.highlighted_option is not None
-            else None
-        )
-        options = _quick_deploy_options(
-            self._quick_deploy_profiles,
-            self._quick_deploy_plans,
-        )
-        option_list.set_options(options)
-        if selected_id is not None:
-            for index in range(option_list.option_count):
-                if option_list.get_option_at_index(index).id == selected_id:
-                    option_list.highlighted = index
-                    break
-        if option_list.highlighted is None and option_list.option_count > 0:
-            option_list.action_first()
 
     def _refresh_hf_auth_status(self) -> None:
         if self._hf_auth_refresh_inflight:
@@ -1667,9 +1210,32 @@ class MainMenuScreen(CopyEnabledScreen):
         )
 
     def _refresh_panels(self) -> None:
+        if not self._is_active_screen():
+            return
         self._refresh_deployment_status()
+
+    def _refresh_secondary_panels(self) -> None:
+        self._secondary_refresh_timer = None
+        if not self._is_active_screen():
+            return
+        self._secondary_refresh_started = True
+        self._refresh_quick_deploy_catalog()
+        self._refresh_billing_panels()
+        self._refresh_storage_estimate()
+
+    def _refresh_billing_panels(self) -> None:
+        if not self._is_active_screen():
+            return
+        self._last_billing_refresh_at = time.monotonic()
         self._refresh_billing_report()
         self._refresh_prime_billing_report()
+
+    def _is_active_screen(self) -> bool:
+        """Return whether this screen is the visible top of the app stack."""
+        try:
+            return self.app.screen is self
+        except Exception:
+            return False
 
     def _refresh_storage_estimate(self) -> None:
         cached_storage_snapshot = getattr(self.app, "cached_storage_snapshot", None)
@@ -1684,11 +1250,11 @@ class MainMenuScreen(CopyEnabledScreen):
             return
         self._status_refresh_inflight = True
         self.query_one("#deployment-status-body", Static).update("[dim]Refreshing deployment status...[/dim]")
-        self.run_worker(
-            self._run_load_deployments,
-            name="main-menu-status-worker",
-            thread=True,
-        )
+        refresh = getattr(self.app, "begin_endpoint_refresh", None)
+        if callable(refresh):
+            refresh(self, force=False)
+            return
+        self.run_worker(self._run_load_deployments, name="main-menu-status-worker", thread=True)
 
     def _run_load_deployments(self) -> None:
         poster = getattr(self, "post_message", None)
@@ -1705,6 +1271,37 @@ class MainMenuScreen(CopyEnabledScreen):
             return
         _annotate_runtime_statuses(rows, self.username)
         poster(DeploymentsLoaded(rows=[row for row in rows if row.backend is not None]))
+
+    def on_endpoints_loaded(self, message: EndpointsLoaded) -> None:
+        """Add runtime health details without mutating the shared endpoint cache."""
+        rows = [replace(row) for row in message.rows if row.backend is not None]
+        fingerprint = self._runtime_fingerprint(rows)
+        cached_runtime_is_fresh = (
+            fingerprint == self._runtime_rows_fingerprint
+            and time.monotonic() - self._runtime_rows_cached_at
+            <= self._RUNTIME_STATUS_CACHE_TTL_SECONDS
+        )
+        if cached_runtime_is_fresh:
+            if not message.is_stale:
+                self._status_refresh_inflight = False
+            self._show_deployments([replace(row) for row in self._runtime_rows])
+            return
+        if message.is_stale:
+            self._show_deployments(rows)
+            return
+        self.run_worker(
+            lambda: self._run_annotate_deployments(rows),
+            name="main-menu-runtime-status-worker",
+            thread=True,
+            exclusive=True,
+        )
+
+    def _run_annotate_deployments(self, rows: list[EndpointInfo]) -> None:
+        _annotate_runtime_statuses(rows, self.username)
+        self.post_message(DeploymentsLoaded(rows=rows))
+
+    def on_endpoints_failed(self, message: EndpointsFailed) -> None:
+        self.post_message(DeploymentsLoadFailed(error=message.error))
 
     def _refresh_billing_report(self) -> None:
         if self._billing_refresh_inflight:
@@ -1784,9 +1381,32 @@ class MainMenuScreen(CopyEnabledScreen):
 
     def on_deployments_loaded(self, message: DeploymentsLoaded) -> None:
         self._status_refresh_inflight = False
-        visible_rows = [row for row in message.rows if _should_show_in_panel(row.state)]
+        self._runtime_rows = [replace(row) for row in message.rows]
+        self._runtime_rows_fingerprint = self._runtime_fingerprint(message.rows)
+        self._runtime_rows_cached_at = time.monotonic()
+        self._show_deployments(message.rows)
+
+    def _show_deployments(self, rows: list[EndpointInfo]) -> None:
+        visible_rows = [row for row in rows if _should_show_in_panel(row.state)]
         self.query_one("#deployment-status-body", Static).update(
             _render_deployment_status(visible_rows, username=self.username)
+        )
+
+    @staticmethod
+    def _runtime_fingerprint(rows: list[EndpointInfo]) -> tuple[tuple[object, ...], ...]:
+        return tuple(
+            sorted(
+                (
+                    row.provider.value,
+                    row.backend.value if row.backend is not None else "",
+                    row.name or "",
+                    row.app_id or "",
+                    row.state or "",
+                    row.web_url or "",
+                    row.endpoint_api_key or "",
+                )
+                for row in rows
+            )
         )
 
     def on_deployments_load_failed(self, message: DeploymentsLoadFailed) -> None:
@@ -1833,15 +1453,11 @@ class MainMenuScreen(CopyEnabledScreen):
         return
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
-        option_list_id = event.option_list.id
         option_id = event.option.id
-        if option_list_id == "quick-deploy-list":
-            plan = self._quick_deploy_plan_for_id(str(option_id))
-            if plan is not None:
-                self.app.push_quick_deploy(plan)  # type: ignore[attr-defined]
-            return
         if option_id == "deploy":
             self.app.action_push_deploy()  # type: ignore[attr-defined]
+        elif option_id == "custom-deploy":
+            self.app.action_push_custom_deploy()  # type: ignore[attr-defined]
         elif option_id == "manage":
             self.app.action_push_manage()  # type: ignore[attr-defined]
         elif option_id == "storage":
@@ -1852,6 +1468,9 @@ class MainMenuScreen(CopyEnabledScreen):
     def action_select_deploy(self) -> None:
         self.app.action_push_deploy()  # type: ignore[attr-defined]
 
+    def action_select_custom_deploy(self) -> None:
+        self.app.action_push_custom_deploy()  # type: ignore[attr-defined]
+
     def action_select_manage(self) -> None:
         self.app.action_push_manage()  # type: ignore[attr-defined]
 
@@ -1860,23 +1479,3 @@ class MainMenuScreen(CopyEnabledScreen):
 
     def action_select_settings(self) -> None:
         self.app.action_push_settings()  # type: ignore[attr-defined]
-
-    def _quick_deploy_plan_for_id(self, plan_id: str) -> InferencePlan | None:
-        for plan in self._quick_deploy_plans:
-            if plan.quote.id == plan_id:
-                return plan
-        return None
-
-    def _focus_launcher(self, target_id: str) -> None:
-        target = self.query_one(f"#{target_id}", OptionList)
-        target.focus()
-        if target.highlighted is None and target.option_count > 0:
-            target.highlighted = 0
-
-    def action_focus_next_launcher(self) -> None:
-        focused_id = getattr(self.focused, "id", "")
-        self._focus_launcher("quick-deploy-list" if focused_id == "action-list" else "action-list")
-
-    def action_focus_previous_launcher(self) -> None:
-        focused_id = getattr(self.focused, "id", "")
-        self._focus_launcher("action-list" if focused_id == "quick-deploy-list" else "quick-deploy-list")

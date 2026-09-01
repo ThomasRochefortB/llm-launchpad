@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from llm_launchpad.core.orchestrator import Orchestrator
 from llm_launchpad.protocol.enums import BackendType, OperationType
-from llm_launchpad.protocol.events import LogEvent, OperationCompleteEvent
+from llm_launchpad.protocol.events import ErrorEvent, LogEvent, OperationCompleteEvent
 from llm_launchpad.protocol.models import DeploymentConfig, LaunchpadSettings
 
 
@@ -15,6 +15,27 @@ class _FakeConfigStore:
 
 
 class OrchestratorLlamaCppDeployFlowTests(unittest.TestCase):
+    def test_llamacpp_deploy_blocks_unsupported_architecture_before_modal(self) -> None:
+        config = DeploymentConfig(
+            backend=BackendType.LLAMACPP,
+            repo_id="unsloth/GLM-5.3-Flash-GGUF",
+            quant="UD-Q2_K_XL",
+            gguf_architecture="glm5next",
+            do_warmup=False,
+        )
+
+        with patch("llm_launchpad.core.orchestrator.ModalBackend.run_streaming") as run:
+            events = list(Orchestrator(config_store=_FakeConfigStore()).deploy(config))
+
+        run.assert_not_called()
+        errors = [event for event in events if isinstance(event, ErrorEvent)]
+        self.assertEqual(len(errors), 1)
+        self.assertIn("glm5next", errors[0].message)
+        completions = [event for event in events if isinstance(event, OperationCompleteEvent)]
+        self.assertEqual(len(completions), 1)
+        self.assertFalse(completions[0].success)
+        self.assertEqual(completions[0].exit_code, 2)
+
     def test_llamacpp_deploy_splits_prepare_and_deploy_commands(self) -> None:
         seen_commands: list[list[str]] = []
 

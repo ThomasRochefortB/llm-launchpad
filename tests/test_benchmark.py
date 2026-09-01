@@ -160,6 +160,23 @@ class BenchmarkCoreTests(unittest.TestCase):
         self.assertEqual(metrics["time_to_first_token_p50"], 90.0)
         self.assertEqual(metrics["request_latency_p90"], 1300.0)
 
+    def test_parse_aiperf_summary_falls_back_when_json_has_no_known_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            artifact_dir = Path(tmp)
+            json_path, csv_path = expected_export_paths(artifact_dir)
+            json_path.write_text('{"metadata": {"version": "1"}}')
+            csv_path.write_text(
+                "Metric,avg,p50,p90,p99\n"
+                "Output Token Throughput (tokens/sec),12.5,,,\n"
+                "Request Throughput (requests/sec),1.25,,,\n"
+            )
+
+            metrics, source = parse_aiperf_summary(json_path, csv_path)
+
+        self.assertTrue(source.endswith("profile_export_aiperf.csv"))
+        self.assertEqual(metrics["output_token_throughput"], 12.5)
+        self.assertEqual(metrics["request_throughput"], 1.25)
+
     def test_aiperf_metrics_have_successful_requests_rejects_empty_exports(self) -> None:
         self.assertFalse(aiperf_metrics_have_successful_requests({"request_count": 0.0}))
         self.assertFalse(aiperf_metrics_have_successful_requests({"request_count": None}))

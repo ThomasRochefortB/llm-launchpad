@@ -7,19 +7,19 @@
 /* ---- Global ---- */
 
 * {
-    scrollbar-background: #0b110d;
-    scrollbar-color: #2b5933;
-    scrollbar-background-hover: #0f1812;
-    scrollbar-color-hover: #3d7a4a;
-    scrollbar-background-active: #0f1812;
-    scrollbar-color-active: #7bf168;
+    scrollbar-background: $scrollbar-background;
+    scrollbar-color: $scrollbar;
+    scrollbar-background-hover: $scrollbar-background-hover;
+    scrollbar-color-hover: $scrollbar-hover;
+    scrollbar-background-active: $scrollbar-background-active;
+    scrollbar-color-active: $scrollbar-active;
     scrollbar-size: 1 1;
     scrollbar-gutter: stable;
 }
 
 Screen {
-    background: #050806;
-    color: #eef7ef;
+    background: $background;
+    color: $text;
 }
 
 Vertical,
@@ -27,49 +27,22 @@ VerticalScroll,
 OptionList,
 DataTable,
 SelectionList,
-ListView,
-#quick-deploy-list {
-    scrollbar-background: #0b110d;
-    scrollbar-color: #2b5933;
-    scrollbar-background-hover: #0f1812;
-    scrollbar-color-hover: #3d7a4a;
-    scrollbar-background-active: #0f1812;
-    scrollbar-color-active: #7bf168;
+ListView {
+    scrollbar-background: $scrollbar-background;
+    scrollbar-color: $scrollbar;
+    scrollbar-background-hover: $scrollbar-background-hover;
+    scrollbar-color-hover: $scrollbar-hover;
+    scrollbar-background-active: $scrollbar-background-active;
+    scrollbar-color-active: $scrollbar-active;
 }
 
-/* ---- Header / Footer bars ---- */
-
-#header-bar {
-    dock: top;
-    height: 3;
-    background: #070b08;
-    color: #eef7ef;
-    padding: 0 2;
-    border-bottom: solid #7bf168;
-}
-
-#header-bar .app-title {
-    text-style: bold;
-    color: #7bf168;
-}
-
-#header-bar .app-meta {
-    color: #93a596;
-}
-
-#footer-bar {
-    dock: bottom;
-    height: 1;
-    background: #070b08;
-    color: #93a596;
-    padding: 0 2;
-}
+/* ---- Footer ---- */
 
 Footer {
     height: 2;
-    background: #070b08;
-    color: #93a596;
-    border-top: solid #17321e;
+    background: $footer-background;
+    color: $footer-foreground;
+    border-top: solid $border;
 }
 
 /* ---- Status header widget ---- */
@@ -77,47 +50,47 @@ Footer {
 StatusHeader {
     height: 4;
     padding: 0 2;
-    background: #070b08;
-    border-bottom: solid #17321e;
-}
-
-StatusHeader .status-label {
-    text-style: bold;
-    color: #7bf168;
-}
-
-StatusHeader .status-value {
-    color: #eef7ef;
+    background: $surface;
+    border-bottom: solid $border;
 }
 
 /* ---- Log viewer ---- */
 
 LogViewer {
     height: 1fr;
-    border: solid #17321e;
-    background: #0a0f0b;
+    border: solid $border;
+    background: $surface;
     padding: 0 1;
 }
 
 LogViewer Log {
+    overflow-x: hidden;
     scrollbar-size: 1 1;
 }
 
 /* ---- Main menu ---- */
 
-#main-menu {
-    align: center middle;
-    width: 100%;
-    height: 100%;
+#main-menu-center {
+    height: 1fr;
 }
 
-#menu-container {
+#compact-menu-header,
+#compact-menu-help {
+    display: none;
+}
+
+#main-menu-primary {
     width: 1fr;
-    min-width: 56;
     height: 1fr;
     padding: 1 2;
     content-align: center middle;
     align: center middle;
+}
+
+.screen-scroll {
+    width: 100%;
+    height: 1fr;
+    padding: 1 2;
 }
 
 #main-menu-layout {
@@ -142,8 +115,8 @@ LogViewer Log {
     max-height: 14;
     overflow-y: auto;
     padding: 0 2;
-    border: heavy #1e3a24;
-    background: #0f1410;
+    border: solid $border;
+    background: $panel;
 }
 
 #billing-report-panel {
@@ -151,18 +124,8 @@ LogViewer Log {
     height: auto;
     margin: 1 0 0 0;
     padding: 0 2;
-    border: heavy #1e3a24;
-    background: #0f1410;
-}
-
-#quick-deploy-panel {
-    width: 100%;
-    height: auto;
-    min-height: 13;
-    margin: 1 0 0 0;
-    padding: 0 2;
-    border: heavy #2b5933;
-    background: #121b14;
+    border: solid $border;
+    background: $panel;
 }
 
 #deployment-status-title {
@@ -170,7 +133,7 @@ LogViewer Log {
 }
 
 #deployment-status-body {
-    color: #eef7ef;
+    color: $text;
     text-wrap: wrap;
     overflow-y: auto;
 }
@@ -180,179 +143,205 @@ LogViewer Log {
 }
 
 #billing-report-body {
-    color: #eef7ef;
+    color: $text;
     text-wrap: wrap;
-}
-
-#landing-quick-deploy-title {
-    padding: 0 0 0 0;
-}
-
-#landing-quick-deploy-subtitle {
-    color: #b7c9b9;
-    text-style: bold;
-    padding: 0 0 0 0;
-}
-
-#landing-quick-deploy-helper {
-    color: #93a596;
-    padding: 1 0 0 0;
-}
-
-#quick-deploy-list {
-    border: solid #2b5933;
-    background: #0b110d;
-    max-height: 12;
-    height: auto;
-    text-wrap: nowrap;
-    overflow: hidden;
-}
-
-#quick-deploy-list:focus {
-    border: solid #7bf168;
-}
-
-#quick-deploy-list > .option-list--option {
-    text-wrap: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    width: 100%;
 }
 
 #banner-text {
     text-align: center;
-    color: #7bf168;
+    color: $primary;
     padding: 0 0 1 0;
 }
 
 #auth-status-block {
-    dock: bottom;
     width: auto;
     max-width: 92;
     height: auto;
     min-height: 4;
     margin: 0 0 1 1;
     padding: 0 1;
-    border-left: tall #17321e;
-    color: #93a596;
+    border-left: tall $border;
+    color: $text-muted;
     background: transparent;
 }
 
 /* ---- Option / Selection Lists ---- */
 
 OptionList {
-    background: #0b110d;
-    border: solid #17321e;
+    background: $surface;
+    border: solid $border;
     padding: 0;
     height: auto;
     max-height: 20;
 }
 
 OptionList:focus {
-    border: solid #7bf168;
+    border: solid $primary;
 }
 
 OptionList > .option-list--option-highlighted {
-    background: #12311b;
-    color: #eef7ef;
+    background: $primary-background;
+    color: $text;
     text-style: bold;
 }
 
 OptionList > .option-list--option-hover-highlighted {
-    background: #12311b;
-    color: #eef7ef;
+    background: $primary-background;
+    color: $text;
     text-style: bold;
 }
 
 DataTable {
-    background: #0b110d;
-    border: solid #17321e;
-    height: 20;
-    color: #eef7ef;
+    background: $surface;
+    border: solid $border;
+    height: 1fr;
+    min-height: 3;
+    max-height: 20;
+    color: $text;
 }
 
 DataTable:focus {
-    border: solid #7bf168;
+    border: solid $primary;
 }
 
 SelectionList {
-    background: #0b110d;
+    background: $surface;
     height: auto;
     max-height: 20;
 }
 
 ListView {
-    background: #0b110d;
+    background: $surface;
     height: auto;
     max-height: 20;
 }
 
 ListView > ListItem.--highlight {
-    background: #12311b;
+    background: $primary-background;
 }
 
 /* ---- Inputs ---- */
 
 Input {
-    border: tall #1d3c25;
-    background: #0b110d;
-    color: #eef7ef;
+    border: tall $border;
+    background: $surface;
+    color: $text;
     padding: 0 1;
 }
 
 Input:focus {
-    border: tall #7bf168;
-    background: #0f1812;
+    border: tall $primary;
+    background: $surface-lighten-1;
 }
 
 Select {
-    border: tall #1d3c25;
-    background: #0b110d;
-    color: #eef7ef;
+    border: tall $border;
+    background: $surface;
+    color: $text;
 }
 
 Select:focus {
-    border: tall #7bf168;
-    background: #0f1812;
+    border: tall $primary;
+    background: $surface-lighten-1;
 }
 
 Switch {
-    background: #0b110d;
+    background: $surface;
 }
 
 Switch > .switch--slider {
-    color: #050806;
-    background: #2d3b30;
+    color: $background;
+    background: $foreground-muted;
 }
 
 Switch.-on > .switch--slider {
-    background: #7bf168;
+    background: $primary;
 }
 
 /* ---- Buttons ---- */
 
 Button {
     min-width: 16;
-    background: #101913;
-    color: #eef7ef;
-    border: solid #17321e;
+    background: $panel;
+    color: $text;
+    border: solid $border;
 }
 
 Button:hover {
-    background: #12311b;
-    border: solid #7bf168;
+    background: $primary-background;
+    border: solid $primary;
 }
 
 Button.-primary {
-    background: #7bf168;
-    color: #050806;
+    background: $primary;
+    color: $button-color-foreground;
     text-style: bold;
-    border: solid #7bf168;
+    border: solid $primary;
 }
 
 Button:focus {
     text-style: bold;
-    border: solid #95ff85;
+    border: solid $accent;
+}
+
+/* ---- Fast deploy flow ---- */
+
+#fast-deploy-container {
+    width: 100%;
+    height: 1fr;
+    padding: 1 2;
+}
+
+#fast-deploy-title {
+    height: auto;
+}
+
+#fast-deploy-subtitle,
+#fast-deploy-status {
+    color: $text-muted;
+    height: auto;
+    padding: 0 0 1 0;
+}
+
+#fast-deploy-gpu-label {
+    color: $text-muted;
+    height: 1;
+    padding: 0;
+    margin: 0;
+}
+
+#fast-deploy-gpu-filter {
+    width: 100%;
+    max-width: 72;
+    height: 3;
+    min-height: 3;
+    margin: 0 0 1 0;
+    padding: 0;
+}
+
+#fast-deploy-list {
+    width: 100%;
+    height: 1fr;
+    max-height: 24;
+    text-wrap: nowrap;
+}
+
+#fast-deploy-list > .option-list--option {
+    text-wrap: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    width: 100%;
+}
+
+#fast-deploy-detail {
+    width: 100%;
+    height: auto;
+    min-height: 3;
+    margin: 1 0 0 0;
+    padding: 0 1;
+    border-left: tall $primary;
+    background: $surface-lighten-1;
+    text-wrap: wrap;
 }
 
 /* ---- Quick deploy screen ---- */
@@ -363,12 +352,12 @@ Button:focus {
 
 #quick-deploy-subtitle {
     padding: 0 2 0 2;
-    color: #93a596;
+    color: $text-muted;
 }
 
 #quick-deploy-layout {
     width: 100%;
-    height: auto;
+    height: 1fr;
     padding: 0 2 1 2;
 }
 
@@ -376,8 +365,8 @@ Button:focus {
 #quick-deploy-form {
     height: auto;
     padding: 1 2;
-    border: solid #17321e;
-    background: #0b110d;
+    border: solid $border;
+    background: $surface;
 }
 
 #quick-deploy-profile-card {
@@ -390,13 +379,19 @@ Button:focus {
     margin: 0 0 0 0;
 }
 
+#quick-deploy-actions {
+    width: 100%;
+    height: auto;
+    padding: 0 2 1 2;
+}
+
 #quick-deploy-profile-title {
-    color: #7bf168;
+    color: $primary;
     padding: 0 0 1 0;
 }
 
 #quick-deploy-profile-body {
-    color: #eef7ef;
+    color: $text;
     text-wrap: wrap;
 }
 
@@ -404,49 +399,43 @@ Button:focus {
     height: 1;
 }
 
-/* ---- Dialogs / Modals ---- */
-
-#dialog-overlay {
-    align: center middle;
-    background: #050806 82%;
+#quick-fulfillment,
+#quick-fulfillment-note {
+    width: 100%;
+    height: auto;
+    margin: 0 0 1 0;
 }
 
-#dialog-box {
-    width: 60;
-    height: auto;
-    max-height: 70%;
-    padding: 1 2;
-    border: solid #7bf168;
-    background: #0b110d;
+#quick-fulfillment-note {
+    color: $text-muted;
 }
 
 /* ---- Deploy form ---- */
 
-.form-group {
-    height: auto;
-    padding: 0 0 1 0;
-}
-
 .form-label {
-    color: #c8d6c9;
+    color: $foreground;
     padding: 0 0 0 0;
-    height: 1;
+    height: auto;
+    text-wrap: wrap;
 }
 
 .form-hint {
-    color: #7f9082;
-    height: 1;
+    color: $text-muted;
+    height: auto;
+    text-wrap: wrap;
 }
 
 .form-section-title {
-    color: #7bf168;
+    color: $primary;
     text-style: bold;
-    height: 1;
+    height: auto;
+    text-wrap: wrap;
 }
 
 .form-section-subtitle {
-    color: #7f9082;
-    height: 1;
+    color: $text-muted;
+    height: auto;
+    text-wrap: wrap;
     padding: 0 0 1 0;
 }
 
@@ -454,7 +443,7 @@ Button:focus {
 
 LlamaCppDeployScreen .form-label,
 VllmDeployScreen .form-label {
-    color: #eef7ef;
+    color: $text;
     text-style: bold;
 }
 
@@ -462,28 +451,28 @@ LlamaCppDeployScreen .form-hint,
 VllmDeployScreen .form-hint,
 LlamaCppDeployScreen .form-section-subtitle,
 VllmDeployScreen .form-section-subtitle {
-    color: #93a596;
+    color: $text-muted;
 }
 
 LlamaCppDeployScreen Input,
 VllmDeployScreen Input,
 LlamaCppDeployScreen Select,
 VllmDeployScreen Select {
-    border: tall #2b5933;
+    border: tall $border;
 }
 
 LlamaCppDeployScreen Input:focus,
 VllmDeployScreen Input:focus,
 LlamaCppDeployScreen Select:focus,
 VllmDeployScreen Select:focus {
-    border: tall #7bf168;
-    background: #0f1812;
+    border: tall $primary;
+    background: $surface-lighten-1;
 }
 
 LlamaCppDeployScreen .gpu-config-panel,
 VllmDeployScreen .gpu-config-panel {
-    border: tall #2b5933;
-    background: #0f1812;
+    border: tall $border;
+    background: $surface-lighten-1;
 }
 
 /* ---- Monitor screen ---- */
@@ -496,8 +485,8 @@ VllmDeployScreen .gpu-config-panel {
     width: 100%;
     height: 2;
     padding: 0 2;
-    background: #070b08;
-    border-bottom: solid #17321e;
+    background: $surface;
+    border-bottom: solid $border;
 }
 
 #monitor-title {
@@ -513,33 +502,91 @@ VllmDeployScreen .gpu-config-panel {
     text-align: right;
 }
 
-#monitor-log {
-    height: 1fr;
-    border: solid #17321e;
-    padding: 0 1;
+#connection-card {
+    width: 100%;
+    height: auto;
+    margin: 0 2 1 2;
+    padding: 1 2;
+    border: solid $primary;
+    background: $surface-lighten-1;
 }
 
-#monitor-status {
-    dock: top;
-    height: 3;
-    padding: 0 2;
-    background: #070b08;
-    border-bottom: solid #17321e;
+#connection-card-body {
+    height: auto;
+    text-wrap: wrap;
+}
+
+#connection-card-actions {
+    width: 100%;
+    height: auto;
+    padding: 1 0 0 0;
+}
+
+#connection-card-actions Button {
+    margin: 0 1 0 0;
 }
 
 /* ---- Manage screen ---- */
 
 #manage-layout {
+    width: 100%;
     height: 100%;
     padding: 1 2;
 }
 
+#manage-title,
+#manage-status,
+#manage-selection-detail,
+#manage-help,
+#stop-warning {
+    height: auto;
+}
+
+#manage-status {
+    margin: 0 0 1 0;
+}
+
+#manage-endpoint-table {
+    height: auto;
+    min-height: 4;
+    max-height: 12;
+}
+
+#manage-selection-detail {
+    min-height: 2;
+    margin: 1 0 0 0;
+}
+
+#manage-actions {
+    width: 100%;
+    height: auto;
+    max-height: 8;
+    margin: 1 0 0 0;
+}
+
+#manage-action-context,
+#manage-action-help {
+    height: auto;
+}
+
+#manage-action-help {
+    margin: 1 0 0 0;
+}
+
+#stop-confirm-actions {
+    width: 100%;
+    height: auto;
+    margin: 1 0 0 0;
+}
+
+#stop-confirm-actions Button {
+    margin: 0 1 0 0;
+}
+
 /* ---- Settings screen ---- */
 
-#settings-layout {
+#settings-scroll {
     align: center middle;
-    width: 100%;
-    height: 100%;
 }
 
 #storage-controls {
@@ -547,11 +594,12 @@ VllmDeployScreen .gpu-config-panel {
 }
 
 #settings-form {
-    width: 60;
+    width: 100%;
+    max-width: 60;
     height: auto;
     padding: 1 2;
-    border: solid #17321e;
-    background: #0b110d;
+    border: solid $border;
+    background: $surface;
 }
 
 /* ---- Deploy screen GPU row ---- */
@@ -567,8 +615,8 @@ VllmDeployScreen .gpu-config-panel {
     height: auto;
     margin: 0 0 1 0;
     padding: 0 1 1 1;
-    border: tall #1d3c25;
-    background: #0b110d;
+    border: tall $border;
+    background: $surface;
 }
 
 .gpu-config-main-row {
@@ -610,18 +658,269 @@ VllmDeployScreen .gpu-config-panel {
     text-align: center;
 }
 
-.bold {
-    text-style: bold;
+/* ---- Responsive viewport profiles ---- */
+
+#minimum-size-overlay {
+    layer: overlay;
+    dock: top;
+    width: 100%;
+    height: 100%;
+    padding: 1;
+    content-align: center middle;
+    text-align: center;
+    background: $background;
+    color: $text;
 }
 
-.accent {
-    color: #7bf168;
+StatusHeader.state-healthy,
+StatusHeader.state-running {
+    border-bottom: solid $success;
 }
 
-.muted {
-    color: #93a596;
+StatusHeader.state-queued,
+StatusHeader.state-deploying,
+StatusHeader.state-warming-up {
+    border-bottom: solid $warning;
 }
 
-.spacer {
+#monitor-search {
+    width: 100%;
+    margin: 0;
+}
+
+.viewport-narrow #main-menu-side-column,
+.viewport-short #main-menu-side-column {
+    display: none;
+}
+
+.viewport-narrow.show-secondary-panel #main-menu-side-column,
+.viewport-short.show-secondary-panel #main-menu-side-column {
+    display: block;
+    layer: overlay;
+    dock: right;
+    width: 80%;
+    min-width: 40;
+    max-width: 56;
+    height: 100%;
+    margin: 0;
+    padding: 1;
+    background: $background;
+    border-left: solid $primary;
+    overflow-y: auto;
+}
+
+.viewport-narrow #main-menu-layout {
+    width: 100%;
+    max-width: 100%;
+}
+
+.viewport-narrow #main-menu-primary {
+    width: 100%;
+}
+
+.viewport-narrow #auth-status-block {
+    width: 100%;
+    max-width: 100%;
+    margin: 0 0 1 0;
+}
+
+.viewport-compact #banner-text,
+.viewport-compact .main-menu-version,
+.viewport-compact .decorative-spacer {
+    display: none;
+}
+
+.viewport-compact #main-menu-center,
+.viewport-compact #main-menu-layout,
+.viewport-compact #main-menu-primary {
+    height: auto;
+    min-height: 0;
+    content-align: left top;
+    align: left top;
+}
+
+.viewport-compact #compact-menu-header,
+.viewport-compact #compact-menu-help {
+    display: block;
+    width: 100%;
+    height: auto;
+    padding: 0 1;
+}
+
+.viewport-compact #compact-menu-header {
+    margin: 1 0;
+}
+
+.viewport-compact #compact-menu-help {
+    margin: 1 0 0 0;
+}
+
+.viewport-compact #action-list {
+    height: 7;
+    min-height: 7;
+    max-height: 7;
+}
+
+.viewport-compact.viewport-short #action-list {
+    height: 1fr;
+    min-height: 3;
+    max-height: 100%;
+}
+
+.viewport-compact.viewport-short #main-menu-center,
+.viewport-compact.viewport-short #main-menu-layout,
+.viewport-compact.viewport-short #main-menu-primary {
+    height: 1fr;
+}
+
+.viewport-compact.viewport-short #compact-menu-header,
+.viewport-compact.viewport-short #compact-menu-help {
+    display: none;
+}
+
+.viewport-compact #main-menu-primary,
+.viewport-compact .screen-scroll,
+.viewport-compact #fast-deploy-container,
+.viewport-compact #quick-deploy-layout,
+.viewport-compact #quick-deploy-actions {
+    padding: 0 1;
+}
+
+.viewport-minimal #main-menu-primary,
+.viewport-minimal .screen-scroll,
+.viewport-minimal #fast-deploy-container,
+.viewport-minimal #quick-deploy-layout,
+.viewport-minimal #quick-deploy-actions {
+    padding: 0;
+}
+
+.viewport-narrow #fast-deploy-subtitle,
+.viewport-narrow #fast-deploy-gpu-label,
+.viewport-compact #fast-deploy-subtitle,
+.viewport-compact #fast-deploy-gpu-label {
+    display: none;
+}
+
+.viewport-compact #fast-deploy-gpu-filter {
+    max-width: 100%;
+    height: 3;
+    min-height: 3;
+    margin: 0 0 1 0;
+}
+
+.viewport-compact #quick-deploy-title,
+.viewport-compact #quick-deploy-subtitle {
+    padding-left: 1;
+    padding-right: 1;
+}
+
+.viewport-compact #quick-deploy-profile-card,
+.viewport-compact #quick-deploy-form,
+.viewport-compact #quick-deploy-actions,
+.viewport-compact #settings-form {
+    padding: 0 1;
+}
+
+.viewport-compact .gpu-config-main-row {
+    layout: vertical;
+}
+
+.viewport-compact #gpu-type-group-llama,
+.viewport-compact #gpu-type-group-vllm,
+.viewport-compact #gpu-count-group-llama,
+.viewport-compact #gpu-count-group-vllm {
+    width: 100%;
+    padding: 0;
+}
+
+.viewport-compact #monitor-title,
+.viewport-short #monitor-title {
+    display: none;
+}
+
+.viewport-compact #monitor-view-status,
+.viewport-short #monitor-view-status {
+    width: 100%;
+    text-align: left;
+    content-align: left middle;
+}
+
+.viewport-short StatusHeader {
+    height: 2;
+    padding: 0 1;
+}
+
+.viewport-short #manage-selection-detail,
+.viewport-short #manage-help {
+    display: none;
+}
+
+.viewport-short #monitor-toolbar {
     height: 1;
+    padding: 0 1;
+}
+
+.viewport-short .form-hint,
+.viewport-short .form-section-subtitle,
+.viewport-short #quick-deploy-subtitle,
+.viewport-short #storage-hint {
+    display: none;
+}
+
+.viewport-short #fast-deploy-subtitle,
+.viewport-short #fast-deploy-gpu-label,
+.viewport-short #fast-deploy-detail {
+    display: none;
+}
+
+.viewport-short #auth-status-block {
+    max-height: 4;
+    overflow-y: auto;
+}
+
+.viewport-minimal Footer,
+.viewport-shallow Footer {
+    display: none;
+}
+
+.viewport-shallow #connection-card {
+    padding: 0 1;
+    margin: 0;
+}
+
+.viewport-shallow #connection-card-actions {
+    padding: 0;
+}
+
+.viewport-minimal #quick-deploy-profile-card,
+.viewport-minimal #quick-deploy-form,
+.viewport-minimal #settings-form,
+.viewport-minimal LogViewer,
+.viewport-minimal DataTable,
+.viewport-minimal OptionList {
+    border-left: none;
+    border-right: none;
+}
+
+.density-compact .screen-scroll,
+.density-compact #main-menu-primary,
+.density-compact #fast-deploy-container,
+.density-compact #quick-deploy-layout,
+.density-compact #quick-deploy-profile-card,
+.density-compact #quick-deploy-form,
+.density-compact #quick-deploy-actions,
+.density-compact #settings-form {
+    padding-top: 0;
+    padding-bottom: 0;
+}
+
+CopyEnabledScreen.viewport-ultra-wide {
+    align-horizontal: center;
+}
+
+.viewport-ultra-wide .screen-scroll,
+.viewport-ultra-wide #fast-deploy-container,
+.viewport-ultra-wide #quick-deploy-layout,
+.viewport-ultra-wide #quick-deploy-actions {
+    max-width: 160;
 }

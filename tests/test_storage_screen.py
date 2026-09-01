@@ -10,6 +10,7 @@ from textual.widgets import DataTable, Input, OptionList, Static
 from llm_launchpad.protocol.enums import BackendType
 from llm_launchpad.protocol.models import StorageSnapshot, StoredModelInfo
 from llm_launchpad.tui.screens.storage import StorageScreen, _model_label
+from llm_launchpad.tui.widgets.adaptive_table import AdaptiveDataTable
 from llm_launchpad.tui.workers import StorageLoaded
 
 _GIB = 1024**3
@@ -104,10 +105,10 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             screen = app.screen
             assert isinstance(screen, StorageScreen)
-            table = screen.query_one("#storage-table", DataTable)
+            table = screen.query_one("#storage-table", AdaptiveDataTable)
             self.assertEqual(table.row_count, 2)
-            self.assertEqual(table.get_cell_at(Coordinate(0, 6)), "$0.18/mo")
-            self.assertEqual(table.get_cell_at(Coordinate(1, 6)), "$0.27/mo")
+            self.assertEqual(table.get_cell_at(Coordinate(0, 4)), "$0.18/mo")
+            self.assertEqual(table.get_cell_at(Coordinate(1, 4)), "$0.27/mo")
 
             status = screen.query_one("#storage-status", Static)
             rendered_status = str(status.renderable)
@@ -115,6 +116,30 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("0.00 GiB billable", rendered_status)
             self.assertIn("1 TiB free", rendered_status)
             self.assertIn("$0.00/mo", rendered_status)
+
+    async def test_table_adapts_columns_and_preserves_highlight_on_resize(self) -> None:
+        app = _TestApp()
+        async with app.run_test(size=(140, 35)) as pilot:
+            app.push_screen(StorageScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, StorageScreen)
+            table = screen.query_one("#storage-table", AdaptiveDataTable)
+            self.assertEqual(
+                table.visible_column_keys,
+                ("backend", "model", "revision", "quant", "files", "size", "cost"),
+            )
+            table.move_cursor(row=1, column=0, animate=False)
+            selected = table.coordinate_to_cell_key(Coordinate(1, 0)).row_key
+
+            await pilot.resize_terminal(50, 35)
+            await pilot.pause()
+
+            self.assertEqual(table.visible_column_keys, ("model", "summary"))
+            self.assertEqual(
+                table.coordinate_to_cell_key(Coordinate(table.cursor_row, 0)).row_key,
+                selected,
+            )
 
     async def test_mount_focuses_backend_filter_menu_for_arrow_navigation(self) -> None:
         app = _TestApp()
