@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -14,6 +15,13 @@ from llm_launchpad.core.quick_deploy_refresh import ArtificialAnalysisAuthStatus
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider, OperationType
 from llm_launchpad.protocol.events import EndpointAvailableEvent, LogEvent, OperationCompleteEvent
 from llm_launchpad.protocol.models import EndpointInfo, PrimeProviderOptions
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _plain_cli_output(text: str) -> str:
+    """Strip ANSI styling; typer colorizes errors when GITHUB_ACTIONS is set."""
+    return _ANSI_ESCAPE_RE.sub("", text)
 
 
 class CliMainHelperTests(unittest.TestCase):
@@ -176,9 +184,10 @@ class CliMainCommandTests(unittest.TestCase):
         )
 
         self.assertEqual(result.exit_code, 2)
-        self.assertIn("Invalid value for '--provider'", result.output)
-        self.assertIn("modal", result.output)
-        self.assertIn("prime", result.output)
+        output = _plain_cli_output(result.output)
+        self.assertIn("Invalid value for '--provider'", output)
+        self.assertIn("modal", output)
+        self.assertIn("prime", output)
         self.assertNotIn("Traceback", result.output)
         self.assertNotIsInstance(result.exception, ValueError)
 
@@ -189,9 +198,10 @@ class CliMainCommandTests(unittest.TestCase):
         )
 
         self.assertEqual(result.exit_code, 2)
-        self.assertIn("Invalid value for '--backend'", result.output)
-        self.assertIn("llamacpp", result.output)
-        self.assertIn("vllm", result.output)
+        output = _plain_cli_output(result.output)
+        self.assertIn("Invalid value for '--backend'", output)
+        self.assertIn("llamacpp", output)
+        self.assertIn("vllm", output)
         self.assertNotIn("Traceback", result.output)
         self.assertNotIsInstance(result.exception, ValueError)
 

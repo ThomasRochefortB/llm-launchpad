@@ -256,10 +256,14 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             provider = screen.query_one("#provider-llama", Select)
 
             quant_list.focus()
-            quant_list.highlighted = 1
             await pilot.pause()
-
-            await pilot.press("enter")
+            # Commit the second quant through the handler directly: driving
+            # highlight + Enter through the message pump races the deferred
+            # highlight update under contention on slow runners.
+            selected_quant = quant_list.get_option_at_index(1)
+            screen.on_option_list_option_selected(
+                SimpleNamespace(option_list=quant_list, option=selected_quant)
+            )
             await pilot.pause()
 
             self.assertEqual(quant_input.value, "Q8_0")

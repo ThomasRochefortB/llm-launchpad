@@ -73,6 +73,7 @@ dev = [
 addopts = ["-n", "4"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+pythonpath = ["."]
 
 [tool.ruff]
 target-version = "py312"
