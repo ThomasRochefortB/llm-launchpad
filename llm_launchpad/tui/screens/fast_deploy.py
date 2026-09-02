@@ -17,6 +17,7 @@ from ...core.compute_availability import (
     load_compute_availability,
     plans_for_compute_profile,
 )
+from ...core.deploy_log_summary import SUMMARY_SPINNER_FRAMES
 from ...core.quick_deploy import (
     QuickDeployCatalogInfo,
     QuickDeployModel,
@@ -508,6 +509,8 @@ class FastDeployScreen(CopyEnabledScreen):
         self._gpu_filter = "any"
         self._model_search = ""
         self._updating_gpu_filter = False
+        self._catalog_building = False
+        self._catalog_spinner_index = 0
 
     def compose(self) -> ComposeResult:
         with Vertical(id="fast-deploy-container"):
@@ -538,6 +541,11 @@ class FastDeployScreen(CopyEnabledScreen):
         self._apply_model_catalog(force=True)
         self.query_one("#fast-deploy-list", OptionList).focus()
         self._load_availability(purpose="filter")
+        self.set_interval(
+            0.25,
+            self._tick_catalog_spinner,
+            name="fast-deploy-catalog-spinner",
+        )
 
     def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
         if event.option_list.id != "fast-deploy-list":
@@ -594,6 +602,7 @@ class FastDeployScreen(CopyEnabledScreen):
         self.query_one("#fast-deploy-subtitle", Static).update(_subtitle(info))
         self.query_one("#fast-deploy-detail", Static).update("")
         if info.error:
+            self._catalog_building = False
             option_list.set_options(
                 [
                     Option(
@@ -610,15 +619,37 @@ class FastDeployScreen(CopyEnabledScreen):
                 f"[dim]{_escape_markup(_clip(info.error, 140))}[/dim]"
             )
         else:
+            self._catalog_building = True
+            frame = SUMMARY_SPINNER_FRAMES[self._catalog_spinner_index]
             option_list.set_options(
-                [Option("  Building the live model catalog…", disabled=True)]
+                [Option(f"  {frame} Building the live model catalog…", disabled=True)]
             )
             status = (
-                "[dim]Building the live model catalog from "
-                "Artificial Analysis and Hugging Face…[/dim]"
+                f"[bold #7bf168]{frame}[/][dim] Building the live model catalog "
+                "from Artificial Analysis and Hugging Face…[/dim]"
             )
         self.query_one("#fast-deploy-status", Static).update(status)
         option_list.focus()
+
+    def _tick_catalog_spinner(self) -> None:
+        """Advance the building-catalog spinner like deploy-log in-progress steps."""
+        if not self._catalog_building:
+            return
+        self._catalog_spinner_index = (
+            self._catalog_spinner_index + 1
+        ) % len(SUMMARY_SPINNER_FRAMES)
+        frame = SUMMARY_SPINNER_FRAMES[self._catalog_spinner_index]
+        try:
+            option_list = self.query_one("#fast-deploy-list", OptionList)
+            option_list.set_options(
+                [Option(f"  {frame} Building the live model catalog…", disabled=True)]
+            )
+            self.query_one("#fast-deploy-status", Static).update(
+                f"[bold #7bf168]{frame}[/][dim] Building the live model catalog "
+                "from Artificial Analysis and Hugging Face…[/dim]"
+            )
+        except Exception:
+            return
 
     def _choose(self, option_id: str) -> None:
         if option_id == _CUSTOM_DEPLOY_OPTION_ID:
@@ -922,6 +953,7 @@ class FastDeployScreen(CopyEnabledScreen):
             "[bold #7bf168]Deploy[/]  [dim]Step 1: Pick a model[/dim]"
         )
         self.query_one("#fast-deploy-model-search", Input).remove_class("hidden")
+        self._catalog_building = False
         visible = self._visible_models()
         if not visible and not self._catalog_info.ready:
             self._render_catalog_unavailable(option_list)

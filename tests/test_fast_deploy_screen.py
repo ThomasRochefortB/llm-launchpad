@@ -744,6 +744,53 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
         quick_deploy._reset_quick_deploy_catalog_cache()
 
+    async def test_building_catalog_shows_in_progress_spinner(self) -> None:
+        from llm_launchpad.core.deploy_log_summary import SUMMARY_SPINNER_FRAMES
+
+        quick_deploy._reset_quick_deploy_catalog_cache()
+        self.addCleanup(quick_deploy._reset_quick_deploy_catalog_cache)
+
+        app = _StyledApp()
+        async with app.run_test(size=(140, 42)) as pilot:
+            app.push_screen(FastDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, FastDeployScreen)
+            self.assertTrue(screen._catalog_building)
+            option_list = screen.query_one("#fast-deploy-list", OptionList)
+            status = str(screen.query_one("#fast-deploy-status", Static).renderable)
+            self.assertIn("Building the live model catalog", status)
+            self.assertIn(SUMMARY_SPINNER_FRAMES[0], status)
+            self.assertIn(SUMMARY_SPINNER_FRAMES[0], str(option_list.get_option_at_index(0).prompt))
+
+            screen._tick_catalog_spinner()
+            self.assertEqual(screen._catalog_spinner_index, 1 % len(SUMMARY_SPINNER_FRAMES))
+            status = str(screen.query_one("#fast-deploy-status", Static).renderable)
+            self.assertIn(SUMMARY_SPINNER_FRAMES[1], status)
+            self.assertIn(
+                SUMMARY_SPINNER_FRAMES[1],
+                str(option_list.get_option_at_index(0).prompt),
+            )
+
+            # Activating a live catalog stops the spinner and renders models.
+            profile = _profile("Spinner-Model", required_vram_gb=8.0)
+            quick_deploy.activate_quick_deploy_catalog(
+                QuickDeployCatalogInfo(source_label="Test catalog", ready=True),
+                (profile,),
+            )
+            screen._apply_model_catalog(force=True)
+            await pilot.pause()
+
+            self.assertFalse(screen._catalog_building)
+            status = str(screen.query_one("#fast-deploy-status", Static).renderable)
+            self.assertNotIn("Building the live model catalog", status)
+            self.assertGreaterEqual(option_list.option_count, 1)
+            self.assertNotIn(
+                "Building the live model catalog",
+                str(option_list.get_option_at_index(0).prompt),
+            )
+
 
 class FastDeployMainMenuTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
