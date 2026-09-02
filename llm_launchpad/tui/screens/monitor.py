@@ -74,6 +74,13 @@ def _connection_copy_text(payload: dict[str, str]) -> str:
     return "\n".join(line for line in lines if not line.endswith(": "))
 
 
+def _result_card_markup(rows: list[tuple[str, str]]) -> str:
+    """Render result-card fields for a finished status check or benchmark."""
+    return "\n".join(
+        f"[dim]{escape(label)}[/dim]  {escape(value)}" for label, value in rows
+    )
+
+
 class MonitorScreen(CopyEnabledScreen):
     """Full-screen operation monitor with streaming logs."""
 
@@ -131,6 +138,8 @@ class MonitorScreen(CopyEnabledScreen):
         self._search_total = 0
         self._success = False
         self._connection_payload: dict[str, str] | None = None
+        self._status_result: dict[str, str] = {}
+        self._result_rows: list[tuple[str, str]] = []
         self._deploy_summarizer = (
             DeployLogSummarizer(deploy_backend)
             if deploy_backend is not None and summarize_backend_logs and not show_debug_logs
@@ -160,7 +169,14 @@ class MonitorScreen(CopyEnabledScreen):
                     yield Button("Copy URL", id="copy-url-btn")
                     yield Button("Copy API key", id="copy-key-btn")
                     yield Button("Copy all", id="copy-all-btn")
+                    yield Button("Manage endpoint", id="connection-manage-btn")
                     yield Button("Done", id="connection-done-btn", variant="primary")
+            with Vertical(id="result-card", classes="hidden"):
+                yield Static("[bold #7bf168]Result[/]", id="result-card-title")
+                yield Static("", id="result-card-body")
+                with Horizontal(id="result-card-actions"):
+                    yield Button("Copy result", id="result-copy-btn")
+                    yield Button("Done", id="result-done-btn", variant="primary")
             yield LogViewer(id="monitor-log-viewer")
         yield Footer()
 
@@ -231,6 +247,7 @@ class MonitorScreen(CopyEnabledScreen):
     def on_log_message(self, message: LogMessage) -> None:
         prefix = "stderr | " if message.stream == "stderr" else ""
         cleaned = _strip_ansi(message.line)
+        self._capture_result_lines(cleaned)
         raw_line = (
             message.line
             if self._show_debug_logs and self._summarize_backend_logs
@@ -283,6 +300,7 @@ class MonitorScreen(CopyEnabledScreen):
         self._append_log_line("")
         if message.success:
             self._append_log_line(f"Operation complete ({message.operation.value}).")
+            self._show_result_card(message)
         else:
             self._append_log_line(f"Operation failed (exit code {message.exit_code}).")
             if message.detail:
@@ -291,11 +309,64 @@ class MonitorScreen(CopyEnabledScreen):
                 self._append_log_line(
                     'Tip: re-run with "Show debug logs" enabled to see full backend logs.'
                 )
+            self._append_log_line("Press esc or q to return, or enter to retry.")
+            return
         if message.success and self._connection_payload:
             self._append_log_line("Press enter or esc to return home.")
             self._show_connection_card()
         else:
             self._append_log_line("Press esc or q to return.")
+
+    def _capture_result_lines(self, cleaned_line: str) -> None:
+        """Capture structured status-probe output while an operation runs."""
+        if self._current_operation != OperationType.STATUS:
+            return
+        if cleaned_line.startswith("Status: healthy"):
+            self._status_result["status"] = cleaned_line.strip()
+        elif cleaned_line.startswith("Test command:"):
+            self._status_result["test_command"] = (
+                cleaned_line.removeprefix("Test command:").strip()
+            )
+
+    def _show_result_card(self, message: OperationDone) -> None:
+        """Render a structured result card for status checks and benchmarks."""
+        rows: list[tuple[str, str]] = []
+        if message.operation == OperationType.STATUS:
+            status_line = self._status_result.get("status") or ""
+            if "healthy" in status_line:
+                rows.append(("Status", "Healthy"))
+            test_command = self._status_result.get("test_command") or ""
+            if test_command:
+                rows.append(("Test command", test_command))
+        elif message.operation == OperationType.BENCHMARK:
+            summary = message.data
+            best_concurrency = getattr(summary, "best_concurrency", None)
+            best_throughput = getattr(summary, "best_output_token_throughput", None)
+            if best_throughput is not None:
+                rows.append(
+                    (
+                        "Best throughput",
+                        f"{best_throughput:.2f} tok/s at concurrency {best_concurrency}",
+                    )
+                )
+            run_dir = getattr(summary, "run_dir", "")
+            if run_dir:
+                rows.append(("Artifacts", run_dir))
+        if not rows:
+            return
+        self._result_rows = rows
+        card = self.query_one("#result-card", Vertical)
+        card.remove_class("hidden")
+        self.query_one("#result-card-body", Static).update(_result_card_markup(rows))
+        self.query_one("#result-done-btn", Button).focus()
+
+    def _copy_result(self) -> None:
+        if not self._result_rows:
+            self.notify("Nothing to copy", timeout=2)
+            return
+        text = "\n".join(f"{label}: {value}" for label, value in self._result_rows)
+        self.app.copy_to_clipboard(text)
+        self.notify("Copied result", timeout=2)
 
     def on_operation_error(self, message: OperationError) -> None:
         self._append_log_line(f"Error: {message.message}")
@@ -393,12 +464,32 @@ class MonitorScreen(CopyEnabledScreen):
             self.action_copy_api_key()
         elif event.button.id == "copy-all-btn":
             self.action_copy_connection()
+        elif event.button.id == "connection-manage-btn":
+            self.action_open_manage()
         elif event.button.id == "connection-done-btn":
+            self.action_finish_success()
+        elif event.button.id == "result-copy-btn":
+            self._copy_result()
+        elif event.button.id == "result-done-btn":
             self.action_finish_success()
 
     def action_finish_success(self) -> None:
         if self._success and self._connection_payload:
             self._pop_after_success()
+            return
+        if self._done and not self._success:
+            # Pop back to the form that started the operation so the user can
+            # adjust options and retry without navigating from scratch.
+            self.app.pop_screen()
+
+    def action_open_manage(self) -> None:
+        """Jump to the Manage screen after a successful deploy."""
+        popper = getattr(self.app, "pop_to_main_menu", None)
+        if callable(popper):
+            popper()
+        pusher = getattr(self.app, "action_push_manage", None)
+        if callable(pusher):
+            pusher()
 
     def _pop_after_success(self) -> None:
         pop_home = getattr(self.app, "pop_to_main_menu", None)
@@ -454,6 +545,11 @@ class MonitorScreen(CopyEnabledScreen):
         self._following = True
         self._unseen_lines = 0
         self._line_count = 0
+        self._result_rows = []
+        try:
+            self.query_one("#result-card", Vertical).add_class("hidden")
+        except Exception:
+            pass
         self.query_one("#monitor-view-status", Static).update(
             self._view_status_markup()
         )

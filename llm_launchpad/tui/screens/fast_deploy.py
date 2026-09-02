@@ -7,9 +7,9 @@ from dataclasses import dataclass
 from textual.actions import SkipAction
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical
+from textual.containers import Horizontal, Vertical
 from textual.message import Message
-from textual.widgets import Footer, OptionList, Select, Static
+from textual.widgets import Footer, Input, OptionList, Select, Static
 from textual.widgets.option_list import Option
 
 from ...core.compute_availability import (
@@ -410,6 +410,19 @@ def _model_fits_gpu_type(
     return False
 
 
+def _model_matches_query(model: QuickDeployModel, query: str) -> bool:
+    """Case-insensitive type-to-search over model display name and recipe ids."""
+    if query in model.display_name.casefold():
+        return True
+    if query in model.id.casefold():
+        return True
+    for profile in model.profiles:
+        for candidate in (profile.repo_id, profile.model_name, profile.aa_model_name):
+            if candidate and query in candidate.casefold():
+                return True
+    return False
+
+
 def _filter_infra_rows(rows: tuple[_InfraRow, ...], gpu_type: str) -> tuple[_InfraRow, ...]:
     if not gpu_type or gpu_type == "any":
         return rows
@@ -477,6 +490,7 @@ class FastDeployScreen(CopyEnabledScreen):
         Binding("escape", "pop_screen", "Back", show=True),
         Binding("enter", "choose_selected", "Choose", show=True, priority=True),
         Binding("g", "focus_gpu_filter", "GPU filter", show=True),
+        Binding("/", "focus_model_search", "Search", show=True),
     ]
 
     def __init__(self) -> None:
@@ -492,6 +506,7 @@ class FastDeployScreen(CopyEnabledScreen):
         self._phase = "models"
         self._snapshot: ComputeAvailabilitySnapshot | None = None
         self._gpu_filter = "any"
+        self._model_search = ""
         self._updating_gpu_filter = False
 
     def compose(self) -> ComposeResult:
@@ -502,12 +517,17 @@ class FastDeployScreen(CopyEnabledScreen):
             )
             yield Static(_subtitle(self._catalog_info), id="fast-deploy-subtitle")
             yield Static("[dim]GPU filter[/dim]", id="fast-deploy-gpu-label")
-            yield Select(
-                options=[("Any GPU", "any")],
-                value="any",
-                allow_blank=False,
-                id="fast-deploy-gpu-filter",
-            )
+            with Horizontal(id="fast-deploy-filter-row"):
+                yield Select(
+                    options=[("Any GPU", "any")],
+                    value="any",
+                    allow_blank=False,
+                    id="fast-deploy-gpu-filter",
+                )
+                yield Input(
+                    placeholder="Search models (type to filter)",
+                    id="fast-deploy-model-search",
+                )
             yield Static("[dim]Loading models...[/dim]", id="fast-deploy-status")
             yield OptionList(id="fast-deploy-list")
             yield Static("", id="fast-deploy-detail")
@@ -540,6 +560,20 @@ class FastDeployScreen(CopyEnabledScreen):
         if event.option_list.id == "fast-deploy-list":
             self._choose(str(event.option.id))
 
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "fast-deploy-model-search":
+            return
+        self._model_search = event.value
+        if self._phase == "models":
+            self._render_model_list(preferred_id=self._highlighted_model_id())
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id != "fast-deploy-model-search":
+            return
+        option_list = self.query_one("#fast-deploy-list", OptionList)
+        if option_list.option_count:
+            option_list.focus()
+
     def _goto_custom_deploy(self) -> None:
         self._cancel_availability_request()
         app = self.app
@@ -563,7 +597,7 @@ class FastDeployScreen(CopyEnabledScreen):
             option_list.set_options(
                 [
                     Option(
-                        "  Open Custom deploy to set models up manually",
+                        "  Open Advanced deploy to configure a model manually",
                         id=_CUSTOM_DEPLOY_OPTION_ID,
                     )
                 ]
@@ -571,7 +605,7 @@ class FastDeployScreen(CopyEnabledScreen):
             option_list.highlighted = 0
             status = (
                 "[yellow]Live model catalog unavailable.[/yellow]\n"
-                "[dim]Enter opens Custom deploy for manual setup; "
+                "[dim]Enter opens Advanced deploy for manual setup; "
                 "press Esc to go back.[/dim]\n"
                 f"[dim]{_escape_markup(_clip(info.error, 140))}[/dim]"
             )
@@ -622,6 +656,7 @@ class FastDeployScreen(CopyEnabledScreen):
         if model is None or self._availability_inflight:
             return
         self._selected_model = model
+        self.query_one("#fast-deploy-model-search", Input).add_class("hidden")
         self.query_one("#fast-deploy-title", Static).update(
             f"[bold #7bf168]Deploy[/]  "
             f"[dim]{_escape_markup(model.display_name)} · Step 2: Pick infrastructure[/dim]"
@@ -847,13 +882,17 @@ class FastDeployScreen(CopyEnabledScreen):
         self._render_model_list(preferred_id=preferred_id)
 
     def _visible_models(self) -> tuple[QuickDeployModel, ...]:
-        if self._gpu_filter == "any" or self._snapshot is None:
-            return self._models
-        return tuple(
-            model
-            for model in self._models
-            if _model_fits_gpu_type(model, self._snapshot, self._gpu_filter)
-        )
+        visible = self._models
+        if self._gpu_filter != "any" and self._snapshot is not None:
+            visible = tuple(
+                model
+                for model in visible
+                if _model_fits_gpu_type(model, self._snapshot, self._gpu_filter)
+            )
+        query = self._model_search.strip().casefold()
+        if query:
+            visible = tuple(model for model in visible if _model_matches_query(model, query))
+        return visible
 
     def viewport_profile_changed(
         self,
@@ -882,6 +921,7 @@ class FastDeployScreen(CopyEnabledScreen):
         self.query_one("#fast-deploy-title", Static).update(
             "[bold #7bf168]Deploy[/]  [dim]Step 1: Pick a model[/dim]"
         )
+        self.query_one("#fast-deploy-model-search", Input).remove_class("hidden")
         visible = self._visible_models()
         if not visible and not self._catalog_info.ready:
             self._render_catalog_unavailable(option_list)
@@ -924,8 +964,10 @@ class FastDeployScreen(CopyEnabledScreen):
         filter_note = ""
         if self._gpu_filter != "any":
             filter_note = f" · GPU {_escape_markup(self._gpu_filter)}"
+        query = self._model_search.strip()
+        search_note = f" · search: {_escape_markup(query)}" if query else ""
         self.query_one("#fast-deploy-status", Static).update(
-            f"[dim]{len(visible)} model{plural}{filter_note} · "
+            f"[dim]{len(visible)} model{plural}{filter_note}{search_note} · "
             f"{_escape_markup(self._catalog_info.source_label)}[/dim]"
         )
         if getattr(self.focused, "id", "") != "fast-deploy-gpu-filter":
@@ -980,7 +1022,7 @@ class FastDeployScreen(CopyEnabledScreen):
         self.query_one("#fast-deploy-detail", Static).update(_fallback_detail(profile))
 
     def action_choose_selected(self) -> None:
-        if isinstance(self.focused, Select):
+        if isinstance(self.focused, (Select, Input)):
             raise SkipAction()
         highlighted = self.query_one("#fast-deploy-list", OptionList).highlighted_option
         if highlighted is not None and highlighted.id is not None:
@@ -988,6 +1030,15 @@ class FastDeployScreen(CopyEnabledScreen):
 
     def action_focus_gpu_filter(self) -> None:
         self.query_one("#fast-deploy-gpu-filter", Select).focus()
+
+    def action_focus_model_search(self) -> None:
+        search = self.query_one("#fast-deploy-model-search", Input)
+        if not search.display:
+            self.notify(
+                "Model search is unavailable at this terminal size.", timeout=3
+            )
+            return
+        search.focus()
 
     def action_pop_screen(self) -> None:
         if self._phase == "models":

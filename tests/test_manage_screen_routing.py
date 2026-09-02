@@ -178,10 +178,49 @@ class ManageScreenRoutingTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertIsInstance(app.screen, EndpointActionsScreen)
             await pilot.press("down")
+            await pilot.press("down")
             await pilot.press("enter")
             await pilot.pause()
 
         self.assertEqual(app.logs_calls, [(endpoint, True)])
+
+    async def test_action_menu_routes_connection_info_and_status_probe(self) -> None:
+        endpoint = _endpoint("active-endpoint", "ap-active")
+        app = _TestApp()
+        app.instances = [endpoint]
+
+        async with app.run_test() as pilot:
+            app.push_screen(ManageScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, ManageScreen)
+            await pilot.press("enter")
+            await pilot.pause()
+
+            actions = app.screen
+            assert isinstance(actions, EndpointActionsScreen)
+            # First menu entry is now Connection info.
+            await pilot.press("enter")
+            await pilot.pause()
+            from llm_launchpad.tui.screens.manage import ConnectionInfoScreen
+
+            self.assertIsInstance(app.screen, ConnectionInfoScreen)
+            app.pop_screen()
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, ManageScreen)
+            await pilot.press("enter")
+            await pilot.pause()
+
+            actions = app.screen
+            assert isinstance(actions, EndpointActionsScreen)
+            # Second entry (status) probes immediately with defaults.
+            await pilot.press("down")
+            await pilot.press("enter")
+            await pilot.pause()
+
+        self.assertEqual(app.status_calls, [(endpoint, None, 60)])
 
     async def test_failed_endpoint_keeps_logs_but_blocks_runtime_actions(self) -> None:
         failed = _endpoint("failed-app", "ap-failed", state="failed")

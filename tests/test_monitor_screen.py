@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from rich.cells import cell_len
 from textual.app import App
+from textual.screen import Screen
 from textual.widgets import Button, Input, Log, Static
 
 from llm_launchpad.protocol.enums import BackendType, DeploymentState, OperationType
@@ -208,7 +209,7 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             content = "\n".join(screen.log_viewer.log_widget.lines)
             self.assertIn("Operation failed (exit code 9).", content)
             self.assertIn("Detail: backend error", content)
-            self.assertIn("Press esc or q to return.", content)
+            self.assertIn("Press esc or q to return, or enter to retry.", content)
             self.assertIn("Error: worker failed", content)
             self.assertNotIn("[red", content)
             self.assertNotIn("[green", content)
@@ -501,6 +502,89 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             screen.action_go_back()
             await pilot.pause()
             self.assertEqual(app.home_calls, 0)
+
+    async def test_failed_operation_enter_pops_back_for_retry(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(Screen())
+            app.push_screen(MonitorScreen(title="Status Check"))
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, MonitorScreen)
+            self.assertEqual(len(app.screen_stack), 3)
+            screen.on_operation_done(
+                OperationDone(operation=OperationType.STATUS, success=False, exit_code=1)
+            )
+            await pilot.pause()
+
+            screen.action_finish_success()
+            await pilot.pause()
+
+            self.assertEqual(len(app.screen_stack), 2)
+
+    async def test_status_success_shows_result_card_with_curl(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(MonitorScreen(title="Status Check"))
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, MonitorScreen)
+            card = screen.query_one("#result-card")
+            self.assertTrue(card.has_class("hidden"))
+
+            screen.on_state_changed(
+                StateChanged(DeploymentState.RUNNING, operation=OperationType.STATUS)
+            )
+            screen.on_log_message(LogMessage("Status: healthy (backend=vllm, url=https://x.test)"))
+            screen.on_log_message(LogMessage("Test command:\ncurl https://x.test/v1/chat"))
+            screen.on_operation_done(
+                OperationDone(operation=OperationType.STATUS, success=True)
+            )
+            await pilot.pause()
+
+            self.assertFalse(card.has_class("hidden"))
+            body = str(screen.query_one("#result-card-body", Static).content)
+            self.assertIn("Healthy", body)
+            self.assertIn("curl https://x.test/v1/chat", body)
+
+    async def test_connection_card_manage_button_routes_to_manage(self) -> None:
+        class _RouteApp(App[None]):
+            def __init__(self) -> None:
+                super().__init__()
+                self.home_calls = 0
+                self.manage_calls = 0
+
+            def pop_to_main_menu(self) -> None:
+                self.home_calls += 1
+                self.pop_screen()
+
+            def action_push_manage(self) -> None:
+                self.manage_calls += 1
+
+        app = _RouteApp()
+        async with app.run_test() as pilot:
+            app.push_screen(MonitorScreen(title="Deploy"))
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, MonitorScreen)
+            screen.on_connection_summary_ready(
+                ConnectionSummaryReady(
+                    {
+                        "base_url": "https://example.modal.run/v1",
+                        "model_id": "Qwen3-4B",
+                        "display_name": "Qwen3-4B",
+                    }
+                )
+            )
+            screen.on_operation_done(
+                OperationDone(operation=OperationType.DEPLOY, success=True)
+            )
+            await pilot.pause()
+
+            screen.action_open_manage()
+
+        self.assertEqual(app.home_calls, 1)
+        self.assertEqual(app.manage_calls, 1)
 
     async def test_connection_card_stays_hidden_until_operation_succeeds(self) -> None:
         app = _HomeApp()

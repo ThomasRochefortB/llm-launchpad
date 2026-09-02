@@ -212,6 +212,7 @@ class CliMainCommandTests(unittest.TestCase):
 
     def test_tui_defaults_to_terminal_selection_over_ssh(self) -> None:
         app_instance = Mock()
+        app_instance.mouse_enabled = False
         with (
             patch.dict("os.environ", {"SSH_CONNECTION": "1"}, clear=True),
             patch("llm_launchpad.tui.app.TuiApp", return_value=app_instance) as app_cls,
@@ -221,11 +222,12 @@ class CliMainCommandTests(unittest.TestCase):
             patch("llm_launchpad.cli.main.ModalBackend.is_cli_available", return_value=True),
         ):
             cli_main.tui()
-        app_cls.assert_called_once_with(mouse_enabled=False)
+        app_cls.assert_called_once_with(mouse_enabled=None)
         app_instance.run.assert_called_once_with(mouse=False)
 
     def test_tui_allows_mouse_override(self) -> None:
         app_instance = Mock()
+        app_instance.mouse_enabled = True
         with (
             patch("llm_launchpad.tui.app.TuiApp", return_value=app_instance) as app_cls,
             patch("llm_launchpad.core.backend.ModalBackend.terminate_all", return_value=None),
@@ -239,6 +241,7 @@ class CliMainCommandTests(unittest.TestCase):
 
     def test_tui_allows_no_mouse_override(self) -> None:
         app_instance = Mock()
+        app_instance.mouse_enabled = False
         with (
             patch("llm_launchpad.tui.app.TuiApp", return_value=app_instance) as app_cls,
             patch("llm_launchpad.core.backend.ModalBackend.terminate_all", return_value=None),

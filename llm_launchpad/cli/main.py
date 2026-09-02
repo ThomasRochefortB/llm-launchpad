@@ -37,6 +37,7 @@ from ..core.diagnostics import log_exception, setup_logging
 from ..core.deploy_log_summary import DeployLogSummarizer, beautify_summary_line
 from ..core.hf_models import fetch_gguf_quant_metadata
 from ..core.modal_gpu import fetch_modal_gpu_types
+from ..tui import mouse as mouse_defaults
 from ..core.naming import (
     auto_instance_name_for_backend,
     build_deployment_name,
@@ -177,58 +178,19 @@ def _preflight(
 
 
 def _parse_bool_env(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
-        return default
-    normalized = raw.strip().lower()
-    if normalized in {"1", "true", "yes", "on"}:
-        return True
-    if normalized in {"0", "false", "no", "off"}:
-        return False
-    return default
+    return mouse_defaults.parse_bool_env(name, default)
 
 
 def _is_ssh_session() -> bool:
-    return bool(os.getenv("SSH_CONNECTION") or os.getenv("SSH_TTY"))
+    return mouse_defaults.is_ssh_session()
 
 
 def _likely_remote_clipboard_supported() -> bool:
-    """Best-effort guess for whether remote clipboard writes can reach the local terminal."""
-    marker_values = [
-        os.getenv("TERM", ""),
-        os.getenv("TERM_PROGRAM", ""),
-        os.getenv("LC_TERMINAL", ""),
-    ]
-    normalized_markers = " ".join(value.strip().lower() for value in marker_values if value)
-
-    if any(
-        os.getenv(name)
-        for name in (
-            "ITERM_SESSION_ID",
-            "KITTY_WINDOW_ID",
-            "KITTY_PUBLIC_KEY",
-            "WEZTERM_EXECUTABLE",
-            "GHOSTTY_RESOURCES_DIR",
-        )
-    ):
-        return True
-
-    if any(marker in normalized_markers for marker in ("iterm", "wezterm", "kitty", "ghostty", "vscode")):
-        return True
-
-    if "apple_terminal" in normalized_markers or "apple terminal" in normalized_markers:
-        return False
-
-    # Over SSH, default to terminal-native selection unless we recognize a terminal
-    # that is likely to accept clipboard escape sequences from the remote app.
-    return False
+    return mouse_defaults.likely_remote_clipboard_supported()
 
 
 def _default_tui_mouse_enabled() -> bool:
-    default = True
-    if _is_ssh_session():
-        default = _likely_remote_clipboard_supported()
-    return _parse_bool_env("LLM_LAUNCHPAD_TUI_MOUSE", default)
+    return mouse_defaults.default_tui_mouse_enabled()
 
 
 def _ensure_tui_runtime() -> None:
@@ -685,10 +647,9 @@ def tui(
         raise typer.Exit(code=1)
 
     _ensure_tui_runtime()
-    resolved_mouse = _default_tui_mouse_enabled() if mouse is None else mouse
-    app_instance = TuiApp(mouse_enabled=resolved_mouse)
+    app_instance = TuiApp(mouse_enabled=mouse)
     try:
-        app_instance.run(mouse=resolved_mouse)
+        app_instance.run(mouse=app_instance.mouse_enabled)
     finally:
         from ..core.backend import ModalBackend
         ModalBackend.terminate_all()

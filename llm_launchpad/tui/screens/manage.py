@@ -11,6 +11,7 @@ from textual.widgets import Button, DataTable, Footer, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
 from ...protocol.models import EndpointInfo
+from ..connection import endpoint_connection_payload, resolve_openai_base_url
 from ..navigation import move_focus_across_widgets
 from ..responsive import ViewportProfile, WidthMode
 from ..widgets.adaptive_table import AdaptiveColumn, AdaptiveDataTable
@@ -85,7 +86,7 @@ def _available_actions(row: EndpointInfo) -> frozenset[str]:
     actions = {"logs"}
     state = _normalized_state(row.state)
     if state in _READY_STATES or bool((row.web_url or "").strip()):
-        actions.update(("status", "benchmark"))
+        actions.update(("status", "benchmark", "connection"))
     if _is_stoppable_state(state):
         actions.add("stop")
     return frozenset(actions)
@@ -182,6 +183,7 @@ class ManageScreen(CopyEnabledScreen):
         Binding("l", "logs_selected", "Logs", show=False),
         Binding("b", "benchmark_selected", "Benchmark", show=False),
         Binding("x", "stop_selected", "Stop", show=False),
+        Binding("u", "copy_base_url", "Copy URL", show=False),
     ]
 
     def compose(self) -> ComposeResult:
@@ -310,6 +312,26 @@ class ManageScreen(CopyEnabledScreen):
         if row is not None:
             self.app.push_screen(StopConfirmScreen(row))
 
+    def action_copy_base_url(self) -> None:
+        row = self._selected_endpoint()
+        if row is None:
+            self.notify("Choose an endpoint first.", severity="warning", timeout=4)
+            return
+        payload = endpoint_connection_payload(row, username=self._modal_username())
+        base_url = payload.get("base_url")
+        if not base_url:
+            self.notify(
+                "No endpoint URL is stored for this deployment.",
+                severity="warning",
+                timeout=5,
+            )
+            return
+        self.app.copy_to_clipboard(base_url)
+        self.notify("Copied base URL", timeout=2)
+
+    def _modal_username(self) -> str:
+        return str(getattr(self.app, "_username", "") or "")
+
     def action_pop_screen(self) -> None:
         self.app.pop_screen()
 
@@ -380,12 +402,16 @@ class ManageScreen(CopyEnabledScreen):
                 ("logs", "logs"),
                 ("benchmark", "benchmark"),
                 ("stop", "stop"),
+                ("connection", "connection info"),
             )
             if action in actions
         ]
+        base_url, _derived = resolve_openai_base_url(row, username=self._modal_username())
+        url_line = f"\n[dim]Base URL:[/dim] {escape(base_url)}" if base_url else ""
         detail.update(
             f"[bold]{escape(_endpoint_name(row))}[/bold]  "
-            f"[dim]{escape(_endpoint_host(row))} · {escape(_state_label(row.state))}[/dim]\n"
+            f"[dim]{escape(_endpoint_host(row))} · {escape(_state_label(row.state))}[/dim]"
+            f"{url_line}\n"
             f"Actions: {', '.join(action_labels) or 'none'}"
         )
 
@@ -398,6 +424,7 @@ class EndpointActionsScreen(CopyEnabledScreen):
     ]
 
     _ACTION_LABELS = (
+        ("connection", "  Connection info"),
         ("status", "  Check status"),
         ("logs", "  View logs"),
         ("benchmark", "  Run benchmark"),
@@ -454,14 +481,105 @@ class EndpointActionsScreen(CopyEnabledScreen):
         if action not in _available_actions(self.endpoint):
             return
         self.app.pop_screen()
-        if action == "status":
-            self.app.push_screen(StatusOptionsScreen(self.endpoint))
+        if action == "connection":
+            self.app.push_screen(ConnectionInfoScreen(self.endpoint))
+        elif action == "status":
+            # The common path probes immediately with defaults; the URL-override
+            # form stays available via the hidden "s" shortcut on Manage.
+            self.app.begin_status(self.endpoint)  # type: ignore[attr-defined]
         elif action == "logs":
             self.app.begin_logs(self.endpoint, follow=True)  # type: ignore[attr-defined]
         elif action == "benchmark":
             self.app.push_screen(BenchmarkOptionsScreen(self.endpoint))
         elif action == "stop":
             self.app.push_screen(StopConfirmScreen(self.endpoint))
+
+
+class ConnectionInfoScreen(CopyEnabledScreen):
+    """Show OpenAI-compatible connection details for one endpoint."""
+
+    BINDINGS = [
+        Binding("escape", "pop_screen", "Back", show=True),
+        Binding("u", "copy_base_url", "Copy URL", show=False),
+        Binding("k", "copy_api_key", "Copy key", show=False),
+    ]
+
+    def __init__(self, endpoint: EndpointInfo) -> None:
+        super().__init__()
+        self.endpoint = endpoint
+        self._payload: dict[str, str | None] = {}
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(classes="screen-scroll"):
+            yield Static("[bold #7bf168]Connection Info[/]")
+            yield Static(
+                f"[bold]{escape(_endpoint_name(self.endpoint))}[/bold]  "
+                f"[dim]{escape(_endpoint_summary(self.endpoint))}[/dim]"
+            )
+            yield Static("", id="connection-info-fields")
+            with Horizontal(id="connection-info-actions"):
+                yield Button("Copy base URL", id="connection-copy-url")
+                yield Button("Copy model ID", id="connection-copy-model")
+                yield Button("Copy API key", id="connection-copy-key")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._payload = endpoint_connection_payload(
+            self.endpoint,
+            username=self._modal_username(),
+        )
+        self.query_one("#connection-info-fields", Static).update(
+            self._fields_markup(self._payload)
+        )
+        has_key = bool((self._payload.get("api_key") or "").strip())
+        self.query_one("#connection-copy-key", Button).display = has_key
+        self.query_one("#connection-copy-url", Button).focus()
+
+    def _modal_username(self) -> str:
+        return str(getattr(self.app, "_username", "") or "")
+
+    @staticmethod
+    def _fields_markup(payload: dict[str, str | None]) -> str:
+        base_url = payload.get("base_url") or "(unavailable while the app is starting)"
+        model_id = payload.get("model_id") or "(unknown)"
+        display_name = payload.get("display_name") or "(unknown)"
+        api_key = (payload.get("api_key") or "").strip()
+        key_line = (
+            f"[dim]API key[/dim]   {escape(api_key)}"
+            if api_key
+            else "[dim]API key[/dim]   none (no auth by default)"
+        )
+        return (
+            f"[dim]Base URL[/dim]   {escape(base_url)}\n"
+            f"[dim]Model ID[/dim]   {escape(model_id)}\n"
+            f"[dim]Display[/dim]    {escape(display_name)}\n"
+            f"{key_line}"
+        )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "connection-copy-url":
+            self.action_copy_base_url()
+        elif event.button.id == "connection-copy-model":
+            self._copy_field("model_id", empty_message="No model ID to copy")
+        elif event.button.id == "connection-copy-key":
+            self.action_copy_api_key()
+
+    def _copy_field(self, field: str, *, empty_message: str) -> None:
+        value = (self._payload.get(field) or "").strip()
+        if not value:
+            self.notify(empty_message, timeout=2)
+            return
+        self.app.copy_to_clipboard(value)
+        self.notify(f"Copied {field.replace('_', ' ')}", timeout=2)
+
+    def action_copy_base_url(self) -> None:
+        self._copy_field("base_url", empty_message="No base URL to copy")
+
+    def action_copy_api_key(self) -> None:
+        self._copy_field("api_key", empty_message="No API key to copy")
+
+    def action_pop_screen(self) -> None:
+        self.app.pop_screen()
 
 
 class StatusOptionsScreen(CopyEnabledScreen):
@@ -534,7 +652,8 @@ class BenchmarkOptionsScreen(CopyEnabledScreen):
 
     BINDINGS = [
         Binding("escape", "pop_screen", "Back", show=True),
-        Binding("ctrl+b", "do_submit", "Benchmark", show=True),
+        Binding("enter", "do_submit", "Benchmark", show=True),
+        Binding("ctrl+b", "do_submit", "Benchmark", show=False),
     ]
 
     def __init__(self, endpoint: EndpointInfo) -> None:

@@ -69,9 +69,11 @@ from .screens.fast_deploy import FastDeployScreen
 from .screens.manage import ManageScreen
 from .screens.monitor import MonitorScreen
 from .screens.quick_deploy import QuickDeployScreen
+from .screens.setup import SetupRequiredScreen
 from .screens.storage import StorageScreen
 from .screens.settings import SettingsScreen
 from .clipboard import read_system_clipboard, write_system_clipboard
+from .mouse import default_tui_mouse_enabled
 from .visual import (
     LAUNCHPAD_THEMES,
     normalize_tui_density,
@@ -169,13 +171,20 @@ class TuiApp(App):
     _ENDPOINT_CACHE_TTL_SECONDS = 20.0
     _STORAGE_CACHE_TTL_SECONDS = 20.0
 
-    def __init__(self, *, mouse_enabled: bool = True, **kwargs: object) -> None:
+    def __init__(self, *, mouse_enabled: bool | None = None, **kwargs: object) -> None:
         super().__init__(**kwargs)
         for theme in LAUNCHPAD_THEMES:
             self.register_theme(theme)
         visual_settings = ConfigStore().load()
         self.theme = normalize_tui_theme(visual_settings.tui_theme)
         self.tui_density = normalize_tui_density(visual_settings.tui_density)
+        self._confirm_quit = visual_settings.confirm_quit
+        if mouse_enabled is None:
+            mouse_enabled = (
+                visual_settings.tui_mouse
+                if visual_settings.tui_mouse is not None
+                else default_tui_mouse_enabled()
+            )
         self._monochrome_filter = Monochrome(
             enabled=self.theme == "launchpad-monochrome"
         )
@@ -325,6 +334,9 @@ class TuiApp(App):
         """Require a second Ctrl+C press before quitting the TUI."""
         if self._copy_current_selection():
             return
+        if not self._confirm_quit:
+            await self.action_quit()
+            return
         now = time.monotonic()
         if (
             self._ctrl_c_last_requested_at > 0.0
@@ -362,20 +374,22 @@ class TuiApp(App):
     def on_mount(self) -> None:
         """Launch the TUI when at least one compute provider is configured.
 
-        Authentication is surfaced inside the main menu instead of gating startup.
+        Missing authentication is surfaced inside the app via a dedicated setup
+        screen instead of exiting before the user can read the message.
         """
+        if not self._provider_is_configured():
+            self.push_screen(SetupRequiredScreen())
+            return
+        self._enter_main_menu()
+
+    def _provider_is_configured(self) -> bool:
         modal_available = ModalBackend.is_cli_available()
         prime_available = get_prime_auth_status().authenticated
-        if not modal_available and not prime_available:
-            self.notify(
-                "No compute provider is configured. Run `modal setup` or `prime login`.",
-                severity="error",
-                timeout=10,
-            )
-            self.exit(return_code=1)
-            return
+        return modal_available or prime_available
+
+    def _enter_main_menu(self) -> None:
         self.push_screen(MainMenuScreen(username="", version=self._version))
-        if modal_available:
+        if ModalBackend.is_cli_available():
             self.run_worker(
                 self._run_load_modal_username,
                 name="modal-username-worker",
@@ -386,6 +400,22 @@ class TuiApp(App):
                 "Terminal copy mode active. Press Ctrl+T to enable mouse.",
                 timeout=4,
             )
+
+    def recheck_provider_setup(self) -> bool:
+        """Re-run provider detection; enter the main menu when configured.
+
+        Returns whether the app entered the main menu. Called by the setup
+        screen's Re-check action after the user authenticates elsewhere.
+        """
+        if not self._provider_is_configured():
+            return False
+        try:
+            if isinstance(self.screen, SetupRequiredScreen):
+                self.pop_screen()
+        except Exception:
+            pass
+        self._enter_main_menu()
+        return True
 
     def _run_load_modal_username(self) -> None:
         self.post_message(ModalUsernameLoaded(ModalBackend.get_username() or ""))

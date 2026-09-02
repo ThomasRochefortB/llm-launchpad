@@ -728,10 +728,10 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             assert isinstance(screen, FastDeployScreen)
             option_list = screen.query_one("#fast-deploy-list", OptionList)
             prompt = str(option_list.get_option_at_index(0).prompt)
-            self.assertIn("Open Custom deploy", prompt)
+            self.assertIn("Open Advanced deploy", prompt)
             status = str(screen.query_one("#fast-deploy-status", Static).renderable)
             self.assertIn("Live model catalog unavailable", status)
-            self.assertIn("Custom deploy", status)
+            self.assertIn("Advanced deploy", status)
             self.assertIn("catalog build failed", status)
 
             # Selecting the custom-deploy option triggers the custom deploy flow.

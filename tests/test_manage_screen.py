@@ -57,7 +57,7 @@ class ManageScreenHelpersTests(unittest.TestCase):
 
         self.assertEqual(
             _available_actions(running),
-            frozenset({"status", "logs", "benchmark", "stop"}),
+            frozenset({"status", "logs", "benchmark", "stop", "connection"}),
         )
         self.assertEqual(_available_actions(failed), frozenset({"logs"}))
         self.assertEqual(_available_actions(starting), frozenset({"logs", "stop"}))

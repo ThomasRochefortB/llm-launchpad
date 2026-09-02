@@ -190,7 +190,7 @@ class TuiAppStorageCacheTests(unittest.TestCase):
         push_screen.assert_called_once()
 
     def test_on_mount_launches_main_menu_without_authenticated_preflight(self) -> None:
-        app = TuiApp()
+        app = TuiApp(mouse_enabled=True)
         app._version = "1.2.3"
         app._orchestrator = type(
             "FakeOrchestrator",
@@ -220,6 +220,47 @@ class TuiAppStorageCacheTests(unittest.TestCase):
             name="modal-username-worker",
             thread=True,
         )
+
+    def test_on_mount_shows_setup_screen_when_no_provider_is_authenticated(self) -> None:
+        app = TuiApp(mouse_enabled=True)
+        app._version = "1.2.3"
+
+        with (
+            patch("llm_launchpad.tui.app.ModalBackend.is_cli_available", return_value=False),
+            patch("llm_launchpad.tui.app.get_prime_auth_status", return_value=PrimeAuthStatus(authenticated=False)),
+            patch.object(app, "push_screen") as push_screen,
+            patch.object(app, "run_worker", return_value=None) as run_worker,
+            patch.object(app, "notify", return_value=None) as notify,
+            patch.object(app, "exit", return_value=None) as exit_mock,
+        ):
+            app.on_mount()
+
+        notify.assert_not_called()
+        exit_mock.assert_not_called()
+        run_worker.assert_not_called()
+        push_screen.assert_called_once()
+        from llm_launchpad.tui.screens.setup import SetupRequiredScreen
+
+        self.assertIsInstance(push_screen.call_args.args[0], SetupRequiredScreen)
+
+    def test_recheck_provider_setup_enters_main_menu_after_auth(self) -> None:
+        app = TuiApp(mouse_enabled=True)
+        app._version = "1.2.3"
+
+        with (
+            patch("llm_launchpad.tui.app.ModalBackend.is_cli_available", return_value=False),
+            patch("llm_launchpad.tui.app.get_prime_auth_status", return_value=PrimeAuthStatus(authenticated=False)),
+            patch.object(app, "push_screen", return_value=None) as push_screen,
+            patch.object(app, "run_worker", return_value=None),
+        ):
+            self.assertFalse(app.recheck_provider_setup())
+
+            with patch(
+                "llm_launchpad.tui.app.get_prime_auth_status", return_value=PrimeAuthStatus(authenticated=True)
+            ):
+                self.assertTrue(app.recheck_provider_setup())
+
+        self.assertEqual(push_screen.call_count, 1)
 
     def test_deploy_connection_summary_lines_for_llamacpp_are_simple_and_boxed(self) -> None:
         config = DeploymentConfig(
