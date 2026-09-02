@@ -12,12 +12,17 @@ import threading
 from typing import Any, Iterable
 
 from ..protocol.enums import BackendType, ComputeProvider
-from ..protocol.models import DeploymentConfig, EndpointInfo
+from ..protocol.models import DeploymentConfig, EndpointInfo, ReasoningCapabilities
 from .config import SETTINGS_DIR
 from .naming import (
     default_llamacpp_served_model_name,
     default_served_model_name,
     infer_provider_from_app_name,
+)
+from .reasoning_profiles import (
+    reasoning_capabilities_from_dict,
+    reasoning_capabilities_to_dict,
+    reasoning_variants,
 )
 
 OPENCODE_CONFIG_PATH = Path.home() / ".config" / "opencode" / "opencode.json"
@@ -51,6 +56,7 @@ class OpenCodeConnection:
     api_key: str | None = None
     context_limit: int | None = None
     output_limit: int | None = None
+    reasoning: ReasoningCapabilities | None = None
 
 
 @dataclass
@@ -218,6 +224,8 @@ def build_openai_connection_payload(
         payload["context_limit"] = context_limit
     if output_limit is not None:
         payload["output_limit"] = output_limit
+    if config.reasoning is not None:
+        payload["reasoning"] = reasoning_capabilities_to_dict(config.reasoning)
     return payload
 
 
@@ -245,6 +253,7 @@ def build_connection_from_config(
         api_key=config.endpoint_api_key,
         context_limit=payload.get("context_limit"),
         output_limit=payload.get("output_limit"),
+        reasoning=reasoning_capabilities_from_dict(payload.get("reasoning")),
     )
 
 
@@ -298,7 +307,6 @@ def build_connection_from_endpoint(
         row.max_context_tokens,
         row.max_output_tokens,
     )
-
     return OpenCodeConnection(
         app_name=app_name,
         instance_name=instance_name,
@@ -312,6 +320,7 @@ def build_connection_from_endpoint(
         api_key=row.endpoint_api_key,
         context_limit=context_limit,
         output_limit=output_limit,
+        reasoning=row.reasoning,
     )
 
 
@@ -361,6 +370,18 @@ def resolve_connection_for_app(
     for row in visible_launchpad_rows(rows or []):
         if (row.name or "").strip() != target_app_name:
             continue
+        if (
+            fallback_config is not None
+            and (fallback_config.app_name or "").strip() == target_app_name
+        ):
+            fallback_url = (row.web_url or fallback_server_url or "").strip()
+            if fallback_url:
+                selected = build_connection_from_config(
+                    fallback_config,
+                    fallback_url,
+                )
+                if selected is not None:
+                    return selected
         resolved = build_connection_from_endpoint(
             row,
             username=username,
@@ -650,6 +671,13 @@ def _provider_payload(connection: OpenCodeConnection) -> dict[str, Any]:
             "context": context_limit,
             "output": output_limit,
         }
+    if connection.reasoning is not None:
+        model["reasoning"] = True
+        model["variants"] = reasoning_variants(connection.reasoning)
+        if connection.reasoning.interleaved_field:
+            model["interleaved"] = {
+                "field": connection.reasoning.interleaved_field,
+            }
     return {
         "npm": _MANAGED_NPM,
         "name": connection.provider_name,
@@ -672,6 +700,7 @@ def _registry_entry_for_connection(connection: OpenCodeConnection) -> dict[str, 
         "display_name": connection.display_name,
         "context_limit": connection.context_limit,
         "output_limit": connection.output_limit,
+        "reasoning": reasoning_capabilities_to_dict(connection.reasoning),
     }
 
 

@@ -709,7 +709,16 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             overhead_gb=10.0,
             context_tokens=8192,
         )
-        with patch("llm_launchpad.tui.screens.deploy.fetch_vllm_memory_breakdown", return_value=estimate):
+        with (
+            patch(
+                "llm_launchpad.tui.screens.deploy.fetch_vllm_memory_breakdown",
+                return_value=estimate,
+            ),
+            patch(
+                "llm_launchpad.tui.screens.deploy.discover_reasoning_capabilities",
+                return_value=None,
+            ) as discover_reasoning,
+        ):
             async with app.run_test() as pilot:
                 app.push_screen(VllmDeployScreen())
                 await pilot.pause()
@@ -723,6 +732,11 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 text = str(screen.query_one("#vllm-vram-status", Static).content)
                 self.assertIn("Estimated VRAM", text)
                 self.assertIn("~60.0 GB/GPU @ TP=2", text)
+                discover_reasoning.assert_any_call(
+                    BackendType.VLLM,
+                    "Qwen/Qwen3-8B",
+                    None,
+                )
 
     async def test_vllm_memory_status_handles_unavailable_estimate(self) -> None:
         app = _TestApp()

@@ -23,6 +23,7 @@ from ..protocol.events import (
     StateChangeEvent,
 )
 from .backend import ModalBackend
+from .diagnostics import log_exception
 from .naming import legacy_app_name
 from .prime_backend import PrimeBackend
 
@@ -187,7 +188,9 @@ class WarmupRunner:
             # flush each write immediately when stdout is a pipe.
             unbuf_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
             proc = subprocess.Popen(
-                ["modal", "app", "logs", *follow, target_app_name],
+                ModalBackend._resolve_command(
+                    ["modal", "app", "logs", *follow, target_app_name]
+                ),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -203,7 +206,7 @@ class WarmupRunner:
                     for raw_line in proc.stdout:
                         q.put(raw_line.rstrip("\n"))
                 except Exception:
-                    pass
+                    log_exception("Modal log-tail reader stopped unexpectedly")
                 finally:
                     q.put(None)  # sentinel: reader finished
 
@@ -277,7 +280,7 @@ class WarmupRunner:
                     try:
                         logs_proc.terminate()
                     except Exception:
-                        pass
+                        log_exception("Failed to terminate Modal log tail on shutdown")
                 return
 
             if (
@@ -306,7 +309,7 @@ class WarmupRunner:
                     try:
                         logs_proc.terminate()
                     except Exception:
-                        pass
+                        log_exception("Failed to terminate Modal log tail on timeout")
                 yield ErrorEvent(
                     message=f"Timed out after {timeout}s. Last error: {last_err}",
                     operation=OperationType.WARMUP,
@@ -332,7 +335,7 @@ class WarmupRunner:
                         try:
                             logs_proc.terminate()
                         except Exception:
-                            pass
+                            log_exception("Failed to terminate Modal log tail after readiness")
                     yield LogEvent(line="Server is ready!")
                     curl_cmd = ModalBackend.test_curl_command(
                         backend,
@@ -388,7 +391,7 @@ class WarmupRunner:
                                 seen_log_lines.add(line)
                                 yield LogEvent(line=line, operation=OperationType.WARMUP)
                     except Exception:
-                        pass
+                        log_exception("Failed to fetch Prime pod logs during warmup")
             except Exception as exc:
                 last_err = str(exc)
 
@@ -413,7 +416,7 @@ def fetch_historical_logs(
     try:
         unbuf_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
         hist = subprocess.run(
-            ["modal", "app", "logs", app_name],
+            ModalBackend._resolve_command(["modal", "app", "logs", app_name]),
             capture_output=True,
             text=True,
             timeout=15,

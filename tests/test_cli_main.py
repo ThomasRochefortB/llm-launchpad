@@ -169,6 +169,32 @@ class CliMainCommandTests(unittest.TestCase):
         self.assertEqual(argv, ["llm-launchpad", "tui"])
         fake_app.assert_called_once_with()
 
+    def test_invalid_provider_is_rejected_without_a_traceback(self) -> None:
+        result = self.runner.invoke(
+            cli_main.app,
+            ["status", "--provider", "bogus", "--app-name", "vllm-test"],
+        )
+
+        self.assertEqual(result.exit_code, 2)
+        self.assertIn("Invalid value for '--provider'", result.output)
+        self.assertIn("modal", result.output)
+        self.assertIn("prime", result.output)
+        self.assertNotIn("Traceback", result.output)
+        self.assertNotIsInstance(result.exception, ValueError)
+
+    def test_invalid_backend_is_rejected_without_a_traceback(self) -> None:
+        result = self.runner.invoke(
+            cli_main.app,
+            ["status", "--backend", "bogus", "--app-name", "vllm-test"],
+        )
+
+        self.assertEqual(result.exit_code, 2)
+        self.assertIn("Invalid value for '--backend'", result.output)
+        self.assertIn("llamacpp", result.output)
+        self.assertIn("vllm", result.output)
+        self.assertNotIn("Traceback", result.output)
+        self.assertNotIsInstance(result.exception, ValueError)
+
     def test_deploy_success_prints_target(self) -> None:
         orch = SimpleNamespace(
             deploy=lambda _config: [
@@ -1009,7 +1035,7 @@ class CliMainCommandTests(unittest.TestCase):
             patch(
                 "llm_launchpad.cli.main._load_rows_for_opencode_sync",
                 return_value=(rows, (ComputeProvider.MODAL, ComputeProvider.PRIME), []),
-            ),
+            ) as load_rows,
             patch("llm_launchpad.cli.main._sync_opencode_cli") as sync_mock,
         ):
             result = self.runner.invoke(
@@ -1017,6 +1043,7 @@ class CliMainCommandTests(unittest.TestCase):
                 ["opencode", "sync", "--app-name", "vllm-qwen3", "--dry-run"],
             )
         self.assertEqual(result.exit_code, 0)
+        load_rows.assert_called_once_with(None, persist_backfill=False)
         sync_mock.assert_called_once_with(
             target_app_name="vllm-qwen3",
             current_rows=rows,
@@ -1111,7 +1138,10 @@ class CliMainCommandTests(unittest.TestCase):
                 return_value=(ComputeProvider.MODAL,),
             ),
             patch("llm_launchpad.cli.main.ModalBackend.list_apps", return_value=None),
-            patch("llm_launchpad.cli.main.merge_connections", side_effect=lambda rows: rows),
+            patch(
+                "llm_launchpad.cli.main.merge_connections",
+                side_effect=lambda rows, **_kwargs: rows,
+            ),
             patch(
                 "llm_launchpad.cli.main.rows_from_connection_cache",
                 return_value=cached,
@@ -1147,7 +1177,10 @@ class CliMainCommandTests(unittest.TestCase):
             ),
             patch("llm_launchpad.cli.main.ModalBackend.list_apps", return_value=None),
             patch("llm_launchpad.cli.main.PrimeBackend") as prime_mock,
-            patch("llm_launchpad.cli.main.merge_connections", side_effect=lambda rows: rows),
+            patch(
+                "llm_launchpad.cli.main.merge_connections",
+                side_effect=lambda rows, **_kwargs: rows,
+            ),
             patch(
                 "llm_launchpad.cli.main.rows_from_connection_cache",
                 return_value=cached_modal,

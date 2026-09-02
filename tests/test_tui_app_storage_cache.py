@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import PropertyMock, patch
 
+from llm_launchpad.core.hf_models import GgufQuantMetadata
 from llm_launchpad.core.prime_auth import PrimeAuthStatus
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider, OperationType
 from llm_launchpad.protocol.events import EndpointAvailableEvent, LogEvent, OperationCompleteEvent
@@ -37,6 +38,36 @@ class TuiAppStorageCacheTests(unittest.TestCase):
         integration_patch = patch.object(TuiApp, "_sync_opencode", return_value=None)
         integration_patch.start()
         self.addCleanup(integration_patch.stop)
+
+    def test_llamacpp_selection_prefetches_reasoning_capabilities(self) -> None:
+        receiver = _MessageReceiver()
+        metadata = GgufQuantMetadata(
+            quantizations=["Q4_K_M"],
+            vram_gb_by_quant={"Q4_K_M": 12.0},
+            architecture="llama",
+        )
+        with (
+            patch(
+                "llm_launchpad.tui.app.fetch_gguf_quant_metadata",
+                return_value=metadata,
+            ),
+            patch(
+                "llm_launchpad.tui.app.discover_reasoning_capabilities",
+                return_value=None,
+            ) as discover_reasoning,
+        ):
+            TuiApp()._run_fetch_llamacpp_quants(
+                "acme/Future-Reasoner-GGUF",
+                "release-1",
+                receiver,
+            )
+
+        discover_reasoning.assert_called_once_with(
+            BackendType.LLAMACPP,
+            "acme/Future-Reasoner-GGUF",
+            "release-1",
+        )
+        self.assertEqual(len(receiver.messages), 1)
 
     def test_packaging_config_includes_tui_theme_css(self) -> None:
         pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
@@ -536,6 +567,7 @@ class TuiAppStorageCacheTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             app = TuiApp()
             app._deploy_connection_cache_path = Path(tmp) / "deployment_connection_summaries.json"
+            app._storage_cache_path = Path(tmp) / "storage_snapshot.json"
             app._deploy_connection_cache = {}
             config = DeploymentConfig(
                 backend=BackendType.LLAMACPP,
@@ -575,6 +607,11 @@ class TuiAppStorageCacheTests(unittest.TestCase):
                 merged[0].display_name,
                 "Nanbeige4.1-3B-Q4_K_M-GGUF (Q4_K_M)",
             )
+            self.assertEqual(
+                merged[0].repo_id,
+                "Edge-Quant/Nanbeige4.1-3B-Q4_K_M-GGUF",
+            )
+            self.assertEqual(merged[0].quant, "Q4_K_M")
 
     def test_list_instances_does_not_mutate_opencode_configuration(self) -> None:
         app = TuiApp()

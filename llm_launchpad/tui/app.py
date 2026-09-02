@@ -24,6 +24,12 @@ from textual.widgets import Input, TextArea
 from ..core.backend import ModalBackend
 from ..core.benchmark import benchmark_config_from_endpoint, parse_concurrency_values
 from ..core.config import ConfigStore, SETTINGS_DIR
+from ..core.connection_store import (
+    load_connection_entries,
+    merge_connections,
+    save_connection,
+)
+from ..core.diagnostics import log_exception
 from ..core.hf_models import fetch_gguf_quant_metadata, list_llamacpp_candidates, list_vllm_candidates
 from ..core.naming import (
     build_deployment_name,
@@ -33,6 +39,7 @@ from ..core.prime_auth import get_prime_auth_status
 from ..core.prime_backend import PrimeBackend
 from ..core.provider_options import prime_provider_options
 from ..core.quick_deploy import QuickDeployProfile
+from ..core.reasoning_profiles import discover_reasoning_capabilities
 from ..core.runtime_support import evaluate_llamacpp_architecture
 from ..core.opencode import (
     build_openai_connection_payload,
@@ -1183,7 +1190,7 @@ class TuiApp(App):
         try:
             self._storage_cache_path.unlink(missing_ok=True)
         except Exception:
-            pass
+            log_exception("Failed to remove cached storage snapshot")
 
     def _persist_storage_snapshot(self, snapshot: StorageSnapshot) -> None:
         payload = {
@@ -1194,7 +1201,7 @@ class TuiApp(App):
             self._storage_cache_path.parent.mkdir(parents=True, exist_ok=True)
             self._storage_cache_path.write_text(json.dumps(payload))
         except Exception:
-            pass
+            log_exception("Failed to persist storage snapshot cache")
 
     def _cache_deploy_connection_summary(
         self,
@@ -1205,19 +1212,20 @@ class TuiApp(App):
         app_name = (config.app_name or "").strip()
         if not app_name:
             return
-        payload = _deploy_connection_summary_payload(config, server_url)
-        self._deploy_connection_cache[app_name] = {
-            "backend": config.backend.value,
-            "provider": config.provider.value,
-            "resource_id": endpoint.app_id if endpoint else "",
-            "instance_name": config.instance_name or (endpoint.instance_name if endpoint else ""),
-            "base_url": payload["base_url"],
-            "model_id": payload["model_id"],
-            "display_name": payload["display_name"],
-            "api_key": config.endpoint_api_key or (endpoint.endpoint_api_key if endpoint else ""),
-            "cached_at_epoch": time.time(),
-        }
-        self._persist_deploy_connection_cache()
+        cached_endpoint = replace(endpoint) if endpoint is not None else EndpointInfo()
+        cached_endpoint.name = cached_endpoint.name or app_name
+        cached_endpoint.web_url = server_url
+        try:
+            save_connection(config, cached_endpoint, self._deploy_connection_cache_path)
+            self._deploy_connection_cache = load_connection_entries(
+                self._deploy_connection_cache_path
+            )
+        except Exception:
+            # Connection summaries are a convenience cache; a read-only home
+            # directory must not turn an otherwise successful deploy into a
+            # failed operation.
+            log_exception("Failed to cache deploy connection summary")
+            return
 
     def _persist_deploy_connection_cache(self) -> None:
         payload = {"entries": self._deploy_connection_cache}
@@ -1226,7 +1234,7 @@ class TuiApp(App):
             self._deploy_connection_cache_path.write_text(json.dumps(payload))
             os.chmod(self._deploy_connection_cache_path, 0o600)
         except Exception:
-            pass
+            log_exception("Failed to persist deploy connection cache")
 
     def _load_persisted_deploy_connection_cache(self) -> None:
         try:
@@ -1249,31 +1257,14 @@ class TuiApp(App):
     def _merge_deploy_connection_cache(self, rows: list[EndpointInfo]) -> None:
         if not self._deploy_connection_cache:
             return
-        for row in rows:
-            cached = self._deploy_connection_cache.get((row.name or "").strip())
-            if not isinstance(cached, dict):
-                continue
-            if not (row.web_url or "").strip():
-                base_url = str(cached.get("base_url", "") or "").strip()
-                if base_url:
-                    row.web_url = base_url.removesuffix("/v1")
-            if not (row.served_model_name or "").strip():
-                model_id = str(cached.get("model_id", "") or "").strip()
-                if model_id:
-                    row.served_model_name = model_id
-            if not (row.display_name or "").strip():
-                display_name = str(cached.get("display_name", "") or "").strip()
-                if display_name:
-                    row.display_name = display_name
-            if not row.app_id:
-                row.app_id = str(cached.get("resource_id", "") or "")
-            if not row.instance_name:
-                row.instance_name = str(cached.get("instance_name", "") or "") or None
-            if not row.endpoint_api_key:
-                row.endpoint_api_key = str(cached.get("api_key", "") or "") or None
-            provider = str(cached.get("provider", "") or "")
-            if provider in {item.value for item in ComputeProvider}:
-                row.provider = ComputeProvider(provider)
+        merge_connections(
+            rows,
+            self._deploy_connection_cache_path,
+            self._storage_cache_path,
+        )
+        self._deploy_connection_cache = load_connection_entries(
+            self._deploy_connection_cache_path
+        )
 
     def _load_persisted_storage_cache(self) -> None:
         try:
@@ -1435,3 +1426,11 @@ class TuiApp(App):
                 llamacpp_runtime_id=compatibility.runtime_id,
             )
         )
+        try:
+            discover_reasoning_capabilities(
+                BackendType.LLAMACPP,
+                repo_id,
+                revision,
+            )
+        except Exception:
+            pass

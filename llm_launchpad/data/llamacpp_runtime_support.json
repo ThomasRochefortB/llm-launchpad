@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "runtime_id": "llama.cpp-b10689-cuda12",
   "runtime_build": "b10689",
   "image_ref": "ghcr.io/ggml-org/llama.cpp:server-cuda-b10689",
@@ -158,5 +158,20 @@
     "talkie",
     "wavtokenizer-dec",
     "xverse"
+  ],
+  "mtp_architectures": [
+    "bailingmoe3",
+    "cohere2moe",
+    "deepseek2",
+    "deepseek32",
+    "deepseek4",
+    "glm-dsa",
+    "glm4moe",
+    "hy_v3",
+    "mimo2",
+    "qwen35",
+    "qwen35moe",
+    "qwen3next",
+    "step35"
   ]
 }

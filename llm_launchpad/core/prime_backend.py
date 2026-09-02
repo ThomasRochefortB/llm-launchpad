@@ -18,6 +18,7 @@ import requests
 from ..protocol.enums import BackendType, ComputeProvider
 from ..protocol.models import ComputeOffer, DeploymentConfig, EndpointInfo
 from .config import SETTINGS_DIR
+from .diagnostics import log_exception
 from .naming import infer_instance_from_app_name
 from .prime_auth import PrimeConfig, load_prime_config
 from .provider_options import prime_provider_options
@@ -567,7 +568,7 @@ class PrimeBackend:
         try:
             os.chmod(private_path.parent, 0o700)
         except OSError:
-            pass
+            log_exception("Could not restrict Prime key directory permissions")
 
         if not private_path.exists():
             try:
@@ -617,7 +618,7 @@ class PrimeBackend:
             os.chmod(private_path, 0o600)
             os.chmod(public_path, 0o644)
         except OSError:
-            pass
+            log_exception("Could not restrict Prime SSH key file permissions")
         return public_path.read_text(encoding="utf-8").strip()
 
     def ensure_bootstrap_ssh_key(self) -> str:
@@ -1018,7 +1019,7 @@ class PrimeBackend:
         try:
             os.chmod(PRIME_KNOWN_HOSTS_DIR, 0o700)
         except OSError:
-            pass
+            log_exception("Could not restrict Prime known-hosts directory permissions")
         args = [
             "ssh",
             "-i",

@@ -58,15 +58,9 @@ def _quiet_main_menu():
 
 class MainMenuDeployDoorTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
-        self._catalog_patch = patch(
-            "llm_launchpad.core.quick_deploy._read_bundled_catalog_text",
-            return_value=None,
-        )
-        self._catalog_patch.start()
         quick_deploy._reset_quick_deploy_catalog_cache()
 
     def tearDown(self) -> None:
-        self._catalog_patch.stop()
         quick_deploy._reset_quick_deploy_catalog_cache()
 
     async def test_home_menu_has_deploy_and_custom_deploy_only(self) -> None:

@@ -196,9 +196,19 @@ class HFModelsTests(unittest.TestCase):
         with (
             patch.dict("sys.modules", {"huggingface_hub": fake_module}),
             patch("llm_launchpad.core.hf_models._fetch_gguf_quantization_data_from_model_page", return_value=None),
+            patch(
+                "llm_launchpad.core.hf_models.fetch_gguf_mtp_capability",
+                return_value=None,
+            ),
         ):
-            first = hf_models.fetch_gguf_quant_metadata("Qwen/Qwen3-Coder-Next-GGUF")
-            second = hf_models.fetch_gguf_quant_metadata("Qwen/Qwen3-Coder-Next-GGUF")
+            first = hf_models.fetch_gguf_quant_metadata(
+                "Qwen/Qwen3-Coder-Next-GGUF",
+                inspect_mtp=True,
+            )
+            second = hf_models.fetch_gguf_quant_metadata(
+                "Qwen/Qwen3-Coder-Next-GGUF",
+                inspect_mtp=True,
+            )
 
         self.assertEqual(first.quantizations, ["Q4_K_M", "Q6_K"])
         self.assertEqual(second.quantizations, ["Q4_K_M", "Q6_K"])

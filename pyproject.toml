@@ -64,11 +64,13 @@ version = { attr = "llm_launchpad._version.__version__" }
 dev = [
     "pytest>=9.0.2",
     "pytest-cov>=7.0.0",
+    "pytest-xdist>=3.8.0",
     "ruff>=0.11.0",
     "ty>=0.0.17",
 ]
 
 [tool.pytest.ini_options]
+addopts = ["-n", "4"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 

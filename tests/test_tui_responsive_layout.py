@@ -13,7 +13,6 @@ from textual.widget import Widget
 from textual.widgets import Footer, Input, OptionList, Static
 
 from llm_launchpad.core.compute_availability import aggregate_compute_availability
-from llm_launchpad.core.quick_deploy import list_quick_deploy_profiles
 from llm_launchpad.protocol.enums import BackendType
 from llm_launchpad.protocol.models import EndpointInfo
 from llm_launchpad.tui.app import TuiApp
@@ -132,30 +131,57 @@ class ResponsiveLayoutTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertFalse(side_column.display)
 
-    async def test_all_screen_families_fit_supported_viewports(self) -> None:
-        profile = list_quick_deploy_profiles()[0]
+    async def test_navigation_screen_families_fit_supported_viewports(self) -> None:
+        from tests.catalog_fixtures import STATIC_LIKE_PROFILES
+
+        profile = STATIC_LIKE_PROFILES[0]
+        await self._assert_screen_families_fit_supported_viewports(
+            (
+                lambda: MainMenuScreen(username="alice", version="1.0"),
+                BackendSelectScreen,
+                lambda: QuickDeployScreen(profile),
+                FastDeployScreen,
+            )
+        )
+
+    async def test_deployment_screen_families_fit_supported_viewports(self) -> None:
+        await self._assert_screen_families_fit_supported_viewports(
+            (
+                LlamaCppDeployScreen,
+                VllmDeployScreen,
+                SettingsScreen,
+            )
+        )
+
+    async def test_management_screen_families_fit_supported_viewports(self) -> None:
         endpoint = EndpointInfo(
             name="vllm-test",
             app_id="ap-test",
             state="running",
             backend=BackendType.VLLM,
         )
-        factories: tuple[Callable[[], Screen], ...] = (
-            lambda: MainMenuScreen(username="alice", version="1.0"),
-            BackendSelectScreen,
-            LlamaCppDeployScreen,
-            VllmDeployScreen,
-            lambda: QuickDeployScreen(profile),
-            FastDeployScreen,
-            ManageScreen,
-            lambda: EndpointActionsScreen(endpoint),
-            lambda: StatusOptionsScreen(endpoint),
-            lambda: BenchmarkOptionsScreen(endpoint),
-            lambda: StopConfirmScreen(endpoint),
-            StorageScreen,
-            SettingsScreen,
-            lambda: MonitorScreen("Logs"),
+        await self._assert_screen_families_fit_supported_viewports(
+            (
+                ManageScreen,
+                lambda: EndpointActionsScreen(endpoint),
+                lambda: StatusOptionsScreen(endpoint),
+                lambda: BenchmarkOptionsScreen(endpoint),
+                lambda: StopConfirmScreen(endpoint),
+            )
         )
+
+    async def test_operational_screen_families_fit_supported_viewports(self) -> None:
+        await self._assert_screen_families_fit_supported_viewports(
+            (
+                StorageScreen,
+                lambda: MonitorScreen("Logs"),
+            )
+        )
+
+    async def _assert_screen_families_fit_supported_viewports(
+        self,
+        factories: tuple[Callable[[], Screen], ...],
+    ) -> None:
         sizes = (
             (140, 45),
             (100, 30),
@@ -170,56 +196,59 @@ class ResponsiveLayoutTests(unittest.IsolatedAsyncioTestCase):
         )
 
         for factory in factories:
-            for width, height in sizes:
-                screen = factory()
-                app = _ScreenApp(screen)
-                with self.subTest(screen=type(screen).__name__, size=(width, height)):
-                    with ExitStack() as patches:
-                        if isinstance(screen, MainMenuScreen):
-                            for method_name in (
-                                "_refresh_modal_auth_status",
-                                "_refresh_prime_auth_status",
-                                "_refresh_hf_auth_status",
-                                "_refresh_aai_auth_status",
-                                "_refresh_panels",
-                                "_refresh_quick_deploy_catalog",
-                                "_refresh_storage_estimate",
-                            ):
-                                patches.enter_context(
-                                    patch.object(MainMenuScreen, method_name, lambda self: None)
-                                )
-                        if isinstance(screen, (LlamaCppDeployScreen, VllmDeployScreen)):
-                            patches.enter_context(
-                                patch.object(type(screen), "_refresh_gpu_types", lambda self: None)
-                            )
-                            patches.enter_context(
-                                patch.object(
-                                    type(screen),
-                                    "_refresh_cached_models_from_storage",
-                                    lambda self: None,
-                                )
-                            )
-                        if isinstance(screen, VllmDeployScreen):
-                            patches.enter_context(
-                                patch.object(
-                                    VllmDeployScreen,
-                                    "_refresh_vllm_memory_status",
-                                    lambda self, *args, **kwargs: None,
-                                )
-                            )
-                        if isinstance(screen, FastDeployScreen):
-                            patches.enter_context(
-                                patch(
-                                    "llm_launchpad.tui.screens.fast_deploy.load_compute_availability",
-                                    return_value=aggregate_compute_availability(),
-                                )
-                            )
-                        if isinstance(screen, StorageScreen):
-                            patches.enter_context(
-                                patch.object(StorageScreen, "_refresh_storage_snapshot", lambda self: None)
-                            )
-                        async with app.run_test(size=(width, height)) as pilot:
-                            await pilot.pause()
+            screen = factory()
+            app = _ScreenApp(screen)
+            with ExitStack() as patches:
+                if isinstance(screen, MainMenuScreen):
+                    for method_name in (
+                        "_refresh_modal_auth_status",
+                        "_refresh_prime_auth_status",
+                        "_refresh_hf_auth_status",
+                        "_refresh_aai_auth_status",
+                        "_refresh_panels",
+                        "_refresh_quick_deploy_catalog",
+                        "_refresh_storage_estimate",
+                    ):
+                        patches.enter_context(
+                            patch.object(MainMenuScreen, method_name, lambda self: None)
+                        )
+                if isinstance(screen, (LlamaCppDeployScreen, VllmDeployScreen)):
+                    patches.enter_context(
+                        patch.object(type(screen), "_refresh_gpu_types", lambda self: None)
+                    )
+                    patches.enter_context(
+                        patch.object(
+                            type(screen),
+                            "_refresh_cached_models_from_storage",
+                            lambda self: None,
+                        )
+                    )
+                if isinstance(screen, VllmDeployScreen):
+                    patches.enter_context(
+                        patch.object(
+                            VllmDeployScreen,
+                            "_refresh_vllm_memory_status",
+                            lambda self, *args, **kwargs: None,
+                        )
+                    )
+                if isinstance(screen, FastDeployScreen):
+                    patches.enter_context(
+                        patch(
+                            "llm_launchpad.tui.screens.fast_deploy.load_compute_availability",
+                            return_value=aggregate_compute_availability(),
+                        )
+                    )
+                if isinstance(screen, StorageScreen):
+                    patches.enter_context(
+                        patch.object(StorageScreen, "_refresh_storage_snapshot", lambda self: None)
+                    )
+
+                first_width, first_height = sizes[0]
+                async with app.run_test(size=(first_width, first_height)) as pilot:
+                    for index, (width, height) in enumerate(sizes):
+                        with self.subTest(screen=type(screen).__name__, size=(width, height)):
+                            if index:
+                                await pilot.resize_terminal(width, height)
                             self.assertEqual(screen.region.width, width)
                             self.assertEqual(screen.region.height, height)
                             self.assertFalse(screen.has_class("viewport-too-small"))

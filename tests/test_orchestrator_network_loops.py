@@ -325,26 +325,36 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
         fake_requests = types.SimpleNamespace(get=lambda *_args, **_kwargs: _Response(200, "ok"))
         with patch.dict("sys.modules", {"requests": fake_requests}):
             with patch("llm_launchpad.core.warmup.ModalBackend.logs_follow_args", return_value=["--follow"]):
-                with patch("llm_launchpad.core.warmup.subprocess.Popen", return_value=fake_proc) as popen_mock:
-                    with patch("llm_launchpad.core.warmup.threading.Thread", _SyncThread):
-                        with patch("llm_launchpad.core.warmup.os.environ", {}):
-                            with patch(
-                                "llm_launchpad.core.warmup.ModalBackend.test_curl_command",
-                                return_value="curl ok",
-                            ):
-                                events = list(
-                                    Orchestrator().warmup(
-                                        backend=BackendType.VLLM,
-                                        server_url="https://example.modal.run",
-                                        timeout=10,
-                                        tail_logs=True,
-                                        app_name="vllm-test",
+                with patch(
+                    "llm_launchpad.core.warmup.ModalBackend._resolve_command",
+                    return_value=[
+                        "/opt/launchpad/bin/modal",
+                        "app",
+                        "logs",
+                        "--follow",
+                        "vllm-test",
+                    ],
+                ):
+                    with patch("llm_launchpad.core.warmup.subprocess.Popen", return_value=fake_proc) as popen_mock:
+                        with patch("llm_launchpad.core.warmup.threading.Thread", _SyncThread):
+                            with patch("llm_launchpad.core.warmup.os.environ", {}):
+                                with patch(
+                                    "llm_launchpad.core.warmup.ModalBackend.test_curl_command",
+                                    return_value="curl ok",
+                                ):
+                                    events = list(
+                                        Orchestrator().warmup(
+                                            backend=BackendType.VLLM,
+                                            server_url="https://example.modal.run",
+                                            timeout=10,
+                                            tail_logs=True,
+                                            app_name="vllm-test",
+                                        )
                                     )
-                                )
         popen_mock.assert_called_once()
         self.assertEqual(
             popen_mock.call_args.args[0],
-            ["modal", "app", "logs", "--follow", "vllm-test"],
+            ["/opt/launchpad/bin/modal", "app", "logs", "--follow", "vllm-test"],
         )
 
         self.assertTrue(
@@ -442,9 +452,21 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
             stdout="line-A\nline-B\nline-C\n", returncode=0
         )
         seen: set[str] = {"line-A"}
-        with patch("llm_launchpad.core.warmup.subprocess.run", return_value=fake_run_result):
-            with patch("llm_launchpad.core.warmup.os.environ", {}):
-                events = list(fetch_historical_logs("myapp", seen))
+        with patch(
+            "llm_launchpad.core.warmup.ModalBackend._resolve_command",
+            return_value=["/opt/launchpad/bin/modal", "app", "logs", "myapp"],
+        ):
+            with patch(
+                "llm_launchpad.core.warmup.subprocess.run",
+                return_value=fake_run_result,
+            ) as run_mock:
+                with patch("llm_launchpad.core.warmup.os.environ", {}):
+                    events = list(fetch_historical_logs("myapp", seen))
+
+        self.assertEqual(
+            run_mock.call_args.args[0],
+            ["/opt/launchpad/bin/modal", "app", "logs", "myapp"],
+        )
 
         lines = [e.line for e in events if isinstance(e, LogEvent)]
         # The header line plus the two new content lines

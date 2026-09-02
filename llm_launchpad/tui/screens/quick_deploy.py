@@ -74,6 +74,11 @@ def _render_profile_summary(profile: QuickDeployProfile, plan: InferencePlan) ->
         lines.insert(-1, f"[bold]Quant[/bold]    {_escape_markup(profile.quant)}")
     if profile.required_vram_gb:
         lines.append(f"[bold]VRAM[/bold]     {profile.required_vram_gb:.0f} GB required")
+    if profile.speculative_decoding is not None:
+        lines.append(
+            "[bold]Spec decode[/bold] Native MTP · up to "
+            f"{profile.speculative_decoding.num_speculative_tokens} draft tokens"
+        )
     lines.extend(
         [
             f"[bold]Max ctx[/bold]  {_escape_markup(format_context_length(profile.max_context_tokens))}",
@@ -224,6 +229,16 @@ class QuickDeployScreen(CopyEnabledScreen):
                         "[dim]The provider is revealed here because it determines billing, region, and credentials.[/dim]",
                         id="quick-fulfillment-note",
                     )
+                if self.profile.speculative_decoding is not None:
+                    yield ToggleField(
+                        "Use MTP speculative decoding",
+                        "quick-speculative-decoding",
+                        default=True,
+                    )
+                    yield Static(
+                        "[dim]Native MTP · drafts up to 3 tokens[/dim]",
+                        id="quick-speculative-note",
+                    )
                 yield Button("Advanced options...", id="toggle-advanced-quick", variant="default")
                 yield FormField(
                     "Instance name (optional)",
@@ -329,6 +344,11 @@ class QuickDeployScreen(CopyEnabledScreen):
         self._deploy()
 
     def _deploy(self) -> None:
+        enable_speculative_decoding = (
+            self.query_one("#quick-speculative-decoding", Switch).value
+            if self.profile.speculative_decoding is not None
+            else False
+        )
         config = build_quick_deploy_config(
             self.profile,
             plan=self.plan,
@@ -336,6 +356,7 @@ class QuickDeployScreen(CopyEnabledScreen):
             app_name=self.query_one("#quick-app-name", Input).value,
             do_warmup=self.query_one("#quick-warmup", Switch).value,
             show_debug_logs=self.query_one("#quick-debug-logs", Switch).value,
+            enable_speculative_decoding=enable_speculative_decoding,
         )
         if config.provider == ComputeProvider.PRIME:
             options = prime_provider_options(config)

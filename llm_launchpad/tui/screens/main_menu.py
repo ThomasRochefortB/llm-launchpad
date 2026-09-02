@@ -31,6 +31,7 @@ from ...core.quick_deploy import (
     QuickDeployCatalogInfo,
     QuickDeployProfile,
     activate_quick_deploy_catalog,
+    record_quick_deploy_catalog_failure,
 )
 from ...core.quick_deploy_refresh import (
     ArtificialAnalysisAuthStatus,
@@ -154,7 +155,7 @@ class QuickDeployCatalogLoaded(Message):
 
 
 class QuickDeployCatalogLoadFailed(Message):
-    """The live Deploy catalog refresh failed; keep the bundled catalog."""
+    """The live Deploy catalog refresh failed."""
 
     def __init__(self, error: str) -> None:
         super().__init__()
@@ -1048,9 +1049,13 @@ class MainMenuScreen(CopyEnabledScreen):
 
     def on_quick_deploy_catalog_load_failed(
         self,
-        _: QuickDeployCatalogLoadFailed,
+        message: QuickDeployCatalogLoadFailed,
     ) -> None:
         self._quick_deploy_catalog_refresh_inflight = False
+        if record_quick_deploy_catalog_failure(message.error):
+            notifier = getattr(self.app, "quick_deploy_catalog_updated", None)
+            if callable(notifier):
+                notifier()
 
     def _refresh_modal_auth_status(self) -> None:
         if self._modal_auth_refresh_inflight:

@@ -9,7 +9,28 @@ from unittest.mock import patch
 from llm_launchpad.core import opencode
 from llm_launchpad.protocol.models import DeploymentConfig
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider
-from llm_launchpad.protocol.models import EndpointInfo
+from llm_launchpad.protocol.models import EndpointInfo, ReasoningCapabilities
+
+
+def _reasoning(
+    *,
+    efforts: tuple[str, ...] = ("low", "medium", "xhigh"),
+    default_effort: str = "xhigh",
+    interleaved_field: str | None = None,
+) -> ReasoningCapabilities:
+    return ReasoningCapabilities(
+        profile_id="hf-test-profile",
+        canonical_model_id="acme/Future-Reasoner",
+        model_revision="a" * 40,
+        efforts=efforts,
+        default_effort=default_effort,
+        source_repo="acme/Future-Reasoner",
+        source_revision="b" * 40,
+        source_path="chat_template.jinja",
+        request_option_path="chat_template_kwargs.reasoning_effort",
+        enable_thinking=True,
+        interleaved_field=interleaved_field,
+    )
 
 
 def _connection(
@@ -23,6 +44,7 @@ def _connection(
     provider: ComputeProvider = ComputeProvider.MODAL,
     context_limit: int | None = None,
     output_limit: int | None = None,
+    reasoning: ReasoningCapabilities | None = None,
 ) -> opencode.OpenCodeConnection:
     return opencode.OpenCodeConnection(
         app_name=app_name,
@@ -36,6 +58,7 @@ def _connection(
         provider=provider,
         context_limit=context_limit,
         output_limit=output_limit,
+        reasoning=reasoning,
     )
 
 
@@ -234,6 +257,106 @@ class OpenCodeSyncTests(unittest.TestCase):
                 {"context": 262144, "output": 32768},
             )
 
+    def test_sync_persists_discovered_reasoning_variants(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "opencode.json"
+            registry_path = Path(tmp) / "opencode_registry.json"
+            target = _connection(
+                app_name="llamacpp-qwen38",
+                backend=BackendType.LLAMACPP,
+                model_id="Qwen3.8-27B-GGUF-UD-Q4_K_XL",
+                display_name="Qwen3.8-27B-GGUF (UD-Q4_K_XL)",
+                reasoning=_reasoning(),
+            )
+            with self._patched_paths(tmp)[0], self._patched_paths(tmp)[1], self._patched_paths(tmp)[2], patch(
+                "llm_launchpad.core.opencode.shutil.which", return_value="/usr/bin/opencode"
+            ):
+                opencode.sync_opencode_config(target=target)
+
+            payload = json.loads(config_path.read_text(encoding="utf-8"))
+            registry = json.loads(registry_path.read_text(encoding="utf-8"))
+            model = payload["provider"][target.provider_id]["models"][target.model_id]
+            self.assertTrue(model["reasoning"])
+            self.assertEqual(
+                list(model["variants"]),
+                ["default", "low", "medium", "xhigh"],
+            )
+            self.assertEqual(
+                model["variants"]["medium"],
+                {
+                    "chat_template_kwargs": {
+                        "reasoning_effort": "medium",
+                        "enable_thinking": True,
+                    }
+                },
+            )
+            self.assertNotIn("high", model["variants"])
+            self.assertEqual(
+                registry["entries"][target.app_name]["reasoning"]["source_revision"],
+                "b" * 40,
+            )
+
+    def test_build_connection_from_config_uses_selection_discovery(self) -> None:
+        config = DeploymentConfig(
+            backend=BackendType.VLLM,
+            app_name="vllm-future-reasoner",
+            model_name="acme/Future-Reasoner",
+            reasoning=_reasoning(
+                efforts=("high", "max"),
+                default_effort="max",
+            ),
+        )
+
+        connection = opencode.build_connection_from_config(config, "https://example.com")
+
+        self.assertIsNotNone(connection)
+        assert connection is not None
+        self.assertIsNotNone(connection.reasoning)
+        assert connection.reasoning is not None
+        self.assertEqual(connection.reasoning.efforts, ("high", "max"))
+        model = opencode._provider_payload(connection)["models"][connection.model_id]
+        self.assertEqual(list(model["variants"]), ["default", "high", "max"])
+
+    def test_endpoint_uses_source_discovered_interleaved_reasoning(self) -> None:
+        row = EndpointInfo(
+            name="llamacpp-future-reasoner",
+            state="running",
+            backend=BackendType.LLAMACPP,
+            web_url="https://example.com",
+            served_model_name="Future-Reasoner-GGUF-UD-Q2_K_XL",
+            reasoning=_reasoning(
+                efforts=("low", "high", "max"),
+                default_effort="low",
+                interleaved_field="reasoning_content",
+            ),
+        )
+
+        connection = opencode.build_connection_from_endpoint(row)
+
+        self.assertIsNotNone(connection)
+        assert connection is not None
+        model = opencode._provider_payload(connection)["models"][connection.model_id]
+        self.assertEqual(model["interleaved"], {"field": "reasoning_content"})
+        self.assertEqual(
+            list(model["variants"]),
+            ["default", "low", "high", "max"],
+        )
+
+    def test_unknown_model_does_not_advertise_reasoning(self) -> None:
+        config = DeploymentConfig(
+            backend=BackendType.VLLM,
+            app_name="vllm-unknown",
+            model_name="example/Unknown-7B",
+        )
+
+        connection = opencode.build_connection_from_config(config, "https://example.com")
+
+        self.assertIsNotNone(connection)
+        assert connection is not None
+        model = opencode._provider_payload(connection)["models"][connection.model_id]
+        self.assertNotIn("reasoning", model)
+        self.assertNotIn("variants", model)
+
     def test_build_connection_from_endpoint_strips_hf_owner_from_vllm_display_name(self) -> None:
         row = EndpointInfo(
             name="vllm-glm",
@@ -267,6 +390,10 @@ class OpenCodeSyncTests(unittest.TestCase):
             instance_name="glm",
             repo_id="unsloth/GLM-4.7-Flash-GGUF",
             quant="Q4_K_M",
+            reasoning=_reasoning(
+                efforts=("low", "high"),
+                default_effort="high",
+            ),
         )
 
         resolved = opencode.resolve_connection_for_app(
@@ -282,6 +409,9 @@ class OpenCodeSyncTests(unittest.TestCase):
             resolved.base_url,
             "https://alice--llamacpp-glm-serve-live.modal.run/v1",
         )
+        self.assertIsNotNone(resolved.reasoning)
+        assert resolved.reasoning is not None
+        self.assertEqual(resolved.reasoning.efforts, ("low", "high"))
 
     def test_sync_prunes_missing_and_stopped_entries(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -136,6 +136,9 @@ class _StyledApp(_TestApp):
 
 class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
+        from llm_launchpad.core import quick_deploy as _qd
+
+        _qd._reset_quick_deploy_catalog_cache()
         self._availability_patch = patch(
             "llm_launchpad.tui.screens.fast_deploy.load_compute_availability",
             return_value=aggregate_compute_availability(),
@@ -143,7 +146,10 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
         self._availability_patch.start()
 
     def tearDown(self) -> None:
+        from llm_launchpad.core import quick_deploy as _qd
+
         self._availability_patch.stop()
+        _qd._reset_quick_deploy_catalog_cache()
 
     async def test_model_list_renders_catalog_models(self) -> None:
         model = _model((_profile("test-model", required_vram_gb=100.0),))
@@ -692,13 +698,55 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 self.assertGreaterEqual(option_list.size.height, 6)
 
 
+    async def test_pending_catalog_renders_building_state(self) -> None:
+        app = _StyledApp()
+        quick_deploy._reset_quick_deploy_catalog_cache()
+        async with app.run_test(size=(140, 42)) as pilot:
+            app.push_screen(FastDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, FastDeployScreen)
+            option_list = screen.query_one("#fast-deploy-list", OptionList)
+            prompt = str(option_list.get_option_at_index(0).prompt)
+            self.assertIn("Building the live model catalog", prompt)
+            status = str(screen.query_one("#fast-deploy-status", Static).renderable)
+            self.assertIn("Building the live model catalog", status)
+
+    async def test_failed_catalog_renders_unavailable_with_custom_deploy_option(self) -> None:
+        from llm_launchpad.core.quick_deploy import record_quick_deploy_catalog_failure
+
+        quick_deploy._reset_quick_deploy_catalog_cache()
+        record_quick_deploy_catalog_failure("catalog build failed")
+
+        app = _StyledApp()
+        async with app.run_test(size=(140, 42)) as pilot:
+            app.push_screen(FastDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, FastDeployScreen)
+            option_list = screen.query_one("#fast-deploy-list", OptionList)
+            prompt = str(option_list.get_option_at_index(0).prompt)
+            self.assertIn("Open Custom deploy", prompt)
+            status = str(screen.query_one("#fast-deploy-status", Static).renderable)
+            self.assertIn("Live model catalog unavailable", status)
+            self.assertIn("Custom deploy", status)
+            self.assertIn("catalog build failed", status)
+
+            # Selecting the custom-deploy option triggers the custom deploy flow.
+            app.action_push_custom_deploy = lambda: setattr(app, "_custom_called", True)  # type: ignore[attr-defined]
+            app._custom_called = False  # type: ignore[attr-defined]
+            # Re-define after screen is mounted so _goto_custom_deploy sees it.
+            screen._choose("fast-deploy-open-custom-deploy")
+            await pilot.pause()
+            self.assertTrue(getattr(app, "_custom_called", False))
+
+        quick_deploy._reset_quick_deploy_catalog_cache()
+
+
 class FastDeployMainMenuTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
-        self._catalog_patch = patch(
-            "llm_launchpad.core.quick_deploy._read_bundled_catalog_text",
-            return_value=None,
-        )
-        self._catalog_patch.start()
         self._prime_refresh_patch = patch.object(
             MainMenuScreen,
             "_refresh_prime_auth_status",
@@ -725,7 +773,6 @@ class FastDeployMainMenuTests(unittest.IsolatedAsyncioTestCase):
         quick_deploy._reset_quick_deploy_catalog_cache()
 
     def tearDown(self) -> None:
-        self._catalog_patch.stop()
         self._prime_refresh_patch.stop()
         self._catalog_refresh_patch.stop()
         self._aai_refresh_patch.stop()

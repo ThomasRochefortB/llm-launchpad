@@ -36,7 +36,12 @@ Get up and running in four steps:
    huggingface-cli login
    ```
 
-4. Launch the TUI:
+4. Verify your setup:
+   ```bash
+   llm-launchpad doctor
+   ```
+
+5. Launch the TUI:
    ```bash
    llm-launchpad
    ```
@@ -52,41 +57,19 @@ From the TUI you can:
 - Copy the OpenAI-compatible base URL, model ID, and API key after a successful deploy
 
 Deploy is model-first: each model can have multiple runtime recipes and each
-recipe can receive quotes from any compatible provider adapter. Quotes normalize
-GPU shape, availability, hourly price, billing model, and a workload-based
-monthly estimate. A GPU filter on the Deploy screen narrows the catalog to
-models that fit a selected GPU type. Existing Quick Deploy bundles supply the
-curated recipes and Modal estimates; both llama.cpp and vLLM recipes can also
-use live Prime Intellect offers through the same plan-to-deployment path. Prime
-CPU rows are excluded, and live GPU options are filtered per model using its
-estimated VRAM requirement plus safety headroom.
-
-When the TUI opens, it renders the bundled catalog immediately, then rebuilds
-the Deploy catalog in the background. With an Artificial Analysis API key
-configured (`ARTIFICIAL_ANALYSIS_API_KEY` or `llm-launchpad aai-auth login`),
-it selects the top three deployable open-weight models in each of three size
-bands (Compact ≤40B, Medium 40–150B, and Large >150B), ranked by the Artificial
-Analysis Intelligence Index. Hugging Face verifies matching GGUF weights
-and memory requirements, while Modal supplies current GPU availability and
-pricing. GGUF recommendations are also filtered by their `general.architecture`
-against a generated support manifest for the exact pinned llama.cpp image. Models
-with missing or unsupported architecture metadata are not recommended.
-
-Artificial Analysis responses are cached for 24 hours under
-`~/.llm_launchpad/artificial_analysis_models.json`; the API key resolves from
-`ARTIFICIAL_ANALYSIS_API_KEY` first, then from an owner-only file written by
-`llm-launchpad aai-auth login` under `~/.llm_launchpad/`. A one-way key
-fingerprint lets the TUI reuse a recent successful validation safely. The authentication footer
-shows the AAI status and account tier alongside Modal, Prime Intellect, and
-Hugging Face. Modal prices and Hugging Face GGUF metadata are still refreshed
-on each launch. Free AAI keys are supported, with model size inferred when the
-free response omits parameter counts. Without a key or cached AAI response,
-startup falls back to Hugging Face trending GGUF models; fully offline launches
-keep the bundled catalog.
+recipe can receive quotes from any compatible provider adapter. For details on
+recommendations, the Artificial Analysis ranking, caching, and llama.cpp
+runtime support, see the [deploy catalog guide](docs/catalog.md).
 
 ## Headless CLI examples
 
-The TUI is the recommended path for interactive use, but the same workflows are available from the command line for scripts and repeatable operations.
+The TUI is the recommended path for interactive use, but the same workflows are available from the command line for scripts and repeatable operations. See the [full CLI reference](docs/cli.md) for every command and option.
+
+Before anything else, verify your local setup:
+
+```bash
+llm-launchpad doctor
+```
 
 Deploy a vLLM endpoint and wait until it is ready:
 ```bash
@@ -95,87 +78,6 @@ llm-launchpad deploy \
   --model-name Qwen/Qwen3-4B \
   --instance-name qwen3 \
   --do-warmup
-```
-
-Deploy vLLM on Prime Intellect using the cheapest matching fixed-price,
-secure on-demand offer:
-```bash
-llm-launchpad offers --gpu-type H100_80GB --gpu-count 1
-llm-launchpad deploy \
-  --provider prime \
-  --backend vllm \
-  --model-name Qwen/Qwen3-4B \
-  --gpu-type H100_80GB \
-  --gpu-count 1 \
-  --do-warmup
-```
-
-Deploy a llama.cpp GGUF endpoint on Prime with the same offer selection:
-```bash
-llm-launchpad llamacpp-support --repo-id unsloth/Qwen3-4B-GGUF
-llm-launchpad deploy \
-  --provider prime \
-  --backend llamacpp \
-  --repo-id unsloth/Qwen3-4B-GGUF \
-  --quant Q4_K_M \
-  --gpu-type H100_80GB \
-  --gpu-count 1 \
-  --do-warmup
-```
-
-Run `llm-launchpad llamacpp-support` without a repo to list every supported GGUF
-architecture. Launchpad repeats this preflight before allocating Modal or Prime
-compute and blocks known-incompatible models with the architecture and pinned
-runtime build in the error. Setting a custom `LLAMA_CPP_IMAGE_REF` is still
-supported, but its compatibility is reported as unverified because the bundled
-manifest only describes the pinned default image.
-
-Prime support uses the REST API and the credentials written by `prime login`
-(`PRIME_API_KEY` takes precedence). Launchpad resolves the Prime runtime behind
-the provider adapter. Its default path provisions Prime's `ubuntu_22_cuda_12`
-image, creates and registers a dedicated Launchpad SSH key, and starts the
-configured upstream vLLM or llama.cpp container over SSH. The key is reused from
-`~/.llm_launchpad/prime/bootstrap_ed25519`; users only need their normal Prime
-login.
-
-The runtime is bound only to the pod's loopback interface. Launchpad registers a
-Prime Tunnel locally, sends only its ephemeral tunnel credentials to the pod,
-and returns the generated HTTPS URL. The Prime account API key never needs to be
-stored on rented compute. Standard OpenAI-compatible bearer authentication remains
-enabled behind the tunnel. `--allow-insecure-http` explicitly bypasses the tunnel
-and publishes the runtime directly; it is intended only as a troubleshooting
-fallback. Stopping a pod also removes every Launchpad tunnel associated with it.
-Prime currently returns tunnel registrations with an expiry timestamp (seven days
-in live validation). Launchpad shows that timestamp in deploy logs; redeploy before
-it expires if the serving session needs to continue.
-
-Prime llama.cpp uses the default Hugging Face revision and accepts a quant label
-such as `Q4_K_M`.
-
-Prime deploys create or reuse a 100 GB persistent cache disk by default. The disk
-stores Hugging Face and llama.cpp caches so later pods can reuse downloaded model
-weights. Use `--no-prime-disk` to opt out, or provide `--prime-disk-id` to attach
-an existing disk. Persistent disks remain billable after a pod stops; remove an
-unused Launchpad cache disk from the Prime dashboard. Launchpad also caches its
-pinned, checksum-verified Prime Tunnel client locally and on the persistent disk,
-so pods do not repeatedly download it from GitHub.
-
-The generated endpoint bearer key is stored with mode `0600` in
-`~/.llm_launchpad/deployment_connection_summaries.json` and is reused by status,
-warmup, benchmark, and OpenCode sync. Prime Tunnel's public URL is HTTPS, but the
-URL itself is not an access-control mechanism; vLLM or llama.cpp validates the
-stored bearer key on every inference request.
-
-Maintainers can run the Prime certification suite against the same portable
-Ubuntu path used by every deployment. It drives the real Textual deploy form,
-verifies HTTPS and bearer authentication, enforces a spend cutoff, removes test
-pods and tunnels, and writes a redacted JSON report:
-
-```bash
-uv run python scripts/validate_prime_live.py \
-  --confirm-live \
-  --budget-usd 3 \
-  --stage portable_vllm_and_auth
 ```
 
 Switch a llama.cpp instance to a Hugging Face GGUF model, redeploy it, and warm it up:
@@ -193,49 +95,44 @@ llm-launchpad list
 llm-launchpad status --backend llamacpp --instance-name qwen3
 llm-launchpad logs --backend llamacpp --instance-name qwen3
 llm-launchpad stop --backend llamacpp --instance-name qwen3 --yes
-llm-launchpad list --provider prime
-llm-launchpad logs --provider prime --backend llamacpp --instance-name qwen3
-llm-launchpad stop --provider prime --backend llamacpp --instance-name qwen3 --yes
 ```
 
-Sync existing Launchpad deployments into OpenCode without changing files first:
+## Prime Intellect
+
+Prime deploys use the cheapest matching fixed-price, secure on-demand offer,
+provision a portable Ubuntu runtime over SSH, and publish the endpoint through
+an HTTPS tunnel with bearer authentication:
+
+```bash
+llm-launchpad offers --gpu-type H100_80GB --gpu-count 1
+llm-launchpad deploy \
+  --provider prime \
+  --backend vllm \
+  --model-name Qwen/Qwen3-4B \
+  --gpu-type H100_80GB \
+  --gpu-count 1 \
+  --do-warmup
+```
+
+See the [Prime Intellect provider guide](docs/prime.md) for the tunnel and
+security model, persistent cache disks, and maintainer certification.
+
+## OpenCode integration
+
+LLM-Launchpad automatically detects a local OpenCode installation and syncs
+your deployments into its config. Preview a sync without changing files:
 ```bash
 llm-launchpad opencode sync --dry-run
 ```
 
-## Storage and cleanup
+## Documentation
 
-Downloaded model weights are cached in the Modal `huggingface-cache` volume so repeated deploys can start faster. Use the TUI Storage screen to refresh the cache inventory, predownload a model, or delete selected cached weights when they are no longer needed.
-
-Stopping an app and deleting cached weights are separate operations: `llm-launchpad stop` stops a deployed Modal app, while the Storage screen manages cached model files. If storage size looks stale after a deployment or delete, refresh the Storage screen to reload the Modal volume snapshot.
-
-## Costs and scaledown
-
-GPU costs depend on the selected provider's billing model. Modal inference can
-scale to zero, while a Prime pod is billed for the full provisioned serving
-window. LLM-Launchpad shows both the provider's hourly price and a normalized
-monthly estimate so those options can be compared without pretending their idle
-costs are equivalent. Modal deployments default the scaledown window to 1800
-seconds; change it in Settings or with `SCALEDOWN_WINDOW` before deploying.
-
-For predictable costs:
-- Stop apps you no longer need with `llm-launchpad stop`.
-- Prefer smaller GPU layouts for quick tests before moving to larger models.
-- Use the warmup command only when you actually need the endpoint ready immediately.
-- Treat displayed cost estimates as guidance and confirm current provider pricing for production workloads.
-
-## OpenCode integration
-
-LLM-Launchpad automatically detects local installation of OpenCode and will set up your OpenCode config with the final OpenAI-compatible base URL and model ID after deployment.
-
-## Troubleshooting
-
-- `Modal CLI not found`: reinstall or upgrade the package, then confirm `modal --help` works in the same shell.
-- `Modal authentication missing`: run `modal setup`.
-- Hugging Face download errors: run `huggingface-cli login` and verify the model license or gated-repo access in your Hugging Face account.
-- Warmup stays queued: Modal may still be scheduling the requested GPU. Try a smaller GPU configuration or wait for capacity.
-- Endpoint status fails after deploy: inspect `llm-launchpad logs --backend <backend> --instance-name <name>` for backend startup errors.
-- TUI copy/paste: select text by dragging in mouse mode, then use `Ctrl/Cmd+C`; `Ctrl/Cmd+V` pastes the host clipboard into focused fields. Over SSH, start with `llm-launchpad tui --no-mouse` to let the terminal handle native text selection.
+- [Deploy catalog and recommendations](docs/catalog.md)
+- [Prime Intellect provider](docs/prime.md)
+- [Storage and costs](docs/storage-and-costs.md)
+- [OpenCode integration](docs/opencode.md)
+- [Troubleshooting and debug log](docs/troubleshooting.md)
+- [Full CLI reference](docs/cli.md)
 
 ## Development setup
 

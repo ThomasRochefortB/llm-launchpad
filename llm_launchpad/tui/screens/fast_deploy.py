@@ -70,6 +70,9 @@ class FastDeployAvailabilityFailed(Message):
         self.purpose = purpose
 
 
+_CUSTOM_DEPLOY_OPTION_ID = "fast-deploy-open-custom-deploy"
+
+
 @dataclass(frozen=True)
 class _InfraRow:
     """One deployable (profile, plan) pairing behind a fast-deploy row."""
@@ -537,7 +540,56 @@ class FastDeployScreen(CopyEnabledScreen):
         if event.option_list.id == "fast-deploy-list":
             self._choose(str(event.option.id))
 
+    def _goto_custom_deploy(self) -> None:
+        self._cancel_availability_request()
+        app = self.app
+        popper = getattr(app, "pop_to_main_menu", None)
+        if callable(popper):
+            popper()
+        else:
+            try:
+                app.pop_screen()
+            except Exception:
+                pass
+        pusher = getattr(app, "action_push_custom_deploy", None)
+        if callable(pusher):
+            pusher()
+
+    def _render_catalog_unavailable(self, option_list: OptionList) -> None:
+        info = self._catalog_info
+        self.query_one("#fast-deploy-subtitle", Static).update(_subtitle(info))
+        self.query_one("#fast-deploy-detail", Static).update("")
+        if info.error:
+            option_list.set_options(
+                [
+                    Option(
+                        "  Open Custom deploy to set models up manually",
+                        id=_CUSTOM_DEPLOY_OPTION_ID,
+                    )
+                ]
+            )
+            option_list.highlighted = 0
+            status = (
+                "[yellow]Live model catalog unavailable.[/yellow]\n"
+                "[dim]Enter opens Custom deploy for manual setup; "
+                "press Esc to go back.[/dim]\n"
+                f"[dim]{_escape_markup(_clip(info.error, 140))}[/dim]"
+            )
+        else:
+            option_list.set_options(
+                [Option("  Building the live model catalog…", disabled=True)]
+            )
+            status = (
+                "[dim]Building the live model catalog from "
+                "Artificial Analysis and Hugging Face…[/dim]"
+            )
+        self.query_one("#fast-deploy-status", Static).update(status)
+        option_list.focus()
+
     def _choose(self, option_id: str) -> None:
+        if option_id == _CUSTOM_DEPLOY_OPTION_ID:
+            self._goto_custom_deploy()
+            return
         if self._phase == "loading":
             return
         if self._phase == "models":
@@ -827,7 +879,13 @@ class FastDeployScreen(CopyEnabledScreen):
 
     def _render_model_list(self, *, preferred_id: str | None = None) -> None:
         option_list = self.query_one("#fast-deploy-list", OptionList)
+        self.query_one("#fast-deploy-title", Static).update(
+            "[bold #7bf168]Deploy[/]  [dim]Step 1: Pick a model[/dim]"
+        )
         visible = self._visible_models()
+        if not visible and not self._catalog_info.ready:
+            self._render_catalog_unavailable(option_list)
+            return
         options = [
             Option(
                 _model_option(
@@ -861,9 +919,6 @@ class FastDeployScreen(CopyEnabledScreen):
             self._update_model_detail(visible[highlight_index])
         else:
             self.query_one("#fast-deploy-detail", Static).update("")
-        self.query_one("#fast-deploy-title", Static).update(
-            "[bold #7bf168]Deploy[/]  [dim]Step 1: Pick a model[/dim]"
-        )
         self.query_one("#fast-deploy-subtitle", Static).update(_subtitle(self._catalog_info))
         plural = "s" if len(visible) != 1 else ""
         filter_note = ""

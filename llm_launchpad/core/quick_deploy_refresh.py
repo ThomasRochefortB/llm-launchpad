@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 
 from .artificial_analysis_auth import resolve_artificial_analysis_api_key
 from .config import SETTINGS_DIR
+from .gguf_metadata import GgufMtpStatus
 from .hf_models import (
     GgufQuantMetadata,
     ModelCandidate,
@@ -26,7 +27,9 @@ from .hf_models import (
 from .modal_gpu import ModalGpuSpec, fetch_modal_gpu_catalog
 from .naming import slugify_instance_name
 from .quick_deploy import QuickDeployCatalogInfo, QuickDeployProfile
-from .runtime_support import evaluate_llamacpp_architecture
+from .runtime_support import evaluate_llamacpp_architecture, evaluate_llamacpp_mtp
+from ..protocol.enums import SpeculativeDecodingMethod
+from ..protocol.models import SpeculativeDecodingConfig
 
 DEFAULT_MODEL_LIMIT = 3
 DEFAULT_CANDIDATE_LIMIT = 80
@@ -517,7 +520,7 @@ def _build_resolved_aa_model(
     repo_id: str,
 ) -> _ResolvedAAModel | None:
     try:
-        metadata = fetch_gguf_quant_metadata(repo_id)
+        metadata = fetch_gguf_quant_metadata(repo_id, inspect_mtp=True)
     except Exception:
         return None
     size_bucket = _size_bucket_for_parameters(candidate.parameter_count_b)
@@ -1068,12 +1071,13 @@ def _profiles_for_model(
 ) -> list[QuickDeployProfile]:
     if metadata is None:
         try:
-            metadata = fetch_gguf_quant_metadata(model.repo_id)
+            metadata = fetch_gguf_quant_metadata(model.repo_id, inspect_mtp=True)
         except Exception:
             return []
     compatibility = evaluate_llamacpp_architecture(metadata.architecture)
     if not compatibility.is_supported:
         return []
+    speculative_decoding = _mtp_recommendation(metadata)
     quants = _selected_quants(metadata)
     if not quants:
         return []
@@ -1100,6 +1104,7 @@ def _profiles_for_model(
                 aa_candidate=aa_candidate,
                 size_bucket=size_bucket,
                 llamacpp_runtime_id=compatibility.runtime_id,
+                speculative_decoding=speculative_decoding,
             )
         )
     return profiles
@@ -1139,6 +1144,7 @@ def _profiles_for_quant(
     aa_candidate: AAModelCandidate | None = None,
     size_bucket: ModelSizeBucket | None = None,
     llamacpp_runtime_id: str,
+    speculative_decoding: SpeculativeDecodingConfig | None,
 ) -> list[QuickDeployProfile]:
     required_vram_gb = _required_vram_for_quant(metadata, quant)
     if required_vram_gb is None:
@@ -1232,9 +1238,27 @@ def _profiles_for_quant(
                 ),
                 gguf_architecture=metadata.architecture,
                 llamacpp_runtime_id=llamacpp_runtime_id,
+                speculative_decoding=speculative_decoding,
             )
         )
     return profiles
+
+
+def _mtp_recommendation(
+    metadata: GgufQuantMetadata,
+) -> SpeculativeDecodingConfig | None:
+    capability = metadata.mtp
+    if capability is None or capability.status != GgufMtpStatus.SUPPORTED:
+        return None
+    layers = capability.nextn_predict_layers
+    decision = evaluate_llamacpp_mtp(metadata.architecture, layers)
+    if not decision.is_supported or layers is None:
+        return None
+    return SpeculativeDecodingConfig(
+        method=SpeculativeDecodingMethod.MTP,
+        num_speculative_tokens=3,
+        nextn_predict_layers=layers,
+    )
 
 
 def _select_gpu_shape(

@@ -19,6 +19,7 @@ from .modal_cli import _CLI_TIMEOUT_SECONDS as _MODAL_CLI_TIMEOUT_SECONDS
 from .modal_cli import resolve_modal_cli_path
 from .shutdown import is_shutting_down as _is_shutting_down
 from .shutdown import shutdown_event
+from .diagnostics import log_exception
 from .naming import default_served_model_name
 from .naming import infer_backend_from_app_name, infer_instance_from_app_name, legacy_app_name
 from .naming import modal_function_name, modal_web_label
@@ -132,7 +133,7 @@ class ModalBackend:
                 if proc.stderr and proc.stderr != subprocess.PIPE:
                     proc.stderr.close()
             except Exception:
-                pass
+                log_exception("Failed to terminate a tracked Modal subprocess")
 
     # ------------------------------------------------------------------
     # Pre-flight checks

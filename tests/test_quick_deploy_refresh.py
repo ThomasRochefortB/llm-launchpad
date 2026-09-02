@@ -8,6 +8,7 @@ from typing import Any, Sequence
 import unittest
 from unittest.mock import patch
 
+from llm_launchpad.core.gguf_metadata import GgufMtpCapability, GgufMtpStatus
 from llm_launchpad.core.hf_models import GgufQuantMetadata, ModelCandidate
 from llm_launchpad.core.modal_gpu import ModalGpuSpec
 from llm_launchpad.core.quick_deploy_refresh import (
@@ -19,6 +20,7 @@ from llm_launchpad.core.quick_deploy_refresh import (
     build_live_quick_deploy_catalog,
     fetch_artificial_analysis_models,
     normalize_aa_model_candidates,
+    _mtp_recommendation,
 )
 
 
@@ -51,6 +53,32 @@ def _ordered_unique_names(profiles: Sequence[object]) -> list[str]:
 
 
 class QuickDeployRefreshTests(unittest.TestCase):
+    def test_mtp_recommendation_requires_model_and_runtime_support(self) -> None:
+        supported = GgufQuantMetadata(
+            quantizations=[],
+            vram_gb_by_quant={},
+            architecture="qwen35",
+            mtp=GgufMtpCapability(
+                status=GgufMtpStatus.SUPPORTED,
+                nextn_predict_layers=1,
+            ),
+        )
+        absent = GgufQuantMetadata(
+            quantizations=[],
+            vram_gb_by_quant={},
+            architecture="deepseek4",
+            mtp=GgufMtpCapability(
+                status=GgufMtpStatus.UNSUPPORTED,
+                nextn_predict_layers=0,
+            ),
+        )
+
+        recommendation = _mtp_recommendation(supported)
+
+        self.assertIsNotNone(recommendation)
+        self.assertEqual(recommendation.num_speculative_tokens, 3)  # type: ignore[union-attr]
+        self.assertIsNone(_mtp_recommendation(absent))
+
     def test_live_catalog_selects_top_open_models_in_rank_order(self) -> None:
         candidates = (
             _aa_candidate("Closed Model 8B", 8, 99, rank=1),
@@ -377,7 +405,7 @@ class QuickDeployRefreshTests(unittest.TestCase):
             ModelCandidate(repo_id="org/Usable-GGUF"),
         ]
 
-        def metadata_for(repo_id: str) -> GgufQuantMetadata:
+        def metadata_for(repo_id: str, **_kwargs: object) -> GgufQuantMetadata:
             if repo_id == "org/Broken-GGUF":
                 raise RuntimeError("metadata unavailable")
             return GgufQuantMetadata(

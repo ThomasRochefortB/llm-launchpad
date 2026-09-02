@@ -4,16 +4,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
-from importlib import resources
-import json
 import shlex
-from typing import Any, Sequence
+from typing import Sequence
 
 from ..protocol.enums import BackendType, ComputeProvider
 from ..protocol.models import (
     DeploymentConfig,
     InferencePlan,
     InferenceRecipe,
+    SpeculativeDecodingConfig,
     WorkloadProfile,
 )
 from .inference_options import (
@@ -24,7 +23,6 @@ from .inference_options import (
     resolve_inference_plans,
 )
 from .naming import build_deployment_name, infer_instance_from_app_name, slugify_instance_name
-from .runtime_support import evaluate_llamacpp_architecture
 
 
 @dataclass(frozen=True)
@@ -58,6 +56,7 @@ class QuickDeployProfile:
     model_name: str | None = None
     gguf_architecture: str | None = None
     llamacpp_runtime_id: str | None = None
+    speculative_decoding: SpeculativeDecodingConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -82,106 +81,15 @@ class QuickDeployCatalogInfo:
     attribution: str | None = None
     is_fallback: bool = False
     is_live: bool = False
+    ready: bool = True
+    error: str | None = None
 
 
-_BUNDLED_CATALOG_PACKAGE = "llm_launchpad.data"
-_BUNDLED_CATALOG_FILENAME = "quick_deploy_catalog.json"
-
-
-QWEN35_397B_SERVER_ARGS = (
-    "--ctx-size",
-    "262144",
-    "--threads",
-    "16",
-    "--temp",
-    "0.6",
-    "--top-p",
-    "0.95",
-    "--top-k",
-    "20",
-    "--min-p",
-    "0.00",
+_PENDING_CATALOG_INFO = QuickDeployCatalogInfo(
+    source_label="Loading live catalog",
+    ready=False,
 )
-
-GLM5_SERVER_ARGS = (
-    "--ctx-size",
-    "202752",
-    "--flash-attn",
-    "on",
-    "--temp",
-    "0.7",
-    "--top-p",
-    "1.0",
-    "--min-p",
-    "0.01",
-)
-
-KIMI_K25_SERVER_ARGS = (
-    "--special",
-    "--kv-unified",
-    "--ctx-size",
-    "98304",
-    "--temp",
-    "1.0",
-    "--top-p",
-    "0.95",
-    "--min-p",
-    "0.01",
-)
-
-
-_STATIC_QUICK_DEPLOY_PROFILES: tuple[QuickDeployProfile, ...] = (
-    QuickDeployProfile(
-        id="qwen35-397b-rtxpro",
-        display_name="Qwen3.5 397B A17B",
-        repo_id="unsloth/Qwen3.5-397B-A17B-GGUF",
-        quant="UD-Q4_K_XL",
-        gpu_type="RTX-PRO-6000",
-        gpu_count=3,
-        profile_label="Cheap but good",
-        approx_cost_per_hour_usd=9.09,
-        max_context_tokens=262144,
-        instance_slug_hint="qwen35-397b-rtxpro",
-        summary="Default curated Qwen3.5 profile for long-context coding workloads on three RTX PRO 6000 GPUs.",
-        server_args=QWEN35_397B_SERVER_ARGS,
-        source_label="Curated fallback",
-    ),
-    QuickDeployProfile(
-        id="glm5-rtxpro",
-        display_name="GLM-5",
-        repo_id="unsloth/GLM-5-GGUF",
-        quant="UD-Q4_K_XL",
-        gpu_type="RTX-PRO-6000",
-        gpu_count=4,
-        profile_label="Cheap but good",
-        approx_cost_per_hour_usd=12.12,
-        max_context_tokens=202752,
-        instance_slug_hint="glm5-rtxpro",
-        summary="Default curated GLM-5 profile for long-context coding and agent workflows on four RTX PRO 6000 GPUs.",
-        server_args=GLM5_SERVER_ARGS,
-        source_label="Curated fallback",
-    ),
-    QuickDeployProfile(
-        id="kimi25-rtxpro",
-        display_name="Kimi K2.5",
-        repo_id="unsloth/Kimi-K2.5-GGUF",
-        quant="UD-Q4_K_XL",
-        gpu_type="RTX-PRO-6000",
-        gpu_count=5,
-        profile_label="Cheap but good",
-        approx_cost_per_hour_usd=15.15,
-        max_context_tokens=262144,
-        instance_slug_hint="kimi25-rtxpro",
-        summary="Default curated Kimi K2.5 profile for long-context coding and agent workflows on five RTX PRO 6000 GPUs.",
-        server_args=KIMI_K25_SERVER_ARGS,
-        source_label="Curated fallback",
-    ),
-)
-
-_STATIC_CATALOG_INFO = QuickDeployCatalogInfo(
-    source_label="Curated llama.cpp coding profiles",
-    is_fallback=True,
-)
+_EMPTY_PROFILES: tuple[QuickDeployProfile, ...] = ()
 _CATALOG_CACHE: tuple[QuickDeployCatalogInfo, tuple[QuickDeployProfile, ...]] | None = None
 
 
@@ -222,189 +130,26 @@ def _load_quick_deploy_catalog() -> tuple[QuickDeployCatalogInfo, tuple[QuickDep
     global _CATALOG_CACHE
     if _CATALOG_CACHE is not None:
         return _CATALOG_CACHE
-
-    text = _read_bundled_catalog_text()
-    if text is None:
-        _CATALOG_CACHE = (_STATIC_CATALOG_INFO, _STATIC_QUICK_DEPLOY_PROFILES)
-        return _CATALOG_CACHE
-
-    try:
-        payload = json.loads(text)
-        loaded = _profiles_from_catalog_payload(payload)
-    except Exception:
-        loaded = None
-
-    if loaded is None:
-        _CATALOG_CACHE = (_STATIC_CATALOG_INFO, _STATIC_QUICK_DEPLOY_PROFILES)
-        return _CATALOG_CACHE
-
-    _CATALOG_CACHE = loaded
+    _CATALOG_CACHE = (_PENDING_CATALOG_INFO, _EMPTY_PROFILES)
     return _CATALOG_CACHE
 
 
-def _read_bundled_catalog_text() -> str | None:
-    try:
-        resource = resources.files(_BUNDLED_CATALOG_PACKAGE).joinpath(_BUNDLED_CATALOG_FILENAME)
-        return resource.read_text(encoding="utf-8")
-    except Exception:
-        return None
+def record_quick_deploy_catalog_failure(error: str) -> bool:
+    """Record a live catalog failure; keeps any existing live catalog."""
 
-
-def _profiles_from_catalog_payload(
-    payload: Any,
-) -> tuple[QuickDeployCatalogInfo, tuple[QuickDeployProfile, ...]] | None:
-    if not isinstance(payload, dict):
-        return None
-    raw_profiles = payload.get("profiles")
-    if not isinstance(raw_profiles, list):
-        return None
-
-    schema_version = _positive_int(payload.get("schema_version")) or 1
-    profiles: list[QuickDeployProfile] = []
-    seen_ids: set[str] = set()
-    for raw_profile in raw_profiles:
-        profile = _profile_from_catalog_row(raw_profile)
-        if profile is None or profile.id in seen_ids:
-            continue
-        if profile.backend == BackendType.LLAMACPP and schema_version >= 2:
-            compatibility = evaluate_llamacpp_architecture(profile.gguf_architecture)
-            if not compatibility.is_supported:
-                continue
-        seen_ids.add(profile.id)
-        profiles.append(profile)
-
-    if not profiles:
-        return None
-
-    source = (
-        _clean_string(payload.get("source"))
-        or "Artificial Analysis Intelligence Index rankings"
+    global _CATALOG_CACHE
+    if _CATALOG_CACHE is not None and _CATALOG_CACHE[1]:
+        return False
+    detail = error.strip() or "The live model catalog could not be reached."
+    _CATALOG_CACHE = (
+        QuickDeployCatalogInfo(
+            source_label="Live catalog unavailable",
+            ready=False,
+            error=detail,
+        ),
+        _EMPTY_PROFILES,
     )
-    generated_at = _clean_string(payload.get("generated_at")) or None
-    attribution = _clean_string(payload.get("attribution")) or None
-    info = QuickDeployCatalogInfo(
-        source_label=source,
-        generated_at=generated_at,
-        attribution=attribution,
-        is_fallback=False,
-    )
-    return (info, tuple(profiles))
-
-
-def _profile_from_catalog_row(payload: Any) -> QuickDeployProfile | None:
-    if not isinstance(payload, dict):
-        return None
-
-    profile_id = _clean_string(payload.get("id"))
-    display_name = _clean_string(payload.get("display_name"))
-    repo_id = _clean_string(payload.get("repo_id"))
-    model_name = _clean_string(payload.get("model_name"))
-    quant = _clean_string(payload.get("quant"))
-    gpu_type = _clean_string(payload.get("gpu_type"))
-    profile_label = _clean_string(payload.get("profile_label"))
-    instance_slug_hint = _clean_string(payload.get("instance_slug_hint"))
-    summary = _clean_string(payload.get("summary"))
-    server_args = _clean_string_tuple(payload.get("server_args"))
-    gpu_count = _positive_int(payload.get("gpu_count"))
-    approx_cost = _nonnegative_float(payload.get("approx_cost_per_hour_usd"))
-    max_context = _positive_int(payload.get("max_context_tokens"))
-    backend_value = _clean_string(payload.get("backend")) or BackendType.LLAMACPP.value
-    try:
-        backend = BackendType(backend_value)
-    except ValueError:
-        return None
-
-    common_required = [
-        profile_id,
-        display_name,
-        gpu_type,
-        profile_label,
-        instance_slug_hint,
-        summary,
-    ]
-    if not all(common_required):
-        return None
-    if backend == BackendType.LLAMACPP and not (repo_id and quant):
-        return None
-    if backend == BackendType.VLLM and not (model_name or repo_id):
-        return None
-    if server_args is None or gpu_count is None or approx_cost is None or max_context is None:
-        return None
-
-    return QuickDeployProfile(
-        id=profile_id,
-        display_name=display_name,
-        repo_id=repo_id,
-        quant=quant,
-        gpu_type=gpu_type,
-        gpu_count=gpu_count,
-        profile_label=profile_label,
-        approx_cost_per_hour_usd=approx_cost,
-        max_context_tokens=max_context,
-        instance_slug_hint=instance_slug_hint,
-        summary=summary,
-        server_args=server_args or (),
-        required_vram_gb=_positive_float(payload.get("required_vram_gb")),
-        resource_tier=_clean_string(payload.get("resource_tier")) or None,
-        resource_tier_label=_clean_string(payload.get("resource_tier_label")) or None,
-        source_label=_clean_string(payload.get("source_label")) or "Artificial Analysis",
-        aa_model_id=_clean_string(payload.get("aa_model_id")) or None,
-        aa_model_name=_clean_string(payload.get("aa_model_name")) or None,
-        aa_model_slug=_clean_string(payload.get("aa_model_slug")) or None,
-        aa_coding_score=_optional_float(payload.get("aa_coding_score")),
-        aa_intelligence_score=_optional_float(payload.get("aa_intelligence_score")),
-        aa_rank=_positive_int(payload.get("aa_rank")),
-        model_size_label=_clean_string(payload.get("model_size_label")) or None,
-        backend=backend,
-        model_name=model_name or None,
-        gguf_architecture=_clean_string(payload.get("gguf_architecture")) or None,
-        llamacpp_runtime_id=_clean_string(payload.get("llamacpp_runtime_id")) or None,
-    )
-
-
-def _clean_string(value: Any) -> str:
-    return str(value or "").strip()
-
-
-def _clean_string_tuple(value: Any) -> tuple[str, ...] | None:
-    if not isinstance(value, list):
-        return None
-    parsed = tuple(str(item).strip() for item in value if str(item).strip())
-    return parsed
-
-
-def _positive_int(value: Any) -> int | None:
-    if isinstance(value, bool):
-        return None
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if parsed > 0 else None
-
-
-def _optional_float(value: Any) -> float | None:
-    if value is None or isinstance(value, bool):
-        return None
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if parsed == parsed else None
-
-
-def _nonnegative_float(value: Any) -> float | None:
-    parsed = _optional_float(value)
-    if parsed is None or parsed < 0:
-        return None
-    return parsed
-
-
-def _positive_float(value: Any) -> float | None:
-    parsed = _optional_float(value)
-    if parsed is None or parsed <= 0:
-        return None
-    return parsed
+    return True
 
 
 def _reset_quick_deploy_catalog_cache() -> None:
@@ -462,6 +207,8 @@ def quick_deploy_recipe(profile: QuickDeployProfile) -> InferenceRecipe:
             model_id,
             profile.quant,
             str(profile.max_context_tokens),
+            profile.speculative_decoding.method.value if profile.speculative_decoding else "",
+            str(profile.speculative_decoding.num_speculative_tokens) if profile.speculative_decoding else "",
             *profile.server_args,
         )
     )
@@ -477,6 +224,7 @@ def quick_deploy_recipe(profile: QuickDeployProfile) -> InferenceRecipe:
         max_context_tokens=profile.max_context_tokens,
         required_vram_gb=profile.required_vram_gb,
         server_args=profile.server_args,
+        speculative_decoding=profile.speculative_decoding,
         source_label=profile.source_label,
         quality_score=quick_deploy_quality_score(profile),
         quality_rank=profile.aa_rank,
@@ -614,6 +362,7 @@ def build_quick_deploy_config(
     app_name: str = "",
     do_warmup: bool = True,
     show_debug_logs: bool = False,
+    enable_speculative_decoding: bool = True,
 ) -> DeploymentConfig:
     """Build a deployment config from a recipe bound to a provider quote."""
 
@@ -632,6 +381,8 @@ def build_quick_deploy_config(
         config.gguf_architecture = profile.gguf_architecture
         config.llamacpp_runtime_id = profile.llamacpp_runtime_id
         config.server_args = shlex.join(profile.server_args)
+        if enable_speculative_decoding:
+            config.speculative_decoding = profile.speculative_decoding
     else:
         config.model_name = profile.model_name or profile.repo_id
         config.n_gpu = plan.quote.gpu_count if plan is not None else profile.gpu_count

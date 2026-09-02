@@ -143,6 +143,9 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             assert isinstance(screen, LlamaCppDeployScreen)
             screen.query_one("#repo-id", Input).value = "Qwen/Qwen3-Coder-Next-GGUF"
             await pilot.pause()
+            # The synthetic response bypasses the normal debounced fetch, which
+            # cancels this timer before the worker posts its result.
+            screen._cancel_quantization_lookup()
             screen.on_llama_cpp_quants_loaded(
                 LlamaCppQuantsLoaded(
                     repo_id="Qwen/Qwen3-Coder-Next-GGUF",
@@ -151,6 +154,7 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                     vram_gb_by_quant={},
                 )
             )
+            await pilot.pause()
             quant_list = screen.query_one("#llama-quant-list", OptionList)
             provider = screen.query_one("#provider-llama", Select)
 

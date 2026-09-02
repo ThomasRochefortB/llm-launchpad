@@ -9,7 +9,9 @@ from llm_launchpad.core.runtime_support import (
     LlamaCppSupportManifest,
     RuntimeCompatibility,
     evaluate_llamacpp_architecture,
+    evaluate_llamacpp_mtp,
     extract_llamacpp_architectures,
+    extract_llamacpp_mtp_architectures,
     load_llamacpp_support_manifest,
 )
 from llm_launchpad.protocol.enums import BackendType
@@ -24,6 +26,9 @@ class LlamaCppRuntimeSupportTests(unittest.TestCase):
         self.assertIn("qwen35", manifest.architectures)
         self.assertIn("glm-dsa", manifest.architectures)
         self.assertNotIn("glm5next", manifest.architectures)
+        self.assertTrue(manifest.mtp_support_known)
+        self.assertIn("qwen35", manifest.mtp_architectures)
+        self.assertIn("glm-dsa", manifest.mtp_architectures)
 
     def test_modal_and_prime_defaults_match_support_manifest(self) -> None:
         manifest = load_llamacpp_support_manifest()
@@ -65,6 +70,50 @@ class LlamaCppRuntimeSupportTests(unittest.TestCase):
         """
 
         self.assertEqual(extract_llamacpp_architectures(source), ["llama", "qwen35"])
+
+    def test_extract_mtp_architectures_requires_metadata_and_graph_support(self) -> None:
+        architecture_source = """
+        { LLM_ARCH_QWEN35, "qwen35" },
+        { LLM_ARCH_LLAMA, "llama" },
+        """
+        qwen_source = """
+        llm_model_qwen35::llm_model_qwen35() {}
+        LLM_KV_NEXTN_PREDICT_LAYERS
+        LLM_GRAPH_TYPE_DECODER_MTP
+        """
+        llama_source = """
+        llm_model_llama::llm_model_llama() {}
+        LLM_GRAPH_TYPE_DECODER_MTP
+        """
+
+        result = extract_llamacpp_mtp_architectures(
+            architecture_source,
+            (qwen_source, llama_source),
+        )
+
+        self.assertEqual(result, ["qwen35"])
+
+    def test_mtp_evaluator_requires_embedded_heads_and_runtime_support(self) -> None:
+        manifest = LlamaCppSupportManifest(
+            runtime_id="test-runtime",
+            runtime_build="b1",
+            image_ref="example/runtime:server-cuda-b1",
+            image_digest="sha256:test",
+            source_revision="abc",
+            source_url="https://example.invalid/source",
+            generated_at="2026-08-30T00:00:00Z",
+            architectures=frozenset({"qwen35", "deepseek4"}),
+            mtp_architectures=frozenset({"qwen35", "deepseek4"}),
+            mtp_support_known=True,
+        )
+
+        supported = evaluate_llamacpp_mtp("qwen35", 1, manifest=manifest)
+        absent = evaluate_llamacpp_mtp("deepseek4", 0, manifest=manifest)
+        unknown = evaluate_llamacpp_mtp("qwen35", None, manifest=manifest)
+
+        self.assertEqual(supported.status, RuntimeCompatibility.SUPPORTED)
+        self.assertEqual(absent.status, RuntimeCompatibility.UNSUPPORTED)
+        self.assertEqual(unknown.status, RuntimeCompatibility.UNKNOWN)
 
     def test_evaluator_accepts_manifest_compatible_image_alias(self) -> None:
         manifest = LlamaCppSupportManifest(

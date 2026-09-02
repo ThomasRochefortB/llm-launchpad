@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from .gguf_metadata import GgufMtpCapability, fetch_gguf_mtp_capability
 from .shutdown import is_shutting_down
 
 ModelRankMode = Literal["downloads", "trending"]
@@ -34,6 +35,7 @@ class GgufQuantMetadata:
     quantizations: list[str]
     vram_gb_by_quant: dict[str, float]
     architecture: str | None = None
+    mtp: GgufMtpCapability | None = None
 
 
 @dataclass(frozen=True)
@@ -53,7 +55,7 @@ _HF_REQUEST_TIMEOUT_SECONDS = 10.0
 _HF_ETAG_TIMEOUT_SECONDS = 10.0
 _DEFAULT_CONTEXT_TOKENS = 8192
 _CACHE: dict[tuple[str, str, int], tuple[float, list[ModelCandidate]]] = {}
-_GGUF_QUANT_METADATA_CACHE: dict[tuple[str, str], tuple[float, GgufQuantMetadata]] = {}
+_GGUF_QUANT_METADATA_CACHE: dict[tuple[str, str, str, bool], tuple[float, GgufQuantMetadata]] = {}
 _VLLM_MEMORY_CACHE: dict[tuple[int, str, str, int], tuple[float, VllmMemoryBreakdown]] = {}
 _HF_JSON_FILE_CACHE: dict[tuple[str, str, str], tuple[float, dict[str, Any] | None]] = {}
 _SORT_BY_MODE: dict[ModelRankMode, str] = {
@@ -432,7 +434,14 @@ def list_llamacpp_candidates(mode: ModelRankMode = "downloads", limit: int = 10)
     return models
 
 
-def fetch_gguf_quant_metadata(repo_id: str, revision: str | None = None) -> GgufQuantMetadata:
+def fetch_gguf_quant_metadata(
+    repo_id: str,
+    revision: str | None = None,
+    *,
+    inspect_mtp: bool = False,
+    mtp_quant: str | None = None,
+    force_refresh: bool = False,
+) -> GgufQuantMetadata:
     """Return detected GGUF quantizations and per-quant VRAM estimates in GB."""
     if is_shutting_down():
         return GgufQuantMetadata(quantizations=[], vram_gb_by_quant={})
@@ -440,15 +449,17 @@ def fetch_gguf_quant_metadata(repo_id: str, revision: str | None = None) -> Gguf
     if not normalized_repo:
         return GgufQuantMetadata(quantizations=[], vram_gb_by_quant={})
     revision_key = (revision or "").strip()
-    cache_key = (normalized_repo, revision_key)
+    quant_key = (mtp_quant or "").strip().casefold()
+    cache_key = (normalized_repo, revision_key, quant_key, inspect_mtp)
     now = time.time()
     cached = _GGUF_QUANT_METADATA_CACHE.get(cache_key)
-    if cached and (now - cached[0]) < _CACHE_TTL_SECONDS:
+    if not force_refresh and cached and (now - cached[0]) < _CACHE_TTL_SECONDS:
         cached_metadata = cached[1]
         return GgufQuantMetadata(
             quantizations=list(cached_metadata.quantizations),
             vram_gb_by_quant=dict(cached_metadata.vram_gb_by_quant),
             architecture=cached_metadata.architecture,
+            mtp=cached_metadata.mtp,
         )
 
     try:
@@ -467,7 +478,8 @@ def fetch_gguf_quant_metadata(repo_id: str, revision: str | None = None) -> Gguf
         revision=revision_key or None,
         expand=["siblings", "gguf"],
     )
-    quantizations = _extract_gguf_quantizations(getattr(info, "siblings", None))
+    siblings = getattr(info, "siblings", None)
+    quantizations = _extract_gguf_quantizations(siblings)
     gguf_payload = getattr(info, "gguf", None)
     architecture = _extract_gguf_architecture(gguf_payload)
     vram_gb_by_quant = _extract_gguf_vram_by_quant(gguf_payload)
@@ -481,16 +493,29 @@ def fetch_gguf_quant_metadata(repo_id: str, revision: str | None = None) -> Gguf
         allowed = {quant.upper() for quant in quantizations}
         vram_gb_by_quant = {quant: value for quant, value in vram_gb_by_quant.items() if quant in allowed}
 
+    mtp = (
+        fetch_gguf_mtp_capability(
+            normalized_repo,
+            siblings,
+            revision=revision_key or None,
+            quant=mtp_quant,
+        )
+        if inspect_mtp
+        else None
+    )
+
     metadata = GgufQuantMetadata(
         quantizations=list(quantizations),
         vram_gb_by_quant=dict(vram_gb_by_quant),
         architecture=architecture,
+        mtp=mtp,
     )
     _GGUF_QUANT_METADATA_CACHE[cache_key] = (now, metadata)
     return GgufQuantMetadata(
         quantizations=list(metadata.quantizations),
         vram_gb_by_quant=dict(metadata.vram_gb_by_quant),
         architecture=metadata.architecture,
+        mtp=metadata.mtp,
     )
 
 

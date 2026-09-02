@@ -41,6 +41,7 @@ from ...core.prime_backend import (
     is_compatible_prime_offer,
     preferred_prime_offer_image,
 )
+from ...core.reasoning_profiles import discover_reasoning_capabilities
 from ...protocol.enums import BackendType, ComputeProvider
 from ...protocol.models import (
     ComputeOffer,
@@ -1863,8 +1864,16 @@ class VllmDeployScreen(CopyEnabledScreen):
             estimate = fetch_vllm_memory_breakdown(repo_id=repo_id, revision=revision)
         except Exception as exc:
             poster(VllmMemoryFailed(repo_id=repo_id, revision=revision, error=str(exc)))
-            return
-        poster(VllmMemoryLoaded(repo_id=repo_id, revision=revision, estimate=estimate))
+        else:
+            poster(VllmMemoryLoaded(repo_id=repo_id, revision=revision, estimate=estimate))
+        try:
+            discover_reasoning_capabilities(
+                BackendType.VLLM,
+                repo_id,
+                revision,
+            )
+        except Exception:
+            pass
 
     def on_vllm_memory_loaded(self, message: VllmMemoryLoaded) -> None:
         cache_key = self._memory_cache_key(message.repo_id, message.revision)

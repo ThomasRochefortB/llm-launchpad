@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import unittest
-from unittest.mock import patch
+from dataclasses import replace
 
 from textual.app import App
 from textual.widgets import Button, Input, Select, Static, Switch
@@ -12,12 +12,18 @@ from llm_launchpad.core.quick_deploy import (
     get_quick_deploy_profile,
     quick_deploy_recipe,
 )
-from llm_launchpad.protocol.enums import BackendType, BillingModel, ComputeProvider
+from llm_launchpad.protocol.enums import (
+    BackendType,
+    BillingModel,
+    ComputeProvider,
+    SpeculativeDecodingMethod,
+)
 from llm_launchpad.protocol.models import (
     InferencePlan,
     ModalProviderOptions,
     PrimeProviderOptions,
     ProviderQuote,
+    SpeculativeDecodingConfig,
 )
 from llm_launchpad.tui.app import TuiApp
 from llm_launchpad.tui.screens.quick_deploy import QuickDeployScreen
@@ -38,15 +44,12 @@ class _StyledApp(_TestApp):
 
 class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
-        self._catalog_patch = patch(
-            "llm_launchpad.core.quick_deploy._read_bundled_catalog_text",
-            return_value=None,
-        )
-        self._catalog_patch.start()
+        from tests.catalog_fixtures import activate_static_like_catalog
+
         quick_deploy._reset_quick_deploy_catalog_cache()
+        activate_static_like_catalog()
 
     def tearDown(self) -> None:
-        self._catalog_patch.stop()
         quick_deploy._reset_quick_deploy_catalog_cache()
 
     async def test_screen_renders_selected_profile_summary(self) -> None:
@@ -164,6 +167,32 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             assert instance_input.parent is not None
             self.assertTrue(instance_input.parent.has_class("hidden"))
             self.assertTrue(screen.query_one("#quick-deploy-btn", Button).has_focus)
+
+    async def test_supported_profile_shows_default_on_mtp_toggle_and_can_disable_it(self) -> None:
+        profile = replace(
+            get_quick_deploy_profile("qwen35-397b-rtxpro"),
+            speculative_decoding=SpeculativeDecodingConfig(
+                method=SpeculativeDecodingMethod.MTP,
+                num_speculative_tokens=3,
+                nextn_predict_layers=1,
+            ),
+        )
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(QuickDeployScreen(profile_id=profile))
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, QuickDeployScreen)
+            toggle = screen.query_one("#quick-speculative-decoding", Switch)
+            summary = str(screen.query_one("#quick-deploy-profile-body", Static).content)
+            self.assertTrue(toggle.value)
+            self.assertIn("Native MTP · up to 3 draft tokens", summary)
+            toggle.value = False
+            screen._deploy()
+
+        self.assertIsNotNone(app.deployed_config)
+        self.assertIsNone(app.deployed_config.speculative_decoding)
 
     async def test_deploy_button_stays_visible_on_compact_terminals(self) -> None:
         app = _StyledApp()

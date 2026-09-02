@@ -16,10 +16,17 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shlex
 import time
 from typing import Any, Generator, List, Optional
 
-from ..protocol.enums import BackendType, ComputeProvider, DeploymentState, OperationType
+from ..protocol.enums import (
+    BackendType,
+    ComputeProvider,
+    DeploymentState,
+    OperationType,
+    SpeculativeDecodingMethod,
+)
 from ..protocol.events import (
     BaseEvent,
     EndpointAvailableEvent,
@@ -45,6 +52,7 @@ from .benchmark import (
 )
 from .backend import ModalBackend
 from .config import ConfigStore
+from .gguf_metadata import GgufMtpStatus
 from .hf_models import fetch_gguf_quant_metadata
 from .modal_auth import get_modal_auth_status
 from .naming import legacy_app_name
@@ -59,11 +67,13 @@ from .prime_backend import (
 )
 from .prime_disks import bind_prime_disk, resolve_prime_offer_and_disk
 from .provider_options import prime_provider_options
+from .reasoning_profiles import discover_selected_model_reasoning
 from .runtime_support import (
     DEFAULT_LLAMACPP_IMAGE_REF,
     RuntimeCompatibility,
     RuntimeCompatibilityDecision,
     evaluate_llamacpp_architecture,
+    evaluate_llamacpp_mtp,
 )
 from .warmup import WarmupRunner
 from .warmup import modal_gpu_scheduling_hint as _modal_gpu_scheduling_hint
@@ -78,6 +88,36 @@ _SIZE_TOKEN_RE = re.compile(r"^\s*(?P<num>\d+(?:\.\d+)?)\s*(?P<unit>[A-Za-z]+)?\
 _LLAMACPP_MIN_PLAUSIBLE_GGUF_BYTES = 1024 * 1024
 _LLAMACPP_STORAGE_JSON_BEGIN = "LLM_LAUNCHPAD_STORAGE_JSON_BEGIN"
 _LLAMACPP_STORAGE_JSON_END = "LLM_LAUNCHPAD_STORAGE_JSON_END"
+
+
+def _configured_llamacpp_image(config: DeploymentConfig) -> str:
+    if config.provider == ComputeProvider.PRIME:
+        return default_prime_container_image(BackendType.LLAMACPP)
+    return (
+        os.environ.get("LLAMA_CPP_IMAGE_REF", "").strip()
+        or DEFAULT_LLAMACPP_IMAGE_REF
+    )
+
+
+def _without_managed_mtp_args(server_args: str | None) -> str | None:
+    """Remove launchpad-managed MTP flags so preflight remains idempotent."""
+
+    tokens = shlex.split(server_args or "")
+    filtered: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token in {"--spec-type", "--spec-draft-n-max"}:
+            index += 2
+            continue
+        if token.startswith("--spec-type=") or token.startswith(
+            "--spec-draft-n-max="
+        ):
+            index += 1
+            continue
+        filtered.append(token)
+        index += 1
+    return shlex.join(filtered) or None
 
 
 def _tag_operation(events: EventStream, operation: OperationType) -> EventStream:
@@ -111,6 +151,7 @@ def _prime_endpoint_info(
         endpoint_api_key=config.endpoint_api_key,
         max_context_tokens=config.max_context_tokens,
         max_output_tokens=config.max_output_tokens,
+        reasoning=config.reasoning,
     )
 
 
@@ -211,6 +252,30 @@ class Orchestrator:
 
     def deploy(self, config: DeploymentConfig) -> EventStream:
         """Run a full deploy workflow (optional preload + deploy + warmup)."""
+        try:
+            config.reasoning = discover_selected_model_reasoning(config)
+        except Exception as exc:
+            config.reasoning = None
+            yield LogEvent(
+                line=(
+                    "Reasoning capability preflight warning: could not inspect "
+                    f"the selected Hugging Face revision ({exc}). "
+                    "OpenCode reasoning variants will remain disabled."
+                ),
+                operation=OperationType.DEPLOY,
+            )
+        if config.reasoning is not None:
+            capabilities = config.reasoning
+            yield LogEvent(
+                line=(
+                    "Reasoning capability preflight: "
+                    f"{', '.join(capabilities.efforts)} "
+                    f"(default {capabilities.default_effort}), verified from "
+                    f"{capabilities.source_repo}@{capabilities.source_revision[:12]}"
+                ),
+                operation=OperationType.DEPLOY,
+                is_milestone=True,
+            )
         if config.backend == BackendType.LLAMACPP and not (config.served_model_name or "").strip():
             config.served_model_name = default_llamacpp_served_model_name(
                 config.repo_id,
@@ -251,6 +316,7 @@ class Orchestrator:
                     line=f"Compatibility preflight warning: {detail} Continuing unverified.",
                     operation=OperationType.DEPLOY,
                 )
+            yield from self._prepare_llamacpp_speculative_decoding(config)
         if config.provider == ComputeProvider.PRIME:
             yield from self._deploy_prime(config)
             return
@@ -283,19 +349,96 @@ class Orchestrator:
             except Exception as exc:
                 lookup_error = str(exc)
 
-        if config.provider == ComputeProvider.PRIME:
-            image_ref = default_prime_container_image(BackendType.LLAMACPP)
-        else:
-            image_ref = (
-                os.environ.get("LLAMA_CPP_IMAGE_REF", "").strip()
-                or DEFAULT_LLAMACPP_IMAGE_REF
-            )
+        image_ref = _configured_llamacpp_image(config)
         decision = evaluate_llamacpp_architecture(
             architecture,
             image_ref=image_ref,
         )
         config.llamacpp_runtime_id = decision.runtime_id
         return decision, lookup_error
+
+    def _prepare_llamacpp_speculative_decoding(
+        self,
+        config: DeploymentConfig,
+    ) -> EventStream:
+        """Revalidate and render a Fast Deploy speculative-decoding request."""
+
+        requested = config.speculative_decoding
+        if requested is None:
+            return
+        config.server_args = _without_managed_mtp_args(config.server_args)
+        if requested.method != SpeculativeDecodingMethod.MTP:
+            config.speculative_decoding = None
+            yield LogEvent(
+                line="Speculative decoding disabled: unsupported method requested.",
+                operation=OperationType.DEPLOY,
+            )
+            return
+
+        try:
+            metadata = fetch_gguf_quant_metadata(
+                config.repo_id or "",
+                revision=config.revision,
+                inspect_mtp=True,
+                mtp_quant=config.quant,
+                force_refresh=True,
+            )
+            capability = metadata.mtp
+            layers = (
+                capability.nextn_predict_layers
+                if capability is not None
+                and capability.status == GgufMtpStatus.SUPPORTED
+                else None
+            )
+            architecture = metadata.architecture or config.gguf_architecture
+            decision = evaluate_llamacpp_mtp(
+                architecture,
+                layers,
+                image_ref=_configured_llamacpp_image(config),
+            )
+            detail = decision.message
+            if capability is not None and capability.message:
+                detail = f"{detail} {capability.message}"
+        except Exception as exc:
+            layers = None
+            decision = None
+            detail = f"metadata lookup failed: {exc}"
+
+        if decision is None or not decision.is_supported or layers is None:
+            config.speculative_decoding = None
+            yield LogEvent(
+                line=(
+                    f"MTP preflight warning: {detail} Disabling MTP and continuing "
+                    "with normal decoding."
+                ),
+                operation=OperationType.DEPLOY,
+            )
+            return
+
+        config.gguf_architecture = decision.architecture
+        config.llamacpp_runtime_id = decision.runtime_id
+        config.speculative_decoding = replace(
+            requested,
+            nextn_predict_layers=layers,
+        )
+        arguments = shlex.split(config.server_args or "")
+        arguments.extend(
+            [
+                "--spec-type",
+                "draft-mtp",
+                "--spec-draft-n-max",
+                str(requested.num_speculative_tokens),
+            ]
+        )
+        config.server_args = shlex.join(arguments)
+        yield LogEvent(
+            line=(
+                "MTP preflight: enabled native draft-mtp with up to "
+                f"{requested.num_speculative_tokens} draft tokens."
+            ),
+            operation=OperationType.DEPLOY,
+            is_milestone=True,
+        )
 
     def _deploy_prime(self, config: DeploymentConfig) -> EventStream:
         """Provision a Prime pod and resolve its public inference endpoint."""

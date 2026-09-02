@@ -29,6 +29,12 @@ class BackendType(str, Enum):
         }[self]
 
 
+class SpeculativeDecodingMethod(str, Enum):
+    """Speculative decoding methods understood by launchpad runtimes."""
+
+    MTP = "mtp"
+
+
 class ComputeProvider(str, Enum):
     """Infrastructure providers used to host serving backends."""
 

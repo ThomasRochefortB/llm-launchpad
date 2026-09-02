@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 import unittest
 
 import pytest
@@ -75,12 +76,44 @@ def _stub_orchestrator_llamacpp_metadata(monkeypatch: pytest.MonkeyPatch) -> Non
 
     monkeypatch.setattr(
         "llm_launchpad.core.orchestrator.fetch_gguf_quant_metadata",
-        lambda _repo_id, revision=None: GgufQuantMetadata(
+        lambda _repo_id, revision=None, **_kwargs: GgufQuantMetadata(
             quantizations=[],
             vram_gb_by_quant={},
             architecture="llama",
         ),
     )
+
+
+@pytest.fixture(autouse=True)
+def _stub_orchestrator_reasoning_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep deployment tests from inspecting live Hugging Face repositories."""
+
+    monkeypatch.setattr(
+        "llm_launchpad.core.orchestrator.discover_selected_model_reasoning",
+        lambda config: config.reasoning,
+    )
+    monkeypatch.setattr(
+        "llm_launchpad.tui.app.discover_reasoning_capabilities",
+        lambda _backend, _repo_id, _revision=None: None,
+    )
+    monkeypatch.setattr(
+        "llm_launchpad.tui.screens.deploy.discover_reasoning_capabilities",
+        lambda _backend, _repo_id, _revision=None: None,
+    )
+    monkeypatch.setattr(
+        "llm_launchpad.core.connection_store.discover_reasoning_capabilities",
+        lambda _backend, _repo_id, _revision=None: None,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_tui_local_caches(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Keep TUI connection/storage tests out of the real user settings directory."""
+
+    monkeypatch.setattr("llm_launchpad.tui.app.SETTINGS_DIR", tmp_path / "tui-settings")
 
 
 @pytest.fixture(autouse=True)

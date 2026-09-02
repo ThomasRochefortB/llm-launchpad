@@ -33,6 +33,9 @@ uv run llm-launchpad tui --no-mouse
 - Keep cross-layer contracts in `llm_launchpad/protocol/`.
 - Reuse `llm_launchpad/core/paths.py` and `BackendType.script` instead of hardcoding backend paths.
 - Add behavior-focused tests for both success and failure paths when changing CLI or core logic.
+- When adding or changing a CLI command, regenerate the reference with
+  `uv run python scripts/generate_cli_reference.py` and commit the updated
+  `docs/cli.md`.
 
 ## Pull requests
 

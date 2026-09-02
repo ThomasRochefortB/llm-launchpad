@@ -1,20 +1,23 @@
 from __future__ import annotations
 
-import json
 import shlex
 import unittest
-from unittest.mock import patch
 
 from llm_launchpad.core import quick_deploy
 from llm_launchpad.core.quick_deploy import (
+    QuickDeployProfile,
     build_quick_deploy_config,
     format_context_length,
-    get_quick_deploy_profile,
     get_quick_deploy_catalog_info,
+    get_quick_deploy_profile,
     list_quick_deploy_profiles,
     quick_deploy_model_label_parts,
+    record_quick_deploy_catalog_failure,
 )
-from llm_launchpad.protocol.enums import BackendType
+from llm_launchpad.protocol.enums import BackendType, SpeculativeDecodingMethod
+from llm_launchpad.protocol.models import SpeculativeDecodingConfig
+
+from tests.catalog_fixtures import activate_static_like_catalog
 
 
 class QuickDeployConfigTests(unittest.TestCase):
@@ -27,135 +30,76 @@ class QuickDeployConfigTests(unittest.TestCase):
     def test_format_context_length_uses_grouped_tokens(self) -> None:
         self.assertEqual(format_context_length(262144), "262,144 ctx")
 
-    def test_catalog_contains_expected_profiles(self) -> None:
+    def test_empty_cache_reports_pending_catalog(self) -> None:
+        info = get_quick_deploy_catalog_info()
         profiles = list_quick_deploy_profiles()
-        self.assertGreaterEqual(len(profiles), 1)
-        self.assertIn("UD-Q4_K_XL", {profile.quant for profile in profiles})
-        self.assertIn("UD-Q2_K_XL", {profile.quant for profile in profiles})
-        self.assertFalse(get_quick_deploy_catalog_info().is_fallback)
-        self.assertEqual(
-            get_quick_deploy_catalog_info().source_label,
-            "Curated popular open-weight models",
+        self.assertEqual(profiles, ())
+        self.assertFalse(info.ready)
+        self.assertIsNone(info.error)
+        self.assertEqual(info.source_label, "Loading live catalog")
+
+    def test_record_failure_marks_catalog_unavailable_when_empty(self) -> None:
+        recorded = record_quick_deploy_catalog_failure("network unreachable")
+        self.assertTrue(recorded)
+        info = get_quick_deploy_catalog_info()
+        self.assertFalse(info.ready)
+        self.assertEqual(info.error, "network unreachable")
+        self.assertEqual(info.source_label, "Live catalog unavailable")
+        self.assertEqual(list_quick_deploy_profiles(), ())
+
+    def test_record_failure_keeps_last_good_catalog(self) -> None:
+        activate_static_like_catalog()
+        recorded = record_quick_deploy_catalog_failure("late failure")
+        self.assertFalse(recorded)
+        self.assertEqual([p.id for p in list_quick_deploy_profiles()], ["qwen35-397b-rtxpro", "glm5-rtxpro", "kimi25-rtxpro"])
+        self.assertTrue(get_quick_deploy_catalog_info().ready)
+
+    def test_activate_populates_profiles(self) -> None:
+        activate_static_like_catalog()
+        profiles = list_quick_deploy_profiles()
+        self.assertEqual([p.id for p in profiles], ["qwen35-397b-rtxpro", "glm5-rtxpro", "kimi25-rtxpro"])
+        info = get_quick_deploy_catalog_info()
+        self.assertTrue(info.ready)
+        self.assertTrue(info.is_live)
+        self.assertIsNone(info.error)
+
+    def test_build_config_can_disable_speculative_decoding(self) -> None:
+        profile = QuickDeployProfile(
+            id="test-mtp",
+            display_name="Test MTP Model",
+            repo_id="unsloth/Test-MTP-GGUF",
+            quant="UD-Q4_K_XL",
+            gpu_type="L40S",
+            gpu_count=1,
+            profile_label="Test",
+            approx_cost_per_hour_usd=2.0,
+            max_context_tokens=32768,
+            instance_slug_hint="test-mtp",
+            summary="Test profile with MTP.",
+            server_args=("--ctx-size", "32768"),
+            speculative_decoding=SpeculativeDecodingConfig(
+                method=SpeculativeDecodingMethod.MTP,
+                num_speculative_tokens=3,
+                nextn_predict_layers=1,
+            ),
         )
-
-    def test_catalog_loader_accepts_generated_json(self) -> None:
-        payload = {
-            "schema_version": 1,
-            "generated_at": "2026-05-01T12:00:00Z",
-            "source": "Artificial Analysis coding rankings",
-            "attribution": "Artificial Analysis",
-            "profiles": [
-                {
-                    "id": "test-model",
-                    "display_name": "Test Model",
-                    "repo_id": "unsloth/Test-Model-GGUF",
-                    "quant": "Q4_K_M",
-                    "gpu_type": "L40S",
-                    "gpu_count": 2,
-                    "profile_label": "AA Coding",
-                    "resource_tier": "rtx-pro",
-                    "resource_tier_label": "$$",
-                    "approx_cost_per_hour_usd": 3.9,
-                    "required_vram_gb": 88.5,
-                    "max_context_tokens": 65536,
-                    "instance_slug_hint": "test-model",
-                    "summary": "Generated profile.",
-                    "server_args": ["--ctx-size", "65536"],
-                    "source_label": "Artificial Analysis",
-                    "aa_model_id": "aa-1",
-                    "aa_model_name": "Test Model",
-                    "aa_model_slug": "test-model",
-                    "aa_coding_score": 42.5,
-                    "aa_intelligence_score": 38.5,
-                    "aa_rank": 1,
-                }
-            ],
-        }
-
-        with patch(
-            "llm_launchpad.core.quick_deploy._read_bundled_catalog_text",
-            return_value=json.dumps(payload),
-        ):
-            quick_deploy._reset_quick_deploy_catalog_cache()
-            profiles = list_quick_deploy_profiles()
-
-        self.assertEqual([profile.id for profile in profiles], ["test-model"])
-        self.assertEqual(profiles[0].aa_coding_score, 42.5)
-        self.assertEqual(profiles[0].aa_intelligence_score, 38.5)
-        self.assertEqual(profiles[0].required_vram_gb, 88.5)
-        self.assertEqual(profiles[0].resource_tier, "rtx-pro")
-        self.assertEqual(profiles[0].resource_tier_label, "$$")
-        self.assertEqual(profiles[0].server_args, ("--ctx-size", "65536"))
-        self.assertEqual(get_quick_deploy_catalog_info().generated_at, "2026-05-01T12:00:00Z")
-
-    def test_catalog_loader_accepts_vllm_recipe_without_quant(self) -> None:
-        payload = {
-            "schema_version": 1,
-            "source": "Curated models",
-            "profiles": [
-                {
-                    "id": "test-vllm",
-                    "display_name": "Test vLLM Model",
-                    "repo_id": "",
-                    "model_name": "org/Test-Model",
-                    "backend": "vllm",
-                    "quant": "",
-                    "gpu_type": "H100_80GB",
-                    "gpu_count": 1,
-                    "profile_label": "Fast",
-                    "approx_cost_per_hour_usd": 2.0,
-                    "max_context_tokens": 32768,
-                    "instance_slug_hint": "test-vllm",
-                    "summary": "Generated vLLM recipe.",
-                    "server_args": [],
-                }
-            ],
-        }
-
-        with patch(
-            "llm_launchpad.core.quick_deploy._read_bundled_catalog_text",
-            return_value=json.dumps(payload),
-        ):
-            quick_deploy._reset_quick_deploy_catalog_cache()
-            profile = list_quick_deploy_profiles()[0]
-
-        self.assertEqual(profile.backend, BackendType.VLLM)
-        self.assertEqual(profile.model_name, "org/Test-Model")
-        self.assertEqual(profile.quant, "")
-
-    def test_catalog_loader_falls_back_when_file_missing(self) -> None:
-        with patch("llm_launchpad.core.quick_deploy._read_bundled_catalog_text", return_value=None):
-            quick_deploy._reset_quick_deploy_catalog_cache()
-            profiles = list_quick_deploy_profiles()
-
-        self.assertEqual([profile.id for profile in profiles], ["qwen35-397b-rtxpro", "glm5-rtxpro", "kimi25-rtxpro"])
-        self.assertTrue(get_quick_deploy_catalog_info().is_fallback)
-
-    def test_catalog_loader_falls_back_when_json_invalid(self) -> None:
-        with patch("llm_launchpad.core.quick_deploy._read_bundled_catalog_text", return_value="{not-json"):
-            quick_deploy._reset_quick_deploy_catalog_cache()
-            profiles = list_quick_deploy_profiles()
-
-        self.assertEqual([profile.id for profile in profiles], ["qwen35-397b-rtxpro", "glm5-rtxpro", "kimi25-rtxpro"])
-        self.assertTrue(get_quick_deploy_catalog_info().is_fallback)
+        enabled = build_quick_deploy_config(profile)
+        disabled = build_quick_deploy_config(profile, enable_speculative_decoding=False)
+        self.assertIsNotNone(enabled.speculative_decoding)
+        self.assertIsNone(disabled.speculative_decoding)
 
     def test_quick_deploy_model_label_parts_split_quant_suffix(self) -> None:
-        with patch("llm_launchpad.core.quick_deploy._read_bundled_catalog_text", return_value=None):
-            quick_deploy._reset_quick_deploy_catalog_cache()
-            profile = get_quick_deploy_profile("kimi25-rtxpro")
-
+        activate_static_like_catalog()
+        profile = get_quick_deploy_profile("kimi25-rtxpro")
         self.assertEqual(
             quick_deploy_model_label_parts(profile),
             ("Kimi K2.5", "(UD-Q4_K_XL)"),
         )
 
     def test_build_quick_deploy_config_maps_profile_defaults(self) -> None:
-        with patch("llm_launchpad.core.quick_deploy._read_bundled_catalog_text", return_value=None):
-            quick_deploy._reset_quick_deploy_catalog_cache()
-            profile = get_quick_deploy_profile("qwen35-397b-rtxpro")
-
+        activate_static_like_catalog()
+        profile = get_quick_deploy_profile("qwen35-397b-rtxpro")
         config = build_quick_deploy_config(profile)
-
         self.assertEqual(config.backend, BackendType.LLAMACPP)
         self.assertEqual(config.repo_id, "unsloth/Qwen3.5-397B-A17B-GGUF")
         self.assertEqual(config.quant, "UD-Q4_K_XL")
@@ -176,12 +120,9 @@ class QuickDeployConfigTests(unittest.TestCase):
         )
 
     def test_build_quick_deploy_config_maps_glm_profile_defaults(self) -> None:
-        with patch("llm_launchpad.core.quick_deploy._read_bundled_catalog_text", return_value=None):
-            quick_deploy._reset_quick_deploy_catalog_cache()
-            profile = get_quick_deploy_profile("glm5-rtxpro")
-
+        activate_static_like_catalog()
+        profile = get_quick_deploy_profile("glm5-rtxpro")
         config = build_quick_deploy_config(profile)
-
         self.assertEqual(config.backend, BackendType.LLAMACPP)
         self.assertEqual(config.repo_id, "unsloth/GLM-5-GGUF")
         self.assertEqual(config.quant, "UD-Q4_K_XL")
@@ -196,12 +137,9 @@ class QuickDeployConfigTests(unittest.TestCase):
         )
 
     def test_build_quick_deploy_config_maps_kimi_profile_defaults(self) -> None:
-        with patch("llm_launchpad.core.quick_deploy._read_bundled_catalog_text", return_value=None):
-            quick_deploy._reset_quick_deploy_catalog_cache()
-            profile = get_quick_deploy_profile("kimi25-rtxpro")
-
+        activate_static_like_catalog()
+        profile = get_quick_deploy_profile("kimi25-rtxpro")
         config = build_quick_deploy_config(profile)
-
         self.assertEqual(config.backend, BackendType.LLAMACPP)
         self.assertEqual(config.repo_id, "unsloth/Kimi-K2.5-GGUF")
         self.assertEqual(config.quant, "UD-Q4_K_XL")
@@ -216,10 +154,8 @@ class QuickDeployConfigTests(unittest.TestCase):
         )
 
     def test_build_quick_deploy_config_applies_overrides(self) -> None:
-        with patch("llm_launchpad.core.quick_deploy._read_bundled_catalog_text", return_value=None):
-            quick_deploy._reset_quick_deploy_catalog_cache()
-            profile = get_quick_deploy_profile("qwen35-397b-rtxpro")
-
+        activate_static_like_catalog()
+        profile = get_quick_deploy_profile("qwen35-397b-rtxpro")
         config = build_quick_deploy_config(
             profile,
             instance_name="My Qwen Prod",
@@ -227,7 +163,6 @@ class QuickDeployConfigTests(unittest.TestCase):
             do_warmup=False,
             show_debug_logs=True,
         )
-
         self.assertEqual(config.instance_name, "my-qwen-prod")
         self.assertEqual(config.app_name, "llamacpp-custom-prod")
         self.assertFalse(config.do_warmup)
@@ -236,12 +171,9 @@ class QuickDeployConfigTests(unittest.TestCase):
         self.assertEqual(config.gpu_count, 3)
 
     def test_build_quick_deploy_config_infers_instance_from_prefixed_app_name(self) -> None:
-        with patch("llm_launchpad.core.quick_deploy._read_bundled_catalog_text", return_value=None):
-            quick_deploy._reset_quick_deploy_catalog_cache()
-            profile = get_quick_deploy_profile("qwen35-397b-rtxpro")
-
+        activate_static_like_catalog()
+        profile = get_quick_deploy_profile("qwen35-397b-rtxpro")
         config = build_quick_deploy_config(profile, app_name="llamacpp-custom-prod")
-
         self.assertEqual(config.app_name, "llamacpp-custom-prod")
         self.assertEqual(config.instance_name, "custom-prod")
 

@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+from io import BytesIO
 import json
 from pathlib import Path
+import tarfile
 from typing import Sequence
 
 import requests
@@ -14,6 +16,7 @@ import requests
 from llm_launchpad.core.runtime_support import (
     DEFAULT_LLAMACPP_IMAGE_REF,
     extract_llamacpp_architectures,
+    extract_llamacpp_mtp_architectures,
 )
 
 
@@ -31,6 +34,7 @@ DEFAULT_OUTPUT = (
 def build_manifest(
     source: str,
     *,
+    model_sources: Sequence[str] = (),
     source_revision: str,
     image_ref: str,
     image_digest: str,
@@ -47,7 +51,7 @@ def build_manifest(
         f"{source_revision}/src/llama-arch.cpp"
     )
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "runtime_id": f"llama.cpp-{runtime_build}-cuda12",
         "runtime_build": runtime_build,
         "image_ref": image_ref,
@@ -59,6 +63,10 @@ def build_manifest(
         "source_url": source_url,
         "generated_at": generated_at or _utc_now_iso(),
         "architectures": architectures,
+        "mtp_architectures": extract_llamacpp_mtp_architectures(
+            source,
+            model_sources,
+        ),
     }
 
 
@@ -72,6 +80,26 @@ def fetch_architecture_source(source_revision: str, timeout: float = 20.0) -> st
     response = requests.get(url, timeout=timeout)
     response.raise_for_status()
     return response.text
+
+
+def fetch_model_sources(source_revision: str, timeout: float = 60.0) -> list[str]:
+    """Fetch all model implementations from the same pinned source archive."""
+
+    url = f"https://github.com/ggml-org/llama.cpp/archive/{source_revision}.tar.gz"
+    response = requests.get(url, timeout=timeout)
+    response.raise_for_status()
+    sources: list[str] = []
+    with tarfile.open(fileobj=BytesIO(response.content), mode="r:gz") as archive:
+        for member in archive.getmembers():
+            path = member.name
+            if not member.isfile() or "/src/models/" not in path or not path.endswith(".cpp"):
+                continue
+            extracted = archive.extractfile(member)
+            if extracted is not None:
+                sources.append(extracted.read().decode("utf-8"))
+    if not sources:
+        raise RuntimeError("No llama.cpp model sources were found in the pinned archive")
+    return sources
 
 
 def write_manifest(payload: dict[str, object], output: Path) -> None:
@@ -97,8 +125,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     source = fetch_architecture_source(args.source_revision)
+    model_sources = fetch_model_sources(args.source_revision)
     payload = build_manifest(
         source,
+        model_sources=model_sources,
         source_revision=args.source_revision,
         image_ref=args.image_ref,
         image_digest=args.image_digest,

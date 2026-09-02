@@ -40,6 +40,7 @@ from llm_launchpad.protocol.models import (
     DeploymentConfig,
     EndpointInfo,
     PrimeProviderOptions,
+    ReasoningCapabilities,
 )
 
 
@@ -1606,3 +1607,46 @@ class ConnectionStoreTests(unittest.TestCase):
             merge_connections([row], path)
 
             self.assertEqual(row.backend, BackendType.LLAMACPP)
+
+    def test_reasoning_profile_round_trips_through_connection_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "connections.json"
+            config = DeploymentConfig(
+                backend=BackendType.LLAMACPP,
+                provider=ComputeProvider.MODAL,
+                app_name="llamacpp-qwen38",
+                repo_id="unsloth/Qwen3.8-27B-GGUF",
+                quant="UD-Q4_K_XL",
+                reasoning=ReasoningCapabilities(
+                    profile_id="hf-test-profile",
+                    canonical_model_id="unsloth/Qwen3.8-27B-GGUF",
+                    model_revision="a" * 40,
+                    efforts=("low", "medium", "xhigh"),
+                    default_effort="xhigh",
+                    source_repo="Qwen/Qwen3.8-27B",
+                    source_revision="b" * 40,
+                    source_path="chat_template.jinja",
+                    request_option_path="chat_template_kwargs.reasoning_effort",
+                ),
+            )
+            endpoint = EndpointInfo(
+                name=config.app_name or "",
+                app_id="app-qwen38",
+                backend=BackendType.LLAMACPP,
+                provider=ComputeProvider.MODAL,
+                web_url="https://qwen38.example",
+            )
+
+            save_connection(config, endpoint, path)
+            entry = load_connection_entries(path)[endpoint.name]
+            rows = rows_from_connection_cache(path)
+
+            self.assertEqual(entry["repo_id"], "unsloth/Qwen3.8-27B-GGUF")
+            self.assertEqual(
+                entry["reasoning"]["efforts"],
+                ["low", "medium", "xhigh"],
+            )
+            self.assertEqual(len(rows), 1)
+            self.assertIsNotNone(rows[0].reasoning)
+            assert rows[0].reasoning is not None
+            self.assertEqual(rows[0].reasoning.default_effort, "xhigh")

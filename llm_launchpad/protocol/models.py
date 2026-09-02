@@ -10,6 +10,7 @@ from .enums import (
     BillingModel,
     ComputeProvider,
     QuoteAvailability,
+    SpeculativeDecodingMethod,
 )
 
 
@@ -65,6 +66,32 @@ class LaunchpadSettings:
         )
 
 
+@dataclass(frozen=True)
+class ReasoningCapabilities:
+    """Verified model reasoning controls advertised to API clients."""
+
+    profile_id: str
+    canonical_model_id: str
+    model_revision: str
+    efforts: tuple[str, ...]
+    default_effort: str
+    source_repo: str
+    source_revision: str
+    source_path: str
+    request_option_path: str
+    enable_thinking: bool = True
+    interleaved_field: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class SpeculativeDecodingConfig:
+    """A verified speculative-decoding recommendation or deployment request."""
+
+    method: SpeculativeDecodingMethod
+    num_speculative_tokens: int
+    nextn_predict_layers: Optional[int] = None
+
+
 @dataclass
 class DeploymentConfig:
     """All parameters needed to execute a deployment."""
@@ -88,10 +115,12 @@ class DeploymentConfig:
     required_vram_gb: Optional[float] = None
     gguf_architecture: Optional[str] = None
     llamacpp_runtime_id: Optional[str] = None
+    speculative_decoding: Optional[SpeculativeDecodingConfig] = None
 
     # Model limits advertised to OpenAI-compatible clients such as OpenCode.
     max_context_tokens: Optional[int] = None
     max_output_tokens: Optional[int] = None
+    reasoning: Optional[ReasoningCapabilities] = None
 
     # vLLM specific
     model_name: Optional[str] = None
@@ -150,6 +179,7 @@ class InferenceRecipe:
     max_context_tokens: Optional[int] = None
     required_vram_gb: Optional[float] = None
     server_args: tuple[str, ...] = ()
+    speculative_decoding: Optional[SpeculativeDecodingConfig] = None
     source_label: str = "Curated"
     quality_score: Optional[float] = None
     quality_rank: Optional[int] = None
@@ -327,6 +357,7 @@ class EndpointInfo:
     endpoint_api_key: Optional[str] = None
     max_context_tokens: Optional[int] = None
     max_output_tokens: Optional[int] = None
+    reasoning: Optional[ReasoningCapabilities] = None
 
 
 @dataclass

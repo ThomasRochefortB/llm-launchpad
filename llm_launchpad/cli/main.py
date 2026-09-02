@@ -33,6 +33,7 @@ from ..core.connection_store import (
     rows_from_connection_cache,
     save_connection,
 )
+from ..core.diagnostics import log_exception, setup_logging
 from ..core.deploy_log_summary import DeployLogSummarizer, beautify_summary_line
 from ..core.hf_models import fetch_gguf_quant_metadata
 from ..core.modal_gpu import fetch_modal_gpu_types
@@ -77,8 +78,32 @@ aai_auth_app = typer.Typer(help="Manage the stored Artificial Analysis API key."
 app.add_typer(aai_auth_app, name="aai-auth")
 
 
+def _version_callback(value: bool) -> None:
+    if not value:
+        return
+    try:
+        from importlib.metadata import version as _package_version
+
+        pkg_version = _package_version("llm-launchpad")
+    except Exception:
+        pkg_version = "unknown"
+    typer.echo(f"llm-launchpad {pkg_version}")
+    raise typer.Exit()
+
+
 @app.callback()
-def _default(ctx: typer.Context) -> None:
+def _default(
+    ctx: typer.Context,
+    version: Annotated[
+        Optional[bool],
+        typer.Option(
+            "--version",
+            callback=_version_callback,
+            is_eager=True,
+            help="Show the installed version and exit.",
+        ),
+    ] = None,
+) -> None:
     """Launch the TUI when no subcommand is given."""
     if ctx.invoked_subcommand is None:
         tui()
@@ -336,7 +361,7 @@ def _connected_compute_providers() -> tuple[ComputeProvider, ...]:
         if get_prime_auth_status().authenticated:
             providers.append(ComputeProvider.PRIME)
     except Exception:
-        pass
+        log_exception("Prime auth probe failed while listing connected providers")
     return tuple(providers)
 
 
@@ -368,6 +393,8 @@ def _list_provider_deployments(provider: ComputeProvider) -> list[EndpointInfo] 
 
 def _load_rows_for_opencode_sync(
     provider: ComputeProvider | None = None,
+    *,
+    persist_backfill: bool = True,
 ) -> tuple[list[EndpointInfo] | None, tuple[ComputeProvider, ...], list[str]]:
     """Load deployments for OpenCode sync and the providers that were listed.
 
@@ -391,7 +418,13 @@ def _load_rows_for_opencode_sync(
             collected.extend(rows)
             listed.append(compute_provider)
             continue
-        cached_rows = [row for row in rows_from_connection_cache() if row.provider == compute_provider]
+        cached_rows = [
+            row
+            for row in rows_from_connection_cache(
+                persist_backfill=persist_backfill,
+            )
+            if row.provider == compute_provider
+        ]
         if cached_rows:
             collected.extend(cached_rows)
             notes.append(f"{compute_provider.value.title()} listing failed; using cached connection summaries.")
@@ -401,7 +434,16 @@ def _load_rows_for_opencode_sync(
             )
     if not listed and not collected:
         return None, (), notes
-    return visible_launchpad_rows(merge_connections(collected)), tuple(listed), notes
+    return (
+        visible_launchpad_rows(
+            merge_connections(
+                collected,
+                persist_backfill=persist_backfill,
+            )
+        ),
+        tuple(listed),
+        notes,
+    )
 
 
 def _sync_opencode_cli(
@@ -657,6 +699,32 @@ def tui(
 # -----------------------------------------------------------------------
 
 
+@app.command("doctor")
+def doctor() -> None:
+    """Check local prerequisites and print a fix hint for each failure."""
+    from ..core.doctor import doctor_exit_code, run_doctor_checks
+
+    checks = run_doctor_checks()
+    for check in checks:
+        if check.ok:
+            marker = "ok"
+        elif check.required:
+            marker = "FAIL"
+        else:
+            marker = "warn"
+        suffix = f": {check.detail}" if check.detail else ""
+        typer.echo(f"[{marker}] {check.name}{suffix}")
+        if not check.ok and check.hint:
+            typer.echo(f"       fix: {check.hint}")
+    failed = [check for check in checks if not check.ok and check.required]
+    if failed:
+        typer.echo(
+            f"{len(failed)} required check(s) failed; see hints above.",
+            err=True,
+        )
+        raise typer.Exit(code=doctor_exit_code(checks))
+
+
 @app.command("gpu-types")
 def gpu_types(
     timeout: int = typer.Option(10, min=1, help="Modal docs request timeout in seconds"),
@@ -784,8 +852,14 @@ def prime_offers(
 
 @app.command()
 def deploy(
-    provider: str = typer.Option("modal", help="Compute provider: modal or prime"),
-    backend: str = typer.Option("llamacpp", help="Backend: llamacpp or vllm"),
+    provider: ComputeProvider = typer.Option(
+        ComputeProvider.MODAL,
+        help="Compute provider: modal or prime",
+    ),
+    backend: BackendType = typer.Option(
+        BackendType.LLAMACPP,
+        help="Backend: llamacpp or vllm",
+    ),
     do_warmup: bool = typer.Option(False, help="Verify readiness after deploy"),
     preset: Optional[str] = typer.Option(None, help="llama.cpp preset name (Modal only)"),
     repo_id: Optional[str] = typer.Option(None, help="llama.cpp Hugging Face GGUF repo ID"),
@@ -925,8 +999,14 @@ def deploy(
 
 @app.command()
 def warmup(
-    provider: str = typer.Option("modal", help="Compute provider: modal or prime"),
-    backend: str = typer.Option("llamacpp", help="Backend: llamacpp or vllm"),
+    provider: ComputeProvider = typer.Option(
+        ComputeProvider.MODAL,
+        help="Compute provider: modal or prime",
+    ),
+    backend: BackendType = typer.Option(
+        BackendType.LLAMACPP,
+        help="Backend: llamacpp or vllm",
+    ),
     server_url: Optional[str] = typer.Option(None, help="Deployed web URL"),
     served_model_name: Optional[str] = typer.Option(None, help="Served model name for llama.cpp probes"),
     function_slug: Optional[str] = typer.Option(
@@ -999,7 +1079,10 @@ def warmup(
 
 @app.command("list")
 def list_apps(
-    provider: str = typer.Option("modal", help="Compute provider: modal or prime"),
+    provider: ComputeProvider = typer.Option(
+        ComputeProvider.MODAL,
+        help="Compute provider: modal or prime",
+    ),
 ) -> None:
     """List launchpad deployments for a compute provider."""
     compute_provider = ComputeProvider(provider)
@@ -1031,8 +1114,14 @@ def list_apps(
 
 @app.command()
 def status(
-    provider: str = typer.Option("modal", help="Compute provider: modal or prime"),
-    backend: str = typer.Option("llamacpp", help="Backend: llamacpp or vllm"),
+    provider: ComputeProvider = typer.Option(
+        ComputeProvider.MODAL,
+        help="Compute provider: modal or prime",
+    ),
+    backend: BackendType = typer.Option(
+        BackendType.LLAMACPP,
+        help="Backend: llamacpp or vllm",
+    ),
     server_url: Optional[str] = typer.Option(None, help="Deployed web URL"),
     served_model_name: Optional[str] = typer.Option(None, help="Served model name for llama.cpp probes"),
     function_slug: Optional[str] = typer.Option(
@@ -1090,8 +1179,14 @@ def status(
 
 @app.command()
 def benchmark(
-    provider: str = typer.Option("modal", help="Compute provider: modal or prime"),
-    backend: str = typer.Option("llamacpp", help="Backend: llamacpp or vllm"),
+    provider: ComputeProvider = typer.Option(
+        ComputeProvider.MODAL,
+        help="Compute provider: modal or prime",
+    ),
+    backend: BackendType = typer.Option(
+        BackendType.LLAMACPP,
+        help="Backend: llamacpp or vllm",
+    ),
     server_url: Optional[str] = typer.Option(None, help="Deployed web URL"),
     model: Optional[str] = typer.Option(None, "--model", help="Served model name to benchmark"),
     function_slug: Optional[str] = typer.Option(
@@ -1181,8 +1276,14 @@ def benchmark(
 
 @app.command()
 def logs(
-    provider: str = typer.Option("modal", help="Compute provider: modal or prime"),
-    backend: str = typer.Option("llamacpp", help="Backend: llamacpp or vllm"),
+    provider: ComputeProvider = typer.Option(
+        ComputeProvider.MODAL,
+        help="Compute provider: modal or prime",
+    ),
+    backend: BackendType = typer.Option(
+        BackendType.LLAMACPP,
+        help="Backend: llamacpp or vllm",
+    ),
     follow: bool = typer.Option(True, help="Follow log stream"),
     instance_name: Optional[str] = typer.Option(None, help="Target instance name"),
     app_name: Optional[str] = typer.Option(None, help="Target deployment name"),
@@ -1211,8 +1312,14 @@ def logs(
 
 @app.command()
 def stop(
-    provider: str = typer.Option("modal", help="Compute provider: modal or prime"),
-    backend: str = typer.Option("llamacpp", help="Backend: llamacpp or vllm"),
+    provider: ComputeProvider = typer.Option(
+        ComputeProvider.MODAL,
+        help="Compute provider: modal or prime",
+    ),
+    backend: BackendType = typer.Option(
+        BackendType.LLAMACPP,
+        help="Backend: llamacpp or vllm",
+    ),
     yes: bool = typer.Option(False, "--yes", help="Skip confirmation"),
     instance_name: Optional[str] = typer.Option(None, help="Target instance name"),
     app_name: Optional[str] = typer.Option(None, help="Target deployment name"),
@@ -1257,8 +1364,14 @@ def stop(
 
 @app.command()
 def switch(
-    provider: str = typer.Option("modal", help="Compute provider: modal or prime"),
-    backend: str = typer.Option("llamacpp", help="Backend: llamacpp or vllm"),
+    provider: ComputeProvider = typer.Option(
+        ComputeProvider.MODAL,
+        help="Compute provider: modal or prime",
+    ),
+    backend: BackendType = typer.Option(
+        BackendType.LLAMACPP,
+        help="Backend: llamacpp or vllm",
+    ),
     preset: Optional[str] = typer.Option(None, help="Preset name"),
     repo_id: Optional[str] = typer.Option(None, help="HF repo id"),
     quant: Optional[str] = typer.Option(None, help="Quant pattern"),
@@ -1471,11 +1584,14 @@ def switch(
 
 @opencode_app.command("sync")
 def opencode_sync(
-    provider: Optional[str] = typer.Option(
+    provider: Optional[ComputeProvider] = typer.Option(
         None,
         help="Limit to modal or prime. Default: every connected compute provider.",
     ),
-    backend: Optional[str] = typer.Option(None, help="Backend: llamacpp or vllm"),
+    backend: Optional[BackendType] = typer.Option(
+        None,
+        help="Backend: llamacpp or vllm",
+    ),
     instance_name: Optional[str] = typer.Option(None, help="Target instance name"),
     app_name: Optional[str] = typer.Option(None, help="Target deployment name"),
     dry_run: bool = typer.Option(False, help="Print the intended sync changes without writing files"),
@@ -1491,7 +1607,10 @@ def opencode_sync(
             username = ""
     _print_banner()
 
-    current_rows, listed_providers, fallback_notes = _load_rows_for_opencode_sync(compute_provider)
+    current_rows, listed_providers, fallback_notes = _load_rows_for_opencode_sync(
+        compute_provider,
+        persist_backfill=not dry_run,
+    )
     for note in fallback_notes:
         typer.echo(note)
     target_app_name = (app_name or "").strip() or None
@@ -1651,6 +1770,7 @@ def aai_auth_clear() -> None:
 
 def main() -> None:
     """Console script entrypoint."""
+    setup_logging()
     if len(sys.argv) == 1:
         sys.argv.append("tui")
     app()
