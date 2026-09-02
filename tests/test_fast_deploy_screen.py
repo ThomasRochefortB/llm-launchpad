@@ -759,17 +759,25 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             assert isinstance(screen, FastDeployScreen)
             self.assertTrue(screen._catalog_building)
             option_list = screen.query_one("#fast-deploy-list", OptionList)
+            # The 0.25s spinner interval may tick between mount and the first
+            # assertion on slower/contended runners, so assert against the
+            # frame actually on screen instead of assuming index 0.
+            initial_index = screen._catalog_spinner_index
             status = str(screen.query_one("#fast-deploy-status", Static).renderable)
             self.assertIn("Building the live model catalog", status)
-            self.assertIn(SUMMARY_SPINNER_FRAMES[0], status)
-            self.assertIn(SUMMARY_SPINNER_FRAMES[0], str(option_list.get_option_at_index(0).prompt))
+            self.assertIn(SUMMARY_SPINNER_FRAMES[initial_index], status)
+            self.assertIn(
+                SUMMARY_SPINNER_FRAMES[initial_index],
+                str(option_list.get_option_at_index(0).prompt),
+            )
 
             screen._tick_catalog_spinner()
-            self.assertEqual(screen._catalog_spinner_index, 1 % len(SUMMARY_SPINNER_FRAMES))
+            expected_index = (initial_index + 1) % len(SUMMARY_SPINNER_FRAMES)
+            self.assertEqual(screen._catalog_spinner_index, expected_index)
             status = str(screen.query_one("#fast-deploy-status", Static).renderable)
-            self.assertIn(SUMMARY_SPINNER_FRAMES[1], status)
+            self.assertIn(SUMMARY_SPINNER_FRAMES[expected_index], status)
             self.assertIn(
-                SUMMARY_SPINNER_FRAMES[1],
+                SUMMARY_SPINNER_FRAMES[expected_index],
                 str(option_list.get_option_at_index(0).prompt),
             )
 
