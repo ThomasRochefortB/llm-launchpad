@@ -26,7 +26,6 @@ from ...core.hf_auth import HuggingFaceAuthStatus, get_huggingface_auth_status
 from ...core.modal_auth import ModalAuthStatus, get_modal_auth_status
 from ...core.prime_auth import PrimeAuthStatus, get_prime_auth_status
 from ...core.prime_backend import PrimeBackend
-from ...core.naming import default_llamacpp_served_model_name, default_served_model_name
 from ...core.quick_deploy import (
     QuickDeployCatalogInfo,
     QuickDeployProfile,
@@ -44,6 +43,7 @@ from ...core.storage_costs import (
 )
 from ...protocol.enums import BackendType, ComputeProvider
 from ...protocol.models import EndpointInfo, StorageSnapshot
+from ..connection import endpoint_model_summary, resolve_openai_base_url
 from ..workers import EndpointsFailed, EndpointsLoaded, StorageFailed, StorageLoaded
 from ..responsive import ViewportProfile
 from .copy_enabled import CopyEnabledScreen
@@ -261,17 +261,6 @@ def _should_show_in_panel(state: str) -> bool:
     return bucket in {"healthy", "deploying", "queued", "error"}
 
 
-def _resolve_openai_base_url(row: EndpointInfo, username: str = "") -> tuple[str | None, bool]:
-    raw_url = (row.web_url or "").strip()
-    if raw_url:
-        base_root = raw_url.rstrip("/")
-        return (base_root if base_root.endswith("/v1") else f"{base_root}/v1"), False
-    if row.provider != ComputeProvider.MODAL or not username.strip() or not row.name.strip():
-        return None, False
-    derived = ModalBackend.default_server_url(username.strip(), app_name=row.name.strip()).rstrip("/")
-    return (derived if derived.endswith("/v1") else f"{derived}/v1"), True
-
-
 def _runtime_bucket_from_modal_state(state: str) -> str:
     bucket = _state_bucket(state)
     if bucket == "healthy":
@@ -308,7 +297,7 @@ def _probe_row_runtime_status(row: EndpointInfo, username: str) -> tuple[str, st
     if row.backend not in {BackendType.VLLM, BackendType.LLAMACPP}:
         return "in_progress", "unknown backend"
 
-    base_url, was_derived = _resolve_openai_base_url(row, username=username)
+    base_url, was_derived = resolve_openai_base_url(row, username=username)
     if not base_url:
         return "in_progress", "missing URL"
 
@@ -442,34 +431,6 @@ def _wrap_url_for_panel(value: str, width: int = 44) -> list[str]:
     return lines or [text]
 
 
-def _endpoint_model_summary(row: EndpointInfo) -> tuple[str | None, str | None]:
-    explicit_display_name = (row.display_name or "").strip() or None
-
-    if row.backend == BackendType.VLLM:
-        model_id = (row.served_model_name or "").strip()
-        if not model_id and (row.model_name or "").strip():
-            model_id = default_served_model_name(row.model_name)
-        display_name = explicit_display_name or (row.model_name or row.served_model_name or "").strip() or None
-        return model_id or None, display_name
-
-    if row.backend == BackendType.LLAMACPP:
-        model_id = (row.served_model_name or "").strip()
-        if not model_id and (row.repo_id or "").strip():
-            model_id = default_llamacpp_served_model_name(row.repo_id, row.quant)
-        if explicit_display_name:
-            display_name = explicit_display_name
-        else:
-            repo = (row.repo_id or "").strip()
-            quant = (row.quant or "").strip()
-            if repo:
-                display_name = f"{repo} ({quant})" if quant else repo
-            else:
-                display_name = (row.served_model_name or "").strip() or None
-        return model_id or None, display_name or None
-
-    return (row.served_model_name or "").strip() or None, explicit_display_name
-
-
 def _render_deployment_status(rows: list[EndpointInfo], username: str = "") -> str:
     if not rows:
         return (
@@ -507,11 +468,11 @@ def _render_deployment_status(rows: list[EndpointInfo], username: str = "") -> s
             modal_app_line += f" [dim]({_escape_markup(row.app_id)})[/dim]"
         app_lines.append(modal_app_line)
 
-        model_id, display_name = _endpoint_model_summary(row)
+        model_id, display_name = endpoint_model_summary(row)
         app_lines.append(f"[dim]Display name:[/dim] {_escape_markup(display_name or '')}")
         app_lines.append(f"[dim]Model ID:[/dim] {_escape_markup(model_id or '')}")
 
-        base_url, _was_derived = _resolve_openai_base_url(row, username=username)
+        base_url, _was_derived = resolve_openai_base_url(row, username=username)
         show_connection = _state_bucket(row.state) == "healthy" or bool((row.web_url or "").strip())
         if base_url:
             base_root = base_url.rstrip("/")
@@ -798,7 +759,7 @@ class MainMenuScreen(CopyEnabledScreen):
 
     BINDINGS = [
         Binding("d", "select_deploy", "Deploy", show=True),
-        Binding("c", "select_custom_deploy", "Custom", show=True),
+        Binding("c", "select_custom_deploy", "Advanced", show=True),
         Binding("m", "select_manage", "Manage", show=True),
         Binding("t", "select_storage", "Storage", show=True),
         Binding("s", "select_settings", "Settings", show=True),
@@ -860,11 +821,11 @@ class MainMenuScreen(CopyEnabledScreen):
                         )
                         yield Static("", classes="decorative-spacer")
                         yield OptionList(
-                            Option("  Deploy            Pick a model and live placement", id="deploy"),
-                            Option("  Custom deploy     llama.cpp or vLLM expert form", id="custom-deploy"),
-                            Option("  Manage            List, status, logs, stop", id="manage"),
-                            Option("  Storage           Cached models and pre-download", id="storage"),
-                            Option("  Settings          Scaledown defaults", id="settings"),
+                            Option("  Deploy model       Pick a model, get a live placement", id="deploy"),
+                            Option("  Advanced deploy    llama.cpp / vLLM expert form", id="custom-deploy"),
+                            Option("  Manage             Status, logs, benchmark, stop", id="manage"),
+                            Option("  Storage            Cached models, pre-download, delete", id="storage"),
+                            Option("  Settings           Appearance and deploy defaults", id="settings"),
                             id="action-list",
                         )
                         yield Static(
@@ -967,8 +928,25 @@ class MainMenuScreen(CopyEnabledScreen):
         """Dismiss the narrow detail drawer once both panels fit again."""
         _ = previous
         self._refresh_action_labels(profile)
+        self._refresh_menu_help(profile)
         if not profile.narrow and not profile.short:
             self.remove_class("show-secondary-panel")
+
+    def _menu_help_text(self, profile: ViewportProfile | None = None) -> str:
+        """Return the menu help line; the details hint only fits narrow layouts."""
+        try:
+            active_profile = profile or self.viewport_profile
+        except Exception:
+            active_profile = None
+        if active_profile is not None and (active_profile.narrow or active_profile.short):
+            return "[dim]↑/↓ select · enter open · i details[/dim]"
+        return "[dim]↑/↓ select · enter open[/dim]"
+
+    def _refresh_menu_help(self, profile: ViewportProfile | None = None) -> None:
+        try:
+            self.query_one("#compact-menu-help", Static).update(self._menu_help_text(profile))
+        except Exception:
+            return
 
     def _refresh_action_labels(self, profile: ViewportProfile) -> None:
         """Use concise action records when descriptive columns no longer fit."""
@@ -981,18 +959,18 @@ class MainMenuScreen(CopyEnabledScreen):
         if profile.compact:
             labels = (
                 ("deploy", "  Deploy model"),
-                ("custom-deploy", "  Custom deployment"),
+                ("custom-deploy", "  Advanced deploy"),
                 ("manage", "  Manage endpoints"),
                 ("storage", "  Storage"),
                 ("settings", "  Settings"),
             )
         else:
             labels = (
-                ("deploy", "  Deploy            Pick a model and live placement"),
-                ("custom-deploy", "  Custom deploy     llama.cpp or vLLM expert form"),
-                ("manage", "  Manage            List, status, logs, stop"),
-                ("storage", "  Storage           Cached models and pre-download"),
-                ("settings", "  Settings          Scaledown defaults"),
+                ("deploy", "  Deploy model       Pick a model, get a live placement"),
+                ("custom-deploy", "  Advanced deploy    llama.cpp / vLLM expert form"),
+                ("manage", "  Manage             Status, logs, benchmark, stop"),
+                ("storage", "  Storage            Cached models, pre-download, delete"),
+                ("settings", "  Settings           Appearance and deploy defaults"),
             )
         action_list.set_options(
             [Option(label, id=option_id) for option_id, label in labels]
@@ -1005,6 +983,11 @@ class MainMenuScreen(CopyEnabledScreen):
     def action_toggle_details(self) -> None:
         """Expose secondary fleet and billing panels as a narrow drawer."""
         if not self.viewport_profile.narrow and not self.viewport_profile.short:
+            self.notify(
+                "Fleet and billing panels are already visible on this screen size.",
+                title="Details",
+                timeout=3,
+            )
             return
         self.toggle_class("show-secondary-panel")
 

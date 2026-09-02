@@ -73,6 +73,36 @@ from .copy_enabled import CopyEnabledScreen
 
 _MODEL_LOOKUP_DEBOUNCE_SECONDS = 0.35
 
+_RANKING_SUBTITLES: dict[str, dict[str, str]] = {
+    BackendType.LLAMACPP: {
+        "cached": "models cached in your storage volumes",
+        "downloads": "top 10 GGUF text-generation models on Hugging Face",
+        "trending": "trending GGUF text-generation models on Hugging Face",
+    },
+    BackendType.VLLM: {
+        "cached": "models cached in your storage volumes",
+        "downloads": "top 10 text-generation models on Hugging Face",
+        "trending": "trending text-generation models on Hugging Face",
+    },
+}
+
+
+def _ranking_subtitle(backend: BackendType, mode: str) -> str:
+    subtitles = _RANKING_SUBTITLES.get(backend) or {}
+    return subtitles.get(mode) or "models cached in your storage volumes"
+
+
+def _format_hourly_cost(value: float | None) -> str:
+    if value is None:
+        return "price n/a"
+    return f"${value:.2f}/hr"
+
+
+def _format_always_on_monthly_cost(value: float | None) -> str:
+    if value is None:
+        return "monthly est. n/a"
+    return f"~${value * 24 * 30:,.0f}/mo at 24/7"
+
 
 def _is_plausible_model_lookup(value: str) -> bool:
     """Return whether a partial model value is worth resolving remotely."""
@@ -304,6 +334,38 @@ def _advance_deploy_focus(screen: CopyEnabledScreen, navigation_order: tuple[str
     )
 
 
+class _CostPreviewMixin:
+    """Shared hourly cost preview behavior for custom deploy forms."""
+
+    _gpu_price_by_value: dict[str, float]
+    _provider: ComputeProvider
+    _prime_offers: dict[str, ComputeOffer]
+    _selected_prime_offer_id: str | None
+    _selected_gpu_type: str | None
+
+    def _current_gpu_hourly_price(self) -> float | None:
+        if self._provider == ComputeProvider.PRIME:
+            offer = self._prime_offers.get(self._selected_prime_offer_id or "")
+            return offer.price_per_hour if offer is not None else None
+        return self._gpu_price_by_value.get((self._selected_gpu_type or "").strip())
+
+    def _update_cost_preview(self, preview_id: str) -> None:
+        from textual.widgets import Static
+
+        try:
+            preview = self.query_one(f"#{preview_id}", Static)
+        except Exception:
+            return
+        price = self._current_gpu_hourly_price()
+        if price is None:
+            preview.update("[dim]Hourly: price n/a[/dim]")
+            return
+        preview.update(
+            f"[dim]Hourly: {_format_hourly_cost(price)} · "
+            f"{_format_always_on_monthly_cost(price)}[/dim]"
+        )
+
+
 class BackendSelectScreen(CopyEnabledScreen):
     """Step 1: pick backend (llama.cpp or vLLM)."""
 
@@ -313,7 +375,7 @@ class BackendSelectScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(classes="screen-scroll"):
-            yield Static("[bold #7bf168]Custom deploy[/]  [dim]Step 1: Choose backend[/dim]")
+            yield Static("[bold #7bf168]Advanced deploy[/]  [dim]Step 1: Choose serving engine[/dim]")
             yield Static("")
             yield OptionList(
                 Option("  llama.cpp (GGUF) ( Recommended )", id="llamacpp"),
@@ -338,7 +400,7 @@ class BackendSelectScreen(CopyEnabledScreen):
         self.app.pop_screen()
 
 
-class LlamaCppDeployScreen(CopyEnabledScreen):
+class LlamaCppDeployScreen(_CostPreviewMixin, CopyEnabledScreen):
     """llama.cpp deploy form."""
 
     BINDINGS = [
@@ -375,10 +437,13 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(classes="screen-scroll"):
-            yield Static("[bold #7bf168]Custom deploy llama.cpp[/]  [dim]Step 2: Model & options[/dim]")
+            yield Static("[bold #7bf168]Advanced deploy llama.cpp[/]  [dim]Step 2: Model & options[/dim]")
             yield Static("")
 
-            yield Static("[bold]Model ranking[/bold]  [dim](Top 10 GGUF text-generation models)[/dim]")
+            yield Static(
+                "[bold]Model[/bold]  [dim](cached models in your storage volumes)[/dim]",
+                id="llama-model-ranking-title",
+            )
             yield OptionList(
                 Option("  Cached in storage", id="rank-cached"),
                 Option("  Most downloaded", id="rank-downloads"),
@@ -442,6 +507,7 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
                             id="gpu-count-llama",
                             type="integer",
                         )
+                yield Static("", id="llama-cost-preview")
 
             yield Static("")
 
@@ -473,6 +539,7 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
                 default=False,
                 classes="llama-advanced prime-only",
             )
+            yield Static("[bold]Runtime[/bold]", classes="llama-advanced")
             yield FormField(
                 "Server args",
                 "server-args",
@@ -500,6 +567,7 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
             )
 
             yield Static("")
+            yield Static("[bold]Naming[/bold]", classes="llama-advanced")
             yield FormField(
                 "Instance name (optional)",
                 "instance-name-llama",
@@ -541,6 +609,7 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
         self._provider = ComputeProvider.MODAL
         self._prime_offers: dict[str, ComputeOffer] = {}
         self._selected_prime_offer_id: str | None = None
+        self._gpu_price_by_value: dict[str, float] = {}
         for widget in self.query(".llama-advanced"):
             widget.add_class("hidden")
         for widget in self.query(".prime-only"):
@@ -549,10 +618,12 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
         if rank_mode_list.option_count > 0:
             rank_mode_list.highlighted = 0
         rank_mode_list.focus()
+        self._set_ranking_title()
         self._refresh_gpu_types()
         self._set_model_status("[dim]Loading cached models from storage...[/dim]")
         self._refresh_cached_models_from_storage()
         self._refresh_app_preview()
+        self._update_cost_preview("llama-cost-preview")
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option_list.id == "llama-rank-mode":
@@ -561,6 +632,7 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
                 return
             if selected_mode != self._rank_mode:
                 self._rank_mode = selected_mode
+                self._set_ranking_title()
                 self._ranked_models = []
                 self._set_model_status("[dim]Loading model suggestions...[/dim]")
                 self.query_one("#llama-model-list", OptionList).set_options([])
@@ -609,6 +681,8 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
             self._schedule_quantization_lookup()
         if event.input.id in {"repo-id", "quant"} and self._prime_offers:
             self._refresh_prime_offer_options()
+        if event.input.id == "gpu-count-llama":
+            self._update_cost_preview("llama-cost-preview")
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "provider-llama":
@@ -621,6 +695,7 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
             elif self._provider == ComputeProvider.MODAL:
                 self._refresh_gpu_types()
             self._refresh_app_preview()
+            self._update_cost_preview("llama-cost-preview")
             return
         if event.select.id == "prime-offer-llama":
             if not isinstance(event.value, str):
@@ -634,11 +709,13 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
                 )
                 self.query_one("#gpu-type-llama", Select).value = offer.gpu_type
                 self.query_one("#gpu-count-llama", Input).value = str(offer.gpu_count)
+            self._update_cost_preview("llama-cost-preview")
             return
         if event.select.id != "gpu-type-llama":
             return
         if isinstance(event.value, str) and event.value.strip():
             self._selected_gpu_type = normalize_gpu_type(event.value)
+        self._update_cost_preview("llama-cost-preview")
 
     def _sync_prime_visibility(self) -> None:
         advanced_visible = not self.query_one("#warmup").has_class("hidden")
@@ -737,6 +814,12 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
         selected = self._selected_gpu_type if self._selected_gpu_type in option_values else option_values[0]
         dropdown.value = selected
         self._selected_gpu_type = selected
+        self._gpu_price_by_value = {
+            spec.value.strip(): spec.price_per_hour_usd
+            for spec in message.gpu_types
+            if spec.price_per_hour_usd is not None
+        }
+        self._update_cost_preview("llama-cost-preview")
 
     def on_gpu_types_failed(self, _: GpuTypesFailed) -> None:
         # Keep default value if Modal docs fetch fails.
@@ -927,26 +1010,25 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
                 auto_disk=self.query_one("#prime-auto-disk-llama", Switch).value,
             )
 
-        # Advanced
-        adv_visible = not self.query(".llama-advanced").first().has_class("hidden")
-        if adv_visible:
-            sa = self.query_one("#server-args", Input).value.strip()
-            config.server_args = sa or None
-            h = self.query_one("#host-input", Input).value.strip()
-            config.host = h or None
-            p = self.query_one("#port-input", Input).value.strip()
-            if p:
-                try:
-                    config.port = int(p)
-                except ValueError:
-                    pass
-            ngl = self.query_one("#n-gpu-layers", Input).value.strip()
-            if ngl:
-                try:
-                    config.n_gpu_layers = int(ngl)
-                except ValueError:
-                    pass
-            config.llamacpp_image_no_cache = self.query_one("#llama-image-no-cache", Switch).value
+        # Advanced values are always read: collapsing the section must never
+        # silently discard options the user entered before collapsing it.
+        sa = self.query_one("#server-args", Input).value.strip()
+        config.server_args = sa or None
+        h = self.query_one("#host-input", Input).value.strip()
+        config.host = h or None
+        p = self.query_one("#port-input", Input).value.strip()
+        if p:
+            try:
+                config.port = int(p)
+            except ValueError:
+                pass
+        ngl = self.query_one("#n-gpu-layers", Input).value.strip()
+        if ngl:
+            try:
+                config.n_gpu_layers = int(ngl)
+            except ValueError:
+                pass
+        config.llamacpp_image_no_cache = self.query_one("#llama-image-no-cache", Switch).value
 
         model_hint = config.repo_id
         instance_override = self.query_one("#instance-name-llama", Input).value.strip()
@@ -969,6 +1051,15 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
 
     def _set_model_status(self, text: str) -> None:
         self.query_one("#llama-model-status", Static).update(text)
+
+    def _set_ranking_title(self) -> None:
+        subtitle = _ranking_subtitle(BackendType.LLAMACPP, self._rank_mode)
+        try:
+            self.query_one("#llama-model-ranking-title", Static).update(
+                f"[bold]Model[/bold]  [dim]({subtitle})[/dim]"
+            )
+        except Exception:
+            return
 
     def _set_quant_status(self, text: str) -> None:
         self.query_one("#llama-quant-status", Static).update(text)
@@ -1211,7 +1302,7 @@ class LlamaCppDeployScreen(CopyEnabledScreen):
         self.app.action_push_storage(BackendType.LLAMACPP)  # type: ignore[attr-defined]
 
 
-class VllmDeployScreen(CopyEnabledScreen):
+class VllmDeployScreen(_CostPreviewMixin, CopyEnabledScreen):
     """vLLM deploy form."""
 
     BINDINGS = [
@@ -1249,10 +1340,13 @@ class VllmDeployScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(classes="screen-scroll"):
-            yield Static("[bold #7bf168]Custom deploy vLLM[/]  [dim]Step 2: Model & options[/dim]")
+            yield Static("[bold #7bf168]Advanced deploy vLLM[/]  [dim]Step 2: Model & options[/dim]")
             yield Static("")
 
-            yield Static("[bold]Model ranking[/bold]  [dim](Top 10 text-generation models)[/dim]")
+            yield Static(
+                "[bold]Model[/bold]  [dim](cached models in your storage volumes)[/dim]",
+                id="vllm-model-ranking-title",
+            )
             yield OptionList(
                 Option("  Cached in storage", id="rank-cached"),
                 Option("  Most downloaded", id="rank-downloads"),
@@ -1303,7 +1397,7 @@ class VllmDeployScreen(CopyEnabledScreen):
                             id="gpu-type-vllm",
                         )
                     with Vertical(id="gpu-count-group-vllm"):
-                        yield Static("Deployment GPU count", classes="form-label")
+                        yield Static("GPU count", classes="form-label")
                         yield Input(
                             value=str(DEFAULT_GPU_COUNT),
                             placeholder="1",
@@ -1314,9 +1408,10 @@ class VllmDeployScreen(CopyEnabledScreen):
                     "Tensor parallel size",
                     "n-gpu",
                     default="1",
-                    hint="vLLM --tensor-parallel-size (separate from deployment GPU count)",
+                    hint="vLLM --tensor-parallel-size (separate from GPU count)",
                     classes="gpu-config-tensor-field",
                 )
+                yield Static("", id="vllm-cost-preview")
             yield Button("Advanced options...", id="toggle-advanced-vllm", variant="default")
             yield FormField(
                 "Model revision (optional)",
@@ -1355,12 +1450,17 @@ class VllmDeployScreen(CopyEnabledScreen):
                 classes="vllm-advanced",
             )
             yield ToggleField(
-                "Verify readiness after deploy",
+                "Warm up after deploy",
                 "warmup-vllm",
                 default=True,
                 classes="vllm-advanced",
             )
-            yield ToggleField("Enforce eager startup", "fast-boot", default=False, classes="vllm-advanced")
+            yield ToggleField(
+                "Enforce eager startup (skips CUDA graph capture)",
+                "fast-boot",
+                default=False,
+                classes="vllm-advanced",
+            )
             yield ToggleField(
                 "Trust remote model code",
                 "trust-remote-code",
@@ -1373,6 +1473,7 @@ class VllmDeployScreen(CopyEnabledScreen):
                 default=False,
                 classes="vllm-advanced",
             )
+            yield Static("[bold]Runtime[/bold]", classes="vllm-advanced")
             yield FormField(
                 "Served model alias",
                 "served-model-name",
@@ -1397,6 +1498,7 @@ class VllmDeployScreen(CopyEnabledScreen):
                 hint='e.g., {"enable_thinking": false}',
                 classes="vllm-advanced",
             )
+            yield Static("[bold]Naming[/bold]", classes="vllm-advanced")
             yield FormField(
                 "Instance name (optional)",
                 "instance-name-vllm",
@@ -1433,6 +1535,7 @@ class VllmDeployScreen(CopyEnabledScreen):
         self._model_to_memory_estimate: dict[str, VllmMemoryBreakdown | None] = {}
         self._last_memory_lookup: tuple[str, str] | None = None
         self._memory_lookup_timer: Timer | None = None
+        self._gpu_price_by_value: dict[str, float] = {}
         for widget in self.query(".vllm-advanced"):
             widget.add_class("hidden")
         for widget in self.query(".prime-only"):
@@ -1441,12 +1544,14 @@ class VllmDeployScreen(CopyEnabledScreen):
         if rank_mode_list.option_count > 0:
             rank_mode_list.highlighted = 0
         rank_mode_list.focus()
+        self._set_ranking_title()
         self._refresh_gpu_types()
         self._set_model_status("[dim]Loading cached models from storage...[/dim]")
         self._refresh_cached_models_from_storage()
         self._sync_served_alias_from_model(force=True)
         self._sync_tool_call_parser_from_model(force=True)
         self._refresh_app_preview()
+        self._update_cost_preview("vllm-cost-preview")
         self._refresh_vllm_memory_status()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
@@ -1456,6 +1561,7 @@ class VllmDeployScreen(CopyEnabledScreen):
                 return
             if selected_mode != self._rank_mode:
                 self._rank_mode = selected_mode
+                self._set_ranking_title()
                 self._ranked_models = []
                 self._set_model_status("[dim]Loading model suggestions...[/dim]")
                 self.query_one("#vllm-model-list", OptionList).set_options([])
@@ -1509,6 +1615,8 @@ class VllmDeployScreen(CopyEnabledScreen):
             self._refresh_app_preview()
         if event.input.id in {"model-name", "model-revision"} and self._prime_offers:
             self._refresh_prime_offer_options()
+        if event.input.id == "gpu-count-vllm":
+            self._update_cost_preview("vllm-cost-preview")
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "provider-vllm":
@@ -1521,6 +1629,7 @@ class VllmDeployScreen(CopyEnabledScreen):
             elif self._provider == ComputeProvider.MODAL:
                 self._refresh_gpu_types()
             self._refresh_app_preview()
+            self._update_cost_preview("vllm-cost-preview")
             return
         if event.select.id == "prime-offer-vllm":
             if not isinstance(event.value, str):
@@ -1535,11 +1644,13 @@ class VllmDeployScreen(CopyEnabledScreen):
                 self.query_one("#gpu-type-vllm", Select).value = offer.gpu_type
                 self.query_one("#gpu-count-vllm", Input).value = str(offer.gpu_count)
                 self.query_one("#n-gpu", Input).value = str(offer.gpu_count)
+            self._update_cost_preview("vllm-cost-preview")
             return
         if event.select.id != "gpu-type-vllm":
             return
         if isinstance(event.value, str) and event.value.strip():
             self._selected_gpu_type = normalize_gpu_type(event.value)
+        self._update_cost_preview("vllm-cost-preview")
 
     def _sync_prime_visibility(self) -> None:
         advanced_visible = not self.query_one("#model-revision").has_class("hidden")
@@ -1637,6 +1748,12 @@ class VllmDeployScreen(CopyEnabledScreen):
         selected = self._selected_gpu_type if self._selected_gpu_type in option_values else option_values[0]
         dropdown.value = selected
         self._selected_gpu_type = selected
+        self._gpu_price_by_value = {
+            spec.value.strip(): spec.price_per_hour_usd
+            for spec in message.gpu_types
+            if spec.price_per_hour_usd is not None
+        }
+        self._update_cost_preview("vllm-cost-preview")
 
     def on_gpu_types_failed(self, _: GpuTypesFailed) -> None:
         # Keep default value if Modal docs fetch fails.
@@ -1738,6 +1855,15 @@ class VllmDeployScreen(CopyEnabledScreen):
 
     def _set_model_status(self, text: str) -> None:
         self.query_one("#vllm-model-status", Static).update(text)
+
+    def _set_ranking_title(self) -> None:
+        subtitle = _ranking_subtitle(BackendType.VLLM, self._rank_mode)
+        try:
+            self.query_one("#vllm-model-ranking-title", Static).update(
+                f"[bold]Model[/bold]  [dim]({subtitle})[/dim]"
+            )
+        except Exception:
+            return
 
     def _resolve_rank_mode(self, option_id: str) -> str | None:
         if option_id == "rank-cached":
@@ -1929,7 +2055,7 @@ class VllmDeployScreen(CopyEnabledScreen):
             return
         gpu_count = parse_gpu_count(self.query_one("#gpu-count-vllm", Input).value, default=0)
         if gpu_count <= 0:
-            self.app.notify("Deployment GPU count must be an integer >= 1.", severity="error", timeout=5)
+            self.app.notify("GPU count must be an integer >= 1.", severity="error", timeout=5)
             return
         config.gpu_type = gpu_type
         config.gpu_count = gpu_count
@@ -1960,11 +2086,11 @@ class VllmDeployScreen(CopyEnabledScreen):
                 config.n_gpu = int(n_gpu_str) if n_gpu_str else 1
             except ValueError:
                 config.n_gpu = 1
-        adv_visible = not self.query(".vllm-advanced").first().has_class("hidden")
         config.tool_call_parser = self.query_one("#tool-call-parser", Input).value.strip() or None
-        if adv_visible:
-            config.reasoning_parser = self.query_one("#reasoning-parser", Input).value.strip() or None
-        kwargs_raw = self.query_one("#chat-template-kwargs", Input).value.strip() if adv_visible else ""
+        # Advanced values are always read: collapsing the section must never
+        # silently discard options the user entered before collapsing it.
+        config.reasoning_parser = self.query_one("#reasoning-parser", Input).value.strip() or None
+        kwargs_raw = self.query_one("#chat-template-kwargs", Input).value.strip()
         if kwargs_raw:
             try:
                 parsed = json.loads(kwargs_raw)

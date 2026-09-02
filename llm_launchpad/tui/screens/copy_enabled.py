@@ -28,6 +28,7 @@ class CopyEnabledScreen(Screen):
     """Screen base class that provides consistent copy behavior."""
 
     BINDINGS = [
+        Binding("?", "show_help", "Help", show=True),
         Binding("y", "copy_text", "Copy", key_display="y", show=False),
         Binding(
             "ctrl+shift+c,super+c,meta+c,cmd+c,command+c",
@@ -136,6 +137,12 @@ class CopyEnabledScreen(Screen):
             self.app.copy_to_clipboard(normalized)
             return
         self.notify("Nothing to copy", timeout=2)
+
+    def action_show_help(self) -> None:
+        """Open the keybinding help overlay for the active screen."""
+        from ..widgets.help_overlay import HelpOverlayScreen
+
+        self.app.push_screen(HelpOverlayScreen.from_screen(self))
 
     async def _watch_selections(
         self,

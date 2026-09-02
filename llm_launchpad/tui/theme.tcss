@@ -310,9 +310,23 @@ Button:focus {
     margin: 0;
 }
 
-#fast-deploy-gpu-filter {
+#fast-deploy-filter-row {
     width: 100%;
-    max-width: 72;
+    height: auto;
+}
+
+#fast-deploy-gpu-filter {
+    width: 1fr;
+    max-width: 36;
+    height: 3;
+    min-height: 3;
+    margin: 0 1 1 0;
+    padding: 0;
+}
+
+#fast-deploy-model-search {
+    width: 1fr;
+    max-width: 36;
     height: 3;
     min-height: 3;
     margin: 0 0 1 0;
@@ -796,9 +810,18 @@ StatusHeader.state-warming-up {
 
 .viewport-narrow #fast-deploy-subtitle,
 .viewport-narrow #fast-deploy-gpu-label,
+.viewport-narrow #fast-deploy-model-search,
 .viewport-compact #fast-deploy-subtitle,
-.viewport-compact #fast-deploy-gpu-label {
+.viewport-compact #fast-deploy-gpu-label,
+.viewport-minimal #fast-deploy-model-search,
+.viewport-short #fast-deploy-model-search {
     display: none;
+}
+
+.viewport-narrow #fast-deploy-gpu-filter,
+.viewport-minimal #fast-deploy-gpu-filter {
+    max-width: 100%;
+    margin-right: 0;
 }
 
 .viewport-compact #fast-deploy-gpu-filter {

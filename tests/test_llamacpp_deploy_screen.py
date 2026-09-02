@@ -809,8 +809,57 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             screen.query_one("#app-name-llama", Input).value = "llamacpp-special"
             screen._do_deploy()
 
-        self.assertEqual(app.deployed_config.app_name, "llamacpp-special")
-        self.assertEqual(app.deployed_config.instance_name, "team-prod")
+            self.assertEqual(app.deployed_config.app_name, "llamacpp-special")
+            self.assertEqual(app.deployed_config.instance_name, "team-prod")
+
+    async def test_collapsed_advanced_values_still_map_into_config(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+
+            screen.query_one("#repo-id", Input).value = "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF"
+            screen.query_one("#quant", Input).value = "Q4_K_M"
+            for widget in screen.query(".llama-advanced"):
+                widget.remove_class("hidden")
+            screen.query_one("#server-args", Input).value = "--ctx-size 65536"
+            screen.query_one("#n-gpu-layers", Input).value = "99"
+            # Collapse the advanced section before deploying; values must persist.
+            for widget in screen.query(".llama-advanced"):
+                widget.add_class("hidden")
+
+            screen._do_deploy()
+
+        self.assertIsNotNone(app.deployed_config)
+        self.assertEqual(app.deployed_config.server_args, "--ctx-size 65536")
+        self.assertEqual(app.deployed_config.n_gpu_layers, 99)
+
+    async def test_gpu_cost_preview_reflects_catalog_price(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+            preview = screen.query_one("#llama-cost-preview", Static)
+
+            screen.post_message(
+                GpuTypesLoaded(
+                    gpu_types=[
+                        ModalGpuSpec(value="A100-80GB", price_per_hour_usd=2.5),
+                        ModalGpuSpec(value="H100", price_per_hour_usd=None),
+                    ]
+                )
+            )
+            await pilot.pause()
+
+            markup = str(preview.renderable)
+            self.assertIn("$2.50/hr", markup)
+            self.assertIn("24/7", markup)
 
 
 if __name__ == "__main__":

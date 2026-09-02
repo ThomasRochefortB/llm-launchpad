@@ -36,11 +36,13 @@ ProviderOptions = ModalProviderOptions | PrimeProviderOptions
 
 @dataclass
 class LaunchpadSettings:
-    """Persisted user settings (scaledown, etc.)."""
+    """Persisted user settings (scaledown, appearance, and TUI behavior)."""
 
     scaledown_window: int = 1800  # seconds (30 minutes)
     tui_theme: str = "launchpad-dark"
     tui_density: str = "comfortable"
+    tui_mouse: Optional[bool] = None  # None = follow CLI/env default
+    confirm_quit: bool = True
 
     def to_env(self) -> Dict[str, str]:
         """Derive Modal environment variables from settings."""
@@ -54,15 +56,21 @@ class LaunchpadSettings:
             "SCALEDOWN_WINDOW": self.scaledown_window,
             "tui_theme": self.tui_theme,
             "tui_density": self.tui_density,
+            "tui_mouse": self.tui_mouse,
+            "confirm_quit": self.confirm_quit,
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> LaunchpadSettings:
         raw_value = data.get("SCALEDOWN_WINDOW", data.get("scaledown_window", 1800))
+        raw_mouse = data.get("tui_mouse")
+        mouse = raw_mouse if isinstance(raw_mouse, bool) else None
         return cls(
             scaledown_window=int(raw_value),
             tui_theme=str(data.get("tui_theme", "launchpad-dark")),
             tui_density=str(data.get("tui_density", "comfortable")),
+            tui_mouse=mouse,
+            confirm_quit=bool(data.get("confirm_quit", True)),
         )
 
 
