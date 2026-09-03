@@ -51,6 +51,15 @@ class _ScreenApp(App[None]):
         return []
 
 
+def _viewport_test_endpoint() -> EndpointInfo:
+    return EndpointInfo(
+        name="vllm-test",
+        app_id="ap-test",
+        state="running",
+        backend=BackendType.VLLM,
+    )
+
+
 def _has_ancestor(widget: Widget, ancestor_type: type[Widget]) -> bool:
     parent = widget.parent
     while isinstance(parent, Widget):
@@ -131,51 +140,68 @@ class ResponsiveLayoutTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertFalse(side_column.display)
 
-    async def test_navigation_screen_families_fit_supported_viewports(self) -> None:
+    async def test_navigation_main_menu_fits_supported_viewports(self) -> None:
+        await self._assert_screen_fits_supported_viewports(
+            MainMenuScreen(username="alice", version="1.0")
+        )
+
+    async def test_navigation_backend_select_fits_supported_viewports(self) -> None:
+        await self._assert_screen_fits_supported_viewports(BackendSelectScreen())
+
+    async def test_navigation_quick_deploy_fits_supported_viewports(self) -> None:
         from tests.catalog_fixtures import STATIC_LIKE_PROFILES
 
-        profile = STATIC_LIKE_PROFILES[0]
-        await self._assert_screen_families_fit_supported_viewports(
-            (
-                lambda: MainMenuScreen(username="alice", version="1.0"),
-                BackendSelectScreen,
-                lambda: QuickDeployScreen(profile),
-                FastDeployScreen,
-            )
+        await self._assert_screen_fits_supported_viewports(
+            QuickDeployScreen(STATIC_LIKE_PROFILES[0])
         )
 
-    async def test_deployment_screen_families_fit_supported_viewports(self) -> None:
-        await self._assert_screen_families_fit_supported_viewports(
-            (
-                LlamaCppDeployScreen,
-                VllmDeployScreen,
-                SettingsScreen,
-            )
+    async def test_navigation_fast_deploy_fits_supported_viewports(self) -> None:
+        await self._assert_screen_fits_supported_viewports(FastDeployScreen())
+
+    async def test_deployment_llamacpp_fits_supported_viewports(self) -> None:
+        await self._assert_screen_fits_supported_viewports(LlamaCppDeployScreen())
+
+    async def test_deployment_vllm_fits_supported_viewports(self) -> None:
+        await self._assert_screen_fits_supported_viewports(VllmDeployScreen())
+
+    async def test_deployment_settings_fits_supported_viewports(self) -> None:
+        await self._assert_screen_fits_supported_viewports(SettingsScreen())
+
+    async def test_management_manage_fits_supported_viewports(self) -> None:
+        await self._assert_screen_fits_supported_viewports(ManageScreen())
+
+    async def test_management_endpoint_actions_fits_supported_viewports(self) -> None:
+        await self._assert_screen_fits_supported_viewports(
+            EndpointActionsScreen(_viewport_test_endpoint())
         )
 
-    async def test_management_screen_families_fit_supported_viewports(self) -> None:
-        endpoint = EndpointInfo(
-            name="vllm-test",
-            app_id="ap-test",
-            state="running",
-            backend=BackendType.VLLM,
-        )
-        await self._assert_screen_families_fit_supported_viewports(
-            (
-                ManageScreen,
-                lambda: EndpointActionsScreen(endpoint),
-                lambda: StatusOptionsScreen(endpoint),
-                lambda: BenchmarkOptionsScreen(endpoint),
-                lambda: StopConfirmScreen(endpoint),
-            )
+    async def test_management_status_options_fits_supported_viewports(self) -> None:
+        await self._assert_screen_fits_supported_viewports(
+            StatusOptionsScreen(_viewport_test_endpoint())
         )
 
-    async def test_operational_screen_families_fit_supported_viewports(self) -> None:
+    async def test_management_benchmark_options_fits_supported_viewports(self) -> None:
+        await self._assert_screen_fits_supported_viewports(
+            BenchmarkOptionsScreen(_viewport_test_endpoint())
+        )
+
+    async def test_management_stop_confirm_fits_supported_viewports(self) -> None:
+        await self._assert_screen_fits_supported_viewports(
+            StopConfirmScreen(_viewport_test_endpoint())
+        )
+
+    async def test_operational_storage_fits_supported_viewports(self) -> None:
+        await self._assert_screen_fits_supported_viewports(StorageScreen())
+
+    async def test_operational_monitor_fits_supported_viewports(self) -> None:
+        await self._assert_screen_fits_supported_viewports(MonitorScreen("Logs"))
+
+    async def _assert_screen_fits_supported_viewports(
+        self,
+        screen: Screen,
+    ) -> None:
         await self._assert_screen_families_fit_supported_viewports(
-            (
-                StorageScreen,
-                lambda: MonitorScreen("Logs"),
-            )
+            (lambda screen=screen: screen,),
         )
 
     async def _assert_screen_families_fit_supported_viewports(

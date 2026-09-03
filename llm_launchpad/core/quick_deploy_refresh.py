@@ -421,6 +421,22 @@ def _profiles_from_aa_rankings(
     """Select the top `model_limit` unique open models in each size bucket."""
 
     window = _aa_candidate_window(candidates, candidate_limit)
+    # Deduplicate variants of the same model *before* fanning out to threads.
+    # _resolve_aa_model caches by model key, but the check-then-act on the
+    # shared dict races: two variants with the same key can both miss the
+    # cache and issue duplicate HF lookups (flaky call counts under xdist).
+    # Resolving one representative per key keeps behavior identical (the
+    # loser would be dropped by seen_repos anyway) and makes HF call counts
+    # deterministic.
+    seen_keys: set[str] = set()
+    deduped_window: list[AAModelCandidate] = []
+    for candidate in window:
+        model_key = _model_key(candidate.name) or _model_key(candidate.slug)
+        if model_key:
+            if model_key in seen_keys:
+                continue
+            seen_keys.add(model_key)
+        deduped_window.append(candidate)
     selected_by_bucket: dict[ModelSizeBucket, list[_ResolvedAAModel]] = {
         bucket: [] for bucket in _MODEL_SIZE_BUCKETS
     }
@@ -435,7 +451,7 @@ def _profiles_from_aa_rankings(
                 modal_gpu_catalog,
                 repo_by_model_key=repo_by_model_key,
             )
-            for candidate in window
+            for candidate in deduped_window
         ]
         for future in futures:
             resolved = future.result()
