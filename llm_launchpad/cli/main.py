@@ -18,7 +18,7 @@ import typer
 try:
     from rich.console import Console
 except Exception:
-    Console = None  # type: ignore
+    Console = None
 
 from ..core.backend import ModalBackend
 from ..core.benchmark import (
