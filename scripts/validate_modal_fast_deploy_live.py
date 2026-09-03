@@ -62,8 +62,12 @@ MAX_LONG_PROMPT_TOKENS = 32768
 CHARS_PER_TOKEN = 4
 # Depths as a fraction of the probe prompt. Quantized caches degrade oldest
 # entries first, so the shallow depth is the one that discriminates.
-RECALL_DEPTHS = (0.1, 0.5, 0.9)
-RECALL_CONTEXT_TOKENS = 16384
+RECALL_DEPTHS = (0.05, 0.25, 0.5, 0.75, 0.95)
+# A probe far below the advertised window barely exercises the cache at all:
+# 16K against a 262K model tests about 6% of the range where quantization
+# damage concentrates. Default to a deep probe and let the caller trade it
+# down when prefill time matters more than confidence.
+DEFAULT_RECALL_CONTEXT_TOKENS = 131072
 
 
 
@@ -657,6 +661,7 @@ async def run(
     gpu_type: str | None,
     cache_type: str | None,
     recall_probe: bool,
+    recall_context_tokens: int = DEFAULT_RECALL_CONTEXT_TOKENS,
 ) -> int:
     auth = get_modal_auth_status()
     if not auth.authenticated:
@@ -734,7 +739,7 @@ async def run(
                     _recall_probe,
                     endpoint_root_url(endpoint),
                     config.served_model_name or "",
-                    min(RECALL_CONTEXT_TOKENS, context_tokens),
+                    min(recall_context_tokens, context_tokens),
                 )
             report["evidence"]["management"] = await asyncio.to_thread(
                 _llamacpp_management_evidence,
@@ -810,6 +815,15 @@ def parse_args() -> argparse.Namespace:
         help="Probe long-context recall before stopping (adds a few requests).",
     )
     parser.add_argument(
+        "--recall-context",
+        type=int,
+        default=DEFAULT_RECALL_CONTEXT_TOKENS,
+        help=(
+            "Prompt size for the recall probe, capped at the model's window. "
+            "A small value is cheap but barely exercises the cache."
+        ),
+    )
+    parser.add_argument(
         "--cache-type",
         default=None,
         choices=list(KV_CACHE_TYPES),
@@ -844,6 +858,7 @@ def main() -> int:
             gpu_type=args.gpu_type,
             cache_type=args.cache_type,
             recall_probe=args.recall_probe,
+            recall_context_tokens=args.recall_context,
         )
     )
 

@@ -145,6 +145,33 @@ def tuning_for_objective(
 KV_CACHE_TYPES: tuple[str, ...] = ("f16", "q8_0", "q4_0")
 
 
+# Quantized KV is planned only for architectures a bake-off has actually
+# measured. This is an allowlist, not a denylist: an unknown architecture gets
+# f16, which is always correct, rather than inheriting a default that has never
+# been run on it. Architectures move in when scripts/bakeoff_kv_cache.py shows
+# recall matching f16 and no throughput regression on that architecture.
+#
+# Deliberately absent are the MLA-style families (deepseek2/32/4, glm-dsa),
+# which compress the KV cache in the attention design itself, so quantizing it
+# again is both less valuable and less understood.
+QUANTIZED_KV_ARCHITECTURES: frozenset[str] = frozenset()
+QUANTIZED_KV_CACHE_TYPE = "q8_0"
+
+
+def default_cache_type(architecture: str | None) -> str:
+    """Return the KV precision Fast Deploy should plan with for an architecture.
+
+    Separate from ``with_cache_type``, which is the mechanism: callers running a
+    deliberate comparison set any precision they like, while planning only ever
+    picks one that has been measured on the architecture in hand.
+    """
+
+    key = (architecture or "").strip().casefold()
+    if key and key in QUANTIZED_KV_ARCHITECTURES:
+        return QUANTIZED_KV_CACHE_TYPE
+    return "f16"
+
+
 def with_cache_type(tuning: RuntimeTuning, cache_type: str) -> RuntimeTuning:
     """Return tuning that stores the KV cache at one precision.
 

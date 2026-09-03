@@ -18,7 +18,11 @@ from typing import Any
 
 from llm_launchpad.core.llamacpp_planner import KV_CACHE_TYPES
 from llm_launchpad.core.quick_deploy import get_quick_deploy_profile
-from scripts.validate_modal_fast_deploy_live import DEFAULT_PROFILE_ID, run as validate_run
+from scripts.validate_modal_fast_deploy_live import (
+    DEFAULT_PROFILE_ID,
+    DEFAULT_RECALL_CONTEXT_TOKENS,
+    run as validate_run,
+)
 
 
 def _await_profile(profile_id: str, *, attempts: int = 5) -> None:
@@ -147,6 +151,12 @@ def main() -> int:
     )
     parser.add_argument("--objective", default="general_purpose")
     parser.add_argument(
+        "--recall-context",
+        type=int,
+        default=DEFAULT_RECALL_CONTEXT_TOKENS,
+        help="Prompt size for the recall probe, capped at the model's window.",
+    )
+    parser.add_argument(
         "--out-dir",
         default=f"/tmp/llm-launchpad-kv-bakeoff-{int(time.time())}",
     )
@@ -181,6 +191,7 @@ def main() -> int:
                 gpu_type=args.gpu_type,
                 cache_type=cache_type,
                 recall_probe=True,
+                recall_context_tokens=args.recall_context,
             )
         )
         report = json.loads(report_path.read_text())

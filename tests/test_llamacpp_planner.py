@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shlex
 import unittest
+from unittest.mock import patch
 from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -13,6 +14,8 @@ from llm_launchpad.core.llamacpp_planner import (
     estimate_memory,
     load_runtime_attestation,
     save_runtime_attestation,
+    QUANTIZED_KV_ARCHITECTURES,
+    default_cache_type,
     memory_for_cache_type,
     with_cache_type,
     serving_fingerprint,
@@ -282,6 +285,31 @@ class KvCacheTypeTests(unittest.TestCase):
         # saving that the runtime will not deliver.
         with self.assertRaisesRegex(ValueError, "fallback heuristic"):
             memory_for_cache_type(fallback, from_cache_type="f16", to_cache_type="q8_0")
+
+    def test_an_unmeasured_architecture_plans_with_f16(self) -> None:
+        # The safe default must win for anything not in the allowlist, including
+        # an architecture string we have never seen.
+        self.assertEqual(default_cache_type("glm-dsa"), "f16")
+        self.assertEqual(default_cache_type("deepseek4"), "f16")
+        self.assertEqual(default_cache_type("some-future-arch"), "f16")
+        self.assertEqual(default_cache_type(None), "f16")
+        self.assertEqual(default_cache_type(""), "f16")
+
+    def test_mla_architectures_are_never_allowlisted(self) -> None:
+        # These compress KV in the attention design itself; quantizing on top
+        # is unmeasured, so they must not be added without a bake-off.
+        for architecture in ("deepseek2", "deepseek32", "deepseek4", "glm-dsa"):
+            self.assertNotIn(architecture, QUANTIZED_KV_ARCHITECTURES)
+            self.assertEqual(default_cache_type(architecture), "f16")
+
+    def test_an_allowlisted_architecture_plans_with_the_measured_type(self) -> None:
+        with patch(
+            "llm_launchpad.core.llamacpp_planner.QUANTIZED_KV_ARCHITECTURES",
+            frozenset({"qwen35"}),
+        ):
+            self.assertEqual(default_cache_type("qwen35"), "q8_0")
+            self.assertEqual(default_cache_type("QWEN35"), "q8_0")
+            self.assertEqual(default_cache_type("qwen3next"), "f16")
 
     def test_compiled_args_carry_the_selected_cache_type(self) -> None:
         args = compile_server_args(
