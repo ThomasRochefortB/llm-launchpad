@@ -130,6 +130,15 @@ def _load_quick_deploy_catalog() -> tuple[QuickDeployCatalogInfo, tuple[QuickDep
     global _CATALOG_CACHE
     if _CATALOG_CACHE is not None:
         return _CATALOG_CACHE
+    try:
+        from .quick_deploy_refresh import load_cached_quick_deploy_catalog
+
+        cached = load_cached_quick_deploy_catalog()
+    except Exception:
+        cached = None
+    if cached is not None:
+        _CATALOG_CACHE = cached
+        return _CATALOG_CACHE
     _CATALOG_CACHE = (_PENDING_CATALOG_INFO, _EMPTY_PROFILES)
     return _CATALOG_CACHE
 

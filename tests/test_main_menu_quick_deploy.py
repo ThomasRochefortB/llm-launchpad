@@ -10,6 +10,7 @@ from textual.widgets import OptionList
 
 from llm_launchpad.core import quick_deploy
 from llm_launchpad.core.compute_availability import aggregate_compute_availability
+from llm_launchpad.core.quick_deploy import QuickDeployCatalogInfo, QuickDeployProfile
 from llm_launchpad.protocol.enums import BackendType
 from llm_launchpad.protocol.models import EndpointInfo
 from llm_launchpad.tui.screens.fast_deploy import FastDeployScreen
@@ -163,6 +164,89 @@ class MainMenuDeployDoorTests(unittest.IsolatedAsyncioTestCase):
 
                     screen.on_endpoints_loaded(EndpointsLoaded(rows))
                     run_worker.assert_called_once()
+
+    def test_warm_catalog_activates_instantly_and_refreshes_in_background(self) -> None:
+        profile = QuickDeployProfile(
+            id="warm-model-cheap",
+            display_name="Warm Model",
+            repo_id="unsloth/Warm-Model-GGUF",
+            quant="UD-Q2_K_XL",
+            gpu_type="L4",
+            gpu_count=1,
+            profile_label="Slow but cheap",
+            approx_cost_per_hour_usd=0.8,
+            max_context_tokens=131_072,
+            instance_slug_hint="warm-model",
+            summary="Warm snapshot.",
+            server_args=("--ctx-size", "131072"),
+        )
+        info = QuickDeployCatalogInfo(
+            source_label="Cached snapshot",
+            generated_at="2026-09-03T00:00:00Z",
+            is_live=True,
+            ready=True,
+        )
+        screen = MainMenuScreen(username="alice")
+        posted: list[object] = []
+        screen.post_message = posted.append  # type: ignore[method-assign]
+        with patch(
+            "llm_launchpad.tui.screens.main_menu.load_cached_quick_deploy_catalog",
+            return_value=(info, (profile,)),
+        ), patch(
+            "llm_launchpad.tui.screens.main_menu.is_fresh_cached_quick_deploy_catalog",
+            return_value=True,
+        ), patch.object(
+            screen, "run_worker", return_value=None
+        ) as run_worker, patch(
+            "llm_launchpad.tui.screens.main_menu.activate_quick_deploy_catalog",
+            wraps=quick_deploy.activate_quick_deploy_catalog,
+        ) as activate:
+            screen._refresh_quick_deploy_catalog()
+
+        self.assertTrue(screen._quick_deploy_catalog_refresh_inflight)
+        activate.assert_called_once_with(info, (profile,))
+        run_worker.assert_called_once()
+        self.assertEqual(
+            [p.id for p in quick_deploy.list_quick_deploy_profiles()],
+            ["warm-model-cheap"],
+        )
+
+    def test_stale_snapshot_still_activates_before_refresh(self) -> None:
+        profile = QuickDeployProfile(
+            id="stale-model-cheap",
+            display_name="Stale Model",
+            repo_id="unsloth/Stale-Model-GGUF",
+            quant="UD-Q2_K_XL",
+            gpu_type="L4",
+            gpu_count=1,
+            profile_label="Slow but cheap",
+            approx_cost_per_hour_usd=0.8,
+            max_context_tokens=131_072,
+            instance_slug_hint="stale-model",
+            summary="Stale snapshot.",
+            server_args=("--ctx-size", "131072"),
+        )
+        info = QuickDeployCatalogInfo(
+            source_label="Cached snapshot",
+            generated_at="2026-09-01T00:00:00Z",
+            is_live=True,
+            ready=True,
+        )
+        screen = MainMenuScreen(username="alice")
+        with patch(
+            "llm_launchpad.tui.screens.main_menu.load_cached_quick_deploy_catalog",
+            return_value=(info, (profile,)),
+        ), patch(
+            "llm_launchpad.tui.screens.main_menu.is_fresh_cached_quick_deploy_catalog",
+            return_value=False,
+        ), patch.object(screen, "run_worker", return_value=None) as run_worker:
+            screen._refresh_quick_deploy_catalog()
+
+        run_worker.assert_called_once()
+        self.assertEqual(
+            [p.id for p in quick_deploy.list_quick_deploy_profiles()],
+            ["stale-model-cheap"],
+        )
 
     async def test_hidden_home_screen_skips_periodic_endpoint_refresh(self) -> None:
         app = _TestApp()

@@ -34,8 +34,11 @@ from ...core.quick_deploy import (
 )
 from ...core.quick_deploy_refresh import (
     ArtificialAnalysisAuthStatus,
+    attach_quick_deploy_mtp_recommendations,
     build_live_quick_deploy_catalog,
     get_artificial_analysis_auth_status,
+    is_fresh_cached_quick_deploy_catalog,
+    load_cached_quick_deploy_catalog,
 )
 from ...core.storage_costs import (
     MODAL_VOLUME_FREE_TIER_GIB_MONTH,
@@ -856,6 +859,10 @@ class MainMenuScreen(CopyEnabledScreen):
         self._refresh_hf_auth_status()
         self._refresh_aai_auth_status()
         self._refresh_panels()
+        # Start the catalog build immediately: it is the longest pole and
+        # used to wait behind the deferred secondary pass. Billing/storage
+        # stay deferred so first paint stays fast.
+        self._refresh_quick_deploy_catalog()
         self._secondary_refresh_timer = self.set_timer(
             self._SECONDARY_REFRESH_DELAY_SECONDS,
             self._refresh_secondary_panels,
@@ -999,11 +1006,52 @@ class MainMenuScreen(CopyEnabledScreen):
         if self._quick_deploy_catalog_refresh_inflight:
             return
         self._quick_deploy_catalog_refresh_inflight = True
+        if self._activate_warm_quick_deploy_catalog():
+            # A fresh disk snapshot is already live; still refresh in the
+            # background so pricing/benchmarks stay current, but the picker
+            # never sits in the "Building…" empty state meanwhile.
+            self.run_worker(
+                self._run_refresh_quick_deploy_catalog,
+                name="main-menu-quick-deploy-catalog-worker",
+                thread=True,
+            )
+            return
         self.run_worker(
             self._run_refresh_quick_deploy_catalog,
             name="main-menu-quick-deploy-catalog-worker",
             thread=True,
         )
+
+    def _activate_warm_quick_deploy_catalog(self) -> bool:
+        """Activate a fresh disk snapshot so Deploy opens instantly.
+
+        Returns True when a fresh snapshot was activated (a background
+        refresh is still worthwhile). Stale snapshots are also activated
+        so the picker has content, but return False so the caller treats
+        the refresh as the load-bearing path.
+        """
+
+        try:
+            cached = load_cached_quick_deploy_catalog()
+        except Exception:
+            return False
+        if cached is None:
+            return False
+        info, profiles = cached
+        try:
+            activate_quick_deploy_catalog(info, profiles)
+        except ValueError:
+            return False
+        try:
+            notifier = getattr(self.app, "quick_deploy_catalog_updated", None)
+        except Exception:
+            notifier = None
+        if callable(notifier):
+            try:
+                notifier()
+            except Exception:
+                pass
+        return is_fresh_cached_quick_deploy_catalog(info)
 
     def ensure_quick_deploy_catalog_refresh(self) -> None:
         """Start the live model-catalog refresh before opening the picker."""
@@ -1016,6 +1064,15 @@ class MainMenuScreen(CopyEnabledScreen):
             self.post_message(QuickDeployCatalogLoadFailed(error=str(exc)))
             return
         self.post_message(QuickDeployCatalogLoaded(info=info, profiles=profiles))
+        # MTP probes are the slowest per-model fetch and only feed the
+        # draft-model toggle; attach them as a trailing update so the
+        # picker stays usable while they resolve.
+        try:
+            upgraded = attach_quick_deploy_mtp_recommendations(profiles)
+        except Exception:
+            return
+        if upgraded != tuple(profiles):
+            self.post_message(QuickDeployCatalogLoaded(info=info, profiles=upgraded))
 
     def on_quick_deploy_catalog_loaded(
         self,
@@ -1207,6 +1264,9 @@ class MainMenuScreen(CopyEnabledScreen):
         if not self._is_active_screen():
             return
         self._secondary_refresh_started = True
+        # The catalog refresh already started on mount; this is only a
+        # backstop for screens mounted before that change or refreshes
+        # skipped while suspended.
         self._refresh_quick_deploy_catalog()
         self._refresh_billing_panels()
         self._refresh_storage_estimate()

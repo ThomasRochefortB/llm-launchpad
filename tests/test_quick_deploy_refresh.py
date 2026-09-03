@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -13,12 +14,20 @@ from llm_launchpad.core.hf_models import GgufQuantMetadata, ModelCandidate
 from llm_launchpad.core.modal_gpu import ModalGpuSpec
 from llm_launchpad.core.quick_deploy_refresh import (
     AAModelCandidate,
+    QUICK_DEPLOY_CATALOG_CACHE_SCHEMA_VERSION,
     _AARankings,
+    _available_gpu_types,
     _find_unsloth_gguf_match,
     _load_aa_rankings,
+    _quick_deploy_profile_from_dict,
+    _quick_deploy_profile_to_dict,
+    _read_quick_deploy_catalog_cache,
     _write_aa_cache,
+    attach_quick_deploy_mtp_recommendations,
     build_live_quick_deploy_catalog,
     fetch_artificial_analysis_models,
+    is_fresh_cached_quick_deploy_catalog,
+    load_cached_quick_deploy_catalog,
     normalize_aa_model_candidates,
     _mtp_recommendation,
 )
@@ -434,6 +443,40 @@ class QuickDeployRefreshTests(unittest.TestCase):
 
         self.assertEqual({profile.repo_id for profile in profiles}, {"org/Usable-GGUF"})
 
+    def test_fallback_catalog_upgrades_context_length_after_profiles_exist(self) -> None:
+        models = [ModelCandidate(repo_id="unsloth/Test-Model-GGUF")]
+        metadata = GgufQuantMetadata(
+            quantizations=["Q4_K_M"],
+            vram_gb_by_quant={"Q4_K_M": 10.0},
+            architecture="llama",
+        )
+        with patch(
+            "llm_launchpad.core.quick_deploy_refresh._load_aa_rankings",
+            return_value=None,
+        ), patch(
+            "llm_launchpad.core.quick_deploy_refresh.list_llamacpp_candidates",
+            return_value=models,
+        ), patch(
+            "llm_launchpad.core.quick_deploy_refresh.fetch_modal_gpu_catalog",
+            return_value=[ModalGpuSpec("L4", 0.75)],
+        ), patch(
+            "llm_launchpad.core.quick_deploy_refresh.fetch_gguf_quant_metadata",
+            return_value=metadata,
+        ), patch(
+            "llm_launchpad.core.quick_deploy_refresh.fetch_model_max_context",
+            return_value=131_072,
+        ), patch(
+            "llm_launchpad.core.quick_deploy_refresh._write_quick_deploy_catalog_cache",
+        ):
+            _info, profiles = build_live_quick_deploy_catalog(model_limit=1)
+
+        self.assertTrue(profiles)
+        self.assertEqual(
+            {profile.max_context_tokens for profile in profiles}, {131_072}
+        )
+        for profile in profiles:
+            self.assertIn(str(131_072), " ".join(profile.server_args))
+
     def test_catalog_fails_when_no_aa_or_trending_models_are_available(self) -> None:
         with patch(
             "llm_launchpad.core.quick_deploy_refresh._load_aa_rankings",
@@ -635,6 +678,171 @@ class QuickDeployRefreshTests(unittest.TestCase):
         assert rankings is not None
         self.assertEqual(rankings.freshness, "cached")
         self.assertEqual(rankings.candidates[0].aa_model_id, "stale")
+
+    def test_available_gpu_types_skips_unpriced_and_unknown_shapes(self) -> None:
+        catalog = [
+            ModalGpuSpec("T4", 0.5),
+            ModalGpuSpec("H100!", None),
+            ModalGpuSpec("H200", None),
+            ModalGpuSpec("B200", 6.25),
+            ModalGpuSpec("B300", 7.10),
+        ]
+        # H100!/H200/B300 have no usable Modal price or VRAM entry, so the
+        # catalog must not offer them as deploy shapes. Previously B300 (no
+        # VRAM entry) and unpriced H100!/H200 leaked through as profiles.
+        self.assertEqual(
+            _available_gpu_types(catalog),
+            ["T4", "B200"],
+        )
+
+    def test_available_gpu_types_falls_back_to_priced_shapes(self) -> None:
+        self.assertEqual(
+            _available_gpu_types([]),
+            ["T4", "L4", "A100", "L40S", "RTX-PRO-6000", "H100", "H200", "B200"],
+        )
+
+    def test_catalog_build_skips_mtp_inspection_on_first_pass(self) -> None:
+        candidates = (
+            _aa_candidate("Open Model One 8B", 8, 95, rank=1),
+            _aa_candidate("Open Model Two 8B", 8, 90, rank=2),
+        )
+        rankings = _AARankings(candidates=candidates, freshness="live")
+        metadata = GgufQuantMetadata(
+            quantizations=["UD-Q2_K_XL"],
+            vram_gb_by_quant={"UD-Q2_K_XL": 20.0},
+            architecture="llama",
+        )
+        gpu_catalog = [ModalGpuSpec("L4", 0.5)]
+
+        def matched_repo(candidate: AAModelCandidate, _api: object) -> str:
+            return f"unsloth/{candidate.name.replace(' ', '-')}-GGUF"
+
+        with patch(
+            "llm_launchpad.core.quick_deploy_refresh._load_aa_rankings",
+            return_value=rankings,
+        ), patch(
+            "llm_launchpad.core.quick_deploy_refresh.fetch_modal_gpu_catalog",
+            return_value=gpu_catalog,
+        ), patch(
+            "llm_launchpad.core.quick_deploy_refresh._find_unsloth_gguf_match",
+            side_effect=matched_repo,
+        ), patch(
+            "llm_launchpad.core.quick_deploy_refresh.fetch_gguf_quant_metadata",
+            return_value=metadata,
+        ) as fetch_metadata, patch(
+            "llm_launchpad.core.quick_deploy_refresh._write_quick_deploy_catalog_cache",
+        ):
+            _info, profiles = build_live_quick_deploy_catalog(model_limit=1)
+
+        self.assertTrue(profiles)
+        self.assertTrue(
+            all(profile.speculative_decoding is None for profile in profiles)
+        )
+        for _args, kwargs in fetch_metadata.call_args_list:
+            self.assertNotEqual(kwargs.get("inspect_mtp"), True)
+
+    def test_attach_mtp_recommendations_upgrades_profiles_lazily(self) -> None:
+        from llm_launchpad.core.quick_deploy import QuickDeployProfile
+
+        profile = QuickDeployProfile(
+            id="model-cheap-l4",
+            display_name="Open Model One 8B",
+            repo_id="unsloth/Open-Model-One-8B-GGUF",
+            quant="UD-Q2_K_XL",
+            gpu_type="L4",
+            gpu_count=2,
+            profile_label="Slow but cheap",
+            approx_cost_per_hour_usd=1.0,
+            max_context_tokens=131_072,
+            instance_slug_hint="open-model-one",
+            summary="Test profile.",
+            server_args=("--ctx-size", "131072"),
+        )
+        metadata = GgufQuantMetadata(
+            quantizations=["UD-Q2_K_XL"],
+            vram_gb_by_quant={"UD-Q2_K_XL": 20.0},
+            architecture="qwen35",
+            mtp=GgufMtpCapability(
+                status=GgufMtpStatus.SUPPORTED,
+                nextn_predict_layers=1,
+            ),
+        )
+        with patch(
+            "llm_launchpad.core.quick_deploy_refresh.fetch_gguf_quant_metadata",
+            return_value=metadata,
+        ) as fetch_metadata:
+            upgraded = attach_quick_deploy_mtp_recommendations((profile,))
+
+        fetch_metadata.assert_called_once_with(
+            "unsloth/Open-Model-One-8B-GGUF",
+            inspect_mtp=True,
+        )
+        self.assertIsNone(profile.speculative_decoding)
+        self.assertIsNotNone(upgraded[0].speculative_decoding)
+
+    def test_cached_catalog_round_trip_marks_stale_snapshots(self) -> None:
+        from llm_launchpad.core.quick_deploy import QuickDeployProfile
+
+        profile = QuickDeployProfile(
+            id="model-cheap-l4",
+            display_name="Open Model One 8B",
+            repo_id="unsloth/Open-Model-One-8B-GGUF",
+            quant="UD-Q2_K_XL",
+            gpu_type="L4",
+            gpu_count=2,
+            profile_label="Slow but cheap",
+            approx_cost_per_hour_usd=1.0,
+            max_context_tokens=131_072,
+            instance_slug_hint="open-model-one",
+            summary="Test profile.",
+            server_args=("--ctx-size", "131072"),
+        )
+        payload = _quick_deploy_profile_to_dict(profile)
+        restored = _quick_deploy_profile_from_dict(payload)
+        self.assertEqual(restored, profile)
+
+        with TemporaryDirectory() as temporary_directory:
+            from llm_launchpad.core.quick_deploy import QuickDeployCatalogInfo
+
+            cache_path = Path(temporary_directory) / "catalog.json"
+            fresh_info = QuickDeployCatalogInfo(
+                source_label="Test catalog",
+                generated_at="2026-09-03T00:00:00Z",
+                is_live=True,
+                ready=True,
+            )
+            envelope = {
+                "schema_version": QUICK_DEPLOY_CATALOG_CACHE_SCHEMA_VERSION,
+                "info": {
+                    "source_label": fresh_info.source_label,
+                    "generated_at": fresh_info.generated_at,
+                    "is_live": True,
+                    "ready": True,
+                },
+                "profiles": [payload],
+            }
+            cache_path.write_text(json.dumps(envelope), encoding="utf-8")
+            cached = _read_quick_deploy_catalog_cache(cache_path)
+            assert cached is not None
+            cached_info, cached_profiles = cached
+            self.assertEqual(cached_profiles, (profile,))
+            self.assertTrue(
+                is_fresh_cached_quick_deploy_catalog(
+                    cached_info,
+                    now=datetime(2026, 9, 3, 1, tzinfo=timezone.utc),
+                )
+            )
+            self.assertFalse(
+                is_fresh_cached_quick_deploy_catalog(
+                    cached_info,
+                    now=datetime(2026, 9, 4, tzinfo=timezone.utc),
+                )
+            )
+            with patch(
+                "llm_launchpad.core.quick_deploy_refresh._quick_deploy_catalog_cache_path",
+                return_value=cache_path,
+            ):
+                self.assertEqual(load_cached_quick_deploy_catalog(), cached)
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
@@ -33,8 +33,11 @@ from ..protocol.models import SpeculativeDecodingConfig
 
 DEFAULT_MODEL_LIMIT = 3
 DEFAULT_CANDIDATE_LIMIT = 80
-_AA_RESOLUTION_WORKERS = 8
+_AA_RESOLUTION_WORKERS = 24
 _FALLBACK_TRENDING_LIMIT = 8
+_HF_SEARCH_WORKERS = 4
+_HF_SEARCH_LIMIT = 10
+_HF_SEARCH_TIMEOUT_SECONDS = 10.0
 DEFAULT_CONTEXT_TOKENS = 65_536
 LOW_VRAM_QUANT = "UD-Q2_K_XL"
 AA_PRO_MODELS_URL = "https://artificialanalysis.ai/api/v2/language/models"
@@ -42,6 +45,18 @@ AA_FREE_MODELS_URL = "https://artificialanalysis.ai/api/v2/language/models/free"
 AA_CACHE_PATH = SETTINGS_DIR / "artificial_analysis_models.json"
 AA_CACHE_TTL = timedelta(hours=24)
 AA_ATTRIBUTION = "Benchmark data sourced from Artificial Analysis: https://artificialanalysis.ai/"
+
+
+def _quick_deploy_catalog_cache_path() -> Path:
+    """Resolve the catalog snapshot path from the current settings dir."""
+
+    from .config import SETTINGS_DIR as current_settings_dir
+
+    return current_settings_dir / "quick_deploy_catalog.json"
+
+
+QUICK_DEPLOY_CATALOG_CACHE_TTL = timedelta(hours=6)
+QUICK_DEPLOY_CATALOG_CACHE_SCHEMA_VERSION = 1
 _AA_CACHE_LOCK = Lock()
 
 ModelSizeBucket = Literal["compact", "medium", "large"]
@@ -208,13 +223,251 @@ def build_live_quick_deploy_catalog(
                 ),
                 is_live=True,
             )
+            _write_quick_deploy_catalog_cache(info, profiles)
             return (info, profiles)
 
-    return _build_trending_fallback_catalog(
+    fallback = _build_trending_fallback_catalog(
         model_limit=normalized_model_limit,
         modal_gpu_catalog=modal_gpu_catalog,
         has_live_modal_pricing=has_live_modal_pricing,
     )
+    _write_quick_deploy_catalog_cache(fallback[0], fallback[1])
+    return fallback
+
+
+def load_cached_quick_deploy_catalog(
+    *,
+    cache_path: Path | None = None,
+    now: datetime | None = None,
+) -> tuple[QuickDeployCatalogInfo, tuple[QuickDeployProfile, ...]] | None:
+    """Return the last successfully built catalog, whatever its age.
+
+    The caller decides freshness (``is_fresh_cached_quick_deploy_catalog``);
+    a stale snapshot still beats the "Building…" empty state, so loading and
+    freshness are separate steps.
+    """
+
+    return _read_quick_deploy_catalog_cache(cache_path or _quick_deploy_catalog_cache_path())
+
+
+def is_fresh_cached_quick_deploy_catalog(
+    info: QuickDeployCatalogInfo,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Return True when a cached catalog snapshot is fresh enough to trust."""
+
+    generated_at = _clean_string(info.generated_at)
+    if not generated_at:
+        return False
+    try:
+        fetched_at = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if fetched_at.tzinfo is None:
+        fetched_at = fetched_at.replace(tzinfo=timezone.utc)
+    current_time = now or datetime.now(timezone.utc)
+    return current_time - fetched_at.astimezone(timezone.utc) <= QUICK_DEPLOY_CATALOG_CACHE_TTL
+
+
+def _quick_deploy_profile_to_dict(profile: QuickDeployProfile) -> dict[str, Any]:
+    speculative = profile.speculative_decoding
+    return {
+        "id": profile.id,
+        "display_name": profile.display_name,
+        "repo_id": profile.repo_id,
+        "quant": profile.quant,
+        "gpu_type": profile.gpu_type,
+        "gpu_count": profile.gpu_count,
+        "profile_label": profile.profile_label,
+        "approx_cost_per_hour_usd": profile.approx_cost_per_hour_usd,
+        "max_context_tokens": profile.max_context_tokens,
+        "instance_slug_hint": profile.instance_slug_hint,
+        "summary": profile.summary,
+        "server_args": list(profile.server_args),
+        "required_vram_gb": profile.required_vram_gb,
+        "resource_tier": profile.resource_tier,
+        "resource_tier_label": profile.resource_tier_label,
+        "source_label": profile.source_label,
+        "aa_model_id": profile.aa_model_id,
+        "aa_model_name": profile.aa_model_name,
+        "aa_model_slug": profile.aa_model_slug,
+        "aa_coding_score": profile.aa_coding_score,
+        "aa_intelligence_score": profile.aa_intelligence_score,
+        "aa_rank": profile.aa_rank,
+        "model_size_label": profile.model_size_label,
+        "backend": profile.backend.value,
+        "model_name": profile.model_name,
+        "gguf_architecture": profile.gguf_architecture,
+        "llamacpp_runtime_id": profile.llamacpp_runtime_id,
+        "speculative_decoding": (
+            {
+                "method": speculative.method.value,
+                "num_speculative_tokens": speculative.num_speculative_tokens,
+                "nextn_predict_layers": speculative.nextn_predict_layers,
+            }
+            if speculative is not None
+            else None
+        ),
+    }
+
+
+def _quick_deploy_profile_from_dict(payload: Any) -> QuickDeployProfile | None:
+    if not isinstance(payload, dict):
+        return None
+    try:
+        from ..protocol.enums import BackendType
+    except Exception:
+        return None
+    try:
+        backend = BackendType(str(payload.get("backend") or "llamacpp"))
+    except ValueError:
+        return None
+    speculative_payload = payload.get("speculative_decoding")
+    speculative = None
+    if isinstance(speculative_payload, dict):
+        try:
+            speculative = SpeculativeDecodingConfig(
+                method=SpeculativeDecodingMethod(
+                    str(speculative_payload.get("method") or "mtp")
+                ),
+                num_speculative_tokens=int(
+                    speculative_payload.get("num_speculative_tokens") or 0
+                ),
+                nextn_predict_layers=(
+                    int(speculative_payload["nextn_predict_layers"])
+                    if speculative_payload.get("nextn_predict_layers") is not None
+                    else None
+                ),
+            )
+        except (ValueError, TypeError):
+            speculative = None
+    try:
+        return QuickDeployProfile(
+            id=str(payload.get("id") or ""),
+            display_name=str(payload.get("display_name") or ""),
+            repo_id=str(payload.get("repo_id") or ""),
+            quant=str(payload.get("quant") or ""),
+            gpu_type=str(payload.get("gpu_type") or ""),
+            gpu_count=int(payload.get("gpu_count") or 0),
+            profile_label=str(payload.get("profile_label") or ""),
+            approx_cost_per_hour_usd=float(payload.get("approx_cost_per_hour_usd") or 0.0),
+            max_context_tokens=int(payload.get("max_context_tokens") or 0),
+            instance_slug_hint=str(payload.get("instance_slug_hint") or ""),
+            summary=str(payload.get("summary") or ""),
+            server_args=tuple(str(arg) for arg in (payload.get("server_args") or ())),
+            required_vram_gb=(
+                float(payload["required_vram_gb"])
+                if payload.get("required_vram_gb") is not None
+                else None
+            ),
+            resource_tier=payload.get("resource_tier"),
+            resource_tier_label=payload.get("resource_tier_label"),
+            source_label=str(payload.get("source_label") or "Curated"),
+            aa_model_id=payload.get("aa_model_id"),
+            aa_model_name=payload.get("aa_model_name"),
+            aa_model_slug=payload.get("aa_model_slug"),
+            aa_coding_score=(
+                float(payload["aa_coding_score"])
+                if payload.get("aa_coding_score") is not None
+                else None
+            ),
+            aa_intelligence_score=(
+                float(payload["aa_intelligence_score"])
+                if payload.get("aa_intelligence_score") is not None
+                else None
+            ),
+            aa_rank=(
+                int(payload["aa_rank"]) if payload.get("aa_rank") is not None else None
+            ),
+            model_size_label=payload.get("model_size_label"),
+            backend=backend,
+            model_name=payload.get("model_name"),
+            gguf_architecture=payload.get("gguf_architecture"),
+            llamacpp_runtime_id=payload.get("llamacpp_runtime_id"),
+            speculative_decoding=speculative,
+        )
+    except (ValueError, TypeError):
+        return None
+
+
+def _quick_deploy_catalog_info_to_dict(info: QuickDeployCatalogInfo) -> dict[str, Any]:
+    return {
+        "source_label": info.source_label,
+        "generated_at": info.generated_at,
+        "attribution": info.attribution,
+        "is_fallback": info.is_fallback,
+        "is_live": info.is_live,
+        "ready": info.ready,
+        "error": info.error,
+    }
+
+
+def _quick_deploy_catalog_info_from_dict(payload: Any) -> QuickDeployCatalogInfo | None:
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return QuickDeployCatalogInfo(
+            source_label=str(payload.get("source_label") or "Cached catalog"),
+            generated_at=payload.get("generated_at"),
+            attribution=payload.get("attribution"),
+            is_fallback=bool(payload.get("is_fallback", False)),
+            is_live=bool(payload.get("is_live", True)),
+            ready=bool(payload.get("ready", True)),
+            error=payload.get("error"),
+        )
+    except (ValueError, TypeError):
+        return None
+
+
+def _write_quick_deploy_catalog_cache(
+    info: QuickDeployCatalogInfo,
+    profiles: Sequence[QuickDeployProfile],
+    *,
+    cache_path: Path | None = None,
+) -> None:
+    envelope = {
+        "schema_version": QUICK_DEPLOY_CATALOG_CACHE_SCHEMA_VERSION,
+        "info": _quick_deploy_catalog_info_to_dict(info),
+        "profiles": [_quick_deploy_profile_to_dict(profile) for profile in profiles],
+    }
+    path = cache_path or _quick_deploy_catalog_cache_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = path.with_suffix(f"{path.suffix}.tmp")
+        temporary_path.write_text(json.dumps(envelope, indent=2) + "\n", encoding="utf-8")
+        temporary_path.replace(path)
+    except Exception:
+        return
+
+
+def _read_quick_deploy_catalog_cache(
+    path: Path,
+) -> tuple[QuickDeployCatalogInfo, tuple[QuickDeployProfile, ...]] | None:
+    try:
+        envelope = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(envelope, dict):
+        return None
+    if envelope.get("schema_version") != QUICK_DEPLOY_CATALOG_CACHE_SCHEMA_VERSION:
+        return None
+    info = _quick_deploy_catalog_info_from_dict(envelope.get("info"))
+    raw_profiles = envelope.get("profiles")
+    if info is None or not isinstance(raw_profiles, list):
+        return None
+    profiles = tuple(
+        profile
+        for raw in raw_profiles
+        if (profile := _quick_deploy_profile_from_dict(raw)) is not None
+        and profile.id
+        and profile.repo_id
+    )
+    if not profiles:
+        return None
+    if not info.ready:
+        info = replace(info, ready=True, error=None)
+    return (info, profiles)
 
 
 def fetch_artificial_analysis_models(
@@ -442,33 +695,43 @@ def _profiles_from_aa_rankings(
     }
     seen_repos: set[str] = set()
     repo_by_model_key: dict[str, str] = {}
+    resolved_by_candidate: dict[int, _ResolvedAAModel | None] = {}
+    try:
+        from huggingface_hub import HfApi
+
+        shared_hf_api: Any | None = HfApi()
+    except Exception:
+        shared_hf_api = None
     executor = ThreadPoolExecutor(max_workers=_AA_RESOLUTION_WORKERS)
     try:
-        futures = [
+        futures = {
             executor.submit(
                 _resolve_aa_model,
                 candidate,
                 modal_gpu_catalog,
                 repo_by_model_key=repo_by_model_key,
-            )
+                hf_api=shared_hf_api,
+            ): candidate
             for candidate in deduped_window
-        ]
-        for future in futures:
-            resolved = future.result()
-            if resolved is None or not resolved.repo_id or resolved.repo_id in seen_repos:
-                continue
-            seen_repos.add(resolved.repo_id)
-            bucket_models = selected_by_bucket[resolved.size_bucket]
-            if len(bucket_models) >= model_limit:
-                continue
-            bucket_models.append(resolved)
-            if all(
-                len(selected_by_bucket[bucket]) >= model_limit
-                for bucket in _MODEL_SIZE_BUCKETS
-            ):
-                break
+        }
+        for completed in as_completed(futures):
+            resolved_by_candidate[id(futures[completed])] = completed.result()
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
+    for candidate in deduped_window:
+        resolved = resolved_by_candidate.get(id(candidate))
+        if resolved is None or not resolved.repo_id or resolved.repo_id in seen_repos:
+            continue
+        seen_repos.add(resolved.repo_id)
+        bucket_models = selected_by_bucket[resolved.size_bucket]
+        if len(bucket_models) >= model_limit:
+            continue
+        bucket_models.append(resolved)
+        if all(
+            len(selected_by_bucket[bucket]) >= model_limit
+            for bucket in _MODEL_SIZE_BUCKETS
+        ):
+            break
 
     profiles: list[QuickDeployProfile] = []
     for bucket in _MODEL_SIZE_BUCKETS:
@@ -508,6 +771,7 @@ def _resolve_aa_model(
     modal_gpu_catalog: Sequence[ModalGpuSpec],
     *,
     repo_by_model_key: dict[str, str] | None = None,
+    hf_api: Any | None = None,
 ) -> _ResolvedAAModel | None:
     model_key = _model_key(candidate.name) or _model_key(candidate.slug)
     if repo_by_model_key is not None and model_key in repo_by_model_key:
@@ -517,9 +781,12 @@ def _resolve_aa_model(
             repo_by_model_key[model_key],
         )
     try:
-        from huggingface_hub import HfApi
+        api = hf_api
+        if api is None:
+            from huggingface_hub import HfApi
 
-        repo_id = _find_unsloth_gguf_match(candidate, HfApi())
+            api = HfApi()
+        repo_id = _find_unsloth_gguf_match(candidate, api)
     except Exception:
         return None
     if repo_id is None:
@@ -536,13 +803,15 @@ def _build_resolved_aa_model(
     repo_id: str,
 ) -> _ResolvedAAModel | None:
     try:
-        metadata = fetch_gguf_quant_metadata(repo_id, inspect_mtp=True)
+        metadata = fetch_gguf_quant_metadata(repo_id)
     except Exception:
         return None
     size_bucket = _size_bucket_for_parameters(candidate.parameter_count_b)
     if size_bucket is None:
         size_bucket = _size_bucket_from_gguf_metadata(metadata)
     if size_bucket is None:
+        return None
+    if not evaluate_llamacpp_architecture(metadata.architecture).is_supported:
         return None
     model = ModelCandidate(repo_id=repo_id)
     profiles = _profiles_for_model(
@@ -554,6 +823,10 @@ def _build_resolved_aa_model(
     )
     if not profiles:
         return None
+    # MTP heads only affect the draft-model toggle on the confirm screen, so
+    # resolve them lazily after the catalog is already visible (see
+    # _attach_mtp_recommendations). Fetching 1 MiB range requests here would
+    # dominate cold-start latency.
     return _ResolvedAAModel(
         candidate=candidate,
         repo_id=repo_id,
@@ -575,17 +848,31 @@ def _build_trending_fallback_catalog(
             "were available"
         )
 
-    with ThreadPoolExecutor(max_workers=min(4, len(models))) as executor:
-        profile_groups = list(
-            executor.map(
-                lambda model: _profiles_for_model(model, modal_gpu_catalog),
-                models,
+    profiles_by_repo: dict[str, list[QuickDeployProfile]] = {}
+    with ThreadPoolExecutor(max_workers=min(8, len(models))) as executor:
+        metadata_futures = {
+            executor.submit(_safe_fetch_gguf_metadata, model.repo_id): model
+            for model in models
+        }
+        for metadata_future in as_completed(metadata_futures):
+            model = metadata_futures[metadata_future]
+            metadata = metadata_future.result()
+            if metadata is None:
+                continue
+            group = _profiles_for_model(
+                model,
+                modal_gpu_catalog,
+                metadata=metadata,
+                skip_context_lookup=True,
             )
-        )
+            if group:
+                profiles_by_repo[model.repo_id] = group
+    _attach_profile_context_lengths(profiles_by_repo, max_workers=8)
 
     profiles: list[QuickDeployProfile] = []
     selected_models = 0
-    for group in profile_groups:
+    for model in models:
+        group = profiles_by_repo.get(model.repo_id)
         if not group:
             continue
         profiles.extend(group)
@@ -888,18 +1175,25 @@ def _find_unsloth_gguf_match(
             return resolved_repo_id
 
     rows: list[Any] = []
-    for search in _hf_search_terms(candidate):
-        kwargs = {
-            "author": "unsloth",
-            "search": search,
-            "limit": 25,
-            "full": True,
-        }
-        try:
-            rows.extend(list(hf_api.list_models(**kwargs)))
-        except TypeError:
-            kwargs.pop("author")
-            rows.extend(list(hf_api.list_models(**kwargs)))
+    search_executor = ThreadPoolExecutor(max_workers=_HF_SEARCH_WORKERS)
+    try:
+        search_futures = [
+            search_executor.submit(
+                _list_unsloth_gguf_search,
+                hf_api,
+                search,
+            )
+            for search in _ranked_hf_search_terms(candidate)
+        ]
+        for search_future in as_completed(search_futures):
+            try:
+                rows.extend(search_future.result())
+            except Exception:
+                continue
+            if _has_strong_unsloth_gguf_match(candidate, rows):
+                break
+    finally:
+        search_executor.shutdown(wait=False, cancel_futures=True)
 
     scored: list[tuple[float, str]] = []
     seen: set[str] = set()
@@ -975,6 +1269,10 @@ def _canonical_unsloth_gguf_repo_ids(
 
 
 def _hf_search_terms(candidate: AAModelCandidate) -> list[str]:
+    return _ranked_hf_search_terms(candidate)
+
+
+def _ranked_hf_search_terms(candidate: AAModelCandidate) -> list[str]:
     values = [
         _repo_model_name(_repo_id_from_huggingface_url(candidate.huggingface_url) or ""),
         _strip_creator_prefix(candidate.name, candidate.creator_name),
@@ -990,6 +1288,53 @@ def _hf_search_terms(candidate: AAModelCandidate) -> list[str]:
             seen.add(key)
             terms.append(cleaned)
     return terms
+
+
+def _list_unsloth_gguf_search(hf_api: Any, search: str) -> list[Any]:
+    """Run one Unsloth-scoped Hub search with lightweight result rows.
+
+    ``limit=10`` matches the scorer: it only needs the best exact-token
+    hit, and the slimmer ``expand`` payload keeps each search to one small
+    response instead of 25 full model cards.
+    """
+
+    kwargs: dict[str, Any] = {
+        "author": "unsloth",
+        "search": search,
+        "limit": _HF_SEARCH_LIMIT,
+        "expand": ["siblings"],
+    }
+    try:
+        return list(hf_api.list_models(**kwargs))
+    except TypeError:
+        # Older huggingface_hub releases lack author/expand; retry unscoped.
+        fallback = {"search": search, "limit": _HF_SEARCH_LIMIT}
+        try:
+            return list(hf_api.list_models(**fallback))
+        except Exception:
+            return []
+    except Exception:
+        return []
+
+
+def _has_strong_unsloth_gguf_match(
+    candidate: AAModelCandidate,
+    rows: Sequence[Any],
+) -> bool:
+    """Return True once an exact-token Unsloth GGUF match is available."""
+
+    for row in rows:
+        repo_id = _repo_id_from_hf_row(row)
+        repo_key = repo_id.casefold()
+        if (
+            not repo_id
+            or not repo_key.startswith("unsloth/")
+            or not repo_key.endswith("-gguf")
+        ):
+            continue
+        if _aa_hf_match_score(candidate, repo_id) >= 100.0:
+            return True
+    return False
 
 
 def _repo_id_from_huggingface_url(value: str | None) -> str | None:
@@ -1077,6 +1422,108 @@ def _fetch_modal_gpu_catalog_or_fallback() -> tuple[tuple[ModalGpuSpec, ...], bo
     return (catalog, any(spec.price_per_hour_usd is not None for spec in catalog))
 
 
+def _safe_fetch_gguf_metadata(repo_id: str) -> GgufQuantMetadata | None:
+    """Fetch GGUF metadata without MTP inspection or context lookups."""
+
+    try:
+        return fetch_gguf_quant_metadata(repo_id)
+    except Exception:
+        return None
+
+
+def _attach_profile_context_lengths(
+    profiles_by_repo: dict[str, list[QuickDeployProfile]],
+    *,
+    max_workers: int = 8,
+) -> None:
+    """Fill per-repo context lengths after profiles are selectable.
+
+    Only upgrades rows still carrying the conservative default; AA rows
+    already know their context window and are left untouched.
+    """
+
+    pending = [
+        repo_id
+        for repo_id, group in profiles_by_repo.items()
+        if group and all(profile.max_context_tokens == DEFAULT_CONTEXT_TOKENS for profile in group)
+    ]
+    if not pending:
+        return
+    context_by_repo: dict[str, int | None] = {}
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(pending))) as executor:
+        futures = {
+            executor.submit(_safe_fetch_model_max_context, repo_id): repo_id
+            for repo_id in pending
+        }
+        for future in as_completed(futures):
+            context_by_repo[futures[future]] = future.result()
+    for repo_id, context_tokens in context_by_repo.items():
+        if context_tokens is None:
+            continue
+        upgraded_group: list[QuickDeployProfile] = []
+        for profile in profiles_by_repo[repo_id]:
+            server_args = _with_context_length(profile.server_args, context_tokens)
+            upgraded_group.append(
+                replace(
+                    profile,
+                    max_context_tokens=context_tokens,
+                    server_args=server_args,
+                )
+            )
+        profiles_by_repo[repo_id] = upgraded_group
+
+
+def _safe_fetch_model_max_context(repo_id: str) -> int | None:
+    try:
+        return fetch_model_max_context(repo_id)
+    except Exception:
+        return None
+
+
+def attach_quick_deploy_mtp_recommendations(
+    profiles: Sequence[QuickDeployProfile],
+    *,
+    max_workers: int = 8,
+) -> tuple[QuickDeployProfile, ...]:
+    """Attach MTP recommendations to catalog profiles without blocking.
+
+    Intended as a lazy second pass after the catalog is already active:
+    the 1 MiB GGUF range probes dominate cold-start latency but only feed
+    the speculative-decoding toggle on the confirm screen. Deploy-time
+    preflight revalidates MTP anyway, so a missing recommendation here is
+    always safe to recompute later.
+    """
+
+    pending = [profile for profile in profiles if profile.speculative_decoding is None]
+    if not pending:
+        return tuple(profiles)
+    metadata_by_repo: dict[str, GgufQuantMetadata | None] = {}
+    repos = list({profile.repo_id for profile in pending})
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(repos))) as executor:
+        futures = {
+            executor.submit(fetch_gguf_quant_metadata, repo_id, inspect_mtp=True): repo_id
+            for repo_id in repos
+        }
+        for future in as_completed(futures):
+            try:
+                metadata_by_repo[futures[future]] = future.result()
+            except Exception:
+                metadata_by_repo[futures[future]] = None
+    upgraded: list[QuickDeployProfile] = []
+    for profile in profiles:
+        if profile.speculative_decoding is not None:
+            upgraded.append(profile)
+            continue
+        metadata = metadata_by_repo.get(profile.repo_id)
+        recommendation = _mtp_recommendation(metadata) if metadata is not None else None
+        upgraded.append(
+            replace(profile, speculative_decoding=recommendation)
+            if recommendation is not None
+            else profile
+        )
+    return tuple(upgraded)
+
+
 def _profiles_for_model(
     model: ModelCandidate,
     modal_gpu_catalog: Sequence[ModalGpuSpec],
@@ -1084,21 +1531,21 @@ def _profiles_for_model(
     metadata: GgufQuantMetadata | None = None,
     aa_candidate: AAModelCandidate | None = None,
     size_bucket: ModelSizeBucket | None = None,
+    skip_context_lookup: bool = False,
 ) -> list[QuickDeployProfile]:
     if metadata is None:
         try:
-            metadata = fetch_gguf_quant_metadata(model.repo_id, inspect_mtp=True)
+            metadata = fetch_gguf_quant_metadata(model.repo_id)
         except Exception:
             return []
     compatibility = evaluate_llamacpp_architecture(metadata.architecture)
     if not compatibility.is_supported:
         return []
-    speculative_decoding = _mtp_recommendation(metadata)
     quants = _selected_quants(metadata)
     if not quants:
         return []
     max_context_tokens = aa_candidate.max_context_tokens if aa_candidate else None
-    if max_context_tokens is None:
+    if max_context_tokens is None and not skip_context_lookup:
         try:
             max_context_tokens = fetch_model_max_context(model.repo_id)
         except Exception:
@@ -1120,7 +1567,7 @@ def _profiles_for_model(
                 aa_candidate=aa_candidate,
                 size_bucket=size_bucket,
                 llamacpp_runtime_id=compatibility.runtime_id,
-                speculative_decoding=speculative_decoding,
+                speculative_decoding=None,
             )
         )
     return profiles
@@ -1160,7 +1607,7 @@ def _profiles_for_quant(
     aa_candidate: AAModelCandidate | None = None,
     size_bucket: ModelSizeBucket | None = None,
     llamacpp_runtime_id: str,
-    speculative_decoding: SpeculativeDecodingConfig | None,
+    speculative_decoding: SpeculativeDecodingConfig | None = None,
 ) -> list[QuickDeployProfile]:
     required_vram_gb = _required_vram_for_quant(metadata, quant)
     if required_vram_gb is None:
@@ -1315,8 +1762,29 @@ def _select_gpu_shape(
 
 
 def _available_gpu_types(modal_gpu_catalog: Sequence[ModalGpuSpec]) -> list[str]:
-    values = [entry.value.strip() for entry in modal_gpu_catalog if entry.value.strip()]
-    return values or list(_GPU_MEMORY_GB)
+    """Return catalog GPU shapes that can actually back a priced profile.
+
+    Entries without a known VRAM size (e.g. future ``B300`` shapes) or
+    without a usable hourly price (e.g. unpriced ``H100!``/``H200`` rows)
+    are skipped: offering them produces profiles whose cost math silently
+    falls back to RTX pricing and whose fulfillment lands on ``price n/a``
+    placements.
+    """
+    prices = _live_price_by_gpu(modal_gpu_catalog)
+    values = [
+        entry.value.strip()
+        for entry in modal_gpu_catalog
+        if entry.value.strip()
+        and _GPU_MEMORY_GB.get(entry.value.strip()) is not None
+        and (prices.get(entry.value.strip()) or 0) > 0
+    ]
+    if values:
+        return values
+    return [
+        value
+        for value in _GPU_MEMORY_GB
+        if value in {"T4", "L4", "A100", "L40S", "RTX-PRO-6000", "H100", "H200", "B200"}
+    ]
 
 
 def _price_by_gpu(modal_gpu_catalog: Sequence[ModalGpuSpec]) -> dict[str, float]:
@@ -1325,6 +1793,23 @@ def _price_by_gpu(modal_gpu_catalog: Sequence[ModalGpuSpec]) -> dict[str, float]
         if entry.price_per_hour_usd is not None and entry.price_per_hour_usd > 0:
             prices[entry.value] = entry.price_per_hour_usd
     return prices
+
+
+def _live_price_by_gpu(modal_gpu_catalog: Sequence[ModalGpuSpec]) -> dict[str, float]:
+    """Return only catalog-reported prices, without static fallbacks.
+
+    Used to decide which GPU shapes are genuinely orderable right now. The
+    fallback table in :func:`_price_by_gpu` keeps cost math working for
+    shapes Modal omits, but it must not resurrect shapes Modal explicitly
+    lists without a price.
+    """
+    return {
+        entry.value.strip(): entry.price_per_hour_usd
+        for entry in modal_gpu_catalog
+        if entry.value.strip()
+        and entry.price_per_hour_usd is not None
+        and entry.price_per_hour_usd > 0
+    }
 
 
 def _required_vram_for_quant(
@@ -1342,6 +1827,17 @@ def _display_name(repo_id: str) -> str:
     name = repo_id.split("/", 1)[-1]
     name = re.sub(r"(?i)-gguf$", "", name)
     return re.sub(r"[-_]+", " ", name).strip() or repo_id
+
+
+def _with_context_length(server_args: Sequence[str], context_tokens: int) -> tuple[str, ...]:
+    """Rewrite the ``--ctx-size`` pair so it matches an upgraded context length."""
+
+    args = list(server_args)
+    for index, token in enumerate(args[:-1]):
+        if token == "--ctx-size":
+            args[index + 1] = str(context_tokens)
+            return tuple(args)
+    return tuple([*args, "--ctx-size", str(context_tokens)])
 
 
 def _quant_key(value: str) -> str:

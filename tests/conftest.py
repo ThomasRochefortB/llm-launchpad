@@ -117,6 +117,39 @@ def _isolate_tui_local_caches(
 
 
 @pytest.fixture(autouse=True)
+def _isolate_quick_deploy_catalog_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep catalog warm-start snapshots out of the real user settings dir.
+
+    ``quick_deploy._load_quick_deploy_catalog`` imports
+    ``quick_deploy_refresh.load_cached_quick_deploy_catalog`` lazily, so
+    stub the loader at its definition site plus the already-imported
+    reference inside ``quick_deploy``'s module namespace.
+    """
+
+    from llm_launchpad.core import quick_deploy as quick_deploy_module
+    from llm_launchpad.core import quick_deploy_refresh as quick_deploy_refresh_module
+
+    quick_deploy_module._reset_quick_deploy_catalog_cache()
+
+    def _no_warm_catalog(*_args: object, **_kwargs: object) -> None:
+        return None
+
+    monkeypatch.setattr(
+        quick_deploy_refresh_module,
+        "load_cached_quick_deploy_catalog",
+        _no_warm_catalog,
+    )
+    monkeypatch.setattr(
+        quick_deploy_module,
+        "load_cached_quick_deploy_catalog",
+        _no_warm_catalog,
+        raising=False,
+    )
+    yield
+    quick_deploy_module._reset_quick_deploy_catalog_cache()
+
+
+@pytest.fixture(autouse=True)
 def _isolate_prime_local_caches(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path_factory: pytest.TempPathFactory,
