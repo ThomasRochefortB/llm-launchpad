@@ -107,16 +107,6 @@ def _stub_orchestrator_reasoning_discovery(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 @pytest.fixture(autouse=True)
-def _isolate_tui_local_caches(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Keep TUI connection/storage tests out of the real user settings directory."""
-
-    monkeypatch.setattr("llm_launchpad.tui.app.SETTINGS_DIR", tmp_path / "tui-settings")
-
-
-@pytest.fixture(autouse=True)
 def _isolate_quick_deploy_catalog_cache(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path_factory: pytest.TempPathFactory,
@@ -161,38 +151,59 @@ def _isolate_quick_deploy_catalog_cache(
     quick_deploy_module._reset_quick_deploy_catalog_cache()
 
 
-@pytest.fixture(autouse=True)
-def _isolate_prime_local_caches(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path_factory: pytest.TempPathFactory,
-) -> None:
-    """Keep Prime disk/frpc caches out of the real ~/.llm_launchpad directory."""
+def _discover_settings_paths() -> tuple[tuple[str, str, Path], ...]:
+    """Find every module attribute that resolves into the real settings dir.
 
-    root = tmp_path_factory.mktemp("prime-launchpad")
-    monkeypatch.setattr(
-        "llm_launchpad.core.prime_disks.PRIME_CACHE_DISKS_PATH",
-        root / "disks.json",
-    )
-    monkeypatch.setattr(
-        "llm_launchpad.core.prime_frpc.PRIME_FRPC_CACHE_DIR",
-        root / "frpc",
-    )
-
-
-@pytest.fixture(autouse=True)
-def _isolate_serving_certificate_cache(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path_factory: pytest.TempPathFactory,
-) -> None:
-    """Keep planner placement assessments independent of real attestations.
-
-    ``assess_memory_placement`` consults the certificate cache to promote or
-    reject a topology. Without isolation, a developer machine that has deployed
-    before would resolve genuine certificates and change placement outcomes.
+    Constants like ``CONNECTIONS_PATH`` are computed from ``SETTINGS_DIR`` at
+    import time, so redirecting ``SETTINGS_DIR`` alone comes too late. Rather
+    than maintain a hand-written list -- which was already incomplete the first
+    time it was written -- the modules are walked and every offending path is
+    rebased. New caches are covered automatically.
     """
 
-    root = tmp_path_factory.mktemp("serving-certificates")
-    monkeypatch.setattr(
-        "llm_launchpad.core.llamacpp_planner.CERTIFICATE_CACHE_PATH",
-        root / "serving_certificates.json",
-    )
+    import importlib
+    import pkgutil
+
+    import llm_launchpad
+    from llm_launchpad.core.config import SETTINGS_DIR
+
+    found: list[tuple[str, str, Path]] = []
+    for info in pkgutil.walk_packages(
+        llm_launchpad.__path__, prefix=f"{llm_launchpad.__name__}."
+    ):
+        try:
+            module = importlib.import_module(info.name)
+        except Exception:
+            continue
+        for name, value in vars(module).items():
+            if not isinstance(value, Path):
+                continue
+            if value == SETTINGS_DIR:
+                found.append((info.name, name, Path(".")))
+            elif SETTINGS_DIR in value.parents:
+                found.append((info.name, name, value.relative_to(SETTINGS_DIR)))
+    return tuple(found)
+
+
+_SETTINGS_PATHS = _discover_settings_paths()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_user_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Path:
+    """Redirect every ~/.llm_launchpad path the suite can reach.
+
+    These caches hold real user state: OpenCode registrations, deployment
+    connection summaries, Artificial Analysis credentials, saved settings, and
+    Prime SSH key material. A test that writes one edits the installed product,
+    and a test that reads one inherits whatever the developer's machine happens
+    to contain. Both have already happened, so isolation is enforced globally
+    and verified by ``test_settings_isolation``.
+    """
+
+    root = tmp_path_factory.mktemp("launchpad-settings")
+    for module_name, attribute, relative in _SETTINGS_PATHS:
+        monkeypatch.setattr(f"{module_name}.{attribute}", root / relative)
+    return root

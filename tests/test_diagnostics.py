@@ -94,8 +94,14 @@ class DiagnosticsSetupTests(unittest.TestCase):
             self.assertIn("ValueError: boom", content)
             self.assertIn("Traceback", content)
 
-    def test_default_log_dir_under_home(self) -> None:
-        self.assertEqual(diagnostics.LOG_DIR, Path.home() / ".llm_launchpad" / "logs")
+    def test_default_log_dir_sits_under_the_settings_dir(self) -> None:
+        # Asserted relative to SETTINGS_DIR rather than to an absolute home
+        # path: the suite redirects the settings root so no test can write the
+        # real one, and where that root lives is config's invariant, not this
+        # module's. See tests/test_settings_isolation.py.
+        from llm_launchpad.core.config import SETTINGS_DIR
+
+        self.assertEqual(diagnostics.LOG_DIR, SETTINGS_DIR / "logs")
         self.assertEqual(diagnostics.LOG_FILE, diagnostics.LOG_DIR / "llm_launchpad.log")
 
     def test_setup_handles_mkdir_failure(self) -> None:
