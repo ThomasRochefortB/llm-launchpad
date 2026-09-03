@@ -723,6 +723,26 @@ def _load_opencode_config(path: Path) -> dict[str, Any]:
     return payload
 
 
+def _atomic_write(path: Path, contents: str) -> None:
+    """Replace a file in one step so a reader never sees a partial config.
+
+    ``Path.write_text`` truncates and then writes, so an interrupted call, or
+    two syncs running at once, can leave the tail of the longer previous
+    version behind the shorter new one. That produces trailing bytes after the
+    closing brace and OpenCode refuses to start. Writing to a sibling and
+    renaming makes the swap atomic, matching how the catalog and certificate
+    caches are written.
+    """
+
+    temporary_path = path.with_suffix(f"{path.suffix}.tmp")
+    temporary_path.write_text(contents, encoding="utf-8")
+    try:
+        os.chmod(temporary_path, 0o600)
+    except OSError:
+        pass
+    temporary_path.replace(path)
+
+
 def _write_opencode_config(path: Path, payload: dict[str, Any]) -> None:
     serialized = json.dumps(payload, indent=2) + "\n"
     if path.exists():
@@ -737,11 +757,7 @@ def _write_opencode_config(path: Path, payload: dict[str, Any]) -> None:
         except OSError:
             pass
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(serialized, encoding="utf-8")
-    try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+    _atomic_write(path, serialized)
 
 
 def _load_registry(
@@ -768,7 +784,7 @@ def _load_registry(
 def _write_registry(path: Path, entries: dict[str, dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"entries": entries}
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    _atomic_write(path, json.dumps(payload, indent=2) + "\n")
 
 
 def _bootstrap_registry_from_config(config: dict[str, Any]) -> dict[str, dict[str, Any]]:

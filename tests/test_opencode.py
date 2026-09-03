@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import tempfile
+from tempfile import TemporaryDirectory
+from typing import Any
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -677,6 +679,61 @@ class OpenCodeSyncTests(unittest.TestCase):
             payload = json.loads(config_path.read_text(encoding="utf-8"))
             self.assertTrue(result.changed)
             self.assertEqual(payload["provider"]["llm-launchpad-vllm-qwen3"]["name"], "llm-launchpad")
+
+
+
+class AtomicConfigWriteTests(unittest.TestCase):
+    """A partially written config stops OpenCode from starting at all."""
+
+    def test_a_shorter_config_leaves_no_trailing_bytes(self) -> None:
+        from llm_launchpad.core.opencode import _write_opencode_config
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "opencode.json"
+            path.write_text(
+                json.dumps({"provider": {f"p{i}": {} for i in range(40)}}, indent=2)
+                + "\n",
+                encoding="utf-8",
+            )
+            long_size = path.stat().st_size
+
+            _write_opencode_config(path, {"provider": {}})
+
+            written = path.read_text(encoding="utf-8")
+            self.assertLess(len(written), long_size)
+            # The failure this guards against parses as valid JSON followed by
+            # the tail of the previous, longer file.
+            self.assertEqual(json.loads(written), {"provider": {}})
+
+    def test_no_temporary_file_is_left_behind(self) -> None:
+        from llm_launchpad.core.opencode import _write_opencode_config
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "opencode.json"
+            _write_opencode_config(path, {"provider": {}})
+
+            self.assertEqual(
+                sorted(child.name for child in Path(directory).iterdir()),
+                ["opencode.json"],
+            )
+
+    def test_the_replacement_is_a_rename_not_a_truncating_write(self) -> None:
+        from llm_launchpad.core import opencode as opencode_module
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "opencode.json"
+            path.write_text('{"provider": {"old": {}}}\n', encoding="utf-8")
+            observed: list[Path] = []
+            original = Path.replace
+
+            def record(self: Path, target: Any) -> Any:
+                observed.append(Path(target))
+                return original(self, target)
+
+            with patch.object(Path, "replace", record):
+                opencode_module._write_opencode_config(path, {"provider": {}})
+
+            self.assertIn(path, observed)
 
 
 if __name__ == "__main__":
