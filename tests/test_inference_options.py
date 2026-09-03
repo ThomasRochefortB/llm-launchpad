@@ -498,6 +498,27 @@ class ProviderAdapterTests(unittest.TestCase):
         self.assertEqual(offers_by_recipe["large"], {"h100"})
         self.assertNotIn("cpu", {plan.quote.provider_reference for plan in plans})
 
+    def test_prime_availability_handles_human_readable_stock_statuses(self) -> None:
+        from llm_launchpad.core.compute_availability import (
+            _prime_availability as aggregate_availability,
+        )
+        from llm_launchpad.core.inference_options import (
+            _prime_availability as quote_availability,
+        )
+
+        for status in ("Out of Stock", "Out_of_Stock", "In Stock", "  Available  "):
+            with self.subTest(stock_status=status):
+                self.assertEqual(
+                    quote_availability(status),
+                    aggregate_availability(status),
+                )
+        self.assertEqual(
+            quote_availability("Out of Stock"), QuoteAvailability.UNAVAILABLE
+        )
+        self.assertEqual(
+            quote_availability("In Stock"), QuoteAvailability.AVAILABLE
+        )
+
     def test_billing_models_normalize_idle_time_differently(self) -> None:
         workload = WorkloadProfile(paid_hours_per_day=8, utilization=0.25)
         common = {

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from typing import Iterable, Protocol, Sequence
+import re
 
 from ..protocol.enums import BackendType, BillingModel, ComputeProvider, QuoteAvailability
 from ..protocol.models import (
@@ -300,9 +301,17 @@ def _plan_sort_key(plan: InferencePlan) -> tuple[int, int, float, str]:
 
 
 def _prime_availability(stock_status: str | None) -> QuoteAvailability:
-    value = (stock_status or "").strip().casefold()
+    value = re.sub(r"[^a-z0-9]+", "_", (stock_status or "").casefold()).strip("_")
     if value in {"available", "in_stock", "instock"}:
         return QuoteAvailability.AVAILABLE
-    if value in {"unavailable", "out_of_stock", "outofstock"}:
+    if value in {
+        "unavailable",
+        "out_of_stock",
+        "outofstock",
+        "sold_out",
+        "soldout",
+        "not_available",
+        "notavailable",
+    }:
         return QuoteAvailability.UNAVAILABLE
     return QuoteAvailability.UNKNOWN
