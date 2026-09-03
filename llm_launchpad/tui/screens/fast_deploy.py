@@ -17,6 +17,7 @@ from ...core.compute_availability import (
     load_compute_availability,
     plans_for_compute_profile,
 )
+from ...core.llamacpp_planner import assessment_score
 from ...core.deploy_log_summary import SUMMARY_SPINNER_FRAMES
 from ...core.quick_deploy import (
     QuickDeployCatalogInfo,
@@ -356,17 +357,54 @@ def _infra_detail(row: _InfraRow) -> str:
     price = _format_price(quote.price_per_hour_usd, estimate=quote.is_estimate)
     monthly = _monthly_label(row.plan.estimated_monthly_cost_usd)
     region = (quote.region or "").strip() or "provider-managed regions"
+    performance = ""
+    if row.plan.assessment is not None:
+        single = max(
+            (
+                point.output_tokens_per_second or 0.0
+                for point in row.plan.assessment.performance
+                if point.concurrency == 1
+            ),
+            default=0.0,
+        )
+        aggregate = max(
+            (
+                point.aggregate_output_tokens_per_second or 0.0
+                for point in row.plan.assessment.performance
+            ),
+            default=0.0,
+        )
+        if single > 0:
+            evidence = (
+                "measured"
+                if any(point.measured for point in row.plan.assessment.performance)
+                else "estimated"
+            )
+            performance = (
+                f"\n[dim]~{single:.0f} tok/s single · "
+                f"~{aggregate:.0f} tok/s aggregate · {evidence}[/dim]"
+            )
     return (
         f"[bold]{_escape_markup(gpu)}[/bold] x{quote.gpu_count}  "
         f"{_escape_markup(quote.provider.display_name)} · {_quant_markup(row.profile)}\n"
         f"[dim]{price} · {monthly} · {region} · {_availability_label(row.configuration)}[/dim]"
+        f"{performance}"
     )
 
 
 def _infra_sort_key(row: _InfraRow) -> tuple[int, float, str, int]:
     price = row.plan.quote.price_per_hour_usd
+    requirements = row.plan.recipe.serving_requirements
+    if row.plan.assessment is not None and requirements is not None:
+        score = assessment_score(row.plan.assessment, requirements.objective)
+        return (
+            0,
+            -score,
+            row.plan.quote.gpu_type.casefold(),
+            row.plan.quote.gpu_count,
+        )
     return (
-        1 if price is None else 0,
+        2 if price is None else 1,
         price if price is not None else float("inf"),
         row.plan.quote.gpu_type.casefold(),
         row.plan.quote.gpu_count,
@@ -665,9 +703,26 @@ class FastDeployScreen(CopyEnabledScreen):
         if self._phase == "infra":
             row = self._infra_rows.get(option_id)
             if row is not None:
+                alternatives: list[InferencePlan] = []
+                seen_quotes: set[str] = set()
+                for candidate in self._infra_rows.values():
+                    if candidate.plan.recipe.id != row.plan.recipe.id:
+                        continue
+                    for plan in (candidate.plan, *candidate.alternative_plans):
+                        if plan.quote.id in seen_quotes:
+                            continue
+                        seen_quotes.add(plan.quote.id)
+                        alternatives.append(plan)
+                alternatives.sort(
+                    key=lambda plan: (
+                        plan.quote.id != row.plan.quote.id,
+                        plan.quote.price_per_hour_usd is None,
+                        plan.quote.price_per_hour_usd or float("inf"),
+                    )
+                )
                 self.app.push_quick_deploy(  # type: ignore[attr-defined]
                     row.plan,
-                    alternative_plans=row.alternative_plans,
+                    alternative_plans=tuple(alternatives),
                 )
             return
         profile = self._fallback_profiles.get(option_id)
@@ -818,7 +873,7 @@ class FastDeployScreen(CopyEnabledScreen):
         status = (
             f"[bold]{len(rows)} infrastructure option"
             f"{'s' if len(rows) != 1 else ''}[/bold] "
-            "[dim]cheapest first · updated just now[/dim]"
+            "[dim]best full-context throughput first · updated just now[/dim]"
         )
         if self._gpu_filter not in {"", "any"}:
             status += f" [dim]· GPU {_escape_markup(self._gpu_filter)}[/dim]"

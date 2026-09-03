@@ -471,7 +471,7 @@ def _deploy_and_maybe_warmup(
         elif isinstance(event, EndpointAvailableEvent):
             deployed_endpoint = event.endpoint
             deployed_web_url = event.endpoint.web_url or deployed_web_url
-            if deployed_web_url:
+            if deployed_web_url and not do_warmup:
                 save_connection(config, event.endpoint)
                 _sync_opencode_cli(
                     target_app_name=config.app_name,
@@ -499,7 +499,7 @@ def _deploy_and_maybe_warmup(
         _print_event(event, summarizer=summarizer)
         _raise_on_failed_completion(event)
 
-    if deploy_succeeded and deployed_endpoint and deployed_web_url:
+    if deploy_succeeded and deployed_endpoint and deployed_web_url and not do_warmup:
         # Persist provider credentials immediately. A later warmup failure must
         # not strand a live, billable pod without its generated bearer key.
         save_connection(config, deployed_endpoint)
@@ -517,6 +517,15 @@ def _deploy_and_maybe_warmup(
         if not url:
             typer.echo("Error: the provider did not return a usable endpoint URL.", err=True)
             raise typer.Exit(code=1)
+        certification_kwargs = (
+            {
+                "serving_requirements": config.serving_requirements,
+                "placement_assessment": config.placement_assessment,
+                "runtime_id": config.llamacpp_runtime_id,
+            }
+            if config.serving_requirements is not None
+            else {}
+        )
         warmup_events = (
             orch.warmup(
                 backend,
@@ -525,6 +534,7 @@ def _deploy_and_maybe_warmup(
                 tail_logs,
                 app_name=config.app_name,
                 served_model_name=config.served_model_name,
+                **certification_kwargs,
             )
             if config.provider == ComputeProvider.MODAL
             else orch.warmup(
@@ -537,6 +547,7 @@ def _deploy_and_maybe_warmup(
                 provider=config.provider,
                 api_key=config.endpoint_api_key,
                 pod_id=deployed_endpoint.app_id if deployed_endpoint else None,
+                **certification_kwargs,
             )
         )
         for event in warmup_events:
@@ -551,6 +562,11 @@ def _deploy_and_maybe_warmup(
                     maybe_url = event.data.get("url")
                     if isinstance(maybe_url, str) and maybe_url.strip():
                         final_sync_url = maybe_url.strip()
+                    attestation = event.data.get("attestation")
+                    if attestation is not None:
+                        config.runtime_attestation = attestation
+                        if deployed_endpoint is not None:
+                            deployed_endpoint.runtime_attestation = attestation
             _print_event(event, summarizer=summarizer)
             if (
                 isinstance(event, OperationCompleteEvent)

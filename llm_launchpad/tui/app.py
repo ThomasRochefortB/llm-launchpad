@@ -49,12 +49,13 @@ from ..core.opencode import (
     visible_launchpad_rows,
 )
 from ..core.orchestrator import Orchestrator
-from ..protocol.enums import BackendType, ComputeProvider, OperationType
+from ..protocol.enums import BackendType, ComputeProvider, DeploymentState, OperationType
 from ..protocol.events import (
     EndpointAvailableEvent,
     ErrorEvent,
     LogEvent,
     OperationCompleteEvent,
+    StateChangeEvent,
 )
 from ..protocol.models import BenchmarkConfig
 from ..protocol.models import EndpointInfo
@@ -552,8 +553,9 @@ class TuiApp(App):
                 if event.endpoint.web_url:
                     deployed_web_url = event.endpoint.web_url
                     deployed_web_url_priority = max(deployed_web_url_priority, 2)
-                    _emit_connection_summary(event.endpoint.web_url)
-                    _sync_now(event.endpoint.web_url)
+                    if not will_run_warmup:
+                        _emit_connection_summary(event.endpoint.web_url)
+                        _sync_now(event.endpoint.web_url)
             elif isinstance(event, OperationCompleteEvent):
                 deploy_succeeded = event.success
                 if event.operation == OperationType.DEPLOY:
@@ -561,7 +563,7 @@ class TuiApp(App):
                 if event.success and isinstance(event.data, EndpointInfo):
                     deployed_endpoint = event.data
                     deployed_web_url = event.data.web_url or deployed_web_url
-                    if event.data.web_url:
+                    if event.data.web_url and not will_run_warmup:
                         self._cache_deploy_connection_summary(
                             config, event.data.web_url, event.data
                         )
@@ -603,6 +605,24 @@ class TuiApp(App):
                         _sync_now(url)
             _dispatch_event(monitor, event)
 
+        if not deploy_succeeded and config.fallback_configs:
+            fallbacks = list(config.fallback_configs)
+            next_config = fallbacks.pop(0)
+            next_config.fallback_configs = tuple(fallbacks)
+            _dispatch_event(
+                monitor,
+                LogEvent(
+                    line=(
+                        "Deployment could not start; trying an equivalent placement "
+                        "at or below the approved hourly price."
+                    ),
+                    operation=OperationType.DEPLOY,
+                    is_milestone=True,
+                ),
+            )
+            self._run_deploy(next_config, monitor)
+            return
+
         # Warmup if requested and deploy was successful
         if config.do_warmup and config.do_deploy and deploy_succeeded:
             target_app_name = config.app_name or legacy_app_name(config.backend)
@@ -616,6 +636,15 @@ class TuiApp(App):
             if not url:
                 _dispatch_event(monitor, ErrorEvent(message="Provider returned no endpoint URL."))
                 return
+            certification_kwargs = (
+                {
+                    "serving_requirements": config.serving_requirements,
+                    "placement_assessment": config.placement_assessment,
+                    "runtime_id": config.llamacpp_runtime_id,
+                }
+                if config.serving_requirements is not None
+                else {}
+            )
             warmup_events = (
                 self._orchestrator.warmup(
                     backend=config.backend,
@@ -624,6 +653,7 @@ class TuiApp(App):
                     tail_logs=True,
                     app_name=target_app_name,
                     served_model_name=config.served_model_name,
+                    **certification_kwargs,
                 )
                 if config.provider == ComputeProvider.MODAL
                 else self._orchestrator.warmup(
@@ -636,6 +666,7 @@ class TuiApp(App):
                     provider=config.provider,
                     api_key=config.endpoint_api_key,
                     pod_id=deployed_endpoint.app_id if deployed_endpoint else None,
+                    **certification_kwargs,
                 )
             )
             for event in warmup_events:
@@ -649,6 +680,19 @@ class TuiApp(App):
                         maybe_url = event.data.get("url")
                         if isinstance(maybe_url, str) and maybe_url.strip():
                             completed_url = maybe_url.strip()
+                        attestation = event.data.get("attestation")
+                        if attestation is not None:
+                            config.runtime_attestation = attestation
+                            if deployed_endpoint is not None:
+                                deployed_endpoint.runtime_attestation = attestation
+                    _dispatch_event(
+                        monitor,
+                        StateChangeEvent(
+                            current=DeploymentState.PUBLISHING,
+                            operation=OperationType.WARMUP,
+                            detail="Publishing verified endpoint",
+                        ),
+                    )
                     _emit_connection_summary(completed_url)
                     if not opencode_synced or completed_url != url:
                         _sync_now(completed_url)
@@ -656,35 +700,46 @@ class TuiApp(App):
                     isinstance(event, OperationCompleteEvent)
                     and not event.success
                     and event.operation == OperationType.WARMUP
-                    and config.provider == ComputeProvider.PRIME
-                    and deployed_endpoint is not None
-                    and not prime_provider_options(config).keep_failed_resource
                 ):
-                    _dispatch_event(
-                        monitor,
-                        LogEvent(
-                            line=(
-                                "Warmup failed; terminating Prime pod "
-                                f"{deployed_endpoint.app_id}."
-                            )
-                        ),
+                    keep_failed_prime = (
+                        config.provider == ComputeProvider.PRIME
+                        and prime_provider_options(config).keep_failed_resource
                     )
-                    for cleanup_event in self._orchestrator.stop_app(
-                        config.backend,
-                        app_name=target_app_name,
-                        app_id=deployed_endpoint.app_id,
-                        provider=ComputeProvider.PRIME,
-                    ):
-                        _dispatch_event(monitor, cleanup_event)
-                    self._deploy_connection_cache.pop(target_app_name, None)
-                    self._persist_deploy_connection_cache()
-                    live_rows, prune_providers = self._visible_rows_and_prune_scope()
-                    self._sync_opencode(
-                        current_rows=live_rows,
-                        remove_app_names=[target_app_name],
-                        prune_providers=prune_providers,
-                        monitor=monitor,
-                    )
+                    if not keep_failed_prime:
+                        resource_label = (
+                            f"Prime pod {deployed_endpoint.app_id}"
+                            if config.provider == ComputeProvider.PRIME
+                            and deployed_endpoint is not None
+                            else f"failed {config.provider.display_name} deployment"
+                        )
+                        _dispatch_event(
+                            monitor,
+                            LogEvent(line=f"Certification failed; cleaning up {resource_label}."),
+                        )
+                        for cleanup_event in self._orchestrator.stop_app(
+                            config.backend,
+                            app_name=target_app_name,
+                            app_id=(deployed_endpoint.app_id if deployed_endpoint else None),
+                            provider=config.provider,
+                        ):
+                            _dispatch_event(monitor, cleanup_event)
+                    fallbacks = list(config.fallback_configs)
+                    if fallbacks:
+                        next_config = fallbacks.pop(0)
+                        next_config.fallback_configs = tuple(fallbacks)
+                        _dispatch_event(
+                            monitor,
+                            LogEvent(
+                                line=(
+                                    "Trying an equivalent certified placement at or below "
+                                    "the approved hourly price."
+                                ),
+                                operation=OperationType.DEPLOY,
+                                is_milestone=True,
+                            ),
+                        )
+                        self._run_deploy(next_config, monitor)
+                        return
                 _dispatch_event(monitor, event)
 
     # ------------------------------------------------------------------

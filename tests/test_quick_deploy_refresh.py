@@ -12,6 +12,7 @@ from unittest.mock import patch
 from llm_launchpad.core.gguf_metadata import GgufMtpCapability, GgufMtpStatus
 from llm_launchpad.core.hf_models import GgufQuantMetadata, ModelCandidate
 from llm_launchpad.core.modal_gpu import ModalGpuSpec
+from llm_launchpad.core.quick_deploy import QuickDeployProfile
 from llm_launchpad.core.quick_deploy_refresh import (
     AAModelCandidate,
     QUICK_DEPLOY_CATALOG_CACHE_SCHEMA_VERSION,
@@ -21,7 +22,11 @@ from llm_launchpad.core.quick_deploy_refresh import (
     _load_aa_rankings,
     _quick_deploy_profile_from_dict,
     _quick_deploy_profile_to_dict,
+    _fetch_serving_metadata,
+    _is_transient_hub_error,
     _read_quick_deploy_catalog_cache,
+    _retained_catalog_for,
+    _write_quick_deploy_catalog_cache,
     _write_aa_cache,
     attach_quick_deploy_mtp_recommendations,
     build_live_quick_deploy_catalog,
@@ -154,8 +159,12 @@ class QuickDeployRefreshTests(unittest.TestCase):
             and profile.resource_tier == "cheap"
         )
         self.assertEqual(compact_q4.gpu_type, "L4")
-        self.assertEqual(compact_q4.gpu_count, 2)
-        self.assertEqual(compact_q4.approx_cost_per_hour_usd, 1.0)
+        # Fast Deploy sizes the full KV cache and compute workspace, not only
+        # the GGUF weight file, so this 30 GB profile needs three 24 GB L4s.
+        self.assertEqual(compact_q4.gpu_count, 3)
+        self.assertIsNotNone(compact_q4.memory_estimate)
+        self.assertGreater(compact_q4.required_vram_gb or 0, 30.0)
+        self.assertEqual(compact_q4.approx_cost_per_hour_usd, 1.5)
         self.assertEqual(compact_q4.aa_coding_score, 95)
         self.assertEqual(compact_q4.aa_intelligence_score, 95)
 
@@ -776,6 +785,7 @@ class QuickDeployRefreshTests(unittest.TestCase):
         fetch_metadata.assert_called_once_with(
             "unsloth/Open-Model-One-8B-GGUF",
             inspect_mtp=True,
+            inspect_serving=True,
         )
         self.assertIsNone(profile.speculative_decoding)
         self.assertIsNotNone(upgraded[0].speculative_decoding)
@@ -843,6 +853,132 @@ class QuickDeployRefreshTests(unittest.TestCase):
                 return_value=cache_path,
             ):
                 self.assertEqual(load_cached_quick_deploy_catalog(), cached)
+
+
+class _HubStatusError(Exception):
+    def __init__(self, status_code: int) -> None:
+        super().__init__(f"HTTP {status_code}")
+        self.response = SimpleNamespace(status_code=status_code)
+
+
+def _catalog_profile(profile_id: str) -> QuickDeployProfile:
+    return QuickDeployProfile(
+        id=profile_id,
+        display_name=f"Model {profile_id}",
+        repo_id=f"org/{profile_id}-GGUF",
+        quant="Q4_K_M",
+        gpu_type="L4",
+        gpu_count=1,
+        profile_label="Curated",
+        approx_cost_per_hour_usd=0.8,
+        max_context_tokens=131_072,
+        instance_slug_hint=profile_id,
+        summary="Test profile.",
+        server_args=("--ctx-size", "131072"),
+    )
+
+
+class TransientHubFailureTests(unittest.TestCase):
+    """A rate limit must not be recorded as a model that does not exist."""
+
+    def test_rate_limits_and_server_errors_are_transient(self) -> None:
+        self.assertTrue(_is_transient_hub_error(_HubStatusError(429)))
+        self.assertTrue(_is_transient_hub_error(_HubStatusError(503)))
+        self.assertTrue(_is_transient_hub_error(TimeoutError("timed out")))
+        self.assertTrue(_is_transient_hub_error(Exception("Connection reset")))
+
+    def test_missing_repository_is_not_transient(self) -> None:
+        self.assertFalse(_is_transient_hub_error(_HubStatusError(404)))
+        self.assertFalse(_is_transient_hub_error(ValueError("bad quant")))
+
+    def test_metadata_fetch_retries_a_rate_limit_then_succeeds(self) -> None:
+        metadata = GgufQuantMetadata(quantizations=["Q4_K_M"], vram_gb_by_quant={})
+        calls: list[int] = []
+
+        def flaky(repo_id: str, **kwargs: Any) -> GgufQuantMetadata:
+            calls.append(1)
+            if len(calls) < 3:
+                raise _HubStatusError(429)
+            return metadata
+
+        with patch(
+            "llm_launchpad.core.quick_deploy_refresh.fetch_gguf_quant_metadata",
+            side_effect=flaky,
+        ), patch("llm_launchpad.core.quick_deploy_refresh.time.sleep"):
+            self.assertIs(_fetch_serving_metadata("org/model"), metadata)
+
+        self.assertEqual(len(calls), 3)
+
+    def test_metadata_fetch_does_not_retry_a_permanent_failure(self) -> None:
+        calls: list[int] = []
+
+        def missing(repo_id: str, **kwargs: Any) -> GgufQuantMetadata:
+            calls.append(1)
+            raise _HubStatusError(404)
+
+        with patch(
+            "llm_launchpad.core.quick_deploy_refresh.fetch_gguf_quant_metadata",
+            side_effect=missing,
+        ), patch("llm_launchpad.core.quick_deploy_refresh.time.sleep"):
+            with self.assertRaises(_HubStatusError):
+                _fetch_serving_metadata("org/missing")
+
+        self.assertEqual(len(calls), 1)
+
+
+class CatalogRetentionTests(unittest.TestCase):
+    """A degraded rebuild must not overwrite a good cached catalog."""
+
+    def _seed(self, cache_path: Path, count: int) -> None:
+        from llm_launchpad.core.quick_deploy import QuickDeployCatalogInfo
+
+        _write_quick_deploy_catalog_cache(
+            QuickDeployCatalogInfo(
+                source_label="Cached catalog",
+                generated_at="2026-09-03T00:00:00Z",
+                is_live=True,
+            ),
+            [_catalog_profile(f"model-{index}") for index in range(count)],
+            cache_path=cache_path,
+        )
+
+    def test_a_collapsed_rebuild_keeps_the_previous_catalog(self) -> None:
+        with TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "catalog.json"
+            self._seed(cache_path, 38)
+
+            retained = _retained_catalog_for(
+                [_catalog_profile("model-0")],
+                cache_path=cache_path,
+            )
+
+            assert retained is not None
+            info, profiles = retained
+            self.assertEqual(len(profiles), 38)
+            self.assertIn("rate limiting", info.error or "")
+            self.assertIn("1 of 38", info.error or "")
+
+    def test_an_ordinary_ranking_change_is_allowed_through(self) -> None:
+        with TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "catalog.json"
+            self._seed(cache_path, 38)
+
+            # Losing a couple of models is normal churn, not a failed refresh.
+            self.assertIsNone(
+                _retained_catalog_for(
+                    [_catalog_profile(f"model-{index}") for index in range(34)],
+                    cache_path=cache_path,
+                )
+            )
+
+    def test_a_first_build_has_nothing_to_retain(self) -> None:
+        with TemporaryDirectory() as directory:
+            self.assertIsNone(
+                _retained_catalog_for(
+                    [_catalog_profile("model-0")],
+                    cache_path=Path(directory) / "missing.json",
+                )
+            )
 
 
 if __name__ == "__main__":

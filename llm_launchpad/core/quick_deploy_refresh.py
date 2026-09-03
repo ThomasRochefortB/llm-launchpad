@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 import re
 from threading import Lock
+import time
 from typing import Any, Literal, Sequence
 from urllib.parse import urlparse
 
@@ -27,9 +28,20 @@ from .hf_models import (
 from .modal_gpu import ModalGpuSpec, fetch_modal_gpu_catalog
 from .naming import slugify_instance_name
 from .quick_deploy import QuickDeployCatalogInfo, QuickDeployProfile
+from .llamacpp_planner import (
+    compile_server_args,
+    estimate_memory,
+    serving_requirements,
+    tuning_for_objective,
+)
 from .runtime_support import evaluate_llamacpp_architecture, evaluate_llamacpp_mtp
-from ..protocol.enums import SpeculativeDecodingMethod
-from ..protocol.models import SpeculativeDecodingConfig
+from ..protocol.enums import ServingObjective, SpeculativeDecodingMethod
+from ..protocol.models import (
+    MemoryEstimate,
+    RuntimeTuning,
+    ServingRequirements,
+    SpeculativeDecodingConfig,
+)
 
 DEFAULT_MODEL_LIMIT = 3
 DEFAULT_CANDIDATE_LIMIT = 80
@@ -47,6 +59,53 @@ AA_CACHE_TTL = timedelta(hours=24)
 AA_ATTRIBUTION = "Benchmark data sourced from Artificial Analysis: https://artificialanalysis.ai/"
 
 
+# A Hub failure that is merely transient must not be recorded as "this model
+# does not exist": every dropped model silently shrinks the user's catalog.
+_HUB_FETCH_ATTEMPTS = 3
+_HUB_RETRY_BASE_SECONDS = 0.5
+# A refresh that loses a large share of the catalog is far more likely to be a
+# run of transient upstream failures than a real change in the rankings, so the
+# previous snapshot is kept and the next refresh recovers on its own.
+_CATALOG_RETENTION_RATIO = 0.6
+
+
+def _is_transient_hub_error(exc: BaseException) -> bool:
+    """Return whether a Hub failure is worth retrying rather than treating as absent."""
+
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if isinstance(status, int):
+        return status == 429 or 500 <= status < 600
+    text = f"{type(exc).__name__}: {exc}".casefold()
+    return any(
+        marker in text
+        for marker in (
+            "429",
+            "too many requests",
+            "timeout",
+            "timed out",
+            "connection",
+            "temporarily",
+            "503",
+            "502",
+        )
+    )
+
+
+def _fetch_serving_metadata(repo_id: str) -> GgufQuantMetadata:
+    """Fetch GGUF serving metadata, retrying transient Hub failures."""
+
+    delay = _HUB_RETRY_BASE_SECONDS
+    for attempt in range(1, _HUB_FETCH_ATTEMPTS + 1):
+        try:
+            return fetch_gguf_quant_metadata(repo_id, inspect_serving=True)
+        except Exception as exc:
+            if attempt >= _HUB_FETCH_ATTEMPTS or not _is_transient_hub_error(exc):
+                raise
+            time.sleep(delay)
+            delay *= 2
+    raise RuntimeError(f"Unreachable metadata retry loop for {repo_id}")
+
+
 def _quick_deploy_catalog_cache_path() -> Path:
     """Resolve the catalog snapshot path from the current settings dir."""
 
@@ -56,7 +115,7 @@ def _quick_deploy_catalog_cache_path() -> Path:
 
 
 QUICK_DEPLOY_CATALOG_CACHE_TTL = timedelta(hours=6)
-QUICK_DEPLOY_CATALOG_CACHE_SCHEMA_VERSION = 1
+QUICK_DEPLOY_CATALOG_CACHE_SCHEMA_VERSION = 2
 _AA_CACHE_LOCK = Lock()
 
 ModelSizeBucket = Literal["compact", "medium", "large"]
@@ -223,6 +282,9 @@ def build_live_quick_deploy_catalog(
                 ),
                 is_live=True,
             )
+            retained = _retained_catalog_for(profiles)
+            if retained is not None:
+                return retained
             _write_quick_deploy_catalog_cache(info, profiles)
             return (info, profiles)
 
@@ -233,6 +295,43 @@ def build_live_quick_deploy_catalog(
     )
     _write_quick_deploy_catalog_cache(fallback[0], fallback[1])
     return fallback
+
+
+def _retained_catalog_for(
+    profiles: Sequence[QuickDeployProfile],
+    *,
+    cache_path: Path | None = None,
+) -> tuple[QuickDeployCatalogInfo, tuple[QuickDeployProfile, ...]] | None:
+    """Return the cached catalog when a rebuild lost most of its profiles.
+
+    Every model whose Hub metadata cannot be read is dropped from the rebuild,
+    so a run of transient failures produces a small but structurally valid
+    catalog. Persisting that would replace a good snapshot with a worse one and
+    hide models the user deployed yesterday, so the previous snapshot wins and
+    the next refresh recovers on its own.
+    """
+
+    previous = _read_quick_deploy_catalog_cache(
+        cache_path or _quick_deploy_catalog_cache_path()
+    )
+    if previous is None:
+        return None
+    previous_info, previous_profiles = previous
+    if not previous_profiles:
+        return None
+    if len(profiles) >= len(previous_profiles) * _CATALOG_RETENTION_RATIO:
+        return None
+    return (
+        replace(
+            previous_info,
+            error=(
+                f"Kept the previous catalog: this refresh resolved only "
+                f"{len(profiles)} of {len(previous_profiles)} models, which "
+                "usually means Hugging Face was rate limiting or unreachable."
+            ),
+        ),
+        previous_profiles,
+    )
 
 
 def load_cached_quick_deploy_catalog(
@@ -272,6 +371,9 @@ def is_fresh_cached_quick_deploy_catalog(
 
 def _quick_deploy_profile_to_dict(profile: QuickDeployProfile) -> dict[str, Any]:
     speculative = profile.speculative_decoding
+    requirements = profile.serving_requirements
+    tuning = profile.runtime_tuning
+    memory = profile.memory_estimate
     return {
         "id": profile.id,
         "display_name": profile.display_name,
@@ -286,6 +388,7 @@ def _quick_deploy_profile_to_dict(profile: QuickDeployProfile) -> dict[str, Any]
         "summary": profile.summary,
         "server_args": list(profile.server_args),
         "required_vram_gb": profile.required_vram_gb,
+        "gpu_memory_gb": profile.gpu_memory_gb,
         "resource_tier": profile.resource_tier,
         "resource_tier_label": profile.resource_tier_label,
         "source_label": profile.source_label,
@@ -307,6 +410,47 @@ def _quick_deploy_profile_to_dict(profile: QuickDeployProfile) -> dict[str, Any]
                 "nextn_predict_layers": speculative.nextn_predict_layers,
             }
             if speculative is not None
+            else None
+        ),
+        "serving_requirements": (
+            {
+                "context_tokens": requirements.context_tokens,
+                "objective": requirements.objective.value,
+                "full_context_per_request": requirements.full_context_per_request,
+                "gpu_only": requirements.gpu_only,
+                "max_hourly_cost_usd": requirements.max_hourly_cost_usd,
+            }
+            if requirements is not None
+            else None
+        ),
+        "runtime_tuning": (
+            {
+                "parallel_slots": tuning.parallel_slots,
+                "batch_size": tuning.batch_size,
+                "ubatch_size": tuning.ubatch_size,
+                "cache_type_k": tuning.cache_type_k,
+                "cache_type_v": tuning.cache_type_v,
+                "flash_attention": tuning.flash_attention,
+                "gpu_layers": tuning.gpu_layers,
+                "fit_target_mib": tuning.fit_target_mib,
+            }
+            if tuning is not None
+            else None
+        ),
+        "memory_estimate": (
+            {
+                "weights_gb": memory.weights_gb,
+                "kv_cache_gb": memory.kv_cache_gb,
+                "compute_gb": memory.compute_gb,
+                "speculative_gb": memory.speculative_gb,
+                "reserve_gb": memory.reserve_gb,
+                "total_gb": memory.total_gb,
+                "per_device_required_gb": list(memory.per_device_required_gb),
+                "confidence": memory.confidence,
+                "source": memory.source,
+                "total_layer_count": memory.total_layer_count,
+            }
+            if memory is not None
             else None
         ),
     }
@@ -342,6 +486,12 @@ def _quick_deploy_profile_from_dict(payload: Any) -> QuickDeployProfile | None:
             )
         except (ValueError, TypeError):
             speculative = None
+    requirements = _serving_requirements_from_dict(payload.get("serving_requirements"))
+    tuning = _runtime_tuning_from_dict(
+        payload.get("runtime_tuning"),
+        speculative_decoding=speculative,
+    )
+    memory = _memory_estimate_from_dict(payload.get("memory_estimate"))
     try:
         return QuickDeployProfile(
             id=str(payload.get("id") or ""),
@@ -359,6 +509,11 @@ def _quick_deploy_profile_from_dict(payload: Any) -> QuickDeployProfile | None:
             required_vram_gb=(
                 float(payload["required_vram_gb"])
                 if payload.get("required_vram_gb") is not None
+                else None
+            ),
+            gpu_memory_gb=(
+                float(payload["gpu_memory_gb"])
+                if payload.get("gpu_memory_gb") is not None
                 else None
             ),
             resource_tier=payload.get("resource_tier"),
@@ -386,8 +541,81 @@ def _quick_deploy_profile_from_dict(payload: Any) -> QuickDeployProfile | None:
             gguf_architecture=payload.get("gguf_architecture"),
             llamacpp_runtime_id=payload.get("llamacpp_runtime_id"),
             speculative_decoding=speculative,
+            serving_requirements=requirements,
+            runtime_tuning=tuning,
+            memory_estimate=memory,
         )
     except (ValueError, TypeError):
+        return None
+
+
+def _serving_requirements_from_dict(payload: Any) -> ServingRequirements | None:
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return ServingRequirements(
+            context_tokens=max(1, int(payload["context_tokens"])),
+            objective=ServingObjective(
+                str(payload.get("objective") or ServingObjective.GENERAL_PURPOSE.value)
+            ),
+            full_context_per_request=bool(payload.get("full_context_per_request", True)),
+            gpu_only=bool(payload.get("gpu_only", True)),
+            max_hourly_cost_usd=(
+                float(payload["max_hourly_cost_usd"])
+                if payload.get("max_hourly_cost_usd") is not None
+                else None
+            ),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _runtime_tuning_from_dict(
+    payload: Any,
+    *,
+    speculative_decoding: SpeculativeDecodingConfig | None,
+) -> RuntimeTuning | None:
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return RuntimeTuning(
+            parallel_slots=max(1, int(payload.get("parallel_slots", 1))),
+            batch_size=max(1, int(payload.get("batch_size", 2048))),
+            ubatch_size=max(1, int(payload.get("ubatch_size", 512))),
+            cache_type_k=str(payload.get("cache_type_k") or "f16"),
+            cache_type_v=str(payload.get("cache_type_v") or "f16"),
+            flash_attention=bool(payload.get("flash_attention", True)),
+            gpu_layers=str(payload.get("gpu_layers") or "all"),
+            fit_target_mib=max(2048, int(payload.get("fit_target_mib", 2048))),
+            speculative_decoding=speculative_decoding,
+        )
+    except (TypeError, ValueError):
+        return None
+
+
+def _memory_estimate_from_dict(payload: Any) -> MemoryEstimate | None:
+    if not isinstance(payload, dict):
+        return None
+    try:
+        return MemoryEstimate(
+            weights_gb=float(payload["weights_gb"]),
+            kv_cache_gb=float(payload["kv_cache_gb"]),
+            compute_gb=float(payload["compute_gb"]),
+            speculative_gb=float(payload.get("speculative_gb", 0.0)),
+            reserve_gb=float(payload.get("reserve_gb", 0.0)),
+            total_gb=float(payload["total_gb"]),
+            per_device_required_gb=tuple(
+                float(value) for value in payload.get("per_device_required_gb", ())
+            ),
+            confidence=float(payload.get("confidence", 0.0)),
+            source=str(payload.get("source") or "estimated"),
+            total_layer_count=(
+                int(payload["total_layer_count"])
+                if payload.get("total_layer_count") is not None
+                else None
+            ),
+        )
+    except (KeyError, TypeError, ValueError):
         return None
 
 
@@ -803,7 +1031,7 @@ def _build_resolved_aa_model(
     repo_id: str,
 ) -> _ResolvedAAModel | None:
     try:
-        metadata = fetch_gguf_quant_metadata(repo_id)
+        metadata = _fetch_serving_metadata(repo_id)
     except Exception:
         return None
     size_bucket = _size_bucket_for_parameters(candidate.parameter_count_b)
@@ -1422,7 +1650,7 @@ def _safe_fetch_gguf_metadata(repo_id: str) -> GgufQuantMetadata | None:
     """Fetch GGUF metadata without MTP inspection or context lookups."""
 
     try:
-        return fetch_gguf_quant_metadata(repo_id)
+        return fetch_gguf_quant_metadata(repo_id, inspect_serving=True)
     except Exception:
         return None
 
@@ -1458,12 +1686,41 @@ def _attach_profile_context_lengths(
             continue
         upgraded_group: list[QuickDeployProfile] = []
         for profile in profiles_by_repo[repo_id]:
-            server_args = _with_context_length(profile.server_args, context_tokens)
+            requirements = (
+                replace(profile.serving_requirements, context_tokens=context_tokens)
+                if profile.serving_requirements is not None
+                else serving_requirements(context_tokens)
+            )
+            tuning = profile.runtime_tuning or tuning_for_objective(
+                requirements.objective,
+                speculative_decoding=profile.speculative_decoding,
+            )
+            server_args = compile_server_args(requirements, tuning)
+            memory = profile.memory_estimate
+            if memory is not None:
+                old_context = max(1, profile.max_context_tokens)
+                kv_cache_gb = memory.kv_cache_gb * context_tokens / old_context
+                memory = replace(
+                    memory,
+                    kv_cache_gb=round(kv_cache_gb, 3),
+                    total_gb=round(
+                        memory.weights_gb
+                        + kv_cache_gb
+                        + memory.compute_gb
+                        + memory.speculative_gb
+                        + memory.reserve_gb,
+                        3,
+                    ),
+                )
             upgraded_group.append(
                 replace(
                     profile,
                     max_context_tokens=context_tokens,
                     server_args=server_args,
+                    required_vram_gb=(memory.total_gb if memory is not None else profile.required_vram_gb),
+                    serving_requirements=requirements,
+                    runtime_tuning=tuning,
+                    memory_estimate=memory,
                 )
             )
         profiles_by_repo[repo_id] = upgraded_group
@@ -1497,7 +1754,12 @@ def attach_quick_deploy_mtp_recommendations(
     repos = list({profile.repo_id for profile in pending})
     with ThreadPoolExecutor(max_workers=min(max_workers, len(repos))) as executor:
         futures = {
-            executor.submit(fetch_gguf_quant_metadata, repo_id, inspect_mtp=True): repo_id
+            executor.submit(
+                fetch_gguf_quant_metadata,
+                repo_id,
+                inspect_mtp=True,
+                inspect_serving=True,
+            ): repo_id
             for repo_id in repos
         }
         for future in as_completed(futures):
@@ -1512,10 +1774,36 @@ def attach_quick_deploy_mtp_recommendations(
             continue
         metadata = metadata_by_repo.get(profile.repo_id)
         recommendation = _mtp_recommendation(metadata) if metadata is not None else None
+        if recommendation is None or metadata is None:
+            upgraded.append(profile)
+            continue
+        requirements = profile.serving_requirements or serving_requirements(
+            profile.max_context_tokens
+        )
+        tuning = tuning_for_objective(
+            requirements.objective,
+            speculative_decoding=recommendation,
+        )
+        weights_gb = _required_vram_for_quant(metadata, profile.quant)
+        memory = (
+            estimate_memory(
+                metadata,
+                weights_gb=weights_gb,
+                requirements=requirements,
+                tuning=tuning,
+            )
+            if weights_gb is not None
+            else profile.memory_estimate
+        )
         upgraded.append(
-            replace(profile, speculative_decoding=recommendation)
-            if recommendation is not None
-            else profile
+            replace(
+                profile,
+                speculative_decoding=recommendation,
+                server_args=compile_server_args(requirements, tuning),
+                runtime_tuning=tuning,
+                memory_estimate=memory,
+                required_vram_gb=(memory.total_gb if memory is not None else profile.required_vram_gb),
+            )
         )
     return tuple(upgraded)
 
@@ -1531,7 +1819,7 @@ def _profiles_for_model(
 ) -> list[QuickDeployProfile]:
     if metadata is None:
         try:
-            metadata = fetch_gguf_quant_metadata(model.repo_id)
+            metadata = _fetch_serving_metadata(model.repo_id)
         except Exception:
             return []
     compatibility = evaluate_llamacpp_architecture(metadata.architecture)
@@ -1540,12 +1828,17 @@ def _profiles_for_model(
     quants = _selected_quants(metadata)
     if not quants:
         return []
-    max_context_tokens = aa_candidate.max_context_tokens if aa_candidate else None
+    max_context_tokens = metadata.context_length
     if max_context_tokens is None and not skip_context_lookup:
         try:
             max_context_tokens = fetch_model_max_context(model.repo_id)
         except Exception:
             max_context_tokens = None
+    if max_context_tokens is None and aa_candidate is not None:
+        # Retain catalog coverage for repositories whose GGUF metadata is not
+        # yet exposed by the Hub. The lower-confidence planner estimate remains
+        # subject to runtime attestation before the endpoint is published.
+        max_context_tokens = aa_candidate.max_context_tokens
     context_tokens = max_context_tokens or DEFAULT_CONTEXT_TOKENS
     display_name = aa_candidate.name if aa_candidate else _display_name(model.repo_id)
     slug_hint = slugify_instance_name(display_name)
@@ -1605,9 +1898,24 @@ def _profiles_for_quant(
     llamacpp_runtime_id: str,
     speculative_decoding: SpeculativeDecodingConfig | None = None,
 ) -> list[QuickDeployProfile]:
-    required_vram_gb = _required_vram_for_quant(metadata, quant)
-    if required_vram_gb is None:
+    weights_gb = _required_vram_for_quant(metadata, quant)
+    if weights_gb is None:
         return []
+    requirements = serving_requirements(
+        context_tokens,
+        objective=ServingObjective.GENERAL_PURPOSE,
+    )
+    runtime_tuning = tuning_for_objective(
+        requirements.objective,
+        speculative_decoding=speculative_decoding,
+    )
+    memory_estimate = estimate_memory(
+        metadata,
+        weights_gb=weights_gb,
+        requirements=requirements,
+        tuning=runtime_tuning,
+    )
+    required_vram_gb = memory_estimate.total_gb
     selections = (
         ("cheap", _select_gpu_shape(quant, required_vram_gb, modal_gpu_catalog)),
         (
@@ -1677,8 +1985,9 @@ def _profiles_for_quant(
                     else "Live Hugging Face trending GGUF model matched to current "
                     "Modal GPU pricing."
                 ),
-                server_args=("--ctx-size", str(context_tokens)),
+                server_args=compile_server_args(requirements, runtime_tuning),
                 required_vram_gb=round(selection.required_vram_gb, 1),
+                gpu_memory_gb=_GPU_MEMORY_GB.get(selection.gpu_type),
                 source_label=(
                     "Artificial Analysis"
                     if aa_candidate is not None
@@ -1698,6 +2007,9 @@ def _profiles_for_quant(
                 gguf_architecture=metadata.architecture,
                 llamacpp_runtime_id=llamacpp_runtime_id,
                 speculative_decoding=speculative_decoding,
+                serving_requirements=requirements,
+                runtime_tuning=runtime_tuning,
+                memory_estimate=memory_estimate,
             )
         )
     return profiles
@@ -1737,7 +2049,8 @@ def _select_gpu_shape(
         if memory_gb is None:
             continue
         for gpu_count in range(1, 9):
-            if memory_gb * gpu_count < required_vram_gb * 1.05:
+            reserve_per_gpu = max(2.0, memory_gb * 0.05)
+            if required_vram_gb / gpu_count + reserve_per_gpu > memory_gb:
                 continue
             cost = prices.get(
                 candidate_gpu,

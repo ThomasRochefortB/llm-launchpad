@@ -179,6 +179,11 @@ def _model_limits_from_config(
 ) -> tuple[int | None, int | None]:
     """Resolve the actual deployed context window and OpenCode output reserve."""
     declared_context = _positive_token_limit(config.max_context_tokens)
+    attested_context = _positive_token_limit(
+        config.runtime_attestation.effective_context_tokens
+        if config.runtime_attestation is not None
+        else None
+    )
     runtime_context: int | None = None
     if config.backend == BackendType.LLAMACPP:
         runtime_context = _llamacpp_context_from_server_args(config.server_args)
@@ -190,7 +195,9 @@ def _model_limits_from_config(
             runtime_context = _DEFAULT_MODAL_LLAMACPP_CONTEXT_TOKENS
 
     known_contexts = [
-        value for value in (declared_context, runtime_context) if value is not None
+        value
+        for value in (declared_context, runtime_context, attested_context)
+        if value is not None
     ]
     effective_context = min(known_contexts) if known_contexts else None
     return _model_limits(effective_context, config.max_output_tokens)

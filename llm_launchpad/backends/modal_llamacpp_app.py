@@ -122,6 +122,7 @@ def _server_args_define_alias(args: Optional[List[str]]) -> bool:
 PREDOWNLOAD_TIMEOUT_MINUTES = _read_int_env("PREDOWNLOAD_TIMEOUT_MINUTES", 6 * 60)
 SNAPSHOT_MAX_WORKERS = _read_int_env("HF_SNAPSHOT_MAX_WORKERS", 32)
 DOWNLOAD_CPU = _read_int_env("HF_DOWNLOAD_CPU", 4)
+SERVE_CPU = _read_int_env("LLAMACPP_SERVE_CPU", 4)
 HF_HUB_DISABLE_XET_DEFAULT = _read_bool_env("HF_HUB_DISABLE_XET", True)
 HF_XET_HIGH_PERFORMANCE_DEFAULT = _read_optional_bool_env("HF_XET_HIGH_PERFORMANCE")
 LLAMA_CPP_IMAGE_REF = (
@@ -1023,6 +1024,55 @@ def _resolve_llama_server_binary() -> str:
     )
 
 
+def _resolve_fit_binary() -> Optional[str]:
+    """Return llama.cpp's runtime memory planner when shipped by the image."""
+
+    for candidate in ("/app/llama-fit-params", "llama-fit-params"):
+        if os.path.isabs(candidate) and Path(candidate).exists():
+            return candidate
+        resolved = shutil.which(candidate)
+        if resolved:
+            return resolved
+    return None
+
+
+def _fit_relevant_args(server_args: List[str]) -> List[str]:
+    """Keep common memory-affecting flags understood by llama-fit-params."""
+
+    supported = {
+        "-c",
+        "--ctx-size",
+        "-b",
+        "--batch-size",
+        "-ub",
+        "--ubatch-size",
+        "-ctk",
+        "--cache-type-k",
+        "-ctv",
+        "--cache-type-v",
+        "-ngl",
+        "--n-gpu-layers",
+        "--gpu-layers",
+        "-fa",
+        "--flash-attn",
+        "-fitt",
+        "--fit-target",
+    }
+    result: List[str] = []
+    index = 0
+    while index < len(server_args):
+        token = server_args[index]
+        key = token.split("=", 1)[0]
+        if key in supported:
+            result.append(token)
+            if "=" not in token and index + 1 < len(server_args):
+                result.append(server_args[index + 1])
+                index += 2
+                continue
+        index += 1
+    return result
+
+
 def _llama_server_runtime_env(server_bin: str) -> tuple[dict[str, str], Optional[str]]:
     """Prepare env/cwd so official docker image shared libs resolve under Modal."""
     env = dict(os.environ)
@@ -1098,6 +1148,7 @@ except Exception:
     image=image,
     volumes={cache_dir: model_cache},
     gpu=GPU_CONFIG,
+    cpu=SERVE_CPU,
     timeout=60 * MINUTES,  # allow long cold starts
     scaledown_window=SCALEDOWN_WINDOW,  # keep container warm after requests (overridable via env)
     max_containers=1,  # cap number of containers (replicas) to 1
@@ -1119,6 +1170,7 @@ def serve():
         cfg.get("served_model_name") or _default_llamacpp_served_model_name(model_repo_id, quant)
     ).strip() or _default_llamacpp_served_model_name(model_repo_id, quant)
     extra_server_args: Optional[List[str]] = cfg.get("server_args")
+    serving_fingerprint = str(cfg.get("serving_fingerprint") or "").strip()
     host = str(cfg.get("host", "0.0.0.0"))
     port = int(cfg.get("port", 8080))
 
@@ -1137,6 +1189,39 @@ def serve():
         print(f"🦙 using llama-server cwd: {server_cwd}")
 
     server_args = extra_server_args or DEFAULT_SERVER_ARGS
+    if serving_fingerprint:
+        fit_binary = _resolve_fit_binary()
+        if fit_binary:
+            fit_command = [
+                fit_binary,
+                "--model",
+                str(model_path),
+                *_fit_relevant_args(server_args),
+            ]
+            print("🧭 verifying full-context device fit:")
+            print(" ", " ".join(fit_command))
+            fit_result = subprocess.run(
+                fit_command,
+                env=server_env,
+                cwd=server_cwd,
+                capture_output=True,
+                text=True,
+                timeout=15 * 60,
+            )
+            if fit_result.stdout:
+                print(fit_result.stdout.rstrip())
+            if fit_result.stderr:
+                print(fit_result.stderr.rstrip())
+            if fit_result.returncode != 0:
+                raise RuntimeError(
+                    "llama.cpp rejected the full-context GPU-only serving plan "
+                    f"(fit exit {fit_result.returncode})."
+                )
+        else:
+            print(
+                "⚠️ llama-fit-params is unavailable; startup success with explicit "
+                "all-GPU layers will be used as the residency guard."
+            )
     command = [
         server_bin,
         "--model",
@@ -1155,6 +1240,24 @@ def serve():
 
     print("🦙 starting llama-server:")
     print(" ", " ".join(command))
+    if serving_fingerprint:
+        requested_context = None
+        for index, argument in enumerate(command[:-1]):
+            if argument in {"-c", "--ctx-size"}:
+                try:
+                    requested_context = int(command[index + 1])
+                except (TypeError, ValueError):
+                    requested_context = None
+        marker = {
+            "schema_version": 1,
+            "fingerprint": serving_fingerprint,
+            "requested_context_tokens": requested_context,
+            "gpu_only_requested": "--n-gpu-layers" in command,
+            "gpu_config": GPU_CONFIG,
+        }
+        print("LLM_LAUNCHPAD_ATTESTATION_JSON_BEGIN")
+        print(json.dumps(marker, separators=(",", ":")))
+        print("LLM_LAUNCHPAD_ATTESTATION_JSON_END")
 
     # Start server process; the web_server decorator will keep the container alive
     subprocess.Popen(command, env=server_env, cwd=server_cwd)
@@ -1186,6 +1289,7 @@ def main(
     host: str = "0.0.0.0",
     port: int = 8080,
     n_gpu_layers: Optional[int] = None,
+    serving_fingerprint: Optional[str] = None,
     deploy: bool = False,
 ):
     """Configure, optionally preload weights, and optionally deploy the server.
@@ -1224,6 +1328,7 @@ def main(
     cfg["host"] = host
     cfg["port"] = int(port)
     cfg["n_gpu_layers"] = n_gpu_layers if n_gpu_layers is not None else None
+    cfg["serving_fingerprint"] = (serving_fingerprint or "").strip() or None
 
     if server_args:
         # Tokenize simple space-separated string to list; respect quotes

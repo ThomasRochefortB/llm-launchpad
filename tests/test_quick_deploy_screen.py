@@ -135,7 +135,7 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             summary = str(screen.query_one("#quick-deploy-profile-body", Static).content)
             self.assertIn("[bold]Tier[/bold]     $$$ B200", summary)
             self.assertIn("[bold]VRAM[/bold]     141 GB required", summary)
-            self.assertIn("[bold]Max ctx[/bold]  196,608 ctx", summary)
+            self.assertIn("[bold]Context[/bold]  Full 196,608 ctx", summary)
 
     async def test_deploy_uses_blank_override_defaults(self) -> None:
         app = _TestApp()

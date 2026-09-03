@@ -35,6 +35,33 @@ class SpeculativeDecodingMethod(str, Enum):
     MTP = "mtp"
 
 
+class ServingObjective(str, Enum):
+    """Optimization target for a planned inference endpoint."""
+
+    GENERAL_PURPOSE = "general_purpose"
+    INTERACTIVE = "interactive"
+    THROUGHPUT = "throughput"
+    BENCHMARK = "benchmark"
+
+    @property
+    def display_name(self) -> str:
+        return {
+            ServingObjective.GENERAL_PURPOSE: "General purpose",
+            ServingObjective.INTERACTIVE: "Interactive",
+            ServingObjective.THROUGHPUT: "Throughput",
+            ServingObjective.BENCHMARK: "Benchmark",
+        }[self]
+
+
+class CertificationState(str, Enum):
+    """Confidence level for a planned or running serving configuration."""
+
+    ESTIMATED = "estimated"
+    CERTIFIED = "certified"
+    REJECTED = "rejected"
+    STALE = "stale"
+
+
 class ComputeProvider(str, Enum):
     """Infrastructure providers used to host serving backends."""
 
@@ -72,6 +99,9 @@ class DeploymentState(str, Enum):
     RUNNING = "running"
     DEPLOYING = "deploying"
     WARMING_UP = "warming_up"
+    VERIFYING = "verifying"
+    CALIBRATING = "calibrating"
+    PUBLISHING = "publishing"
     HEALTHY = "healthy"
     STOPPED = "stopped"
 

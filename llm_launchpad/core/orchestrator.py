@@ -37,7 +37,7 @@ from ..protocol.events import (
 )
 from ..protocol.models import DeploymentConfig, EndpointInfo
 from ..protocol.models import BenchmarkConcurrencyResult, BenchmarkConfig
-from ..protocol.models import StoredModelInfo, StorageSnapshot
+from ..protocol.models import PlacementAssessment, ServingRequirements, StoredModelInfo, StorageSnapshot
 
 from .benchmark import (
     aiperf_metrics_have_successful_requests,
@@ -55,6 +55,7 @@ from .config import ConfigStore
 from .gguf_metadata import GgufMtpStatus
 from .hf_models import fetch_gguf_quant_metadata
 from .modal_auth import get_modal_auth_status
+from .llamacpp_planner import compile_server_args_string, tuning_for_objective
 from .naming import legacy_app_name
 from .naming import default_llamacpp_served_model_name
 from .naming import random_function_slug
@@ -317,6 +318,60 @@ class Orchestrator:
                     operation=OperationType.DEPLOY,
                 )
             yield from self._prepare_llamacpp_speculative_decoding(config)
+            if config.serving_requirements is not None:
+                if (
+                    config.placement_assessment is not None
+                    and (
+                        not config.placement_assessment.fits
+                        or not config.placement_assessment.gpu_resident
+                    )
+                ):
+                    message = (
+                        config.placement_assessment.rejection_reason
+                        or "The selected placement cannot keep the full-context plan on GPU."
+                    )
+                    yield ErrorEvent(
+                        message=message,
+                        operation=OperationType.DEPLOY,
+                        recoverable=False,
+                    )
+                    yield OperationCompleteEvent(
+                        operation=OperationType.DEPLOY,
+                        success=False,
+                        exit_code=2,
+                        detail=message,
+                    )
+                    return
+                tuning = config.runtime_tuning or tuning_for_objective(
+                    config.serving_requirements.objective,
+                    speculative_decoding=config.speculative_decoding,
+                )
+                tuning = replace(
+                    tuning,
+                    speculative_decoding=config.speculative_decoding,
+                )
+                config.runtime_tuning = tuning
+                config.max_context_tokens = config.serving_requirements.context_tokens
+                config.server_args = compile_server_args_string(
+                    config.serving_requirements,
+                    tuning,
+                    extra_args=shlex.split(config.server_args or ""),
+                )
+                # Fast Deploy expresses the all-GPU invariant in canonical
+                # server args; keeping this unset avoids a conflicting legacy
+                # integer override in provider adapters.
+                config.n_gpu_layers = None
+                if config.placement_assessment is not None:
+                    config.required_vram_gb = config.placement_assessment.memory.total_gb
+                yield LogEvent(
+                    line=(
+                        "Serving plan: full "
+                        f"{config.serving_requirements.context_tokens:,}-token context, "
+                        f"{tuning.parallel_slots} parallel slot(s), GPU-only placement."
+                    ),
+                    operation=OperationType.DEPLOY,
+                    is_milestone=True,
+                )
         if config.provider == ComputeProvider.PRIME:
             yield from self._deploy_prime(config)
             return
@@ -874,6 +929,9 @@ class Orchestrator:
         provider: ComputeProvider = ComputeProvider.MODAL,
         api_key: Optional[str] = None,
         pod_id: Optional[str] = None,
+        serving_requirements: ServingRequirements | None = None,
+        placement_assessment: PlacementAssessment | None = None,
+        runtime_id: str | None = None,
     ) -> EventStream:
         """Probe endpoint readiness and optionally tail logs."""
         yield from WarmupRunner().run(
@@ -887,6 +945,9 @@ class Orchestrator:
             api_key=api_key,
             pod_id=pod_id,
             prime_backend=self.prime_backend if provider == ComputeProvider.PRIME else None,
+            serving_requirements=serving_requirements,
+            placement_assessment=placement_assessment,
+            runtime_id=runtime_id,
         )
 
     # ------------------------------------------------------------------

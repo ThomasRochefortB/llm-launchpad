@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import shlex
 from typing import Sequence
 
-from ..protocol.enums import BackendType, ComputeProvider
+from ..protocol.enums import BackendType, ComputeProvider, ServingObjective
 from ..protocol.models import (
     DeploymentConfig,
     InferencePlan,
     InferenceRecipe,
+    MemoryEstimate,
+    RuntimeTuning,
+    ServingRequirements,
     SpeculativeDecodingConfig,
     WorkloadProfile,
 )
@@ -23,6 +26,12 @@ from .inference_options import (
     resolve_inference_plans,
 )
 from .naming import build_deployment_name, infer_instance_from_app_name, slugify_instance_name
+from .llamacpp_planner import (
+    assess_memory_placement,
+    compile_server_args,
+    tuning_for_gpu_memory,
+    tuning_for_objective,
+)
 
 
 @dataclass(frozen=True)
@@ -42,6 +51,7 @@ class QuickDeployProfile:
     summary: str
     server_args: tuple[str, ...]
     required_vram_gb: float | None = None
+    gpu_memory_gb: float | None = None
     resource_tier: str | None = None
     resource_tier_label: str | None = None
     source_label: str = "Curated"
@@ -57,6 +67,9 @@ class QuickDeployProfile:
     gguf_architecture: str | None = None
     llamacpp_runtime_id: str | None = None
     speculative_decoding: SpeculativeDecodingConfig | None = None
+    serving_requirements: ServingRequirements | None = None
+    runtime_tuning: RuntimeTuning | None = None
+    memory_estimate: MemoryEstimate | None = None
 
 
 @dataclass(frozen=True)
@@ -216,6 +229,12 @@ def quick_deploy_recipe(profile: QuickDeployProfile) -> InferenceRecipe:
             model_id,
             profile.quant,
             str(profile.max_context_tokens),
+            profile.serving_requirements.objective.value
+            if profile.serving_requirements is not None
+            else "",
+            str(profile.runtime_tuning.parallel_slots)
+            if profile.runtime_tuning is not None
+            else "",
             profile.speculative_decoding.method.value if profile.speculative_decoding else "",
             str(profile.speculative_decoding.num_speculative_tokens) if profile.speculative_decoding else "",
             *profile.server_args,
@@ -237,6 +256,8 @@ def quick_deploy_recipe(profile: QuickDeployProfile) -> InferenceRecipe:
         source_label=profile.source_label,
         quality_score=quick_deploy_quality_score(profile),
         quality_rank=profile.aa_rank,
+        serving_requirements=profile.serving_requirements,
+        runtime_tuning=profile.runtime_tuning,
     )
 
 
@@ -321,12 +342,43 @@ def resolve_quick_deploy_plans(
                 recipe_id=quick_deploy_recipe(profile).id,
                 gpu_type=profile.gpu_type,
                 gpu_count=profile.gpu_count,
+                gpu_memory_gb=profile.gpu_memory_gb,
                 price_per_hour_usd=profile.approx_cost_per_hour_usd,
             )
             for profile in rows
         ]
         adapters = (ModalInferenceAdapter(options),)
-    return tuple(resolve_inference_plans(recipes, adapters, workload))
+    plans = tuple(resolve_inference_plans(recipes, adapters, workload))
+    profile_by_recipe = {
+        quick_deploy_recipe(profile).id: profile for profile in rows
+    }
+    resolved = tuple(
+        retune_quick_deploy_plan(
+            profile_by_recipe[plan.recipe.id],
+            plan,
+            (
+                plan.recipe.serving_requirements.objective
+                if plan.recipe.serving_requirements is not None
+                else ServingObjective.GENERAL_PURPOSE
+            ),
+        )
+        if plan.recipe.id in profile_by_recipe
+        else plan
+        for plan in plans
+    )
+    # Parity with the live compute path: an assessed placement that cannot hold
+    # the full context on GPU is never offered. Legacy profiles without a
+    # memory estimate carry no assessment and stay eligible.
+    return tuple(plan for plan in resolved if plan_is_eligible(plan))
+
+
+def plan_is_eligible(plan: InferencePlan) -> bool:
+    """Return whether a plan may be offered as a Fast Deploy placement."""
+
+    assessment = plan.assessment
+    if assessment is None:
+        return True
+    return assessment.fits and assessment.gpu_resident
 
 
 def get_quick_deploy_plan(
@@ -340,6 +392,79 @@ def get_quick_deploy_plan(
         return plans[plan_id]
     except KeyError as exc:
         raise KeyError(f"Unknown quick deploy plan: {plan_id}") from exc
+
+
+def retune_quick_deploy_plan(
+    profile: QuickDeployProfile,
+    plan: InferencePlan,
+    objective: ServingObjective,
+) -> InferencePlan:
+    """Reassess one Fast Deploy plan for a different serving objective."""
+
+    current = plan.recipe.serving_requirements or profile.serving_requirements
+    if current is None:
+        return plan
+    requirements = replace(
+        current,
+        objective=objective,
+        max_hourly_cost_usd=plan.quote.price_per_hour_usd,
+    )
+    tuning = tuning_for_objective(
+        objective,
+        speculative_decoding=profile.speculative_decoding,
+    )
+    tuning = tuning_for_gpu_memory(tuning, plan.quote.gpu_memory_gb)
+    recipe = replace(
+        plan.recipe,
+        serving_requirements=requirements,
+        runtime_tuning=tuning,
+        server_args=compile_server_args(requirements, tuning),
+    )
+    assessment = plan.assessment
+    if profile.memory_estimate is not None and plan.quote.gpu_memory_gb is not None:
+        assessment = assess_memory_placement(
+            profile.memory_estimate,
+            model_id=recipe.model_id,
+            revision=None,
+            quant=recipe.quant,
+            runtime_id=profile.llamacpp_runtime_id,
+            requirements=requirements,
+            tuning=tuning,
+            gpu_type=plan.quote.gpu_type,
+            gpu_count=plan.quote.gpu_count,
+            gpu_memory_gb=plan.quote.gpu_memory_gb,
+            price_per_hour_usd=plan.quote.price_per_hour_usd,
+        )
+    single_tps = None
+    aggregate_tps = None
+    if assessment is not None:
+        single_tps = max(
+            (
+                point.output_tokens_per_second or 0.0
+                for point in assessment.performance
+                if point.concurrency == 1
+            ),
+            default=0.0,
+        ) or None
+        aggregate_tps = max(
+            (
+                point.aggregate_output_tokens_per_second or 0.0
+                for point in assessment.performance
+            ),
+            default=0.0,
+        ) or None
+    quote = replace(
+        plan.quote,
+        estimated_output_tokens_per_second=single_tps,
+        estimated_aggregate_output_tokens_per_second=aggregate_tps,
+    )
+    return replace(
+        plan,
+        recipe=recipe,
+        quote=quote,
+        assessment=assessment,
+        recommendation_reason=f"Optimized for {objective.display_name.casefold()} throughput",
+    )
 
 
 def quick_deploy_profile_for_plan(
@@ -390,8 +515,62 @@ def build_quick_deploy_config(
         config.gguf_architecture = profile.gguf_architecture
         config.llamacpp_runtime_id = profile.llamacpp_runtime_id
         config.server_args = shlex.join(profile.server_args)
+        config.serving_requirements = (
+            plan.recipe.serving_requirements
+            if plan is not None
+            else profile.serving_requirements
+        )
+        if config.serving_requirements is not None and plan is not None:
+            config.serving_requirements = ServingRequirements(
+                context_tokens=config.serving_requirements.context_tokens,
+                objective=config.serving_requirements.objective,
+                full_context_per_request=config.serving_requirements.full_context_per_request,
+                gpu_only=config.serving_requirements.gpu_only,
+                max_hourly_cost_usd=plan.quote.price_per_hour_usd,
+            )
+        config.runtime_tuning = (
+            plan.assessment.tuning
+            if plan is not None and plan.assessment is not None
+            else (
+                plan.recipe.runtime_tuning
+                if plan is not None
+                else profile.runtime_tuning
+            )
+        )
+        config.placement_assessment = plan.assessment if plan is not None else None
         if enable_speculative_decoding:
             config.speculative_decoding = profile.speculative_decoding
+        elif config.runtime_tuning is not None:
+            config.runtime_tuning = RuntimeTuning(
+                parallel_slots=config.runtime_tuning.parallel_slots,
+                batch_size=config.runtime_tuning.batch_size,
+                ubatch_size=config.runtime_tuning.ubatch_size,
+                cache_type_k=config.runtime_tuning.cache_type_k,
+                cache_type_v=config.runtime_tuning.cache_type_v,
+                flash_attention=config.runtime_tuning.flash_attention,
+                gpu_layers=config.runtime_tuning.gpu_layers,
+                fit_target_mib=config.runtime_tuning.fit_target_mib,
+                speculative_decoding=None,
+            )
+            if (
+                config.serving_requirements is not None
+                and profile.memory_estimate is not None
+                and plan is not None
+                and plan.quote.gpu_memory_gb is not None
+            ):
+                config.placement_assessment = assess_memory_placement(
+                    profile.memory_estimate,
+                    model_id=plan.recipe.model_id,
+                    revision=None,
+                    quant=plan.recipe.quant,
+                    runtime_id=profile.llamacpp_runtime_id,
+                    requirements=config.serving_requirements,
+                    tuning=config.runtime_tuning,
+                    gpu_type=plan.quote.gpu_type,
+                    gpu_count=plan.quote.gpu_count,
+                    gpu_memory_gb=plan.quote.gpu_memory_gb,
+                    price_per_hour_usd=plan.quote.price_per_hour_usd,
+                )
     else:
         config.model_name = profile.model_name or profile.repo_id
         config.n_gpu = plan.quote.gpu_count if plan is not None else profile.gpu_count
@@ -411,7 +590,9 @@ def build_quick_deploy_config(
     config.provider_options = plan.quote.provider_options if plan is not None else None
     config.preload = True
     config.do_deploy = True
-    config.do_warmup = do_warmup
+    # Certified Fast Deploy endpoints must pass runtime attestation and a
+    # bounded performance calibration before they can be published.
+    config.do_warmup = True if config.serving_requirements is not None else do_warmup
     config.show_debug_logs = show_debug_logs
 
     instance_override = instance_name.strip()
