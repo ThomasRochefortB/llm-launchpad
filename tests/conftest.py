@@ -117,7 +117,10 @@ def _isolate_tui_local_caches(
 
 
 @pytest.fixture(autouse=True)
-def _isolate_quick_deploy_catalog_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+def _isolate_quick_deploy_catalog_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
     """Keep catalog warm-start snapshots out of the real user settings dir.
 
     ``quick_deploy._load_quick_deploy_catalog`` imports
@@ -130,6 +133,15 @@ def _isolate_quick_deploy_catalog_cache(monkeypatch: pytest.MonkeyPatch) -> None
     from llm_launchpad.core import quick_deploy_refresh as quick_deploy_refresh_module
 
     quick_deploy_module._reset_quick_deploy_catalog_cache()
+
+    # Catalog retention compares a rebuild against the snapshot on disk, so the
+    # snapshot path itself has to be isolated or tests read the developer's own
+    # catalog and inherit whatever state it happens to be in.
+    monkeypatch.setattr(
+        quick_deploy_refresh_module,
+        "_quick_deploy_catalog_cache_path",
+        lambda: tmp_path_factory.mktemp("quick-deploy-catalog") / "catalog.json",
+    )
 
     def _no_warm_catalog(*_args: object, **_kwargs: object) -> None:
         return None
@@ -164,4 +176,23 @@ def _isolate_prime_local_caches(
     monkeypatch.setattr(
         "llm_launchpad.core.prime_frpc.PRIME_FRPC_CACHE_DIR",
         root / "frpc",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_serving_certificate_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """Keep planner placement assessments independent of real attestations.
+
+    ``assess_memory_placement`` consults the certificate cache to promote or
+    reject a topology. Without isolation, a developer machine that has deployed
+    before would resolve genuine certificates and change placement outcomes.
+    """
+
+    root = tmp_path_factory.mktemp("serving-certificates")
+    monkeypatch.setattr(
+        "llm_launchpad.core.llamacpp_planner.CERTIFICATE_CACHE_PATH",
+        root / "serving_certificates.json",
     )
