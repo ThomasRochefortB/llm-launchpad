@@ -1864,7 +1864,7 @@ wheels = [
 
 [[package]]
 name = "modal"
-version = "1.5.0"
+version = "1.5.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -1882,9 +1882,9 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "watchfiles" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/59/f9/87425e60db2a8597b248417772b409c49ca3a05ff6b1282a21cd7d856f09/modal-1.5.0.tar.gz", hash = "sha256:15033cf84f5f4f9f8a3dcf47a768cfcca36d1ad38ab7b3459fd3cbc29aa84a77", size = 771722, upload-time = "2026-06-09T22:37:27.5Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/b9/a5/9e322043716e511b7f6c9120804f33b92e21a818bf4709b2d98b3c76d665/modal-1.5.5.tar.gz", hash = "sha256:30df363ed1898cc3d91a09ff3f95c38ab043f6b6294011b01085312c6a0ac777", size = 870356, upload-time = "2026-08-28T19:51:34.881Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/5c/71/85e476e7d32c0a648d5aa97c4335ac02357d059c2bb734cf175b08446597/modal-1.5.0-py3-none-any.whl", hash = "sha256:9c5687eff775d1372bd70b87e43499e40777a1de160f23786c00807bf342fcb6", size = 882122, upload-time = "2026-06-09T22:37:24.608Z" },
+    { url = "https://files.pythonhosted.org/packages/04/19/b3dca8baec119126058b12ca620e44022e4d08a091956668bd04180c89a7/modal-1.5.5-py3-none-any.whl", hash = "sha256:8d10d3ee09818aaba1973b73ce2521ab8961b63a29b5b52e3ff0d25e7a74808e", size = 985163, upload-time = "2026-08-28T19:51:32.404Z" },
 ]
 
 [[package]]
@@ -3716,14 +3716,14 @@ wheels = [
 
 [[package]]
 name = "synchronicity"
-version = "0.12.4"
+version = "0.12.5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/68/38/901ed2557527541e90e89366212538463de96f9393de95fee2f7928d1321/synchronicity-0.12.4.tar.gz", hash = "sha256:f9e38d0c37d8e56b5dcb22cc0083591a535a42187d3d97ea9aef6e84bd122640", size = 60339, upload-time = "2026-06-16T15:43:06.29Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/5d/1c/f51dc54bbd302991026a53f9790735540e0e9e1184e9d5939f02446aa5bc/synchronicity-0.12.5.tar.gz", hash = "sha256:94d96b1d85698e3056b96a793b8c0949af6584e4a7d877fabdeb5385efe230aa", size = 60745, upload-time = "2026-06-18T21:06:23.545Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e5/44/ed8f5c1ce8d6a4d986a5629fcd17fca6e91952e43ffa9bdb7d640341e50d/synchronicity-0.12.4-py3-none-any.whl", hash = "sha256:87c53625f680ed1a6992fccda5adeb6705904fdb0c820e04d384358708f2607c", size = 41013, upload-time = "2026-06-16T15:43:05.233Z" },
+    { url = "https://files.pythonhosted.org/packages/06/74/ad9b99520f70c0bc3318e582e359d360cfc0f7afd7bf368a7f24013cece7/synchronicity-0.12.5-py3-none-any.whl", hash = "sha256:fdbbb10d437bc08a6b0f814fc66fddd1b58ffed314533d42f1ab555801e781af", size = 41107, upload-time = "2026-06-18T21:06:22.505Z" },
 ]
 
 [[package]]
