@@ -6,7 +6,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 import math
 import re
-from typing import Iterable, Sequence
+from typing import Sequence
 
 from ..protocol.enums import (
     BackendType,
@@ -274,28 +274,6 @@ def profile_required_vram_gb(profile: QuickDeployProfile) -> float:
         return 0.0
     # The selected shape already includes the catalog's five-percent headroom.
     return per_gpu_memory * max(1, profile.gpu_count) / 1.05
-
-
-def compatible_compute_profiles(
-    configuration: ComputeConfiguration,
-    profiles: Iterable[QuickDeployProfile],
-) -> tuple[tuple[QuickDeployProfile, tuple[InferencePlan, ...]], ...]:
-    """Return catalog profiles that have at least one valid fulfillment plan."""
-
-    compatible = []
-    for profile in profiles:
-        plans = plans_for_compute_profile(configuration, profile)
-        if plans:
-            compatible.append((profile, plans))
-    compatible.sort(
-        key=lambda item: (
-            item[0].aa_rank is None,
-            item[0].aa_rank if item[0].aa_rank is not None else 10**9,
-            item[0].display_name.casefold(),
-            item[0].id,
-        )
-    )
-    return tuple(compatible)
 
 
 def _modal_placements(catalog: Sequence[ModalGpuSpec]) -> list[ComputePlacement]:

@@ -355,10 +355,6 @@ def _extract_base_model_repo_ids(info: Any) -> list[str]:
     return candidates
 
 
-def _looks_like_hf_repo_id(value: str) -> bool:
-    return _normalize_hf_repo_id(value) is not None
-
-
 def _normalize_hf_repo_id(value: str) -> str | None:
     """Return an ``owner/model`` ID from a Hub repo ID or canonical URL."""
     text = value.strip()

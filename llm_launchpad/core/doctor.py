@@ -162,15 +162,3 @@ def doctor_exit_code(checks: tuple[DoctorCheck, ...]) -> int:
     """Return 1 when any required check failed, else 0."""
 
     return 1 if any(not check.ok and check.required for check in checks) else 0
-
-
-def write_probe_file(directory: Path) -> bool:
-    """Best-effort writability probe used by doctor helpers."""
-
-    try:
-        probe = directory / ".doctor_write_test"
-        probe.write_text("ok")
-        probe.unlink(missing_ok=True)
-    except OSError:
-        return False
-    return True

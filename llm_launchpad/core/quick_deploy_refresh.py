@@ -1268,10 +1268,6 @@ def _canonical_unsloth_gguf_repo_ids(
     return tuple(repo_ids)
 
 
-def _hf_search_terms(candidate: AAModelCandidate) -> list[str]:
-    return _ranked_hf_search_terms(candidate)
-
-
 def _ranked_hf_search_terms(candidate: AAModelCandidate) -> list[str]:
     values = [
         _repo_model_name(_repo_id_from_huggingface_url(candidate.huggingface_url) or ""),

@@ -181,14 +181,6 @@ def _parse_bool_env(name: str, default: bool) -> bool:
     return mouse_defaults.parse_bool_env(name, default)
 
 
-def _is_ssh_session() -> bool:
-    return mouse_defaults.is_ssh_session()
-
-
-def _likely_remote_clipboard_supported() -> bool:
-    return mouse_defaults.likely_remote_clipboard_supported()
-
-
 def _default_tui_mouse_enabled() -> bool:
     return mouse_defaults.default_tui_mouse_enabled()
 
