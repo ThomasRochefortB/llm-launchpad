@@ -18,11 +18,18 @@ from ...core.quick_deploy import (
     get_quick_deploy_profile,
     quick_deploy_profile_for_plan,
     quick_deploy_model_label_parts,
+    retune_quick_deploy_plan,
     resolve_quick_deploy_plans,
 )
 from ...core.provider_options import prime_provider_options
-from ...protocol.enums import BillingModel, ComputeProvider, QuoteAvailability
-from ...protocol.models import InferencePlan
+from ...protocol.enums import (
+    BillingModel,
+    CertificationState,
+    ComputeProvider,
+    QuoteAvailability,
+    ServingObjective,
+)
+from ...protocol.models import DeploymentConfig, InferencePlan
 from ..widgets.input_form import FormField, ToggleField
 from .copy_enabled import CopyEnabledScreen
 
@@ -72,8 +79,43 @@ def _render_profile_summary(profile: QuickDeployProfile, plan: InferencePlan) ->
         )
     if profile.quant:
         lines.insert(-1, f"[bold]Quant[/bold]    {_escape_markup(profile.quant)}")
-    if profile.required_vram_gb:
-        lines.append(f"[bold]VRAM[/bold]     {profile.required_vram_gb:.0f} GB required")
+    required_memory = (
+        plan.assessment.memory.total_gb
+        if plan.assessment is not None
+        else profile.required_vram_gb
+    )
+    if required_memory:
+        lines.append(f"[bold]VRAM[/bold]     {required_memory:.0f} GB required")
+    requirements = plan.recipe.serving_requirements
+    if requirements is not None:
+        lines.append(
+            f"[bold]Optimize[/bold] {_escape_markup(requirements.objective.display_name)}"
+        )
+    if plan.assessment is not None:
+        single = max(
+            (
+                point.output_tokens_per_second or 0.0
+                for point in plan.assessment.performance
+                if point.concurrency == 1
+            ),
+            default=0.0,
+        )
+        aggregate = max(
+            (
+                point.aggregate_output_tokens_per_second or 0.0
+                for point in plan.assessment.performance
+            ),
+            default=0.0,
+        )
+        evidence = (
+            "certified"
+            if plan.assessment.certification == CertificationState.CERTIFIED
+            else "estimated; verified during deploy"
+        )
+        if single > 0:
+            lines.append(f"[bold]Single[/bold]   ~{single:.0f} output tok/s")
+            lines.append(f"[bold]Batch[/bold]    ~{aggregate:.0f} aggregate tok/s")
+        lines.append(f"[bold]Evidence[/bold] {_escape_markup(evidence)}")
     if profile.speculative_decoding is not None:
         lines.append(
             "[bold]Spec decode[/bold] Native MTP · up to "
@@ -81,7 +123,7 @@ def _render_profile_summary(profile: QuickDeployProfile, plan: InferencePlan) ->
         )
     lines.extend(
         [
-            f"[bold]Max ctx[/bold]  {_escape_markup(format_context_length(profile.max_context_tokens))}",
+            f"[bold]Context[/bold]  Full {_escape_markup(format_context_length(profile.max_context_tokens))}",
             f"[bold]Hourly[/bold]   {_escape_markup(_plan_hourly_cost(plan))}",
             f"[bold]Monthly[/bold]  {_escape_markup(_plan_monthly_cost(plan))}",
             f"[bold]Model[/bold]    {_escape_markup(plan.recipe.model_id)}",
@@ -191,15 +233,21 @@ class QuickDeployScreen(CopyEnabledScreen):
             plan.quote.id: plan
             for plan in self._alternative_plans
         }
+        requirements = self.plan.recipe.serving_requirements
+        self._objective = (
+            requirements.objective
+            if requirements is not None
+            else ServingObjective.GENERAL_PURPOSE
+        )
 
     def compose(self) -> ComposeResult:
         yield Static(
-            "[bold #7bf168]Quick Deploy[/]  "
-            f"[dim]Curated inference plan for[/dim] {_render_profile_label(self.profile)}",
+            "[bold #7bf168]Deploy endpoint[/]  "
+            f"[dim]Recommended plan for[/dim] {_render_profile_label(self.profile)}",
             id="quick-deploy-title",
         )
         yield Static(
-            "Review the curated profile, add optional naming overrides, then deploy.",
+            "Full context, GPU residency, and throughput are verified before publication.",
             id="quick-deploy-subtitle",
         )
         yield Static("")
@@ -211,8 +259,8 @@ class QuickDeployScreen(CopyEnabledScreen):
                     id="quick-deploy-profile-body",
                 )
             with Vertical(id="quick-deploy-form"):
+                yield Static("Fulfillment", classes="form-label")
                 if len(self._alternative_plans) > 1:
-                    yield Static("Fulfillment", classes="form-label")
                     yield Select(
                         options=[
                             (
@@ -229,6 +277,11 @@ class QuickDeployScreen(CopyEnabledScreen):
                         "[dim]The provider is revealed here because it determines billing, region, and credentials.[/dim]",
                         id="quick-fulfillment-note",
                     )
+                else:
+                    yield Static(
+                        _fulfillment_option(self.plan, recommended=True),
+                        id="quick-fulfillment-single",
+                    )
                 if self.profile.speculative_decoding is not None:
                     yield ToggleField(
                         "Use MTP speculative decoding",
@@ -240,6 +293,20 @@ class QuickDeployScreen(CopyEnabledScreen):
                         id="quick-speculative-note",
                     )
                 yield Button("Advanced options...", id="toggle-advanced-quick", variant="default")
+                if self.plan.recipe.serving_requirements is not None:
+                    yield Static("Optimize for", classes="form-label quick-advanced")
+                    yield Select(
+                        options=[
+                            ("General purpose (recommended)", ServingObjective.GENERAL_PURPOSE.value),
+                            ("Interactive", ServingObjective.INTERACTIVE.value),
+                            ("Throughput", ServingObjective.THROUGHPUT.value),
+                            ("Benchmark", ServingObjective.BENCHMARK.value),
+                        ],
+                        value=self._objective.value,
+                        allow_blank=False,
+                        id="quick-objective",
+                        classes="quick-advanced",
+                    )
                 yield FormField(
                     "Instance name (optional)",
                     "quick-instance-name",
@@ -252,12 +319,13 @@ class QuickDeployScreen(CopyEnabledScreen):
                     hint="Leave blank to use the selected provider's standard naming.",
                     classes="quick-advanced",
                 )
-                yield ToggleField(
-                    "Warm up after deploy",
-                    "quick-warmup",
-                    default=True,
-                    classes="quick-advanced",
-                )
+                if self.plan.recipe.serving_requirements is None:
+                    yield ToggleField(
+                        "Warm up after deploy",
+                        "quick-warmup",
+                        default=True,
+                        classes="quick-advanced",
+                    )
                 yield ToggleField(
                     "Show debug logs",
                     "quick-debug-logs",
@@ -316,7 +384,46 @@ class QuickDeployScreen(CopyEnabledScreen):
             self._deploy()
 
     def on_select_changed(self, event: Select.Changed) -> None:
-        if event.select.id != "quick-fulfillment" or not isinstance(event.value, str):
+        if not isinstance(event.value, str):
+            return
+        if event.select.id == "quick-objective":
+            try:
+                objective = ServingObjective(event.value)
+            except ValueError:
+                return
+            self._objective = objective
+            selected_quote_id = self.plan.quote.id
+            self._alternative_plans = tuple(
+                retune_quick_deploy_plan(self.profile, plan, objective)
+                for plan in self._alternative_plans
+            )
+            self._plan_by_id = {
+                plan.quote.id: plan for plan in self._alternative_plans
+            }
+            self.plan = self._plan_by_id.get(
+                selected_quote_id,
+                self._alternative_plans[0],
+            )
+            self.query_one("#quick-deploy-profile-body", Static).update(
+                _render_profile_summary(self.profile, self.plan)
+            )
+            try:
+                fulfillment = self.query_one("#quick-fulfillment", Select)
+            except Exception:
+                fulfillment = None
+            if fulfillment is not None:
+                fulfillment.set_options(
+                    [
+                        (
+                            _fulfillment_option(plan, recommended=index == 0),
+                            plan.quote.id,
+                        )
+                        for index, plan in enumerate(self._alternative_plans)
+                    ]
+                )
+                fulfillment.value = self.plan.quote.id
+            return
+        if event.select.id != "quick-fulfillment":
             return
         plan = self._plan_by_id.get(event.value)
         if plan is None:
@@ -349,32 +456,56 @@ class QuickDeployScreen(CopyEnabledScreen):
             if self.profile.speculative_decoding is not None
             else False
         )
-        config = build_quick_deploy_config(
-            self.profile,
-            plan=self.plan,
-            instance_name=self.query_one("#quick-instance-name", Input).value,
-            app_name=self.query_one("#quick-app-name", Input).value,
-            do_warmup=self.query_one("#quick-warmup", Switch).value,
-            show_debug_logs=self.query_one("#quick-debug-logs", Switch).value,
-            enable_speculative_decoding=enable_speculative_decoding,
-        )
-        if config.provider == ComputeProvider.PRIME:
-            options = prime_provider_options(config)
-            allow_insecure_http = self.query_one(
-                "#quick-prime-insecure-http", Switch
-            ).value
-            config.provider_options = replace(
-                options,
-                disk_id=(
-                    self.query_one("#quick-prime-disk-id", Input).value.strip()
-                    or options.disk_id
+        instance_name = self.query_one("#quick-instance-name", Input).value
+        app_name = self.query_one("#quick-app-name", Input).value
+        show_debug_logs = self.query_one("#quick-debug-logs", Switch).value
+
+        def _config_for_plan(plan: InferencePlan) -> DeploymentConfig:
+            candidate = build_quick_deploy_config(
+                self.profile,
+                plan=plan,
+                instance_name=instance_name,
+                app_name=app_name,
+                do_warmup=(
+                    True
+                    if plan.recipe.serving_requirements is not None
+                    else self.query_one("#quick-warmup", Switch).value
                 ),
-                allow_insecure_http=allow_insecure_http,
-                keep_failed_resource=self.query_one(
-                    "#quick-prime-keep-failed", Switch
-                ).value,
-                auto_disk=self.query_one("#quick-prime-auto-disk", Switch).value,
+                show_debug_logs=show_debug_logs,
+                enable_speculative_decoding=enable_speculative_decoding,
             )
+            if candidate.provider == ComputeProvider.PRIME:
+                options = prime_provider_options(candidate)
+                candidate.provider_options = replace(
+                    options,
+                    disk_id=(
+                        self.query_one("#quick-prime-disk-id", Input).value.strip()
+                        or options.disk_id
+                    ),
+                    allow_insecure_http=self.query_one(
+                        "#quick-prime-insecure-http", Switch
+                    ).value,
+                    keep_failed_resource=self.query_one(
+                        "#quick-prime-keep-failed", Switch
+                    ).value,
+                    auto_disk=self.query_one("#quick-prime-auto-disk", Switch).value,
+                )
+            return candidate
+
+        config = _config_for_plan(self.plan)
+        approved_price = self.plan.quote.price_per_hour_usd
+        fallback_plans = [
+            plan
+            for plan in self._alternative_plans
+            if plan.quote.id != self.plan.quote.id
+            and plan.quote.price_per_hour_usd is not None
+            and (
+                approved_price is None
+                or plan.quote.price_per_hour_usd <= approved_price
+            )
+            and (plan.assessment is None or plan.assessment.fits)
+        ]
+        config.fallback_configs = tuple(_config_for_plan(plan) for plan in fallback_plans)
         self.app.begin_deploy(config)  # type: ignore[attr-defined]
 
     def action_pop_screen(self) -> None:

@@ -309,6 +309,8 @@ class ModalBackend:
             args += ["--port", str(config.port)]
         if config.n_gpu_layers is not None:
             args += ["--n-gpu-layers", str(config.n_gpu_layers)]
+        if config.placement_assessment is not None:
+            args += ["--serving-fingerprint", config.placement_assessment.fingerprint]
         return args
 
     @staticmethod

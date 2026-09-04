@@ -10,7 +10,11 @@ import time
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from .gguf_metadata import GgufMtpCapability, fetch_gguf_mtp_capability
+from .gguf_metadata import (
+    GgufMtpCapability,
+    fetch_gguf_mtp_capability,
+    fetch_gguf_serving_metadata,
+)
 from .shutdown import is_shutting_down
 
 ModelRankMode = Literal["downloads", "trending"]
@@ -36,6 +40,13 @@ class GgufQuantMetadata:
     vram_gb_by_quant: dict[str, float]
     architecture: str | None = None
     mtp: GgufMtpCapability | None = None
+    context_length: int | None = None
+    block_count: int | None = None
+    embedding_length: int | None = None
+    attention_head_count: int | None = None
+    attention_head_count_kv: int | None = None
+    attention_key_length: int | None = None
+    attention_value_length: int | None = None
 
 
 @dataclass(frozen=True)
@@ -55,7 +66,9 @@ _HF_REQUEST_TIMEOUT_SECONDS = 10.0
 _HF_ETAG_TIMEOUT_SECONDS = 10.0
 _DEFAULT_CONTEXT_TOKENS = 8192
 _CACHE: dict[tuple[str, str, int], tuple[float, list[ModelCandidate]]] = {}
-_GGUF_QUANT_METADATA_CACHE: dict[tuple[str, str, str, bool], tuple[float, GgufQuantMetadata]] = {}
+_GGUF_QUANT_METADATA_CACHE: dict[
+    tuple[str, str, str, bool, bool], tuple[float, GgufQuantMetadata]
+] = {}
 _VLLM_MEMORY_CACHE: dict[tuple[int, str, str, int], tuple[float, VllmMemoryBreakdown]] = {}
 _HF_JSON_FILE_CACHE: dict[tuple[str, str, str], tuple[float, dict[str, Any] | None]] = {}
 _SORT_BY_MODE: dict[ModelRankMode, str] = {
@@ -435,6 +448,7 @@ def fetch_gguf_quant_metadata(
     revision: str | None = None,
     *,
     inspect_mtp: bool = False,
+    inspect_serving: bool = False,
     mtp_quant: str | None = None,
     force_refresh: bool = False,
 ) -> GgufQuantMetadata:
@@ -446,7 +460,7 @@ def fetch_gguf_quant_metadata(
         return GgufQuantMetadata(quantizations=[], vram_gb_by_quant={})
     revision_key = (revision or "").strip()
     quant_key = (mtp_quant or "").strip().casefold()
-    cache_key = (normalized_repo, revision_key, quant_key, inspect_mtp)
+    cache_key = (normalized_repo, revision_key, quant_key, inspect_mtp, inspect_serving)
     now = time.time()
     cached = _GGUF_QUANT_METADATA_CACHE.get(cache_key)
     if not force_refresh and cached and (now - cached[0]) < _CACHE_TTL_SECONDS:
@@ -456,6 +470,13 @@ def fetch_gguf_quant_metadata(
             vram_gb_by_quant=dict(cached_metadata.vram_gb_by_quant),
             architecture=cached_metadata.architecture,
             mtp=cached_metadata.mtp,
+            context_length=cached_metadata.context_length,
+            block_count=cached_metadata.block_count,
+            embedding_length=cached_metadata.embedding_length,
+            attention_head_count=cached_metadata.attention_head_count,
+            attention_head_count_kv=cached_metadata.attention_head_count_kv,
+            attention_key_length=cached_metadata.attention_key_length,
+            attention_value_length=cached_metadata.attention_value_length,
         )
 
     try:
@@ -478,6 +499,74 @@ def fetch_gguf_quant_metadata(
     quantizations = _extract_gguf_quantizations(siblings)
     gguf_payload = getattr(info, "gguf", None)
     architecture = _extract_gguf_architecture(gguf_payload)
+    context_length = _extract_gguf_positive_int(
+        gguf_payload,
+        "context_length",
+        "max_context_length",
+    )
+    block_count = _extract_gguf_positive_int(
+        gguf_payload,
+        "block_count",
+        "num_hidden_layers",
+    )
+    embedding_length = _extract_gguf_positive_int(
+        gguf_payload,
+        "embedding_length",
+        "hidden_size",
+    )
+    attention_head_count = _extract_gguf_positive_int(
+        gguf_payload,
+        "attention.head_count",
+        "attention_head_count",
+        "num_attention_heads",
+    )
+    attention_head_count_kv = _extract_gguf_positive_int(
+        gguf_payload,
+        "attention.head_count_kv",
+        "attention_head_count_kv",
+        "num_key_value_heads",
+    )
+    attention_key_length = _extract_gguf_positive_int(
+        gguf_payload,
+        "attention.key_length",
+        "attention_key_length",
+        "head_dim",
+    )
+    attention_value_length = _extract_gguf_positive_int(
+        gguf_payload,
+        "attention.value_length",
+        "attention_value_length",
+        "head_dim",
+    )
+    if inspect_serving and (
+        block_count is None
+        or embedding_length is None
+        or attention_head_count is None
+        or attention_head_count_kv is None
+    ):
+        serving_metadata = fetch_gguf_serving_metadata(
+            normalized_repo,
+            siblings,
+            revision=revision_key or None,
+            quant=mtp_quant,
+        )
+        if serving_metadata is not None:
+            architecture = serving_metadata.architecture or architecture
+            context_length = serving_metadata.context_length or context_length
+            block_count = serving_metadata.block_count or block_count
+            embedding_length = serving_metadata.embedding_length or embedding_length
+            attention_head_count = (
+                serving_metadata.attention_head_count or attention_head_count
+            )
+            attention_head_count_kv = (
+                serving_metadata.attention_head_count_kv or attention_head_count_kv
+            )
+            attention_key_length = (
+                serving_metadata.attention_key_length or attention_key_length
+            )
+            attention_value_length = (
+                serving_metadata.attention_value_length or attention_value_length
+            )
     vram_gb_by_quant = _extract_gguf_vram_by_quant(gguf_payload)
     page_quant_data = _fetch_gguf_quantization_data_from_model_page(normalized_repo)
     page_quantizations, page_vram_gb_by_quant = _extract_quantizations_and_vram_from_quantization_data(page_quant_data)
@@ -505,6 +594,13 @@ def fetch_gguf_quant_metadata(
         vram_gb_by_quant=dict(vram_gb_by_quant),
         architecture=architecture,
         mtp=mtp,
+        context_length=context_length,
+        block_count=block_count,
+        embedding_length=embedding_length,
+        attention_head_count=attention_head_count,
+        attention_head_count_kv=attention_head_count_kv,
+        attention_key_length=attention_key_length,
+        attention_value_length=attention_value_length,
     )
     _GGUF_QUANT_METADATA_CACHE[cache_key] = (now, metadata)
     return GgufQuantMetadata(
@@ -512,6 +608,13 @@ def fetch_gguf_quant_metadata(
         vram_gb_by_quant=dict(metadata.vram_gb_by_quant),
         architecture=metadata.architecture,
         mtp=metadata.mtp,
+        context_length=metadata.context_length,
+        block_count=metadata.block_count,
+        embedding_length=metadata.embedding_length,
+        attention_head_count=metadata.attention_head_count,
+        attention_head_count_kv=metadata.attention_head_count_kv,
+        attention_key_length=metadata.attention_key_length,
+        attention_value_length=metadata.attention_value_length,
     )
 
 
@@ -623,6 +726,38 @@ def _extract_gguf_architecture(gguf_payload: Any) -> str | None:
         if architecture:
             return architecture
     return None
+
+
+def _extract_gguf_positive_int(gguf_payload: Any, *keys: str) -> int | None:
+    """Read a positive architecture scalar from the Hub GGUF payload.
+
+    Hugging Face has exposed GGUF metadata in both a flat dotted-key shape and
+    nested ``metadata`` objects. Matching suffixes keeps this compatible with
+    architecture-prefixed keys such as ``qwen3.attention.head_count_kv``.
+    """
+
+    expected = {key.strip().casefold() for key in keys if key.strip()}
+    matches: list[int] = []
+
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            for raw_key, value in node.items():
+                key = str(raw_key).strip().casefold()
+                if key in expected or any(key.endswith(f".{item}") for item in expected):
+                    try:
+                        numeric = int(value)
+                    except (TypeError, ValueError):
+                        numeric = 0
+                    if numeric > 0 and not isinstance(value, bool):
+                        matches.append(numeric)
+                if isinstance(value, (dict, list, tuple)):
+                    _walk(value)
+        elif isinstance(node, (list, tuple)):
+            for value in node:
+                _walk(value)
+
+    _walk(gguf_payload)
+    return max(matches) if matches else None
 
 
 def _extract_gguf_vram_by_quant(gguf_payload: Any) -> dict[str, float]:

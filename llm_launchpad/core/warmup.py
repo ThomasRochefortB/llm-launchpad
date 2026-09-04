@@ -5,16 +5,24 @@ from __future__ import annotations
 from .shutdown import is_shutting_down, shutdown_event
 
 import json
+import math
 import os
 import queue
 import re
 import subprocess
 import threading
 import time
-from typing import Generator, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Generator, Optional
 from urllib.parse import urlsplit
 
-from ..protocol.enums import BackendType, ComputeProvider, DeploymentState, OperationType
+from ..protocol.enums import (
+    BackendType,
+    ComputeProvider,
+    DeploymentState,
+    OperationType,
+    ServingObjective,
+)
 from ..protocol.events import (
     BaseEvent,
     ErrorEvent,
@@ -22,8 +30,10 @@ from ..protocol.events import (
     OperationCompleteEvent,
     StateChangeEvent,
 )
+from ..protocol.models import PerformancePoint, PlacementAssessment, ServingRequirements
 from .backend import ModalBackend
 from .diagnostics import log_exception
+from .llamacpp_planner import attestation_now, save_runtime_attestation
 from .naming import legacy_app_name
 from .prime_backend import PrimeBackend
 
@@ -34,6 +44,36 @@ _MODAL_GPU_WAIT_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _MODAL_RELAX_RE = re.compile(r"Relaxing requirements \((?P<requirements>[^)]+)\)", flags=re.IGNORECASE)
+
+_CALIBRATION_BUDGET_SECONDS = 90.0
+_GENERAL_PURPOSE_MIN_OUTPUT_TPS = 8.0
+
+
+def extract_effective_context(payload: object) -> int | None:
+    """Extract the active context size from a llama.cpp ``/props`` payload."""
+
+    exact_keys = {"n_ctx", "ctx_size", "context_size", "context_tokens"}
+    values: list[int] = []
+
+    def _walk(node: object) -> None:
+        if isinstance(node, dict):
+            for raw_key, value in node.items():
+                key = str(raw_key).strip().casefold()
+                if key in exact_keys:
+                    try:
+                        numeric = int(value)
+                    except (TypeError, ValueError):
+                        numeric = 0
+                    if numeric > 0:
+                        values.append(numeric)
+                if isinstance(value, (dict, list, tuple)):
+                    _walk(value)
+        elif isinstance(node, (list, tuple)):
+            for value in node:
+                _walk(value)
+
+    _walk(payload)
+    return max(values) if values else None
 
 
 def modal_gpu_scheduling_hint(response_text: str) -> str | None:
@@ -143,6 +183,9 @@ class WarmupRunner:
         api_key: Optional[str] = None,
         pod_id: Optional[str] = None,
         prime_backend: PrimeBackend | None = None,
+        serving_requirements: ServingRequirements | None = None,
+        placement_assessment: PlacementAssessment | None = None,
+        runtime_id: str | None = None,
     ) -> EventStream:
         """Probe endpoint readiness and optionally tail logs."""
         yield StateChangeEvent(
@@ -336,6 +379,172 @@ class WarmupRunner:
                             logs_proc.terminate()
                         except Exception:
                             log_exception("Failed to terminate Modal log tail after readiness")
+                    attestation = None
+                    if serving_requirements is not None:
+                        yield StateChangeEvent(
+                            current=DeploymentState.VERIFYING,
+                            operation=OperationType.WARMUP,
+                            detail="Verifying full-context GPU residency",
+                        )
+                        effective_context = serving_requirements.context_tokens
+                        if backend == BackendType.LLAMACPP:
+                            props_url = endpoint_root_url(server_url) + "/props"
+                            try:
+                                props_response = requests.get(
+                                    props_url,
+                                    headers=headers,
+                                    timeout=15,
+                                )
+                                props_response.raise_for_status()
+                                effective_context = extract_effective_context(
+                                    props_response.json()
+                                ) or 0
+                            except Exception as exc:
+                                last_err = f"runtime property verification failed: {exc}"
+                                yield ErrorEvent(
+                                    message=(
+                                        "Endpoint responded, but Launchpad could not verify "
+                                        f"its effective context: {exc}"
+                                    ),
+                                    operation=OperationType.WARMUP,
+                                    recoverable=False,
+                                )
+                                yield OperationCompleteEvent(
+                                    operation=OperationType.WARMUP,
+                                    success=False,
+                                    exit_code=1,
+                                    detail=last_err,
+                                )
+                                return
+                        if placement_assessment is None:
+                            detail = "No placement assessment was supplied for runtime certification."
+                            yield ErrorEvent(
+                                message=f"Runtime attestation failed: {detail}",
+                                operation=OperationType.WARMUP,
+                                recoverable=False,
+                            )
+                            yield OperationCompleteEvent(
+                                operation=OperationType.WARMUP,
+                                success=False,
+                                exit_code=1,
+                                detail=detail,
+                            )
+                            return
+                        gpu_resident = bool(
+                            placement_assessment.gpu_resident
+                            and placement_assessment.tuning.gpu_layers.casefold() == "all"
+                        )
+                        if (
+                            effective_context < serving_requirements.context_tokens
+                            or (serving_requirements.gpu_only and not gpu_resident)
+                        ):
+                            detail = (
+                                f"Requested {serving_requirements.context_tokens:,} context, "
+                                f"runtime reported {effective_context:,}; "
+                                f"GPU-only={gpu_resident}."
+                            )
+                            yield ErrorEvent(
+                                message=f"Runtime attestation failed: {detail}",
+                                operation=OperationType.WARMUP,
+                                recoverable=False,
+                            )
+                            yield OperationCompleteEvent(
+                                operation=OperationType.WARMUP,
+                                success=False,
+                                exit_code=1,
+                                detail=detail,
+                            )
+                            return
+
+                        performance: tuple[PerformancePoint, ...] = ()
+                        yield StateChangeEvent(
+                            current=DeploymentState.CALIBRATING,
+                            operation=OperationType.WARMUP,
+                            detail="Measuring endpoint throughput",
+                        )
+                        performance = _calibrate_endpoint(
+                            requests,
+                            server_url=server_url,
+                            model=llama_probe_model,
+                            headers=headers,
+                            parallel_slots=(
+                                placement_assessment.tuning.parallel_slots
+                                if placement_assessment is not None
+                                else 1
+                            ),
+                            price_per_hour_usd=serving_requirements.max_hourly_cost_usd,
+                            budget_seconds=_CALIBRATION_BUDGET_SECONDS,
+                        )
+                        accepted, calibration_detail = _calibration_is_acceptable(
+                            performance,
+                            serving_requirements.objective,
+                        )
+                        if not accepted:
+                            yield ErrorEvent(
+                                message=f"Endpoint performance certification failed: {calibration_detail}",
+                                operation=OperationType.WARMUP,
+                                recoverable=True,
+                            )
+                            yield OperationCompleteEvent(
+                                operation=OperationType.WARMUP,
+                                success=False,
+                                exit_code=1,
+                                detail=calibration_detail,
+                            )
+                            return
+
+                        total_layers = max(
+                            1,
+                            placement_assessment.memory.total_layer_count or 0,
+                        )
+                        attestation = attestation_now(
+                            fingerprint=placement_assessment.fingerprint,
+                            requested_context_tokens=serving_requirements.context_tokens,
+                            effective_context_tokens=effective_context,
+                            gpu_layers=total_layers,
+                            total_layers=total_layers,
+                            gpu_resident=True,
+                            memory=placement_assessment.memory,
+                            performance=performance,
+                            runtime_id=runtime_id,
+                        )
+                        try:
+                            save_runtime_attestation(attestation)
+                        except Exception as exc:
+                            yield LogEvent(
+                                line=f"Warning: could not cache serving certificate: {exc}",
+                                operation=OperationType.WARMUP,
+                            )
+                        best_single = max(
+                            (
+                                point.output_tokens_per_second or 0.0
+                                for point in performance
+                                if point.concurrency == 1
+                            ),
+                            default=0.0,
+                        )
+                        best_aggregate = max(
+                            (
+                                point.aggregate_output_tokens_per_second or 0.0
+                                for point in performance
+                            ),
+                            default=0.0,
+                        )
+                        metric = ""
+                        if best_single > 0:
+                            metric = (
+                                f" · {best_single:.1f} tok/s single, "
+                                f"{best_aggregate:.1f} tok/s aggregate"
+                            )
+                        yield LogEvent(
+                            line=(
+                                f"Full {effective_context:,}-token context verified on GPU"
+                                f"{metric}."
+                            ),
+                            operation=OperationType.WARMUP,
+                            is_milestone=True,
+                        )
+
                     yield LogEvent(line="Server is ready!")
                     curl_cmd = ModalBackend.test_curl_command(
                         backend,
@@ -350,7 +559,9 @@ class WarmupRunner:
                         current=DeploymentState.HEALTHY, operation=OperationType.WARMUP
                     )
                     yield OperationCompleteEvent(
-                        operation=OperationType.WARMUP, success=True, data={"url": server_url}
+                        operation=OperationType.WARMUP,
+                        success=True,
+                        data={"url": server_url, "attestation": attestation},
                     )
                     return
                 if 200 <= resp.status_code < 300 and readiness_reason:
@@ -406,6 +617,223 @@ class WarmupRunner:
                     shutdown_event().wait(timeout=chunk)
                 yield from _drain_queue()
             backoff = min(max_backoff, backoff * 1.5)
+
+
+def _calibrate_endpoint(
+    requests_module: Any,
+    *,
+    server_url: str,
+    model: str,
+    headers: dict[str, str],
+    parallel_slots: int,
+    price_per_hour_usd: float | None,
+    budget_seconds: float,
+) -> tuple[PerformancePoint, ...]:
+    """Measure a bounded performance curve without requiring aiperf."""
+
+    root = endpoint_root_url(server_url)
+    endpoint = root + "/v1/completions"
+    started = time.monotonic()
+    scenarios = [(512, 1), (4096, 1)] + [
+        (512, concurrency)
+        for concurrency in (2, 4, 8)
+        if concurrency <= max(1, parallel_slots)
+    ]
+    points: list[PerformancePoint] = []
+    previous_aggregate = 0.0
+    for prompt_tokens, concurrency in scenarios:
+        remaining = budget_seconds - (time.monotonic() - started)
+        if remaining <= 1.0:
+            break
+        scenario_started = time.monotonic()
+        results: list[dict[str, float]] = []
+        errors = 0
+        timeout = max(1.0, min(60.0, remaining))
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = [
+                executor.submit(
+                    _streaming_calibration_request,
+                    requests_module,
+                    endpoint=endpoint,
+                    model=model,
+                    headers=headers,
+                    prompt_tokens=prompt_tokens,
+                    output_tokens=128,
+                    timeout=timeout,
+                )
+                for _ in range(concurrency)
+            ]
+            for future in as_completed(futures):
+                try:
+                    results.append(future.result())
+                except Exception:
+                    errors += 1
+        elapsed = max(0.001, time.monotonic() - scenario_started)
+        successful = len(results)
+        completion_tokens = sum(row["completion_tokens"] for row in results)
+        latencies = sorted(row["latency"] for row in results)
+        output_rates = [row["output_tps"] for row in results]
+        prompt_rates = [row["prompt_tps"] for row in results]
+        ttfts = [row["ttft"] for row in results]
+        aggregate = completion_tokens / elapsed if successful else 0.0
+        error_rate = errors / max(1, concurrency)
+        p95_index = max(0, math.ceil(len(latencies) * 0.95) - 1) if latencies else 0
+        point = PerformancePoint(
+            prompt_tokens=prompt_tokens,
+            output_tokens=128,
+            concurrency=concurrency,
+            prompt_tokens_per_second=(
+                sum(prompt_rates) / len(prompt_rates) if prompt_rates else None
+            ),
+            output_tokens_per_second=(
+                sum(output_rates) / len(output_rates) if output_rates else None
+            ),
+            aggregate_output_tokens_per_second=aggregate or None,
+            time_to_first_token_seconds=(
+                sum(ttfts) / len(ttfts) if ttfts else None
+            ),
+            p95_latency_seconds=(latencies[p95_index] if latencies else None),
+            error_rate=error_rate,
+            output_tokens_per_dollar=(
+                aggregate * 3600.0 / price_per_hour_usd
+                if price_per_hour_usd is not None and price_per_hour_usd > 0
+                else None
+            ),
+            measured=True,
+        )
+        points.append(point)
+        if concurrency > 1:
+            if error_rate > 0.05 or (
+                previous_aggregate > 0 and aggregate <= previous_aggregate * 1.02
+            ):
+                break
+            previous_aggregate = aggregate
+        elif prompt_tokens == 512:
+            previous_aggregate = aggregate
+    return tuple(points)
+
+
+def _streaming_calibration_request(
+    requests_module: Any,
+    *,
+    endpoint: str,
+    model: str,
+    headers: dict[str, str],
+    prompt_tokens: int,
+    output_tokens: int,
+    timeout: float,
+) -> dict[str, float]:
+    """Run one streaming completion and return timing primitives."""
+
+    prompt = " calibration" * max(1, prompt_tokens)
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "max_tokens": output_tokens,
+        "temperature": 0,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    started = time.monotonic()
+    response = requests_module.post(
+        endpoint,
+        headers=headers,
+        data=json.dumps(payload),
+        timeout=timeout,
+        stream=True,
+    )
+    status_code = int(getattr(response, "status_code", 0))
+    if not 200 <= status_code < 300:
+        raise RuntimeError(f"calibration returned HTTP {status_code}")
+
+    first_token_at: float | None = None
+    observed_chunks = 0
+    usage_completion_tokens = 0
+    iterator = getattr(response, "iter_lines", None)
+    if callable(iterator):
+        for raw_line in iterator(decode_unicode=True):
+            line = str(raw_line or "").strip()
+            if not line.startswith("data:"):
+                continue
+            raw_data = line[5:].strip()
+            if not raw_data or raw_data == "[DONE]":
+                continue
+            try:
+                chunk = json.loads(raw_data)
+            except json.JSONDecodeError:
+                continue
+            usage = chunk.get("usage") if isinstance(chunk, dict) else None
+            if isinstance(usage, dict):
+                try:
+                    usage_completion_tokens = max(
+                        usage_completion_tokens,
+                        int(usage.get("completion_tokens") or 0),
+                    )
+                except (TypeError, ValueError):
+                    pass
+            choices = chunk.get("choices") if isinstance(chunk, dict) else None
+            if not isinstance(choices, list) or not choices:
+                continue
+            choice = choices[0] if isinstance(choices[0], dict) else {}
+            raw_delta = choice.get("delta")
+            delta = raw_delta if isinstance(raw_delta, dict) else {}
+            text = str(choice.get("text") or delta.get("content") or "")
+            if text:
+                if first_token_at is None:
+                    first_token_at = time.monotonic()
+                observed_chunks += 1
+    else:
+        # Test doubles and non-streaming compatibility proxies may only expose
+        # a final JSON body. This still supplies conservative end-to-end rates.
+        body = response.json()
+        first_token_at = time.monotonic()
+        usage = body.get("usage") if isinstance(body, dict) else None
+        if isinstance(usage, dict):
+            usage_completion_tokens = int(usage.get("completion_tokens") or 0)
+        observed_chunks = usage_completion_tokens
+
+    finished = time.monotonic()
+    first = first_token_at or finished
+    completion_tokens = float(max(1, usage_completion_tokens or observed_chunks))
+    latency = max(0.001, finished - started)
+    ttft = max(0.001, first - started)
+    decode_seconds = max(0.001, finished - first)
+    if first >= finished:
+        decode_seconds = latency
+    return {
+        "completion_tokens": completion_tokens,
+        "latency": latency,
+        "ttft": ttft,
+        "prompt_tps": float(prompt_tokens) / ttft,
+        "output_tps": completion_tokens / decode_seconds,
+    }
+
+
+def _calibration_is_acceptable(
+    performance: tuple[PerformancePoint, ...],
+    objective: ServingObjective,
+) -> tuple[bool, str]:
+    """Apply the minimal stability and interactivity policy for Fast Deploy."""
+
+    healthy = [point for point in performance if point.error_rate <= 0.05]
+    if not healthy:
+        return False, "the bounded calibration produced no stable requests"
+    if objective in {ServingObjective.GENERAL_PURPOSE, ServingObjective.INTERACTIVE}:
+        single = max(
+            (
+                point.output_tokens_per_second or 0.0
+                for point in healthy
+                if point.concurrency == 1
+            ),
+            default=0.0,
+        )
+        if single < _GENERAL_PURPOSE_MIN_OUTPUT_TPS:
+            return (
+                False,
+                f"single-request output was {single:.1f} tok/s; "
+                f"Fast Deploy requires {_GENERAL_PURPOSE_MIN_OUTPUT_TPS:.1f} tok/s",
+            )
+    return True, "performance policy satisfied"
 
 
 def fetch_historical_logs(

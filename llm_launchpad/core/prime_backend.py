@@ -102,6 +102,44 @@ PRIME_TUNNEL_LABEL = "llm-launchpad"
 PRIME_TUNNEL_PID_PATH = f"{PRIME_RUNTIME_ROOT}/tunnel.pid"
 PRIME_TUNNEL_LOG_PATH = f"{PRIME_RUNTIME_ROOT}/tunnel.log"
 PRIME_BOOTSTRAP_SSH_KEY_NAME = "llm-launchpad-bootstrap"
+
+
+def _llamacpp_fit_relevant_args(arguments: list[str]) -> list[str]:
+    """Keep memory-affecting common args accepted by llama-fit-params."""
+
+    supported = {
+        "-c",
+        "--ctx-size",
+        "-b",
+        "--batch-size",
+        "-ub",
+        "--ubatch-size",
+        "-ctk",
+        "--cache-type-k",
+        "-ctv",
+        "--cache-type-v",
+        "-ngl",
+        "--n-gpu-layers",
+        "--gpu-layers",
+        "-fa",
+        "--flash-attn",
+        "-fitt",
+        "--fit-target",
+    }
+    result: list[str] = []
+    index = 0
+    while index < len(arguments):
+        token = arguments[index]
+        if token.split("=", 1)[0] in supported:
+            result.append(token)
+            if "=" not in token and index + 1 < len(arguments):
+                result.append(arguments[index + 1])
+                index += 2
+                continue
+        index += 1
+    return result
+
+
 PRIME_BOOTSTRAP_SSH_KEY_PATH = SETTINGS_DIR / "prime" / "bootstrap_ed25519"
 PRIME_KNOWN_HOSTS_DIR = SETTINGS_DIR / "prime" / "known_hosts"
 
@@ -978,6 +1016,10 @@ class PrimeBackend:
                 "LLAMACPP_API_KEY": (config.endpoint_api_key or "").strip(),
                 "LLAMACPP_SERVER_ARGS": "\n".join(extra_args),
             }
+            if config.placement_assessment is not None:
+                env["LLM_LAUNCHPAD_SERVING_FINGERPRINT"] = (
+                    config.placement_assessment.fingerprint
+                )
             if config.n_gpu_layers is not None:
                 env["N_GPU_LAYERS"] = str(config.n_gpu_layers)
             if options.disk_id:
@@ -1212,6 +1254,11 @@ class PrimeBackend:
             values["HF_TOKEN"] = runtime_env["HF_TOKEN"]
         if config.backend == BackendType.LLAMACPP:
             values["LLAMA_ARG_API_KEY"] = endpoint_api_key
+            fingerprint = str(
+                runtime_env.get("LLM_LAUNCHPAD_SERVING_FINGERPRINT") or ""
+            ).strip()
+            if fingerprint:
+                values["LLM_LAUNCHPAD_SERVING_FINGERPRINT"] = fingerprint
             if prime_provider_options(config).disk_id:
                 values["LLAMA_CACHE"] = "/data/llama.cpp"
         else:
@@ -1288,7 +1335,31 @@ class PrimeBackend:
                     str(config.served_model_name or repo.rsplit("/", 1)[-1]),
                 ]
             )
-            inner = f'exec {shlex.join(llama_args)} --api-key "$LLAMA_ARG_API_KEY"'
+            server_extra_args = shlex.split(config.server_args or "")
+            fit_args = [
+                "/app/llama-fit-params",
+                "--hf-repo",
+                hf_repo,
+                *_llamacpp_fit_relevant_args(server_extra_args),
+            ]
+            attestation_marker = (
+                "echo LLM_LAUNCHPAD_ATTESTATION_JSON_BEGIN; "
+                "printf '{\"schema_version\":1,\"fingerprint\":\"%s\","
+                "\"gpu_only_requested\":true}\\n' "
+                '"$LLM_LAUNCHPAD_SERVING_FINGERPRINT"; '
+                "echo LLM_LAUNCHPAD_ATTESTATION_JSON_END; "
+            )
+            fit_guard = ""
+            if config.placement_assessment is not None:
+                fit_guard = (
+                    f"if [ -x /app/llama-fit-params ]; then {shlex.join(fit_args)} "
+                    "|| exit $?; fi; "
+                    f"{attestation_marker}"
+                )
+            inner = (
+                f'{fit_guard}exec {shlex.join(llama_args)} '
+                '--api-key "$LLAMA_ARG_API_KEY"'
+            )
             if not options.disk_id:
                 command.extend(
                     ["-v", "llm-launchpad-llama-cache:/root/.cache/llama.cpp"]

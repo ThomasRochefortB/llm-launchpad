@@ -12,6 +12,7 @@ from ..protocol.enums import BackendType, ComputeProvider
 from ..protocol.models import DeploymentConfig, EndpointInfo
 from .config import SETTINGS_DIR
 from .opencode import build_openai_connection_payload
+from .llamacpp_planner import runtime_attestation_from_dict, runtime_attestation_to_dict
 from .reasoning_profiles import (
     discover_reasoning_capabilities,
     reasoning_capabilities_from_dict,
@@ -74,6 +75,7 @@ def save_connection(
         "max_context_tokens": payload.get("context_limit"),
         "max_output_tokens": payload.get("output_limit"),
         "reasoning": payload.get("reasoning"),
+        "runtime_attestation": runtime_attestation_to_dict(config.runtime_attestation),
         "api_key": config.endpoint_api_key or endpoint.endpoint_api_key or "",
         "cached_at_epoch": time.time(),
     }
@@ -116,6 +118,9 @@ def merge_connections(
         )
         row.reasoning = row.reasoning or reasoning_capabilities_from_dict(
             cached.get("reasoning")
+        )
+        row.runtime_attestation = row.runtime_attestation or runtime_attestation_from_dict(
+            cached.get("runtime_attestation")
         )
         provider = str(cached.get("provider") or "")
         if provider in {item.value for item in ComputeProvider}:
@@ -172,6 +177,9 @@ def rows_from_connection_cache(
                 max_context_tokens=_positive_int(entry.get("max_context_tokens")),
                 max_output_tokens=_positive_int(entry.get("max_output_tokens")),
                 reasoning=reasoning_capabilities_from_dict(entry.get("reasoning")),
+                runtime_attestation=runtime_attestation_from_dict(
+                    entry.get("runtime_attestation")
+                ),
             )
         )
     return rows

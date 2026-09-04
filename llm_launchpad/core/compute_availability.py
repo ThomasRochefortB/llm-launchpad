@@ -29,6 +29,7 @@ from .inference_options import (
     estimate_cost_per_million_output_tokens,
     estimate_monthly_compute_cost,
 )
+from .llamacpp_planner import assess_memory_placement, assessment_score
 from .modal_cli import resolve_modal_cli_path
 from .modal_gpu import ModalGpuSpec, fetch_modal_gpu_catalog
 from .prime_auth import get_prime_auth_status
@@ -218,12 +219,55 @@ def plans_for_compute_profile(
     for placement in configuration.placements:
         if placement.is_spot or recipe.backend not in placement.supported_backends:
             continue
-        gpu_count = _placement_gpu_count(placement, required_vram_gb)
+        gpu_count = _placement_gpu_count(
+            placement,
+            required_vram_gb,
+            memory_estimate=profile.memory_estimate,
+        )
         if gpu_count is None:
             continue
         price = placement.price_per_hour_usd
         if price is not None and placement.price_is_per_gpu:
             price *= gpu_count
+        assessment = None
+        if (
+            profile.memory_estimate is not None
+            and recipe.serving_requirements is not None
+            and recipe.runtime_tuning is not None
+        ):
+            assessment = assess_memory_placement(
+                profile.memory_estimate,
+                model_id=recipe.model_id,
+                revision=None,
+                quant=recipe.quant,
+                runtime_id=profile.llamacpp_runtime_id,
+                requirements=recipe.serving_requirements,
+                tuning=recipe.runtime_tuning,
+                gpu_type=placement.gpu_type,
+                gpu_count=gpu_count,
+                gpu_memory_gb=placement.gpu_memory_gb,
+                price_per_hour_usd=price,
+            )
+            if not assessment.fits or not assessment.gpu_resident:
+                continue
+        single_tps = None
+        aggregate_tps = None
+        if assessment is not None:
+            single_tps = max(
+                (
+                    point.output_tokens_per_second or 0.0
+                    for point in assessment.performance
+                    if point.concurrency == 1
+                ),
+                default=0.0,
+            ) or None
+            aggregate_tps = max(
+                (
+                    point.aggregate_output_tokens_per_second or 0.0
+                    for point in assessment.performance
+                ),
+                default=0.0,
+            ) or None
         quote = ProviderQuote(
             id=f"{placement.provider.value}:compute:{recipe.id}:{placement.id}:{gpu_count}",
             recipe_id=recipe.id,
@@ -233,12 +277,15 @@ def plans_for_compute_profile(
             gpu_count=gpu_count,
             price_per_hour_usd=price,
             billing_model=placement.billing_model,
+            gpu_memory_gb=placement.gpu_memory_gb,
             availability=placement.availability,
             region=placement.region,
             security=placement.security,
             is_estimate=placement.is_estimate,
             configuration_id=configuration.id,
             provider_options=placement.provider_options,
+            estimated_output_tokens_per_second=single_tps,
+            estimated_aggregate_output_tokens_per_second=aggregate_tps,
         )
         monthly_cost = estimate_monthly_compute_cost(quote, workload)
         plans.append(
@@ -253,13 +300,28 @@ def plans_for_compute_profile(
                         monthly_cost,
                     )
                 ),
+                assessment=assessment,
             )
         )
-    plans.sort(key=_plan_sort_key)
+    plans.sort(
+        key=lambda plan: (
+            -assessment_score(
+                plan.assessment,
+                recipe.serving_requirements.objective,
+            )
+            if plan.assessment is not None and recipe.serving_requirements is not None
+            else 0.0,
+            *_plan_sort_key(plan),
+        )
+    )
     if plans:
         plans[0] = replace(
             plans[0],
-            recommendation_reason="Best available placement for this GPU type",
+            recommendation_reason=(
+                "Best full-context throughput for this GPU type"
+                if plans[0].assessment is not None
+                else "Best available placement for this GPU type"
+            ),
         )
     return tuple(plans)
 
@@ -371,8 +433,19 @@ def _prime_availability(stock_status: str | None) -> QuoteAvailability:
 def _placement_gpu_count(
     placement: ComputePlacement,
     required_vram_gb: float,
+    *,
+    memory_estimate: object | None = None,
 ) -> int | None:
     count = placement.gpu_count_min
+    if memory_estimate is not None:
+        total_gb = float(getattr(memory_estimate, "total_gb", 0.0)) - float(
+            getattr(memory_estimate, "reserve_gb", 0.0)
+        )
+        for candidate in range(count, placement.gpu_count_max + 1):
+            reserve_per_gpu = max(2.0, placement.gpu_memory_gb * 0.05)
+            if total_gb / candidate + reserve_per_gpu <= placement.gpu_memory_gb:
+                return candidate
+        return None
     if required_vram_gb > 0:
         count = max(
             count,

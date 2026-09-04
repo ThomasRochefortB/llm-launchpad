@@ -10,6 +10,8 @@ from llm_launchpad.core.inference_options import (
     recommended_vllm_tool_call_parser,
     resolve_inference_plans,
 )
+from llm_launchpad.core.llamacpp_planner import serving_requirements, tuning_for_objective
+from llm_launchpad.core.prime_backend import is_compatible_prime_offer
 from llm_launchpad.core.provider_options import prime_provider_options
 from llm_launchpad.core.quick_deploy import (
     QuickDeployProfile,
@@ -24,11 +26,13 @@ from llm_launchpad.protocol.enums import (
     BillingModel,
     ComputeProvider,
     QuoteAvailability,
+    ServingObjective,
 )
 from llm_launchpad.protocol.models import (
     ComputeOffer,
     DeploymentConfig,
     InferenceRecipe,
+    MemoryEstimate,
     PrimeProviderOptions,
     ProviderQuote,
     WorkloadProfile,
@@ -59,6 +63,72 @@ def _profile(
         aa_model_id="model-1",
         aa_coding_score=42.0,
         aa_rank=3,
+    )
+
+
+def _planned_profile(
+    profile_id: str = "example-planned",
+    *,
+    context_tokens: int = 262144,
+    full_context_total_gb: float = 60.0,
+    legacy_required_vram_gb: float = 40.0,
+) -> QuickDeployProfile:
+    """A catalog entry whose full-context estimate exceeds its weight size."""
+
+    requirements = serving_requirements(context_tokens)
+    tuning = tuning_for_objective(ServingObjective.GENERAL_PURPOSE)
+    return QuickDeployProfile(
+        id=profile_id,
+        display_name="Planned Model",
+        repo_id="org/planned-GGUF",
+        quant="Q4_K_M",
+        gpu_type="H100_80GB",
+        gpu_count=1,
+        profile_label="Curated",
+        approx_cost_per_hour_usd=2.0,
+        max_context_tokens=context_tokens,
+        instance_slug_hint="planned",
+        summary="Planned summary.",
+        server_args=("--ctx-size", str(context_tokens)),
+        required_vram_gb=legacy_required_vram_gb,
+        gpu_memory_gb=80.0,
+        llamacpp_runtime_id="runtime-1",
+        serving_requirements=requirements,
+        runtime_tuning=tuning,
+        memory_estimate=MemoryEstimate(
+            weights_gb=legacy_required_vram_gb,
+            kv_cache_gb=full_context_total_gb - legacy_required_vram_gb - 2.0,
+            compute_gb=2.0,
+            speculative_gb=0.0,
+            reserve_gb=0.0,
+            total_gb=full_context_total_gb,
+            per_device_required_gb=(full_context_total_gb,),
+            confidence=0.82,
+            source="gguf-metadata",
+            total_layer_count=48,
+        ),
+    )
+
+
+def _offer(
+    offer_id: str,
+    *,
+    gpu_type: str,
+    gpu_count: int = 1,
+    price: float = 2.0,
+    gpu_memory_gb: float | None = None,
+) -> ComputeOffer:
+    return ComputeOffer(
+        id=offer_id,
+        cloud_id=f"cloud-{offer_id}",
+        provider_name="provider",
+        gpu_type=gpu_type,
+        gpu_count=gpu_count,
+        gpu_memory_gb=gpu_memory_gb,
+        price_per_hour=price,
+        security="secure_cloud",
+        stock_status="Available",
+        images=("ubuntu_22_cuda_12",),
     )
 
 
@@ -563,6 +633,102 @@ class ProviderAdapterTests(unittest.TestCase):
         config.provider_options = modal_option
         with self.assertRaisesRegex(ValueError, "non-Prime"):
             prime_provider_options(config)
+
+
+class PrimePlacementParityTests(unittest.TestCase):
+    """Prime quotes must carry the same planner evidence as Modal quotes."""
+
+    def test_prime_quote_reports_per_gpu_memory_not_aggregate_node_memory(self) -> None:
+        backend = _FakePrimeBackend(
+            [_offer("h100x8", gpu_type="H100_80GB", gpu_count=8, gpu_memory_gb=640.0)]
+        )
+        adapter = PrimeInferenceAdapter(backend=backend)  # type: ignore[arg-type]
+        recipe = InferenceRecipe(
+            id="recipe",
+            model_key="model",
+            display_name="Model",
+            backend=BackendType.LLAMACPP,
+            model_id="org/model",
+        )
+
+        quote = adapter.quote(recipe, WorkloadProfile())[0]
+
+        self.assertEqual(quote.gpu_memory_gb, 80.0)
+
+    def test_prime_placement_is_rejected_when_full_context_exceeds_one_gpu(self) -> None:
+        profile = _planned_profile()
+        backend = _FakePrimeBackend([_offer("l40s", gpu_type="L40S_48GB", price=1.1)])
+        adapter = PrimeInferenceAdapter(backend=backend)  # type: ignore[arg-type]
+
+        # The legacy weight-only rule admits this offer: 48 GB clears the
+        # 40 GB of weights plus 5% headroom. The full-context estimate does not.
+        recipe = list_quick_deploy_recipes((profile,))[0]
+        self.assertTrue(
+            is_compatible_prime_offer(
+                backend.offers[0],
+                profile.required_vram_gb,
+                required_image="ubuntu_22_cuda_12",
+            )
+        )
+        self.assertEqual(len(adapter.quote(recipe, WorkloadProfile())), 1)
+
+        self.assertEqual(resolve_quick_deploy_plans((profile,), adapters=(adapter,)), ())
+
+    def test_prime_placement_that_holds_full_context_keeps_planner_evidence(self) -> None:
+        profile = _planned_profile()
+        backend = _FakePrimeBackend([_offer("h100", gpu_type="H100_80GB", price=2.4)])
+        adapter = PrimeInferenceAdapter(backend=backend)  # type: ignore[arg-type]
+
+        plans = resolve_quick_deploy_plans((profile,), adapters=(adapter,))
+
+        self.assertEqual(len(plans), 1)
+        plan = plans[0]
+        self.assertEqual(plan.quote.provider, ComputeProvider.PRIME)
+        self.assertEqual(plan.quote.gpu_memory_gb, 80.0)
+        assessment = plan.assessment
+        assert assessment is not None
+        self.assertTrue(assessment.fits)
+        self.assertTrue(assessment.gpu_resident)
+        # 60 GB of model/KV/compute plus a 5% per-device reserve on 80 GB.
+        self.assertAlmostEqual(assessment.memory.total_gb, 64.0, places=3)
+        # The reserve is also promised to llama.cpp's runtime fitter.
+        self.assertEqual(assessment.tuning.fit_target_mib, 4096)
+        self.assertIsNotNone(plan.quote.estimated_output_tokens_per_second)
+        self.assertIsNotNone(plan.quote.estimated_aggregate_output_tokens_per_second)
+
+    def test_prime_and_modal_agree_on_placement_for_the_same_topology(self) -> None:
+        profile = _planned_profile()
+        prime = PrimeInferenceAdapter(
+            backend=_FakePrimeBackend(  # type: ignore[arg-type]
+                [_offer("h100", gpu_type="H100_80GB", price=2.4)]
+            )
+        )
+        modal = ModalInferenceAdapter(
+            [
+                ModalCatalogOption(
+                    id=profile.id,
+                    recipe_id=list_quick_deploy_recipes((profile,))[0].id,
+                    gpu_type="H100_80GB",
+                    gpu_count=1,
+                    price_per_hour_usd=2.4,
+                    gpu_memory_gb=80.0,
+                )
+            ]
+        )
+
+        prime_plan = resolve_quick_deploy_plans((profile,), adapters=(prime,))[0]
+        modal_plan = resolve_quick_deploy_plans((profile,), adapters=(modal,))[0]
+
+        assert prime_plan.assessment is not None and modal_plan.assessment is not None
+        self.assertEqual(
+            prime_plan.assessment.fingerprint,
+            modal_plan.assessment.fingerprint,
+        )
+        self.assertEqual(
+            prime_plan.assessment.memory,
+            modal_plan.assessment.memory,
+        )
+        self.assertEqual(prime_plan.recipe.server_args, modal_plan.recipe.server_args)
 
 
 if __name__ == "__main__":

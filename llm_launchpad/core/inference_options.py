@@ -21,6 +21,7 @@ from .prime_backend import (
     PrimeBackend,
     is_compatible_prime_offer,
     preferred_prime_offer_image,
+    prime_offer_gpu_memory_gb,
 )
 
 
@@ -69,6 +70,7 @@ class ModalCatalogOption:
     gpu_type: str
     gpu_count: int
     price_per_hour_usd: float | None
+    gpu_memory_gb: float | None = None
     estimated_output_tokens_per_second: float | None = None
 
 
@@ -104,6 +106,7 @@ class ModalInferenceAdapter:
                 gpu_count=option.gpu_count,
                 price_per_hour_usd=option.price_per_hour_usd,
                 billing_model=self.capabilities.billing_model,
+                gpu_memory_gb=option.gpu_memory_gb,
                 availability=QuoteAvailability.UNKNOWN,
                 is_estimate=True,
                 estimated_output_tokens_per_second=(
@@ -163,6 +166,9 @@ class PrimeInferenceAdapter:
                 continue
             availability = _prime_availability(offer.stock_status)
             region = offer.country or offer.region or offer.data_center
+            # Prime sometimes reports aggregate node memory. Planner placement
+            # math is per-device, so quotes always carry the per-GPU size.
+            per_gpu_memory_gb = prime_offer_gpu_memory_gb(offer)
             quotes.append(
                 ProviderQuote(
                     id=f"prime:{recipe.id}:{offer.id}",
@@ -173,6 +179,7 @@ class PrimeInferenceAdapter:
                     gpu_count=offer.gpu_count,
                     price_per_hour_usd=offer.price_per_hour,
                     billing_model=self.capabilities.billing_model,
+                    gpu_memory_gb=per_gpu_memory_gb,
                     availability=availability,
                     region=region,
                     security=offer.security,

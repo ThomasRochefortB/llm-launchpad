@@ -24,6 +24,12 @@ from textual.widgets import Input, TextArea
 from ..core.backend import ModalBackend
 from ..core.benchmark import benchmark_config_from_endpoint, parse_concurrency_values
 from ..core.config import ConfigStore, SETTINGS_DIR
+from ..core.deploy_journal import (
+    InFlightDeployment,
+    clear_in_flight,
+    load_in_flight,
+    record_in_flight,
+)
 from ..core.connection_store import (
     load_connection_entries,
     merge_connections,
@@ -49,12 +55,13 @@ from ..core.opencode import (
     visible_launchpad_rows,
 )
 from ..core.orchestrator import Orchestrator
-from ..protocol.enums import BackendType, ComputeProvider, OperationType
+from ..protocol.enums import BackendType, ComputeProvider, DeploymentState, OperationType
 from ..protocol.events import (
     EndpointAvailableEvent,
     ErrorEvent,
     LogEvent,
     OperationCompleteEvent,
+    StateChangeEvent,
 )
 from ..protocol.models import BenchmarkConfig
 from ..protocol.models import EndpointInfo
@@ -206,6 +213,7 @@ class TuiApp(App):
         self._storage_cache_path = SETTINGS_DIR / "storage_snapshot.json"
         self._deploy_connection_cache_path = SETTINGS_DIR / "deployment_connection_summaries.json"
         self._deploy_connection_cache: dict[str, dict[str, object]] = {}
+        self._in_flight_deploy: InFlightDeployment | None = None
         self._load_persisted_storage_cache()
         self._load_persisted_deploy_connection_cache()
         try:
@@ -324,11 +332,51 @@ class TuiApp(App):
         Without this, worker threads blocked on subprocess I/O prevent
         Python from shutting down cleanly (the atexit thread-join hangs).
         """
+        import asyncio
+
+        # Killing the local client does not stop what the provider already
+        # created, so an in-flight deployment would keep billing with nothing
+        # pointing at it. Stop it before the workers that own it are cancelled.
+        pending = self._in_flight_deploy
+        if pending is not None:
+            self.notify(
+                f"Stopping {pending.app_name} before exit...",
+                severity="warning",
+            )
+            await asyncio.to_thread(self._stop_in_flight, pending)
         ModalBackend.terminate_all()
         self.workers.cancel_all()
-        import asyncio
         await asyncio.sleep(0.3)
         self.exit()
+
+    def _stop_in_flight(self, pending: InFlightDeployment) -> bool:
+        """Stop an abandoned deployment. Returns whether it is confirmed gone."""
+
+        try:
+            for event in self._orchestrator.stop_app(
+                pending.backend_type,
+                app_name=pending.app_name,
+                app_id=pending.app_id,
+                provider=pending.compute_provider,
+            ):
+                if isinstance(event, OperationCompleteEvent) and not event.success:
+                    return False
+        except Exception:
+            log_exception(f"Failed to stop in-flight deployment {pending.app_name}")
+            return False
+        clear_in_flight(pending.app_name)
+        return True
+
+    def recover_abandoned_deployments(self) -> tuple[InFlightDeployment, ...]:
+        """Return deployments a previous session started but never resolved.
+
+        A SIGKILL runs no handler, so the journal is the only record that a
+        deployment was left behind. Entries are reported rather than stopped
+        automatically: the user may have deliberately left one running, and
+        silently terminating someone's endpoint is worse than telling them.
+        """
+
+        return load_in_flight()
 
     async def action_request_quit(self) -> None:
         """Require a second Ctrl+C press before quitting the TUI."""
@@ -381,6 +429,34 @@ class TuiApp(App):
             self.push_screen(SetupRequiredScreen())
             return
         self._enter_main_menu()
+        self._warn_about_abandoned_deployments()
+
+    def _warn_about_abandoned_deployments(self) -> None:
+        """Tell the user about deployments a previous session left running.
+
+        Nothing is stopped automatically: the journal records that a deploy was
+        interrupted, not that the resource is unwanted, and terminating an
+        endpoint someone is using would be worse than the leak.
+        """
+
+        abandoned = self.recover_abandoned_deployments()
+        if not abandoned:
+            return
+        for entry in abandoned:
+            exposure = entry.exposure_usd()
+            # Phrased as a ceiling, not a bill: the journal knows the deploy
+            # never resolved, not whether the resource still exists.
+            spend = (
+                f" (up to ~${exposure:.2f} if it still is)"
+                if exposure is not None and exposure >= 0.01
+                else ""
+            )
+            self.notify(
+                f"{entry.app_name} was still deploying when Launchpad last "
+                f"exited and may still be running{spend}. Check Deployments.",
+                severity="warning",
+                timeout=15,
+            )
 
     def _provider_is_configured(self) -> bool:
         modal_available = ModalBackend.is_cli_available()
@@ -500,8 +576,47 @@ class TuiApp(App):
             thread=True,
         )
 
-    def _run_deploy(self, config: DeploymentConfig, monitor: MonitorScreen):  # type: ignore[return]
-        """Generator consumed by run_worker in a thread."""
+    def _run_deploy(self, config: DeploymentConfig, monitor: MonitorScreen) -> None:
+        """Run one deployment to completion, journalling it for recovery."""
+        # The provider creates the app before its command returns, so this is
+        # journalled first: an entry that outlives the process is the only
+        # evidence that a deployment was abandoned mid-flight.
+        self._begin_in_flight(config)
+        try:
+            # Not a generator: run_worker calls this directly and relies on its
+            # side effects, so the body must execute on call.
+            self._run_deploy_inner(config, monitor)
+        finally:
+            self._finish_in_flight(config)
+
+    def _begin_in_flight(self, config: DeploymentConfig) -> None:
+        app_name = (config.app_name or legacy_app_name(config.backend)).strip()
+        if not app_name:
+            return
+        requirements = config.serving_requirements
+        entry = InFlightDeployment(
+            app_name=app_name,
+            provider=config.provider.value,
+            backend=config.backend.value,
+            instance_name=config.instance_name or None,
+            gpu_type=config.gpu_type or None,
+            gpu_count=max(1, int(config.gpu_count or 1)),
+            price_per_hour_usd=(
+                requirements.max_hourly_cost_usd if requirements is not None else None
+            ),
+            started_at_epoch=time.time(),
+        )
+        self._in_flight_deploy = entry
+        record_in_flight(entry)
+
+    def _finish_in_flight(self, config: DeploymentConfig) -> None:
+        app_name = (config.app_name or legacy_app_name(config.backend)).strip()
+        self._in_flight_deploy = None
+        if app_name:
+            clear_in_flight(app_name)
+
+    def _run_deploy_inner(self, config: DeploymentConfig, monitor: MonitorScreen):  # type: ignore[return]
+        """Consumed by run_worker in a thread."""
         deployed_web_url: Optional[str] = None
         deployed_endpoint: EndpointInfo | None = None
         deployed_web_url_priority = -1
@@ -552,8 +667,9 @@ class TuiApp(App):
                 if event.endpoint.web_url:
                     deployed_web_url = event.endpoint.web_url
                     deployed_web_url_priority = max(deployed_web_url_priority, 2)
-                    _emit_connection_summary(event.endpoint.web_url)
-                    _sync_now(event.endpoint.web_url)
+                    if not will_run_warmup:
+                        _emit_connection_summary(event.endpoint.web_url)
+                        _sync_now(event.endpoint.web_url)
             elif isinstance(event, OperationCompleteEvent):
                 deploy_succeeded = event.success
                 if event.operation == OperationType.DEPLOY:
@@ -561,7 +677,7 @@ class TuiApp(App):
                 if event.success and isinstance(event.data, EndpointInfo):
                     deployed_endpoint = event.data
                     deployed_web_url = event.data.web_url or deployed_web_url
-                    if event.data.web_url:
+                    if event.data.web_url and not will_run_warmup:
                         self._cache_deploy_connection_summary(
                             config, event.data.web_url, event.data
                         )
@@ -603,6 +719,24 @@ class TuiApp(App):
                         _sync_now(url)
             _dispatch_event(monitor, event)
 
+        if not deploy_succeeded and config.fallback_configs:
+            fallbacks = list(config.fallback_configs)
+            next_config = fallbacks.pop(0)
+            next_config.fallback_configs = tuple(fallbacks)
+            _dispatch_event(
+                monitor,
+                LogEvent(
+                    line=(
+                        "Deployment could not start; trying an equivalent placement "
+                        "at or below the approved hourly price."
+                    ),
+                    operation=OperationType.DEPLOY,
+                    is_milestone=True,
+                ),
+            )
+            self._run_deploy(next_config, monitor)
+            return
+
         # Warmup if requested and deploy was successful
         if config.do_warmup and config.do_deploy and deploy_succeeded:
             target_app_name = config.app_name or legacy_app_name(config.backend)
@@ -616,6 +750,15 @@ class TuiApp(App):
             if not url:
                 _dispatch_event(monitor, ErrorEvent(message="Provider returned no endpoint URL."))
                 return
+            certification_kwargs = (
+                {
+                    "serving_requirements": config.serving_requirements,
+                    "placement_assessment": config.placement_assessment,
+                    "runtime_id": config.llamacpp_runtime_id,
+                }
+                if config.serving_requirements is not None
+                else {}
+            )
             warmup_events = (
                 self._orchestrator.warmup(
                     backend=config.backend,
@@ -624,6 +767,7 @@ class TuiApp(App):
                     tail_logs=True,
                     app_name=target_app_name,
                     served_model_name=config.served_model_name,
+                    **certification_kwargs,
                 )
                 if config.provider == ComputeProvider.MODAL
                 else self._orchestrator.warmup(
@@ -636,6 +780,7 @@ class TuiApp(App):
                     provider=config.provider,
                     api_key=config.endpoint_api_key,
                     pod_id=deployed_endpoint.app_id if deployed_endpoint else None,
+                    **certification_kwargs,
                 )
             )
             for event in warmup_events:
@@ -649,6 +794,19 @@ class TuiApp(App):
                         maybe_url = event.data.get("url")
                         if isinstance(maybe_url, str) and maybe_url.strip():
                             completed_url = maybe_url.strip()
+                        attestation = event.data.get("attestation")
+                        if attestation is not None:
+                            config.runtime_attestation = attestation
+                            if deployed_endpoint is not None:
+                                deployed_endpoint.runtime_attestation = attestation
+                    _dispatch_event(
+                        monitor,
+                        StateChangeEvent(
+                            current=DeploymentState.PUBLISHING,
+                            operation=OperationType.WARMUP,
+                            detail="Publishing verified endpoint",
+                        ),
+                    )
                     _emit_connection_summary(completed_url)
                     if not opencode_synced or completed_url != url:
                         _sync_now(completed_url)
@@ -656,35 +814,46 @@ class TuiApp(App):
                     isinstance(event, OperationCompleteEvent)
                     and not event.success
                     and event.operation == OperationType.WARMUP
-                    and config.provider == ComputeProvider.PRIME
-                    and deployed_endpoint is not None
-                    and not prime_provider_options(config).keep_failed_resource
                 ):
-                    _dispatch_event(
-                        monitor,
-                        LogEvent(
-                            line=(
-                                "Warmup failed; terminating Prime pod "
-                                f"{deployed_endpoint.app_id}."
-                            )
-                        ),
+                    keep_failed_prime = (
+                        config.provider == ComputeProvider.PRIME
+                        and prime_provider_options(config).keep_failed_resource
                     )
-                    for cleanup_event in self._orchestrator.stop_app(
-                        config.backend,
-                        app_name=target_app_name,
-                        app_id=deployed_endpoint.app_id,
-                        provider=ComputeProvider.PRIME,
-                    ):
-                        _dispatch_event(monitor, cleanup_event)
-                    self._deploy_connection_cache.pop(target_app_name, None)
-                    self._persist_deploy_connection_cache()
-                    live_rows, prune_providers = self._visible_rows_and_prune_scope()
-                    self._sync_opencode(
-                        current_rows=live_rows,
-                        remove_app_names=[target_app_name],
-                        prune_providers=prune_providers,
-                        monitor=monitor,
-                    )
+                    if not keep_failed_prime:
+                        resource_label = (
+                            f"Prime pod {deployed_endpoint.app_id}"
+                            if config.provider == ComputeProvider.PRIME
+                            and deployed_endpoint is not None
+                            else f"failed {config.provider.display_name} deployment"
+                        )
+                        _dispatch_event(
+                            monitor,
+                            LogEvent(line=f"Certification failed; cleaning up {resource_label}."),
+                        )
+                        for cleanup_event in self._orchestrator.stop_app(
+                            config.backend,
+                            app_name=target_app_name,
+                            app_id=(deployed_endpoint.app_id if deployed_endpoint else None),
+                            provider=config.provider,
+                        ):
+                            _dispatch_event(monitor, cleanup_event)
+                    fallbacks = list(config.fallback_configs)
+                    if fallbacks:
+                        next_config = fallbacks.pop(0)
+                        next_config.fallback_configs = tuple(fallbacks)
+                        _dispatch_event(
+                            monitor,
+                            LogEvent(
+                                line=(
+                                    "Trying an equivalent certified placement at or below "
+                                    "the approved hourly price."
+                                ),
+                                operation=OperationType.DEPLOY,
+                                is_milestone=True,
+                            ),
+                        )
+                        self._run_deploy(next_config, monitor)
+                        return
                 _dispatch_event(monitor, event)
 
     # ------------------------------------------------------------------

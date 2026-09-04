@@ -55,6 +55,21 @@ class GgufMtpCapability:
         return cls(status=GgufMtpStatus.UNKNOWN, message=message)
 
 
+@dataclass(frozen=True)
+class GgufServingMetadata:
+    """Architecture scalars required for context and KV-cache planning."""
+
+    architecture: str | None = None
+    context_length: int | None = None
+    block_count: int | None = None
+    embedding_length: int | None = None
+    attention_head_count: int | None = None
+    attention_head_count_kv: int | None = None
+    attention_key_length: int | None = None
+    attention_value_length: int | None = None
+    source_file: str | None = None
+
+
 class _NeedMoreData(Exception):
     pass
 
@@ -208,6 +223,107 @@ def fetch_gguf_mtp_capability(
     )
 
 
+def parse_gguf_serving_metadata(
+    data: bytes,
+    source_file: str | None = None,
+) -> GgufServingMetadata:
+    """Parse the complete GGUF metadata table for serving-relevant scalars."""
+
+    if len(data) < 24:
+        raise _NeedMoreData
+    if data[:4] != _GGUF_MAGIC:
+        raise _InvalidGguf("Missing GGUF magic")
+    version = _unpack(data, 4, "<I")[0]
+    if version not in {2, 3}:
+        raise _InvalidGguf(f"Unsupported GGUF version {version}")
+    metadata_count = _unpack(data, 16, "<Q")[0]
+    if metadata_count > 10_000_000:
+        raise _InvalidGguf("Implausible GGUF metadata count")
+
+    values: dict[str, int] = {}
+    architecture: str | None = None
+    suffixes = {
+        "context_length": "context_length",
+        "block_count": "block_count",
+        "embedding_length": "embedding_length",
+        "attention.head_count": "attention_head_count",
+        "attention.head_count_kv": "attention_head_count_kv",
+        "attention.key_length": "attention_key_length",
+        "attention.value_length": "attention_value_length",
+    }
+    offset = 24
+    for _ in range(metadata_count):
+        key, offset = _read_string(data, offset, max_length=1024 * 1024)
+        if key is None:
+            raise _InvalidGguf("GGUF metadata key could not be decoded")
+        value_type = _unpack(data, offset, "<I")[0]
+        offset += 4
+        matched = next(
+            (
+                field
+                for suffix, field in suffixes.items()
+                if key == suffix or key.endswith(f".{suffix}")
+            ),
+            None,
+        )
+        capture = key == "general.architecture" or matched is not None
+        value, offset = _read_value(data, offset, value_type, capture=capture)
+        if key == "general.architecture" and isinstance(value, str):
+            architecture = value.strip().casefold() or None
+        elif matched is not None and isinstance(value, int) and not isinstance(value, bool):
+            if value > 0:
+                values[matched] = value
+
+    return GgufServingMetadata(
+        architecture=architecture,
+        context_length=values.get("context_length"),
+        block_count=values.get("block_count"),
+        embedding_length=values.get("embedding_length"),
+        attention_head_count=values.get("attention_head_count"),
+        attention_head_count_kv=values.get("attention_head_count_kv"),
+        attention_key_length=values.get("attention_key_length"),
+        attention_value_length=values.get("attention_value_length"),
+        source_file=source_file,
+    )
+
+
+def fetch_gguf_serving_metadata(
+    repo_id: str,
+    siblings: Any,
+    *,
+    revision: str | None = None,
+    quant: str | None = None,
+    chunk_bytes: int = GGUF_METADATA_CHUNK_BYTES,
+    max_bytes: int = GGUF_METADATA_MAX_BYTES,
+) -> GgufServingMetadata | None:
+    """Fetch and parse bounded GGUF header ranges for memory planning."""
+
+    filename = select_target_gguf_file(siblings, quant=quant)
+    if filename is None or chunk_bytes <= 0 or max_bytes <= 0:
+        return None
+    payload = bytearray()
+    try:
+        while len(payload) < max_bytes:
+            end = min(len(payload) + chunk_bytes, max_bytes) - 1
+            chunk = _fetch_hf_file_range(
+                repo_id,
+                filename,
+                revision=revision,
+                start=len(payload),
+                end=end,
+            )
+            if not chunk:
+                break
+            payload.extend(chunk)
+            try:
+                return parse_gguf_serving_metadata(bytes(payload), source_file=filename)
+            except _NeedMoreData:
+                continue
+    except Exception:
+        return None
+    return None
+
+
 def _fetch_hf_file_range(
     repo_id: str,
     filename: str,
@@ -346,4 +462,3 @@ def _unpack(data: bytes, offset: int, format_string: str) -> tuple[Any, ...]:
 
 def _normalized_token(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "", value.casefold())
-

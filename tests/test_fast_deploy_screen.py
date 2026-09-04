@@ -212,7 +212,9 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
         selected, alternatives = app.quick_deploy_calls[0]
         self.assertEqual(selected.quote.gpu_count, 3)
         self.assertEqual(selected.quote.gpu_type, "L40S")
-        self.assertEqual(len(alternatives), 1)
+        # Equivalent placements travel to confirmation as a bounded retry
+        # ladder; Fast Deploy never retries above the user's selected price.
+        self.assertEqual(len(alternatives), 2)
         self.assertEqual(alternatives[0].quote.id, selected.quote.id)
 
     async def test_availability_failure_renders_catalog_estimates(self) -> None:
