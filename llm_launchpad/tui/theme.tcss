@@ -234,13 +234,20 @@ Input:focus {
     background: $surface-lighten-1;
 }
 
+/* Textual's Select already draws a border around its value row (SelectCurrent).
+   Bordering the Select itself nests one box inside another, so the border is
+   styled where the widget actually draws it. */
 Select {
-    border: tall $border;
+    border: none;
     background: $surface;
     color: $text;
 }
 
-Select:focus {
+Select > SelectCurrent {
+    border: tall $border;
+}
+
+Select:focus > SelectCurrent {
     border: tall $primary;
     background: $surface-lighten-1;
 }
@@ -318,8 +325,9 @@ Button:focus {
 #fast-deploy-gpu-filter {
     width: 1fr;
     max-width: 36;
-    height: 3;
-    min-height: 3;
+    /* Select draws its own bordered value row; pinning the outer height
+       squeezes that border into the line the value should occupy. */
+    height: auto;
     margin: 0 1 1 0;
     padding: 0;
 }
@@ -469,16 +477,23 @@ VllmDeployScreen .form-section-subtitle {
 }
 
 LlamaCppDeployScreen Input,
-VllmDeployScreen Input,
-LlamaCppDeployScreen Select,
-VllmDeployScreen Select {
+VllmDeployScreen Input {
+    border: tall $border;
+}
+
+LlamaCppDeployScreen Select > SelectCurrent,
+VllmDeployScreen Select > SelectCurrent {
     border: tall $border;
 }
 
 LlamaCppDeployScreen Input:focus,
-VllmDeployScreen Input:focus,
-LlamaCppDeployScreen Select:focus,
-VllmDeployScreen Select:focus {
+VllmDeployScreen Input:focus {
+    border: tall $primary;
+    background: $surface-lighten-1;
+}
+
+LlamaCppDeployScreen Select:focus > SelectCurrent,
+VllmDeployScreen Select:focus > SelectCurrent {
     border: tall $primary;
     background: $surface-lighten-1;
 }

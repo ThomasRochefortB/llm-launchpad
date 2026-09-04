@@ -36,6 +36,11 @@ class SettingsScreen(CopyEnabledScreen):
         self._load_error: str | None = None
         self._dirty = False
         self._unsaved_warning_at = 0.0
+        # Textual emits Changed events while widgets take their initial values
+        # during mount. Treating those as edits told anyone who merely opened
+        # this screen that they had unsaved changes, and then demanded a second
+        # esc to "discard" them.
+        self._accepting_edits = False
 
     def compose(self) -> ComposeResult:
         loaded = self._store.load_result()
@@ -102,6 +107,13 @@ class SettingsScreen(CopyEnabledScreen):
                 )
         yield Footer()
 
+    def on_mount(self) -> None:
+        # Only edits that arrive after the initial values have settled count.
+        self.call_after_refresh(self._start_accepting_edits)
+
+    def _start_accepting_edits(self) -> None:
+        self._accepting_edits = True
+
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "save-btn":
             self._save()
@@ -116,6 +128,8 @@ class SettingsScreen(CopyEnabledScreen):
         self._mark_dirty()
 
     def _mark_dirty(self) -> None:
+        if not self._accepting_edits:
+            return
         self._dirty = True
         try:
             self.query_one("#save-feedback", Static).update(

@@ -48,13 +48,32 @@ def _render_profile_label(profile: QuickDeployProfile, *, accent: str = "") -> s
     return f"{label_markup} [dim]{_escape_markup(quant_suffix)}[/dim]"
 
 
+def _placement_matches_profile(
+    profile: QuickDeployProfile,
+    plan: InferencePlan,
+) -> bool:
+    """Whether the chosen placement is the one this catalog tier describes."""
+
+    return (
+        (profile.gpu_type or "").strip().casefold()
+        == (plan.quote.gpu_type or "").strip().casefold()
+        and int(profile.gpu_count or 0) == int(plan.quote.gpu_count or 0)
+    )
+
+
 def _render_profile_summary(profile: QuickDeployProfile, plan: InferencePlan) -> str:
     lines = [
         _render_profile_label(profile, accent="bold #7bf168"),
         f"[dim]{_escape_markup(profile.summary)}[/dim]",
         "",
     ]
-    if profile.resource_tier_label:
+    # The tier label describes the shape the catalog chose for this profile, but
+    # step 2 lets the user pick any certified placement. Showing the catalog's
+    # label against someone else's choice reads as nonsense -- "Slow but cheap"
+    # on the B200 they deliberately selected -- so it is shown only when the
+    # placement is the one the tier actually describes. Everything it conveyed
+    # is stated exactly by the GPU, hourly and throughput rows below.
+    if profile.resource_tier_label and _placement_matches_profile(profile, plan):
         tier_detail = profile.resource_tier_label
         if profile.profile_label and profile.profile_label != profile.resource_tier_label:
             tier_detail = f"{tier_detail} {profile.profile_label}"
