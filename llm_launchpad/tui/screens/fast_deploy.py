@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Sequence
 
 from textual.actions import SkipAction
 from textual.app import ComposeResult
@@ -18,6 +19,8 @@ from ...core.compute_availability import (
     plans_for_compute_profile,
 )
 from ...core.llamacpp_planner import assessment_score
+from ...core.serving_tiers import ServingTier, serving_tiers
+from ...protocol.enums import ServingObjective
 from ...core.deploy_log_summary import SUMMARY_SPINNER_FRAMES
 from ...core.quick_deploy import (
     QuickDeployCatalogInfo,
@@ -323,6 +326,35 @@ def _infra_gpu_label(row: _InfraRow) -> str:
     return row.configuration.gpu_type or display_gpu_type(row.plan.quote.gpu_type)
 
 
+def _tier_option(
+    tier: ServingTier,
+    width_mode: WidthMode = WidthMode.WIDE,
+) -> str:
+    """One tier line: what it costs, how fast it is, what it trades away.
+
+    Hardware is deliberately absent. The user picked a model, not a data
+    centre; the GPU belongs in the detail pane.
+    """
+
+    marker = "[#7bf168]*[/]" if tier.is_recommended else " "
+    price = _format_price(tier.price_per_hour_usd, estimate=tier.plan.quote.is_estimate)
+    speed = tier.output_tokens_per_second
+    speed_text = f"~{speed:.0f} tok/s" if speed > 0 else "speed n/a"
+    note = tier.tradeoff or ("recommended" if tier.is_recommended else "")
+    if width_mode == WidthMode.MINIMAL:
+        return f" {marker} {_escape_markup(tier.label):<9} [dim]{price}[/dim]"
+    if width_mode == WidthMode.COMPACT:
+        return (
+            f" {marker} {_escape_markup(tier.label):<9} "
+            f"[dim]{price} · {speed_text}[/dim]"
+        )
+    return (
+        f" {marker} {_escape_markup(tier.label):<10} "
+        f"{price:<12} {speed_text:<14} "
+        f"[dim]{_escape_markup(note)}[/dim]"
+    )
+
+
 def _infra_option(row: _InfraRow, width_mode: WidthMode = WidthMode.WIDE) -> str:
     quote = row.plan.quote
     gpu = _infra_gpu_label(row)
@@ -533,10 +565,15 @@ class FastDeployScreen(CopyEnabledScreen):
         Binding("enter", "choose_selected", "Choose", show=True, priority=True),
         Binding("g", "focus_gpu_filter", "GPU filter", show=True),
         Binding("/", "focus_model_search", "Search", show=True),
+        Binding("a", "toggle_all_placements", "Compare all", show=True),
     ]
 
     def __init__(self) -> None:
         super().__init__()
+        # Step two offers named tiers by default. The full placement list is a
+        # detail view: picking between "two L40S" and "one A100" is a question
+        # almost nobody can answer, while cheap-or-fast is one everybody can.
+        self._show_all_placements = False
         self._catalog_info = get_quick_deploy_catalog_info()
         self._models = list_quick_deploy_models()
         self._model_by_id = {model.id: model for model in self._models}
@@ -841,6 +878,37 @@ class FastDeployScreen(CopyEnabledScreen):
             return
         self._render_fallback(model, reason=message.error)
 
+    def _tiers_for(self, rows: Sequence[_InfraRow]) -> tuple[ServingTier, ...]:
+        """Collapse the visible placements into named tiers."""
+
+        plans = [row.plan for row in rows]
+        requirements = next(
+            (
+                plan.recipe.serving_requirements
+                for plan in plans
+                if plan.recipe.serving_requirements is not None
+            ),
+            None,
+        )
+        objective = (
+            requirements.objective
+            if requirements is not None
+            else ServingObjective.GENERAL_PURPOSE
+        )
+        tiers = serving_tiers(plans, objective)
+        # A single tier is not a choice; fall back to the full list rather than
+        # presenting one option as though it were a considered selection.
+        return tiers if len(tiers) > 1 else ()
+
+    def action_toggle_all_placements(self) -> None:
+        """Swap between named tiers and the full placement list."""
+
+        if self._phase != "infra" or self._selected_model is None:
+            return
+        self._show_all_placements = not self._show_all_placements
+        if self._snapshot is not None:
+            self._render_infra_from_snapshot(self._selected_model, self._snapshot)
+
     def _render_infra_from_snapshot(
         self,
         model: QuickDeployModel,
@@ -862,22 +930,46 @@ class FastDeployScreen(CopyEnabledScreen):
         self._infra_rows = {row.plan.quote.id: row for row in rows}
         width_mode = self.viewport_profile.width_mode
         option_list = self.query_one("#fast-deploy-list", OptionList)
-        option_list.set_options(
-            [
-                Option(_infra_option(row, width_mode), id=row.plan.quote.id)
-                for row in rows
-            ]
-        )
-        option_list.highlighted = 0
-        self._update_infra_detail(rows[0])
+        tiers = () if self._show_all_placements else self._tiers_for(rows)
+        if tiers:
+            # Tier option ids are the underlying quote ids, so selection and the
+            # detail pane keep working unchanged whichever view is showing.
+            option_list.set_options(
+                [
+                    Option(_tier_option(tier, width_mode), id=tier.plan.quote.id)
+                    for tier in tiers
+                ]
+            )
+            recommended = next(
+                (index for index, tier in enumerate(tiers) if tier.is_recommended),
+                0,
+            )
+            option_list.highlighted = recommended
+            self._update_infra_detail(self._infra_rows[tiers[recommended].plan.quote.id])
+        else:
+            option_list.set_options(
+                [
+                    Option(_infra_option(row, width_mode), id=row.plan.quote.id)
+                    for row in rows
+                ]
+            )
+            option_list.highlighted = 0
+            self._update_infra_detail(rows[0])
         self.query_one("#fast-deploy-subtitle", Static).update(
             f"Pick infrastructure · {_escape_markup(self._catalog_info.source_label)}"
         )
-        status = (
-            f"[bold]{len(rows)} infrastructure option"
-            f"{'s' if len(rows) != 1 else ''}[/bold] "
-            "[dim]· best full-context throughput first · updated just now[/dim]"
-        )
+        if tiers:
+            status = (
+                f"[bold]Every option runs the full "
+                f"{model.max_context_tokens:,}-token context[/bold] "
+                f"[dim]· press a to compare all {len(rows)} placements[/dim]"
+            )
+        else:
+            status = (
+                f"[bold]{len(rows)} infrastructure option"
+                f"{'s' if len(rows) != 1 else ''}[/bold] "
+                "[dim]· best full-context throughput first · press a for tiers[/dim]"
+            )
         if self._gpu_filter not in {"", "any"}:
             status += f" [dim]· GPU {_escape_markup(self._gpu_filter)}[/dim]"
         if snapshot.errors:

@@ -19,6 +19,11 @@ from ..protocol.enums import ServingObjective
 from ..protocol.models import InferencePlan
 from .llamacpp_planner import assessment_score
 
+# Below this, two options are the same on that axis and saying "1.0x" would be
+# noise. A flank that gains nothing is still shown -- with the gain named as
+# absent, so a bad deal reads as a bad deal rather than disappearing.
+_MEANINGFUL_MARGIN = 0.05
+
 ECONOMY = "economy"
 BALANCED = "balanced"
 FASTEST = "fastest"
@@ -43,6 +48,18 @@ class ServingTier:
     @property
     def price_per_hour_usd(self) -> float | None:
         return self.plan.quote.price_per_hour_usd
+
+    @property
+    def output_tokens_per_second(self) -> float:
+        """Single-stream decode speed, the number a person feels while typing."""
+
+        return _single_stream_tps(self.plan)
+
+    @property
+    def aggregate_output_tokens_per_second(self) -> float:
+        """Combined decode speed across concurrent requests."""
+
+        return _aggregate_tps(self.plan)
 
     @property
     def measured(self) -> bool:
@@ -139,20 +156,29 @@ def _describe_tradeoff(
     baseline_speed = _throughput(baseline, objective)
     price = tier_plan.quote.price_per_hour_usd
     baseline_price = baseline.quote.price_per_hour_usd
-    parts: list[str] = []
+    speed_text = ""
     if speed > 0 and baseline_speed > 0:
         ratio = speed / baseline_speed
-        if ratio >= 1.05:
-            parts.append(f"{ratio:.1f}x faster")
-        elif ratio <= 0.95:
-            parts.append(f"{1 / ratio:.1f}x slower")
+        if ratio >= 1.0 + _MEANINGFUL_MARGIN:
+            speed_text = f"{ratio:.1f}x faster"
+        elif ratio <= 1.0 - _MEANINGFUL_MARGIN:
+            speed_text = f"{1 / ratio:.1f}x slower"
+        else:
+            speed_text = "same speed"
+    price_text = ""
     if price and baseline_price:
         ratio = price / baseline_price
-        if ratio >= 1.05:
-            parts.append(f"{ratio:.1f}x the price")
-        elif ratio <= 0.95:
-            parts.append(f"{1 / ratio:.1f}x cheaper")
-    return " for ".join(parts) if parts else None
+        if ratio >= 1.0 + _MEANINGFUL_MARGIN:
+            price_text = f"{ratio:.1f}x the price"
+        elif ratio <= 1.0 - _MEANINGFUL_MARGIN:
+            price_text = f"{1 / ratio:.1f}x cheaper"
+        else:
+            # Naming the absent benefit is the point: an option that is much
+            # slower and no cheaper should read as the bad deal it is, rather
+            # than being quietly dropped from the list.
+            price_text = "no cheaper"
+    parts = [text for text in (speed_text, price_text) if text]
+    return ", ".join(parts) if parts else None
 
 
 def serving_tiers(

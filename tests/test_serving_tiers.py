@@ -178,6 +178,9 @@ class ServingTierTests(unittest.TestCase):
         self.assertIn("cheaper", by_key[ECONOMY].tradeoff or "")
         self.assertIn("faster", by_key[FASTEST].tradeoff or "")
         self.assertIn("the price", by_key[FASTEST].tradeoff or "")
+        # Both axes are always named, so nothing is silently favourable.
+        for key in (ECONOMY, FASTEST):
+            self.assertEqual((by_key[key].tradeoff or "").count(","), 1)
 
     def test_evidence_reports_whether_numbers_were_measured(self) -> None:
         estimated = serving_tiers(self._frontier())
@@ -194,6 +197,42 @@ class ServingTierTests(unittest.TestCase):
             serving_tiers([_plan("no", price=1.0, single_tps=1.0, aggregate_tps=1.0, fits=False)]),
             (),
         )
+
+
+    def test_a_bad_deal_is_shown_with_its_absent_benefit_named(self) -> None:
+        # A flank that is much slower and no cheaper is still offered: hiding
+        # it would remove the reader's ability to check the recommendation.
+        # It has to read as the bad deal it is instead.
+        plans = [
+            _plan("barely-cheaper", price=14.99, single_tps=10.0, aggregate_tps=12.0),
+            _plan("value", price=15.16, single_tps=28.0, aggregate_tps=34.0),
+            _plan("fast", price=31.92, single_tps=50.0, aggregate_tps=60.0),
+        ]
+
+        tiers = serving_tiers(plans)
+        by_id = {tier.plan.quote.id: tier for tier in tiers}
+
+        self.assertIn("barely-cheaper", by_id)
+        self.assertIn("slower", by_id["barely-cheaper"].tradeoff or "")
+        self.assertIn("no cheaper", by_id["barely-cheaper"].tradeoff or "")
+
+    def test_a_flank_that_is_barely_faster_is_still_offered(self) -> None:
+        plans = [
+            _plan("cheap", price=1.0, single_tps=40.0, aggregate_tps=45.0),
+            _plan("value", price=2.0, single_tps=100.0, aggregate_tps=300.0),
+            _plan("barely-faster", price=9.0, single_tps=102.0, aggregate_tps=104.0),
+        ]
+
+        tiers = serving_tiers(plans)
+        by_id = {tier.plan.quote.id: tier for tier in tiers}
+
+        self.assertIn("barely-faster", by_id)
+        self.assertIn("the price", by_id["barely-faster"].tradeoff or "")
+
+    def test_a_genuinely_cheaper_flank_is_still_offered(self) -> None:
+        tiers = serving_tiers(self._frontier())
+
+        self.assertIn(ECONOMY, {tier.key for tier in tiers})
 
 
 if __name__ == "__main__":
