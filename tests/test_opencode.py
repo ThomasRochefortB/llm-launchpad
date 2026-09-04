@@ -765,7 +765,7 @@ class CorruptConfigRecoveryTests(unittest.TestCase):
 
             # Silently inventing an empty config would delete the user's
             # providers on the next write.
-            with self.assertRaises(Exception):
+            with self.assertRaises(ValueError):
                 _load_opencode_config(path)
 
     def test_a_corrupt_backup_is_not_trusted_either(self) -> None:
@@ -776,7 +776,7 @@ class CorruptConfigRecoveryTests(unittest.TestCase):
             path.write_text("{ broken", encoding="utf-8")
             path.with_suffix(".json.bak").write_text("also broken", encoding="utf-8")
 
-            with self.assertRaises(Exception):
+            with self.assertRaises(ValueError):
                 _load_opencode_config(path)
 
     def test_a_healthy_config_is_read_normally(self) -> None:

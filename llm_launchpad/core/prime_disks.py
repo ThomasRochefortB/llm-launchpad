@@ -12,6 +12,7 @@ from typing import Any
 
 from ..protocol.models import ComputeOffer, DeploymentConfig, PrimeProviderOptions
 from .config import SETTINGS_DIR
+from .diagnostics import log_exception
 from .prime_backend import (
     PrimeApiError,
     PrimeDiskOffer,
@@ -287,7 +288,7 @@ def _create_cache_disk(backend: Any, gpu_offer: ComputeOffer) -> StoredPrimeDisk
         try:
             backend.delete_disk(disk_id)
         except Exception:
-            pass
+            log_exception(f"Could not release Prime disk {disk_id} after a failed attach")
         return None
     return StoredPrimeDisk(
         id=disk_id,
@@ -374,7 +375,7 @@ def resolve_prime_offer_and_disk(
         try:
             backend.delete_disk(created.id)
         except Exception:
-            pass
+            log_exception(f"Could not release Prime disk {created.id} after a failed attach")
         messages.append(
             "Prime cache disk could not be paired with an available GPU; "
             "model weights will not persist across this deploy"

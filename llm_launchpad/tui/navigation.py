@@ -66,8 +66,8 @@ def is_focusable_for_navigation(
         return False
     if check_hidden_ancestor and has_hidden_ancestor(widget):
         return False
-    if check_size and (widget.size.height <= 0 or widget.size.width <= 0):
-        return False
+    if check_size:
+        return widget.size.height > 0 and widget.size.width > 0
     return True
 
 

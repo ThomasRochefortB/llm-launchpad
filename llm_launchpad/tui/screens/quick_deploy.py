@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from rich.markup import escape
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
@@ -34,18 +35,14 @@ from ..widgets.input_form import FormField, ToggleField
 from .copy_enabled import CopyEnabledScreen
 
 
-def _escape_markup(value: str) -> str:
-    return (value or "").replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
-
-
 def _render_profile_label(profile: QuickDeployProfile, *, accent: str = "") -> str:
     label, quant_suffix = quick_deploy_model_label_parts(profile)
-    label_markup = _escape_markup(label)
+    label_markup = escape(label)
     if accent:
         label_markup = f"[{accent}]{label_markup}[/]"
     if not quant_suffix:
         return label_markup
-    return f"{label_markup} [dim]{_escape_markup(quant_suffix)}[/dim]"
+    return f"{label_markup} [dim]{escape(quant_suffix)}[/dim]"
 
 
 def _placement_matches_profile(
@@ -64,7 +61,7 @@ def _placement_matches_profile(
 def _render_profile_summary(profile: QuickDeployProfile, plan: InferencePlan) -> str:
     lines = [
         _render_profile_label(profile, accent="bold #7bf168"),
-        f"[dim]{_escape_markup(profile.summary)}[/dim]",
+        f"[dim]{escape(profile.summary)}[/dim]",
         "",
     ]
     # The tier label describes the shape the catalog chose for this profile, but
@@ -77,27 +74,27 @@ def _render_profile_summary(profile: QuickDeployProfile, plan: InferencePlan) ->
         tier_detail = profile.resource_tier_label
         if profile.profile_label and profile.profile_label != profile.resource_tier_label:
             tier_detail = f"{tier_detail} {profile.profile_label}"
-        lines.append(f"[bold]Tier[/bold]     {_escape_markup(tier_detail)}")
+        lines.append(f"[bold]Tier[/bold]     {escape(tier_detail)}")
     lines.extend(
         [
-            f"[bold]Provider[/bold] {_escape_markup(plan.quote.provider.display_name)}",
-            f"[bold]Billing[/bold]  {_escape_markup(_billing_label(plan.quote.billing_model))}",
-            f"[bold]Backend[/bold]  {_escape_markup(plan.recipe.backend.display_name)}",
-            f"[bold]GPU[/bold]      {_escape_markup(display_gpu_type(plan.quote.gpu_type))} x{plan.quote.gpu_count}",
+            f"[bold]Provider[/bold] {escape(plan.quote.provider.display_name)}",
+            f"[bold]Billing[/bold]  {escape(_billing_label(plan.quote.billing_model))}",
+            f"[bold]Backend[/bold]  {escape(plan.recipe.backend.display_name)}",
+            f"[bold]GPU[/bold]      {escape(display_gpu_type(plan.quote.gpu_type))} x{plan.quote.gpu_count}",
         ]
     )
     if plan.quote.region:
-        lines.append(f"[bold]Region[/bold]   {_escape_markup(plan.quote.region)}")
+        lines.append(f"[bold]Region[/bold]   {escape(plan.quote.region)}")
     lines.append(
-        f"[bold]Availability[/bold] {_escape_markup(_availability_label(plan))}"
+        f"[bold]Availability[/bold] {escape(_availability_label(plan))}"
     )
     reference = (plan.quote.provider_reference or "").strip()
     if reference and _show_placement_reference(reference, plan.quote.gpu_type):
         lines.append(
-            f"[bold]Placement[/bold] {_escape_markup(reference)}"
+            f"[bold]Placement[/bold] {escape(reference)}"
         )
     if profile.quant:
-        lines.insert(-1, f"[bold]Quant[/bold]    {_escape_markup(profile.quant)}")
+        lines.insert(-1, f"[bold]Quant[/bold]    {escape(profile.quant)}")
     required_memory = (
         plan.assessment.memory.total_gb
         if plan.assessment is not None
@@ -108,7 +105,7 @@ def _render_profile_summary(profile: QuickDeployProfile, plan: InferencePlan) ->
     requirements = plan.recipe.serving_requirements
     if requirements is not None:
         lines.append(
-            f"[bold]Optimize[/bold] {_escape_markup(requirements.objective.display_name)}"
+            f"[bold]Optimize[/bold] {escape(requirements.objective.display_name)}"
         )
     if plan.assessment is not None:
         single = max(
@@ -134,7 +131,7 @@ def _render_profile_summary(profile: QuickDeployProfile, plan: InferencePlan) ->
         if single > 0:
             lines.append(f"[bold]Single[/bold]   ~{single:.0f} output tok/s")
             lines.append(f"[bold]Batch[/bold]    ~{aggregate:.0f} aggregate tok/s")
-        lines.append(f"[bold]Evidence[/bold] {_escape_markup(evidence)}")
+        lines.append(f"[bold]Evidence[/bold] {escape(evidence)}")
     if profile.speculative_decoding is not None:
         lines.append(
             "[bold]Spec decode[/bold] Native MTP · up to "
@@ -142,11 +139,11 @@ def _render_profile_summary(profile: QuickDeployProfile, plan: InferencePlan) ->
         )
     lines.extend(
         [
-            f"[bold]Context[/bold]  Full {_escape_markup(format_context_length(profile.max_context_tokens))}",
-            f"[bold]Hourly[/bold]   {_escape_markup(_plan_hourly_cost(plan))}",
-            f"[bold]Monthly[/bold]  {_escape_markup(_plan_monthly_cost(plan))}",
-            f"[bold]Model[/bold]    {_escape_markup(plan.recipe.model_id)}",
-            f"[bold]Default slug[/bold]  {_escape_markup(profile.instance_slug_hint)}",
+            f"[bold]Context[/bold]  Full {escape(format_context_length(profile.max_context_tokens))}",
+            f"[bold]Hourly[/bold]   {escape(_plan_hourly_cost(plan))}",
+            f"[bold]Monthly[/bold]  {escape(_plan_monthly_cost(plan))}",
+            f"[bold]Model[/bold]    {escape(plan.recipe.model_id)}",
+            f"[bold]Default slug[/bold]  {escape(profile.instance_slug_hint)}",
             "",
             (
                 "[dim]Monthly estimate assumes an 8-hour daily serving window at "

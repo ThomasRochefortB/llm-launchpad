@@ -14,7 +14,7 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Optional
+from typing import Any
 
 from textual.app import App
 from textual.binding import Binding
@@ -306,7 +306,7 @@ class TuiApp(App):
         if driver is not None:
             currently_enabled = bool(getattr(driver, "_mouse", self.mouse_enabled))
             if enabled and not currently_enabled:
-                setattr(driver, "_mouse", True)
+                driver._mouse = True
                 enable = getattr(driver, "_enable_mouse_support", None)
                 if callable(enable):
                     enable()
@@ -314,7 +314,7 @@ class TuiApp(App):
                 disable = getattr(driver, "_disable_mouse_support", None)
                 if callable(disable):
                     disable()
-                setattr(driver, "_mouse", False)
+                driver._mouse = False
 
         self.mouse_enabled = enabled
         try:
@@ -616,9 +616,39 @@ class TuiApp(App):
         if app_name:
             clear_in_flight(app_name)
 
+    def _deploy_endpoint_url(
+        self, config: DeploymentConfig, observed_url: str | None
+    ) -> str | None:
+        """Return the endpoint URL to publish, falling back to Modal's default."""
+        if observed_url:
+            return observed_url
+        if config.provider != ComputeProvider.MODAL:
+            return observed_url
+        return ModalBackend.default_server_url(
+            self._username,
+            app_name=config.app_name or legacy_app_name(config.backend),
+            function_slug=config.function_slug,
+        )
+
+    def _advance_to_fallback(
+        self, config: DeploymentConfig, monitor: MonitorScreen, reason: str
+    ) -> bool:
+        """Start the next approved placement, if this config still has one."""
+        fallbacks = list(config.fallback_configs)
+        if not fallbacks:
+            return False
+        next_config = fallbacks.pop(0)
+        next_config.fallback_configs = tuple(fallbacks)
+        _dispatch_event(
+            monitor,
+            LogEvent(line=reason, operation=OperationType.DEPLOY, is_milestone=True),
+        )
+        self._run_deploy(next_config, monitor)
+        return True
+
     def _run_deploy_inner(self, config: DeploymentConfig, monitor: MonitorScreen):  # type: ignore[return]
         """Consumed by run_worker in a thread."""
-        deployed_web_url: Optional[str] = None
+        deployed_web_url: str | None = None
         deployed_endpoint: EndpointInfo | None = None
         # Endpoint URL precedence lives in core.deploy_events so headless
         # callers get the same answer this screen does.
@@ -699,51 +729,28 @@ class TuiApp(App):
                     and config.do_deploy
                     and not opencode_synced
                 ):
-                    target_app_name = config.app_name or legacy_app_name(config.backend)
-                    url = deployed_web_url
-                    if not url and config.provider == ComputeProvider.MODAL:
-                        url = ModalBackend.default_server_url(
-                            self._username,
-                            app_name=target_app_name,
-                            function_slug=config.function_slug,
-                        )
+                    url = self._deploy_endpoint_url(config, deployed_web_url)
                     if url:
                         _emit_connection_summary(url)
                         _sync_now(url)
             _dispatch_event(monitor, event)
 
-        if not deploy_succeeded and config.fallback_configs:
-            fallbacks = list(config.fallback_configs)
-            next_config = fallbacks.pop(0)
-            next_config.fallback_configs = tuple(fallbacks)
-            _dispatch_event(
-                monitor,
-                LogEvent(
-                    line=(
-                        "Deployment could not start; trying an equivalent placement "
-                        "at or below the approved hourly price."
-                    ),
-                    operation=OperationType.DEPLOY,
-                    is_milestone=True,
-                ),
-            )
-            self._run_deploy(next_config, monitor)
+        if not deploy_succeeded and self._advance_to_fallback(
+            config,
+            monitor,
+            "Deployment could not start; trying an equivalent placement "
+            "at or below the approved hourly price.",
+        ):
             return
 
         # Warmup if requested and deploy was successful
         if config.do_warmup and config.do_deploy and deploy_succeeded:
             target_app_name = config.app_name or legacy_app_name(config.backend)
-            url = deployed_web_url
-            if not url and config.provider == ComputeProvider.MODAL:
-                url = ModalBackend.default_server_url(
-                    self._username,
-                    app_name=target_app_name,
-                    function_slug=config.function_slug,
-                )
+            url = self._deploy_endpoint_url(config, deployed_web_url)
             if not url:
                 _dispatch_event(monitor, ErrorEvent(message="Provider returned no endpoint URL."))
                 return
-            certification_kwargs = (
+            certification_kwargs: dict[str, Any] = (
                 {
                     "serving_requirements": config.serving_requirements,
                     "placement_assessment": config.placement_assessment,
@@ -752,29 +759,20 @@ class TuiApp(App):
                 if config.serving_requirements is not None
                 else {}
             )
-            warmup_events = (
-                self._orchestrator.warmup(
-                    backend=config.backend,
-                    server_url=url,
-                    timeout=1800,
-                    tail_logs=True,
-                    app_name=target_app_name,
-                    served_model_name=config.served_model_name,
-                    **certification_kwargs,
-                )
-                if config.provider == ComputeProvider.MODAL
-                else self._orchestrator.warmup(
-                    backend=config.backend,
-                    server_url=url,
-                    timeout=1800,
-                    tail_logs=True,
-                    app_name=target_app_name,
-                    served_model_name=config.served_model_name,
+            if config.provider != ComputeProvider.MODAL:
+                certification_kwargs.update(
                     provider=config.provider,
                     api_key=config.endpoint_api_key,
                     pod_id=deployed_endpoint.app_id if deployed_endpoint else None,
-                    **certification_kwargs,
                 )
+            warmup_events = self._orchestrator.warmup(
+                backend=config.backend,
+                server_url=url,
+                timeout=1800,
+                tail_logs=True,
+                app_name=target_app_name,
+                served_model_name=config.served_model_name,
+                **certification_kwargs,
             )
             for event in warmup_events:
                 if (
@@ -830,22 +828,12 @@ class TuiApp(App):
                             provider=config.provider,
                         ):
                             _dispatch_event(monitor, cleanup_event)
-                    fallbacks = list(config.fallback_configs)
-                    if fallbacks:
-                        next_config = fallbacks.pop(0)
-                        next_config.fallback_configs = tuple(fallbacks)
-                        _dispatch_event(
-                            monitor,
-                            LogEvent(
-                                line=(
-                                    "Trying an equivalent certified placement at or below "
-                                    "the approved hourly price."
-                                ),
-                                operation=OperationType.DEPLOY,
-                                is_milestone=True,
-                            ),
-                        )
-                        self._run_deploy(next_config, monitor)
+                    if self._advance_to_fallback(
+                        config,
+                        monitor,
+                        "Trying an equivalent certified placement at or below "
+                        "the approved hourly price.",
+                    ):
                         return
                 _dispatch_event(monitor, event)
 
@@ -856,7 +844,7 @@ class TuiApp(App):
     def begin_status(
         self,
         endpoint: EndpointInfo,
-        url_override: Optional[str] = None,
+        url_override: str | None = None,
         timeout: int = 60,
     ) -> None:
         """Probe one selected endpoint, resolving provider details centrally."""
@@ -894,10 +882,10 @@ class TuiApp(App):
         url: str,
         timeout: int,
         app_name: str,
-        served_model_name: Optional[str],
+        served_model_name: str | None,
         provider: ComputeProvider,
-        api_key: Optional[str],
-        pod_id: Optional[str],
+        api_key: str | None,
+        pod_id: str | None,
         monitor: MonitorScreen,
     ):  # type: ignore[return]
         _dispatch_event(monitor, LogEvent(line=f"Target app: {app_name}"))

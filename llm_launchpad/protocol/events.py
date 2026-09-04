@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any
 
 from .enums import DeploymentState, OperationType
 from .models import EndpointInfo
@@ -23,7 +23,7 @@ class LogEvent(BaseEvent):
 
     line: str = ""
     stream: str = "stdout"  # "stdout" | "stderr"
-    operation: Optional[OperationType] = None
+    operation: OperationType | None = None
     is_milestone: bool = False
 
 
@@ -32,7 +32,7 @@ class StateChangeEvent(BaseEvent):
     """Signals a transition in the deployment state machine."""
 
     current: DeploymentState = DeploymentState.IDLE
-    operation: Optional[OperationType] = None
+    operation: OperationType | None = None
     detail: str = ""
 
 
@@ -41,8 +41,8 @@ class ErrorEvent(BaseEvent):
     """An error occurred during an operation."""
 
     message: str = ""
-    operation: Optional[OperationType] = None
-    exit_code: Optional[int] = None
+    operation: OperationType | None = None
+    exit_code: int | None = None
     recoverable: bool = True
 
 
@@ -54,7 +54,7 @@ class OperationCompleteEvent(BaseEvent):
     success: bool = True
     exit_code: int = 0
     detail: str = ""
-    data: Optional[Any] = None
+    data: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -62,4 +62,4 @@ class EndpointAvailableEvent(BaseEvent):
     """Public inference URL is known. The runtime may still be loading weights."""
 
     endpoint: EndpointInfo = field(default_factory=EndpointInfo)
-    operation: Optional[OperationType] = None
+    operation: OperationType | None = None

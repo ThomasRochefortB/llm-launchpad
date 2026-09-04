@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -14,7 +14,7 @@ from llm_launchpad.core.artificial_analysis_auth import (
     resolve_artificial_analysis_api_key,
     save_artificial_analysis_api_key,
 )
-from llm_launchpad.core.quick_deploy_refresh import (
+from llm_launchpad.core.artificial_analysis import (
     _AAHttpError,
     _reset_artificial_analysis_auth_status_cache,
     _write_aa_cache,
@@ -53,7 +53,7 @@ class ArtificialAnalysisAuthTests(unittest.TestCase):
                 return_value="",
             ),
             patch(
-                "llm_launchpad.core.quick_deploy_refresh.fetch_artificial_analysis_models"
+                "llm_launchpad.core.artificial_analysis.fetch_artificial_analysis_models"
             ) as fetch,
         ):
             status = get_artificial_analysis_auth_status()
@@ -66,7 +66,7 @@ class ArtificialAnalysisAuthTests(unittest.TestCase):
         with TemporaryDirectory() as temporary_directory:
             cache_path = Path(temporary_directory) / "aa.json"
             with patch(
-                "llm_launchpad.core.quick_deploy_refresh.fetch_artificial_analysis_models",
+                "llm_launchpad.core.artificial_analysis.fetch_artificial_analysis_models",
                 return_value=_aa_payload(tier="pro"),
             ) as fetch:
                 first = get_artificial_analysis_auth_status(
@@ -92,11 +92,11 @@ class ArtificialAnalysisAuthTests(unittest.TestCase):
             _write_aa_cache(
                 cache_path,
                 _aa_payload(),
-                fetched_at=datetime.now(timezone.utc),
+                fetched_at=datetime.now(UTC),
                 api_key="secret-key",
             )
             with patch(
-                "llm_launchpad.core.quick_deploy_refresh.fetch_artificial_analysis_models"
+                "llm_launchpad.core.artificial_analysis.fetch_artificial_analysis_models"
             ) as fetch:
                 status = get_artificial_analysis_auth_status(
                     api_key="secret-key",
@@ -109,7 +109,7 @@ class ArtificialAnalysisAuthTests(unittest.TestCase):
 
     def test_invalid_key_returns_clear_error(self) -> None:
         with TemporaryDirectory() as temporary_directory, patch(
-            "llm_launchpad.core.quick_deploy_refresh.fetch_artificial_analysis_models",
+            "llm_launchpad.core.artificial_analysis.fetch_artificial_analysis_models",
             side_effect=_AAHttpError(401),
         ):
             status = get_artificial_analysis_auth_status(
@@ -126,11 +126,11 @@ class ArtificialAnalysisAuthTests(unittest.TestCase):
             _write_aa_cache(
                 cache_path,
                 _aa_payload(),
-                fetched_at=datetime.now(timezone.utc),
+                fetched_at=datetime.now(UTC),
                 api_key="old-key",
             )
             with patch(
-                "llm_launchpad.core.quick_deploy_refresh.fetch_artificial_analysis_models",
+                "llm_launchpad.core.artificial_analysis.fetch_artificial_analysis_models",
                 return_value=_aa_payload(tier="pro"),
             ) as fetch:
                 status = get_artificial_analysis_auth_status(
@@ -217,7 +217,7 @@ class ArtificialAnalysisKeyPersistenceTests(unittest.TestCase):
                 patch.dict("os.environ", {}, clear=True),
                 patch(AAI_AUTH_PATH_TARGET, key_path),
                 patch(
-                    "llm_launchpad.core.quick_deploy_refresh.fetch_artificial_analysis_models",
+                    "llm_launchpad.core.artificial_analysis.fetch_artificial_analysis_models",
                     return_value=_aa_payload(tier="pro"),
                 ) as fetch,
             ):

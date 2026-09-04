@@ -216,15 +216,15 @@ class KvCacheTypeTests(unittest.TestCase):
 
     def test_cache_precision_changes_the_serving_fingerprint(self) -> None:
         requirements = serving_requirements(262144)
-        common = dict(
-            model_id="org/model",
-            revision=None,
-            quant="Q2_K_XL",
-            runtime_id="runtime-1",
-            requirements=requirements,
-            gpu_type="RTX-PRO-6000",
-            gpu_count=1,
-        )
+        common = {
+            "model_id": "org/model",
+            "revision": None,
+            "quant": "Q2_K_XL",
+            "runtime_id": "runtime-1",
+            "requirements": requirements,
+            "gpu_type": "RTX-PRO-6000",
+            "gpu_count": 1,
+        }
         f16 = serving_fingerprint(tuning=self._tuning(), **common)
         q8 = serving_fingerprint(
             tuning=with_cache_type(self._tuning(), "q8_0"), **common

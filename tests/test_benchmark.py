@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
 import tempfile
 import unittest
@@ -36,7 +36,7 @@ class BenchmarkCoreTests(unittest.TestCase):
         self.assertEqual(request_count_for_concurrency(8, override=99), 99)
 
     def test_default_benchmark_run_dir_uses_app_name_and_utc_timestamp(self) -> None:
-        now = datetime(2026, 4, 24, 12, 30, 5, tzinfo=timezone.utc)
+        now = datetime(2026, 4, 24, 12, 30, 5, tzinfo=UTC)
 
         run_dir = default_benchmark_run_dir("llamacpp/My App", now=now)
 

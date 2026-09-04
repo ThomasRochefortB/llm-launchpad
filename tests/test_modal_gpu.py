@@ -163,7 +163,7 @@ class ModalGpuTypesTests(unittest.TestCase):
                 return FakeResponse(_DOC_SNIPPET)
             if url == modal_gpu.MODAL_PRICING_URL:
                 return FakeResponse(_PRICING_SNIPPET)
-            self.fail(f"Unexpected URL: {url}")
+            raise AssertionError(f"Unexpected URL: {url}")
 
         fake_requests = types.SimpleNamespace(get=fake_get)
         with patch.dict("sys.modules", {"requests": fake_requests}):
@@ -191,7 +191,7 @@ class ModalGpuTypesTests(unittest.TestCase):
                 return FakeResponse(200, _DOC_SNIPPET)
             if url == modal_gpu.MODAL_PRICING_URL:
                 return FakeResponse(503, "")
-            self.fail(f"Unexpected URL: {url}")
+            raise AssertionError(f"Unexpected URL: {url}")
 
         fake_requests = types.SimpleNamespace(get=fake_get)
         with patch.dict("sys.modules", {"requests": fake_requests}):

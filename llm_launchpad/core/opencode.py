@@ -9,12 +9,14 @@ from pathlib import Path
 import shlex
 import shutil
 import threading
-from typing import Any, Iterable
+from typing import Any
+from collections.abc import Iterable
 
 from ..protocol.enums import BackendType, ComputeProvider
 from ..protocol.models import DeploymentConfig, EndpointInfo, ReasoningCapabilities
 from .config import SETTINGS_DIR
-from .diagnostics import log_debug
+from .coerce import positive_int
+from .diagnostics import log_debug, log_exception
 from .naming import (
     default_llamacpp_served_model_name,
     default_served_model_name,
@@ -110,22 +112,6 @@ def _format_opencode_display_name(source: str, quant: str = "") -> str:
     return f"{base} ({quant_text})" if quant_text else base
 
 
-def _positive_token_limit(value: object) -> int | None:
-    """Normalize an optional token limit from config or persisted metadata."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        parsed = value
-    elif isinstance(value, str):
-        try:
-            parsed = int(value)
-        except ValueError:
-            return None
-    else:
-        return None
-    return parsed if parsed > 0 else None
-
-
 def _llamacpp_context_from_server_args(server_args: str | None) -> int | None:
     """Read the effective llama.cpp context size from a server argument string."""
     text = (server_args or "").strip()
@@ -147,7 +133,7 @@ def _llamacpp_context_from_server_args(server_args: str | None) -> int | None:
                 if token.startswith(prefix):
                     raw_value = token.removeprefix(prefix)
                     break
-        parsed = _positive_token_limit(raw_value)
+        parsed = positive_int(raw_value)
         if parsed is not None:
             context_limit = parsed
     return context_limit
@@ -163,11 +149,11 @@ def _model_limits(
     of the context window for output. This gives OpenCode enough information to
     compact before a request reaches the server's hard context boundary.
     """
-    context = _positive_token_limit(context_limit)
+    context = positive_int(context_limit)
     if context is None:
         return None, None
 
-    output = _positive_token_limit(output_limit)
+    output = positive_int(output_limit)
     if output is None:
         output = min(_DEFAULT_OPENCODE_OUTPUT_TOKENS, max(1, context // 4))
     else:
@@ -179,8 +165,8 @@ def _model_limits_from_config(
     config: DeploymentConfig,
 ) -> tuple[int | None, int | None]:
     """Resolve the actual deployed context window and OpenCode output reserve."""
-    declared_context = _positive_token_limit(config.max_context_tokens)
-    attested_context = _positive_token_limit(
+    declared_context = positive_int(config.max_context_tokens)
+    attested_context = positive_int(
         config.runtime_attestation.effective_context_tokens
         if config.runtime_attestation is not None
         else None
@@ -398,9 +384,8 @@ def resolve_connection_for_app(
         if resolved is not None:
             return resolved
 
-    if fallback_config is not None:
-        if fallback_server_url:
-            return build_connection_from_config(fallback_config, fallback_server_url)
+    if fallback_config is not None and fallback_server_url:
+        return build_connection_from_config(fallback_config, fallback_server_url)
     return None
 
 
@@ -542,7 +527,7 @@ def sync_opencode_config(
                 registry.pop(app_name, None)
                 registry_changed = True
 
-        for app_name in sorted(list(registry.keys())):
+        for app_name in sorted(registry.keys()):
             entry = registry.get(app_name)
             if not isinstance(entry, dict):
                 registry.pop(app_name, None)
@@ -565,7 +550,7 @@ def sync_opencode_config(
                     visible_by_name[row_name] = row
             prune_scope = _prune_scope(visible_rows, prune_providers)
 
-            for app_name in sorted(list(registry.keys())):
+            for app_name in sorted(registry.keys()):
                 entry = registry.get(app_name)
                 if not isinstance(entry, dict):
                     continue
@@ -811,7 +796,7 @@ def _load_registry(
                         normalized[app_name] = value
                 return normalized, False
         except Exception:
-            pass
+            log_exception("Could not read the existing OpenCode provider block")
 
     return _bootstrap_registry_from_config(config), True
 

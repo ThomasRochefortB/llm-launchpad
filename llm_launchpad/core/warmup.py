@@ -13,7 +13,8 @@ import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Generator, Optional
+from typing import Any
+from collections.abc import Generator
 from urllib.parse import urlsplit
 
 from ..protocol.enums import (
@@ -25,13 +26,18 @@ from ..protocol.enums import (
 )
 from ..protocol.events import (
     BaseEvent,
-    ErrorEvent,
     LogEvent,
     OperationCompleteEvent,
     StateChangeEvent,
 )
-from ..protocol.models import PerformancePoint, PlacementAssessment, ServingRequirements
+from ..protocol.models import (
+    PerformancePoint,
+    PlacementAssessment,
+    RuntimeAttestation,
+    ServingRequirements,
+)
 from .backend import ModalBackend
+from .operation_events import fail_operation
 from .diagnostics import log_exception
 from .llamacpp_planner import attestation_now, save_runtime_attestation
 from .naming import legacy_app_name
@@ -168,6 +174,256 @@ def endpoint_url_error(server_url: str) -> str | None:
     return None
 
 
+class _ModalLogTail:
+    """A live tail of one Modal app's logs, drained without blocking the caller.
+
+    A dedicated reader thread feeds a queue so that every line the subprocess
+    emits is captured immediately, regardless of Python's TextIOWrapper
+    read-ahead buffering. (``select()`` only checks the kernel pipe buffer, but
+    ``readline()`` can consume up to 2 KB into an internal buffer in a single
+    call -- a mismatch that leaves lines "stuck" until the next kernel read.)
+    """
+
+    RETRY_DELAY_SECONDS = 5.0
+
+    def __init__(self, app_name: str) -> None:
+        self.app_name = app_name
+        self.seen_lines: set[str] = set()
+        self._proc: subprocess.Popen[str] | None = None
+        self._queue: queue.Queue[str | None] | None = None
+        self._retry_at = 0.0
+
+    def may_attach(self) -> bool:
+        """Return whether the stream is detached and its retry delay has passed."""
+        return self._proc is None and time.time() >= self._retry_at
+
+    def attach(self) -> Generator[LogEvent, None, None]:
+        """Start the live stream, reporting a failure as a warning log line."""
+        try:
+            self._proc = self._spawn()
+        except Exception as exc:
+            yield LogEvent(line=f"Warning: failed to start log tailing: {exc}")
+            self._retry_at = time.time() + self.RETRY_DELAY_SECONDS
+
+    def drain(self) -> Generator[LogEvent, None, None]:
+        """Yield whatever the reader thread has queued, without blocking."""
+        if self._queue is None:
+            return
+        while True:
+            try:
+                line = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if line is None:
+                # Reader thread finished -- subprocess exited.
+                self._proc = None
+                self._queue = None
+                self._retry_at = time.time() + self.RETRY_DELAY_SECONDS
+                break
+            self.seen_lines.add(line)
+            yield LogEvent(line=line, operation=OperationType.WARMUP)
+
+    def stop(self, reason: str) -> None:
+        """Terminate the stream, logging rather than raising on failure."""
+        proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        try:
+            proc.terminate()
+        except Exception:
+            log_exception(f"Failed to terminate Modal log tail {reason}")
+
+    def _spawn(self) -> subprocess.Popen[str]:
+        follow = ModalBackend.logs_follow_args()
+        # PYTHONUNBUFFERED forces the modal CLI (a Python program) to
+        # flush each write immediately when stdout is a pipe.
+        unbuf_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+        proc = subprocess.Popen(
+            ModalBackend._resolve_command(
+                ["modal", "app", "logs", *follow, self.app_name]
+            ),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            env=unbuf_env,
+        )
+        q: queue.Queue[str | None] = queue.Queue()
+        self._queue = q
+
+        def _reader() -> None:
+            try:
+                assert proc.stdout is not None
+                for raw_line in proc.stdout:
+                    q.put(raw_line.rstrip("\n"))
+            except Exception:
+                log_exception("Modal log-tail reader stopped unexpectedly")
+            finally:
+                q.put(None)  # sentinel: reader finished
+
+        threading.Thread(target=_reader, daemon=True).start()
+        return proc
+
+
+def _certify_serving_requirements(
+    requests_module: Any,
+    *,
+    backend: BackendType,
+    server_url: str,
+    headers: dict[str, str],
+    probe_model: str,
+    serving_requirements: ServingRequirements,
+    placement_assessment: PlacementAssessment | None,
+    runtime_id: str | None,
+) -> Generator[BaseEvent, None, RuntimeAttestation | None]:
+    """Verify full-context GPU residency and throughput for a ready endpoint.
+
+    Yields certification progress and, on failure, the events that end the
+    warmup. Returns the attestation, or ``None`` when certification failed and
+    the caller should stop.
+    """
+    yield StateChangeEvent(
+        current=DeploymentState.VERIFYING,
+        operation=OperationType.WARMUP,
+        detail="Verifying full-context GPU residency",
+    )
+    effective_context = serving_requirements.context_tokens
+    if backend == BackendType.LLAMACPP:
+        props_url = endpoint_root_url(server_url) + "/props"
+        try:
+            props_response = requests_module.get(
+                props_url,
+                headers=headers,
+                timeout=15,
+            )
+            props_response.raise_for_status()
+            effective_context = extract_effective_context(
+                props_response.json()
+            ) or 0
+        except Exception as exc:
+            last_err = f"runtime property verification failed: {exc}"
+            yield from fail_operation(
+                OperationType.WARMUP,
+                f'Endpoint responded, but Launchpad could not verify its effective context: {exc}',
+                recoverable=False,
+                detail=last_err,
+            )
+            return None
+    if placement_assessment is None:
+        detail = "No placement assessment was supplied for runtime certification."
+        yield from fail_operation(
+            OperationType.WARMUP,
+            f'Runtime attestation failed: {detail}',
+            recoverable=False,
+            detail=detail,
+        )
+        return None
+    gpu_resident = bool(
+        placement_assessment.gpu_resident
+        and placement_assessment.tuning.gpu_layers.casefold() == "all"
+    )
+    if (
+        effective_context < serving_requirements.context_tokens
+        or (serving_requirements.gpu_only and not gpu_resident)
+    ):
+        detail = (
+            f"Requested {serving_requirements.context_tokens:,} context, "
+            f"runtime reported {effective_context:,}; "
+            f"GPU-only={gpu_resident}."
+        )
+        yield from fail_operation(
+            OperationType.WARMUP,
+            f'Runtime attestation failed: {detail}',
+            recoverable=False,
+            detail=detail,
+        )
+        return None
+
+    performance: tuple[PerformancePoint, ...] = ()
+    yield StateChangeEvent(
+        current=DeploymentState.CALIBRATING,
+        operation=OperationType.WARMUP,
+        detail="Measuring endpoint throughput",
+    )
+    performance = _calibrate_endpoint(
+        requests_module,
+        server_url=server_url,
+        model=probe_model,
+        headers=headers,
+        parallel_slots=(
+            placement_assessment.tuning.parallel_slots
+            if placement_assessment is not None
+            else 1
+        ),
+        price_per_hour_usd=serving_requirements.max_hourly_cost_usd,
+        budget_seconds=_CALIBRATION_BUDGET_SECONDS,
+    )
+    accepted, calibration_detail = _calibration_is_acceptable(
+        performance,
+        serving_requirements.objective,
+    )
+    if not accepted:
+        yield from fail_operation(
+            OperationType.WARMUP,
+            f'Endpoint performance certification failed: {calibration_detail}',
+            detail=calibration_detail,
+        )
+        return None
+
+    total_layers = max(
+        1,
+        placement_assessment.memory.total_layer_count or 0,
+    )
+    attestation = attestation_now(
+        fingerprint=placement_assessment.fingerprint,
+        requested_context_tokens=serving_requirements.context_tokens,
+        effective_context_tokens=effective_context,
+        gpu_layers=total_layers,
+        total_layers=total_layers,
+        gpu_resident=True,
+        memory=placement_assessment.memory,
+        performance=performance,
+        runtime_id=runtime_id,
+    )
+    try:
+        save_runtime_attestation(attestation)
+    except Exception as exc:
+        yield LogEvent(
+            line=f"Warning: could not cache serving certificate: {exc}",
+            operation=OperationType.WARMUP,
+        )
+    best_single = max(
+        (
+            point.output_tokens_per_second or 0.0
+            for point in performance
+            if point.concurrency == 1
+        ),
+        default=0.0,
+    )
+    best_aggregate = max(
+        (
+            point.aggregate_output_tokens_per_second or 0.0
+            for point in performance
+        ),
+        default=0.0,
+    )
+    metric = ""
+    if best_single > 0:
+        metric = (
+            f" · {best_single:.1f} tok/s single, "
+            f"{best_aggregate:.1f} tok/s aggregate"
+        )
+    yield LogEvent(
+        line=(
+            f"Full {effective_context:,}-token context verified on GPU"
+            f"{metric}."
+        ),
+        operation=OperationType.WARMUP,
+        is_milestone=True,
+    )
+    return attestation
+
+
 class WarmupRunner:
     """Probe endpoint readiness while optionally tailing Modal logs."""
 
@@ -177,11 +433,11 @@ class WarmupRunner:
         server_url: str,
         timeout: int = 1800,
         tail_logs: bool = True,
-        app_name: Optional[str] = None,
-        served_model_name: Optional[str] = None,
+        app_name: str | None = None,
+        served_model_name: str | None = None,
         provider: ComputeProvider = ComputeProvider.MODAL,
-        api_key: Optional[str] = None,
-        pod_id: Optional[str] = None,
+        api_key: str | None = None,
+        pod_id: str | None = None,
         prime_backend: PrimeBackend | None = None,
         serving_requirements: ServingRequirements | None = None,
         placement_assessment: PlacementAssessment | None = None,
@@ -199,82 +455,29 @@ class WarmupRunner:
         yield LogEvent(line=f"Probing readiness at: {probe_url}")
         url_error = endpoint_url_error(probe_url)
         if url_error:
-            yield ErrorEvent(
-                message=f"Invalid endpoint URL: {url_error}",
-                operation=OperationType.WARMUP,
-                recoverable=False,
-            )
-            yield OperationCompleteEvent(
-                operation=OperationType.WARMUP,
-                success=False,
+            yield from fail_operation(
+                OperationType.WARMUP,
+                f'Invalid endpoint URL: {url_error}',
                 exit_code=2,
+                recoverable=False,
+                detail="",
             )
             return
 
-        # Start log tailing in background.
-        # We use a dedicated reader thread + queue.Queue so that every
-        # line the subprocess emits is captured immediately, regardless
-        # of Python's internal TextIOWrapper read-ahead buffering.
-        # (select() only checks the kernel pipe buffer, but readline()
-        # can consume up to 2 KB into an internal buffer in a single
-        # call — a mismatch that causes lines to be "stuck" until the
-        # next kernel-buffer read.)
         target_app_name = app_name or legacy_app_name(backend)
-        logs_proc: Optional[subprocess.Popen[str]] = None
-        log_queue: Optional[queue.Queue[Optional[str]]] = None
-        logs_retry_at = 0.0
-
-        def _start_logs_tail() -> subprocess.Popen[str]:
-            nonlocal log_queue
-            follow = ModalBackend.logs_follow_args()
-            # PYTHONUNBUFFERED forces the modal CLI (a Python program) to
-            # flush each write immediately when stdout is a pipe.
-            unbuf_env = {**os.environ, "PYTHONUNBUFFERED": "1"}
-            proc = subprocess.Popen(
-                ModalBackend._resolve_command(
-                    ["modal", "app", "logs", *follow, target_app_name]
-                ),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-                env=unbuf_env,
-            )
-            q: queue.Queue[Optional[str]] = queue.Queue()
-            log_queue = q
-
-            def _reader() -> None:
-                try:
-                    assert proc.stdout is not None
-                    for raw_line in proc.stdout:
-                        q.put(raw_line.rstrip("\n"))
-                except Exception:
-                    log_exception("Modal log-tail reader stopped unexpectedly")
-                finally:
-                    q.put(None)  # sentinel: reader finished
-
-            threading.Thread(target=_reader, daemon=True).start()
-            return proc
-
-        if tail_logs and provider == ComputeProvider.MODAL:
-            try:
-                logs_proc = _start_logs_tail()
-            except Exception as exc:
-                yield LogEvent(line=f"Warning: failed to start log tailing: {exc}")
-                logs_retry_at = time.time() + 5.0
+        log_tail = _ModalLogTail(target_app_name)
+        tail_modal_logs = tail_logs and provider == ComputeProvider.MODAL
+        if tail_modal_logs:
+            yield from log_tail.attach()
 
         try:
             import requests
         except ImportError:
-            yield ErrorEvent(
-                message="'requests' is required. Install with: pip install requests",
-                operation=OperationType.WARMUP,
+            yield from fail_operation(
+                OperationType.WARMUP,
+                "'requests' is required. Install with: pip install requests",
                 recoverable=False,
-            )
-            yield OperationCompleteEvent(
-                operation=OperationType.WARMUP,
-                success=False,
-                exit_code=1,
+                detail="",
             )
             return
 
@@ -291,74 +494,31 @@ class WarmupRunner:
         start = time.time()
         backoff = 2.0
         max_backoff = 30.0
-        last_err: Optional[str] = None
-        last_scheduling_hint: Optional[str] = None
-        # Track displayed log lines so the historical-fetch fallback can
-        # avoid duplicating output already shown by the live stream.
-        seen_log_lines: set[str] = set()
-
-        def _drain_queue() -> Generator[LogEvent, None, None]:
-            """Yield log events from the reader-thread queue (non-blocking)."""
-            nonlocal logs_proc, log_queue, logs_retry_at
-            if log_queue is None:
-                return
-            while True:
-                try:
-                    line = log_queue.get_nowait()
-                except queue.Empty:
-                    break
-                if line is None:
-                    # Reader thread finished — subprocess exited.
-                    logs_proc = None
-                    log_queue = None
-                    logs_retry_at = time.time() + 5.0
-                    break
-                seen_log_lines.add(line)
-                yield LogEvent(line=line, operation=OperationType.WARMUP)
-
+        last_err: str | None = None
+        last_scheduling_hint: str | None = None
         while True:
             # Exit promptly if the app is shutting down.
             if is_shutting_down():
-                if logs_proc:
-                    try:
-                        logs_proc.terminate()
-                    except Exception:
-                        log_exception("Failed to terminate Modal log tail on shutdown")
+                log_tail.stop("on shutdown")
                 return
 
-            if (
-                tail_logs
-                and provider == ComputeProvider.MODAL
-                and logs_proc is None
-                and time.time() >= logs_retry_at
-            ):
+            if tail_modal_logs and log_tail.may_attach():
                 # Historical-fetch fallback: the live stream may miss the
                 # final output of a crashing container, while Modal's persisted
                 # logs still have it.
-                yield from fetch_historical_logs(target_app_name, seen_log_lines)
-                # Re-attach live stream for further output.
-                try:
-                    logs_proc = _start_logs_tail()
-                except Exception as exc:
-                    yield LogEvent(line=f"Warning: failed to start log tailing: {exc}")
-                    logs_retry_at = time.time() + 5.0
+                yield from fetch_historical_logs(target_app_name, log_tail.seen_lines)
+                yield from log_tail.attach()
 
             # Drain log lines delivered by the reader thread.
-            yield from _drain_queue()
+            yield from log_tail.drain()
 
             elapsed = time.time() - start
             if elapsed > timeout:
-                if logs_proc:
-                    try:
-                        logs_proc.terminate()
-                    except Exception:
-                        log_exception("Failed to terminate Modal log tail on timeout")
-                yield ErrorEvent(
-                    message=f"Timed out after {timeout}s. Last error: {last_err}",
-                    operation=OperationType.WARMUP,
-                )
-                yield OperationCompleteEvent(
-                    operation=OperationType.WARMUP, success=False, exit_code=1
+                log_tail.stop("on timeout")
+                yield from fail_operation(
+                    OperationType.WARMUP,
+                    f'Timed out after {timeout}s. Last error: {last_err}',
+                    detail="",
                 )
                 return
 
@@ -374,176 +534,21 @@ class WarmupRunner:
                     backend, resp.status_code, body
                 )
                 if ready_ok:
-                    if logs_proc:
-                        try:
-                            logs_proc.terminate()
-                        except Exception:
-                            log_exception("Failed to terminate Modal log tail after readiness")
+                    log_tail.stop("after readiness")
                     attestation = None
                     if serving_requirements is not None:
-                        yield StateChangeEvent(
-                            current=DeploymentState.VERIFYING,
-                            operation=OperationType.WARMUP,
-                            detail="Verifying full-context GPU residency",
-                        )
-                        effective_context = serving_requirements.context_tokens
-                        if backend == BackendType.LLAMACPP:
-                            props_url = endpoint_root_url(server_url) + "/props"
-                            try:
-                                props_response = requests.get(
-                                    props_url,
-                                    headers=headers,
-                                    timeout=15,
-                                )
-                                props_response.raise_for_status()
-                                effective_context = extract_effective_context(
-                                    props_response.json()
-                                ) or 0
-                            except Exception as exc:
-                                last_err = f"runtime property verification failed: {exc}"
-                                yield ErrorEvent(
-                                    message=(
-                                        "Endpoint responded, but Launchpad could not verify "
-                                        f"its effective context: {exc}"
-                                    ),
-                                    operation=OperationType.WARMUP,
-                                    recoverable=False,
-                                )
-                                yield OperationCompleteEvent(
-                                    operation=OperationType.WARMUP,
-                                    success=False,
-                                    exit_code=1,
-                                    detail=last_err,
-                                )
-                                return
-                        if placement_assessment is None:
-                            detail = "No placement assessment was supplied for runtime certification."
-                            yield ErrorEvent(
-                                message=f"Runtime attestation failed: {detail}",
-                                operation=OperationType.WARMUP,
-                                recoverable=False,
-                            )
-                            yield OperationCompleteEvent(
-                                operation=OperationType.WARMUP,
-                                success=False,
-                                exit_code=1,
-                                detail=detail,
-                            )
-                            return
-                        gpu_resident = bool(
-                            placement_assessment.gpu_resident
-                            and placement_assessment.tuning.gpu_layers.casefold() == "all"
-                        )
-                        if (
-                            effective_context < serving_requirements.context_tokens
-                            or (serving_requirements.gpu_only and not gpu_resident)
-                        ):
-                            detail = (
-                                f"Requested {serving_requirements.context_tokens:,} context, "
-                                f"runtime reported {effective_context:,}; "
-                                f"GPU-only={gpu_resident}."
-                            )
-                            yield ErrorEvent(
-                                message=f"Runtime attestation failed: {detail}",
-                                operation=OperationType.WARMUP,
-                                recoverable=False,
-                            )
-                            yield OperationCompleteEvent(
-                                operation=OperationType.WARMUP,
-                                success=False,
-                                exit_code=1,
-                                detail=detail,
-                            )
-                            return
-
-                        performance: tuple[PerformancePoint, ...] = ()
-                        yield StateChangeEvent(
-                            current=DeploymentState.CALIBRATING,
-                            operation=OperationType.WARMUP,
-                            detail="Measuring endpoint throughput",
-                        )
-                        performance = _calibrate_endpoint(
+                        attestation = yield from _certify_serving_requirements(
                             requests,
+                            backend=backend,
                             server_url=server_url,
-                            model=llama_probe_model,
                             headers=headers,
-                            parallel_slots=(
-                                placement_assessment.tuning.parallel_slots
-                                if placement_assessment is not None
-                                else 1
-                            ),
-                            price_per_hour_usd=serving_requirements.max_hourly_cost_usd,
-                            budget_seconds=_CALIBRATION_BUDGET_SECONDS,
-                        )
-                        accepted, calibration_detail = _calibration_is_acceptable(
-                            performance,
-                            serving_requirements.objective,
-                        )
-                        if not accepted:
-                            yield ErrorEvent(
-                                message=f"Endpoint performance certification failed: {calibration_detail}",
-                                operation=OperationType.WARMUP,
-                                recoverable=True,
-                            )
-                            yield OperationCompleteEvent(
-                                operation=OperationType.WARMUP,
-                                success=False,
-                                exit_code=1,
-                                detail=calibration_detail,
-                            )
-                            return
-
-                        total_layers = max(
-                            1,
-                            placement_assessment.memory.total_layer_count or 0,
-                        )
-                        attestation = attestation_now(
-                            fingerprint=placement_assessment.fingerprint,
-                            requested_context_tokens=serving_requirements.context_tokens,
-                            effective_context_tokens=effective_context,
-                            gpu_layers=total_layers,
-                            total_layers=total_layers,
-                            gpu_resident=True,
-                            memory=placement_assessment.memory,
-                            performance=performance,
+                            probe_model=llama_probe_model,
+                            serving_requirements=serving_requirements,
+                            placement_assessment=placement_assessment,
                             runtime_id=runtime_id,
                         )
-                        try:
-                            save_runtime_attestation(attestation)
-                        except Exception as exc:
-                            yield LogEvent(
-                                line=f"Warning: could not cache serving certificate: {exc}",
-                                operation=OperationType.WARMUP,
-                            )
-                        best_single = max(
-                            (
-                                point.output_tokens_per_second or 0.0
-                                for point in performance
-                                if point.concurrency == 1
-                            ),
-                            default=0.0,
-                        )
-                        best_aggregate = max(
-                            (
-                                point.aggregate_output_tokens_per_second or 0.0
-                                for point in performance
-                            ),
-                            default=0.0,
-                        )
-                        metric = ""
-                        if best_single > 0:
-                            metric = (
-                                f" · {best_single:.1f} tok/s single, "
-                                f"{best_aggregate:.1f} tok/s aggregate"
-                            )
-                        yield LogEvent(
-                            line=(
-                                f"Full {effective_context:,}-token context verified on GPU"
-                                f"{metric}."
-                            ),
-                            operation=OperationType.WARMUP,
-                            is_milestone=True,
-                        )
+                        if attestation is None:
+                            return
 
                     yield LogEvent(line="Server is ready!")
                     curl_cmd = ModalBackend.test_curl_command(
@@ -598,8 +603,8 @@ class WarmupRunner:
                     try:
                         lines = prime_backend.get_pod_logs(pod_id, tail=200)
                         for line in lines:
-                            if line not in seen_log_lines:
-                                seen_log_lines.add(line)
+                            if line not in log_tail.seen_lines:
+                                log_tail.seen_lines.add(line)
                                 yield LogEvent(line=line, operation=OperationType.WARMUP)
                     except Exception:
                         log_exception("Failed to fetch Prime pod logs during warmup")
@@ -615,7 +620,7 @@ class WarmupRunner:
                 chunk = min(0.5, sleep_end - time.time())
                 if chunk > 0:
                     shutdown_event().wait(timeout=chunk)
-                yield from _drain_queue()
+                yield from log_tail.drain()
             backoff = min(max_backoff, backoff * 1.5)
 
 

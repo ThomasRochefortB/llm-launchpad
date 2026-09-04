@@ -5,7 +5,6 @@ from __future__ import annotations
 import hashlib
 import re
 import unicodedata
-from typing import Optional
 
 from coolname import generate_slug
 
@@ -38,7 +37,7 @@ def slugify_instance_name(raw: str, default: str = "default") -> str:
     return slug or default
 
 
-def auto_instance_name_for_backend(backend: BackendType, model_hint: Optional[str]) -> str:
+def auto_instance_name_for_backend(backend: BackendType, model_hint: str | None) -> str:
     """Build a default instance name based on backend model context."""
     if backend == BackendType.VLLM:
         return slugify_instance_name(model_hint or "default")
@@ -46,7 +45,7 @@ def auto_instance_name_for_backend(backend: BackendType, model_hint: Optional[st
     return slugify_instance_name(model_hint or "default")
 
 
-def default_served_model_name(model_name: Optional[str], default: str = "llm") -> str:
+def default_served_model_name(model_name: str | None, default: str = "llm") -> str:
     """Return the default served model alias for a vLLM model id."""
     candidate = (model_name or "").strip()
     if not candidate:
@@ -56,8 +55,8 @@ def default_served_model_name(model_name: Optional[str], default: str = "llm") -
 
 
 def default_llamacpp_served_model_name(
-    repo_id: Optional[str],
-    quant: Optional[str] = None,
+    repo_id: str | None,
+    quant: str | None = None,
     default: str = "default",
 ) -> str:
     """Return a friendly llama.cpp OpenAI model id derived from repo + quant."""
@@ -70,7 +69,7 @@ def default_llamacpp_served_model_name(
     return f"{alias}-{quant_text}"
 
 
-def build_app_name(backend: BackendType, instance_name: Optional[str]) -> str:
+def build_app_name(backend: BackendType, instance_name: str | None) -> str:
     """Compose a launchpad app name from backend + instance name."""
     if not instance_name:
         return legacy_app_name(backend)
@@ -80,7 +79,7 @@ def build_app_name(backend: BackendType, instance_name: Optional[str]) -> str:
 def build_deployment_name(
     provider: ComputeProvider,
     backend: BackendType,
-    instance_name: Optional[str],
+    instance_name: str | None,
 ) -> str:
     """Compose a provider-safe deployment resource name."""
     if provider == ComputeProvider.PRIME:
@@ -88,7 +87,7 @@ def build_deployment_name(
     return build_app_name(backend, instance_name)
 
 
-def infer_provider_from_app_name(app_name: str) -> Optional[ComputeProvider]:
+def infer_provider_from_app_name(app_name: str) -> ComputeProvider | None:
     """Infer compute provider from a Launchpad deployment name."""
     name = (app_name or "").strip()
     if not name:
@@ -100,7 +99,7 @@ def infer_provider_from_app_name(app_name: str) -> Optional[ComputeProvider]:
     return None
 
 
-def infer_backend_from_app_name(app_name: str) -> Optional[BackendType]:
+def infer_backend_from_app_name(app_name: str) -> BackendType | None:
     """Infer backend type from legacy or prefixed app names."""
     if (
         app_name == _LEGACY_APP_NAMES[BackendType.VLLM]
@@ -117,7 +116,7 @@ def infer_backend_from_app_name(app_name: str) -> Optional[BackendType]:
     return None
 
 
-def infer_instance_from_app_name(app_name: str, backend: Optional[BackendType]) -> Optional[str]:
+def infer_instance_from_app_name(app_name: str, backend: BackendType | None) -> str | None:
     """Infer instance name from app name when possible."""
     if backend is None:
         return None
@@ -138,7 +137,7 @@ def random_function_slug() -> str:
     return slugify_instance_name(generate_slug(2))
 
 
-def modal_function_name(base_name: str, function_slug: Optional[str]) -> str:
+def modal_function_name(base_name: str, function_slug: str | None) -> str:
     """Return a Modal function name with optional deployment slug suffix."""
     slug = slugify_instance_name(function_slug or "", default="")
     if not slug:
@@ -146,7 +145,7 @@ def modal_function_name(base_name: str, function_slug: Optional[str]) -> str:
     return f"{base_name}-{slug}"
 
 
-def modal_web_label(app_name: str, function_slug: Optional[str]) -> str:
+def modal_web_label(app_name: str, function_slug: str | None) -> str:
     """Return a short, stable label for a llama.cpp Modal web endpoint.
 
     Modal's default web label concatenates the App and Function names. Large

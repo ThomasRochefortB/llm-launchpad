@@ -98,7 +98,7 @@ class MonitorScreen(CopyEnabledScreen):
         ),
         Binding(
             "ctrl+shift+c,super+c,meta+c,cmd+c,command+c",
-            "copy_text_to_clipboard",
+            "copy_text",
             "Copy",
             show=False,
         ),

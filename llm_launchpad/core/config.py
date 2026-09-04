@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any
 
 from ..protocol.models import LaunchpadSettings
 
@@ -49,7 +49,7 @@ class ConfigStore:
         """Load settings and include diagnostics for corrupt/unreadable files."""
         if self.path.exists():
             try:
-                raw: Dict[str, Any] = json.loads(self.path.read_text())
+                raw: dict[str, Any] = json.loads(self.path.read_text())
                 return ConfigLoadResult(
                     settings=LaunchpadSettings.from_dict(raw),
                     path=self.path,

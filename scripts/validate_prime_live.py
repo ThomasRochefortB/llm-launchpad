@@ -17,7 +17,8 @@ import sys
 import tempfile
 import time
 import traceback
-from typing import Any, Callable
+from typing import Any
+from collections.abc import Callable
 from urllib.parse import urlsplit
 
 import requests

@@ -86,9 +86,7 @@ def is_error_like(text: str) -> bool:
     """Return whether a line should surface as a failure rather than noise."""
     if _ERROR_WORD_RE.search(text) or _OOM_RE.search(text):
         return True
-    if _HTTP_ERROR_CONTEXT_RE.search(text):
-        return True
-    return False
+    return bool(_HTTP_ERROR_CONTEXT_RE.search(text))
 
 
 def strip_summary_marker(text: str) -> str:
@@ -563,9 +561,7 @@ class DeployLogSummarizer:
             return True
         if text.startswith("Loading safetensors checkpoint shards:"):
             return True
-        if "Capturing CUDA graphs (" in text:
-            return True
-        return False
+        return "Capturing CUDA graphs (" in text
 
     @staticmethod
     def _is_llamacpp_readiness_503_noise(text: str) -> bool:

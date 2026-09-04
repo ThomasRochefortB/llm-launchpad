@@ -4,12 +4,12 @@
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from io import BytesIO
 import json
 from pathlib import Path
 import tarfile
-from typing import Sequence
+from collections.abc import Sequence
 
 import requests
 
@@ -110,7 +110,7 @@ def write_manifest(payload: dict[str, object], output: Path) -> None:
 
 
 def _utc_now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace(
+    return datetime.now(UTC).replace(microsecond=0).isoformat().replace(
         "+00:00", "Z"
     )
 

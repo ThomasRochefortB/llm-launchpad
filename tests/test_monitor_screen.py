@@ -421,16 +421,10 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.clipboard, "first line")
 
     def test_copy_binding_includes_terminal_safe_variants(self) -> None:
-        copy_binding = next(b for b in MonitorScreen.BINDINGS if b.action == "copy_text")
-        self.assertEqual(copy_binding.key, "y")
-
-    def test_direct_clipboard_binding_keeps_terminal_copy_aliases(self) -> None:
-        copy_binding = next(
-            b for b in MonitorScreen.BINDINGS if b.action == "copy_text_to_clipboard"
-        )
+        copy_keys = {b.key for b in MonitorScreen.BINDINGS if b.action == "copy_text"}
         self.assertEqual(
-            copy_binding.key,
-            "ctrl+shift+c,super+c,meta+c,cmd+c,command+c",
+            copy_keys,
+            {"y", "ctrl+shift+c,super+c,meta+c,cmd+c,command+c"},
         )
 
     async def test_connection_card_shows_copy_actions_and_returns_home(self) -> None:

@@ -32,7 +32,7 @@ class CopyEnabledScreen(Screen):
         Binding("y", "copy_text", "Copy", key_display="y", show=False),
         Binding(
             "ctrl+shift+c,super+c,meta+c,cmd+c,command+c",
-            "copy_text_to_clipboard",
+            "copy_text",
             "Copy",
             show=False,
         ),
@@ -124,14 +124,6 @@ class CopyEnabledScreen(Screen):
 
     def action_copy_text(self) -> None:
         """Copy selected or focused text to the clipboard."""
-        normalized = self._copyable_text()
-        if normalized:
-            self.app.copy_to_clipboard(normalized)
-            return
-        self.notify("Nothing to copy", timeout=2)
-
-    def action_copy_text_to_clipboard(self) -> None:
-        """Copy selected text directly to the clipboard when the terminal supports it."""
         normalized = self._copyable_text()
         if normalized:
             self.app.copy_to_clipboard(normalized)

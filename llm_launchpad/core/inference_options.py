@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from typing import Iterable, Protocol, Sequence
-import re
+from typing import Protocol
+from collections.abc import Iterable, Sequence
 
 from ..protocol.enums import BackendType, BillingModel, ComputeProvider, QuoteAvailability
 from ..protocol.models import (
@@ -19,6 +19,7 @@ from ..protocol.models import (
 )
 from .prime_backend import (
     PrimeBackend,
+    prime_stock_availability,
     is_compatible_prime_offer,
     preferred_prime_offer_image,
     prime_offer_gpu_memory_gb,
@@ -164,7 +165,7 @@ class PrimeInferenceAdapter:
                 required_image=required_image,
             ):
                 continue
-            availability = _prime_availability(offer.stock_status)
+            availability = prime_stock_availability(offer.stock_status)
             region = offer.country or offer.region or offer.data_center
             # Prime sometimes reports aggregate node memory. Planner placement
             # math is per-device, so quotes always carry the per-GPU size.
@@ -215,7 +216,7 @@ def resolve_inference_plans(
                     )
                 plans.append(_plan_from_quote(recipe, quote, workload))
 
-    plans.sort(key=_plan_sort_key)
+    plans.sort(key=_plan_monthly_cost_sort_key)
     recommended_recipes: set[str] = set()
     for index, plan in enumerate(plans):
         if plan.recipe.id in recommended_recipes:
@@ -292,33 +293,13 @@ def _plan_from_quote(
     )
 
 
-def _plan_sort_key(plan: InferencePlan) -> tuple[int, int, float, str]:
-    availability_order = {
-        QuoteAvailability.AVAILABLE: 0,
-        QuoteAvailability.UNKNOWN: 1,
-        QuoteAvailability.UNAVAILABLE: 2,
-    }
+def _plan_monthly_cost_sort_key(plan: InferencePlan) -> tuple[int, int, float, str]:
     monthly_cost = plan.estimated_monthly_cost_usd
     return (
-        availability_order[plan.quote.availability],
+        plan.quote.availability.sort_rank,
         1 if monthly_cost is None else 0,
         monthly_cost if monthly_cost is not None else float("inf"),
         plan.quote.id,
     )
 
 
-def _prime_availability(stock_status: str | None) -> QuoteAvailability:
-    value = re.sub(r"[^a-z0-9]+", "_", (stock_status or "").casefold()).strip("_")
-    if value in {"available", "in_stock", "instock"}:
-        return QuoteAvailability.AVAILABLE
-    if value in {
-        "unavailable",
-        "out_of_stock",
-        "outofstock",
-        "sold_out",
-        "soldout",
-        "not_available",
-        "notavailable",
-    }:
-        return QuoteAvailability.UNAVAILABLE
-    return QuoteAvailability.UNKNOWN

@@ -9,9 +9,11 @@ import re
 import shlex
 import subprocess
 import threading
-from typing import Any, Dict, Generator, List, Optional
+from typing import Any
+from collections.abc import Generator
 
 from ..protocol.enums import BackendType
+from .coerce import optional_str
 from ..protocol.events import ErrorEvent, LogEvent, OperationCompleteEvent
 from ..protocol.models import DeploymentConfig, EndpointInfo, LaunchpadSettings
 from .modal_auth import get_modal_profile
@@ -86,12 +88,12 @@ class ModalBackend:
     _CLI_TIMEOUT_SECONDS = _MODAL_CLI_TIMEOUT_SECONDS
 
     @staticmethod
-    def modal_cli_path() -> Optional[str]:
+    def modal_cli_path() -> str | None:
         """Resolve the Modal CLI, preferring the active environment's scripts dir."""
         return resolve_modal_cli_path()
 
     @classmethod
-    def _resolve_command(cls, command: List[str]) -> List[str]:
+    def _resolve_command(cls, command: list[str]) -> list[str]:
         if command and command[0] == "modal":
             modal_cli = cls.modal_cli_path()
             if modal_cli:
@@ -144,7 +146,7 @@ class ModalBackend:
         return ModalBackend.modal_cli_path() is not None
 
     @staticmethod
-    def get_username() -> Optional[str]:
+    def get_username() -> str | None:
         """Return the current Modal profile/workspace slug, or None."""
         return get_modal_profile()
 
@@ -155,9 +157,9 @@ class ModalBackend:
     @staticmethod
     def default_server_url(
         username: str,
-        backend: Optional[BackendType] = None,
-        app_name: Optional[str] = None,
-        function_slug: Optional[str] = None,
+        backend: BackendType | None = None,
+        app_name: str | None = None,
+        function_slug: str | None = None,
     ) -> str:
         resolved_backend = backend or infer_backend_from_app_name(app_name or "")
         if resolved_backend is None:
@@ -170,7 +172,7 @@ class ModalBackend:
         return f"https://{username}--{resolved}-{serve_name}.modal.run"
 
     @staticmethod
-    def extract_modal_web_url(line: str) -> Optional[str]:
+    def extract_modal_web_url(line: str) -> str | None:
         """Extract the first Modal web URL from an output line."""
         match = re.search(r"https://[A-Za-z0-9-]+\.modal\.run", line or "")
         return match.group(0) if match else None
@@ -179,15 +181,15 @@ class ModalBackend:
     def test_curl_command(
         backend: BackendType,
         server_url: str,
-        served_model_name: Optional[str] = None,
-        api_key: Optional[str] = None,
+        served_model_name: str | None = None,
+        api_key: str | None = None,
     ) -> str:
         base = server_url.rstrip("/")
         if base.endswith("/v1"):
             base = base[: -len("/v1")].rstrip("/")
         content = "Say hello in one short sentence."
 
-        def _curl_json(endpoint: str, payload: Dict[str, Any]) -> str:
+        def _curl_json(endpoint: str, payload: dict[str, Any]) -> str:
             body = shlex.quote(json.dumps(payload, separators=(",", ":")))
             auth_header = ""
             if api_key:
@@ -225,9 +227,9 @@ class ModalBackend:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def env_for_backend(config: DeploymentConfig) -> Dict[str, str]:
+    def env_for_backend(config: DeploymentConfig) -> dict[str, str]:
         """Derive backend-specific env vars from a deployment config."""
-        env: Dict[str, str] = {}
+        env: dict[str, str] = {}
         if config.app_name:
             env["MODAL_APP_NAME"] = config.app_name
         if config.function_slug:
@@ -262,7 +264,7 @@ class ModalBackend:
     def build_full_env(
         settings: LaunchpadSettings,
         config: DeploymentConfig,
-    ) -> Dict[str, str]:
+    ) -> dict[str, str]:
         env = settings.to_env()
         gpu_type = (config.gpu_type or "").strip()
         if gpu_type and config.gpu_count is not None and config.gpu_count > 0:
@@ -275,18 +277,18 @@ class ModalBackend:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def build_deploy_command(backend: BackendType, app_name: Optional[str] = None) -> List[str]:
+    def build_deploy_command(backend: BackendType, app_name: str | None = None) -> list[str]:
         cmd = ["modal", "deploy", "-m", backend.script]
         if app_name:
             cmd += ["--name", app_name]
         return cmd
 
     @staticmethod
-    def build_run_command(config: DeploymentConfig) -> List[str]:
+    def build_run_command(config: DeploymentConfig) -> list[str]:
         if config.backend == BackendType.VLLM:
             return ["modal", "run", "-m", BackendType.VLLM.script]
 
-        args: List[str] = ["modal", "run", "-m", f"{BackendType.LLAMACPP.script}::main"]
+        args: list[str] = ["modal", "run", "-m", f"{BackendType.LLAMACPP.script}::main"]
         if config.preset:
             args += ["--preset", config.preset]
         if config.repo_id:
@@ -317,8 +319,8 @@ class ModalBackend:
     def build_modal_entrypoint_command(
         script: str,
         entrypoint: str,
-        args: Optional[List[str]] = None,
-    ) -> List[str]:
+        args: list[str] | None = None,
+    ) -> list[str]:
         cmd = ["modal", "run", "-m", f"{script}::{entrypoint}"]
         if args:
             cmd.extend(args)
@@ -329,7 +331,7 @@ class ModalBackend:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def logs_follow_args() -> List[str]:
+    def logs_follow_args() -> list[str]:
         """Best available follow flag for ``modal app logs``."""
         try:
             res = subprocess.run(
@@ -347,7 +349,7 @@ class ModalBackend:
         except subprocess.TimeoutExpired:
             return []
         except Exception:
-            pass
+            log_exception("Could not probe `modal app logs` for a follow flag")
         return []
 
     # ------------------------------------------------------------------
@@ -355,7 +357,7 @@ class ModalBackend:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def list_apps() -> Optional[List[EndpointInfo]]:
+    def list_apps() -> list[EndpointInfo] | None:
         """Return parsed app list (possibly empty), or None on failure."""
         result = ModalBackend.list_apps_result()
         return result.rows if result.success else None
@@ -455,7 +457,7 @@ class ModalBackend:
             )
 
     @staticmethod
-    def billing_report_json() -> tuple[Optional[Any], Optional[str]]:
+    def billing_report_json() -> tuple[Any | None, str | None]:
         """Return billing report JSON and an optional error message."""
         commands = [
             ["modal", "billing", "report", "--for", "this month", "--json"],
@@ -471,7 +473,7 @@ class ModalBackend:
                 or "usage: modal [options] command" in normalized
             )
 
-        last_error: Optional[str] = None
+        last_error: str | None = None
         unsupported_command_seen = False
         for command in commands:
             try:
@@ -514,7 +516,7 @@ class ModalBackend:
         return None, last_error or "Could not read billing report."
 
     @staticmethod
-    def list_volume(volume_name: str, path: str = "/") -> Optional[List[Dict[str, Any]]]:
+    def list_volume(volume_name: str, path: str = "/") -> list[dict[str, Any]] | None:
         """List files/directories in a Modal Volume path."""
         result = ModalBackend.list_volume_result(volume_name, path)
         return result.entries if result.success else None
@@ -601,8 +603,8 @@ class ModalBackend:
 
     @staticmethod
     def run_streaming(
-        command: List[str],
-        env: Optional[Dict[str, str]] = None,
+        command: list[str],
+        env: dict[str, str] | None = None,
     ) -> Generator[LogEvent | OperationCompleteEvent | ErrorEvent, None, None]:
         """Run *command* and yield protocol events for each output line."""
         merged = {**os.environ, **(env or {})}
@@ -641,8 +643,8 @@ class ModalBackend:
     def run_modal_script_entrypoint(
         script: str,
         entrypoint: str,
-        args: Optional[List[str]] = None,
-        env: Optional[Dict[str, str]] = None,
+        args: list[str] | None = None,
+        env: dict[str, str] | None = None,
     ) -> Generator[LogEvent | OperationCompleteEvent | ErrorEvent, None, None]:
         """Run `modal run <script>::<entrypoint>` and stream output."""
         cmd = ModalBackend.build_modal_entrypoint_command(script, entrypoint, args=args)
@@ -652,9 +654,9 @@ class ModalBackend:
     def run_modal_script_entrypoint_capture(
         script: str,
         entrypoint: str,
-        args: Optional[List[str]] = None,
-        env: Optional[Dict[str, str]] = None,
-    ) -> Optional[tuple[int, str, str]]:
+        args: list[str] | None = None,
+        env: dict[str, str] | None = None,
+    ) -> tuple[int, str, str] | None:
         """Run `modal run <script>::<entrypoint>` and capture stdout/stderr."""
         cmd = ModalBackend.build_modal_entrypoint_command(script, entrypoint, args=args)
         merged = {**os.environ, **(env or {})}
@@ -687,8 +689,8 @@ class ModalBackend:
 
     @staticmethod
     def run_blocking(
-        command: List[str],
-        env: Optional[Dict[str, str]] = None,
+        command: list[str],
+        env: dict[str, str] | None = None,
     ) -> int:
         """Run *command* blocking and return exit code."""
         merged = None
@@ -720,19 +722,12 @@ def _modal_cli_error_from_completed_process(
     )
 
 
-def _non_empty_text(value: Any) -> Optional[str]:
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None
-
-
 def _nested_string_for_keys(
     value: Any,
     keys: set[str],
     *,
     max_depth: int = 6,
-) -> Optional[str]:
+) -> str | None:
     """Depth-limited search for a string value by key name (case-insensitive)."""
     if max_depth < 0:
         return None
@@ -740,7 +735,7 @@ def _nested_string_for_keys(
     if isinstance(value, dict):
         for key, child in value.items():
             if str(key).strip().lower() in keys:
-                text = _non_empty_text(child)
+                text = optional_str(child)
                 if text:
                     return text
         for child in value.values():
@@ -759,12 +754,12 @@ def _nested_string_for_keys(
     return None
 
 
-def _collect_modal_web_urls(value: Any, *, max_depth: int = 6) -> List[str]:
+def _collect_modal_web_urls(value: Any, *, max_depth: int = 6) -> list[str]:
     """Collect Modal web URLs found anywhere in a nested JSON-like payload."""
     if max_depth < 0:
         return []
 
-    urls: List[str] = []
+    urls: list[str] = []
     if isinstance(value, dict):
         for child in value.values():
             urls.extend(_collect_modal_web_urls(child, max_depth=max_depth - 1))
@@ -782,7 +777,7 @@ def _collect_modal_web_urls(value: Any, *, max_depth: int = 6) -> List[str]:
     return urls
 
 
-def _extract_item_web_url(item: dict[str, Any]) -> Optional[str]:
+def _extract_item_web_url(item: dict[str, Any]) -> str | None:
     """Best-effort extraction of a Modal web URL from one app-list row."""
     for key in ("web_url", "webUrl", "url", "URL"):
         candidate = item.get(key)
@@ -800,8 +795,8 @@ def _extract_item_web_url(item: dict[str, Any]) -> Optional[str]:
     return unique_urls[0]
 
 
-def _extract_modal_app_rows(payload: Any) -> List[EndpointInfo]:
-    rows: List[EndpointInfo] = []
+def _extract_modal_app_rows(payload: Any) -> list[EndpointInfo]:
+    rows: list[EndpointInfo] = []
     if isinstance(payload, dict):
         if isinstance(payload.get("apps"), list):
             payload = payload["apps"]

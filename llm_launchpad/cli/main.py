@@ -11,7 +11,7 @@ import os
 import sys
 from dataclasses import asdict
 import json
-from typing import Annotated, Optional
+from typing import Annotated
 
 import typer
 
@@ -96,7 +96,7 @@ def _version_callback(value: bool) -> None:
 def _default(
     ctx: typer.Context,
     version: Annotated[
-        Optional[bool],
+        bool | None,
         typer.Option(
             "--version",
             callback=_version_callback,
@@ -203,9 +203,9 @@ def _ensure_tui_runtime() -> None:
 
 def _resolve_deploy_target(
     backend: BackendType,
-    model_hint: Optional[str],
-    instance_name: Optional[str],
-    app_name: Optional[str],
+    model_hint: str | None,
+    instance_name: str | None,
+    app_name: str | None,
     provider: ComputeProvider = ComputeProvider.MODAL,
 ) -> tuple[str, str]:
     """Resolve (instance_name, app_name) for deployment."""
@@ -240,8 +240,8 @@ def _provider_instances(
 
 def _resolve_manage_app_name(
     backend: BackendType,
-    app_name: Optional[str],
-    instance_name: Optional[str],
+    app_name: str | None,
+    instance_name: str | None,
     provider: ComputeProvider = ComputeProvider.MODAL,
 ) -> str:
     explicit_app = (app_name or "").strip()
@@ -273,8 +273,8 @@ def _resolve_manage_app_name(
 def _resolve_manage_target(
     backend: BackendType,
     provider: ComputeProvider,
-    app_name: Optional[str],
-    instance_name: Optional[str],
+    app_name: str | None,
+    instance_name: str | None,
 ) -> EndpointInfo:
     """Resolve a management target and hydrate its locally stored connection."""
     target_name = _resolve_manage_app_name(backend, app_name, instance_name, provider)
@@ -402,9 +402,9 @@ def _load_rows_for_opencode_sync(
 
 def _sync_opencode_cli(
     *,
-    target_app_name: Optional[str] = None,
-    target_url: Optional[str] = None,
-    target_config: Optional[DeploymentConfig] = None,
+    target_app_name: str | None = None,
+    target_url: str | None = None,
+    target_config: DeploymentConfig | None = None,
     current_rows: list[EndpointInfo] | None = None,
     remove_app_names: list[str] | None = None,
     prune_providers: tuple[ComputeProvider, ...] | None = None,
@@ -437,7 +437,7 @@ def _sync_opencode_cli(
         message = f"OpenCode sync failed: {exc}"
         if fail_on_error:
             typer.echo(message, err=True)
-            raise typer.Exit(code=1)
+            raise typer.Exit(code=1) from exc
         typer.echo(message, err=True)
         return
 
@@ -451,15 +451,15 @@ def _deploy_and_maybe_warmup(
     username: str,
     backend: BackendType,
     config: DeploymentConfig,
-    server_url: Optional[str],
+    server_url: str | None,
     do_warmup: bool,
     timeout: int,
     tail_logs: bool,
     debug_logs: bool = False,
 ) -> None:
     """Run deploy, optional warmup, and OpenCode sync for CLI commands."""
-    deployed_web_url: Optional[str] = None
-    deployed_endpoint: Optional[EndpointInfo] = None
+    deployed_web_url: str | None = None
+    deployed_endpoint: EndpointInfo | None = None
     deploy_succeeded = False
     opencode_synced = False
     summarizer = None if debug_logs else DeployLogSummarizer(backend)
@@ -505,7 +505,7 @@ def _deploy_and_maybe_warmup(
         save_connection(config, deployed_endpoint)
 
     warmup_succeeded = False
-    final_sync_url: Optional[str] = None
+    final_sync_url: str | None = None
     if do_warmup:
         url = server_url or deployed_web_url
         if not url and config.provider == ComputeProvider.MODAL:
@@ -634,7 +634,7 @@ def _deploy_and_maybe_warmup(
 @app.command("tui")
 def tui(
     mouse: Annotated[
-        Optional[bool],
+        bool | None,
         typer.Option(
             "--mouse/--no-mouse",
             help=(
@@ -652,7 +652,7 @@ def tui(
             f"Error: Textual is required for the TUI. Install with: pip install textual\n({exc})",
             err=True,
         )
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from exc
 
     _ensure_tui_runtime()
     app_instance = TuiApp(mouse_enabled=mouse)
@@ -703,19 +703,19 @@ def gpu_types(
         values = fetch_modal_gpu_types(timeout=float(timeout))
     except Exception as exc:
         typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from exc
     for value in values:
         typer.echo(value)
 
 
 @app.command("llamacpp-support")
 def llamacpp_support(
-    repo_id: Optional[str] = typer.Option(
+    repo_id: str | None = typer.Option(
         None,
         help="Hugging Face GGUF repo to check against the pinned llama.cpp runtime",
     ),
-    revision: Optional[str] = typer.Option(None, help="Optional Hugging Face revision"),
-    architecture: Optional[str] = typer.Option(
+    revision: str | None = typer.Option(None, help="Optional Hugging Face revision"),
+    architecture: str | None = typer.Option(
         None,
         help="GGUF general.architecture value to check directly",
     ),
@@ -730,7 +730,7 @@ def llamacpp_support(
             metadata = fetch_gguf_quant_metadata(repo_id, revision=revision)
         except Exception as exc:
             typer.echo(f"Error: could not inspect {repo_id}: {exc}", err=True)
-            raise typer.Exit(code=1)
+            raise typer.Exit(code=1) from exc
         resolved_architecture = metadata.architecture
 
     if repo_id or architecture:
@@ -774,10 +774,10 @@ def llamacpp_support(
 
 @app.command("offers")
 def prime_offers(
-    gpu_type: Optional[str] = typer.Option(None, help="GPU type filter"),
-    gpu_count: Optional[int] = typer.Option(None, min=1, help="GPU count filter"),
-    region: Optional[str] = typer.Option(None, help="Region or country filter"),
-    disk_id: Optional[str] = typer.Option(None, help="Only offers compatible with a Prime disk"),
+    gpu_type: str | None = typer.Option(None, help="GPU type filter"),
+    gpu_count: int | None = typer.Option(None, min=1, help="GPU count filter"),
+    region: str | None = typer.Option(None, help="Region or country filter"),
+    disk_id: str | None = typer.Option(None, help="Only offers compatible with a Prime disk"),
     secure_only: bool = typer.Option(True, help="Show only secure-cloud offers"),
     on_demand_only: bool = typer.Option(True, help="Hide spot offers"),
     output_json: bool = typer.Option(False, "--json", help="Print machine-readable JSON"),
@@ -793,7 +793,7 @@ def prime_offers(
         )
     except Exception as exc:
         typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from exc
     if secure_only:
         rows = [row for row in rows if (row.security or "").casefold() == "secure_cloud"]
     if on_demand_only:
@@ -830,24 +830,24 @@ def deploy(
         help="Backend: llamacpp or vllm",
     ),
     do_warmup: bool = typer.Option(False, help="Verify readiness after deploy"),
-    preset: Optional[str] = typer.Option(None, help="llama.cpp preset name (Modal only)"),
-    repo_id: Optional[str] = typer.Option(None, help="llama.cpp Hugging Face GGUF repo ID"),
-    quant: Optional[str] = typer.Option(None, help="llama.cpp GGUF quantization"),
-    revision: Optional[str] = typer.Option(None, help="llama.cpp HF revision (Modal only)"),
-    server_args: Optional[str] = typer.Option(None, help="Additional llama-server arguments"),
-    n_gpu_layers: Optional[int] = typer.Option(None, help="llama.cpp GPU layers (default: auto)"),
-    model_name: Optional[str] = typer.Option(None, help="vLLM MODEL_NAME"),
-    model_revision: Optional[str] = typer.Option(None, help="vLLM MODEL_REVISION"),
-    served_model_name: Optional[str] = typer.Option(None, help="vLLM SERVED_MODEL_NAME"),
-    fast_boot: Optional[bool] = typer.Option(None, help="vLLM FAST_BOOT"),
-    n_gpu: Optional[int] = typer.Option(None, help="vLLM N_GPU"),
-    gpu_type: Optional[str] = typer.Option(None, help="Prime GPU type filter"),
-    gpu_count: Optional[int] = typer.Option(None, min=1, help="Prime GPU count filter"),
-    prime_offer_id: Optional[str] = typer.Option(
+    preset: str | None = typer.Option(None, help="llama.cpp preset name (Modal only)"),
+    repo_id: str | None = typer.Option(None, help="llama.cpp Hugging Face GGUF repo ID"),
+    quant: str | None = typer.Option(None, help="llama.cpp GGUF quantization"),
+    revision: str | None = typer.Option(None, help="llama.cpp HF revision (Modal only)"),
+    server_args: str | None = typer.Option(None, help="Additional llama-server arguments"),
+    n_gpu_layers: int | None = typer.Option(None, help="llama.cpp GPU layers (default: auto)"),
+    model_name: str | None = typer.Option(None, help="vLLM MODEL_NAME"),
+    model_revision: str | None = typer.Option(None, help="vLLM MODEL_REVISION"),
+    served_model_name: str | None = typer.Option(None, help="vLLM SERVED_MODEL_NAME"),
+    fast_boot: bool | None = typer.Option(None, help="vLLM FAST_BOOT"),
+    n_gpu: int | None = typer.Option(None, help="vLLM N_GPU"),
+    gpu_type: str | None = typer.Option(None, help="Prime GPU type filter"),
+    gpu_count: int | None = typer.Option(None, min=1, help="Prime GPU count filter"),
+    prime_offer_id: str | None = typer.Option(
         None, help="Exact six-character Prime availability offer ID"
     ),
-    prime_region: Optional[str] = typer.Option(None, help="Prime region or country filter"),
-    prime_disk_id: Optional[str] = typer.Option(None, help="Existing Prime disk ID to attach"),
+    prime_region: str | None = typer.Option(None, help="Prime region or country filter"),
+    prime_disk_id: str | None = typer.Option(None, help="Existing Prime disk ID to attach"),
     prime_disk: bool = typer.Option(
         True,
         "--prime-disk/--no-prime-disk",
@@ -859,30 +859,30 @@ def deploy(
     allow_insecure_http: bool = typer.Option(
         False, help="Bypass Prime Tunnel and use a direct HTTP endpoint"
     ),
-    trust_remote_code: Optional[bool] = typer.Option(
+    trust_remote_code: bool | None = typer.Option(
         None,
         help="vLLM TRUST_REMOTE_CODE (allow model custom code from Hugging Face)",
     ),
-    reasoning_parser: Optional[str] = typer.Option(
+    reasoning_parser: str | None = typer.Option(
         None,
         help="vLLM reasoning parser (e.g. qwen3, deepseek_r1, granite)",
     ),
-    tool_call_parser: Optional[str] = typer.Option(
+    tool_call_parser: str | None = typer.Option(
         None,
         help="vLLM tool call parser (e.g. hermes, qwen3_xml, llama3_json)",
     ),
-    default_chat_template_kwargs: Optional[str] = typer.Option(
+    default_chat_template_kwargs: str | None = typer.Option(
         None,
         help=(
             "vLLM default chat template kwargs JSON "
             "(e.g. '{\"enable_thinking\": false}' or '{\"thinking\": true}')"
         ),
     ),
-    instance_name: Optional[str] = typer.Option(
+    instance_name: str | None = typer.Option(
         None, help="Instance name (auto-generated from model when omitted)"
     ),
-    app_name: Optional[str] = typer.Option(None, help="Explicit deployment name override"),
-    server_url: Optional[str] = typer.Option(None, help="Deployed web URL"),
+    app_name: str | None = typer.Option(None, help="Explicit deployment name override"),
+    server_url: str | None = typer.Option(None, help="Deployed web URL"),
     timeout: int = typer.Option(1800, help="Warmup timeout seconds"),
     tail_logs: bool = typer.Option(True, help="Tail logs during warmup"),
     debug_logs: bool = typer.Option(
@@ -976,9 +976,9 @@ def warmup(
         BackendType.LLAMACPP,
         help="Backend: llamacpp or vllm",
     ),
-    server_url: Optional[str] = typer.Option(None, help="Deployed web URL"),
-    served_model_name: Optional[str] = typer.Option(None, help="Served model name for llama.cpp probes"),
-    function_slug: Optional[str] = typer.Option(
+    server_url: str | None = typer.Option(None, help="Deployed web URL"),
+    served_model_name: str | None = typer.Option(None, help="Served model name for llama.cpp probes"),
+    function_slug: str | None = typer.Option(
         None, help="Modal function slug suffix used in endpoint URL"
     ),
     timeout: int = typer.Option(1800, help="Seconds to wait"),
@@ -988,8 +988,8 @@ def warmup(
         "--debug-logs/--summary-logs",
         help="Show raw backend logs instead of the concise progress view",
     ),
-    instance_name: Optional[str] = typer.Option(None, help="Target instance name"),
-    app_name: Optional[str] = typer.Option(None, help="Target deployment name"),
+    instance_name: str | None = typer.Option(None, help="Target instance name"),
+    app_name: str | None = typer.Option(None, help="Target deployment name"),
 ) -> None:
     """Cold start the container by probing the server."""
     compute_provider = ComputeProvider(provider)
@@ -1091,14 +1091,14 @@ def status(
         BackendType.LLAMACPP,
         help="Backend: llamacpp or vllm",
     ),
-    server_url: Optional[str] = typer.Option(None, help="Deployed web URL"),
-    served_model_name: Optional[str] = typer.Option(None, help="Served model name for llama.cpp probes"),
-    function_slug: Optional[str] = typer.Option(
+    server_url: str | None = typer.Option(None, help="Deployed web URL"),
+    served_model_name: str | None = typer.Option(None, help="Served model name for llama.cpp probes"),
+    function_slug: str | None = typer.Option(
         None, help="Modal function slug suffix used in endpoint URL"
     ),
     timeout: int = typer.Option(60, help="Timeout seconds"),
-    instance_name: Optional[str] = typer.Option(None, help="Target instance name"),
-    app_name: Optional[str] = typer.Option(None, help="Target deployment name"),
+    instance_name: str | None = typer.Option(None, help="Target instance name"),
+    app_name: str | None = typer.Option(None, help="Target deployment name"),
 ) -> None:
     """Check endpoint readiness."""
     compute_provider = ComputeProvider(provider)
@@ -1156,18 +1156,18 @@ def benchmark(
         BackendType.LLAMACPP,
         help="Backend: llamacpp or vllm",
     ),
-    server_url: Optional[str] = typer.Option(None, help="Deployed web URL"),
-    model: Optional[str] = typer.Option(None, "--model", help="Served model name to benchmark"),
-    function_slug: Optional[str] = typer.Option(
+    server_url: str | None = typer.Option(None, help="Deployed web URL"),
+    model: str | None = typer.Option(None, "--model", help="Served model name to benchmark"),
+    function_slug: str | None = typer.Option(
         None, help="Modal function slug suffix used in endpoint URL fallback"
     ),
-    instance_name: Optional[str] = typer.Option(None, help="Target instance name"),
-    app_name: Optional[str] = typer.Option(None, help="Target deployment name"),
+    instance_name: str | None = typer.Option(None, help="Target instance name"),
+    app_name: str | None = typer.Option(None, help="Target deployment name"),
     concurrency: str = typer.Option(
         "1,2,4,8,16",
         help="Comma or space separated concurrency sweep values",
     ),
-    request_count: Optional[int] = typer.Option(
+    request_count: int | None = typer.Option(
         None,
         min=1,
         help="Requests per concurrency run (default: max(24, concurrency * 4))",
@@ -1180,9 +1180,9 @@ def benchmark(
         min=1,
         help="Per-request timeout passed to AIPerf",
     ),
-    output_dir: Optional[str] = typer.Option(None, help="Benchmark run output directory"),
+    output_dir: str | None = typer.Option(None, help="Benchmark run output directory"),
     aiperf_arg: Annotated[
-        Optional[list[str]],
+        list[str] | None,
         typer.Option(
             "--aiperf-arg",
             help="Extra argument passed through to `aiperf profile`; repeat for multiple args",
@@ -1210,7 +1210,7 @@ def benchmark(
         concurrency_values = parse_concurrency_values(concurrency)
     except ValueError as exc:
         typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=1) from exc
 
     config = benchmark_config_from_endpoint(
         target_row,
@@ -1254,8 +1254,8 @@ def logs(
         help="Backend: llamacpp or vllm",
     ),
     follow: bool = typer.Option(True, help="Follow log stream"),
-    instance_name: Optional[str] = typer.Option(None, help="Target instance name"),
-    app_name: Optional[str] = typer.Option(None, help="Target deployment name"),
+    instance_name: str | None = typer.Option(None, help="Target instance name"),
+    app_name: str | None = typer.Option(None, help="Target deployment name"),
 ) -> None:
     """Show logs for a deployed backend."""
     compute_provider = ComputeProvider(provider)
@@ -1290,8 +1290,8 @@ def stop(
         help="Backend: llamacpp or vllm",
     ),
     yes: bool = typer.Option(False, "--yes", help="Skip confirmation"),
-    instance_name: Optional[str] = typer.Option(None, help="Target instance name"),
-    app_name: Optional[str] = typer.Option(None, help="Target deployment name"),
+    instance_name: str | None = typer.Option(None, help="Target instance name"),
+    app_name: str | None = typer.Option(None, help="Target deployment name"),
 ) -> None:
     """Stop a deployed backend app."""
     compute_provider = ComputeProvider(provider)
@@ -1331,6 +1331,106 @@ def stop(
         )
 
 
+def _redeploy_or_explain(
+    orch: Orchestrator,
+    *,
+    username: str,
+    backend: BackendType,
+    config: DeploymentConfig,
+    redeploy: bool,
+    server_url: str | None,
+    do_warmup: bool,
+    timeout: int,
+    tail_logs: bool,
+    skip_message: str,
+) -> None:
+    """Redeploy the switched config, or explain why nothing was deployed."""
+    if redeploy:
+        config.do_deploy = True
+        _deploy_and_maybe_warmup(
+            orch,
+            username=username,
+            backend=backend,
+            config=config,
+            server_url=server_url,
+            do_warmup=do_warmup,
+            timeout=timeout,
+            tail_logs=tail_logs,
+        )
+    else:
+        typer.echo(skip_message)
+    raise typer.Exit(code=0)
+
+
+def _redeploy_modal_llamacpp(
+    orch: Orchestrator,
+    *,
+    username: str,
+    backend: BackendType,
+    config: DeploymentConfig,
+    instance_name: str,
+    app_name: str,
+    provider: ComputeProvider,
+    server_url: str | None,
+    do_warmup: bool,
+    timeout: int,
+    tail_logs: bool,
+) -> None:
+    """Redeploy a switched llama.cpp app on Modal, then warm it and sync OpenCode."""
+    from ..protocol.models import DeploymentConfig
+
+    bt = backend
+    resolved_instance = instance_name
+    resolved_app_name = app_name
+    compute_provider = provider
+    deploy_config = DeploymentConfig(backend=bt, do_deploy=True)
+    deploy_config.function_slug = random_function_slug()
+    deploy_config.instance_name = resolved_instance
+    settings = ConfigStore().load()
+    deploy_config.app_name = resolved_app_name
+    env = ModalBackend.build_full_env(settings, deploy_config)
+    code = ModalBackend.run_blocking(
+        ModalBackend.build_deploy_command(bt, app_name=resolved_app_name), env=env
+    )
+    if code != 0:
+        raise typer.Exit(code=code)
+    final_sync_url = server_url or ModalBackend.default_server_url(
+        username,
+        app_name=resolved_app_name,
+        function_slug=deploy_config.function_slug,
+    )
+    warmup_succeeded = False
+    if do_warmup:
+        for event in orch.warmup(
+            bt,
+            final_sync_url,
+            timeout,
+            tail_logs,
+            app_name=resolved_app_name,
+        ):
+            if (
+                isinstance(event, OperationCompleteEvent)
+                and event.success
+                and event.operation == OperationType.WARMUP
+            ):
+                warmup_succeeded = True
+                if isinstance(event.data, dict):
+                    maybe_url = event.data.get("url")
+                    if isinstance(maybe_url, str) and maybe_url.strip():
+                        final_sync_url = maybe_url.strip()
+            _print_event(event)
+            _raise_on_failed_completion(event)
+    if (do_warmup and warmup_succeeded) or not do_warmup:
+        _sync_opencode_cli(
+            target_app_name=resolved_app_name,
+            target_url=final_sync_url,
+            target_config=config,
+            current_rows=_load_visible_launchpad_rows(compute_provider),
+            prune_providers=(compute_provider,),
+            username=username,
+        )
+
+
 @app.command()
 def switch(
     provider: ComputeProvider = typer.Option(
@@ -1341,20 +1441,20 @@ def switch(
         BackendType.LLAMACPP,
         help="Backend: llamacpp or vllm",
     ),
-    preset: Optional[str] = typer.Option(None, help="Preset name"),
-    repo_id: Optional[str] = typer.Option(None, help="HF repo id"),
-    quant: Optional[str] = typer.Option(None, help="Quant pattern"),
-    revision: Optional[str] = typer.Option(None, help="HF revision"),
-    model_name: Optional[str] = typer.Option(None, help="vLLM MODEL_NAME"),
-    model_revision: Optional[str] = typer.Option(None, help="vLLM MODEL_REVISION"),
-    served_model_name: Optional[str] = typer.Option(None, help="vLLM SERVED_MODEL_NAME"),
-    fast_boot: Optional[bool] = typer.Option(None, help="vLLM FAST_BOOT"),
-    n_gpu: Optional[int] = typer.Option(None, help="vLLM N_GPU"),
-    gpu_type: Optional[str] = typer.Option(None, help="Prime GPU type filter"),
-    gpu_count: Optional[int] = typer.Option(None, min=1, help="Prime GPU count filter"),
-    prime_offer_id: Optional[str] = typer.Option(None, help="Exact Prime availability offer ID"),
-    prime_region: Optional[str] = typer.Option(None, help="Prime region or country filter"),
-    prime_disk_id: Optional[str] = typer.Option(None, help="Existing Prime disk ID to attach"),
+    preset: str | None = typer.Option(None, help="Preset name"),
+    repo_id: str | None = typer.Option(None, help="HF repo id"),
+    quant: str | None = typer.Option(None, help="Quant pattern"),
+    revision: str | None = typer.Option(None, help="HF revision"),
+    model_name: str | None = typer.Option(None, help="vLLM MODEL_NAME"),
+    model_revision: str | None = typer.Option(None, help="vLLM MODEL_REVISION"),
+    served_model_name: str | None = typer.Option(None, help="vLLM SERVED_MODEL_NAME"),
+    fast_boot: bool | None = typer.Option(None, help="vLLM FAST_BOOT"),
+    n_gpu: int | None = typer.Option(None, help="vLLM N_GPU"),
+    gpu_type: str | None = typer.Option(None, help="Prime GPU type filter"),
+    gpu_count: int | None = typer.Option(None, min=1, help="Prime GPU count filter"),
+    prime_offer_id: str | None = typer.Option(None, help="Exact Prime availability offer ID"),
+    prime_region: str | None = typer.Option(None, help="Prime region or country filter"),
+    prime_disk_id: str | None = typer.Option(None, help="Existing Prime disk ID to attach"),
     prime_disk: bool = typer.Option(
         True,
         "--prime-disk/--no-prime-disk",
@@ -1365,33 +1465,33 @@ def switch(
         False,
         help="Bypass Prime Tunnel and use a direct HTTP endpoint",
     ),
-    trust_remote_code: Optional[bool] = typer.Option(
+    trust_remote_code: bool | None = typer.Option(
         None,
         help="vLLM TRUST_REMOTE_CODE (allow model custom code from Hugging Face)",
     ),
-    reasoning_parser: Optional[str] = typer.Option(
+    reasoning_parser: str | None = typer.Option(
         None,
         help="vLLM reasoning parser (e.g. qwen3, deepseek_r1, granite)",
     ),
-    tool_call_parser: Optional[str] = typer.Option(
+    tool_call_parser: str | None = typer.Option(
         None,
         help="vLLM tool call parser (e.g. hermes, qwen3_xml, llama3_json)",
     ),
-    default_chat_template_kwargs: Optional[str] = typer.Option(
+    default_chat_template_kwargs: str | None = typer.Option(
         None,
         help=(
             "vLLM default chat template kwargs JSON "
             "(e.g. '{\"enable_thinking\": false}' or '{\"thinking\": true}')"
         ),
     ),
-    instance_name: Optional[str] = typer.Option(
+    instance_name: str | None = typer.Option(
         None, help="Instance name (auto-generated from model when omitted)"
     ),
-    app_name: Optional[str] = typer.Option(None, help="Explicit deployment name override"),
+    app_name: str | None = typer.Option(None, help="Explicit deployment name override"),
     preload: bool = typer.Option(True, help="Preload weights"),
     redeploy: bool = typer.Option(True, help="Redeploy after switching"),
     do_warmup: bool = typer.Option(True, help="Verify readiness after redeploy"),
-    server_url: Optional[str] = typer.Option(None, help="Deployed web URL"),
+    server_url: str | None = typer.Option(None, help="Deployed web URL"),
     timeout: int = typer.Option(1800, help="Warmup timeout"),
     tail_logs: bool = typer.Option(True, help="Tail logs during warmup"),
 ) -> None:
@@ -1451,40 +1551,34 @@ def switch(
         if bt == BackendType.LLAMACPP and not repo_id:
             typer.echo("Prime llama.cpp requires --repo-id.", err=True)
             raise typer.Exit(code=2)
-        if redeploy:
-            config.do_deploy = True
-            _deploy_and_maybe_warmup(
-                orch,
-                username=username,
-                backend=bt,
-                config=config,
-                server_url=server_url,
-                do_warmup=do_warmup,
-                timeout=timeout,
-                tail_logs=tail_logs,
-            )
-        else:
-            typer.echo("No deploy performed. Prime model changes require --redeploy.")
-        raise typer.Exit(code=0)
+        _redeploy_or_explain(
+            orch,
+            username=username,
+            backend=bt,
+            config=config,
+            redeploy=redeploy,
+            server_url=server_url,
+            do_warmup=do_warmup,
+            timeout=timeout,
+            tail_logs=tail_logs,
+            skip_message="No deploy performed. Prime model changes require --redeploy.",
+        )
 
     if bt == BackendType.VLLM:
         if preload:
             typer.echo("Note: --preload is only used by llama.cpp and is ignored for vLLM.")
-        if redeploy:
-            config.do_deploy = True
-            _deploy_and_maybe_warmup(
-                orch,
-                username=username,
-                backend=bt,
-                config=config,
-                server_url=server_url,
-                do_warmup=do_warmup,
-                timeout=timeout,
-                tail_logs=tail_logs,
-            )
-        else:
-            typer.echo("No deploy performed. Use --redeploy to apply vLLM model changes.")
-        raise typer.Exit(code=0)
+        _redeploy_or_explain(
+            orch,
+            username=username,
+            backend=bt,
+            config=config,
+            redeploy=redeploy,
+            server_url=server_url,
+            do_warmup=do_warmup,
+            timeout=timeout,
+            tail_logs=tail_logs,
+            skip_message="No deploy performed. Use --redeploy to apply vLLM model changes.",
+        )
 
     if not any([preset, repo_id]):
         typer.echo("Provide --preset or --repo-id to switch.", err=True)
@@ -1496,52 +1590,19 @@ def switch(
         _raise_on_failed_completion(event)
 
     if redeploy:
-        deploy_config = DeploymentConfig(backend=bt, do_deploy=True)
-        deploy_config.function_slug = random_function_slug()
-        deploy_config.instance_name = resolved_instance
-        settings = ConfigStore().load()
-        deploy_config.app_name = resolved_app_name
-        env = ModalBackend.build_full_env(settings, deploy_config)
-        code = ModalBackend.run_blocking(
-            ModalBackend.build_deploy_command(bt, app_name=resolved_app_name), env=env
-        )
-        if code != 0:
-            raise typer.Exit(code=code)
-        final_sync_url = server_url or ModalBackend.default_server_url(
-            username,
+        _redeploy_modal_llamacpp(
+            orch,
+            username=username,
+            backend=bt,
+            config=config,
+            instance_name=resolved_instance,
             app_name=resolved_app_name,
-            function_slug=deploy_config.function_slug,
+            provider=compute_provider,
+            server_url=server_url,
+            do_warmup=do_warmup,
+            timeout=timeout,
+            tail_logs=tail_logs,
         )
-        warmup_succeeded = False
-        if do_warmup:
-            for event in orch.warmup(
-                bt,
-                final_sync_url,
-                timeout,
-                tail_logs,
-                app_name=resolved_app_name,
-            ):
-                if (
-                    isinstance(event, OperationCompleteEvent)
-                    and event.success
-                    and event.operation == OperationType.WARMUP
-                ):
-                    warmup_succeeded = True
-                    if isinstance(event.data, dict):
-                        maybe_url = event.data.get("url")
-                        if isinstance(maybe_url, str) and maybe_url.strip():
-                            final_sync_url = maybe_url.strip()
-                _print_event(event)
-                _raise_on_failed_completion(event)
-        if (do_warmup and warmup_succeeded) or not do_warmup:
-            _sync_opencode_cli(
-                target_app_name=resolved_app_name,
-                target_url=final_sync_url,
-                target_config=config,
-                current_rows=_load_visible_launchpad_rows(compute_provider),
-                prune_providers=(compute_provider,),
-                username=username,
-            )
 
     raise typer.Exit(code=0)
 
@@ -1553,16 +1614,16 @@ def switch(
 
 @opencode_app.command("sync")
 def opencode_sync(
-    provider: Optional[ComputeProvider] = typer.Option(
+    provider: ComputeProvider | None = typer.Option(
         None,
         help="Limit to modal or prime. Default: every connected compute provider.",
     ),
-    backend: Optional[BackendType] = typer.Option(
+    backend: BackendType | None = typer.Option(
         None,
         help="Backend: llamacpp or vllm",
     ),
-    instance_name: Optional[str] = typer.Option(None, help="Target instance name"),
-    app_name: Optional[str] = typer.Option(None, help="Target deployment name"),
+    instance_name: str | None = typer.Option(None, help="Target instance name"),
+    app_name: str | None = typer.Option(None, help="Target deployment name"),
     dry_run: bool = typer.Option(False, help="Print the intended sync changes without writing files"),
 ) -> None:
     """Sync Launchpad-managed deployments into OpenCode config."""
@@ -1652,7 +1713,7 @@ def opencode_sync(
 
 @aai_auth_app.command("login")
 def aai_auth_login(
-    api_key: Optional[str] = typer.Argument(
+    api_key: str | None = typer.Argument(
         None, help="Artificial Analysis API key (prompts when omitted)"
     ),
     no_verify: Annotated[
@@ -1662,7 +1723,7 @@ def aai_auth_login(
 ) -> None:
     """Store an Artificial Analysis API key for llm-launchpad."""
     from ..core.artificial_analysis_auth import save_artificial_analysis_api_key
-    from ..core.quick_deploy_refresh import get_artificial_analysis_auth_status
+    from ..core.artificial_analysis import get_artificial_analysis_auth_status
 
     key = (api_key or "").strip()
     if not key and sys.stdin.isatty():
@@ -1694,7 +1755,7 @@ def aai_auth_status() -> None:
         AAI_API_KEY_ENV,
         load_saved_artificial_analysis_api_key,
     )
-    from ..core.quick_deploy_refresh import get_artificial_analysis_auth_status
+    from ..core.artificial_analysis import get_artificial_analysis_auth_status
 
     env_key = os.getenv(AAI_API_KEY_ENV, "").strip()
     stored_key = load_saved_artificial_analysis_api_key()

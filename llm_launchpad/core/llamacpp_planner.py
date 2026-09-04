@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, replace
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 import hashlib
 import json
 import math
@@ -11,7 +11,8 @@ import os
 from pathlib import Path
 import re
 import shlex
-from typing import Any, Iterable
+from typing import Any
+from collections.abc import Iterable
 
 from ..protocol.enums import CertificationState, ServingObjective
 from ..protocol.models import (
@@ -24,6 +25,7 @@ from ..protocol.models import (
     SpeculativeDecodingConfig,
 )
 from .config import SETTINGS_DIR
+from .coerce import optional_float
 from .hf_models import GgufQuantMetadata
 
 
@@ -528,32 +530,6 @@ def tuning_for_gpu_memory(
     return replace(tuning, fit_target_mib=target_mib)
 
 
-def minimum_gpu_count(
-    metadata: GgufQuantMetadata,
-    *,
-    weights_gb: float,
-    requirements: ServingRequirements,
-    tuning: RuntimeTuning,
-    gpu_memory_gb: float,
-    minimum: int = 1,
-    maximum: int = 8,
-) -> int | None:
-    """Return the first topology that satisfies the full-context estimate."""
-
-    for count in range(max(1, minimum), max(1, maximum) + 1):
-        estimate = estimate_memory(
-            metadata,
-            weights_gb=weights_gb,
-            requirements=requirements,
-            tuning=tuning,
-            gpu_count=count,
-            gpu_memory_gb=gpu_memory_gb,
-        )
-        if all(value <= gpu_memory_gb for value in estimate.per_device_required_gb):
-            return count
-    return None
-
-
 def predict_performance(
     *,
     weights_gb: float,
@@ -736,17 +712,8 @@ def attestation_now(
         memory=memory,
         performance=performance,
         runtime_id=runtime_id,
-        verified_at=datetime.now(timezone.utc).isoformat(),
+        verified_at=datetime.now(UTC).isoformat(),
     )
-
-
-def with_measured_performance(
-    attestation: RuntimeAttestation,
-    performance: tuple[PerformancePoint, ...],
-) -> RuntimeAttestation:
-    """Return an attestation updated after endpoint calibration."""
-
-    return replace(attestation, performance=performance)
 
 
 def _kv_cache_gb(
@@ -884,21 +851,14 @@ def _performance_from_dict(raw: Any) -> PerformancePoint:
         prompt_tokens=int(raw.get("prompt_tokens", 0)),
         output_tokens=int(raw.get("output_tokens", 0)),
         concurrency=max(1, int(raw.get("concurrency", 1))),
-        prompt_tokens_per_second=_optional_float(raw.get("prompt_tokens_per_second")),
-        output_tokens_per_second=_optional_float(raw.get("output_tokens_per_second")),
-        aggregate_output_tokens_per_second=_optional_float(
+        prompt_tokens_per_second=optional_float(raw.get("prompt_tokens_per_second")),
+        output_tokens_per_second=optional_float(raw.get("output_tokens_per_second")),
+        aggregate_output_tokens_per_second=optional_float(
             raw.get("aggregate_output_tokens_per_second")
         ),
-        time_to_first_token_seconds=_optional_float(raw.get("time_to_first_token_seconds")),
-        p95_latency_seconds=_optional_float(raw.get("p95_latency_seconds")),
+        time_to_first_token_seconds=optional_float(raw.get("time_to_first_token_seconds")),
+        p95_latency_seconds=optional_float(raw.get("p95_latency_seconds")),
         error_rate=float(raw.get("error_rate", 0.0)),
-        output_tokens_per_dollar=_optional_float(raw.get("output_tokens_per_dollar")),
+        output_tokens_per_dollar=optional_float(raw.get("output_tokens_per_dollar")),
         measured=bool(raw.get("measured")),
     )
-
-
-def _optional_float(value: Any) -> float | None:
-    try:
-        return float(value) if value is not None else None
-    except (TypeError, ValueError):
-        return None

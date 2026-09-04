@@ -12,6 +12,9 @@ from dataclasses import replace
 import time
 from typing import Any, Literal
 
+from rich.markup import escape
+
+from ..format import clip, format_free_tier, format_gib, format_money
 from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -32,11 +35,13 @@ from ...core.quick_deploy import (
     activate_quick_deploy_catalog,
     record_quick_deploy_catalog_failure,
 )
-from ...core.quick_deploy_refresh import (
+from ...core.artificial_analysis import (
     ArtificialAnalysisAuthStatus,
+    get_artificial_analysis_auth_status,
+)
+from ...core.quick_deploy_refresh import (
     attach_quick_deploy_mtp_recommendations,
     build_live_quick_deploy_catalog,
-    get_artificial_analysis_auth_status,
     is_fresh_cached_quick_deploy_catalog,
     load_cached_quick_deploy_catalog,
 )
@@ -165,19 +170,6 @@ class QuickDeployCatalogLoadFailed(Message):
         self.error = error
 
 
-def _clip(value: str, width: int) -> str:
-    text = (value or "").strip()
-    if len(text) <= width:
-        return text
-    if width <= 3:
-        return text[:width]
-    return f"{text[:width - 3]}..."
-
-
-def _escape_markup(value: str) -> str:
-    return (value or "").replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
-
-
 def _render_hf_auth_status(status: HuggingFaceAuthStatus | None = None) -> str:
     if status is None:
         return "[dim]🤗 Checking Hugging Face auth...[/dim]"
@@ -185,7 +177,7 @@ def _render_hf_auth_status(status: HuggingFaceAuthStatus | None = None) -> str:
         return "[green]🤗 Hugging Face authenticated[/green]"
     if status.error:
         color = "red" if "invalid" in status.error.lower() else "yellow"
-        detail = _escape_markup(_clip(status.error, 72))
+        detail = escape(clip(status.error, 72))
         return f"[{color}]🤗 Hugging Face auth check failed: {detail}[/{color}]"
     return "[yellow]🤗 Hugging Face not authenticated (run: hf auth login)[/yellow]"
 
@@ -196,7 +188,7 @@ def _render_modal_auth_status(status: ModalAuthStatus | None = None) -> str:
     if status.authenticated:
         return "[green]▰ Modal authenticated[/green]"
     if status.error:
-        detail = _escape_markup(_clip(status.error, 72))
+        detail = escape(clip(status.error, 72))
         return f"[yellow]▰ Modal auth check failed: {detail}[/yellow]"
     return "[yellow]▰ Modal not authenticated (run: modal setup)[/yellow]"
 
@@ -207,7 +199,7 @@ def _render_prime_auth_status(status: PrimeAuthStatus | None = None) -> str:
     if status.authenticated:
         return "[green]◆ Prime Intellect authenticated[/green]"
     if status.error:
-        detail = _escape_markup(_clip(status.error, 72))
+        detail = escape(clip(status.error, 72))
         return f"[yellow]◆ Prime Intellect auth check failed: {detail}[/yellow]"
     return "[yellow]◆ Prime Intellect not authenticated (run: prime login)[/yellow]"
 
@@ -218,11 +210,11 @@ def _render_artificial_analysis_auth_status(
     if status is None:
         return "[dim]◈ Checking Artificial Analysis auth...[/dim]"
     if status.authenticated:
-        tier = f" ({_escape_markup(status.tier)} tier)" if status.tier else ""
+        tier = f" ({escape(status.tier)} tier)" if status.tier else ""
         return f"[green]◈ Artificial Analysis authenticated{tier}[/green]"
     if status.error:
         color = "red" if "invalid" in status.error.casefold() else "yellow"
-        detail = _escape_markup(_clip(status.error, 72))
+        detail = escape(clip(status.error, 72))
         return f"[{color}]◈ Artificial Analysis auth check failed: {detail}[/{color}]"
     return (
         "[yellow]◈ Artificial Analysis not authenticated "
@@ -290,7 +282,7 @@ def _style_runtime_bucket(bucket: str) -> str:
         return "[yellow]in progress[/yellow]"
     if normalized == "error":
         return "[red]error[/red]"
-    return f"[dim]{_escape_markup(normalized or 'unknown')}[/dim]"
+    return f"[dim]{escape(normalized or 'unknown')}[/dim]"
 
 
 def _probe_row_runtime_status(row: EndpointInfo, username: str) -> tuple[str, str | None]:
@@ -459,21 +451,21 @@ def _render_deployment_status(rows: list[EndpointInfo], username: str = "") -> s
         instance = (row.instance_name or "").strip() or "default"
         backend_name = _backend_display_name(row.backend)
         app_lines.append(
-            f"[bold]{_escape_markup(instance)}[/bold]  "
-            f"[dim]{_escape_markup(backend_name)}[/dim]  {_style_runtime_bucket(_runtime_bucket(row))} "
-            f"[dim]({row.provider.value}: {_escape_markup((row.state or 'unknown').strip().lower())})[/dim]"
+            f"[bold]{escape(instance)}[/bold]  "
+            f"[dim]{escape(backend_name)}[/dim]  {_style_runtime_bucket(_runtime_bucket(row))} "
+            f"[dim]({row.provider.value}: {escape((row.state or 'unknown').strip().lower())})[/dim]"
         )
         resource_label = (
             "Modal app" if row.provider == ComputeProvider.MODAL else "Prime Intellect pod"
         )
-        modal_app_line = f"[dim]{resource_label}:[/dim] {_escape_markup(row.name or '')}"
+        modal_app_line = f"[dim]{resource_label}:[/dim] {escape(row.name or '')}"
         if (row.app_id or "").strip():
-            modal_app_line += f" [dim]({_escape_markup(row.app_id)})[/dim]"
+            modal_app_line += f" [dim]({escape(row.app_id)})[/dim]"
         app_lines.append(modal_app_line)
 
         model_id, display_name = endpoint_model_summary(row)
-        app_lines.append(f"[dim]Display name:[/dim] {_escape_markup(display_name or '')}")
-        app_lines.append(f"[dim]Model ID:[/dim] {_escape_markup(model_id or '')}")
+        app_lines.append(f"[dim]Display name:[/dim] {escape(display_name or '')}")
+        app_lines.append(f"[dim]Model ID:[/dim] {escape(model_id or '')}")
 
         base_url, _was_derived = resolve_openai_base_url(row, username=username)
         show_connection = _state_bucket(row.state) == "healthy" or bool((row.web_url or "").strip())
@@ -488,9 +480,9 @@ def _render_deployment_status(rows: list[EndpointInfo], username: str = "") -> s
                 app_lines.append(PANEL_SEPARATOR)
                 wrapped_url_lines = _wrap_url_for_panel(host_url)
                 if wrapped_url_lines:
-                    app_lines.append(f"  [dim]Base URL:[/dim] {_escape_markup(wrapped_url_lines[0])}")
+                    app_lines.append(f"  [dim]Base URL:[/dim] {escape(wrapped_url_lines[0])}")
                     for line in wrapped_url_lines[1:]:
-                        app_lines.append(f"    {_escape_markup(line)}")
+                        app_lines.append(f"    {escape(line)}")
                 key_status = "stored locally" if row.endpoint_api_key else ""
                 app_lines.append(f"  [dim]API key[/dim] {key_status}")
             else:
@@ -507,34 +499,16 @@ def _render_deployment_status(rows: list[EndpointInfo], username: str = "") -> s
     return "\n".join(header_lines + app_lines)
 
 
-def _format_money(value: float) -> str:
-    return f"${value:,.2f}"
-
-
-def _format_gib(value: float) -> str:
-    if value >= 100:
-        return f"{value:,.0f} GiB"
-    if value >= 10:
-        return f"{value:,.1f} GiB"
-    return f"{value:,.2f} GiB"
-
-
-def _format_free_tier(value_gib: float) -> str:
-    if value_gib > 0 and value_gib % 1024 == 0:
-        return f"{value_gib / 1024:,.0f} TiB"
-    return _format_gib(value_gib)
-
-
 def _storage_estimate_lines(snapshot: StorageSnapshot | None) -> list[str]:
     if snapshot is None:
         return []
     estimate = estimate_monthly_storage_cost(snapshot)
     return [
-        f"[dim]Launchpad storage est.[/dim] {_format_money(estimate.estimated_monthly_cost_usd)}/mo",
+        f"[dim]Launchpad storage est.[/dim] {format_money(estimate.estimated_monthly_cost_usd)}/mo",
         (
-            f"[dim]{_format_gib(estimate.total_gib_month)} cached; "
-            f"{_format_gib(estimate.billable_gib_month)} billable after "
-            f"{_format_free_tier(MODAL_VOLUME_FREE_TIER_GIB_MONTH)} free[/dim]"
+            f"[dim]{format_gib(estimate.total_gib_month)} cached; "
+            f"{format_gib(estimate.billable_gib_month)} billable after "
+            f"{format_free_tier(MODAL_VOLUME_FREE_TIER_GIB_MONTH)} free[/dim]"
         ),
     ]
 
@@ -613,7 +587,7 @@ def _render_billing_report(
 
         lines = ["[bold]Workspace Spend[/bold]", "[dim]Current month spend[/dim]"]
         if has_total:
-            lines.append(f"[dim]total[/dim] [bold]{_format_money(total)}[/bold]")
+            lines.append(f"[dim]total[/dim] [bold]{format_money(total)}[/bold]")
         else:
             lines.append("[dim]Total unavailable in report payload.[/dim]")
         lines.extend(_storage_estimate_lines(storage_snapshot))
@@ -651,11 +625,11 @@ def _render_billing_report(
     )
     lines = ["[bold]Workspace Spend[/bold]", "[dim]Current month spend[/dim]"]
     if total is not None:
-        lines.append(f"[dim]total[/dim] [bold]{_format_money(total)}[/bold]")
+        lines.append(f"[dim]total[/dim] [bold]{format_money(total)}[/bold]")
     else:
         lines.append("[dim]Total unavailable in report payload.[/dim]")
     if gpu_cost is not None:
-        lines.append(f"[dim]gpu[/dim] {_format_money(gpu_cost)}")
+        lines.append(f"[dim]gpu[/dim] {format_money(gpu_cost)}")
     lines.extend(_storage_estimate_lines(storage_snapshot))
     return "\n".join(lines)
 
@@ -664,7 +638,7 @@ def _render_billing_load_error(error: str) -> str:
     return (
         "[bold]Workspace Spend[/bold]\n"
         "[yellow]Billing unavailable.[/yellow]\n"
-        f"[dim]{_clip(_escape_markup(error), 80)}[/dim]"
+        f"[dim]{escape(clip(error, 80))}[/dim]"
     )
 
 
@@ -681,7 +655,7 @@ def _render_prime_billing_report(payload: Any) -> str:
     if balance is None:
         lines.append("[dim]Balance unavailable in wallet payload.[/dim]")
     else:
-        lines.append(f"[dim]balance[/dim] [bold]{_format_money(balance)}[/bold]")
+        lines.append(f"[dim]balance[/dim] [bold]{format_money(balance)}[/bold]")
 
     totals: dict[str, float] = {}
     rows = payload.get("recent_billings")
@@ -697,7 +671,7 @@ def _render_prime_billing_report(payload: Any) -> str:
 
     if totals:
         summary = " · ".join(
-            f"{resource} {_format_money(amount)}" for resource, amount in sorted(totals.items())
+            f"{resource} {format_money(amount)}" for resource, amount in sorted(totals.items())
         )
         lines.append(f"[dim]recent charges[/dim] {summary}")
     else:
@@ -709,7 +683,7 @@ def _render_prime_billing_load_error(error: str) -> str:
     return (
         "[bold]Prime Intellect Wallet[/bold]\n"
         "[yellow]Wallet unavailable.[/yellow]\n"
-        f"[dim]{_clip(_escape_markup(error), 80)}[/dim]"
+        f"[dim]{escape(clip(error, 80))}[/dim]"
     )
 
 
@@ -1462,7 +1436,7 @@ class MainMenuScreen(CopyEnabledScreen):
         self.query_one("#deployment-status-body", Static).update(
             "[bold]Fleet Pulse[/bold]\n"
             "[yellow]Status unavailable.[/yellow]\n"
-            f"[dim]{_clip(message.error, 80)}[/dim]"
+            f"[dim]{clip(message.error, 80)}[/dim]"
         )
 
     def on_billing_report_loaded(self, message: BillingReportLoaded) -> None:

@@ -11,7 +11,7 @@ from .diagnostics import LOG_FILE, log_file_path
 from .hf_auth import get_huggingface_auth_status
 from .modal_auth import get_modal_auth_status
 from .prime_auth import get_prime_auth_status
-from .quick_deploy_refresh import get_artificial_analysis_auth_status
+from .artificial_analysis import get_artificial_analysis_auth_status
 
 
 @dataclass(frozen=True)
