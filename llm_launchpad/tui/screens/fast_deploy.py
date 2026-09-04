@@ -289,6 +289,8 @@ def representative_profiles_for_model(
 def infra_rows_for_model(
     model: QuickDeployModel,
     snapshot: ComputeAvailabilitySnapshot,
+    *,
+    rejected: list[str] | None = None,
 ) -> tuple[_InfraRow, ...]:
     """Build unique live placements for a model, cheapest first.
 
@@ -302,7 +304,9 @@ def infra_rows_for_model(
     for configuration in snapshot.configurations:
         for profile in representative_profiles_for_model(model):
             grouped: dict[str, list[InferencePlan]] = {}
-            for plan in plans_for_compute_profile(configuration, profile):
+            for plan in plans_for_compute_profile(
+                configuration, profile, rejected=rejected
+            ):
                 grouped.setdefault(plan.quote.provider.value, []).append(plan)
             for provider_plans in grouped.values():
                 best = provider_plans[0]
@@ -914,7 +918,8 @@ class FastDeployScreen(CopyEnabledScreen):
         model: QuickDeployModel,
         snapshot: ComputeAvailabilitySnapshot,
     ) -> None:
-        all_rows = infra_rows_for_model(model, snapshot)
+        excluded: list[str] = []
+        all_rows = infra_rows_for_model(model, snapshot, rejected=excluded)
         rows = _filter_infra_rows(all_rows, self._gpu_filter)
         if not rows:
             if all_rows and self._gpu_filter not in {"", "any"}:
@@ -972,6 +977,14 @@ class FastDeployScreen(CopyEnabledScreen):
             )
         if self._gpu_filter not in {"", "any"}:
             status += f" [dim]· GPU {_escape_markup(self._gpu_filter)}[/dim]"
+        if excluded:
+            # A shorter list with no explanation reads as missing hardware
+            # rather than as hardware that would not have worked.
+            status += (
+                f"\n[dim]{len(excluded)} placement"
+                f"{'s' if len(excluded) != 1 else ''} excluded: "
+                "cannot hold the full context on GPU.[/dim]"
+            )
         if snapshot.errors:
             status += "\n[yellow]Partial results:[/yellow] " + _escape_markup(
                 "; ".join(snapshot.errors)
