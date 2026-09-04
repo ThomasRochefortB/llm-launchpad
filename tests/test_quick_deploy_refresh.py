@@ -23,6 +23,9 @@ from llm_launchpad.core.quick_deploy_refresh import (
     _quick_deploy_profile_from_dict,
     _quick_deploy_profile_to_dict,
     _fetch_serving_metadata,
+    _profiles_for_quant,
+    _stable_profile_id,
+    _with_unique_ids,
     _is_transient_hub_error,
     _read_quick_deploy_catalog_cache,
     _retained_catalog_for,
@@ -979,6 +982,140 @@ class CatalogRetentionTests(unittest.TestCase):
                     cache_path=Path(directory) / "missing.json",
                 )
             )
+
+
+
+class StableProfileIdentityTests(unittest.TestCase):
+    """A catalog id must survive planner and upstream naming changes."""
+
+    def _metadata(self) -> GgufQuantMetadata:
+        return GgufQuantMetadata(
+            quantizations=["UD-Q2_K_XL"],
+            vram_gb_by_quant={"UD-Q2_K_XL": 9.8},
+            block_count=65,
+            embedding_length=4096,
+            attention_head_count=32,
+            attention_head_count_kv=4,
+            attention_key_length=256,
+            attention_value_length=256,
+            architecture="qwen35",
+        )
+
+    def _profiles(self, catalog: list[ModalGpuSpec], display_name: str) -> list[Any]:
+        return _profiles_for_quant(
+            repo_id="unsloth/Qwen3.8-27B-GGUF",
+            display_name=display_name,
+            slug_hint="qwen3-8-27b",
+            context_tokens=262144,
+            quant="UD-Q2_K_XL",
+            metadata=self._metadata(),
+            modal_gpu_catalog=catalog,
+            llamacpp_runtime_id="runtime-1",
+        )
+
+    def test_the_id_survives_the_planner_choosing_a_different_gpu(self) -> None:
+        # The regression this guards: correcting full-context sizing moved a
+        # 27B model off an L4, which used to rename every profile.
+        small = self._profiles([ModalGpuSpec("L4", 0.5)], "Qwen3.8 27B")
+        large = self._profiles([ModalGpuSpec("B200", 5.0)], "Qwen3.8 27B")
+
+        def cheap(profiles: list[Any]) -> Any:
+            return next(row for row in profiles if row.resource_tier == "cheap")
+
+        cheap_small, cheap_large = cheap(small), cheap(large)
+
+        # The two catalogs really do resolve the cheap tier to different
+        # hardware; only then is the id assertion meaningful.
+        self.assertNotEqual(cheap_small.gpu_type, cheap_large.gpu_type)
+        self.assertEqual(cheap_small.id, cheap_large.id)
+
+    def test_the_id_survives_an_upstream_display_name_change(self) -> None:
+        catalog = [ModalGpuSpec("RTX-PRO-6000", 2.0)]
+
+        before = self._profiles(catalog, "Qwen3.8 27B")
+        after = self._profiles(catalog, "Qwen3.8 27B (xhigh)")
+
+        self.assertTrue(before)
+        self.assertEqual(
+            [profile.id for profile in before],
+            [profile.id for profile in after],
+        )
+
+    def test_the_id_still_separates_quants_and_tiers(self) -> None:
+        # Stability must not collapse genuinely different catalog entries.
+        self.assertNotEqual(
+            _stable_profile_id("unsloth/M-GGUF", "q2xl", "cheap"),
+            _stable_profile_id("unsloth/M-GGUF", "q4xl", "cheap"),
+        )
+        self.assertNotEqual(
+            _stable_profile_id("unsloth/M-GGUF", "q2xl", "cheap"),
+            _stable_profile_id("unsloth/M-GGUF", "q2xl", "b200"),
+        )
+        self.assertNotEqual(
+            _stable_profile_id("unsloth/A-GGUF", "q2xl", "cheap"),
+            _stable_profile_id("unsloth/B-GGUF", "q2xl", "cheap"),
+        )
+
+    def test_a_colliding_id_is_dropped_rather_than_shadowing(self) -> None:
+        # Two feed entries for the same artifact would otherwise make lookups
+        # return whichever happened to come first.
+        from llm_launchpad.core.quick_deploy import QuickDeployProfile
+
+        def profile(display_name: str) -> QuickDeployProfile:
+            return QuickDeployProfile(
+                id="qwen3-8-27b-q2xl-cheap",
+                display_name=display_name,
+                repo_id="unsloth/Qwen3.8-27B-GGUF",
+                quant="UD-Q2_K_XL",
+                gpu_type="L4",
+                gpu_count=1,
+                profile_label="Curated",
+                approx_cost_per_hour_usd=0.8,
+                max_context_tokens=262144,
+                instance_slug_hint="qwen",
+                summary="",
+                server_args=(),
+            )
+
+        kept = _with_unique_ids(
+            [profile("Qwen3.8 27B (xhigh)"), profile("Qwen3.8 27B (low)")]
+        )
+
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].display_name, "Qwen3.8 27B (xhigh)")
+
+    def test_distinct_ids_are_all_kept(self) -> None:
+        from llm_launchpad.core.quick_deploy import QuickDeployProfile
+
+        def profile(profile_id: str) -> QuickDeployProfile:
+            return QuickDeployProfile(
+                id=profile_id,
+                display_name="Model",
+                repo_id="unsloth/M-GGUF",
+                quant="UD-Q2_K_XL",
+                gpu_type="L4",
+                gpu_count=1,
+                profile_label="Curated",
+                approx_cost_per_hour_usd=0.8,
+                max_context_tokens=262144,
+                instance_slug_hint="m",
+                summary="",
+                server_args=(),
+            )
+
+        kept = _with_unique_ids([profile("a-q2xl-cheap"), profile("a-q2xl-b200")])
+
+        self.assertEqual([row.id for row in kept], ["a-q2xl-cheap", "a-q2xl-b200"])
+
+    def test_the_id_ignores_the_org_and_gguf_suffix(self) -> None:
+        self.assertEqual(
+            _stable_profile_id("unsloth/Qwen3.8-27B-GGUF", "q2xl", "cheap"),
+            "qwen3-8-27b-q2xl-cheap",
+        )
+        self.assertEqual(
+            _stable_profile_id("other-org/Qwen3.8-27B-gguf", "q2xl", "cheap"),
+            "qwen3-8-27b-q2xl-cheap",
+        )
 
 
 if __name__ == "__main__":

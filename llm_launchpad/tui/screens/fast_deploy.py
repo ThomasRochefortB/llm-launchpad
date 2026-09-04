@@ -429,7 +429,10 @@ def _gpu_filter_options(snapshot: ComputeAvailabilitySnapshot) -> list[tuple[str
         ranked.append((gpu_type, min(prices) if prices else None))
     ranked.sort(key=lambda item: (1 if item[1] is None else 0, item[1] or 0.0, item[0].casefold()))
     for gpu_type, price in ranked:
-        label = gpu_type if price is None else f"{gpu_type} · from {_format_price(price)}"
+        # "from" repeats on every row and pushes the longest entries past the
+        # dropdown width, wrapping them mid-phrase. The prices are already
+        # ascending, so the word earns nothing.
+        label = gpu_type if price is None else f"{gpu_type} · {_format_price(price)}"
         options.append((label, gpu_type))
     return options
 
@@ -873,7 +876,7 @@ class FastDeployScreen(CopyEnabledScreen):
         status = (
             f"[bold]{len(rows)} infrastructure option"
             f"{'s' if len(rows) != 1 else ''}[/bold] "
-            "[dim]best full-context throughput first · updated just now[/dim]"
+            "[dim]· best full-context throughput first · updated just now[/dim]"
         )
         if self._gpu_filter not in {"", "any"}:
             status += f" [dim]· GPU {_escape_markup(self._gpu_filter)}[/dim]"

@@ -50,9 +50,10 @@ from scripts.validate_prime_live import (
 )
 
 
-# The planner-generated catalog renames profiles when tuning changes, so the
-# default is resolved against the live catalog rather than pinned by hand.
-DEFAULT_PROFILE_ID = "qwen3-8-27b-xhigh-q2xl-cheap-rtx-pro-6000"
+# Catalog ids are derived from repository, quantization and resource tier, so
+# they survive the planner picking different hardware and upstream renaming the
+# model. See _stable_profile_id in quick_deploy_refresh.
+DEFAULT_PROFILE_ID = "qwen3-8-27b-q2xl-cheap"
 STOPPED_STATES = {"stopped", "stopping", "terminated", "archived"}
 # A long prompt is what actually exercises the placement the planner certified.
 # Short probes pass even when the KV cache was never budgeted for full context.
