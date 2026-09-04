@@ -14,6 +14,7 @@ from typing import Any, Iterable
 from ..protocol.enums import BackendType, ComputeProvider
 from ..protocol.models import DeploymentConfig, EndpointInfo, ReasoningCapabilities
 from .config import SETTINGS_DIR
+from .diagnostics import log_debug
 from .naming import (
     default_llamacpp_served_model_name,
     default_served_model_name,
@@ -717,9 +718,43 @@ def _load_opencode_config(path: Path) -> dict[str, Any]:
     raw = path.read_text(encoding="utf-8")
     if not raw.strip():
         return {}
-    payload = _parse_jsonc(raw)
+    try:
+        payload = _parse_jsonc(raw)
+    except Exception:
+        payload = _recover_from_backup(path)
+        if payload is None:
+            raise
+        return payload
     if not isinstance(payload, dict):
+        recovered = _recover_from_backup(path)
+        if recovered is not None:
+            return recovered
         raise RuntimeError("OpenCode config must contain a JSON object at the top level.")
+    return payload
+
+
+def _recover_from_backup(path: Path) -> dict[str, Any] | None:
+    """Fall back to the backup when the live config no longer parses.
+
+    This file has been found truncated in the wild -- a valid prefix followed
+    by the tail of a longer previous version, which is what a non-truncating
+    write leaves behind. Launchpad writes it atomically, so the damage came
+    from elsewhere, and refusing to sync until a human notices serves nobody
+    when a known-good copy is sitting next to it.
+    """
+
+    backup_path = path.with_suffix(path.suffix + ".bak")
+    if not backup_path.exists():
+        return None
+    try:
+        payload = _parse_jsonc(backup_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    log_debug(
+        f"OpenCode config at {path} did not parse; recovered from {backup_path}"
+    )
     return payload
 
 

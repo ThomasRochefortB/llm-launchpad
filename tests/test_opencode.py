@@ -736,5 +736,60 @@ class AtomicConfigWriteTests(unittest.TestCase):
             self.assertIn(path, observed)
 
 
+
+class CorruptConfigRecoveryTests(unittest.TestCase):
+    """A truncated config must not stop the tool when a good copy sits beside it."""
+
+    VALID = '{\n  "provider": {"a": {}},\n  "server": {"port": 4096}\n}\n'
+
+    def test_a_truncated_config_recovers_from_the_backup(self) -> None:
+        from llm_launchpad.core.opencode import _load_opencode_config
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "opencode.json"
+            # A valid prefix followed by the tail of a longer previous version:
+            # exactly what a non-truncating write leaves behind.
+            path.write_text(self.VALID + '",\n  "port": 4096\n}\n', encoding="utf-8")
+            path.with_suffix(".json.bak").write_text(self.VALID, encoding="utf-8")
+
+            payload = _load_opencode_config(path)
+
+            self.assertEqual(payload["provider"], {"a": {}})
+
+    def test_a_corrupt_config_without_a_backup_still_raises(self) -> None:
+        from llm_launchpad.core.opencode import _load_opencode_config
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "opencode.json"
+            path.write_text("{ broken", encoding="utf-8")
+
+            # Silently inventing an empty config would delete the user's
+            # providers on the next write.
+            with self.assertRaises(Exception):
+                _load_opencode_config(path)
+
+    def test_a_corrupt_backup_is_not_trusted_either(self) -> None:
+        from llm_launchpad.core.opencode import _load_opencode_config
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "opencode.json"
+            path.write_text("{ broken", encoding="utf-8")
+            path.with_suffix(".json.bak").write_text("also broken", encoding="utf-8")
+
+            with self.assertRaises(Exception):
+                _load_opencode_config(path)
+
+    def test_a_healthy_config_is_read_normally(self) -> None:
+        from llm_launchpad.core.opencode import _load_opencode_config
+
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "opencode.json"
+            path.write_text(self.VALID, encoding="utf-8")
+            path.with_suffix(".json.bak").write_text('{"provider": {"stale": {}}}', encoding="utf-8")
+
+            # The backup must never shadow a file that parses.
+            self.assertEqual(_load_opencode_config(path)["provider"], {"a": {}})
+
+
 if __name__ == "__main__":
     unittest.main()
