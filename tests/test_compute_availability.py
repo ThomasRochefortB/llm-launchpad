@@ -278,6 +278,35 @@ class ComputeAvailabilityTests(unittest.TestCase):
 
         self.assertEqual(plans, ())
 
+    def test_an_excluded_placement_reports_why(self) -> None:
+        # A shorter list with no explanation reads as missing hardware rather
+        # than as hardware that would not have worked.
+        configuration = aggregate_compute_availability(
+            modal_catalog=[ModalGpuSpec("T4", price_per_hour_usd=0.6)],
+        ).configurations[0]
+        rejected: list[str] = []
+
+        plans = plans_for_compute_profile(
+            configuration,
+            _profile(required_vram_gb=140.0),
+            rejected=rejected,
+        )
+
+        self.assertEqual(plans, ())
+        self.assertTrue(rejected)
+        self.assertTrue(all(reason.strip() for reason in rejected))
+
+    def test_nothing_is_reported_when_every_placement_qualifies(self) -> None:
+        configuration = aggregate_compute_availability(
+            modal_catalog=[ModalGpuSpec("H100", price_per_hour_usd=4.0)],
+        ).configurations[0]
+        rejected: list[str] = []
+
+        plans = plans_for_compute_profile(configuration, _profile(), rejected=rejected)
+
+        self.assertTrue(plans)
+        self.assertEqual(rejected, [])
+
     def test_infers_missing_vram_from_the_profile_gpu_shape(self) -> None:
         configuration = aggregate_compute_availability(
             modal_catalog=[ModalGpuSpec("T4", price_per_hour_usd=0.6)],

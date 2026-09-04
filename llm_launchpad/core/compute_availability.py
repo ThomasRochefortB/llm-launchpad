@@ -207,8 +207,15 @@ def plans_for_compute_profile(
     configuration: ComputeConfiguration,
     profile: QuickDeployProfile,
     workload: WorkloadProfile | None = None,
+    *,
+    rejected: list[str] | None = None,
 ) -> tuple[InferencePlan, ...]:
-    """Build ranked fulfillment plans for one model on a selected GPU type."""
+    """Build ranked fulfillment plans for one model on a selected GPU type.
+
+    Placements that cannot hold the full context on GPU are excluded. Pass
+    ``rejected`` to collect the reasons: a silently shorter list tells the
+    reader nothing about why their hardware is missing.
+    """
 
     workload = workload or WorkloadProfile()
     recipe = quick_deploy_recipe(profile)
@@ -225,6 +232,11 @@ def plans_for_compute_profile(
             memory_estimate=profile.memory_estimate,
         )
         if gpu_count is None:
+            if rejected is not None:
+                rejected.append(
+                    f"{placement.gpu_type} has no topology large enough for the "
+                    "full-context plan."
+                )
             continue
         price = placement.price_per_hour_usd
         if price is not None and placement.price_is_per_gpu:
@@ -249,6 +261,11 @@ def plans_for_compute_profile(
                 price_per_hour_usd=price,
             )
             if not assessment.fits or not assessment.gpu_resident:
+                if rejected is not None:
+                    rejected.append(
+                        assessment.rejection_reason
+                        or f"{placement.gpu_type} cannot hold the full context on GPU."
+                    )
                 continue
         single_tps = None
         aggregate_tps = None
