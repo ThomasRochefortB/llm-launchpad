@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import csv
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 import json
 from pathlib import Path
 import re
 import shutil
 import sys
-from typing import Any, Iterable
+from typing import Any
+from collections.abc import Iterable
 
 from ..protocol.enums import BackendType, ComputeProvider
 from ..protocol.models import (
@@ -20,6 +21,7 @@ from ..protocol.models import (
     EndpointInfo,
 )
 from .config import SETTINGS_DIR
+from .diagnostics import log_exception
 from .naming import default_llamacpp_served_model_name, default_served_model_name, slugify_instance_name
 
 DEFAULT_CONCURRENCY = [1, 2, 4, 8, 16]
@@ -122,7 +124,7 @@ def normalize_aiperf_url(server_url: str) -> str:
 
 def default_benchmark_run_dir(app_name: str, now: datetime | None = None) -> Path:
     """Build the default benchmark run directory for an app."""
-    timestamp = (now or datetime.now(timezone.utc)).strftime("%Y%m%dT%H%M%SZ")
+    timestamp = (now or datetime.now(UTC)).strftime("%Y%m%dT%H%M%SZ")
     safe_app_name = slugify_instance_name(app_name or "endpoint")
     return BENCHMARKS_DIR / safe_app_name / timestamp
 
@@ -296,7 +298,7 @@ def parse_aiperf_summary(json_path: Path, csv_path: Path) -> tuple[dict[str, flo
             if any(value is not None for value in json_metrics.values()):
                 return json_metrics, str(json_path)
         except Exception:
-            pass
+            log_exception(f"Could not read benchmark metrics from {json_path}")
     if csv_path.exists():
         return _extract_metrics_from_csv(csv_path), str(csv_path)
     if json_metrics is not None:
@@ -434,13 +436,12 @@ def _extract_metrics_from_csv(csv_path: Path) -> dict[str, float | None]:
 
 
 def _empty_metrics() -> dict[str, float | None]:
-    return {key: None for key in METRIC_KEYS}
+    return dict.fromkeys(METRIC_KEYS)
 
 
 def _find_metric_payload(payload: Any, metric_name: str) -> Any:
     aliases = _METRIC_ALIASES[metric_name]
-    found = _find_metric_payload_inner(payload, aliases)
-    return found
+    return _find_metric_payload_inner(payload, aliases)
 
 
 def _find_metric_payload_inner(payload: Any, aliases: tuple[str, ...]) -> Any:

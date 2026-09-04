@@ -19,7 +19,7 @@ from llm_launchpad.core.doctor import (
 from llm_launchpad.core.hf_auth import HuggingFaceAuthStatus
 from llm_launchpad.core.modal_auth import ModalAuthStatus
 from llm_launchpad.core.prime_auth import PrimeAuthStatus
-from llm_launchpad.core.quick_deploy_refresh import ArtificialAnalysisAuthStatus
+from llm_launchpad.core.artificial_analysis import ArtificialAnalysisAuthStatus
 
 
 def _ok_checks() -> tuple[DoctorCheck, ...]:

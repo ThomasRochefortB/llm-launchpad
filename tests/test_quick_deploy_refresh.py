@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, UTC
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from typing import Any, Sequence
+from typing import Any
+from collections.abc import Sequence
 import unittest
 from unittest.mock import patch
 
@@ -13,31 +14,33 @@ from llm_launchpad.core.gguf_metadata import GgufMtpCapability, GgufMtpStatus
 from llm_launchpad.core.hf_models import GgufQuantMetadata, ModelCandidate
 from llm_launchpad.core.modal_gpu import ModalGpuSpec
 from llm_launchpad.core.quick_deploy import QuickDeployProfile
-from llm_launchpad.core.quick_deploy_refresh import (
+from llm_launchpad.core.artificial_analysis import (
     AAModelCandidate,
-    QUICK_DEPLOY_CATALOG_CACHE_SCHEMA_VERSION,
     _AARankings,
-    _available_gpu_types,
-    _find_unsloth_gguf_match,
     _load_aa_rankings,
+    _write_aa_cache,
+    fetch_artificial_analysis_models,
+    normalize_aa_model_candidates,
+)
+from llm_launchpad.core.quick_deploy_refresh import (
+    QUICK_DEPLOY_CATALOG_CACHE_SCHEMA_VERSION,
+    _available_gpu_types,
+    _fetch_serving_metadata,
+    _find_unsloth_gguf_match,
+    _is_transient_hub_error,
+    _mtp_recommendation,
+    _profiles_for_quant,
     _quick_deploy_profile_from_dict,
     _quick_deploy_profile_to_dict,
-    _fetch_serving_metadata,
-    _profiles_for_quant,
-    _stable_profile_id,
-    _with_unique_ids,
-    _is_transient_hub_error,
     _read_quick_deploy_catalog_cache,
     _retained_catalog_for,
+    _stable_profile_id,
+    _with_unique_ids,
     _write_quick_deploy_catalog_cache,
-    _write_aa_cache,
     attach_quick_deploy_mtp_recommendations,
     build_live_quick_deploy_catalog,
-    fetch_artificial_analysis_models,
     is_fresh_cached_quick_deploy_catalog,
     load_cached_quick_deploy_catalog,
-    normalize_aa_model_candidates,
-    _mtp_recommendation,
 )
 
 
@@ -549,7 +552,7 @@ class QuickDeployRefreshTests(unittest.TestCase):
         self.assertEqual(candidates[0].rank, 1)
 
     def test_fresh_aa_cache_avoids_api_request(self) -> None:
-        now = datetime(2026, 8, 26, 12, tzinfo=timezone.utc)
+        now = datetime(2026, 8, 26, 12, tzinfo=UTC)
         payload = {
             "tier": "free",
             "data": [
@@ -570,7 +573,7 @@ class QuickDeployRefreshTests(unittest.TestCase):
                 api_key="key",
             )
             with patch(
-                "llm_launchpad.core.quick_deploy_refresh.fetch_artificial_analysis_models"
+                "llm_launchpad.core.artificial_analysis.fetch_artificial_analysis_models"
             ) as fetch:
                 rankings = _load_aa_rankings(
                     api_key="key",
@@ -584,7 +587,7 @@ class QuickDeployRefreshTests(unittest.TestCase):
         self.assertEqual(rankings.tier, "free")
 
     def test_stale_aa_cache_refreshes_once_and_is_rewritten(self) -> None:
-        now = datetime(2026, 8, 26, 12, tzinfo=timezone.utc)
+        now = datetime(2026, 8, 26, 12, tzinfo=UTC)
         stale_payload = {
             "data": [
                 {
@@ -611,7 +614,7 @@ class QuickDeployRefreshTests(unittest.TestCase):
             cache_path = Path(temporary_directory) / "aa.json"
             _write_aa_cache(cache_path, stale_payload, fetched_at=now - timedelta(days=2))
             with patch(
-                "llm_launchpad.core.quick_deploy_refresh.fetch_artificial_analysis_models",
+                "llm_launchpad.core.artificial_analysis.fetch_artificial_analysis_models",
                 return_value=live_payload,
             ) as fetch:
                 rankings = _load_aa_rankings(
@@ -663,7 +666,7 @@ class QuickDeployRefreshTests(unittest.TestCase):
         self.assertEqual(get.call_args_list[2].kwargs["params"], {"page": 2})
 
     def test_stale_cache_remains_available_when_aa_refresh_fails(self) -> None:
-        now = datetime(2026, 8, 26, 12, tzinfo=timezone.utc)
+        now = datetime(2026, 8, 26, 12, tzinfo=UTC)
         payload = {
             "data": [
                 {
@@ -678,7 +681,7 @@ class QuickDeployRefreshTests(unittest.TestCase):
             cache_path = Path(temporary_directory) / "aa.json"
             _write_aa_cache(cache_path, payload, fetched_at=now - timedelta(days=2))
             with patch(
-                "llm_launchpad.core.quick_deploy_refresh.fetch_artificial_analysis_models",
+                "llm_launchpad.core.artificial_analysis.fetch_artificial_analysis_models",
                 side_effect=RuntimeError("offline"),
             ):
                 rankings = _load_aa_rankings(
@@ -842,13 +845,13 @@ class QuickDeployRefreshTests(unittest.TestCase):
             self.assertTrue(
                 is_fresh_cached_quick_deploy_catalog(
                     cached_info,
-                    now=datetime(2026, 9, 3, 1, tzinfo=timezone.utc),
+                    now=datetime(2026, 9, 3, 1, tzinfo=UTC),
                 )
             )
             self.assertFalse(
                 is_fresh_cached_quick_deploy_catalog(
                     cached_info,
-                    now=datetime(2026, 9, 4, tzinfo=timezone.utc),
+                    now=datetime(2026, 9, 4, tzinfo=UTC),
                 )
             )
             with patch(

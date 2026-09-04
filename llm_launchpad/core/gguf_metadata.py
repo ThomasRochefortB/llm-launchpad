@@ -270,9 +270,13 @@ def parse_gguf_serving_metadata(
         value, offset = _read_value(data, offset, value_type, capture=capture)
         if key == "general.architecture" and isinstance(value, str):
             architecture = value.strip().casefold() or None
-        elif matched is not None and isinstance(value, int) and not isinstance(value, bool):
-            if value > 0:
-                values[matched] = value
+        elif (
+            matched is not None
+            and isinstance(value, int)
+            and not isinstance(value, bool)
+            and value > 0
+        ):
+            values[matched] = value
 
     return GgufServingMetadata(
         architecture=architecture,

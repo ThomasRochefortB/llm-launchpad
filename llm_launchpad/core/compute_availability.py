@@ -6,7 +6,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 import math
 import re
-from typing import Sequence
+from collections.abc import Sequence
 
 from ..protocol.enums import (
     BackendType,
@@ -35,6 +35,7 @@ from .modal_gpu import ModalGpuSpec, fetch_modal_gpu_catalog
 from .prime_auth import get_prime_auth_status
 from .prime_backend import (
     PrimeBackend,
+    prime_stock_availability,
     is_prime_gpu_offer,
     preferred_prime_offer_image,
     prime_offer_gpu_memory_gb,
@@ -58,18 +59,6 @@ _GPU_MEMORY_GB: dict[str, float] = {
     "B200": 180.0,
     "B200+": 180.0,
 }
-_UNAVAILABLE_STOCK = {
-    "unavailable",
-    "out_of_stock",
-    "outofstock",
-    "sold_out",
-    "soldout",
-    "not_available",
-    "notavailable",
-}
-_AVAILABLE_STOCK = {"available", "in_stock", "instock"}
-
-
 def load_compute_availability() -> ComputeAvailabilitySnapshot:
     """Fetch connected providers concurrently and return one aggregated view."""
 
@@ -328,7 +317,7 @@ def plans_for_compute_profile(
             )
             if plan.assessment is not None and recipe.serving_requirements is not None
             else 0.0,
-            *_plan_sort_key(plan),
+            *_plan_hourly_price_sort_key(plan),
         )
     )
     if plans:
@@ -389,7 +378,7 @@ def _prime_placements(offers: Sequence[ComputeOffer]) -> list[ComputePlacement]:
     placements = []
     for offer in offers:
         memory_gb = prime_offer_gpu_memory_gb(offer)
-        availability = _prime_availability(offer.stock_status)
+        availability = prime_stock_availability(offer.stock_status)
         backends = frozenset(
             backend
             for backend in BackendType
@@ -434,19 +423,6 @@ def _modal_gpu_memory_gb(gpu_type: str) -> float | None:
     return float(match.group(1)) if match is not None else None
 
 
-def _prime_availability(stock_status: str | None) -> QuoteAvailability:
-    normalized = re.sub(
-        r"[^a-z0-9]+",
-        "_",
-        (stock_status or "").casefold(),
-    ).strip("_")
-    if normalized in _UNAVAILABLE_STOCK:
-        return QuoteAvailability.UNAVAILABLE
-    if normalized in _AVAILABLE_STOCK:
-        return QuoteAvailability.AVAILABLE
-    return QuoteAvailability.UNKNOWN
-
-
 def _placement_gpu_count(
     placement: ComputePlacement,
     required_vram_gb: float,
@@ -474,13 +450,8 @@ def _placement_gpu_count(
 
 
 def _placement_sort_key(row: ComputePlacement) -> tuple[int, int, float, str]:
-    availability_order = {
-        QuoteAvailability.AVAILABLE: 0,
-        QuoteAvailability.UNKNOWN: 1,
-        QuoteAvailability.UNAVAILABLE: 2,
-    }
     return (
-        availability_order[row.availability],
+        row.availability.sort_rank,
         row.price_per_hour_usd is None,
         row.price_per_hour_usd
         if row.price_per_hour_usd is not None
@@ -489,15 +460,10 @@ def _placement_sort_key(row: ComputePlacement) -> tuple[int, int, float, str]:
     )
 
 
-def _plan_sort_key(plan: InferencePlan) -> tuple[int, int, float, str]:
-    availability_order = {
-        QuoteAvailability.AVAILABLE: 0,
-        QuoteAvailability.UNKNOWN: 1,
-        QuoteAvailability.UNAVAILABLE: 2,
-    }
+def _plan_hourly_price_sort_key(plan: InferencePlan) -> tuple[int, int, float, str]:
     price = plan.quote.price_per_hour_usd
     return (
-        availability_order[plan.quote.availability],
+        plan.quote.availability.sort_rank,
         price is None,
         price if price is not None else float("inf"),
         plan.quote.id,

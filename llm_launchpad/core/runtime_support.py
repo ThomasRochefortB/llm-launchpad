@@ -8,7 +8,10 @@ from functools import lru_cache
 from importlib import resources
 import json
 import re
-from typing import Any, Iterable
+from typing import Any
+from collections.abc import Iterable
+
+from .coerce import positive_int
 
 
 DEFAULT_LLAMACPP_IMAGE_REF = "ghcr.io/ggml-org/llama.cpp:server-cuda-b10689"
@@ -115,7 +118,7 @@ def load_llamacpp_support_manifest() -> LlamaCppSupportManifest:
     if not isinstance(payload, dict):
         raise RuntimeError("llama.cpp support manifest must be a JSON object")
 
-    schema_version = _positive_int(payload.get("schema_version"))
+    schema_version = positive_int(payload.get("schema_version"))
     if schema_version not in {1, 2}:
         raise RuntimeError(
             f"Unsupported llama.cpp support manifest schema: {schema_version!r}"
@@ -320,13 +323,3 @@ def _string_set(value: Any) -> frozenset[str]:
         for item in value
         if (text := _optional_string(item)) is not None
     )
-
-
-def _positive_int(value: Any) -> int | None:
-    if isinstance(value, bool):
-        return None
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if parsed > 0 else None

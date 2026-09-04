@@ -80,8 +80,13 @@ target-version = "py312"
 line-length = 100
 
 [tool.ruff.lint]
-select = ["E", "F"]
-ignore = ["E501"]
+select = ["E", "F", "B", "C4", "RET", "SIM"]
+ignore = [
+  "E501",     # line length is not enforced; the formatter is not run here
+  "B008",     # `typer.Option(...)` in a default is the Typer idiom
+  "SIM105",   # `contextlib.suppress` is not clearer than a two-line try/except here
+  "SIM117",   # stacked `mock.patch` context managers read better one per line
+]
 
 [tool.ty.environment]
 python-version = "3.12"

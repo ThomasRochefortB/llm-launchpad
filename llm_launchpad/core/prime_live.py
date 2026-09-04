@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 import re
 import time
-from typing import Any, Callable
+from typing import Any
+from collections.abc import Callable
 
 
 _SECRET_PATTERNS = (
@@ -26,7 +27,7 @@ _SECRET_PATTERNS = (
 def utc_now_iso() -> str:
     """Return a compact UTC timestamp suitable for live-test reports."""
 
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 def redact_live_value(value: str, secrets: tuple[str, ...] = ()) -> str:

@@ -317,7 +317,7 @@ class CopyEnabledScreenTests(unittest.IsolatedAsyncioTestCase):
             screen.selections = {target: SELECT_ALL}
             await pilot.pause()
 
-            screen.action_copy_text_to_clipboard()
+            screen.action_copy_text()
 
             self.assertEqual(app.clipboard, "Hello world")
 

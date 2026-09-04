@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 import re
 import tarfile
-from typing import Callable
+from collections.abc import Callable
 
 import requests
 

@@ -11,7 +11,7 @@ from typer.testing import CliRunner
 
 from llm_launchpad.cli import main as cli_main
 from llm_launchpad.core.artificial_analysis_auth import save_artificial_analysis_api_key
-from llm_launchpad.core.quick_deploy_refresh import ArtificialAnalysisAuthStatus
+from llm_launchpad.core.artificial_analysis import ArtificialAnalysisAuthStatus
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider, OperationType
 from llm_launchpad.protocol.events import EndpointAvailableEvent, LogEvent, OperationCompleteEvent
 from llm_launchpad.protocol.models import EndpointInfo, PrimeProviderOptions
@@ -1259,7 +1259,7 @@ class CliMainAaiAuthCommandTests(unittest.TestCase):
                     key_path,
                 ),
                 patch(
-                    "llm_launchpad.core.quick_deploy_refresh.get_artificial_analysis_auth_status",
+                    "llm_launchpad.core.artificial_analysis.get_artificial_analysis_auth_status",
                     return_value=ArtificialAnalysisAuthStatus(authenticated=True, tier="pro"),
                 ),
             ):
@@ -1278,7 +1278,7 @@ class CliMainAaiAuthCommandTests(unittest.TestCase):
                     key_path,
                 ),
                 patch(
-                    "llm_launchpad.core.quick_deploy_refresh.get_artificial_analysis_auth_status",
+                    "llm_launchpad.core.artificial_analysis.get_artificial_analysis_auth_status",
                     return_value=ArtificialAnalysisAuthStatus(
                         authenticated=False,
                         error="Invalid Artificial Analysis API key",
@@ -1302,7 +1302,7 @@ class CliMainAaiAuthCommandTests(unittest.TestCase):
                     key_path,
                 ),
                 patch(
-                    "llm_launchpad.core.quick_deploy_refresh.get_artificial_analysis_auth_status",
+                    "llm_launchpad.core.artificial_analysis.get_artificial_analysis_auth_status",
                     return_value=ArtificialAnalysisAuthStatus(authenticated=True, tier="free"),
                 ),
             ):

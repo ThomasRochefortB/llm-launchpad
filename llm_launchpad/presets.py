@@ -1,4 +1,4 @@
-from typing import Dict, Any
+from typing import Any
 
 """Model presets for the llama.cpp Modal server.
 
@@ -9,7 +9,7 @@ pass your own --repo-id / --quant via the CLI entrypoint instead of using a pres
 __all__ = ["PRESETS"]
 
 
-PRESETS: Dict[str, Dict[str, Any]] = {
+PRESETS: dict[str, dict[str, Any]] = {
     # Heavy coding preset (default in this repo)
     "qwen3-coder-480b": {
         "repo_id": "unsloth/Qwen3-Coder-480B-A35B-Instruct-1M-GGUF",

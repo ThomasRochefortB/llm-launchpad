@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any
 
 from .enums import (
     BackendType,
@@ -25,9 +25,9 @@ class ModalProviderOptions:
 class PrimeProviderOptions:
     """Prime-specific deployment options kept behind the provider boundary."""
 
-    offer_id: Optional[str] = None
-    region: Optional[str] = None
-    disk_id: Optional[str] = None
+    offer_id: str | None = None
+    region: str | None = None
+    disk_id: str | None = None
     keep_failed_resource: bool = False
     allow_insecure_http: bool = False
     auto_disk: bool = True
@@ -43,17 +43,17 @@ class LaunchpadSettings:
     scaledown_window: int = 1800  # seconds (30 minutes)
     tui_theme: str = "launchpad-dark"
     tui_density: str = "comfortable"
-    tui_mouse: Optional[bool] = None  # None = follow CLI/env default
+    tui_mouse: bool | None = None  # None = follow CLI/env default
     confirm_quit: bool = True
 
-    def to_env(self) -> Dict[str, str]:
+    def to_env(self) -> dict[str, str]:
         """Derive Modal environment variables from settings."""
-        env: Dict[str, str] = {}
+        env: dict[str, str] = {}
         if self.scaledown_window > 0:
             env["SCALEDOWN_WINDOW"] = str(self.scaledown_window)
         return env
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "SCALEDOWN_WINDOW": self.scaledown_window,
             "tui_theme": self.tui_theme,
@@ -63,7 +63,7 @@ class LaunchpadSettings:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> LaunchpadSettings:
+    def from_dict(cls, data: dict[str, Any]) -> LaunchpadSettings:
         raw_value = data.get("SCALEDOWN_WINDOW", data.get("scaledown_window", 1800))
         raw_mouse = data.get("tui_mouse")
         mouse = raw_mouse if isinstance(raw_mouse, bool) else None
@@ -90,7 +90,7 @@ class ReasoningCapabilities:
     source_path: str
     request_option_path: str
     enable_thinking: bool = True
-    interleaved_field: Optional[str] = None
+    interleaved_field: str | None = None
 
 
 @dataclass(frozen=True)
@@ -99,7 +99,7 @@ class SpeculativeDecodingConfig:
 
     method: SpeculativeDecodingMethod
     num_speculative_tokens: int
-    nextn_predict_layers: Optional[int] = None
+    nextn_predict_layers: int | None = None
 
 
 @dataclass(frozen=True)
@@ -110,7 +110,7 @@ class ServingRequirements:
     objective: ServingObjective = ServingObjective.GENERAL_PURPOSE
     full_context_per_request: bool = True
     gpu_only: bool = True
-    max_hourly_cost_usd: Optional[float] = None
+    max_hourly_cost_usd: float | None = None
 
 
 @dataclass(frozen=True)
@@ -125,7 +125,7 @@ class RuntimeTuning:
     flash_attention: bool = True
     gpu_layers: str = "all"
     fit_target_mib: int = 2048
-    speculative_decoding: Optional[SpeculativeDecodingConfig] = None
+    speculative_decoding: SpeculativeDecodingConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -141,7 +141,7 @@ class MemoryEstimate:
     per_device_required_gb: tuple[float, ...] = ()
     confidence: float = 0.0
     source: str = "estimated"
-    total_layer_count: Optional[int] = None
+    total_layer_count: int | None = None
 
 
 @dataclass(frozen=True)
@@ -151,13 +151,13 @@ class PerformancePoint:
     prompt_tokens: int
     output_tokens: int
     concurrency: int
-    prompt_tokens_per_second: Optional[float] = None
-    output_tokens_per_second: Optional[float] = None
-    aggregate_output_tokens_per_second: Optional[float] = None
-    time_to_first_token_seconds: Optional[float] = None
-    p95_latency_seconds: Optional[float] = None
+    prompt_tokens_per_second: float | None = None
+    output_tokens_per_second: float | None = None
+    aggregate_output_tokens_per_second: float | None = None
+    time_to_first_token_seconds: float | None = None
+    p95_latency_seconds: float | None = None
     error_rate: float = 0.0
-    output_tokens_per_dollar: Optional[float] = None
+    output_tokens_per_dollar: float | None = None
     measured: bool = False
 
 
@@ -172,7 +172,7 @@ class PlacementAssessment:
     certification: CertificationState = CertificationState.ESTIMATED
     fits: bool = False
     gpu_resident: bool = False
-    rejection_reason: Optional[str] = None
+    rejection_reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -185,10 +185,10 @@ class RuntimeAttestation:
     gpu_layers: int
     total_layers: int
     gpu_resident: bool
-    memory: Optional[MemoryEstimate] = None
+    memory: MemoryEstimate | None = None
     performance: tuple[PerformancePoint, ...] = ()
-    runtime_id: Optional[str] = None
-    verified_at: Optional[str] = None
+    runtime_id: str | None = None
+    verified_at: str | None = None
 
 
 @dataclass
@@ -199,42 +199,42 @@ class DeploymentConfig:
     provider: ComputeProvider = ComputeProvider.MODAL
 
     # llama.cpp specific
-    preset: Optional[str] = None
-    repo_id: Optional[str] = None
-    quant: Optional[str] = None
-    revision: Optional[str] = None
+    preset: str | None = None
+    repo_id: str | None = None
+    quant: str | None = None
+    revision: str | None = None
     preload: bool = True
-    server_args: Optional[str] = None
-    host: Optional[str] = None
-    port: Optional[int] = None
-    n_gpu_layers: Optional[int] = None
-    llamacpp_image_no_cache: Optional[bool] = None
-    gpu_type: Optional[str] = None
-    gpu_count: Optional[int] = None
-    required_vram_gb: Optional[float] = None
-    gguf_architecture: Optional[str] = None
-    llamacpp_runtime_id: Optional[str] = None
-    speculative_decoding: Optional[SpeculativeDecodingConfig] = None
-    serving_requirements: Optional[ServingRequirements] = None
-    runtime_tuning: Optional[RuntimeTuning] = None
-    placement_assessment: Optional[PlacementAssessment] = None
-    runtime_attestation: Optional[RuntimeAttestation] = None
+    server_args: str | None = None
+    host: str | None = None
+    port: int | None = None
+    n_gpu_layers: int | None = None
+    llamacpp_image_no_cache: bool | None = None
+    gpu_type: str | None = None
+    gpu_count: int | None = None
+    required_vram_gb: float | None = None
+    gguf_architecture: str | None = None
+    llamacpp_runtime_id: str | None = None
+    speculative_decoding: SpeculativeDecodingConfig | None = None
+    serving_requirements: ServingRequirements | None = None
+    runtime_tuning: RuntimeTuning | None = None
+    placement_assessment: PlacementAssessment | None = None
+    runtime_attestation: RuntimeAttestation | None = None
 
     # Model limits advertised to OpenAI-compatible clients such as OpenCode.
-    max_context_tokens: Optional[int] = None
-    max_output_tokens: Optional[int] = None
-    reasoning: Optional[ReasoningCapabilities] = None
+    max_context_tokens: int | None = None
+    max_output_tokens: int | None = None
+    reasoning: ReasoningCapabilities | None = None
 
     # vLLM specific
-    model_name: Optional[str] = None
-    model_revision: Optional[str] = None
-    served_model_name: Optional[str] = None
-    fast_boot: Optional[bool] = None
-    n_gpu: Optional[int] = None
-    trust_remote_code: Optional[bool] = None
-    reasoning_parser: Optional[str] = None
-    tool_call_parser: Optional[str] = None
-    default_chat_template_kwargs: Optional[str] = None
+    model_name: str | None = None
+    model_revision: str | None = None
+    served_model_name: str | None = None
+    fast_boot: bool | None = None
+    n_gpu: int | None = None
+    trust_remote_code: bool | None = None
+    reasoning_parser: str | None = None
+    tool_call_parser: str | None = None
+    default_chat_template_kwargs: str | None = None
 
     # Deployment options
     do_deploy: bool = True
@@ -243,13 +243,13 @@ class DeploymentConfig:
     show_debug_logs: bool = False
 
     # Instance identity
-    instance_name: Optional[str] = None
-    app_name: Optional[str] = None
-    function_slug: Optional[str] = None
+    instance_name: str | None = None
+    app_name: str | None = None
+    function_slug: str | None = None
 
     # Provider-specific settings are typed and interpreted only by the adapter.
-    provider_options: Optional[ProviderOptions] = None
-    endpoint_api_key: Optional[str] = None
+    provider_options: ProviderOptions | None = None
+    endpoint_api_key: str | None = None
     # Ephemeral Fast Deploy recovery ladder. Provider adapters ignore it.
     fallback_configs: tuple[DeploymentConfig, ...] = ()
 
@@ -280,16 +280,16 @@ class InferenceRecipe:
     display_name: str
     backend: BackendType
     model_id: str
-    quant: Optional[str] = None
-    max_context_tokens: Optional[int] = None
-    required_vram_gb: Optional[float] = None
+    quant: str | None = None
+    max_context_tokens: int | None = None
+    required_vram_gb: float | None = None
     server_args: tuple[str, ...] = ()
-    speculative_decoding: Optional[SpeculativeDecodingConfig] = None
+    speculative_decoding: SpeculativeDecodingConfig | None = None
     source_label: str = "Curated"
-    quality_score: Optional[float] = None
-    quality_rank: Optional[int] = None
-    serving_requirements: Optional[ServingRequirements] = None
-    runtime_tuning: Optional[RuntimeTuning] = None
+    quality_score: float | None = None
+    quality_rank: int | None = None
+    serving_requirements: ServingRequirements | None = None
+    runtime_tuning: RuntimeTuning | None = None
 
 
 @dataclass(frozen=True)
@@ -298,7 +298,7 @@ class WorkloadProfile:
 
     paid_hours_per_day: float = 8.0
     utilization: float = 0.25
-    output_tokens_per_month: Optional[int] = None
+    output_tokens_per_month: int | None = None
 
 
 @dataclass(frozen=True)
@@ -311,18 +311,18 @@ class ProviderQuote:
     provider_reference: str
     gpu_type: str
     gpu_count: int
-    price_per_hour_usd: Optional[float]
+    price_per_hour_usd: float | None
     billing_model: BillingModel
-    gpu_memory_gb: Optional[float] = None
+    gpu_memory_gb: float | None = None
     availability: QuoteAvailability = QuoteAvailability.UNKNOWN
-    region: Optional[str] = None
-    security: Optional[str] = None
+    region: str | None = None
+    security: str | None = None
     is_estimate: bool = True
-    estimated_output_tokens_per_second: Optional[float] = None
-    configuration_id: Optional[str] = None
-    provider_options: Optional[ProviderOptions] = None
-    estimated_prompt_tokens_per_second: Optional[float] = None
-    estimated_aggregate_output_tokens_per_second: Optional[float] = None
+    estimated_output_tokens_per_second: float | None = None
+    configuration_id: str | None = None
+    provider_options: ProviderOptions | None = None
+    estimated_prompt_tokens_per_second: float | None = None
+    estimated_aggregate_output_tokens_per_second: float | None = None
 
 
 @dataclass(frozen=True)
@@ -331,10 +331,10 @@ class InferencePlan:
 
     recipe: InferenceRecipe
     quote: ProviderQuote
-    estimated_monthly_cost_usd: Optional[float] = None
-    estimated_cost_per_million_output_tokens_usd: Optional[float] = None
-    recommendation_reason: Optional[str] = None
-    assessment: Optional[PlacementAssessment] = None
+    estimated_monthly_cost_usd: float | None = None
+    estimated_cost_per_million_output_tokens_usd: float | None = None
+    recommendation_reason: str | None = None
+    assessment: PlacementAssessment | None = None
 
 
 @dataclass(frozen=True)
@@ -348,16 +348,16 @@ class ComputePlacement:
     gpu_memory_gb: float
     gpu_count_min: int
     gpu_count_max: int
-    price_per_hour_usd: Optional[float]
+    price_per_hour_usd: float | None
     billing_model: BillingModel
     availability: QuoteAvailability
     supported_backends: frozenset[BackendType]
-    region: Optional[str] = None
-    security: Optional[str] = None
+    region: str | None = None
+    security: str | None = None
     is_estimate: bool = False
     price_is_per_gpu: bool = False
     is_spot: bool = False
-    provider_options: Optional[ProviderOptions] = None
+    provider_options: ProviderOptions | None = None
 
 
 @dataclass(frozen=True)
@@ -429,7 +429,7 @@ class ComputeConfiguration:
         )
 
     @property
-    def minimum_price_per_hour_usd(self) -> Optional[float]:
+    def minimum_price_per_hour_usd(self) -> float | None:
         prices = [
             row.price_per_hour_usd
             for row in self._fulfillable_placements()
@@ -444,7 +444,7 @@ class ComputeAvailabilitySnapshot:
 
     configurations: tuple[ComputeConfiguration, ...]
     errors: tuple[str, ...] = ()
-    providers: Optional[tuple[ComputeProvider, ...]] = None
+    providers: tuple[ComputeProvider, ...] | None = None
 
 
 @dataclass
@@ -454,22 +454,22 @@ class EndpointInfo:
     name: str = ""
     app_id: str = ""
     state: str = "unknown"
-    backend: Optional[BackendType] = None
-    instance_name: Optional[str] = None
-    web_url: Optional[str] = None
-    served_model_name: Optional[str] = None
-    display_name: Optional[str] = None
-    model_name: Optional[str] = None
-    repo_id: Optional[str] = None
-    quant: Optional[str] = None
-    runtime_status: Optional[str] = None
-    runtime_status_detail: Optional[str] = None
+    backend: BackendType | None = None
+    instance_name: str | None = None
+    web_url: str | None = None
+    served_model_name: str | None = None
+    display_name: str | None = None
+    model_name: str | None = None
+    repo_id: str | None = None
+    quant: str | None = None
+    runtime_status: str | None = None
+    runtime_status_detail: str | None = None
     provider: ComputeProvider = ComputeProvider.MODAL
-    endpoint_api_key: Optional[str] = None
-    max_context_tokens: Optional[int] = None
-    max_output_tokens: Optional[int] = None
-    reasoning: Optional[ReasoningCapabilities] = None
-    runtime_attestation: Optional[RuntimeAttestation] = None
+    endpoint_api_key: str | None = None
+    max_context_tokens: int | None = None
+    max_output_tokens: int | None = None
+    reasoning: ReasoningCapabilities | None = None
+    runtime_attestation: RuntimeAttestation | None = None
 
 
 @dataclass
@@ -478,19 +478,19 @@ class BenchmarkConfig:
 
     backend: BackendType = BackendType.LLAMACPP
     provider: ComputeProvider = ComputeProvider.MODAL
-    app_name: Optional[str] = None
-    instance_name: Optional[str] = None
-    server_url: Optional[str] = None
-    model_name: Optional[str] = None
+    app_name: str | None = None
+    instance_name: str | None = None
+    server_url: str | None = None
+    model_name: str | None = None
     concurrency: list[int] = field(default_factory=lambda: [1, 2, 4, 8, 16])
-    request_count: Optional[int] = None
+    request_count: int | None = None
     input_tokens: int = 550
     output_tokens: int = 256
     tokenizer: str = "gpt2"
     request_timeout_seconds: int = 300
-    output_dir: Optional[str] = None
+    output_dir: str | None = None
     aiperf_args: list[str] = field(default_factory=list)
-    api_key: Optional[str] = None
+    api_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -502,19 +502,19 @@ class ComputeOffer:
     provider_name: str
     gpu_type: str
     gpu_count: int
-    gpu_memory_gb: Optional[float] = None
-    region: Optional[str] = None
-    data_center: Optional[str] = None
-    country: Optional[str] = None
-    socket: Optional[str] = None
-    security: Optional[str] = None
-    price_per_hour: Optional[float] = None
+    gpu_memory_gb: float | None = None
+    region: str | None = None
+    data_center: str | None = None
+    country: str | None = None
+    socket: str | None = None
+    security: str | None = None
+    price_per_hour: float | None = None
     is_spot: bool = False
     is_variable_price: bool = False
-    stock_status: Optional[str] = None
-    disk_default_gb: Optional[int] = None
-    vcpu_default: Optional[int] = None
-    memory_default_gb: Optional[int] = None
+    stock_status: str | None = None
+    disk_default_gb: int | None = None
+    vcpu_default: int | None = None
+    memory_default_gb: int | None = None
     images: tuple[str, ...] = ()
     raw: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
@@ -529,9 +529,9 @@ class BenchmarkConcurrencyResult:
     exit_code: int = 0
     success: bool = True
     detail: str = ""
-    json_export_path: Optional[str] = None
-    csv_export_path: Optional[str] = None
-    metrics: dict[str, Optional[float]] = field(default_factory=dict)
+    json_export_path: str | None = None
+    csv_export_path: str | None = None
+    metrics: dict[str, float | None] = field(default_factory=dict)
 
 
 @dataclass
@@ -542,8 +542,8 @@ class BenchmarkRunSummary:
     run_dir: str
     results: list[BenchmarkConcurrencyResult] = field(default_factory=list)
     success: bool = True
-    best_concurrency: Optional[int] = None
-    best_output_token_throughput: Optional[float] = None
+    best_concurrency: int | None = None
+    best_output_token_throughput: float | None = None
 
 
 @dataclass
@@ -552,8 +552,8 @@ class StoredModelInfo:
 
     backend: BackendType
     model_id: str
-    revision: Optional[str] = None
-    quant: Optional[str] = None
+    revision: str | None = None
+    quant: str | None = None
     size_bytes: int = 0
     file_count: int = 0
     source_volume: str = ""

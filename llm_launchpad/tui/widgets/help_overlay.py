@@ -62,7 +62,7 @@ class HelpOverlayScreen(ModalScreen):
         self._sections = sections
 
     @classmethod
-    def from_screen(cls, screen: object) -> "HelpOverlayScreen":
+    def from_screen(cls, screen: object) -> HelpOverlayScreen:
         sections: list[tuple[str, list[tuple[str, str]]]] = []
         app = getattr(screen, "app", None)
         screen_bindings = _iter_screen_bindings(screen)

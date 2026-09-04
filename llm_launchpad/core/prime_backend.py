@@ -11,13 +11,15 @@ from pathlib import Path
 import re
 import shlex
 import subprocess
-from typing import Any, Iterable
+from typing import Any
+from collections.abc import Iterable
 
 import requests
 
-from ..protocol.enums import BackendType, ComputeProvider
+from ..protocol.enums import BackendType, ComputeProvider, QuoteAvailability
 from ..protocol.models import ComputeOffer, DeploymentConfig, EndpointInfo
 from .config import SETTINGS_DIR
+from .coerce import optional_float
 from .diagnostics import log_exception
 from .naming import infer_instance_from_app_name
 from .prime_auth import PrimeConfig, load_prime_config
@@ -208,13 +210,6 @@ def _optional_int(value: Any) -> int | None:
         return None
 
 
-def _optional_float(value: Any) -> float | None:
-    try:
-        return float(value) if value is not None else None
-    except (TypeError, ValueError):
-        return None
-
-
 def _format_prime_error_value(value: Any, *, field: str = "") -> str:
     """Format Prime/FastAPI error payloads without echoing submitted values."""
 
@@ -362,13 +357,13 @@ def parse_prime_offer(payload: dict[str, Any]) -> ComputeOffer:
         provider_name=str(payload.get("provider") or ""),
         gpu_type=str(payload.get("gpuType") or ""),
         gpu_count=int(payload.get("gpuCount") or 0),
-        gpu_memory_gb=_optional_float(payload.get("gpuMemory")),
+        gpu_memory_gb=optional_float(payload.get("gpuMemory")),
         region=str(payload.get("region")) if payload.get("region") else None,
         data_center=str(payload.get("dataCenter")) if payload.get("dataCenter") else None,
         country=str(payload.get("country")) if payload.get("country") else None,
         socket=str(payload.get("socket")) if payload.get("socket") else None,
         security=str(payload.get("security")) if payload.get("security") else None,
-        price_per_hour=_optional_float(price),
+        price_per_hour=optional_float(price),
         is_spot=bool(payload.get("isSpot", False)),
         is_variable_price=bool(prices.get("isVariable", False)),
         stock_status=str(payload.get("stockStatus")) if payload.get("stockStatus") else None,
@@ -425,19 +420,33 @@ def is_prime_gpu_offer(offer: ComputeOffer) -> bool:
     )
 
 
+_UNAVAILABLE_STOCK = frozenset({
+    "unavailable",
+    "out_of_stock",
+    "outofstock",
+    "sold_out",
+    "soldout",
+    "not_available",
+    "notavailable",
+})
+_AVAILABLE_STOCK = frozenset({"available", "in_stock", "instock"})
+
+
+def prime_stock_availability(stock_status: str | None) -> QuoteAvailability:
+    """Map a Prime stock status string onto a normalized availability state."""
+
+    normalized = re.sub(r"[^a-z0-9]+", "_", (stock_status or "").casefold()).strip("_")
+    if normalized in _UNAVAILABLE_STOCK:
+        return QuoteAvailability.UNAVAILABLE
+    if normalized in _AVAILABLE_STOCK:
+        return QuoteAvailability.AVAILABLE
+    return QuoteAvailability.UNKNOWN
+
+
 def _is_prime_offer_unavailable(stock_status: str | None) -> bool:
     """Return whether Prime marks an offer as unavailable under a known spelling."""
 
-    normalized = re.sub(r"[^a-z0-9]+", "_", (stock_status or "").casefold()).strip("_")
-    return normalized in {
-        "unavailable",
-        "out_of_stock",
-        "outofstock",
-        "sold_out",
-        "soldout",
-        "not_available",
-        "notavailable",
-    }
+    return prime_stock_availability(stock_status) is QuoteAvailability.UNAVAILABLE
 
 
 def supports_prime_image(offer: ComputeOffer, image: str) -> bool:
@@ -791,7 +800,7 @@ class PrimeBackend:
                         country=str(item.get("country") or ""),
                         region=str(item.get("region") or ""),
                         stock_status=str(item.get("stockStatus") or ""),
-                        price_per_gb_hour=_optional_float(spec.get("pricePerUnit")),
+                        price_per_gb_hour=optional_float(spec.get("pricePerUnit")),
                         minimum_size_gb=_optional_int(spec.get("minCount")),
                         maximum_size_gb=_optional_int(spec.get("maxCount")),
                         raw=item,
@@ -1685,7 +1694,7 @@ class PrimeBackend:
             value,
             flags=re.IGNORECASE,
         )
-        value = re.sub(
+        return re.sub(
             (
                 r"((?:['\"]?(?:api_key|token|frp_token|binding_secret)['\"]?)"
                 r"\s*[=:]\s*)"
@@ -1695,7 +1704,6 @@ class PrimeBackend:
             value,
             flags=re.IGNORECASE,
         )
-        return value
 
     @staticmethod
     def _expected_model_bytes(config: DeploymentConfig) -> int:

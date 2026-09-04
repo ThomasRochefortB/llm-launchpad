@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from rich.markup import escape
+
+from ..format import format_free_tier, format_gib, format_money
 from textual import events
 from textual.actions import SkipAction
 from textual.app import ComposeResult
@@ -40,24 +42,6 @@ def _human_bytes(size_bytes: int) -> str:
             return f"{size:.1f} {unit}"
         size /= 1024.0
     return f"{size_bytes} B"
-
-
-def _format_money(value: float) -> str:
-    return f"${value:,.2f}"
-
-
-def _format_gib(value: float) -> str:
-    if value >= 100:
-        return f"{value:,.0f} GiB"
-    if value >= 10:
-        return f"{value:,.1f} GiB"
-    return f"{value:,.2f} GiB"
-
-
-def _format_free_tier(value_gib: float) -> str:
-    if value_gib > 0 and value_gib % 1024 == 0:
-        return f"{value_gib / 1024:,.0f} TiB"
-    return _format_gib(value_gib)
 
 
 def _model_label(row: StoredModelInfo) -> str:
@@ -130,7 +114,7 @@ _STORAGE_COLUMNS = (
     AdaptiveColumn.visible(
         "cost",
         "list $/mo",
-        lambda row: f"{_format_money(gross_monthly_storage_cost_usd(row.size_bytes))}/mo",
+        lambda row: f"{format_money(gross_monthly_storage_cost_usd(row.size_bytes))}/mo",
         _WIDE,
         _STANDARD,
         _COMPACT,
@@ -140,7 +124,7 @@ _STORAGE_COLUMNS = (
         "details",
         lambda row: (
             f"{row.backend.value} · {_human_bytes(row.size_bytes)} · "
-            f"{_format_money(gross_monthly_storage_cost_usd(row.size_bytes))}/mo"
+            f"{format_money(gross_monthly_storage_cost_usd(row.size_bytes))}/mo"
         ),
         _MINIMAL,
     ),
@@ -308,9 +292,9 @@ class StorageScreen(CopyEnabledScreen):
         self.query_one("#storage-status", Static).update(
             "[green]Storage refreshed.[/green] "
             f"{_human_bytes(estimate.total_size_bytes)} cached; "
-            f"{_format_gib(estimate.billable_gib_month)} billable after "
-            f"{_format_free_tier(MODAL_VOLUME_FREE_TIER_GIB_MONTH)} free; "
-            f"est. {_format_money(estimate.estimated_monthly_cost_usd)}/mo. "
+            f"{format_gib(estimate.billable_gib_month)} billable after "
+            f"{format_free_tier(MODAL_VOLUME_FREE_TIER_GIB_MONTH)} free; "
+            f"est. {format_money(estimate.estimated_monthly_cost_usd)}/mo. "
             "Use selected row or type a model to pre-download."
         )
         should_refocus = self._initial_focus_pending

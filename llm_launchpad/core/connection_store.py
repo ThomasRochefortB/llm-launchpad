@@ -11,6 +11,7 @@ from typing import Any
 from ..protocol.enums import BackendType, ComputeProvider
 from ..protocol.models import DeploymentConfig, EndpointInfo
 from .config import SETTINGS_DIR
+from .coerce import positive_int
 from .opencode import build_openai_connection_payload
 from .llamacpp_planner import runtime_attestation_from_dict, runtime_attestation_to_dict
 from .reasoning_profiles import (
@@ -110,10 +111,10 @@ def merge_connections(
         row.endpoint_api_key = row.endpoint_api_key or str(cached.get("api_key") or "") or None
         row.app_id = row.app_id or str(cached.get("resource_id") or "")
         row.instance_name = row.instance_name or str(cached.get("instance_name") or "") or None
-        row.max_context_tokens = row.max_context_tokens or _positive_int(
+        row.max_context_tokens = row.max_context_tokens or positive_int(
             cached.get("max_context_tokens")
         )
-        row.max_output_tokens = row.max_output_tokens or _positive_int(
+        row.max_output_tokens = row.max_output_tokens or positive_int(
             cached.get("max_output_tokens")
         )
         row.reasoning = row.reasoning or reasoning_capabilities_from_dict(
@@ -174,8 +175,8 @@ def rows_from_connection_cache(
                     else ComputeProvider.MODAL
                 ),
                 endpoint_api_key=str(entry.get("api_key") or "") or None,
-                max_context_tokens=_positive_int(entry.get("max_context_tokens")),
-                max_output_tokens=_positive_int(entry.get("max_output_tokens")),
+                max_context_tokens=positive_int(entry.get("max_context_tokens")),
+                max_output_tokens=positive_int(entry.get("max_output_tokens")),
                 reasoning=reasoning_capabilities_from_dict(entry.get("reasoning")),
                 runtime_attestation=runtime_attestation_from_dict(
                     entry.get("runtime_attestation")
@@ -341,22 +342,6 @@ def _unique_storage_revision(rows: list[dict[str, Any]]) -> dict[str, Any] | Non
     if len(revisions) > 1:
         return None
     return rows[0]
-
-
-def _positive_int(value: object) -> int | None:
-    """Parse a positive integer from untrusted persisted connection metadata."""
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        parsed = value
-    elif isinstance(value, str):
-        try:
-            parsed = int(value)
-        except ValueError:
-            return None
-    else:
-        return None
-    return parsed if parsed > 0 else None
 
 
 def remove_connection(app_name: str, path: Path = CONNECTIONS_PATH) -> None:

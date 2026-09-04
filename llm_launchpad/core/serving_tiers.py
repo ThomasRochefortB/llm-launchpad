@@ -13,11 +13,12 @@ option exist without reopening the silent-degradation question.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from collections.abc import Sequence
 
 from ..protocol.enums import ServingObjective
 from ..protocol.models import InferencePlan
 from .llamacpp_planner import assessment_score
+from .quick_deploy import plan_is_eligible
 
 # Below this, two options are the same on that axis and saying "1.0x" would be
 # noise. A flank that gains nothing is still shown -- with the gain named as
@@ -130,15 +131,6 @@ def _efficiency(plan: InferencePlan) -> float:
     return _aggregate_tps(plan) / price
 
 
-def _is_eligible(plan: InferencePlan) -> bool:
-    assessment = plan.assessment
-    if assessment is None:
-        # Legacy plans carry no assessment; they are offered but never ranked
-        # as though their performance were known.
-        return True
-    return assessment.fits and assessment.gpu_resident
-
-
 def _describe_tradeoff(
     tier_plan: InferencePlan,
     baseline: InferencePlan,
@@ -192,7 +184,7 @@ def serving_tiers(
     which is to make the recommended choice checkable rather than trusted.
     """
 
-    eligible = [plan for plan in plans if _is_eligible(plan)]
+    eligible = [plan for plan in plans if plan_is_eligible(plan)]
     if not eligible:
         return ()
 

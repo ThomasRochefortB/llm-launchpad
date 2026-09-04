@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import hashlib
 import shlex
-from typing import Sequence
+from collections.abc import Sequence
 
 from ..protocol.enums import BackendType, ComputeProvider, ServingObjective
 from ..protocol.models import (

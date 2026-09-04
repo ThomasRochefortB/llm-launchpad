@@ -90,6 +90,18 @@ class QuoteAvailability(str, Enum):
     UNAVAILABLE = "unavailable"
     UNKNOWN = "unknown"
 
+    @property
+    def sort_rank(self) -> int:
+        """Rank for ordering quotes best-first: available, unknown, unavailable."""
+        return _QUOTE_AVAILABILITY_RANK[self]
+
+
+_QUOTE_AVAILABILITY_RANK = {
+    QuoteAvailability.AVAILABLE: 0,
+    QuoteAvailability.UNKNOWN: 1,
+    QuoteAvailability.UNAVAILABLE: 2,
+}
+
 
 class DeploymentState(str, Enum):
     """Lifecycle states for a deployment operation."""

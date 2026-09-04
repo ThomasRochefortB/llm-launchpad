@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Sequence
+from collections.abc import Sequence
 
+from rich.markup import escape
+
+from ..format import clip
 from textual.actions import SkipAction
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -88,19 +91,6 @@ class _InfraRow:
     alternative_plans: tuple[InferencePlan, ...]
 
 
-def _escape_markup(value: str) -> str:
-    return (value or "").replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
-
-
-def _clip(value: str, width: int) -> str:
-    text = (value or "").strip()
-    if len(text) <= width:
-        return text
-    if width <= 3:
-        return text[:width]
-    return f"{text[:width - 3]}..."
-
-
 def _format_price(value: float | None, *, estimate: bool = False) -> str:
     if value is None:
         return "price n/a"
@@ -133,8 +123,8 @@ def _quant_markup(profile: QuickDeployProfile) -> str:
     if not quant:
         return ""
     if quant.casefold().startswith("q2"):
-        return f"[bold #7bf168]{_escape_markup(quant)}[/]"
-    return f"[dim]{_escape_markup(quant)}[/dim]"
+        return f"[bold #7bf168]{escape(quant)}[/]"
+    return f"[dim]{escape(quant)}[/dim]"
 
 
 def _format_aa_index(value: float) -> str:
@@ -158,7 +148,7 @@ def _availability_label(configuration: ComputeConfiguration) -> str:
 
 
 def _subtitle(info: QuickDeployCatalogInfo) -> str:
-    return f"Pick a model · {_escape_markup(info.source_label)}"
+    return f"Pick a model · {escape(info.source_label)}"
 
 
 def _model_cheapest_price(
@@ -214,16 +204,16 @@ def _model_option(
     metrics = f"{size} · " if size else ""
     if width_mode == WidthMode.MINIMAL:
         return (
-            f"  {_escape_markup(_clip(model.display_name, 25))}  "
+            f"  {escape(clip(model.display_name, 25))}  "
             f"[dim]{cost}[/dim]"
         )
     if width_mode == WidthMode.COMPACT:
         return (
-            f"  {_escape_markup(_clip(model.display_name, 28)):<28} "
+            f"  {escape(clip(model.display_name, 28)):<28} "
             f"[dim]{score} · {cost}[/dim]"
         )
     return (
-        f"  {_escape_markup(_clip(model.display_name, 34)):<34} "
+        f"  {escape(clip(model.display_name, 34)):<34} "
         f"[dim]{metrics}{score} · from {cost}[/dim]"
     )
 
@@ -263,8 +253,8 @@ def _model_detail(model: QuickDeployModel) -> str:
         else "unranked"
     )
     return (
-        f"[bold]{_escape_markup(model.display_name)}[/bold]  "
-        f"{_escape_markup(format_context_length(model.max_context_tokens))}\n"
+        f"[bold]{escape(model.display_name)}[/bold]  "
+        f"{escape(format_context_length(model.max_context_tokens))}\n"
         f"[dim]{score} · {_quant_options_label(model)} · "
         f"pick one to see live infrastructure[/dim]"
     )
@@ -346,16 +336,16 @@ def _tier_option(
     speed_text = f"~{speed:.0f} tok/s" if speed > 0 else "speed n/a"
     note = tier.tradeoff or ("recommended" if tier.is_recommended else "")
     if width_mode == WidthMode.MINIMAL:
-        return f" {marker} {_escape_markup(tier.label):<9} [dim]{price}[/dim]"
+        return f" {marker} {escape(tier.label):<9} [dim]{price}[/dim]"
     if width_mode == WidthMode.COMPACT:
         return (
-            f" {marker} {_escape_markup(tier.label):<9} "
+            f" {marker} {escape(tier.label):<9} "
             f"[dim]{price} · {speed_text}[/dim]"
         )
     return (
-        f" {marker} {_escape_markup(tier.label):<10} "
+        f" {marker} {escape(tier.label):<10} "
         f"{price:<12} {speed_text:<14} "
-        f"[dim]{_escape_markup(note)}[/dim]"
+        f"[dim]{escape(note)}[/dim]"
     )
 
 
@@ -368,19 +358,19 @@ def _infra_option(row: _InfraRow, width_mode: WidthMode = WidthMode.WIDE) -> str
     if len(row.alternative_plans) > 1:
         extra = f" · {len(row.alternative_plans)} placements"
     quant = _quant_markup(row.profile)
-    provider = _escape_markup(quote.provider.display_name)
+    provider = escape(quote.provider.display_name)
     if width_mode == WidthMode.MINIMAL:
         return (
-            f"  {_escape_markup(_clip(gpu, 14))} x{quote.gpu_count} "
+            f"  {escape(clip(gpu, 14))} x{quote.gpu_count} "
             f"{quant} [dim]{provider} {price}[/dim]"
         )
     if width_mode == WidthMode.COMPACT:
         return (
-            f"  {_escape_markup(_clip(gpu, 16)):<16} x{quote.gpu_count:<2} "
+            f"  {escape(clip(gpu, 16)):<16} x{quote.gpu_count:<2} "
             f"{quant} {provider} [dim]{price}[/dim]"
         )
     return (
-        f"  {_escape_markup(gpu):<20} x{quote.gpu_count:<2} "
+        f"  {escape(gpu):<20} x{quote.gpu_count:<2} "
         f"{quant} {provider} "
         f"{_availability_label(row.configuration)}  "
         f"[dim]{price} · {monthly}{extra}[/dim]"
@@ -421,8 +411,8 @@ def _infra_detail(row: _InfraRow) -> str:
                 f"~{aggregate:.0f} tok/s aggregate · {evidence}[/dim]"
             )
     return (
-        f"[bold]{_escape_markup(gpu)}[/bold] x{quote.gpu_count}  "
-        f"{_escape_markup(quote.provider.display_name)} · {_quant_markup(row.profile)}\n"
+        f"[bold]{escape(gpu)}[/bold] x{quote.gpu_count}  "
+        f"{escape(quote.provider.display_name)} · {_quant_markup(row.profile)}\n"
         f"[dim]{price} · {monthly} · {region} · {_availability_label(row.configuration)}[/dim]"
         f"{performance}"
     )
@@ -529,7 +519,7 @@ def _tier_markup(profile: QuickDeployProfile) -> str:
         return "[#7bf168]$$[/]"
     if label == "$$$":
         return "[yellow]$$$[/yellow]"
-    return f"[dim]{_escape_markup(label)}[/dim]"
+    return f"[dim]{escape(label)}[/dim]"
 
 
 def _compact_gpu_shape(profile: QuickDeployProfile) -> str:
@@ -546,7 +536,7 @@ def _fallback_option(profile: QuickDeployProfile) -> str:
     shape = _compact_gpu_shape(profile)
     cost = format_hourly_cost(profile.approx_cost_per_hour_usd)
     return (
-        f"  {_escape_markup(_clip(profile.display_name, 34)):<34} "
+        f"  {escape(clip(profile.display_name, 34)):<34} "
         f"{_tier_markup(profile)} {_quant_markup(profile)} "
         f"[dim]{shape} · {cost}[/dim]"
     )
@@ -556,7 +546,7 @@ def _fallback_detail(profile: QuickDeployProfile) -> str:
     shape = _compact_gpu_shape(profile)
     cost = format_hourly_cost(profile.approx_cost_per_hour_usd)
     return (
-        f"[bold]{_escape_markup(profile.display_name)}[/bold]  {_quant_markup(profile)}\n"
+        f"[bold]{escape(profile.display_name)}[/bold]  {_quant_markup(profile)}\n"
         f"[dim]{shape} · {cost} · catalog estimate (availability unavailable)[/dim]"
     )
 
@@ -698,7 +688,7 @@ class FastDeployScreen(CopyEnabledScreen):
                 "[yellow]Live model catalog unavailable.[/yellow]\n"
                 "[dim]Enter opens Advanced deploy for manual setup; "
                 "press Esc to go back.[/dim]\n"
-                f"[dim]{_escape_markup(_clip(info.error, 140))}[/dim]"
+                f"[dim]{escape(clip(info.error, 140))}[/dim]"
             )
         else:
             self._catalog_building = True
@@ -789,7 +779,7 @@ class FastDeployScreen(CopyEnabledScreen):
         self.query_one("#fast-deploy-model-search", Input).add_class("hidden")
         self.query_one("#fast-deploy-title", Static).update(
             f"[bold #7bf168]Deploy[/]  "
-            f"[dim]{_escape_markup(model.display_name)} · Step 2: Pick infrastructure[/dim]"
+            f"[dim]{escape(model.display_name)} · Step 2: Pick infrastructure[/dim]"
         )
         self.query_one("#fast-deploy-status", Static).update(
             "[dim]Checking live infrastructure across connected sources...[/dim]"
@@ -961,7 +951,7 @@ class FastDeployScreen(CopyEnabledScreen):
             option_list.highlighted = 0
             self._update_infra_detail(rows[0])
         self.query_one("#fast-deploy-subtitle", Static).update(
-            f"Pick infrastructure · {_escape_markup(self._catalog_info.source_label)}"
+            f"Pick infrastructure · {escape(self._catalog_info.source_label)}"
         )
         if tiers:
             status = (
@@ -976,7 +966,7 @@ class FastDeployScreen(CopyEnabledScreen):
                 "[dim]· best full-context throughput first · press a for tiers[/dim]"
             )
         if self._gpu_filter not in {"", "any"}:
-            status += f" [dim]· GPU {_escape_markup(self._gpu_filter)}[/dim]"
+            status += f" [dim]· GPU {escape(self._gpu_filter)}[/dim]"
         if excluded:
             # A shorter list with no explanation reads as missing hardware
             # rather than as hardware that would not have worked.
@@ -986,7 +976,7 @@ class FastDeployScreen(CopyEnabledScreen):
                 "cannot hold the full context on GPU.[/dim]"
             )
         if snapshot.errors:
-            status += "\n[yellow]Partial results:[/yellow] " + _escape_markup(
+            status += "\n[yellow]Partial results:[/yellow] " + escape(
                 "; ".join(snapshot.errors)
             )
         self.query_one("#fast-deploy-status", Static).update(status)
@@ -996,14 +986,14 @@ class FastDeployScreen(CopyEnabledScreen):
         self._phase = "infra"
         self._availability_inflight = False
         self._infra_rows = {}
-        gpu = _escape_markup(self._gpu_filter)
+        gpu = escape(self._gpu_filter)
         option_list = self.query_one("#fast-deploy-list", OptionList)
         option_list.set_options(
             [Option(f"  No placements on {gpu}", disabled=True)]
         )
         self.query_one("#fast-deploy-detail", Static).update("")
         self.query_one("#fast-deploy-subtitle", Static).update(
-            f"Pick infrastructure · {_escape_markup(self._catalog_info.source_label)}"
+            f"Pick infrastructure · {escape(self._catalog_info.source_label)}"
         )
         self.query_one("#fast-deploy-status", Static).update(
             f"[yellow]No live placements on {gpu}.[/yellow] "
@@ -1028,14 +1018,14 @@ class FastDeployScreen(CopyEnabledScreen):
                 "[dim]Catalog fallback estimates require Modal.[/dim]"
             )
             if reason:
-                status += f"\n[dim]{_escape_markup(_clip(reason, 120))}[/dim]"
+                status += f"\n[dim]{escape(clip(reason, 120))}[/dim]"
             self.query_one("#fast-deploy-status", Static).update(status)
             return
         self._fallback_profiles = {profile.id: profile for profile in profiles}
         option_list = self.query_one("#fast-deploy-list", OptionList)
         options = [Option(_fallback_option(profile), id=profile.id) for profile in profiles]
         self.query_one("#fast-deploy-subtitle", Static).update(
-            f"Catalog estimates · {_escape_markup(self._catalog_info.source_label)}"
+            f"Catalog estimates · {escape(self._catalog_info.source_label)}"
         )
         if not options:
             options = [Option("  No catalog profiles for this model", disabled=True)]
@@ -1045,7 +1035,7 @@ class FastDeployScreen(CopyEnabledScreen):
             self._update_fallback_detail(profiles[0])
         status = "[yellow]Live availability unavailable — showing catalog estimates.[/yellow]"
         if reason:
-            status += f"\n[dim]{_escape_markup(_clip(reason, 120))}[/dim]"
+            status += f"\n[dim]{escape(clip(reason, 120))}[/dim]"
         self.query_one("#fast-deploy-status", Static).update(status)
 
     def _highlighted_model_id(self) -> str | None:
@@ -1136,7 +1126,7 @@ class FastDeployScreen(CopyEnabledScreen):
             if self._gpu_filter != "any":
                 options = [
                     Option(
-                        f"  No catalog models fit {_escape_markup(self._gpu_filter)}",
+                        f"  No catalog models fit {escape(self._gpu_filter)}",
                         disabled=True,
                     )
                 ]
@@ -1158,12 +1148,12 @@ class FastDeployScreen(CopyEnabledScreen):
         plural = "s" if len(visible) != 1 else ""
         filter_note = ""
         if self._gpu_filter != "any":
-            filter_note = f" · GPU {_escape_markup(self._gpu_filter)}"
+            filter_note = f" · GPU {escape(self._gpu_filter)}"
         query = self._model_search.strip()
-        search_note = f" · search: {_escape_markup(query)}" if query else ""
+        search_note = f" · search: {escape(query)}" if query else ""
         self.query_one("#fast-deploy-status", Static).update(
             f"[dim]{len(visible)} model{plural}{filter_note}{search_note} · "
-            f"{_escape_markup(self._catalog_info.source_label)}[/dim]"
+            f"{escape(self._catalog_info.source_label)}[/dim]"
         )
         if getattr(self.focused, "id", "") != "fast-deploy-gpu-filter":
             option_list.focus()

@@ -17,12 +17,12 @@ def _install_option_list_compatibility() -> None:
     if not hasattr(OptionList, "set_options"):
 
         def set_options(self: object, options: list[object]) -> None:
-            clear_options = getattr(self, "clear_options")
-            add_options = getattr(self, "add_options")
+            clear_options = self.clear_options
+            add_options = self.add_options
             clear_options()
             add_options(options)
 
-        setattr(OptionList, "set_options", set_options)
+        OptionList.set_options = set_options
 
     if not hasattr(OptionList, "highlighted_option"):
 
@@ -32,11 +32,11 @@ def _install_option_list_compatibility() -> None:
             if highlighted is None:
                 return None
             try:
-                return getattr(self, "get_option_at_index")(highlighted)
+                return self.get_option_at_index(highlighted)
             except Exception:
                 return None
 
-        setattr(OptionList, "highlighted_option", highlighted_option)
+        OptionList.highlighted_option = highlighted_option
 
     if not hasattr(Static, "content"):
 
@@ -44,7 +44,7 @@ def _install_option_list_compatibility() -> None:
         def content(self: object) -> object:
             return getattr(self, "_content", "")
 
-        setattr(Static, "content", content)
+        Static.content = content
 
 
 _install_option_list_compatibility()

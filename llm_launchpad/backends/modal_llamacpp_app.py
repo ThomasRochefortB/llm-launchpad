@@ -1,6 +1,7 @@
 from contextlib import contextmanager
 from pathlib import Path
-from typing import List, Optional, Dict, Any, Callable, Iterator
+from typing import Any
+from collections.abc import Callable, Iterator
 import json
 import os
 import time
@@ -81,14 +82,14 @@ def _read_bool_env(name: str, default: bool) -> bool:
     return raw.lower() in {"1", "true", "yes", "on"}
 
 
-def _read_optional_bool_env(name: str) -> Optional[bool]:
+def _read_optional_bool_env(name: str) -> bool | None:
     raw = os.environ.get(name, "").strip()
     if not raw:
         return None
     return raw.lower() in {"1", "true", "yes", "on"}
 
 
-def _env_value_is_true(value: Optional[str]) -> bool:
+def _env_value_is_true(value: str | None) -> bool:
     raw = (value or "").strip()
     if not raw:
         return False
@@ -96,15 +97,12 @@ def _env_value_is_true(value: Optional[str]) -> bool:
 
 
 def _default_llamacpp_served_model_name(
-    repo_id: Optional[str],
-    quant: Optional[str] = None,
+    repo_id: str | None,
+    quant: str | None = None,
     default: str = "default",
 ) -> str:
     candidate = (repo_id or "").strip()
-    if not candidate:
-        alias = default
-    else:
-        alias = candidate.rsplit("/", 1)[-1].strip() or default
+    alias = default if not candidate else candidate.rsplit("/", 1)[-1].strip() or default
     quant_text = (quant or "").strip()
     if not quant_text:
         return alias
@@ -113,7 +111,7 @@ def _default_llamacpp_served_model_name(
     return f"{alias}-{quant_text}"
 
 
-def _server_args_define_alias(args: Optional[List[str]]) -> bool:
+def _server_args_define_alias(args: list[str] | None) -> bool:
     if not args:
         return False
     return any(token in {"--alias", "-a"} for token in args)
@@ -170,7 +168,7 @@ _GGUF_SPLIT_RE = re.compile(r"-(\d+)-of-(\d+)\.gguf$", flags=re.IGNORECASE)
 # Note: Import presets lazily inside the local entrypoint to avoid container import issues.
 
 
-def _download_image_env() -> Dict[str, str]:
+def _download_image_env() -> dict[str, str]:
     env = {
         "HF_HUB_ETAG_TIMEOUT": "30",
         "HF_HUB_DOWNLOAD_TIMEOUT": "120",
@@ -182,7 +180,7 @@ def _download_image_env() -> Dict[str, str]:
     return env
 
 
-def _load_config() -> Dict[str, Any]:
+def _load_config() -> dict[str, Any]:
     """Load configuration from the volume, with sane defaults."""
     if Path(CONFIG_PATH).exists():
         with open(CONFIG_PATH) as f:
@@ -207,7 +205,7 @@ def _hub_model_dir(repo_id: str) -> Path:
     return HF_HUB_DIR / f"models--{_hub_repo_slug(repo_id)}"
 
 
-def _read_hub_ref(model_dir: Path, revision: Optional[str]) -> Optional[str]:
+def _read_hub_ref(model_dir: Path, revision: str | None) -> str | None:
     ref_name = (revision or "").strip() or "main"
     ref_path = model_dir / "refs" / ref_name
     if not ref_path.exists() or not ref_path.is_file():
@@ -219,7 +217,7 @@ def _read_hub_ref(model_dir: Path, revision: Optional[str]) -> Optional[str]:
     return value or None
 
 
-def _resolve_hub_snapshot_dir(repo_id: str, revision: Optional[str]) -> Optional[Path]:
+def _resolve_hub_snapshot_dir(repo_id: str, revision: str | None) -> Path | None:
     model_dir = _hub_model_dir(repo_id)
     snapshots_root = model_dir / "snapshots"
     if not snapshots_root.exists() or not snapshots_root.is_dir():
@@ -255,7 +253,7 @@ def _resolve_hub_snapshot_dir(repo_id: str, revision: Optional[str]) -> Optional
 
 def _fetch_expected_gguf_sizes(
     repo_id: str,
-    revision: Optional[str],
+    revision: str | None,
     allow_patterns: list[str],
 ) -> dict[str, int]:
     from huggingface_hub import HfApi
@@ -279,7 +277,7 @@ def _fetch_expected_gguf_sizes(
 
 def _validate_cached_gguf_matches(
     repo_id: str,
-    revision: Optional[str],
+    revision: str | None,
     allow_patterns: list[str],
 ) -> tuple[list[str], list[str]]:
     snapshot_dir = _resolve_hub_snapshot_dir(repo_id, revision)
@@ -327,7 +325,7 @@ def _validate_cached_gguf_matches(
 
 def _estimate_completed_expected_gguf_size(
     repo_id: str,
-    revision: Optional[str],
+    revision: str | None,
     expected_sizes: dict[str, int],
 ) -> tuple[int, int]:
     snapshot_dir = _resolve_hub_snapshot_dir(repo_id, revision)
@@ -433,7 +431,7 @@ def _matches_any_pattern(name: str, patterns: list[str]) -> bool:
     return any(fnmatch.fnmatch(folded, pat.casefold()) for pat in patterns)
 
 
-def _gguf_allow_patterns(quant: Optional[str]) -> list[str]:
+def _gguf_allow_patterns(quant: str | None) -> list[str]:
     """Build HF allow_patterns that tolerate common case variants."""
     if not quant:
         return ["*.gguf", "*.GGUF"]
@@ -452,7 +450,7 @@ def _gguf_allow_patterns(quant: Optional[str]) -> list[str]:
     return patterns
 
 
-def _snapshot_gguf_candidates(snapshot_dir: Path, quant: Optional[str]) -> list[Path]:
+def _snapshot_gguf_candidates(snapshot_dir: Path, quant: str | None) -> list[Path]:
     quant_folded = quant.casefold() if quant else None
     candidates: list[Path] = []
     for path in snapshot_dir.glob("**/*"):
@@ -469,7 +467,7 @@ def _snapshot_gguf_candidates(snapshot_dir: Path, quant: Optional[str]) -> list[
 def _raise_missing_gguf_match(
     repo_id: str,
     allow_patterns: list[str],
-    revision: Optional[str],
+    revision: str | None,
 ) -> None:
     patterns = ", ".join(repr(pat) for pat in allow_patterns) if allow_patterns else "'*.gguf'"
     revision_text = f", revision={revision}" if revision else ""
@@ -482,8 +480,8 @@ def _raise_missing_gguf_match(
 
 def _resolve_or_download_model_entrypoint(
     repo_id: str,
-    revision: Optional[str],
-    quant: Optional[str],
+    revision: str | None,
+    quant: str | None,
 ) -> Path:
     """Resolve a cached GGUF path first; download only on cache miss."""
     try:
@@ -504,14 +502,14 @@ def _resolve_or_download_model_entrypoint(
     return _resolve_model_entrypoint(repo_id, revision, quant)
 
 
-def _extract_quant(path: str) -> Optional[str]:
+def _extract_quant(path: str) -> str | None:
     match = _GGUF_QUANT_RE.search(path.upper())
     if match:
         return match.group(1).upper()
     return None
 
 
-def _gguf_split_index(path: Path) -> Optional[int]:
+def _gguf_split_index(path: Path) -> int | None:
     match = _GGUF_SPLIT_RE.search(path.name)
     if not match:
         return None
@@ -547,7 +545,7 @@ def _pick_preferred_gguf_entrypoint(candidates: list[Path]) -> Path:
     return _largest(split_nonfirst)
 
 
-def _download_lease_key(repo_id: str, revision: Optional[str]) -> str:
+def _download_lease_key(repo_id: str, revision: str | None) -> str:
     revision_text = (revision or "").strip() or "main"
     return f"hf-download::{_hub_repo_slug(repo_id)}::{revision_text}"
 
@@ -555,7 +553,7 @@ def _download_lease_key(repo_id: str, revision: Optional[str]) -> str:
 def _download_lease_payload(
     owner_id: str,
     repo_id: str,
-    revision: Optional[str],
+    revision: str | None,
     allow_patterns: list[str],
     timestamp: float,
 ) -> dict[str, Any]:
@@ -573,7 +571,7 @@ def _refresh_download_lease(
     lease_key: str,
     owner_id: str,
     repo_id: str,
-    revision: Optional[str],
+    revision: str | None,
     allow_patterns: list[str],
 ) -> None:
     current = download_leases.get(lease_key, None)
@@ -602,7 +600,7 @@ def _release_download_lease(lease_key: str, owner_id: str) -> None:
 @contextmanager
 def _acquire_download_lease(
     repo_id: str,
-    revision: Optional[str],
+    revision: str | None,
     allow_patterns: list[str],
 ) -> Iterator[Callable[[], None]]:
     lease_key = _download_lease_key(repo_id, revision)
@@ -691,9 +689,9 @@ download_image = (
 )
 def download_model(
     repo_id: str = REPO_ID,
-    allow_patterns: Optional[List[str]] = None,
-    revision: Optional[str] = None,
-) -> List[str]:
+    allow_patterns: list[str] | None = None,
+    revision: str | None = None,
+) -> list[str]:
     """Download model files from Hugging Face into a persistent Modal Volume.
 
     Returns a list of relative paths of GGUF files matching the quantization.
@@ -703,9 +701,9 @@ def download_model(
 
 def _download_model_files(
     repo_id: str,
-    allow_patterns: Optional[List[str]],
-    revision: Optional[str],
-) -> List[str]:
+    allow_patterns: list[str] | None,
+    revision: str | None,
+) -> list[str]:
     if allow_patterns is None:
         allow_patterns = _gguf_allow_patterns(QUANT)
 
@@ -761,12 +759,12 @@ def _download_model_files(
 
 def _snapshot_download_with_keepalive(
     repo_id: str,
-    revision: Optional[str],
+    revision: str | None,
     cache_dir: str,
-    allow_patterns: List[str],
+    allow_patterns: list[str],
     max_workers: int = SNAPSHOT_MAX_WORKERS,
     force_download: bool = False,
-    heartbeat: Optional[Callable[[], None]] = None,
+    heartbeat: Callable[[], None] | None = None,
 ) -> None:
     """Run snapshot_download in a subprocess and print periodic keepalives."""
     try:
@@ -796,7 +794,7 @@ def _snapshot_download_with_keepalive(
         ")\n"
     )
 
-    def _attempt_env(*, disable_xet: bool) -> Dict[str, str]:
+    def _attempt_env(*, disable_xet: bool) -> dict[str, str]:
         env = {
             **os.environ,
             "LLM_LAUNCHPAD_SNAPSHOT_CFG": json.dumps(payload),
@@ -806,7 +804,7 @@ def _snapshot_download_with_keepalive(
             env.pop("HF_XET_HIGH_PERFORMANCE", None)
         return env
 
-    def _run_attempt(env: Dict[str, str]) -> int:
+    def _run_attempt(env: dict[str, str]) -> int:
         process = subprocess.Popen(
             [sys.executable, "-c", worker_code],
             env=env,
@@ -882,7 +880,7 @@ def _snapshot_download_with_keepalive(
 
 def _estimate_matched_snapshot_size(
     repo_id: str,
-    revision: Optional[str],
+    revision: str | None,
     allow_patterns: list[str],
 ) -> tuple[int, int]:
     """Estimate size of files matching allow_patterns in the resolved snapshot."""
@@ -932,9 +930,9 @@ def _estimate_incomplete_blob_size(repo_id: str) -> tuple[int, int]:
 )
 def predownload_model(
     repo_id: str,
-    quant: Optional[str] = None,
-    revision: Optional[str] = None,
-) -> List[str]:
+    quant: str | None = None,
+    revision: str | None = None,
+) -> list[str]:
     """Pre-download model files for storage management workflows."""
     allow_patterns = _gguf_allow_patterns(quant)
     return _download_model_files(repo_id, allow_patterns, revision)
@@ -944,9 +942,9 @@ def predownload_model(
     image=download_image,
     volumes={cache_dir: model_cache},
 )
-def list_downloaded_models() -> List[Dict[str, Any]]:
+def list_downloaded_models() -> list[dict[str, Any]]:
     """List cached llama.cpp GGUF entries from Hugging Face Hub cache layout."""
-    grouped: dict[tuple[str, Optional[str], Optional[str]], dict[str, Any]] = {}
+    grouped: dict[tuple[str, str | None, str | None], dict[str, Any]] = {}
     if HF_HUB_DIR.exists():
         for model_dir in sorted(HF_HUB_DIR.glob("models--*")):
             if not model_dir.is_dir():
@@ -1024,7 +1022,7 @@ def _resolve_llama_server_binary() -> str:
     )
 
 
-def _resolve_fit_binary() -> Optional[str]:
+def _resolve_fit_binary() -> str | None:
     """Return llama.cpp's runtime memory planner when shipped by the image."""
 
     for candidate in ("/app/llama-fit-params", "llama-fit-params"):
@@ -1036,7 +1034,7 @@ def _resolve_fit_binary() -> Optional[str]:
     return None
 
 
-def _fit_relevant_args(server_args: List[str]) -> List[str]:
+def _fit_relevant_args(server_args: list[str]) -> list[str]:
     """Keep common memory-affecting flags understood by llama-fit-params."""
 
     supported = {
@@ -1058,7 +1056,7 @@ def _fit_relevant_args(server_args: List[str]) -> List[str]:
         "-fitt",
         "--fit-target",
     }
-    result: List[str] = []
+    result: list[str] = []
     index = 0
     while index < len(server_args):
         token = server_args[index]
@@ -1073,7 +1071,7 @@ def _fit_relevant_args(server_args: List[str]) -> List[str]:
     return result
 
 
-def _llama_server_runtime_env(server_bin: str) -> tuple[dict[str, str], Optional[str]]:
+def _llama_server_runtime_env(server_bin: str) -> tuple[dict[str, str], str | None]:
     """Prepare env/cwd so official docker image shared libs resolve under Modal."""
     env = dict(os.environ)
 
@@ -1090,14 +1088,14 @@ def _llama_server_runtime_env(server_bin: str) -> tuple[dict[str, str], Optional
         ld_entries.append(existing_ld)
     env["LD_LIBRARY_PATH"] = ":".join(entry for entry in ld_entries if entry)
 
-    cwd: Optional[str] = "/app" if Path("/app").is_dir() else None
+    cwd: str | None = "/app" if Path("/app").is_dir() else None
     return env, cwd
 
 
 def _resolve_model_entrypoint(
-    repo_id: Optional[str],
-    revision: Optional[str],
-    quant: Optional[str],
+    repo_id: str | None,
+    revision: str | None,
+    quant: str | None,
 ) -> Path:
     """Pick a GGUF file from HF hub cache."""
     if repo_id:
@@ -1169,7 +1167,7 @@ def serve():
     served_model_name = str(
         cfg.get("served_model_name") or _default_llamacpp_served_model_name(model_repo_id, quant)
     ).strip() or _default_llamacpp_served_model_name(model_repo_id, quant)
-    extra_server_args: Optional[List[str]] = cfg.get("server_args")
+    extra_server_args: list[str] | None = cfg.get("server_args")
     serving_fingerprint = str(cfg.get("serving_fingerprint") or "").strip()
     host = str(cfg.get("host", "0.0.0.0"))
     port = int(cfg.get("port", 8080))
@@ -1267,7 +1265,7 @@ def serve():
     image=download_image,
     volumes={cache_dir: model_cache},
 )
-def save_config_remote(config: Dict[str, Any]) -> None:
+def save_config_remote(config: dict[str, Any]) -> None:
     """Persist configuration inside the Modal Volume so web server can read it.
 
     This avoids attempting to write to /root locally when running the local entrypoint.
@@ -1281,15 +1279,15 @@ def save_config_remote(config: Dict[str, Any]) -> None:
 @app.local_entrypoint()
 def main(
     preload: bool = True,
-    preset: Optional[str] = None,
-    repo_id: Optional[str] = None,
-    quant: Optional[str] = None,
-    revision: Optional[str] = None,
-    server_args: Optional[str] = None,
+    preset: str | None = None,
+    repo_id: str | None = None,
+    quant: str | None = None,
+    revision: str | None = None,
+    server_args: str | None = None,
     host: str = "0.0.0.0",
     port: int = 8080,
-    n_gpu_layers: Optional[int] = None,
-    serving_fingerprint: Optional[str] = None,
+    n_gpu_layers: int | None = None,
+    serving_fingerprint: str | None = None,
     deploy: bool = False,
 ):
     """Configure, optionally preload weights, and optionally deploy the server.
@@ -1303,7 +1301,7 @@ def main(
     from llm_launchpad.presets import PRESETS
 
     # Merge preset with explicit arguments
-    cfg: Dict[str, Any] = {}
+    cfg: dict[str, Any] = {}
     if preset:
         if preset not in PRESETS:
             print(f"⚠️ Unknown preset '{preset}'. Available: {', '.join(PRESETS.keys())}")

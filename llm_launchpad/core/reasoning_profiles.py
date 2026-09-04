@@ -633,7 +633,7 @@ def _parse_repository_reasoning(
     )
     code_sources = tuple(
         parsed
-        for source, parsed in zip(inspection.sources, parsed_sources)
+        for source, parsed in zip(inspection.sources, parsed_sources, strict=False)
         if source.path.casefold().rsplit("/", 1)[-1] not in {"readme.md", "readme.txt"}
         and (parsed.efforts or parsed.default_effort)
     )

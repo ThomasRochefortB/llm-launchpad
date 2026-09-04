@@ -3,8 +3,10 @@ from __future__ import annotations
 import unittest
 from unittest.mock import Mock, patch
 
+from rich.markup import render as render_markup
+
 from llm_launchpad.core.modal_auth import ModalAuthStatus
-from llm_launchpad.core.quick_deploy_refresh import ArtificialAnalysisAuthStatus
+from llm_launchpad.core.artificial_analysis import ArtificialAnalysisAuthStatus
 from llm_launchpad.protocol.enums import BackendType
 from llm_launchpad.protocol.models import EndpointInfo, StorageSnapshot, StoredModelInfo
 from llm_launchpad.tui.screens.main_menu import (
@@ -194,8 +196,11 @@ class MainMenuStatusRenderTests(unittest.TestCase):
         self.assertNotIn("No billed usage", rendered)
 
     def test_render_billing_load_error_escapes_rich_markup_chars(self) -> None:
-        rendered = _render_billing_load_error("Usage: modal [OPTIONS] COMMAND")
-        self.assertIn("modal \\[OPTIONS\\] COMMAND", rendered)
+        rendered = _render_billing_load_error("Usage: modal [red]COMMAND[/red]")
+        self.assertEqual(
+            str(render_markup(rendered)).splitlines()[-1],
+            "Usage: modal [red]COMMAND[/red]",
+        )
 
     def test_render_prime_billing_report_shows_balance_and_resource_totals(self) -> None:
         payload = {
@@ -230,8 +235,11 @@ class MainMenuStatusRenderTests(unittest.TestCase):
         self.assertIn("No recent billing rows.", rendered)
 
     def test_render_prime_billing_load_error_escapes_rich_markup_chars(self) -> None:
-        rendered = _render_prime_billing_load_error("denied [401]")
-        self.assertIn("denied \\[401\\]", rendered)
+        rendered = _render_prime_billing_load_error("denied [bold]401[/bold]")
+        self.assertEqual(
+            str(render_markup(rendered)).splitlines()[-1],
+            "denied [bold]401[/bold]",
+        )
 
     def test_provider_billing_body_combines_modal_and_prime_sections(self) -> None:
         body = _render_provider_billing_body(

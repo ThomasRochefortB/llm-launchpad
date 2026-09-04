@@ -334,6 +334,31 @@ def _advance_deploy_focus(screen: CopyEnabledScreen, navigation_order: tuple[str
     )
 
 
+class _OptionListArrowNavigationMixin:
+    """Arrow keys walk a screen's option lists first, then its focus order."""
+
+    OPTION_LIST_IDS: tuple[str, ...] = ()
+    NAVIGATION_ORDER: tuple[str, ...] = ()
+
+    def _navigate_option_lists(self, direction: int) -> None:
+        if move_focus_across_option_lists(self, self.OPTION_LIST_IDS, direction=direction):
+            return
+        if move_focus_across_widgets(
+            self,
+            self.NAVIGATION_ORDER,
+            direction=direction,
+            is_focusable=_is_focusable_for_arrow_navigation,
+        ):
+            return
+        raise SkipAction()
+
+    def action_navigate_option_list_down(self) -> None:
+        self._navigate_option_lists(1)
+
+    def action_navigate_option_list_up(self) -> None:
+        self._navigate_option_lists(-1)
+
+
 class _CostPreviewMixin:
     """Shared hourly cost preview behavior for custom deploy forms."""
 
@@ -400,7 +425,7 @@ class BackendSelectScreen(CopyEnabledScreen):
         self.app.pop_screen()
 
 
-class LlamaCppDeployScreen(_CostPreviewMixin, CopyEnabledScreen):
+class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyEnabledScreen):
     """llama.cpp deploy form."""
 
     BINDINGS = [
@@ -411,6 +436,7 @@ class LlamaCppDeployScreen(_CostPreviewMixin, CopyEnabledScreen):
         Binding("ctrl+s", "open_storage", "Storage", show=True),
         Binding("p", "predownload_highlighted", "Pre-download", show=True),
     ]
+    OPTION_LIST_IDS = ("llama-rank-mode", "llama-model-list", "llama-quant-list")
     NAVIGATION_ORDER = (
         "llama-rank-mode",
         "llama-model-list",
@@ -1266,43 +1292,11 @@ class LlamaCppDeployScreen(_CostPreviewMixin, CopyEnabledScreen):
     def action_pop_screen(self) -> None:
         self.app.pop_screen()
 
-    def action_navigate_option_list_down(self) -> None:
-        if move_focus_across_option_lists(
-            self,
-            ("llama-rank-mode", "llama-model-list", "llama-quant-list"),
-            direction=1,
-        ):
-            return
-        if move_focus_across_widgets(
-            self,
-            self.NAVIGATION_ORDER,
-            direction=1,
-            is_focusable=_is_focusable_for_arrow_navigation,
-        ):
-            return
-        raise SkipAction()
-
-    def action_navigate_option_list_up(self) -> None:
-        if move_focus_across_option_lists(
-            self,
-            ("llama-rank-mode", "llama-model-list", "llama-quant-list"),
-            direction=-1,
-        ):
-            return
-        if move_focus_across_widgets(
-            self,
-            self.NAVIGATION_ORDER,
-            direction=-1,
-            is_focusable=_is_focusable_for_arrow_navigation,
-        ):
-            return
-        raise SkipAction()
-
     def action_open_storage(self) -> None:
         self.app.action_push_storage(BackendType.LLAMACPP)  # type: ignore[attr-defined]
 
 
-class VllmDeployScreen(_CostPreviewMixin, CopyEnabledScreen):
+class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyEnabledScreen):
     """vLLM deploy form."""
 
     BINDINGS = [
@@ -1313,6 +1307,7 @@ class VllmDeployScreen(_CostPreviewMixin, CopyEnabledScreen):
         Binding("ctrl+s", "open_storage", "Storage", show=True),
         Binding("p", "predownload_highlighted", "Pre-download", show=True),
     ]
+    OPTION_LIST_IDS = ("vllm-rank-mode", "vllm-model-list")
     NAVIGATION_ORDER = (
         "vllm-rank-mode",
         "vllm-model-list",
@@ -2137,38 +2132,6 @@ class VllmDeployScreen(_CostPreviewMixin, CopyEnabledScreen):
 
     def action_pop_screen(self) -> None:
         self.app.pop_screen()
-
-    def action_navigate_option_list_down(self) -> None:
-        if move_focus_across_option_lists(
-            self,
-            ("vllm-rank-mode", "vllm-model-list"),
-            direction=1,
-        ):
-            return
-        if move_focus_across_widgets(
-            self,
-            self.NAVIGATION_ORDER,
-            direction=1,
-            is_focusable=_is_focusable_for_arrow_navigation,
-        ):
-            return
-        raise SkipAction()
-
-    def action_navigate_option_list_up(self) -> None:
-        if move_focus_across_option_lists(
-            self,
-            ("vllm-rank-mode", "vllm-model-list"),
-            direction=-1,
-        ):
-            return
-        if move_focus_across_widgets(
-            self,
-            self.NAVIGATION_ORDER,
-            direction=-1,
-            is_focusable=_is_focusable_for_arrow_navigation,
-        ):
-            return
-        raise SkipAction()
 
     def action_open_storage(self) -> None:
         self.app.action_push_storage(BackendType.VLLM)  # type: ignore[attr-defined]

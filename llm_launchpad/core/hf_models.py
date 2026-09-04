@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from .coerce import optional_str
 from .gguf_metadata import (
     GgufMtpCapability,
     fetch_gguf_mtp_capability,
@@ -354,9 +355,7 @@ def _extract_base_model_repo_ids(info: Any) -> list[str]:
                     "base_model_name",
                     "base_model_name_or_path",
                     "model_name_or_path",
-                }:
-                    _record(nested)
-                elif isinstance(nested, (dict, list, tuple)):
+                } or isinstance(nested, (dict, list, tuple)):
                     _record(nested)
             return
         if isinstance(value, (list, tuple)):
@@ -405,7 +404,7 @@ def _call_model_info(
         return api.model_info(timeout=_HF_REQUEST_TIMEOUT_SECONDS, **kwargs)
     except TypeError:
         if is_shutting_down():
-            raise RuntimeError("Shutdown requested")
+            raise RuntimeError("Shutdown requested") from None
         return api.model_info(**kwargs)
 
 
@@ -658,7 +657,7 @@ def _normalize_candidate(row: Any, target: ModelDiscoveryTarget = "vllm") -> Mod
     if not repo_id:
         return None
 
-    pipeline_tag = _to_optional_str(getattr(row, "pipeline_tag", None))
+    pipeline_tag = optional_str(getattr(row, "pipeline_tag", None))
     tags = getattr(row, "tags", None)
     if not _is_text_generation(pipeline_tag, tags):
         return None
@@ -849,11 +848,7 @@ def _extract_gguf_vram_by_quant(gguf_payload: Any) -> dict[str, float]:
             contextual_memory: list[float] = []
             for key, value in node.items():
                 key_text = str(key).strip().lower()
-                if _is_memory_hint(key_text):
-                    parsed = _parse_memory_to_gb(value)
-                    if parsed is not None:
-                        contextual_memory.append(parsed)
-                elif isinstance(value, str) and _contains_memory_unit(value):
+                if _is_memory_hint(key_text) or isinstance(value, str) and _contains_memory_unit(value):
                     parsed = _parse_memory_to_gb(value)
                     if parsed is not None:
                         contextual_memory.append(parsed)
@@ -1450,10 +1445,3 @@ def _to_optional_int(value: Any) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
-
-
-def _to_optional_str(value: Any) -> str | None:
-    if value is None:
-        return None
-    text = str(value).strip()
-    return text or None

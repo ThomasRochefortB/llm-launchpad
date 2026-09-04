@@ -284,24 +284,23 @@ class SelectableLog(Log):
         self.text_select_all()
 
     async def _on_click(self, event: events.Click) -> None:
-        if event.widget is self:
-            if (
-                self.allow_select
-                and self.screen.allow_select
-                and self.app.ALLOW_SELECT
-            ):
-                if event.chain == 2:
-                    # Select only the clicked line (not all text).
-                    # prevent_default() stops Textual from also calling
-                    # the parent Log._on_click which would text_select_all().
-                    line_index = int(self.scroll_y) + event.y
-                    if self._select_line(line_index):
-                        event.prevent_default()
-                        return
-                elif event.chain == 3:
-                    self._select_all()
+        if event.widget is self and (
+            self.allow_select
+            and self.screen.allow_select
+            and self.app.ALLOW_SELECT
+        ):
+            if event.chain == 2:
+                # Select only the clicked line (not all text).
+                # prevent_default() stops Textual from also calling
+                # the parent Log._on_click which would text_select_all().
+                line_index = int(self.scroll_y) + event.y
+                if self._select_line(line_index):
                     event.prevent_default()
                     return
+            elif event.chain == 3:
+                self._select_all()
+                event.prevent_default()
+                return
         await self.broker_event("click", event)
 
 
