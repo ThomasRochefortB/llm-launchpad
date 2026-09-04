@@ -50,6 +50,18 @@ def _await_profile(profile_id: str, *, attempts: int = 5) -> None:
             delay *= 2
 
 
+def _completed_report(path: Path) -> dict[str, Any] | None:
+    """Return a previous arm's report when it finished successfully."""
+
+    try:
+        report = json.loads(path.read_text())
+    except Exception:
+        return None
+    if not isinstance(report, dict) or not report.get("success"):
+        return None
+    return report
+
+
 def _summarize(report: dict[str, Any]) -> dict[str, Any]:
     evidence = report.get("evidence") or {}
     certification = evidence.get("certification") or {}
@@ -176,6 +188,13 @@ def main() -> int:
     failures: dict[str, str] = {}
     for cache_type in cache_types:
         report_path = out_dir / f"arm-{cache_type}.json"
+        # Each arm is a billable deploy, so a completed one is never repeated:
+        # rerunning the same --out-dir resumes rather than starting over.
+        existing = _completed_report(report_path)
+        if existing is not None:
+            print(f"\n=== arm: {cache_type} (already complete, reusing)", flush=True)
+            summary[cache_type] = _summarize(existing)
+            continue
         print(f"\n{'=' * 70}\n=== arm: {cache_type}\n{'=' * 70}", flush=True)
         try:
             _await_profile(args.profile_id)
