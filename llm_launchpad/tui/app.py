@@ -24,6 +24,7 @@ from textual.widgets import Input, TextArea
 from ..core.backend import ModalBackend
 from ..core.benchmark import benchmark_config_from_endpoint, parse_concurrency_values
 from ..core.config import ConfigStore, SETTINGS_DIR
+from ..core.deploy_events import EndpointUrlResolver
 from ..core.deploy_journal import (
     InFlightDeployment,
     clear_in_flight,
@@ -619,7 +620,9 @@ class TuiApp(App):
         """Consumed by run_worker in a thread."""
         deployed_web_url: Optional[str] = None
         deployed_endpoint: EndpointInfo | None = None
-        deployed_web_url_priority = -1
+        # Endpoint URL precedence lives in core.deploy_events so headless
+        # callers get the same answer this screen does.
+        url_resolver = EndpointUrlResolver()
         deploy_succeeded = False
         opencode_synced = False
         will_run_warmup = bool(config.do_warmup and config.do_deploy)
@@ -649,24 +652,14 @@ class TuiApp(App):
 
         for event in self._orchestrator.deploy(config):
             if isinstance(event, LogEvent):
-                line = event.line or ""
-                maybe_url = ModalBackend.extract_modal_web_url(event.line)
-                if maybe_url:
-                    if "Created web function" in line:
-                        # Prefer the Modal-emitted web function URL over backend-printed
-                        # guidance URLs; within those, prefer the non-dev URL.
-                        priority = 2 if not maybe_url.endswith("-dev.modal.run") else 1
-                    else:
-                        priority = 0
-                    if priority >= deployed_web_url_priority:
-                        deployed_web_url = maybe_url
-                        deployed_web_url_priority = priority
+                url_resolver.observe(event)
+                deployed_web_url = url_resolver.url or deployed_web_url
             elif isinstance(event, EndpointAvailableEvent):
                 deployed_endpoint = event.endpoint
                 self._invalidate_endpoint_snapshot()
+                url_resolver.observe(event)
                 if event.endpoint.web_url:
-                    deployed_web_url = event.endpoint.web_url
-                    deployed_web_url_priority = max(deployed_web_url_priority, 2)
+                    deployed_web_url = url_resolver.url or event.endpoint.web_url
                     if not will_run_warmup:
                         _emit_connection_summary(event.endpoint.web_url)
                         _sync_now(event.endpoint.web_url)
