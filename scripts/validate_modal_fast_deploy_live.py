@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import signal
 from dataclasses import asdict, replace
 import json
 from pathlib import Path
@@ -653,6 +654,29 @@ async def _wait_no_live_apps(
     raise TimeoutError(f"Modal app remained live after stop: {remaining}")
 
 
+
+def _install_cleanup_signals() -> None:
+    """Turn catchable terminations into an exception so cleanup still runs.
+
+    This script deploys a real GPU and stops it in a finally block. A signal
+    that bypasses that block leaves the deployment billing with nothing
+    pointing at it, which has happened. SIGKILL cannot be caught -- the journal
+    in the TUI exists for that -- but SIGTERM and SIGHUP can.
+    """
+
+    def _abort(signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt(f"terminated by signal {signum}")
+
+    for name in ("SIGTERM", "SIGHUP"):
+        handler = getattr(signal, name, None)
+        if handler is not None:
+            try:
+                signal.signal(handler, _abort)
+            except (ValueError, OSError):
+                # Not the main thread, or the platform disallows it.
+                pass
+
+
 async def run(
     report_path: Path,
     *,
@@ -663,6 +687,7 @@ async def run(
     recall_probe: bool,
     recall_context_tokens: int = DEFAULT_RECALL_CONTEXT_TOKENS,
 ) -> int:
+    _install_cleanup_signals()
     auth = get_modal_auth_status()
     if not auth.authenticated:
         raise RuntimeError("Modal authentication is required for live validation.")
@@ -754,10 +779,12 @@ async def run(
         report["cleanup"] = {"matching_live_apps": remaining}
         report["success"] = True
         return 0
-    except Exception as exc:
+    except BaseException as exc:  # noqa: BLE001 - cleanup must cover interrupts
         error = f"{type(exc).__name__}: {exc}"
         report["error"] = error
         traceback.print_exc()
+        if isinstance(exc, KeyboardInterrupt):
+            print("Interrupted; stopping the deployment before exit.", flush=True)
         return 1
     finally:
         if config is not None and config.app_name and not stopped:
