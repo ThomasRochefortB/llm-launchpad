@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 
 from .artificial_analysis_auth import resolve_artificial_analysis_api_key
 from .config import SETTINGS_DIR
+from .diagnostics import log_debug
 from .gguf_metadata import GgufMtpStatus
 from .hf_models import (
     GgufQuantMetadata,
@@ -892,6 +893,33 @@ def get_artificial_analysis_auth_status(
         )
 
 
+def _with_unique_ids(
+    profiles: Sequence[QuickDeployProfile],
+) -> tuple[QuickDeployProfile, ...]:
+    """Drop profiles whose id is already taken.
+
+    Ids are derived from repository, quantization and resource tier, so a
+    collision means two catalog entries describe the same deployable artifact --
+    a benchmark feed listing one model twice under different effort settings,
+    for instance. Keeping both would make ``get_quick_deploy_profile`` return
+    whichever happened to be first, so the duplicate is dropped rather than
+    disambiguated with an order-dependent suffix that would be unstable again.
+    """
+
+    unique: list[QuickDeployProfile] = []
+    seen: set[str] = set()
+    for profile in profiles:
+        if profile.id in seen:
+            log_debug(
+                f"Dropping duplicate catalog profile {profile.id} "
+                f"({profile.display_name} / {profile.repo_id})"
+            )
+            continue
+        seen.add(profile.id)
+        unique.append(profile)
+    return tuple(unique)
+
+
 def _profiles_from_aa_rankings(
     candidates: Sequence[AAModelCandidate],
     modal_gpu_catalog: Sequence[ModalGpuSpec],
@@ -965,7 +993,7 @@ def _profiles_from_aa_rankings(
     for bucket in _MODEL_SIZE_BUCKETS:
         for resolved in selected_by_bucket[bucket]:
             profiles.extend(resolved.profiles)
-    return tuple(profiles)
+    return _with_unique_ids(profiles)
 
 
 def _aa_candidate_window(
@@ -1884,6 +1912,29 @@ def _selected_quants(metadata: GgufQuantMetadata) -> list[str]:
     return selected
 
 
+def _stable_profile_id(repo_id: str, quant_slug: str, resource_tier: str) -> str:
+    """Build a catalog id from identity alone, never from a planner decision.
+
+    The id used to embed the GPU the planner had selected, so improving
+    placement renamed every profile: fixing full-context sizing moved a 27B
+    model off an L4 and turned ``...-cheap-l4`` into ``...-cheap-rtx-pro-6000``
+    overnight. Anything holding an id -- a saved deployment, a script, a
+    benchmark run, a half-finished flow in the UI -- broke.
+
+    The repository is used rather than the display name because benchmark feeds
+    rename models ("Qwen3.8 27B" gaining an "(xhigh)" suffix) without the
+    underlying artifact changing at all. ``resource_tier`` stays because it is
+    an input to selection -- which GPU pool to search -- not an output of it.
+    """
+
+    name = repo_id.strip().rsplit("/", 1)[-1]
+    for suffix in ("-GGUF", "-gguf"):
+        if name.endswith(suffix):
+            name = name[: -len(suffix)]
+            break
+    return f"{slugify_instance_name(name)}-{quant_slug}-{resource_tier}"
+
+
 def _profiles_for_quant(
     *,
     repo_id: str,
@@ -1963,10 +2014,7 @@ def _profiles_for_quant(
         quant_slug = _quant_slug(quant)
         profiles.append(
             QuickDeployProfile(
-                id=(
-                    f"{slug_hint}-{quant_slug}-{resource_tier}-"
-                    f"{_gpu_slug(selection.gpu_type)}"
-                ),
+                id=_stable_profile_id(repo_id, quant_slug, resource_tier),
                 display_name=display_name,
                 repo_id=repo_id,
                 quant=selection.quant,
