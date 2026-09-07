@@ -75,6 +75,53 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("llama.cpp (GGUF)", summary)
             self.assertIn("unsloth/Kimi-K2.5-GGUF", summary)
 
+    def _vision_profile(self, *, certified: bool) -> QuickDeployProfile:
+        from llm_launchpad.protocol.models import ServingRequirements
+
+        return QuickDeployProfile(
+            id="example-vision",
+            display_name="Example Model",
+            repo_id="org/example-GGUF",
+            quant="Q4_K_M",
+            gpu_type="H100",
+            gpu_count=1,
+            profile_label="Fast",
+            approx_cost_per_hour_usd=2.0,
+            max_context_tokens=32768,
+            instance_slug_hint="example-vision",
+            summary="Example profile.",
+            server_args=(),
+            serving_requirements=ServingRequirements(context_tokens=32768) if certified else None,
+        )
+
+    async def test_vision_control_is_hidden_for_guaranteed_fit_plans(self) -> None:
+        """A certified placement does not model image memory, so offering the
+        control would let users pick a mode that can only fail to deploy."""
+        from llm_launchpad.tui.widgets.vision_options import VisionOptions
+
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(QuickDeployScreen(profile_id=self._vision_profile(certified=True)))
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, QuickDeployScreen)
+            self.assertIsNotNone(screen.plan.recipe.serving_requirements)
+            self.assertEqual(len(screen.query(VisionOptions)), 0)
+
+    async def test_vision_control_is_offered_for_uncertified_plans(self) -> None:
+        from llm_launchpad.tui.widgets.vision_options import VisionOptions
+
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(QuickDeployScreen(profile_id=self._vision_profile(certified=False)))
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, QuickDeployScreen)
+            self.assertIsNone(screen.plan.recipe.serving_requirements)
+            self.assertEqual(len(screen.query(VisionOptions)), 1)
+
     async def test_screen_renders_vllm_recipe_without_gguf_fields(self) -> None:
         profile = QuickDeployProfile(
             id="example-vllm",

@@ -11,7 +11,7 @@ import unittest
 import zlib
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from llm_launchpad.core import connection_store, hf_models, opencode, vision
 from llm_launchpad.core.artificial_analysis import AAModelCandidate
@@ -33,8 +33,11 @@ from llm_launchpad.core.vision import (
     vllm_vision_limits,
 )
 from llm_launchpad.core.vision_probe import (
+    ImageProbeCancelled,
+    assistant_text,
     image_probe_payload,
     image_test_command,
+    is_vision_probe_failure,
     verify_image_request,
 )
 from llm_launchpad.protocol.enums import (
@@ -46,6 +49,7 @@ from llm_launchpad.protocol.enums import (
 from llm_launchpad.protocol.events import OperationCompleteEvent
 from llm_launchpad.protocol.models import (
     DeploymentConfig,
+    EndpointInfo,
     ProjectorArtifact,
     VisionCapabilities,
 )
@@ -395,6 +399,21 @@ class ImageProbeTests(unittest.TestCase):
         self.assertEqual(len(zlib.decompress(png[41:-12])), 64 * (1 + 64 * 3))
         self.assertEqual(payload["model"], "Qwen3-VL")
 
+    def test_assistant_text_reads_every_supported_response_shape(self) -> None:
+        cases = [
+            ({"content": "hello"}, "hello"),
+            ({"content": [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]}, "a b"),
+            ({"content": "", "reasoning_content": "thought"}, "thought"),
+            ({"content": "   ", "reasoning_content": "thought"}, "thought"),
+        ]
+        for message, expected in cases:
+            with self.subTest(message=message):
+                self.assertEqual(assistant_text(message).strip(), expected)
+        for empty in ({}, {"content": ""}, {"content": []}, {"content": [{"type": "image"}]},
+                      {"content": None, "reasoning_content": None}):
+            with self.subTest(empty=empty):
+                self.assertEqual(assistant_text(empty), "")
+
     def test_successful_request_records_a_pass(self) -> None:
         state = VisionCapabilities(enabled=True, fingerprint="f")
         payload = {"choices": [{"message": {"content": "A red square."}}]}
@@ -434,16 +453,47 @@ class ImageProbeTests(unittest.TestCase):
                 verify_image_request("https://host/v1", "Qwen3-VL", None, state)
         self.assertEqual(state.verification, VisionVerification.FAILED)
 
-    def test_cancellation_records_a_failure_without_requesting(self) -> None:
-        state = VisionCapabilities(enabled=True, fingerprint="f")
+    def test_cancellation_leaves_verification_untested(self) -> None:
+        # Shutting down teaches nothing about the model, so a cancelled probe
+        # must not be recorded as a failure.
+        state = VisionCapabilities(
+            enabled=True, fingerprint="f", verification=VisionVerification.PASSED
+        )
         with (
             patch("llm_launchpad.core.vision_probe.is_shutting_down", return_value=True),
             patch("llm_launchpad.core.vision_probe.requests.post") as post,
         ):
-            with self.assertRaises(RuntimeError):
+            with self.assertRaises(ImageProbeCancelled):
                 verify_image_request("https://host/v1", "Qwen3-VL", None, state)
         post.assert_not_called()
+        self.assertEqual(state.verification, VisionVerification.UNTESTED)
+
+    def test_reasoning_only_response_counts_as_a_pass(self) -> None:
+        # A thinking model can leave content empty; the server still accepted
+        # the image, which is all this probe claims to prove.
+        state = VisionCapabilities(enabled=True, fingerprint="f")
+        payload = {"choices": [{"message": {"content": "", "reasoning_content": "A red square."}}]}
+        with patch("llm_launchpad.core.vision_probe.requests.post", return_value=self._response(payload)):
+            verify_image_request("https://host/v1", "Qwen3-VL", None, state)
+        self.assertEqual(state.verification, VisionVerification.PASSED)
+
+    def test_list_content_parts_count_as_a_pass(self) -> None:
+        state = VisionCapabilities(enabled=True, fingerprint="f")
+        payload = {"choices": [{"message": {"content": [{"type": "text", "text": "A red square."}]}}]}
+        with patch("llm_launchpad.core.vision_probe.requests.post", return_value=self._response(payload)):
+            verify_image_request("https://host/v1", "Qwen3-VL", None, state)
+        self.assertEqual(state.verification, VisionVerification.PASSED)
+
+    def test_wholly_empty_response_still_fails(self) -> None:
+        state = VisionCapabilities(enabled=True, fingerprint="f")
+        payload = {"choices": [{"message": {"content": "", "reasoning_content": "  "}}]}
+        with patch("llm_launchpad.core.vision_probe.requests.post", return_value=self._response(payload)):
+            with self.assertRaises(ValueError):
+                verify_image_request("https://host/v1", "Qwen3-VL", None, state)
         self.assertEqual(state.verification, VisionVerification.FAILED)
+
+    def test_probe_budget_allows_a_thinking_model_to_answer(self) -> None:
+        self.assertGreaterEqual(image_probe_payload("VL")["max_tokens"], 512)
 
     def test_copyable_command_keeps_the_key_as_an_environment_reference(self) -> None:
         command = image_test_command("https://host/v1", "Qwen3-VL")
@@ -763,6 +813,162 @@ class FastDeployVisionExclusionTests(unittest.TestCase):
 
     def test_text_only_models_are_still_recommended(self) -> None:
         self.assertIsNotNone(self._resolve(False))
+
+
+class ProbeFailureIsolationTests(unittest.TestCase):
+    """A failed image probe must not read as a failed deployment."""
+
+    def test_warmup_marks_probe_failure_in_the_completion_event(self) -> None:
+        state = VisionCapabilities(supported=True, enabled=True, fingerprint="f" * 64)
+        fake_requests = types.SimpleNamespace(
+            get=lambda *_a, **_k: _ReadyResponse(), post=lambda *_a, **_k: _ReadyResponse()
+        )
+        with (
+            patch.dict("sys.modules", {"requests": fake_requests}),
+            patch("llm_launchpad.core.warmup.ModalBackend.test_curl_command", return_value="curl ok"),
+            patch(
+                "llm_launchpad.core.warmup.verify_image_request",
+                side_effect=RuntimeError("400 Bad Request"),
+            ),
+        ):
+            events = list(
+                Orchestrator().warmup(
+                    backend=BackendType.VLLM,
+                    server_url="https://example.modal.run/v1",
+                    timeout=10, tail_logs=False, served_model_name="VL", vision=state,
+                )
+            )
+        completion = next(e for e in events if isinstance(e, OperationCompleteEvent))
+        self.assertFalse(completion.success)
+        self.assertTrue(is_vision_probe_failure(completion))
+
+    def test_other_warmup_failures_are_not_marked_as_probe_failures(self) -> None:
+        # Teardown must still happen for a genuinely broken deployment.
+        from llm_launchpad.core.operation_events import fail_operation
+        from llm_launchpad.protocol.enums import OperationType
+
+        events = list(fail_operation(OperationType.WARMUP, "Timed out after 1800s"))
+        completion = next(e for e in events if isinstance(e, OperationCompleteEvent))
+        self.assertFalse(is_vision_probe_failure(completion))
+
+    def test_predicate_ignores_unrelated_event_payloads(self) -> None:
+        self.assertFalse(is_vision_probe_failure(None))
+        self.assertFalse(is_vision_probe_failure(OperationCompleteEvent(data={"url": "x"})))
+        self.assertFalse(is_vision_probe_failure(OperationCompleteEvent(data="not-a-dict")))
+
+    def test_cancelled_probe_does_not_overwrite_stored_verification(self) -> None:
+        from llm_launchpad.core.vision_probe import ImageProbeCancelled
+
+        state = VisionCapabilities(supported=True, enabled=True, fingerprint="f" * 64)
+        fake_requests = types.SimpleNamespace(
+            get=lambda *_a, **_k: _ReadyResponse(), post=lambda *_a, **_k: _ReadyResponse()
+        )
+        with (
+            patch.dict("sys.modules", {"requests": fake_requests}),
+            patch("llm_launchpad.core.warmup.ModalBackend.test_curl_command", return_value="curl ok"),
+            patch(
+                "llm_launchpad.core.warmup.verify_image_request",
+                side_effect=ImageProbeCancelled("cancelled"),
+            ),
+            patch("llm_launchpad.core.connection_store.update_vision_verification") as persist,
+        ):
+            list(
+                Orchestrator().warmup(
+                    backend=BackendType.VLLM,
+                    server_url="https://example.modal.run/v1",
+                    timeout=10, tail_logs=False, app_name="vl-app",
+                    served_model_name="VL", vision=state,
+                )
+            )
+        persist.assert_not_called()
+
+
+class ImageTestCommandGuardTests(unittest.TestCase):
+    """`--image-test` must never invent an image capability."""
+
+    def _run(self, vision: VisionCapabilities | None):
+        from typer.testing import CliRunner
+        from llm_launchpad.cli import main as cli_main
+
+        target = EndpointInfo(
+            name="vl-app", backend=BackendType.VLLM, web_url="https://host/v1", vision=vision
+        )
+        with (
+            patch.object(cli_main, "_preflight", return_value=(Mock(), "alice")),
+            patch.object(cli_main, "_resolve_manage_target", return_value=target),
+            patch.object(cli_main, "_print_banner"),
+        ):
+            return CliRunner().invoke(cli_main.app, ["warmup", "--app-name", "vl-app", "--image-test"])
+
+    def test_successful_image_test_republishes_the_capability(self) -> None:
+        """Verification is what unlocks image input for clients, so a passing
+        probe must reach OpenCode without waiting for the next deploy."""
+        from typer.testing import CliRunner
+        from llm_launchpad.cli import main as cli_main
+        from llm_launchpad.protocol.enums import OperationType
+
+        state = VisionCapabilities(supported=True, enabled=True, fingerprint="f" * 64)
+        target = EndpointInfo(
+            name="vl-app", backend=BackendType.VLLM, web_url="https://host/v1", vision=state
+        )
+        orch = Mock()
+        orch.warmup.return_value = [
+            OperationCompleteEvent(operation=OperationType.WARMUP, success=True)
+        ]
+        with (
+            patch.object(cli_main, "_preflight", return_value=(orch, "alice")),
+            patch.object(cli_main, "_resolve_manage_target", return_value=target),
+            patch.object(cli_main, "_print_banner"),
+            patch.object(cli_main, "_load_visible_launchpad_rows", return_value=[]),
+            patch.object(cli_main, "_sync_opencode_cli") as sync,
+        ):
+            result = CliRunner().invoke(
+                cli_main.app, ["warmup", "--app-name", "vl-app", "--image-test"]
+            )
+        self.assertEqual(result.exit_code, 0, result.output)
+        sync.assert_called_once()
+        self.assertEqual(sync.call_args.kwargs["target_app_name"], "vl-app")
+
+    def test_refuses_when_the_deployment_never_enabled_images(self) -> None:
+        for state in (
+            None,
+            VisionCapabilities(supported=True, enabled=False, fingerprint="f" * 64),
+            VisionCapabilities(supported=True, enabled=True, fingerprint=""),
+        ):
+            with self.subTest(state=state):
+                result = self._run(state)
+                self.assertEqual(result.exit_code, 2)
+                self.assertIn("image input enabled", result.output)
+
+
+class VllmRuntimeImageTests(unittest.TestCase):
+    """The official vLLM image must not be overwritten from PyPI."""
+
+    def test_no_second_vllm_or_hub_install_over_the_official_image(self) -> None:
+        source = Path("llm_launchpad/backends/modal_vllm_app.py").read_text(encoding="utf-8")
+        self.assertIn('from_registry("vllm/vllm-openai:v0.19.1")', source)
+        self.assertNotIn("uv_pip_install", source)
+
+
+class PrimeProjectorAuthTests(unittest.TestCase):
+    """Public projectors must download without a token."""
+
+    def test_authorization_header_is_omitted_when_no_token_is_set(self) -> None:
+        config = DeploymentConfig(
+            backend=BackendType.LLAMACPP, provider=ComputeProvider.PRIME,
+            repo_id="acme/VL-GGUF", quant="Q4_K_M", served_model_name="vl",
+            vision=VisionCapabilities(
+                supported=True, enabled=True, fingerprint="f" * 64,
+                projector=ProjectorArtifact("acme/VL-GGUF", SHA, "mmproj-F16.gguf", 900),
+            ),
+        )
+        with _fake_hub(_info([])):
+            script = PrimeBackend._bootstrap_docker_command(
+                config, resolve_prime_launch_spec(config)
+            )[-1]
+        # Expanded by the container shell, and dropped entirely when unset.
+        self.assertIn('${HF_TOKEN:+--header "Authorization: Bearer $HF_TOKEN"}', script)
+        self.assertNotIn('--header "Authorization: Bearer $HF_TOKEN" http', script)
 
 
 if __name__ == "__main__":

@@ -29,16 +29,27 @@ shows all of them:
 
 When warmup runs for a vision-enabled deployment, Launchpad sends a bundled
 64×64 PNG to `/v1/chat/completions` after the ordinary readiness probe. A
-failure fails deployment validation and returns a non-zero exit code, while
-leaving the endpoint running for diagnosis.
+failure fails deployment validation and returns a non-zero exit code.
 
-This verifies that the request path accepts an image and returns non-empty
-assistant text. It is not a benchmark of visual accuracy.
+Because the server already answered the readiness probe, an image-probe
+failure is reported distinctly from a failed rollout: the deployment is left
+running so you can inspect it, on both providers and from both the TUI and the
+CLI. Every other warmup failure still tears the deployment down as before.
+
+This verifies that the request path accepts an image and returns assistant
+text — `content`, content parts, or a thinking model's `reasoning_content`. It
+is not a benchmark of visual accuracy.
 
 ```bash
-# Verify an already-running deployment on demand.
+# Verify an already-running deployment on demand, and republish the result.
 llm-launchpad warmup --instance-name my-vl-model --image-test
 ```
+
+`--image-test` only works on a deployment that already enabled image input; it
+will not invent a capability for a text-only or pre-vision endpoint. On success
+it re-syncs OpenCode, so a verified deployment starts advertising image input
+immediately. Interrupting a probe leaves verification untouched rather than
+recording a failure.
 
 *Connection Info* offers **Copy image request**, which yields the same request
 as a `curl` command with the API key left as `$LLM_LAUNCHPAD_API_KEY`.
@@ -94,5 +105,7 @@ Video and audio are always disabled.
 - **OpenCode advertises `image` input only after verification passes.** Until
   then the model is registered as text-only, so an unverified deployment will
   refuse attachments in OpenCode rather than fail mid-request.
+- **Fast Deploy is text-only.** Its plans certify a placement that does not
+  model image memory, so the image-input control is not offered there.
 - **Existing deployments are untouched** until redeployed. Records saved before
   image support load with unknown vision status and text-only advertising.

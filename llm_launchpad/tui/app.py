@@ -45,6 +45,7 @@ from ..core.naming import (
 from ..core.prime_auth import get_prime_auth_status
 from ..core.prime_backend import PrimeBackend
 from ..core.provider_options import prime_provider_options
+from ..core.vision_probe import is_vision_probe_failure
 from ..core.quick_deploy import QuickDeployProfile
 from ..core.reasoning_profiles import discover_reasoning_capabilities
 from ..core.runtime_support import evaluate_llamacpp_architecture
@@ -813,7 +814,9 @@ class TuiApp(App):
                         config.provider == ComputeProvider.PRIME
                         and prime_provider_options(config).keep_failed_resource
                     )
-                    if not keep_failed_prime:
+                    # A server that answered readiness and then failed only the
+                    # image probe stays up so it can be inspected.
+                    if not keep_failed_prime and not is_vision_probe_failure(event):
                         resource_label = (
                             f"Prime pod {deployed_endpoint.app_id}"
                             if config.provider == ComputeProvider.PRIME

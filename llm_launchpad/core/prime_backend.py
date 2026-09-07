@@ -94,12 +94,16 @@ def _prime_projector_setup(config: DeploymentConfig) -> tuple[str, str]:
     quoted = shlex.quote(path)
     url = hf_hub_url(artifact.repo_id, artifact.filename, revision=artifact.revision)
     size_check = f'[ "$(stat -c %s {quoted})" = {artifact.size_bytes} ]' if artifact.size_bytes else f"[ -s {quoted} ]"
-    # The pinned llama.cpp image includes curl. The token is expanded only on the host.
+    # The pinned llama.cpp image includes curl. $HF_TOKEN survives shlex.join
+    # literally and is expanded by the container shell; the header is omitted
+    # entirely when no token is set, because an empty Bearer makes Hugging Face
+    # reject public files that an unauthenticated request would have served.
     setup = (
         f"mkdir -p {shlex.quote(root + '/projectors')} || exit $?; "
         f"if ! {size_check}; then "
         f"curl --fail --location --retry 3 --connect-timeout 20 "
-        f'--header "Authorization: Bearer $HF_TOKEN" {shlex.quote(url)} -o {quoted}.tmp '
+        '${HF_TOKEN:+--header "Authorization: Bearer $HF_TOKEN"} '
+        f'{shlex.quote(url)} -o {quoted}.tmp '
         f"&& mv {quoted}.tmp {quoted} || exit $?; fi; "
         f"{size_check} || exit 1; "
         f'[ "$(head -c 4 {quoted})" = GGUF ] || exit 1; '

@@ -7,6 +7,7 @@ CLI both consume these generators.
 
 from __future__ import annotations
 
+from ..protocol.enums import VisionVerification
 from ..protocol.models import VisionCapabilities
 
 from .shutdown import is_shutting_down, shutdown_event
@@ -999,7 +1000,14 @@ class Orchestrator:
             placement_assessment=placement_assessment,
             runtime_id=runtime_id,
         ):
-            if isinstance(event, OperationCompleteEvent) and vision is not None and app_name:
+            if (
+                isinstance(event, OperationCompleteEvent)
+                and app_name
+                and vision is not None
+                # A cancelled probe leaves this untested and teaches nothing, so
+                # the stored verification must survive untouched.
+                and vision.verification != VisionVerification.UNTESTED
+            ):
                 from .connection_store import update_vision_verification
                 update_vision_verification(app_name, server_url, vision)
             yield event

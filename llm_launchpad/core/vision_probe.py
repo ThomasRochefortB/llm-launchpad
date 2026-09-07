@@ -15,6 +15,45 @@ from ..protocol.models import VisionCapabilities
 from .shutdown import is_shutting_down
 
 
+VISION_PROBE_FAILED = "vision_probe_failed"
+
+
+class ImageProbeCancelled(RuntimeError):
+    """The probe stopped on shutdown, having learned nothing about the model."""
+
+
+def is_vision_probe_failure(event: object) -> bool:
+    """Report whether a failed warmup was only the image probe.
+
+    The endpoint answered the readiness probe, so it is still worth keeping
+    for diagnosis; callers must not treat this like a failed deployment.
+    """
+    data = getattr(event, "data", None)
+    return isinstance(data, dict) and data.get(VISION_PROBE_FAILED) is True
+
+
+def assistant_text(message: dict) -> str:
+    """Extract assistant text from the shapes OpenAI-compatible servers return.
+
+    Thinking models may leave ``content`` empty and put their output in
+    ``reasoning_content``, and some servers return content as a list of parts.
+    Any of those still proves the server accepted the image.
+    """
+    content = message.get("content")
+    if isinstance(content, str) and content.strip():
+        return content
+    if isinstance(content, list):
+        parts = " ".join(
+            str(part.get("text", ""))
+            for part in content
+            if isinstance(part, dict)
+        )
+        if parts.strip():
+            return parts
+    reasoning = message.get("reasoning_content")
+    return reasoning if isinstance(reasoning, str) and reasoning.strip() else ""
+
+
 def image_probe_payload(model: str) -> dict:
     """Build a valid 64px red PNG and a native OpenAI image request."""
     def chunk(kind: bytes, data: bytes) -> bytes:
@@ -31,7 +70,9 @@ def image_probe_payload(model: str) -> dict:
             {"type": "text", "text": "Describe the image in one short sentence."},
             {"type": "image_url", "image_url": {"url": url}},
         ]}],
-        "max_tokens": 128, "temperature": 0,
+        # Generous enough that a thinking model can finish an answer rather
+        # than spending the whole budget inside its reasoning block.
+        "max_tokens": 512, "temperature": 0,
     }
 
 
@@ -44,7 +85,7 @@ def verify_image_request(url: str, model: str | None, api_key: str | None, visio
     vision.verification = VisionVerification.UNTESTED
     try:
         if is_shutting_down():
-            raise RuntimeError("Image verification cancelled.")
+            raise ImageProbeCancelled("Image verification cancelled.")
         if not model:
             response = requests.get(f"{root}/v1/models", headers=headers, timeout=(10, 30))
             response.raise_for_status()
@@ -52,11 +93,12 @@ def verify_image_request(url: str, model: str | None, api_key: str | None, visio
         response = requests.post(f"{root}/v1/chat/completions", headers=headers,
                                  json=image_probe_payload(model), timeout=(10, 60))
         response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
-        if not isinstance(content, str) or not content.strip():
+        if not assistant_text(response.json()["choices"][0]["message"]):
             raise ValueError("Image request returned no assistant text.")
-        if is_shutting_down():
-            raise RuntimeError("Image verification cancelled.")
+    except ImageProbeCancelled:
+        # Nothing was learned, so the previous verification stands.
+        vision.message = "Image verification cancelled before it finished."
+        raise
     except Exception:
         vision.verification = VisionVerification.FAILED
         vision.message = "Image request failed; inspect warmup diagnostics before advertising image input."

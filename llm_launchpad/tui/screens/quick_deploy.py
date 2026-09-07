@@ -324,7 +324,10 @@ class QuickDeployScreen(CopyEnabledScreen):
                         id="quick-objective",
                         classes="quick-advanced",
                     )
-                yield VisionOptions(classes="quick-advanced")
+                # A guaranteed-fit plan cannot serve images, because image
+                # working memory is not part of the placement it certifies.
+                if self.plan.recipe.serving_requirements is None:
+                    yield VisionOptions(classes="quick-advanced")
                 yield FormField(
                     "Instance name (optional)",
                     "quick-instance-name",
@@ -508,7 +511,8 @@ class QuickDeployScreen(CopyEnabledScreen):
                     ).value,
                     auto_disk=self.query_one("#quick-prime-auto-disk", Switch).value,
                 )
-            self.query_one(VisionOptions).apply(candidate)
+            for options in self.query(VisionOptions):
+                options.apply(candidate)
             return candidate
 
         config = _config_for_plan(self.plan)

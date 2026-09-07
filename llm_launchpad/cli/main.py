@@ -8,7 +8,7 @@ all non-interactive commands available for automation.
 from __future__ import annotations
 
 from ..protocol.enums import VisionMode
-from ..protocol.models import VisionCapabilities
+from ..core.vision_probe import is_vision_probe_failure
 
 import os
 import sys
@@ -580,6 +580,9 @@ def _deploy_and_maybe_warmup(
                 and config.provider == ComputeProvider.PRIME
                 and deployed_endpoint is not None
                 and not prime_provider_options(config).keep_failed_resource
+                # A pod that only failed the image probe is still serving, so
+                # keep it for diagnosis instead of terminating it.
+                and not is_vision_probe_failure(event)
             ):
                 typer.echo(
                     f"Warmup failed; terminating Prime pod {deployed_endpoint.app_id}."
@@ -1035,8 +1038,17 @@ def warmup(
         raise typer.Exit(code=1)
     vision_kwargs: dict[str, Any] = {}
     if image_test:
-        state = target.vision or VisionCapabilities(enabled=True, fingerprint="explicit-image-probe")
-        state.enabled = True
+        # Probing an endpoint whose image support was never resolved would
+        # record a verification against an identity that does not exist, so
+        # only a deployment that already enabled images can be tested.
+        state = target.vision
+        if state is None or not state.enabled or not state.fingerprint:
+            typer.echo(
+                "Error: --image-test needs a deployment with image input enabled. "
+                "Redeploy with --vision auto or --vision on first.",
+                err=True,
+            )
+            raise typer.Exit(code=2)
         vision_kwargs["vision"] = state
     warmup_events = (
         orch.warmup(
@@ -1065,6 +1077,21 @@ def warmup(
     summarizer = None if debug_logs else DeployLogSummarizer(bt)
     for event in warmup_events:
         _print_event(event, summarizer=summarizer)
+        if (
+            image_test
+            and isinstance(event, OperationCompleteEvent)
+            and event.success
+            and event.operation == OperationType.WARMUP
+        ):
+            # Verification is what unlocks image input for clients, so publish
+            # the updated capability instead of waiting for the next deploy.
+            _sync_opencode_cli(
+                target_app_name=target.name,
+                target_url=url,
+                current_rows=_load_visible_launchpad_rows(compute_provider),
+                prune_providers=(compute_provider,),
+                username=username,
+            )
         _raise_on_failed_completion(event)
 
 
