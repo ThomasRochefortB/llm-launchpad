@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from ..protocol.models import VisionCapabilities
+from .vision_probe import verify_image_request
+
 from .shutdown import is_shutting_down, shutdown_event
 
 import json
@@ -442,6 +445,7 @@ class WarmupRunner:
         serving_requirements: ServingRequirements | None = None,
         placement_assessment: PlacementAssessment | None = None,
         runtime_id: str | None = None,
+        vision: VisionCapabilities | None = None,
     ) -> EventStream:
         """Probe endpoint readiness and optionally tail logs."""
         yield StateChangeEvent(
@@ -550,6 +554,14 @@ class WarmupRunner:
                         if attestation is None:
                             return
 
+                    if vision is not None and vision.enabled:
+                        yield LogEvent(line="Verifying image input with a bundled PNG.", operation=OperationType.WARMUP)
+                        try:
+                            verify_image_request(server_url, served_model_name, api_key, vision)
+                        except Exception as exc:
+                            yield from fail_operation(OperationType.WARMUP, f"Image verification failed: {exc}")
+                            return
+                        yield LogEvent(line="Image request verified (not a visual accuracy benchmark).", operation=OperationType.WARMUP)
                     yield LogEvent(line="Server is ready!")
                     curl_cmd = ModalBackend.test_curl_command(
                         backend,

@@ -128,6 +128,7 @@ llm-launchpad opencode sync --dry-run
 ## Documentation
 
 - [Deploy catalog and recommendations](docs/catalog.md)
+- [Image input (vision)](docs/vision.md)
 - [Prime Intellect provider](docs/prime.md)
 - [Storage and costs](docs/storage-and-costs.md)
 - [OpenCode integration](docs/opencode.md)

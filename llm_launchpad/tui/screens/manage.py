@@ -10,7 +10,9 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, DataTable, Footer, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
-from ...protocol.models import EndpointInfo
+from ...core.vision_probe import image_test_command
+from ...protocol.enums import VisionVerification
+from ...protocol.models import EndpointInfo, VisionCapabilities
 from ..connection import endpoint_connection_payload, resolve_openai_base_url
 from ..navigation import move_focus_across_widgets
 from ..responsive import ViewportProfile, WidthMode
@@ -116,6 +118,21 @@ def _endpoint_compact_label(row: EndpointInfo) -> str:
 
 def _endpoint_summary(row: EndpointInfo) -> str:
     return f"{_endpoint_host(row)} · {_state_label(row.state)}"
+
+def _vision_summary(vision: VisionCapabilities | None) -> str:
+    """Describe image input without implying a deployment was ever tested."""
+    if vision is None:
+        return "unknown (deployed before image support, or never inspected)"
+    if not vision.enabled:
+        return "disabled (text only)"
+    return f"enabled · {_VISION_VERIFICATION_LABELS[vision.verification]}"
+
+
+_VISION_VERIFICATION_LABELS = {
+    VisionVerification.UNTESTED: "not verified on this deployment",
+    VisionVerification.PASSED: "image request verified",
+    VisionVerification.FAILED: "image request failed",
+}
 
 
 _WIDE = WidthMode.WIDE
@@ -521,6 +538,7 @@ class ConnectionInfoScreen(CopyEnabledScreen):
                 yield Button("Copy base URL", id="connection-copy-url")
                 yield Button("Copy model ID", id="connection-copy-model")
                 yield Button("Copy API key", id="connection-copy-key")
+                yield Button("Copy image request", id="connection-copy-image")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -529,17 +547,21 @@ class ConnectionInfoScreen(CopyEnabledScreen):
             username=self._modal_username(),
         )
         self.query_one("#connection-info-fields", Static).update(
-            self._fields_markup(self._payload)
+            self._fields_markup(self._payload, self.endpoint.vision)
         )
         has_key = bool((self._payload.get("api_key") or "").strip())
         self.query_one("#connection-copy-key", Button).display = has_key
+        vision = self.endpoint.vision
+        self.query_one("#connection-copy-image", Button).display = bool(
+            vision and vision.enabled and self._payload.get("base_url")
+        )
         self.query_one("#connection-copy-url", Button).focus()
 
     def _modal_username(self) -> str:
         return str(getattr(self.app, "_username", "") or "")
 
     @staticmethod
-    def _fields_markup(payload: dict[str, str | None]) -> str:
+    def _fields_markup(payload: dict[str, str | None], vision: VisionCapabilities | None = None) -> str:
         base_url = payload.get("base_url") or "(unavailable while the app is starting)"
         model_id = payload.get("model_id") or "(unknown)"
         display_name = payload.get("display_name") or "(unknown)"
@@ -553,7 +575,8 @@ class ConnectionInfoScreen(CopyEnabledScreen):
             f"[dim]Base URL[/dim]   {escape(base_url)}\n"
             f"[dim]Model ID[/dim]   {escape(model_id)}\n"
             f"[dim]Display[/dim]    {escape(display_name)}\n"
-            f"{key_line}"
+            f"{key_line}\n"
+            f"[dim]Images[/dim]     {escape(_vision_summary(vision))}"
         )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -563,6 +586,17 @@ class ConnectionInfoScreen(CopyEnabledScreen):
             self._copy_field("model_id", empty_message="No model ID to copy")
         elif event.button.id == "connection-copy-key":
             self.action_copy_api_key()
+        elif event.button.id == "connection-copy-image":
+            self._copy_image_request()
+
+    def _copy_image_request(self) -> None:
+        base_url = (self._payload.get("base_url") or "").strip()
+        model_id = (self._payload.get("model_id") or "").strip()
+        if not base_url or not model_id:
+            self.notify("No endpoint URL or model ID to build an image request", timeout=2)
+            return
+        self.app.copy_to_clipboard(image_test_command(base_url, model_id))
+        self.notify("Copied image request", timeout=2)
 
     def _copy_field(self, field: str, *, empty_message: str) -> None:
         value = (self._payload.get(field) or "").strip()

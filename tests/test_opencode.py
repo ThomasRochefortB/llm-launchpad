@@ -66,6 +66,10 @@ def _connection(
 
 def _provider_payload(connection: opencode.OpenCodeConnection) -> dict[str, object]:
     model: dict[str, object] = {"name": connection.display_name}
+    model["modalities"] = {
+        "input": ["text", "image"] if opencode.image_input_verified(connection.vision) else ["text"],
+        "output": ["text"],
+    }
     if connection.context_limit is not None and connection.output_limit is not None:
         model["limit"] = {
             "context": connection.context_limit,

@@ -116,6 +116,7 @@ def _deploy_connection_summary_lines(config: DeploymentConfig, server_url: str) 
         f"Base URL: {base_url}",
         f"Model ID: {model_id}",
         f"Display name: {display_name}",
+        f"Vision: {config.vision_mode.value}; " + (f"{'enabled' if config.vision.enabled else 'disabled'}, {config.vision.verification.value}" if config.vision else "unknown"),
         (
             "API key: generated and stored locally"
             if config.endpoint_api_key
@@ -759,12 +760,14 @@ class TuiApp(App):
                 if config.serving_requirements is not None
                 else {}
             )
-            if config.provider != ComputeProvider.MODAL:
+            if config.provider != ComputeProvider.MODAL or config.endpoint_api_key:
                 certification_kwargs.update(
                     provider=config.provider,
                     api_key=config.endpoint_api_key,
                     pod_id=deployed_endpoint.app_id if deployed_endpoint else None,
                 )
+            if config.vision is not None:
+                certification_kwargs["vision"] = config.vision
             warmup_events = self._orchestrator.warmup(
                 backend=config.backend,
                 server_url=url,

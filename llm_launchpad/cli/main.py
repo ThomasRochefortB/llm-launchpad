@@ -7,11 +7,14 @@ all non-interactive commands available for automation.
 
 from __future__ import annotations
 
+from ..protocol.enums import VisionMode
+from ..protocol.models import VisionCapabilities
+
 import os
 import sys
 from dataclasses import asdict
 import json
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 
@@ -499,10 +502,10 @@ def _deploy_and_maybe_warmup(
         _print_event(event, summarizer=summarizer)
         _raise_on_failed_completion(event)
 
-    if deploy_succeeded and deployed_endpoint and deployed_web_url and not do_warmup:
+    if deploy_succeeded and deployed_web_url:
         # Persist provider credentials immediately. A later warmup failure must
         # not strand a live, billable pod without its generated bearer key.
-        save_connection(config, deployed_endpoint)
+        save_connection(config, deployed_endpoint or EndpointInfo(name=config.app_name or "", backend=config.backend, web_url=deployed_web_url))
 
     warmup_succeeded = False
     final_sync_url: str | None = None
@@ -526,6 +529,8 @@ def _deploy_and_maybe_warmup(
             if config.serving_requirements is not None
             else {}
         )
+        if config.vision is not None:
+            certification_kwargs["vision"] = config.vision
         warmup_events = (
             orch.warmup(
                 backend,
@@ -821,6 +826,12 @@ def prime_offers(
 
 @app.command()
 def deploy(
+    vision: VisionMode = typer.Option(VisionMode.AUTO, help="Image input: auto, on, or off"),
+    projector_repo: str | None = typer.Option(None, help="llama.cpp projector HF repository override"),
+    projector_revision: str | None = typer.Option(None, help="llama.cpp projector HF revision override"),
+    projector_file: str | None = typer.Option(None, help="Exact llama.cpp projector filename"),
+    image_limit: int = typer.Option(1, min=1, help="vLLM images per prompt"),
+    mm_processor_kwargs: str | None = typer.Option(None, help="vLLM image processor kwargs JSON"),
     provider: ComputeProvider = typer.Option(
         ComputeProvider.MODAL,
         help="Compute provider: modal or prime",
@@ -912,6 +923,9 @@ def deploy(
     )
 
     config = DeploymentConfig(
+        vision_mode=vision, projector_repo=projector_repo,
+        projector_revision=projector_revision, projector_file=projector_file,
+        image_limit=image_limit, mm_processor_kwargs=mm_processor_kwargs,
         backend=bt,
         provider=compute_provider,
         do_deploy=True,
@@ -976,6 +990,7 @@ def warmup(
         BackendType.LLAMACPP,
         help="Backend: llamacpp or vllm",
     ),
+    image_test: bool = typer.Option(False, help="Explicitly verify an image request"),
     server_url: str | None = typer.Option(None, help="Deployed web URL"),
     served_model_name: str | None = typer.Option(None, help="Served model name for llama.cpp probes"),
     function_slug: str | None = typer.Option(
@@ -1018,6 +1033,11 @@ def warmup(
     if not url:
         typer.echo("Error: could not resolve the endpoint URL for this deployment.", err=True)
         raise typer.Exit(code=1)
+    vision_kwargs: dict[str, Any] = {}
+    if image_test:
+        state = target.vision or VisionCapabilities(enabled=True, fingerprint="explicit-image-probe")
+        state.enabled = True
+        vision_kwargs["vision"] = state
     warmup_events = (
         orch.warmup(
             bt,
@@ -1025,7 +1045,8 @@ def warmup(
             timeout,
             tail_logs,
             app_name=target.name,
-            served_model_name=served_model_name,
+            served_model_name=served_model_name or target.served_model_name,
+            **vision_kwargs,
         )
         if compute_provider == ComputeProvider.MODAL
         else orch.warmup(
@@ -1034,7 +1055,8 @@ def warmup(
             timeout,
             tail_logs,
             app_name=target.name,
-            served_model_name=served_model_name,
+            served_model_name=served_model_name or target.served_model_name,
+            **vision_kwargs,
             provider=compute_provider,
             api_key=target.endpoint_api_key,
             pod_id=target.app_id,
@@ -1377,13 +1399,13 @@ def _redeploy_modal_llamacpp(
     tail_logs: bool,
 ) -> None:
     """Redeploy a switched llama.cpp app on Modal, then warm it and sync OpenCode."""
-    from ..protocol.models import DeploymentConfig
 
     bt = backend
     resolved_instance = instance_name
     resolved_app_name = app_name
     compute_provider = provider
-    deploy_config = DeploymentConfig(backend=bt, do_deploy=True)
+    deploy_config = config
+    deploy_config.do_deploy = True
     deploy_config.function_slug = random_function_slug()
     deploy_config.instance_name = resolved_instance
     settings = ConfigStore().load()
@@ -1407,6 +1429,7 @@ def _redeploy_modal_llamacpp(
             timeout,
             tail_logs,
             app_name=resolved_app_name,
+            **({"vision": config.vision} if config.vision else {}),
         ):
             if (
                 isinstance(event, OperationCompleteEvent)
@@ -1433,6 +1456,12 @@ def _redeploy_modal_llamacpp(
 
 @app.command()
 def switch(
+    vision: VisionMode = typer.Option(VisionMode.AUTO, help="Image input: auto, on, or off"),
+    projector_repo: str | None = typer.Option(None, help="llama.cpp projector HF repository override"),
+    projector_revision: str | None = typer.Option(None, help="llama.cpp projector HF revision override"),
+    projector_file: str | None = typer.Option(None, help="Exact llama.cpp projector filename"),
+    image_limit: int = typer.Option(1, min=1, help="vLLM images per prompt"),
+    mm_processor_kwargs: str | None = typer.Option(None, help="vLLM image processor kwargs JSON"),
     provider: ComputeProvider = typer.Option(
         ComputeProvider.MODAL,
         help="Compute provider: modal or prime",
@@ -1504,6 +1533,9 @@ def switch(
     from ..protocol.models import DeploymentConfig
 
     config = DeploymentConfig(
+        vision_mode=vision, projector_repo=projector_repo,
+        projector_revision=projector_revision, projector_file=projector_file,
+        image_limit=image_limit, mm_processor_kwargs=mm_processor_kwargs,
         backend=bt,
         provider=compute_provider,
         preset=preset,

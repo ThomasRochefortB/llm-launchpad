@@ -232,6 +232,11 @@ class ModalBackend:
         env: dict[str, str] = {}
         if config.app_name:
             env["MODAL_APP_NAME"] = config.app_name
+        from .vision import vllm_vision_limits
+        if config.backend == BackendType.VLLM:
+            env["LIMIT_MM_PER_PROMPT"] = vllm_vision_limits(config)
+            if config.mm_processor_kwargs:
+                env["MM_PROCESSOR_KWARGS"] = config.mm_processor_kwargs
         if config.function_slug:
             env["MODAL_FUNCTION_SLUG"] = config.function_slug
         if config.backend == BackendType.LLAMACPP:
@@ -297,6 +302,9 @@ class ModalBackend:
             args += ["--quant", config.quant]
         if config.revision:
             args += ["--revision", config.revision]
+        if config.vision is not None:
+            from .vision import vision_to_dict
+            args += ["--vision-json", json.dumps(vision_to_dict(config.vision))]
         if config.preload:
             args += ["--preload"]
         else:
