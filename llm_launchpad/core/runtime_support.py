@@ -49,6 +49,7 @@ class LlamaCppSupportManifest:
     compatible_image_refs: frozenset[str] = frozenset()
     mtp_architectures: frozenset[str] = frozenset()
     mtp_support_known: bool = False
+    build_recipe: str | None = None
 
 
 @dataclass(frozen=True)
@@ -107,13 +108,15 @@ def extract_llamacpp_mtp_architectures(
     return sorted(supported)
 
 
-@lru_cache(maxsize=1)
-def load_llamacpp_support_manifest() -> LlamaCppSupportManifest:
+@lru_cache(maxsize=4)
+def load_llamacpp_support_manifest(architecture: str | None = None) -> LlamaCppSupportManifest:
     """Load and validate the bundled support manifest."""
 
-    resource = resources.files("llm_launchpad.data").joinpath(
-        LLAMACPP_SUPPORT_MANIFEST_FILENAME
+    filename = (
+        "llamacpp_glm5next_support.json"
+        if architecture == "glm5next" else LLAMACPP_SUPPORT_MANIFEST_FILENAME
     )
+    resource = resources.files("llm_launchpad.data").joinpath(filename)
     payload = json.loads(resource.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise RuntimeError("llama.cpp support manifest must be a JSON object")
@@ -127,7 +130,8 @@ def load_llamacpp_support_manifest() -> LlamaCppSupportManifest:
     runtime_id = _required_string(payload, "runtime_id")
     runtime_build = _required_string(payload, "runtime_build")
     image_ref = _required_string(payload, "image_ref")
-    image_digest = _required_string(payload, "image_digest")
+    build_recipe = _optional_string(payload.get("build_recipe"))
+    image_digest = "" if build_recipe else _required_string(payload, "image_digest")
     source_revision = _required_string(payload, "source_revision")
     source_url = _required_string(payload, "source_url")
     generated_at = _required_string(payload, "generated_at")
@@ -147,6 +151,7 @@ def load_llamacpp_support_manifest() -> LlamaCppSupportManifest:
         compatible_image_refs=_string_set(payload.get("compatible_image_refs")),
         mtp_architectures=_string_set(payload.get("mtp_architectures")),
         mtp_support_known=schema_version >= 2,
+        build_recipe=build_recipe,
     )
 
 
@@ -158,7 +163,7 @@ def evaluate_llamacpp_architecture(
 ) -> RuntimeCompatibilityDecision:
     """Check one GGUF architecture against the exact configured llama.cpp image."""
 
-    support = manifest or load_llamacpp_support_manifest()
+    support = manifest or _manifest_for_image(architecture, image_ref)
     selected_image = (image_ref or support.image_ref).strip()
     normalized_architecture = _optional_string(architecture)
     if not _image_matches_manifest(selected_image, support):
@@ -223,7 +228,7 @@ def evaluate_llamacpp_mtp(
 ) -> RuntimeCompatibilityDecision:
     """Check embedded MTP metadata against one exact llama.cpp runtime."""
 
-    support = manifest or load_llamacpp_support_manifest()
+    support = manifest or _manifest_for_image(architecture, image_ref)
     selected_image = (image_ref or support.image_ref).strip()
     normalized_architecture = _optional_string(architecture)
     if not _image_matches_manifest(selected_image, support):
@@ -297,10 +302,38 @@ def _image_matches_manifest(
     accepted = {
         manifest.image_ref,
         *manifest.compatible_image_refs,
-        f"{manifest.image_ref}@{manifest.image_digest}",
-        f"{manifest.image_ref.split(':', 1)[0]}@{manifest.image_digest}",
     }
+    if manifest.image_digest:
+        accepted.update({
+            f"{manifest.image_ref}@{manifest.image_digest}",
+            f"{manifest.image_ref.split(':', 1)[0]}@{manifest.image_digest}",
+        })
     return image_ref in accepted
+
+
+def _manifest_for_image(architecture: str | None, image_ref: str | None) -> LlamaCppSupportManifest:
+    default = load_llamacpp_support_manifest()
+    if image_ref and _image_matches_manifest(image_ref, default):
+        return default
+    return load_llamacpp_support_manifest(_optional_string(architecture))
+
+
+def llamacpp_build_recipe(architecture: str | None) -> str | None:
+    """Return the bundled Dockerfile for a model-specific source runtime."""
+    manifest = load_llamacpp_support_manifest(architecture)
+    if manifest.build_recipe is None:
+        return None
+    return resources.files("llm_launchpad.data").joinpath(manifest.build_recipe).read_text(encoding="utf-8")
+
+
+def llamacpp_cuda_architecture(gpu_type: str | None) -> str | None:
+    """Compile the source runtime for the selected catalog GPU family."""
+    gpu = (gpu_type or "").strip().upper().removesuffix("!")
+    return {
+        "T4": "75", "A100": "80", "A100-40GB": "80", "A100-80GB": "80",
+        "A10": "86", "L4": "89", "L40S": "89", "H100": "90", "H200": "90",
+        "B200": "100", "RTX-PRO-6000": "120",
+    }.get(gpu)
 
 
 def _required_string(payload: dict[str, Any], key: str) -> str:

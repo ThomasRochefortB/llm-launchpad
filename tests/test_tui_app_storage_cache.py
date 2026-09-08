@@ -77,7 +77,7 @@ class TuiAppStorageCacheTests(unittest.TestCase):
         packages = payload["tool"]["setuptools"]["packages"]
         self.assertIn("llm_launchpad.data", packages)
         self.assertEqual(package_data["llm_launchpad.tui"], ["theme.tcss"])
-        self.assertEqual(package_data["llm_launchpad.data"], ["*.json"])
+        self.assertEqual(package_data["llm_launchpad.data"], ["*.json", "*.dockerfile"])
 
     def test_endpoint_refresh_fans_one_discovery_out_to_all_waiting_screens(self) -> None:
         app = TuiApp()

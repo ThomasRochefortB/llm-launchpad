@@ -29,7 +29,7 @@ from .coerce import optional_float
 from .hf_models import GgufQuantMetadata
 
 
-PLANNER_SCHEMA_VERSION = 1
+PLANNER_SCHEMA_VERSION = 2
 CERTIFICATE_CACHE_PATH = SETTINGS_DIR / "serving_certificates.json"
 
 # Conservative relative decode capacity. The values only rank unmeasured
@@ -140,6 +140,13 @@ def tuning_for_objective(
         gpu_layers="all",
         speculative_decoding=speculative_decoding,
     )
+
+
+def tuning_for_architecture(tuning: RuntimeTuning, architecture: str | None) -> RuntimeTuning:
+    """Apply correctness requirements of the selected model implementation."""
+    if architecture == "glm5next":
+        return replace(tuning, flash_attention=False, cache_type_k="f16", cache_type_v="f16")
+    return tuning
 
 
 # Ordered most to least precise. The runtime accepts more types than these;
@@ -333,6 +340,10 @@ def estimate_memory(
     reserve_gb = reserve_per_device * count
     total = weights + kv_gb + compute_gb + speculative_gb + reserve_gb
     per_device = tuple(total / count for _ in range(count))
+    hybrid = metadata.architecture in {"kimi-k3", "kimi-linear", "glm5next"}
+    source = "gguf-hybrid-metadata" if hybrid else "gguf-metadata"
+    nextn = metadata.serving_metadata.nextn_predict_layers if metadata.serving_metadata else 0
+    recurrent = _hybrid_recurrent_gb(metadata, tuning) if hybrid and metadata_complete else 0.0
     return MemoryEstimate(
         weights_gb=round(weights, 3),
         kv_cache_gb=round(kv_gb, 3),
@@ -342,8 +353,10 @@ def estimate_memory(
         total_gb=round(total, 3),
         per_device_required_gb=tuple(round(value, 3) for value in per_device),
         confidence=0.82 if metadata_complete else 0.55,
-        source="gguf-metadata" if metadata_complete else "conservative-fallback",
-        total_layer_count=metadata.block_count,
+        source=source if metadata_complete else "conservative-fallback",
+        total_layer_count=(metadata.block_count - nextn) if metadata.block_count else None,
+        recurrent_gb=round(recurrent, 6),
+        recurrent_state_copies=_recurrent_state_copies(tuning),
     )
 
 
@@ -449,12 +462,18 @@ def assess_memory_placement(
     """Assess a topology from a catalog's model/KV/compute breakdown."""
 
     count = max(1, int(gpu_count))
+    state_copies = _recurrent_state_copies(tuning)
+    recurrent = base_memory.recurrent_gb * state_copies / max(1, base_memory.recurrent_state_copies)
+    state_delta = recurrent - base_memory.recurrent_gb
     reserve_per_device = max(2.0, float(gpu_memory_gb) * 0.05)
     base_without_reserve = max(0.0, base_memory.total_gb - base_memory.reserve_gb)
     reserve = reserve_per_device * count
-    total = base_without_reserve + reserve
+    total = base_without_reserve + reserve + state_delta
     memory = replace(
         base_memory,
+        kv_cache_gb=round(base_memory.kv_cache_gb + state_delta, 3),
+        recurrent_gb=round(recurrent, 6),
+        recurrent_state_copies=state_copies,
         reserve_gb=round(reserve, 3),
         total_gb=round(total, 3),
         per_device_required_gb=tuple(round(total / count, 3) for _ in range(count)),
@@ -723,10 +742,21 @@ def _kv_cache_gb(
     *,
     weights_gb: float,
 ) -> tuple[float, bool]:
+    layout = metadata.serving_metadata
+    hybrid = metadata.architecture in {"kimi-k3", "kimi-linear", "glm5next"}
+    if hybrid:
+        estimate = _hybrid_cache_gb(metadata, context_tokens, tuning)
+        if estimate is not None:
+            return estimate, True
+        # Never interpret missing hybrid arrays as dense multi-head attention.
+        return _fallback_cache_gb(context_tokens, weights_gb), False
+
     layers = metadata.block_count
     embedding = metadata.embedding_length
     heads = metadata.attention_head_count
-    kv_heads = metadata.attention_head_count_kv or heads
+    kv_heads = metadata.attention_head_count_kv
+    if kv_heads is None:
+        kv_heads = heads
     key_length = metadata.attention_key_length
     value_length = metadata.attention_value_length
     if key_length is None and embedding and heads:
@@ -735,16 +765,87 @@ def _kv_cache_gb(
         value_length = key_length
 
     if layers and kv_heads and key_length and value_length:
-        k_elements = layers * kv_heads * key_length * context_tokens
-        v_elements = layers * kv_heads * value_length * context_tokens
+        head_sum = layers * kv_heads
+        if layout and layout.attention_head_count_kv_by_layer:
+            per_layer = layout.attention_head_count_kv_by_layer
+            if len(per_layer) != layers or 0 in per_layer:
+                return _fallback_cache_gb(context_tokens, weights_gb), False
+            head_sum = sum(per_layer)
+        mla = bool(layout and layout.attention_key_length_mla and layout.attention_value_length_mla)
+        k_elements = head_sum * key_length * context_tokens
+        # llama.cpp stores the absorbed MLA latent once, in K; V aliases it.
+        v_elements = 0 if mla else head_sum * value_length * context_tokens
         k_bytes = _cache_bytes(tuning.cache_type_k)
         v_bytes = _cache_bytes(tuning.cache_type_v)
         return ((k_elements * k_bytes + v_elements * v_bytes) / 1_000_000_000.0, True)
 
+    return _fallback_cache_gb(context_tokens, weights_gb), False
+
+
+def _hybrid_cache_gb(
+    metadata: GgufQuantMetadata,
+    context_tokens: int,
+    tuning: RuntimeTuning,
+) -> float | None:
+    """Account for KDA state, absorbed MLA cache, and GLM's pooled indexer.
+
+    Mirrors llama-hparams.cpp, llama-kv-cache.cpp and llama-memory-hybrid.cpp;
+    see docs/fast-deploy-model-support.md for the pinned source and equations.
+    """
+    layout = metadata.serving_metadata
+    if layout is None or not layout.block_count:
+        return None
+    layers = layout.block_count - layout.nextn_predict_layers
+    kv_heads = layout.attention_head_count_kv_by_layer
+    if (
+        layers <= 0 or len(kv_heads) != layout.block_count
+        or not layout.attention_key_length_mla or not layout.attention_value_length_mla
+        or not layout.attention_kv_lora_rank or not layout.attention_key_length
+        or not layout.kda_head_dim or not layout.attention_head_count
+        or not layout.ssm_conv_kernel or layout.ssm_conv_kernel < 2
+    ):
+        return None
+    trunk = kv_heads[:layers]
+    recurrent_layers = trunk.count(0)
+    attention_layers = layers - recurrent_layers
+    if not recurrent_layers or not attention_layers:
+        return None
+    # Cache dimensions in GGUF already describe the compressed latent, not
+    # the expanded query-head projections. Zero heads identify recurrent layers.
+    cache_bytes = sum(trunk) * layout.attention_key_length * context_tokens * _cache_bytes(tuning.cache_type_k)
+    if metadata.architecture == "glm5next":
+        if not layout.indexer_key_length or not layout.indexer_kpool:
+            return None
+        # Full per-token key, compressor gate, and pooled key. The indexer is
+        # never below f16 precision even when the target cache is quantized.
+        index_bytes = max(2.0, _cache_bytes(tuning.cache_type_k))
+        cache_bytes += attention_layers * 3 * layout.indexer_key_length * context_tokens * index_bytes
+    return cache_bytes / 1_000_000_000.0 + _hybrid_recurrent_gb(metadata, tuning)
+
+
+def _recurrent_state_copies(tuning: RuntimeTuning) -> int:
+    rollback = tuning.speculative_decoding.num_speculative_tokens if tuning.speculative_decoding else 0
+    return max(1, tuning.parallel_slots) * (1 + rollback)
+
+
+def _hybrid_recurrent_gb(metadata: GgufQuantMetadata, tuning: RuntimeTuning) -> float:
+    layout = metadata.serving_metadata
+    if not layout or not layout.block_count or not layout.kda_head_dim or not layout.attention_head_count:
+        return 0.0
+    layers = layout.block_count - layout.nextn_predict_layers
+    recurrent_layers = layout.attention_head_count_kv_by_layer[:layers].count(0)
+    head_dim = layout.kda_head_dim
+    heads = layout.attention_head_count
+    conv_elements = 3 * ((layout.ssm_conv_kernel or 4) - 1) * heads * head_dim
+    state_elements = heads * head_dim * head_dim
+    return recurrent_layers * (conv_elements + state_elements) * 4 * _recurrent_state_copies(tuning) / 1_000_000_000.0
+
+
+def _fallback_cache_gb(context_tokens: int, weights_gb: float) -> float:
     # The fallback intentionally grows aggressively with context. It prevents
     # the old failure mode where only the weight file size influenced fit.
     context_units = context_tokens / 32768.0
-    return (max(1.0, context_units * 0.10 * max(1.0, weights_gb)), False)
+    return max(1.0, context_units * 0.10 * max(1.0, weights_gb))
 
 
 def _cache_bytes(cache_type: str) -> float:
@@ -818,6 +919,8 @@ def _attestation_from_dict(raw: Any) -> RuntimeAttestation | None:
                 ),
                 confidence=float(memory_raw.get("confidence", 0.0)),
                 source=str(memory_raw.get("source") or "runtime"),
+                recurrent_gb=float(memory_raw.get("recurrent_gb", 0.0)),
+                recurrent_state_copies=int(memory_raw.get("recurrent_state_copies", 1)),
                 total_layer_count=(
                     int(memory_raw["total_layer_count"])
                     if memory_raw.get("total_layer_count") is not None

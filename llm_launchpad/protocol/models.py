@@ -168,6 +168,21 @@ class MemoryEstimate:
     confidence: float = 0.0
     source: str = "estimated"
     total_layer_count: int | None = None
+    # Recurrent state is included in kv_cache_gb; retain its contribution so
+    # changing concurrency can resize state without scaling the token cache.
+    recurrent_gb: float = 0.0
+    recurrent_state_copies: int = 1
+
+
+@dataclass(frozen=True)
+class CatalogExclusion:
+    """A discovered model omitted from Fast Deploy, with a reviewable reason."""
+
+    model_id: str
+    display_name: str
+    repo_id: str
+    reason: str
+    rank: int | None = None
 
 
 @dataclass(frozen=True)

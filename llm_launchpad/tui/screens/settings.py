@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 
+from rich.markup import escape
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
@@ -100,7 +101,7 @@ class SettingsScreen(CopyEnabledScreen):
                 yield Static("")
                 yield Button("Save", id="save-btn", variant="primary")
                 yield Static(
-                    f"[yellow]{self._load_error} Using defaults.[/yellow]"
+                    f"[yellow]{escape(self._load_error)} Using defaults.[/yellow]"
                     if self._load_error
                     else "",
                     id="save-feedback",
@@ -175,7 +176,7 @@ class SettingsScreen(CopyEnabledScreen):
             self._apply_behavior_settings(settings)
         else:
             self.query_one("#save-feedback", Static).update(
-                f"[red]{result.error or 'Settings could not be saved.'}[/red]"
+                f"[red]{escape(result.error or 'Settings could not be saved.')}[/red]"
             )
 
     def _apply_behavior_settings(self, settings: LaunchpadSettings) -> None:

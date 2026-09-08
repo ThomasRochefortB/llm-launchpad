@@ -11,9 +11,10 @@ import re
 
 from rich.markup import escape
 from textual import events
+from textual.actions import SkipAction
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, Footer, Input, Static
 
 from ...protocol.enums import BackendType, DeploymentState, OperationType
@@ -110,7 +111,7 @@ class MonitorScreen(CopyEnabledScreen):
         Binding("shift+n", "previous_search_match", show=False),
         Binding("v", "toggle_log_view", "Raw/Summary", show=True),
         Binding("ctrl+l", "clear_log", "Clear log", show=True),
-        Binding("enter", "finish_success", "Done", show=False, priority=True),
+        Binding("enter", "submit_or_finish", "Done", show=False, priority=True),
         Binding("u", "copy_base_url", "Copy URL", show=False),
         Binding("k", "copy_api_key", "Copy key", show=False),
     ]
@@ -162,7 +163,7 @@ class MonitorScreen(CopyEnabledScreen):
                 id="monitor-search",
                 classes="hidden",
             )
-            with Vertical(id="connection-card", classes="hidden"):
+            with VerticalScroll(id="connection-card", classes="hidden"):
                 yield Static("[bold #7bf168]Connection[/]", id="connection-card-title")
                 yield Static("", id="connection-card-body")
                 with Horizontal(id="connection-card-actions"):
@@ -171,7 +172,7 @@ class MonitorScreen(CopyEnabledScreen):
                     yield Button("Copy all", id="copy-all-btn")
                     yield Button("Manage endpoint", id="connection-manage-btn")
                     yield Button("Done", id="connection-done-btn", variant="primary")
-            with Vertical(id="result-card", classes="hidden"):
+            with VerticalScroll(id="result-card", classes="hidden"):
                 yield Static("[bold #7bf168]Result[/]", id="result-card-title")
                 yield Static("", id="result-card-body")
                 with Horizontal(id="result-card-actions"):
@@ -355,7 +356,7 @@ class MonitorScreen(CopyEnabledScreen):
         if not rows:
             return
         self._result_rows = rows
-        card = self.query_one("#result-card", Vertical)
+        card = self.query_one("#result-card", VerticalScroll)
         card.remove_class("hidden")
         self.query_one("#result-card-body", Static).update(_result_card_markup(rows))
         self.query_one("#result-done-btn", Button).focus()
@@ -418,7 +419,7 @@ class MonitorScreen(CopyEnabledScreen):
         payload = self._connection_payload
         if payload is None:
             return
-        card = self.query_one("#connection-card", Vertical)
+        card = self.query_one("#connection-card", VerticalScroll)
         card.remove_class("hidden")
         self.query_one("#connection-card-body", Static).update(
             _connection_card_markup(payload)
@@ -473,13 +474,23 @@ class MonitorScreen(CopyEnabledScreen):
         elif event.button.id == "result-done-btn":
             self.action_finish_success()
 
+    def action_submit_or_finish(self) -> None:
+        """Let Enter activate focused buttons before applying the Done shortcut."""
+        if isinstance(self.focused, Button):
+            raise SkipAction()
+        self.action_finish_success()
+
     def action_finish_success(self) -> None:
+        search = self.query_one("#monitor-search", Input)
+        if search.has_focus:
+            search.display = False
+            self.log_viewer.log_widget.focus()
+            return
         if self._success and self._connection_payload:
             self._pop_after_success()
             return
-        if self._done and not self._success:
-            # Pop back to the form that started the operation so the user can
-            # adjust options and retry without navigating from scratch.
+        if self._done:
+            # Return to the originating flow after completion or a failure.
             self.app.pop_screen()
 
     def action_open_manage(self) -> None:
@@ -547,7 +558,7 @@ class MonitorScreen(CopyEnabledScreen):
         self._line_count = 0
         self._result_rows = []
         try:
-            self.query_one("#result-card", Vertical).add_class("hidden")
+            self.query_one("#result-card", VerticalScroll).add_class("hidden")
         except Exception:
             pass
         self.query_one("#monitor-view-status", Static).update(

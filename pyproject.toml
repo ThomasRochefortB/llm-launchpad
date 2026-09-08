@@ -58,7 +58,7 @@ version = { attr = "llm_launchpad._version.__version__" }
 
 [tool.setuptools.package-data]
 "llm_launchpad.tui" = ["theme.tcss"]
-"llm_launchpad.data" = ["*.json"]
+"llm_launchpad.data" = ["*.json", "*.dockerfile"]
 
 [dependency-groups]
 dev = [

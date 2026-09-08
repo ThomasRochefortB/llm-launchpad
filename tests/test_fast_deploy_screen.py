@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 import threading
 import unittest
 from unittest.mock import patch
 
 from textual.app import App
-from textual.widgets import OptionList, Static
+from textual.widgets import Input, OptionList, Static
 
 from llm_launchpad.core import quick_deploy
 from llm_launchpad.core.compute_availability import aggregate_compute_availability
@@ -19,12 +20,13 @@ from llm_launchpad.core.quick_deploy import (
 )
 from llm_launchpad.core.prime_backend import preferred_prime_offer_image
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider
-from llm_launchpad.protocol.models import ComputeOffer, InferencePlan
+from llm_launchpad.protocol.models import CatalogExclusion, ComputeOffer, InferencePlan
 from llm_launchpad.tui.app import TuiApp
 from llm_launchpad.tui.screens.fast_deploy import (
     FastDeployAvailabilityFailed,
     FastDeployAvailabilityLoaded,
     FastDeployScreen,
+    CatalogExclusionsScreen,
     _gpu_filter_options,
     infra_rows_for_model,
     representative_profiles_for_model,
@@ -150,6 +152,118 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
         self._availability_patch.stop()
         _qd._reset_quick_deploy_catalog_cache()
+
+    async def test_excluded_models_explain_missing_entries_and_return_to_selection(self) -> None:
+        model = _model((_profile("available", required_vram_gb=8.0),))
+        info = QuickDeployCatalogInfo(source_label="test", exclusions=(
+            CatalogExclusion("new", "New [model]", "org/new", "Hybrid layout is incomplete; GPU fit cannot be verified."),
+        ))
+        app = _StyledApp()
+        with (
+            patch("llm_launchpad.tui.screens.fast_deploy.list_quick_deploy_models", return_value=(model,)),
+            patch("llm_launchpad.tui.screens.fast_deploy.get_quick_deploy_catalog_info", return_value=info),
+        ):
+            async with app.run_test(size=(80, 24)) as pilot:
+                app.push_screen(FastDeployScreen())
+                await pilot.pause()
+                original = app.screen
+                await pilot.press("x")
+                await pilot.pause()
+                self.assertIsInstance(app.screen, CatalogExclusionsScreen)
+                detail = str(app.screen.query_one("#fast-deploy-detail", Static).content)
+                self.assertIn("GPU fit cannot be verified", detail)
+                self.assertIn("org/new", detail)
+                await pilot.press("enter")
+                self.assertFalse(app.quick_deploy_calls)
+                await pilot.press("escape")
+                self.assertIs(app.screen, original)
+                self.assertEqual(original._highlighted_model_id(), model.id)
+
+    async def test_size_sections_preserve_rank_and_keyboard_selection_across_resize(self) -> None:
+        # Catalog rank order deliberately interleaves sizes and differs from name order.
+        models = tuple(
+            _model((replace(_profile(name, required_vram_gb=8.0), model_size_label=size),))
+            for name, size in (
+                ("large", "Large >150B"),
+                ("z-small", "Compact ≤40B"),
+                ("medium", "Medium 40–150B"),
+                ("a-small", "Compact ≤40B"),
+                ("unknown", None),
+            )
+        )
+        app = _StyledApp()
+        with patch(
+            "llm_launchpad.tui.screens.fast_deploy.list_quick_deploy_models",
+            return_value=models,
+        ):
+            async with app.run_test(size=(140, 42)) as pilot:
+                app.push_screen(FastDeployScreen())
+                await pilot.pause()
+                screen = app.screen
+                assert isinstance(screen, FastDeployScreen)
+                options = screen.query_one("#fast-deploy-list", OptionList)
+                self.assertEqual(
+                    [options.get_option_at_index(i).id for i in range(options.option_count)],
+                    [None, "z-small", "a-small", None, "medium", None, "large", None, "unknown"],
+                )
+                self.assertEqual(screen._highlighted_model_id(), "z-small")
+                await pilot.press("down", "down")
+                self.assertEqual(screen._highlighted_model_id(), "medium")
+                self.assertIn("Medium", str(screen.query_one("#fast-deploy-detail", Static).content))
+
+                for size in ((80, 24), (60, 20), (40, 12), (140, 42)):
+                    with self.subTest(size=size):
+                        await pilot.resize_terminal(*size)
+                        await pilot.pause()
+                        self.assertEqual(screen._highlighted_model_id(), "medium")
+                        if size == (40, 12):
+                            self.assertGreater(options.scroll_y, 0)
+                        for index, heading in (
+                            (0, "Small · ≤40B"), (3, "Medium · >40–150B"),
+                            (5, "Large · >150B"), (7, "Size unknown"),
+                        ):
+                            option = options.get_option_at_index(index)
+                            self.assertTrue(option.disabled)
+                            self.assertIn(heading, str(option.prompt))
+
+                with patch.object(screen, "_choose") as choose:
+                    await pilot.press("enter")
+                    choose.assert_called_once_with("medium")
+
+    async def test_search_removes_empty_sections_and_keeps_typing_focus(self) -> None:
+        models = tuple(
+            _model((replace(_profile(name, required_vram_gb=8.0), model_size_label=size),))
+            for name, size in (("small", "Compact ≤40B"), ("medium", "Medium 40–150B"))
+        )
+        app = _StyledApp()
+        with patch(
+            "llm_launchpad.tui.screens.fast_deploy.list_quick_deploy_models",
+            return_value=models,
+        ):
+            async with app.run_test(size=(140, 42)) as pilot:
+                app.push_screen(FastDeployScreen())
+                await pilot.pause()
+                screen = app.screen
+                assert isinstance(screen, FastDeployScreen)
+                search = screen.query_one("#fast-deploy-model-search", Input)
+                search.focus()
+                await pilot.press("m", "e", "d")
+                await pilot.pause()
+                self.assertEqual(search.value, "med")
+                self.assertIs(screen.focused, search)
+                options = screen.query_one("#fast-deploy-list", OptionList)
+                self.assertEqual(options.option_count, 2)
+                self.assertIn("Medium", str(options.get_option_at_index(0).prompt))
+                self.assertEqual(screen._highlighted_model_id(), "medium")
+
+                search.value = ""
+                await pilot.pause()
+                self.assertEqual(options.option_count, 4)
+                self.assertEqual(screen._highlighted_model_id(), "medium")
+                search.value = "no-match"
+                await pilot.pause()
+                self.assertEqual(options.option_count, 1)
+                self.assertTrue(options.get_option_at_index(0).disabled)
 
     async def test_model_list_renders_catalog_models(self) -> None:
         model = _model((_profile("test-model", required_vram_gb=100.0),))
@@ -515,14 +629,22 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 self.assertGreaterEqual(detail.size.height, 3)
 
     async def test_gpu_filter_limits_model_list_to_compatible_shapes(self) -> None:
-        small = _model((_profile("small-fit", required_vram_gb=20.0, gpu_type="T4"),))
+        small = _model(
+            (replace(
+                _profile("small-fit", required_vram_gb=20.0, gpu_type="T4"),
+                model_size_label="Compact ≤40B",
+            ),)
+        )
         huge = _model(
             (
-                _profile(
-                    "huge-fit",
-                    required_vram_gb=200.0,
-                    gpu_type="B200",
-                    display_name="Huge Model",
+                replace(
+                    _profile(
+                        "huge-fit",
+                        required_vram_gb=200.0,
+                        gpu_type="B200",
+                        display_name="Huge Model",
+                    ),
+                    model_size_label="Large >150B",
                 ),
             )
         )
@@ -559,7 +681,9 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                     option_list.get_option_at_index(index).id
                     for index in range(option_list.option_count)
                 ]
-                self.assertEqual(ids, ["small-fit"])
+                self.assertEqual(ids, [None, "small-fit"])
+                self.assertIn("Small", str(option_list.get_option_at_index(0).prompt))
+                self.assertEqual(screen._highlighted_model_id(), "small-fit")
                 status = str(screen.query_one("#fast-deploy-status", Static).renderable)
                 self.assertIn(gpu_type, status)
 

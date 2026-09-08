@@ -42,6 +42,39 @@ def _gguf_metadata(rows: list[tuple[str, int, object]]) -> bytes:
 
 
 class GgufMetadataTests(unittest.TestCase):
+    def test_serving_parser_preserves_zero_heads_and_layer_arrays(self) -> None:
+        payload = bytearray(_gguf_metadata([
+            ("general.architecture", 8, "kimi-k3"),
+            ("kimi-k3.block_count", 4, 4),
+            ("kimi-k3.kda.head_dim", 4, 128),
+            ("kimi-k3.attention.key_length_mla", 4, 192),
+            ("clip.block_count", 4, 900),
+        ]))
+        # Append the uint32 array encoding, including recurrent-layer zeros.
+        struct.pack_into("<Q", payload, 16, 6)
+        payload.extend(_gguf_string("kimi-k3.attention.head_count_kv"))
+        payload.extend(struct.pack("<IIQ4I", 9, 4, 4, 0, 0, 0, 1))
+        metadata = parse_gguf_serving_metadata(bytes(payload))
+        self.assertEqual(metadata.block_count, 4)
+        self.assertEqual(metadata.attention_head_count_kv_by_layer, (0, 0, 0, 1))
+        self.assertIsNone(metadata.attention_head_count_kv)
+        self.assertEqual(metadata.kda_head_dim, 128)
+        self.assertEqual(metadata.attention_key_length_mla, 192)
+
+        zero = parse_gguf_serving_metadata(_gguf_metadata([
+            ("general.architecture", 8, "kimi-k3"),
+            ("kimi-k3.attention.head_count_kv", 4, 0),
+        ]))
+        self.assertEqual(zero.attention_head_count_kv, 0)
+
+    def test_serving_parser_bounds_captured_arrays(self) -> None:
+        payload = bytearray(_gguf_metadata([("general.architecture", 8, "kimi-k3")]))
+        struct.pack_into("<Q", payload, 16, 2)
+        payload.extend(_gguf_string("kimi-k3.attention.head_count_kv"))
+        payload.extend(struct.pack("<IIQ", 9, 4, 8193))
+        with self.assertRaisesRegex(ValueError, "layer limit"):
+            parse_gguf_serving_metadata(bytes(payload))
+
     def test_serving_parser_reads_architecture_shape(self) -> None:
         payload = _gguf_metadata(
             [
@@ -107,6 +140,47 @@ class GgufMetadataTests(unittest.TestCase):
         self.assertIsNotNone(metadata)
         self.assertEqual(metadata.context_length, 131_072)  # type: ignore[union-attr]
         self.assertGreater(len(ranges), 1)
+
+    def test_large_header_reads_grow_geometrically_and_keep_late_fields(self) -> None:
+        payload = _gguf_metadata([
+            ("general.architecture", 8, "llama"),
+            ("tokenizer.ggml.tokens", 9, ["x" * 400]),
+            ("llama.context_length", 4, 131_072),
+        ])
+        ranges: list[tuple[int, int]] = []
+
+        def fetch(repo_id: str, filename: str, *, start: int, end: int, **kwargs: object) -> bytes:
+            ranges.append((start, end))
+            return payload[start:end + 1]
+
+        with patch.object(gguf_metadata, "_fetch_hf_file_range", side_effect=fetch):
+            metadata = fetch_gguf_serving_metadata(
+                "org/model", [SimpleNamespace(rfilename="model.gguf")], chunk_bytes=64, max_bytes=800,
+            )
+        self.assertIsNotNone(metadata)
+        self.assertEqual(metadata.context_length, 131_072)
+        self.assertEqual(ranges, [(0, 63), (64, 191), (192, 447), (448, 799)])
+
+    def test_growing_header_reads_never_exceed_inspection_limit(self) -> None:
+        payload = _gguf_metadata([
+            ("general.architecture", 8, "llama"),
+            ("tokenizer.ggml.tokens", 9, ["x" * 800]),
+            ("llama.context_length", 4, 131_072),
+        ])
+        for fetcher in (fetch_gguf_serving_metadata, fetch_gguf_mtp_capability):
+            with self.subTest(fetcher=fetcher.__name__):
+                with patch.object(gguf_metadata, "_fetch_hf_file_range", side_effect=(
+                    lambda *args, start, end, **kwargs: payload[start:end + 1]
+                )) as fetch:
+                    result = fetcher(
+                        "org/model", [SimpleNamespace(rfilename="model.gguf")], chunk_bytes=64, max_bytes=500,
+                    )
+                self.assertEqual(fetch.call_count, 4)
+                self.assertEqual(fetch.call_args.kwargs["end"], 499)
+                if fetcher is fetch_gguf_serving_metadata:
+                    self.assertIsNone(result)
+                else:
+                    self.assertEqual(result.status, GgufMtpStatus.UNKNOWN)
 
     def test_parser_detects_embedded_nextn_without_tensor_data(self) -> None:
         payload = _gguf_metadata(

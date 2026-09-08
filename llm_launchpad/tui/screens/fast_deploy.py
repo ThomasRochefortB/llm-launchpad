@@ -23,6 +23,7 @@ from ...core.compute_availability import (
 )
 from ...core.llamacpp_planner import assessment_score
 from ...core.serving_tiers import ServingTier, serving_tiers
+from ...core.runtime_support import load_llamacpp_support_manifest
 from ...protocol.enums import ServingObjective
 from ...core.deploy_log_summary import SUMMARY_SPINNER_FRAMES
 from ...core.quick_deploy import (
@@ -38,6 +39,7 @@ from ...core.quick_deploy import (
 )
 from ...protocol.enums import ComputeProvider
 from ...protocol.models import (
+    CatalogExclusion,
     ComputeAvailabilitySnapshot,
     ComputeConfiguration,
     InferencePlan,
@@ -218,6 +220,17 @@ def _model_option(
     )
 
 
+def _model_size_section(model: QuickDeployModel) -> str:
+    label = (model.profiles[0].model_size_label or "").strip().casefold()
+    if label.startswith(("compact", "small")):
+        return "Small · ≤40B"
+    if label.startswith("medium"):
+        return "Medium · >40–150B"
+    if label.startswith("large"):
+        return "Large · >150B"
+    return "Size unknown"
+
+
 def _unique_quant_labels(model: QuickDeployModel) -> tuple[str, ...]:
     labels: list[str] = []
     seen: set[str] = set()
@@ -252,11 +265,15 @@ def _model_detail(model: QuickDeployModel) -> str:
         if model.quality_score is not None
         else "unranked"
     )
+    runtime_note = (
+        "\n[dim]First launch builds a model-compatible runtime and may take longer.[/]"
+        if load_llamacpp_support_manifest(model.profiles[0].gguf_architecture).build_recipe else ""
+    )
     return (
         f"[bold]{escape(model.display_name)}[/bold]  "
         f"{escape(format_context_length(model.max_context_tokens))}\n"
         f"[dim]{score} · {_quant_options_label(model)} · "
-        f"pick one to see live infrastructure[/dim]"
+        f"pick one to see live infrastructure[/dim]{runtime_note}"
     )
 
 
@@ -551,6 +568,42 @@ def _fallback_detail(profile: QuickDeployProfile) -> str:
     )
 
 
+class CatalogExclusionsScreen(CopyEnabledScreen):
+    """Explain why discovered models were omitted from the shortlist."""
+
+    BINDINGS = [Binding("escape", "pop_screen", "Back")]
+
+    def __init__(self, exclusions: tuple[CatalogExclusion, ...]) -> None:
+        super().__init__()
+        self.exclusions = exclusions
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="fast-deploy-container"):
+            yield Static("[bold #7bf168]Excluded models[/]", id="fast-deploy-title")
+            yield Static(
+                "Checked candidates only; discovery stops when each size category is full.",
+                id="fast-deploy-subtitle",
+            )
+            yield OptionList(
+                *(Option(escape(row.display_name), id=str(i)) for i, row in enumerate(self.exclusions)),
+                id="fast-deploy-list",
+            )
+            yield Static("", id="fast-deploy-detail")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one(OptionList).focus()
+
+    def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
+        row = self.exclusions[int(event.option.id or "0")]
+        self.query_one("#fast-deploy-detail", Static).update(
+            f"[bold]{escape(row.display_name)}[/]\n{escape(row.reason)}\n[dim]{escape(row.repo_id)}[/]"
+        )
+
+    def action_pop_screen(self) -> None:
+        self.app.pop_screen()
+
+
 class FastDeployScreen(CopyEnabledScreen):
     """Pick a catalog model, filter by GPU, then confirm a live placement."""
 
@@ -560,6 +613,7 @@ class FastDeployScreen(CopyEnabledScreen):
         Binding("g", "focus_gpu_filter", "GPU filter", show=True),
         Binding("/", "focus_model_search", "Search", show=True),
         Binding("a", "toggle_all_placements", "Compare all", show=True),
+        Binding("x", "show_excluded_models", "Excluded models", show=True),
     ]
 
     def __init__(self) -> None:
@@ -1111,17 +1165,36 @@ class FastDeployScreen(CopyEnabledScreen):
         if not visible and not self._catalog_info.ready:
             self._render_catalog_unavailable(option_list)
             return
-        options = [
-            Option(
-                _model_option(
-                    model,
-                    self.viewport_profile.width_mode,
-                    snapshot=self._snapshot,
-                ),
-                id=model.id,
-            )
-            for model in visible
-        ]
+        sections: dict[str, list[QuickDeployModel]] = {
+            "Small · ≤40B": [],
+            "Medium · >40–150B": [],
+            "Large · >150B": [],
+            "Size unknown": [],
+        }
+        for model in visible:
+            sections[_model_size_section(model)].append(model)
+        options: list[Option] = []
+        model_indices: dict[str, int] = {}
+        # Legacy catalogs without size metadata retain a plain model list.
+        show_headings = any(rows for title, rows in sections.items() if title != "Size unknown")
+        for title, models in sections.items():
+            if not models:
+                continue
+            if show_headings:
+                options.append(Option(f"[bold #7bf168]{title}[/]", disabled=True))
+            # The catalog already ranks models; preserve that order within a section.
+            for model in models:
+                model_indices[model.id] = len(options)
+                options.append(
+                    Option(
+                        _model_option(
+                            model,
+                            self.viewport_profile.width_mode,
+                            snapshot=self._snapshot,
+                        ),
+                        id=model.id,
+                    )
+                )
         if not options:
             if self._gpu_filter != "any":
                 options = [
@@ -1133,15 +1206,13 @@ class FastDeployScreen(CopyEnabledScreen):
             else:
                 options = [Option("  No models in the quick-deploy catalog", disabled=True)]
         option_list.set_options(options)
-        highlight_index = 0
-        if preferred_id is not None:
-            for index, model in enumerate(visible):
-                if model.id == preferred_id:
-                    highlight_index = index
-                    break
         if visible:
-            option_list.highlighted = highlight_index
-            self._update_model_detail(visible[highlight_index])
+            selected_id = preferred_id if preferred_id in model_indices else next(iter(model_indices))
+            option_list.highlighted = model_indices[selected_id]
+            self._update_model_detail(self._model_by_id[selected_id])
+            # A resize can retain the index while changing row heights; wait
+            # for layout before making the selected model visible again.
+            self.call_after_refresh(option_list.scroll_to_highlight)
         else:
             self.query_one("#fast-deploy-detail", Static).update("")
         self.query_one("#fast-deploy-subtitle", Static).update(_subtitle(self._catalog_info))
@@ -1151,11 +1222,17 @@ class FastDeployScreen(CopyEnabledScreen):
             filter_note = f" · GPU {escape(self._gpu_filter)}"
         query = self._model_search.strip()
         search_note = f" · search: {escape(query)}" if query else ""
+        excluded_note = (
+            f" · {len(self._catalog_info.exclusions)} excluded (x)"
+            if self._catalog_info.exclusions else ""
+        )
         self.query_one("#fast-deploy-status", Static).update(
-            f"[dim]{len(visible)} model{plural}{filter_note}{search_note} · "
+            f"[dim]{len(visible)} model{plural}{filter_note}{search_note}{excluded_note} · "
             f"{escape(self._catalog_info.source_label)}[/dim]"
         )
-        if getattr(self.focused, "id", "") != "fast-deploy-gpu-filter":
+        if getattr(self.focused, "id", "") not in {
+            "fast-deploy-gpu-filter", "fast-deploy-model-search",
+        }:
             option_list.focus()
 
     def _populate_gpu_filter(self, snapshot: ComputeAvailabilitySnapshot) -> None:
@@ -1215,6 +1292,12 @@ class FastDeployScreen(CopyEnabledScreen):
 
     def action_focus_gpu_filter(self) -> None:
         self.query_one("#fast-deploy-gpu-filter", Select).focus()
+
+    def action_show_excluded_models(self) -> None:
+        if self._catalog_info.exclusions:
+            self.app.push_screen(CatalogExclusionsScreen(self._catalog_info.exclusions))
+        else:
+            self.notify("No model exclusions were recorded for this catalog.", timeout=3)
 
     def action_focus_model_search(self) -> None:
         search = self.query_one("#fast-deploy-model-search", Input)

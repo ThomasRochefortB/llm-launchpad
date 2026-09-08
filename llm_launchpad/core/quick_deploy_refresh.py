@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, replace
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
+from collections import deque
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, UTC
 from difflib import SequenceMatcher
 import json
@@ -38,6 +39,7 @@ from .modal_gpu import ModalGpuSpec, fetch_modal_gpu_catalog
 from .naming import slugify_instance_name
 from .quick_deploy import QuickDeployCatalogInfo, QuickDeployProfile
 from .llamacpp_planner import (
+    tuning_for_architecture,
     compile_server_args,
     estimate_memory,
     serving_requirements,
@@ -46,6 +48,7 @@ from .llamacpp_planner import (
 from .runtime_support import evaluate_llamacpp_architecture, evaluate_llamacpp_mtp
 from ..protocol.enums import ServingObjective, SpeculativeDecodingMethod
 from ..protocol.models import (
+    CatalogExclusion,
     MemoryEstimate,
     RuntimeTuning,
     ServingRequirements,
@@ -117,7 +120,7 @@ def _quick_deploy_catalog_cache_path() -> Path:
 
 
 QUICK_DEPLOY_CATALOG_CACHE_TTL = timedelta(hours=6)
-QUICK_DEPLOY_CATALOG_CACHE_SCHEMA_VERSION = 2
+QUICK_DEPLOY_CATALOG_CACHE_SCHEMA_VERSION = 3
 _MODEL_SIZE_BUCKETS: tuple[ModelSizeBucket, ...] = ("compact", "medium", "large")
 _MODEL_SIZE_LABELS: dict[ModelSizeBucket, str] = {
     "compact": "Compact ≤40B",
@@ -217,12 +220,14 @@ def build_live_quick_deploy_catalog(
         rankings = rankings_future.result()
         modal_gpu_catalog, has_live_modal_pricing = gpu_future.result()
 
+    exclusions: list[CatalogExclusion] = []
     if rankings is not None:
         profiles = _profiles_from_aa_rankings(
             rankings.candidates,
             modal_gpu_catalog,
             model_limit=normalized_model_limit,
             candidate_limit=normalized_candidate_limit,
+            exclusions=exclusions,
         )
         if profiles:
             tier_suffix = f", {rankings.tier} tier" if rankings.tier else ""
@@ -238,6 +243,7 @@ def build_live_quick_deploy_catalog(
                     "GPU pricing sourced from Modal."
                 ),
                 is_live=True,
+                exclusions=tuple(sorted(exclusions, key=lambda row: row.rank or 10**9)),
             )
             retained = _retained_catalog_for(profiles)
             if retained is not None:
@@ -250,6 +256,7 @@ def build_live_quick_deploy_catalog(
         modal_gpu_catalog=modal_gpu_catalog,
         has_live_modal_pricing=has_live_modal_pricing,
     )
+    fallback = (replace(fallback[0], exclusions=tuple(exclusions)), fallback[1])
     _write_quick_deploy_catalog_cache(fallback[0], fallback[1])
     return fallback
 
@@ -406,6 +413,8 @@ def _quick_deploy_profile_to_dict(profile: QuickDeployProfile) -> dict[str, Any]
                 "confidence": memory.confidence,
                 "source": memory.source,
                 "total_layer_count": memory.total_layer_count,
+                "recurrent_gb": memory.recurrent_gb,
+                "recurrent_state_copies": memory.recurrent_state_copies,
             }
             if memory is not None
             else None
@@ -566,6 +575,8 @@ def _memory_estimate_from_dict(payload: Any) -> MemoryEstimate | None:
             ),
             confidence=float(payload.get("confidence", 0.0)),
             source=str(payload.get("source") or "estimated"),
+            recurrent_gb=float(payload.get("recurrent_gb", 0.0)),
+            recurrent_state_copies=int(payload.get("recurrent_state_copies", 1)),
             total_layer_count=(
                 int(payload["total_layer_count"])
                 if payload.get("total_layer_count") is not None
@@ -585,6 +596,7 @@ def _quick_deploy_catalog_info_to_dict(info: QuickDeployCatalogInfo) -> dict[str
         "is_live": info.is_live,
         "ready": info.ready,
         "error": info.error,
+        "exclusions": [asdict(row) for row in info.exclusions],
     }
 
 
@@ -600,6 +612,7 @@ def _quick_deploy_catalog_info_from_dict(payload: Any) -> QuickDeployCatalogInfo
             is_live=bool(payload.get("is_live", True)),
             ready=bool(payload.get("ready", True)),
             error=payload.get("error"),
+            exclusions=tuple(CatalogExclusion(**row) for row in payload.get("exclusions", ())),
         )
     except (ValueError, TypeError):
         return None
@@ -688,6 +701,7 @@ def _profiles_from_aa_rankings(
     *,
     model_limit: int,
     candidate_limit: int,
+    exclusions: list[CatalogExclusion] | None = None,
 ) -> tuple[QuickDeployProfile, ...]:
     """Select the top `model_limit` unique open models in each size bucket."""
 
@@ -713,43 +727,73 @@ def _profiles_from_aa_rankings(
     }
     seen_repos: set[str] = set()
     repo_by_model_key: dict[str, str] = {}
-    resolved_by_candidate: dict[int, _ResolvedAAModel | None] = {}
     try:
         from huggingface_hub import HfApi
 
         shared_hf_api: Any | None = HfApi()
     except Exception:
         shared_hf_api = None
+
+    # Keep a bounded lookahead, then consume results in benchmark order. A
+    # faster response must never displace a higher-ranked eligible model.
+    # Once a category is full, its remaining known-size candidates cannot
+    # change the shortlist and need no further Hub inspection. Unknown sizes
+    # remain eligible until all categories are full.
+    remaining = iter(deduped_window)
+    pending: deque[tuple[AAModelCandidate, Future[_ResolvedAAModel | None], list[CatalogExclusion]]] = deque()
+
+    def category_full(candidate: AAModelCandidate) -> bool:
+        bucket = _size_bucket_for_parameters(candidate.parameter_count_b)
+        return bucket is not None and len(selected_by_bucket[bucket]) >= model_limit
+
     executor = ThreadPoolExecutor(max_workers=_AA_RESOLUTION_WORKERS)
-    try:
-        futures = {
-            executor.submit(
+
+    def fill_pending() -> None:
+        while len(pending) < _AA_RESOLUTION_WORKERS:
+            candidate = next(remaining, None)
+            if candidate is None:
+                break
+            if category_full(candidate):
+                continue
+            # Workers own their diagnostics. Cancelled/unused lookahead must
+            # not mutate an already-published catalog after this call returns.
+            reasons: list[CatalogExclusion] = []
+            future = executor.submit(
                 _resolve_aa_model,
                 candidate,
                 modal_gpu_catalog,
                 repo_by_model_key=repo_by_model_key,
                 hf_api=shared_hf_api,
-            ): candidate
-            for candidate in deduped_window
-        }
-        for completed in as_completed(futures):
-            resolved_by_candidate[id(futures[completed])] = completed.result()
+                exclusions=reasons,
+            )
+            pending.append((candidate, future, reasons))
+
+    try:
+        fill_pending()
+        while pending:
+            candidate, future, reasons = pending.popleft()
+            if category_full(candidate):
+                future.cancel()
+                fill_pending()
+                continue
+            resolved = future.result()
+            if exclusions is not None:
+                exclusions.extend(reasons)
+            if resolved is not None and resolved.repo_id and resolved.repo_id not in seen_repos:
+                seen_repos.add(resolved.repo_id)
+                bucket_models = selected_by_bucket[resolved.size_bucket]
+                if len(bucket_models) < model_limit:
+                    bucket_models.append(resolved)
+                else:
+                    _record_exclusion(
+                        exclusions, candidate, resolved.repo_id,
+                        f"Outside the top {model_limit} {_MODEL_SIZE_LABELS[resolved.size_bucket]} recommendations.",
+                    )
+            if all(len(models) >= model_limit for models in selected_by_bucket.values()):
+                break
+            fill_pending()
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
-    for candidate in deduped_window:
-        resolved = resolved_by_candidate.get(id(candidate))
-        if resolved is None or not resolved.repo_id or resolved.repo_id in seen_repos:
-            continue
-        seen_repos.add(resolved.repo_id)
-        bucket_models = selected_by_bucket[resolved.size_bucket]
-        if len(bucket_models) >= model_limit:
-            continue
-        bucket_models.append(resolved)
-        if all(
-            len(selected_by_bucket[bucket]) >= model_limit
-            for bucket in _MODEL_SIZE_BUCKETS
-        ):
-            break
 
     profiles: list[QuickDeployProfile] = []
     for bucket in _MODEL_SIZE_BUCKETS:
@@ -790,6 +834,7 @@ def _resolve_aa_model(
     *,
     repo_by_model_key: dict[str, str] | None = None,
     hf_api: Any | None = None,
+    exclusions: list[CatalogExclusion] | None = None,
 ) -> _ResolvedAAModel | None:
     model_key = _model_key(candidate.name) or _model_key(candidate.slug)
     if repo_by_model_key is not None and model_key in repo_by_model_key:
@@ -797,6 +842,7 @@ def _resolve_aa_model(
             candidate,
             modal_gpu_catalog,
             repo_by_model_key[model_key],
+            exclusions=exclusions,
         )
     try:
         api = hf_api
@@ -809,7 +855,7 @@ def _resolve_aa_model(
         return None
     if repo_id is None:
         return None
-    resolved = _build_resolved_aa_model(candidate, modal_gpu_catalog, repo_id)
+    resolved = _build_resolved_aa_model(candidate, modal_gpu_catalog, repo_id, exclusions=exclusions)
     if resolved is not None and repo_by_model_key is not None and model_key:
         repo_by_model_key[model_key] = repo_id
     return resolved
@@ -819,32 +865,47 @@ def _build_resolved_aa_model(
     candidate: AAModelCandidate,
     modal_gpu_catalog: Sequence[ModalGpuSpec],
     repo_id: str,
+    *,
+    exclusions: list[CatalogExclusion] | None = None,
 ) -> _ResolvedAAModel | None:
     try:
         metadata = _fetch_serving_metadata(repo_id)
     except Exception:
+        _record_exclusion(exclusions, candidate, repo_id, "Could not read Hugging Face serving metadata. Refresh the catalog to retry.")
         return None
     size_bucket = _size_bucket_for_parameters(candidate.parameter_count_b)
     if size_bucket is None:
         size_bucket = _size_bucket_from_gguf_metadata(metadata)
     if size_bucket is None:
+        _record_exclusion(exclusions, candidate, repo_id, "Model size could not be determined from the available metadata.")
         return None
-    if not evaluate_llamacpp_architecture(metadata.architecture).is_supported:
+    compatibility = evaluate_llamacpp_architecture(metadata.architecture)
+    if not compatibility.is_supported:
+        _record_exclusion(exclusions, candidate, repo_id, compatibility.message)
         return None
-    # Fast Deploy only recommends configurations whose memory it models
-    # exactly, and image working memory is not one of them. Vision models stay
-    # available from the manual deploy screens.
     if metadata.has_projector:
+        # Fast Deploy only recommends configurations whose memory it models
+        # exactly, and image working memory is not one of them. The model
+        # stays available from the manual deploy screens.
+        _record_exclusion(
+            exclusions, candidate, repo_id,
+            "Image working memory cannot be estimated, so this vision model is "
+            "not offered as a guaranteed fit. Deploy it manually to use images.",
+        )
         return None
     model = ModelCandidate(repo_id=repo_id)
+    reasons: list[str] = []
     profiles = _profiles_for_model(
         model,
         modal_gpu_catalog,
         metadata=metadata,
         aa_candidate=candidate,
         size_bucket=size_bucket,
+        rejected=reasons,
     )
     if not profiles:
+        reason = " ".join(dict.fromkeys(reasons)) or "No GGUF quantization has a usable weight-size estimate."
+        _record_exclusion(exclusions, candidate, repo_id, reason)
         return None
     # MTP heads only affect the draft-model toggle on the confirm screen, so
     # resolve them lazily after the catalog is already visible (see
@@ -856,6 +917,19 @@ def _build_resolved_aa_model(
         size_bucket=size_bucket,
         profiles=tuple(profiles),
     )
+
+
+def _record_exclusion(
+    exclusions: list[CatalogExclusion] | None,
+    candidate: AAModelCandidate,
+    repo_id: str,
+    reason: str,
+) -> None:
+    if exclusions is not None:
+        exclusions.append(CatalogExclusion(
+            model_id=candidate.aa_model_id or candidate.slug,
+            display_name=candidate.name, repo_id=repo_id, reason=reason, rank=candidate.rank,
+        ))
 
 
 def _build_trending_fallback_catalog(
@@ -952,7 +1026,7 @@ def _find_unsloth_gguf_match(
 
     for repo_id in _canonical_unsloth_gguf_repo_ids(candidate):
         try:
-            row = hf_api.model_info(repo_id=repo_id)
+            row = hf_api.model_info(repo_id=repo_id, timeout=_HF_SEARCH_TIMEOUT_SECONDS)
         except Exception:
             continue
         resolved_repo_id = _repo_id_from_hf_row(row) or repo_id
@@ -1359,6 +1433,7 @@ def _profiles_for_model(
     aa_candidate: AAModelCandidate | None = None,
     size_bucket: ModelSizeBucket | None = None,
     skip_context_lookup: bool = False,
+    rejected: list[str] | None = None,
 ) -> list[QuickDeployProfile]:
     if metadata is None:
         try:
@@ -1400,6 +1475,7 @@ def _profiles_for_model(
                 size_bucket=size_bucket,
                 llamacpp_runtime_id=compatibility.runtime_id,
                 speculative_decoding=None,
+                rejected=rejected,
             )
         )
     return profiles
@@ -1463,6 +1539,7 @@ def _profiles_for_quant(
     size_bucket: ModelSizeBucket | None = None,
     llamacpp_runtime_id: str,
     speculative_decoding: SpeculativeDecodingConfig | None = None,
+    rejected: list[str] | None = None,
 ) -> list[QuickDeployProfile]:
     weights_gb = _required_vram_for_quant(metadata, quant)
     if weights_gb is None:
@@ -1475,12 +1552,17 @@ def _profiles_for_quant(
         requirements.objective,
         speculative_decoding=speculative_decoding,
     )
+    runtime_tuning = tuning_for_architecture(runtime_tuning, metadata.architecture)
     memory_estimate = estimate_memory(
         metadata,
         weights_gb=weights_gb,
         requirements=requirements,
         tuning=runtime_tuning,
     )
+    if metadata.architecture in {"kimi-k3", "kimi-linear", "glm5next"} and memory_estimate.source == "conservative-fallback":
+        if rejected is not None:
+            rejected.append("Hybrid attention memory layout is incomplete; GPU fit cannot be verified. Refresh model metadata to retry.")
+        return []
     required_vram_gb = memory_estimate.total_gb
     selections = (
         ("cheap", _select_gpu_shape(quant, required_vram_gb, modal_gpu_catalog)),
@@ -1574,6 +1656,11 @@ def _profiles_for_quant(
                 runtime_tuning=runtime_tuning,
                 memory_estimate=memory_estimate,
             )
+        )
+    if not profiles and rejected is not None:
+        rejected.append(
+            f"{quant}: estimated {required_vram_gb:,.0f} GB at {context_tokens:,} tokens "
+            "does not fit any priced catalog topology (maximum 8 GPUs)."
         )
     return profiles
 

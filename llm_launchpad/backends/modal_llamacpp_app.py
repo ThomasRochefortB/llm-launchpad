@@ -666,15 +666,28 @@ def _acquire_download_lease(
         model_cache.reload()
 
 
-# --- Use official llama.cpp GHCR server image (CUDA build) and add Python for Modal functions
-image = (
-    modal.Image.from_registry(
-        LLAMA_CPP_IMAGE_REF,
-        add_python="3.12",
-        force_build=LLAMA_CPP_IMAGE_FORCE_BUILD,
-    )
-    .entrypoint([])  # clear image entrypoint so Modal can run Python function code
-)
+# --- Use the official image, or the bundled model-specific source build.
+def _serving_image() -> modal.Image:
+    recipe = os.environ.get("LLAMA_CPP_BUILD_RECIPE", "").strip()
+    if recipe:
+        if recipe != "llamacpp_glm5next.dockerfile":
+            raise ValueError(f"Unknown llama.cpp build recipe: {recipe}")
+        cuda_arch = os.environ.get("LLAMA_CPP_CUDA_ARCHITECTURES", "").strip()
+        if cuda_arch and cuda_arch not in {"75", "80", "86", "89", "90", "100", "120"}:
+            raise ValueError(f"Unknown CUDA architecture: {cuda_arch}")
+        runtime_image = modal.Image.from_dockerfile(
+            Path(__file__).resolve().parents[1] / "data" / recipe,
+            add_python="3.12", force_build=LLAMA_CPP_IMAGE_FORCE_BUILD,
+            build_args={"CUDA_ARCHITECTURES": cuda_arch} if cuda_arch else {},
+        )
+    else:
+        runtime_image = modal.Image.from_registry(
+            LLAMA_CPP_IMAGE_REF, add_python="3.12", force_build=LLAMA_CPP_IMAGE_FORCE_BUILD,
+        )
+    return runtime_image.entrypoint([])
+
+
+image = _serving_image()
 
 
 # --- Separate lightweight image for downloading models

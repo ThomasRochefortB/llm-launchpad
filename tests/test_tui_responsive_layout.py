@@ -13,7 +13,7 @@ from textual.widget import Widget
 from textual.widgets import Footer, Input, OptionList, Static
 
 from llm_launchpad.core.compute_availability import aggregate_compute_availability
-from llm_launchpad.protocol.enums import BackendType
+from llm_launchpad.protocol.enums import BackendType, OperationType
 from llm_launchpad.protocol.models import EndpointInfo
 from llm_launchpad.tui.app import TuiApp
 from llm_launchpad.tui.responsive import HeightMode, ViewportProfile, WidthMode
@@ -26,6 +26,7 @@ from llm_launchpad.tui.screens.fast_deploy import FastDeployScreen
 from llm_launchpad.tui.screens.main_menu import MainMenuScreen
 from llm_launchpad.tui.screens.manage import (
     BenchmarkOptionsScreen,
+    ConnectionInfoScreen,
     EndpointActionsScreen,
     ManageScreen,
     StatusOptionsScreen,
@@ -34,7 +35,9 @@ from llm_launchpad.tui.screens.manage import (
 from llm_launchpad.tui.screens.monitor import MonitorScreen
 from llm_launchpad.tui.screens.quick_deploy import QuickDeployScreen
 from llm_launchpad.tui.screens.settings import SettingsScreen
-from llm_launchpad.tui.screens.storage import StorageScreen
+from llm_launchpad.tui.screens.setup import SetupRequiredScreen
+from llm_launchpad.tui.screens.storage import StorageDeleteConfirmScreen, StorageScreen
+from llm_launchpad.tui.workers import ConnectionSummaryReady, OperationDone
 
 
 class _ScreenApp(App[None]):
@@ -57,6 +60,8 @@ def _viewport_test_endpoint() -> EndpointInfo:
         app_id="ap-test",
         state="running",
         backend=BackendType.VLLM,
+        web_url="https://example.test",
+        endpoint_api_key="audit-example-key",
     )
 
 
@@ -195,6 +200,35 @@ class ResponsiveLayoutTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_operational_monitor_fits_supported_viewports(self) -> None:
         await self._assert_screen_fits_supported_viewports(MonitorScreen("Logs"))
+
+    async def test_completed_deploy_monitor_fits_supported_viewports(self) -> None:
+        class CompletedMonitor(MonitorScreen):
+            def on_mount(self) -> None:
+                super().on_mount()
+                self.post_message(ConnectionSummaryReady({
+                    "base_url": "https://example.test/v1",
+                    "model_id": "org/example",
+                    "display_name": "Example model",
+                    "api_key": "audit-example-key",
+                }))
+                self.post_message(OperationDone(OperationType.DEPLOY, success=True))
+
+        await self._assert_screen_fits_supported_viewports(CompletedMonitor())
+
+    async def test_setup_fits_supported_viewports(self) -> None:
+        await self._assert_screen_fits_supported_viewports(SetupRequiredScreen())
+
+    async def test_connection_info_fits_supported_viewports(self) -> None:
+        await self._assert_screen_fits_supported_viewports(
+            ConnectionInfoScreen(_viewport_test_endpoint())
+        )
+
+    async def test_storage_delete_fits_supported_viewports(self) -> None:
+        from tests.test_storage_screen import _sample_snapshot
+
+        await self._assert_screen_fits_supported_viewports(
+            StorageDeleteConfirmScreen(_sample_snapshot().llamacpp_models[0])
+        )
 
     async def _assert_screen_fits_supported_viewports(
         self,

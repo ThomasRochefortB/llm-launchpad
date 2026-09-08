@@ -9,6 +9,7 @@ from collections.abc import Sequence
 
 from ..protocol.enums import BackendType, ComputeProvider, ServingObjective
 from ..protocol.models import (
+    CatalogExclusion,
     DeploymentConfig,
     InferencePlan,
     InferenceRecipe,
@@ -27,6 +28,7 @@ from .inference_options import (
 )
 from .naming import build_deployment_name, infer_instance_from_app_name, slugify_instance_name
 from .llamacpp_planner import (
+    tuning_for_architecture,
     assess_memory_placement,
     compile_server_args,
     tuning_for_gpu_memory,
@@ -96,6 +98,7 @@ class QuickDeployCatalogInfo:
     is_live: bool = False
     ready: bool = True
     error: str | None = None
+    exclusions: tuple[CatalogExclusion, ...] = ()
 
 
 _PENDING_CATALOG_INFO = QuickDeployCatalogInfo(
@@ -414,6 +417,7 @@ def retune_quick_deploy_plan(
         speculative_decoding=profile.speculative_decoding,
     )
     tuning = tuning_for_gpu_memory(tuning, plan.quote.gpu_memory_gb)
+    tuning = tuning_for_architecture(tuning, profile.gguf_architecture)
     recipe = replace(
         plan.recipe,
         serving_requirements=requirements,

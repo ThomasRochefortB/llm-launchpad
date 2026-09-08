@@ -47,7 +47,7 @@ class LlamaCppRuntimeSupportTests(unittest.TestCase):
         self.assertIn(manifest.image_ref, backend_source)
 
     def test_evaluator_blocks_architecture_absent_from_exact_runtime(self) -> None:
-        decision = evaluate_llamacpp_architecture("glm5next")
+        decision = evaluate_llamacpp_architecture("glm5next", image_ref=DEFAULT_LLAMACPP_IMAGE_REF)
 
         self.assertEqual(decision.status, RuntimeCompatibility.UNSUPPORTED)
         self.assertFalse(decision.is_supported)

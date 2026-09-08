@@ -10,6 +10,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, DataTable, Footer, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
+from ...core.benchmark import parse_concurrency_values
 from ...core.vision_probe import image_test_command
 from ...protocol.enums import VisionVerification
 from ...protocol.models import EndpointInfo, VisionCapabilities
@@ -118,6 +119,7 @@ def _endpoint_compact_label(row: EndpointInfo) -> str:
 
 def _endpoint_summary(row: EndpointInfo) -> str:
     return f"{_endpoint_host(row)} · {_state_label(row.state)}"
+
 
 def _vision_summary(vision: VisionCapabilities | None) -> str:
     """Describe image input without implying a deployment was ever tested."""
@@ -655,6 +657,10 @@ class StatusOptionsScreen(CopyEnabledScreen):
     def action_do_submit(self) -> None:
         self._submit()
 
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        self._submit()
+
     def action_pop_screen(self) -> None:
         self.app.pop_screen()
 
@@ -734,10 +740,22 @@ class BenchmarkOptionsScreen(CopyEnabledScreen):
     def action_do_submit(self) -> None:
         self._submit()
 
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        self._submit()
+
     def action_pop_screen(self) -> None:
         self.app.pop_screen()
 
     def _submit(self) -> None:
+        concurrency = self.query_one("#benchmark-concurrency", Input).value
+        try:
+            parse_concurrency_values(concurrency)
+        except ValueError as exc:
+            self.query_one("#benchmark-feedback", Static).update(
+                f"[red]{escape(str(exc))}[/red]"
+            )
+            return
         request_count_text = self.query_one("#benchmark-request-count", Input).value.strip()
         request_count: int | None = None
         if request_count_text:
@@ -760,15 +778,27 @@ class BenchmarkOptionsScreen(CopyEnabledScreen):
                 "[red]Token lengths must be integers.[/red]"
             )
             return
+        if request_count is not None and request_count <= 0:
+            self.query_one("#benchmark-feedback", Static).update(
+                "[red]Request count must be greater than zero.[/red]"
+            )
+            return
+        if input_tokens <= 0 or output_tokens <= 0:
+            self.query_one("#benchmark-feedback", Static).update(
+                "[red]Token lengths must be greater than zero.[/red]"
+            )
+            return
+        tokenizer = self.query_one("#benchmark-tokenizer", Input).value
+        output_dir = self.query_one("#benchmark-output-dir", Input).value.strip() or None
         self.app.pop_screen()
         self.app.begin_benchmark(  # type: ignore[attr-defined]
             self.endpoint,
-            concurrency=self.query_one("#benchmark-concurrency", Input).value,
+            concurrency=concurrency,
             request_count=request_count,
             input_tokens=input_tokens,
             output_tokens=output_tokens,
-            tokenizer=self.query_one("#benchmark-tokenizer", Input).value,
-            output_dir=self.query_one("#benchmark-output-dir", Input).value.strip() or None,
+            tokenizer=tokenizer,
+            output_dir=output_dir,
         )
 
 

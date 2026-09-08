@@ -305,7 +305,7 @@ class StorageScreen(CopyEnabledScreen):
 
     def on_storage_failed(self, message: StorageFailed) -> None:
         self.query_one("#storage-status", Static).update(
-            f"[yellow]Storage refresh failed:[/yellow] {message.error}"
+            f"[yellow]Storage refresh failed:[/yellow] {escape(message.error)}"
         )
 
     def _render_table(self) -> None:
@@ -317,6 +317,11 @@ class StorageScreen(CopyEnabledScreen):
         if query:
             rows = [row for row in rows if query in row.model_id.casefold()]
         self._rows_by_key = {_storage_row_key(row): row for row in rows}
+        if (
+            self._selected_model is not None
+            and _storage_row_key(self._selected_model) not in self._rows_by_key
+        ):
+            self._selected_model = None
         table.set_rows(rows)
 
     def _apply_row_selection(self, row_key: str) -> None:

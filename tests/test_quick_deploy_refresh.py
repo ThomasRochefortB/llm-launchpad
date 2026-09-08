@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from threading import Event
 from datetime import datetime, timedelta, UTC
 import json
 from pathlib import Path
@@ -30,6 +32,7 @@ from llm_launchpad.core.quick_deploy_refresh import (
     _is_transient_hub_error,
     _mtp_recommendation,
     _profiles_for_quant,
+    _profiles_from_aa_rankings,
     _quick_deploy_profile_from_dict,
     _quick_deploy_profile_to_dict,
     _read_quick_deploy_catalog_cache,
@@ -73,6 +76,17 @@ def _ordered_unique_names(profiles: Sequence[object]) -> list[str]:
 
 
 class QuickDeployRefreshTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Tests supply GGUF/AA metadata; a missing GGUF context length must not
+        # trigger a real Hub download. Context lookup behavior is tested below
+        # with explicit responses and independently in test_hf_models.
+        context_patch = patch(
+            "llm_launchpad.core.quick_deploy_refresh.fetch_model_max_context",
+            return_value=None,
+        )
+        context_patch.start()
+        self.addCleanup(context_patch.stop)
+
     def test_mtp_recommendation_requires_model_and_runtime_support(self) -> None:
         supported = GgufQuantMetadata(
             quantizations=[],
@@ -365,6 +379,114 @@ class QuickDeployRefreshTests(unittest.TestCase):
             ["Open Model One 8B", "Open Model Two 70B"],
         )
         self.assertEqual(match_mock.call_count, 2)
+
+    def test_shortlist_skips_lower_ranked_models_in_filled_categories(self) -> None:
+        candidates = tuple(
+            _aa_candidate(f"Compact Model {i} 8B", 8, 100 - i, rank=i)
+            for i in range(1, 76)
+        ) + (
+            _aa_candidate("Medium Model 70B", 70, 20, rank=76),
+            _aa_candidate("Large Model 300B", 300, 19, rank=77),
+        )
+        metadata = GgufQuantMetadata(
+            quantizations=["Q4_K_M"], vram_gb_by_quant={"Q4_K_M": 10},
+            architecture="llama", context_length=8192,
+        )
+        with (
+            patch("llm_launchpad.core.quick_deploy_refresh._AA_RESOLUTION_WORKERS", 2),
+            patch("llm_launchpad.core.quick_deploy_refresh._find_unsloth_gguf_match",
+                  side_effect=lambda candidate, api: f"unsloth/{candidate.slug}-GGUF") as match,
+            patch("llm_launchpad.core.quick_deploy_refresh._fetch_serving_metadata", return_value=metadata),
+        ):
+            profiles = _profiles_from_aa_rankings(
+                candidates, [ModalGpuSpec("B200", 5)], model_limit=1, candidate_limit=80,
+            )
+        self.assertEqual(_ordered_unique_names(profiles), [
+            "Compact Model 1 8B", "Medium Model 70B", "Large Model 300B",
+        ])
+        # One spare lookahead may already be running, but the long compact
+        # tail must not delay discovery of the other two categories.
+        self.assertLessEqual(match.call_count, 4)
+
+    def test_unknown_size_and_response_order_do_not_change_ranked_shortlist(self) -> None:
+        candidates = (
+            _aa_candidate("Compact Winner", 8, 99, rank=1),
+            _aa_candidate("Unknown Winner", 0, 98, rank=2),
+            _aa_candidate("Medium Runner Up", 70, 97, rank=3),
+            _aa_candidate("Large Winner", 300, 96, rank=4),
+        )
+        runner_up_finished = Event()
+
+        def metadata(repo_id: str) -> GgufQuantMetadata:
+            # The lower-ranked known-size model finishes first. The
+            # unknown-size higher-ranked candidate must still win.
+            if "unknown-winner" in repo_id and not runner_up_finished.wait(3):
+                raise AssertionError("Lower-ranked request did not run concurrently")
+            if "medium-runner-up" in repo_id:
+                runner_up_finished.set()
+            return GgufQuantMetadata(
+                quantizations=["Q4_K_M"], vram_gb_by_quant={"Q4_K_M": 50},
+                architecture="llama", context_length=8192,
+            )
+
+        with (
+            patch("llm_launchpad.core.quick_deploy_refresh._AA_RESOLUTION_WORKERS", 4),
+            patch("llm_launchpad.core.quick_deploy_refresh._find_unsloth_gguf_match",
+                  side_effect=lambda candidate, api: f"unsloth/{candidate.slug}-GGUF"),
+            patch("llm_launchpad.core.quick_deploy_refresh._fetch_serving_metadata", side_effect=metadata),
+        ):
+            profiles = _profiles_from_aa_rankings(
+                candidates, [ModalGpuSpec("B200", 5)], model_limit=1, candidate_limit=80,
+            )
+        self.assertTrue(runner_up_finished.is_set())
+        self.assertEqual(_ordered_unique_names(profiles), [
+            "Compact Winner", "Unknown Winner", "Large Winner",
+        ])
+
+    def test_completed_shortlist_does_not_wait_for_unused_lookahead(self) -> None:
+        candidates = tuple(
+            _aa_candidate(name, size, 100 - i, rank=i)
+            for i, (name, size) in enumerate([
+                ("Compact Winner", 8), ("Medium Winner", 70),
+                ("Large Winner", 300), ("Slow Extra", 300),
+            ], 1)
+        )
+        release_extra = Event()
+        extra_started = Event()
+        metadata = GgufQuantMetadata(
+            quantizations=["Q4_K_M"], vram_gb_by_quant={"Q4_K_M": 10},
+            architecture="llama", context_length=8192,
+        )
+
+        def fetch(repo_id: str) -> GgufQuantMetadata:
+            if "slow-extra" in repo_id:
+                extra_started.set()
+                release_extra.wait(5)
+            else:
+                if not extra_started.wait(3):
+                    raise AssertionError("Lookahead did not run concurrently")
+            return metadata
+
+        # Join all resolver workers before removing mocks, even though the
+        # production path deliberately returns before the spare request ends.
+        with ThreadPoolExecutor(max_workers=4) as resolver, ThreadPoolExecutor(max_workers=1) as caller:
+            with (
+                patch("llm_launchpad.core.quick_deploy_refresh.ThreadPoolExecutor", return_value=resolver),
+                patch("llm_launchpad.core.quick_deploy_refresh._find_unsloth_gguf_match",
+                      side_effect=lambda candidate, api: f"unsloth/{candidate.slug}-GGUF"),
+                patch("llm_launchpad.core.quick_deploy_refresh._fetch_serving_metadata", side_effect=fetch),
+            ):
+                result = caller.submit(
+                    _profiles_from_aa_rankings, candidates, [ModalGpuSpec("B200", 5)],
+                    model_limit=1, candidate_limit=80,
+                )
+                try:
+                    profiles = result.result(timeout=3)
+                    self.assertEqual(len(_ordered_unique_names(profiles)), 3)
+                    self.assertFalse(release_extra.is_set())
+                finally:
+                    release_extra.set()
+                    resolver.shutdown(wait=True)
 
     def test_find_unsloth_gguf_match_finds_untagged_fresh_repos(self) -> None:
         class _FakeHfApi:

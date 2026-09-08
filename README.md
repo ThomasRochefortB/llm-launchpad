@@ -128,12 +128,14 @@ llm-launchpad opencode sync --dry-run
 ## Documentation
 
 - [Deploy catalog and recommendations](docs/catalog.md)
+- [Fast Deploy hybrid model support](docs/fast-deploy-model-support.md)
 - [Image input (vision)](docs/vision.md)
 - [Prime Intellect provider](docs/prime.md)
 - [Storage and costs](docs/storage-and-costs.md)
 - [OpenCode integration](docs/opencode.md)
 - [Troubleshooting and debug log](docs/troubleshooting.md)
 - [Full CLI reference](docs/cli.md)
+- [TUI feature audit](docs/tui-audit.md)
 
 ## Development setup
 
