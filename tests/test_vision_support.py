@@ -20,6 +20,7 @@ from llm_launchpad.core.hf_models import GgufQuantMetadata
 from llm_launchpad.core.modal_gpu import ModalGpuSpec
 from llm_launchpad.core.orchestrator import Orchestrator
 from llm_launchpad.core.prime_backend import PrimeBackend, resolve_prime_launch_spec
+from llm_launchpad.core.quick_deploy import QuickDeployProfile, build_quick_deploy_config
 from llm_launchpad.core.quick_deploy_refresh import _build_resolved_aa_model
 from llm_launchpad.tui.screens import manage
 from llm_launchpad.core.vision import (
@@ -47,6 +48,7 @@ from llm_launchpad.protocol.enums import (
     VisionVerification,
 )
 from llm_launchpad.protocol.events import OperationCompleteEvent
+from llm_launchpad.protocol.models import ServingRequirements
 from llm_launchpad.protocol.models import (
     DeploymentConfig,
     EndpointInfo,
@@ -771,49 +773,58 @@ class ProjectorDiscoveryTests(unittest.TestCase):
         ]
         self.assertEqual(hf_models._extract_gguf_quantizations(siblings), ["Q4_K_M"])
 
-    def test_projector_siblings_are_detected(self) -> None:
-        self.assertTrue(hf_models._has_projector_sibling([_sibling("mmproj-F16.gguf")]))
-        self.assertFalse(hf_models._has_projector_sibling([_sibling("model-Q4_K_M.gguf")]))
-        # A non-GGUF file with a matching name is not a llama.cpp projector.
-        self.assertFalse(hf_models._has_projector_sibling([_sibling("mmproj.safetensors")]))
-        self.assertFalse(hf_models._has_projector_sibling(None))
 
+class FastDeployTextOnlyTests(unittest.TestCase):
+    """Fast Deploy serves projector-bearing models as text, not as exclusions."""
 
-class FastDeployVisionExclusionTests(unittest.TestCase):
-    """Fast Deploy only recommends configurations whose memory it models."""
+    def _profile(self, *, certified: bool) -> QuickDeployProfile:
+        return QuickDeployProfile(
+            id="glm", display_name="GLM", repo_id="unsloth/GLM-5.3-Flash-GGUF",
+            quant="UD-Q2_K_XL", gpu_type="H200", gpu_count=1, profile_label="Fast",
+            approx_cost_per_hour_usd=4.54, max_context_tokens=65536,
+            instance_slug_hint="glm", summary="", server_args=(),
+            serving_requirements=ServingRequirements(context_tokens=65536) if certified else None,
+        )
 
-    def _candidate(self) -> AAModelCandidate:
-        return AAModelCandidate(
-            aa_model_id="vl", name="VL", slug="vl", creator_name="",
+    def test_a_certified_plan_is_text_only_by_construction(self) -> None:
+        # Kimi K3 and GLM-5.3-Flash both ship projectors. A guaranteed fit models
+        # text decoding only, so it must not try to serve images -- and must not
+        # be dropped from the catalog for having a projector available either.
+        config = build_quick_deploy_config(self._profile(certified=True))
+        self.assertIsNotNone(config.serving_requirements)
+        self.assertEqual(config.vision_mode, VisionMode.OFF)
+
+    def test_an_uncertified_plan_leaves_the_choice_open(self) -> None:
+        config = build_quick_deploy_config(self._profile(certified=False))
+        self.assertIsNone(config.serving_requirements)
+        self.assertEqual(config.vision_mode, VisionMode.AUTO)
+
+    def test_a_text_only_plan_passes_the_deploy_guard(self) -> None:
+        config = build_quick_deploy_config(self._profile(certified=True))
+        with patch.object(vision, "inspect_model_vision", side_effect=AssertionError("inspected")):
+            state = prepare_vision(config)
+        self.assertFalse(state.enabled)
+
+    def test_projector_repositories_are_still_offered_by_the_catalog(self) -> None:
+        candidate = AAModelCandidate(
+            aa_model_id="glm", name="GLM-5.3-Flash", slug="glm", creator_name="",
             coding_score=70.0, intelligence_score=50.0, rank=1,
             parameter_count_b=8.0, max_context_tokens=None,
         )
-
-    def _metadata(self, has_projector: bool) -> GgufQuantMetadata:
-        return GgufQuantMetadata(
-            quantizations=["Q4_K_M"],
-            vram_gb_by_quant={"Q4_K_M": 6.0},
-            architecture="llama",
-            has_projector=has_projector,
+        metadata = GgufQuantMetadata(
+            quantizations=["Q4_K_M"], vram_gb_by_quant={"Q4_K_M": 6.0}, architecture="llama",
         )
-
-    def _resolve(self, has_projector: bool):
+        exclusions: list = []
         with patch(
             "llm_launchpad.core.quick_deploy_refresh._fetch_serving_metadata",
-            return_value=self._metadata(has_projector),
+            return_value=metadata,
         ):
-            return _build_resolved_aa_model(
-                self._candidate(),
-                [ModalGpuSpec("A100-80GB", price_per_hour_usd=2.5)],
-                "unsloth/VL-GGUF",
+            resolved = _build_resolved_aa_model(
+                candidate, [ModalGpuSpec("A100-80GB", price_per_hour_usd=2.5)],
+                "unsloth/GLM-5.3-Flash-GGUF", exclusions=exclusions,
             )
-
-    def test_vision_models_are_not_offered_as_guaranteed_fits(self) -> None:
-        self.assertIsNone(self._resolve(True))
-
-    def test_text_only_models_are_still_recommended(self) -> None:
-        self.assertIsNotNone(self._resolve(False))
-
+        self.assertIsNotNone(resolved)
+        self.assertEqual(exclusions, [])
 
 class ProbeFailureIsolationTests(unittest.TestCase):
     """A failed image probe must not read as a failed deployment."""

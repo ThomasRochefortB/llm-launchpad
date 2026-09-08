@@ -7,7 +7,7 @@ import hashlib
 import shlex
 from collections.abc import Sequence
 
-from ..protocol.enums import BackendType, ComputeProvider, ServingObjective
+from ..protocol.enums import VisionMode, BackendType, ComputeProvider, ServingObjective
 from ..protocol.models import (
     CatalogExclusion,
     DeploymentConfig,
@@ -524,6 +524,12 @@ def build_quick_deploy_config(
             if plan is not None
             else profile.serving_requirements
         )
+        if config.serving_requirements is not None:
+            # A certified placement models text decoding only. Serving images
+            # from it would spend memory the guarantee never accounted for, so
+            # these plans are text-only by construction rather than being
+            # withheld from the catalog.
+            config.vision_mode = VisionMode.OFF
         if config.serving_requirements is not None and plan is not None:
             config.serving_requirements = ServingRequirements(
                 context_tokens=config.serving_requirements.context_tokens,

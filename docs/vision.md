@@ -96,16 +96,17 @@ Video and audio are always disabled.
 
 ## Limitations
 
-- **Fast Deploy skips vision models.** Image working memory cannot be estimated
-  from GGUF headers, so vision-capable models are excluded from guaranteed-fit
-  recommendations. Deploy them from the manual deploy screens or the CLI
-  instead.
+- **Fast Deploy serves text only.** A guaranteed fit certifies a placement that
+  models text decoding, and image working memory is not part of it. Vision-capable
+  models still appear in the catalog and deploy normally there, with image input
+  off; use the manual deploy screens or the CLI when you want images.
 - **Manual vLLM estimates exclude image working memory.** The estimate line says
   so when the model is multimodal; leave headroom accordingly.
 - **OpenCode advertises `image` input only after verification passes.** Until
   then the model is registered as text-only, so an unverified deployment will
   refuse attachments in OpenCode rather than fail mid-request.
 - **Fast Deploy is text-only.** Its plans certify a placement that does not
-  model image memory, so the image-input control is not offered there.
+  model image memory, so the image-input control is not offered there and the
+  deployment is built with image input off.
 - **Existing deployments are untouched** until redeployed. Records saved before
   image support load with unknown vision status and text-only advertising.

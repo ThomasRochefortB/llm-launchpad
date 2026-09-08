@@ -883,16 +883,6 @@ def _build_resolved_aa_model(
     if not compatibility.is_supported:
         _record_exclusion(exclusions, candidate, repo_id, compatibility.message)
         return None
-    if metadata.has_projector:
-        # Fast Deploy only recommends configurations whose memory it models
-        # exactly, and image working memory is not one of them. The model
-        # stays available from the manual deploy screens.
-        _record_exclusion(
-            exclusions, candidate, repo_id,
-            "Image working memory cannot be estimated, so this vision model is "
-            "not offered as a guaranteed fit. Deploy it manually to use images.",
-        )
-        return None
     model = ModelCandidate(repo_id=repo_id)
     reasons: list[str] = []
     profiles = _profiles_for_model(

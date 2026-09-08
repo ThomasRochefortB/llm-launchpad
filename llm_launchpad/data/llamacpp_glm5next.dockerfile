@@ -8,8 +8,16 @@ WORKDIR /src
 RUN curl -fL --retry 3 https://codeload.github.com/unslothai/llama.cpp/tar.gz/629b50552801912b3e2078f9799e4d77213197d7 -o source.tar.gz \
     && echo 'ce83b6acece1789d585a9af111f7cc34f96582a1baad31f7b6ed3d506764faf7  source.tar.gz' | sha256sum -c - \
     && tar -xzf source.tar.gz --strip-components=1 && rm source.tar.gz
+# --allow-shlib-undefined matches upstream's own CUDA image: libggml-cuda
+# resolves CUDA driver symbols (cuMemCreate, cuMemMap, ...) against the real
+# driver at run time, not against the devel image's stub at link time.
+# The UI is disabled outright: it is served over the API only, and provisioning
+# it would fetch prebuilt assets from Hugging Face during the build, keyed on a
+# build number that a tarball checkout cannot resolve.
 RUN cmake -S . -B build -DGGML_CUDA=ON -DGGML_NATIVE=OFF \
     -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCHITECTURES}" -DLLAMA_BUILD_TESTS=OFF \
+    -DLLAMA_BUILD_UI=OFF -DLLAMA_USE_PREBUILT_UI=OFF \
+    -DCMAKE_EXE_LINKER_FLAGS=-Wl,--allow-shlib-undefined \
     && cmake --build build --target llama-server llama-fit-params -j 4
 
 FROM nvidia/cuda:12.8.1-runtime-ubuntu22.04
