@@ -944,10 +944,12 @@ class ImageTestCommandGuardTests(unittest.TestCase):
 class VllmRuntimeImageTests(unittest.TestCase):
     """The official vLLM image must not be overwritten from PyPI."""
 
-    def test_no_second_vllm_or_hub_install_over_the_official_image(self) -> None:
+    def test_vllm_is_not_reinstalled_over_the_official_image(self) -> None:
         source = Path("llm_launchpad/backends/modal_vllm_app.py").read_text(encoding="utf-8")
-        self.assertIn('from_registry("vllm/vllm-openai:v0.19.1")', source)
-        self.assertNotIn("uv_pip_install", source)
+        # Modal needs its own interpreter; the image only ships `python3`.
+        self.assertIn('"vllm/vllm-openai:v0.19.1", add_python="3.12"', source)
+        # Reinstalling vLLM from PyPI would replace the image's CUDA build.
+        self.assertNotIn("vllm==", source)
 
 
 class PrimeProjectorAuthTests(unittest.TestCase):

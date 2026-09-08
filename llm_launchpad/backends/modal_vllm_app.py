@@ -115,12 +115,15 @@ if DEPLOY_ENABLE_AUTO_TOOL_CHOICE is not None:
 hf_cache_vol = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
 vllm_cache_vol = modal.Volume.from_name("vllm-cache", create_if_missing=True)
 
-# The official image already ships a CUDA-built vLLM and its pinned
-# dependency set. Reinstalling vLLM or huggingface-hub from PyPI on top of it
-# can silently replace that stack, so mirror Prime and use the image as-is.
+# The official image already ships a CUDA-built vLLM, and ``serve`` execs that
+# image's own ``vllm`` binary, so vLLM is deliberately not reinstalled here.
+# Modal still needs its own interpreter (the image exposes ``python3`` but not
+# ``python``, which fails the image build), and ``predownload_model`` runs under
+# that interpreter, so huggingface-hub is installed for it alone.
 vllm_image = (
-    modal.Image.from_registry("vllm/vllm-openai:v0.19.1")
+    modal.Image.from_registry("vllm/vllm-openai:v0.19.1", add_python="3.12")
     .entrypoint([])
+    .uv_pip_install("huggingface-hub")
     .env(
         {
             "HF_XET_HIGH_PERFORMANCE": "1",
