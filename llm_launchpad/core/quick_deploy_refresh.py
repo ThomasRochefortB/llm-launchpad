@@ -831,11 +831,6 @@ def _build_resolved_aa_model(
         return None
     if not evaluate_llamacpp_architecture(metadata.architecture).is_supported:
         return None
-    # Fast Deploy only recommends configurations whose memory it models
-    # exactly, and image working memory is not one of them. Vision models stay
-    # available from the manual deploy screens.
-    if metadata.has_projector:
-        return None
     model = ModelCandidate(repo_id=repo_id)
     profiles = _profiles_for_model(
         model,

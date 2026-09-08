@@ -48,7 +48,6 @@ class GgufQuantMetadata:
     attention_head_count_kv: int | None = None
     attention_key_length: int | None = None
     attention_value_length: int | None = None
-    has_projector: bool = False
 
 
 @dataclass(frozen=True)
@@ -482,7 +481,6 @@ def fetch_gguf_quant_metadata(
             attention_head_count_kv=cached_metadata.attention_head_count_kv,
             attention_key_length=cached_metadata.attention_key_length,
             attention_value_length=cached_metadata.attention_value_length,
-            has_projector=cached_metadata.has_projector,
         )
 
     try:
@@ -503,7 +501,6 @@ def fetch_gguf_quant_metadata(
     )
     siblings = getattr(info, "siblings", None)
     quantizations = _extract_gguf_quantizations(siblings)
-    has_projector = _has_projector_sibling(siblings)
     gguf_payload = getattr(info, "gguf", None)
     architecture = _extract_gguf_architecture(gguf_payload)
     context_length = _extract_gguf_positive_int(
@@ -608,7 +605,6 @@ def fetch_gguf_quant_metadata(
         attention_head_count_kv=attention_head_count_kv,
         attention_key_length=attention_key_length,
         attention_value_length=attention_value_length,
-        has_projector=has_projector,
     )
     _GGUF_QUANT_METADATA_CACHE[cache_key] = (now, metadata)
     return GgufQuantMetadata(
@@ -623,7 +619,6 @@ def fetch_gguf_quant_metadata(
         attention_head_count_kv=metadata.attention_head_count_kv,
         attention_key_length=metadata.attention_key_length,
         attention_value_length=metadata.attention_value_length,
-        has_projector=metadata.has_projector,
     )
 
 
@@ -715,16 +710,6 @@ def _extract_gguf_quantizations(siblings: Any) -> list[str]:
             detected.add(_normalize_quant_label(match))
     return sorted(detected, key=_quant_sort_key)
 
-
-def _has_projector_sibling(siblings: Any) -> bool:
-    """Report whether the repository ships a llama.cpp vision projector."""
-    if not isinstance(siblings, list):
-        return False
-    return any(
-        "mmproj" in str(getattr(sibling, "rfilename", "")).casefold()
-        and str(getattr(sibling, "rfilename", "")).casefold().endswith(".gguf")
-        for sibling in siblings
-    )
 
 
 def _extract_gguf_architecture(gguf_payload: Any) -> str | None:
