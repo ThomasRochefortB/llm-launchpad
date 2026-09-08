@@ -787,9 +787,9 @@ class FastDeployTextOnlyTests(unittest.TestCase):
         )
 
     def test_a_certified_plan_is_text_only_by_construction(self) -> None:
-        # Kimi K3 and GLM-5.3-Flash both ship projectors. A guaranteed fit models
-        # text decoding only, so it must not try to serve images -- and must not
-        # be dropped from the catalog for having a projector available either.
+        # Popular GGUF repositories ship an mmproj alongside the weights. A
+        # guaranteed fit models text decoding only, so it must not try to serve
+        # images -- and must not drop the model for having a projector either.
         config = build_quick_deploy_config(self._profile(certified=True))
         self.assertIsNotNone(config.serving_requirements)
         self.assertEqual(config.vision_mode, VisionMode.OFF)
