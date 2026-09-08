@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from rich.markup import escape
 from textual.reactive import reactive
 from textual.widgets import Static
 
@@ -30,13 +31,13 @@ class StatusHeader(Static):
         compact = self.screen.has_class("viewport-compact")
         short = self.screen.has_class("viewport-short")
         parts = [
-            f"[bold]backend:[/] {self.backend}",
-            f"  {state_icon} [bold]state:[/] {self.state}",
+            f"[bold]backend:[/] {escape(self.backend)}",
+            f"  {state_icon} [bold]state:[/] {escape(self.state)}",
         ]
         if not compact and self.operation and self.operation != "--":
-            parts.append(f"  [bold]op:[/] {self.operation}")
+            parts.append(f"  [bold]op:[/] {escape(self.operation)}")
         if not compact and not short and self.detail:
-            parts.append(f"  [dim]{self.detail}[/]")
+            parts.append(f"  [dim]{escape(self.detail)}[/]")
         return " ".join(parts)
 
     def watch_state(self, state: str) -> None:

@@ -61,13 +61,12 @@ from .operation_events import fail_operation
 from .gguf_metadata import GgufMtpStatus
 from .hf_models import fetch_gguf_quant_metadata
 from .modal_auth import get_modal_auth_status
-from .llamacpp_planner import compile_server_args_string, tuning_for_objective
+from .llamacpp_planner import compile_server_args_string, tuning_for_objective, tuning_for_architecture
 from .naming import legacy_app_name
 from .naming import default_llamacpp_served_model_name
 from .naming import random_function_slug
 from .paths import MODAL_LLAMACPP_SCRIPT, MODAL_VLLM_SCRIPT
 from .prime_backend import (
-    default_prime_container_image,
     PrimeApiError,
     PrimeBackend,
     resolve_prime_launch_spec,
@@ -76,11 +75,11 @@ from .prime_disks import bind_prime_disk, resolve_prime_offer_and_disk
 from .provider_options import prime_provider_options
 from .reasoning_profiles import discover_selected_model_reasoning
 from .runtime_support import (
-    DEFAULT_LLAMACPP_IMAGE_REF,
     RuntimeCompatibility,
     RuntimeCompatibilityDecision,
     evaluate_llamacpp_architecture,
     evaluate_llamacpp_mtp,
+    load_llamacpp_support_manifest,
 )
 from .warmup import WarmupRunner
 from .warmup import modal_gpu_scheduling_hint as _modal_gpu_scheduling_hint
@@ -99,10 +98,10 @@ _LLAMACPP_STORAGE_JSON_END = "LLM_LAUNCHPAD_STORAGE_JSON_END"
 
 def _configured_llamacpp_image(config: DeploymentConfig) -> str:
     if config.provider == ComputeProvider.PRIME:
-        return default_prime_container_image(BackendType.LLAMACPP)
+        return resolve_prime_launch_spec(config).container_image
     return (
         os.environ.get("LLAMA_CPP_IMAGE_REF", "").strip()
-        or DEFAULT_LLAMACPP_IMAGE_REF
+        or load_llamacpp_support_manifest(config.gguf_architecture).image_ref
     )
 
 
@@ -357,6 +356,7 @@ class Orchestrator:
                     tuning,
                     speculative_decoding=config.speculative_decoding,
                 )
+                tuning = tuning_for_architecture(tuning, config.gguf_architecture)
                 config.runtime_tuning = tuning
                 config.max_context_tokens = config.serving_requirements.context_tokens
                 config.server_args = compile_server_args_string(
@@ -379,16 +379,17 @@ class Orchestrator:
                     operation=OperationType.DEPLOY,
                     is_milestone=True,
                 )
+            elif config.gguf_architecture == "glm5next" and compatibility.is_supported:
+                config.server_args = shlex.join([
+                    *shlex.split(config.server_args or ""), "--flash-attn", "off",
+                ])
         from .vision import prepare_vision
         try:
             vision = prepare_vision(config)
         except (ValueError, OSError) as exc:
             yield from fail_operation(OperationType.DEPLOY, str(exc), exit_code=2)
             return
-        yield LogEvent(
-            line=f"Vision: {vision.message} Enabled: {vision.enabled}; verification: untested.",
-            operation=OperationType.DEPLOY,
-        )
+        yield LogEvent(line=f"Vision: {vision.message} Enabled: {vision.enabled}; verification: untested.", operation=OperationType.DEPLOY)
         if vision.enabled and config.serving_requirements is not None:
             yield from fail_operation(
                 OperationType.DEPLOY,
@@ -1011,6 +1012,7 @@ class Orchestrator:
                 from .connection_store import update_vision_verification
                 update_vision_verification(app_name, server_url, vision)
             yield event
+
 
     # ------------------------------------------------------------------
     # Logs

@@ -68,6 +68,15 @@ class GgufServingMetadata:
     attention_key_length: int | None = None
     attention_value_length: int | None = None
     source_file: str | None = None
+    attention_head_count_kv_by_layer: tuple[int, ...] = ()
+    attention_key_length_mla: int | None = None
+    attention_value_length_mla: int | None = None
+    attention_kv_lora_rank: int | None = None
+    kda_head_dim: int | None = None
+    ssm_conv_kernel: int | None = None
+    indexer_key_length: int | None = None
+    indexer_kpool: int | None = None
+    nextn_predict_layers: int = 0
 
 
 class _NeedMoreData(Exception):
@@ -197,9 +206,10 @@ def fetch_gguf_mtp_capability(
         return GgufMtpCapability.unknown("Invalid GGUF metadata byte limit.")
 
     payload = bytearray()
+    next_chunk_bytes = chunk_bytes
     try:
         while len(payload) < max_bytes:
-            end = min(len(payload) + chunk_bytes, max_bytes) - 1
+            end = min(len(payload) + next_chunk_bytes, max_bytes) - 1
             chunk = _fetch_hf_file_range(
                 repo_id,
                 filename,
@@ -213,6 +223,9 @@ def fetch_gguf_mtp_capability(
             try:
                 return parse_gguf_mtp_metadata(bytes(payload), source_file=filename)
             except _NeedMoreData:
+                # Large tokenizers need several MiB. Grow geometrically to
+                # avoid fetching and reparsing the table one MiB at a time.
+                next_chunk_bytes *= 2
                 continue
     except Exception as exc:
         return GgufMtpCapability.unknown(
@@ -240,7 +253,7 @@ def parse_gguf_serving_metadata(
     if metadata_count > 10_000_000:
         raise _InvalidGguf("Implausible GGUF metadata count")
 
-    values: dict[str, int] = {}
+    values: dict[str, Any] = {}
     architecture: str | None = None
     suffixes = {
         "context_length": "context_length",
@@ -250,6 +263,14 @@ def parse_gguf_serving_metadata(
         "attention.head_count_kv": "attention_head_count_kv",
         "attention.key_length": "attention_key_length",
         "attention.value_length": "attention_value_length",
+        "attention.key_length_mla": "attention_key_length_mla",
+        "attention.value_length_mla": "attention_value_length_mla",
+        "attention.kv_lora_rank": "attention_kv_lora_rank",
+        "kda.head_dim": "kda_head_dim",
+        "ssm.conv_kernel": "ssm_conv_kernel",
+        "attention.indexer.key_length": "indexer_key_length",
+        "attention.indexer.kpool": "indexer_kpool",
+        "nextn_predict_layers": "nextn_predict_layers",
     }
     offset = 24
     for _ in range(metadata_count):
@@ -270,23 +291,27 @@ def parse_gguf_serving_metadata(
         value, offset = _read_value(data, offset, value_type, capture=capture)
         if key == "general.architecture" and isinstance(value, str):
             architecture = value.strip().casefold() or None
+        elif matched is not None:
+            values[key] = value
+
+    # Only the target architecture may supply these fields (not a vision tower).
+    scalars: dict[str, int] = {}
+    kv_by_layer: tuple[int, ...] = ()
+    for suffix, field in suffixes.items():
+        value = values.get(f"{architecture}.{suffix}", values.get(suffix))
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            if value > 0 or field in {"attention_head_count_kv", "nextn_predict_layers"}:
+                scalars[field] = value
         elif (
-            matched is not None
-            and isinstance(value, int)
-            and not isinstance(value, bool)
-            and value > 0
+            field == "attention_head_count_kv" and isinstance(value, tuple)
+            and value and all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in value)
         ):
-            values[matched] = value
+            kv_by_layer = value
 
     return GgufServingMetadata(
         architecture=architecture,
-        context_length=values.get("context_length"),
-        block_count=values.get("block_count"),
-        embedding_length=values.get("embedding_length"),
-        attention_head_count=values.get("attention_head_count"),
-        attention_head_count_kv=values.get("attention_head_count_kv"),
-        attention_key_length=values.get("attention_key_length"),
-        attention_value_length=values.get("attention_value_length"),
+        **scalars,
+        attention_head_count_kv_by_layer=kv_by_layer,
         source_file=source_file,
     )
 
@@ -306,9 +331,10 @@ def fetch_gguf_serving_metadata(
     if filename is None or chunk_bytes <= 0 or max_bytes <= 0:
         return None
     payload = bytearray()
+    next_chunk_bytes = chunk_bytes
     try:
         while len(payload) < max_bytes:
-            end = min(len(payload) + chunk_bytes, max_bytes) - 1
+            end = min(len(payload) + next_chunk_bytes, max_bytes) - 1
             chunk = _fetch_hf_file_range(
                 repo_id,
                 filename,
@@ -322,6 +348,9 @@ def fetch_gguf_serving_metadata(
             try:
                 return parse_gguf_serving_metadata(bytes(payload), source_file=filename)
             except _NeedMoreData:
+                # Large tokenizers need several MiB. Grow geometrically to
+                # avoid fetching and reparsing the table one MiB at a time.
+                next_chunk_bytes *= 2
                 continue
     except Exception:
         return None
@@ -407,6 +436,14 @@ def _read_value(
         size = _GGUF_SCALAR_SIZES.get(element_type)
         if size is None:
             raise _InvalidGguf(f"Unknown GGUF array element type {element_type}")
+        if capture:
+            if length > 8192:
+                raise _InvalidGguf("Serving metadata array exceeds the layer limit")
+            values = []
+            for _ in range(length):
+                value, offset = _read_value(data, offset, element_type, capture=True)
+                values.append(value)
+            return tuple(values), offset
         return None, _advance(data, offset, length * size)
 
     size = _GGUF_SCALAR_SIZES.get(value_type)

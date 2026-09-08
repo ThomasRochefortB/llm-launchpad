@@ -213,6 +213,7 @@ class TuiApp(App):
         self._storage_snapshot_cached_at_epoch: float = 0.0
         self._storage_refresh_inflight = False
         self._storage_refresh_lock = threading.Lock()
+        self._storage_refresh_receivers: list[object] = []
         self._storage_cache_path = SETTINGS_DIR / "storage_snapshot.json"
         self._deploy_connection_cache_path = SETTINGS_DIR / "deployment_connection_summaries.json"
         self._deploy_connection_cache: dict[str, dict[str, object]] = {}
@@ -810,6 +811,7 @@ class TuiApp(App):
                     and not event.success
                     and event.operation == OperationType.WARMUP
                 ):
+                    self._cache_deploy_connection_summary(config, url, deployed_endpoint)
                     keep_failed_prime = (
                         config.provider == ComputeProvider.PRIME
                         and prime_provider_options(config).keep_failed_resource
@@ -902,7 +904,7 @@ class TuiApp(App):
                 timeout,
                 served_model_name=served_model_name,
             )
-            if provider == ComputeProvider.MODAL
+            if provider == ComputeProvider.MODAL and not api_key
             else self._orchestrator.check_status(
                 backend,
                 url,
@@ -1258,48 +1260,58 @@ class TuiApp(App):
 
     def begin_storage_refresh(self, receiver: object, force: bool = False) -> None:
         poster = getattr(receiver, "post_message", None)
+        if poster is None:
+            return
         cache_age = time.time() - self._storage_snapshot_cached_at_epoch
-        if not force and self._storage_snapshot_cache is not None and poster is not None:
+        if not force and self._storage_snapshot_cache is not None:
             # Fast path: show the latest known snapshot immediately.
             poster(StorageLoaded(snapshot=self._storage_snapshot_cache))
             if cache_age <= self._STORAGE_CACHE_TTL_SECONDS:
                 return
 
         with self._storage_refresh_lock:
+            if not any(candidate is receiver for candidate in self._storage_refresh_receivers):
+                self._storage_refresh_receivers.append(receiver)
             if self._storage_refresh_inflight:
                 return
             self._storage_refresh_inflight = True
 
         self.run_worker(
-            lambda: self._run_storage_refresh(receiver),
+            self._run_storage_refresh,
             name="storage-refresh-worker",
             thread=True,
         )
 
-    def _run_storage_refresh(self, receiver: object) -> None:
-        poster = getattr(receiver, "post_message", None)
+    def _run_storage_refresh(self) -> None:
+        result_snapshot: StorageSnapshot | None = None
+        error: str | None = None
         try:
-            if poster is None:
-                return
-            result_snapshot: StorageSnapshot | None = None
             for event in self._orchestrator.list_storage():
                 if isinstance(event, OperationCompleteEvent):
                     if event.success and isinstance(event.data, StorageSnapshot):
                         result_snapshot = event.data
                     elif not event.success:
-                        poster(StorageFailed(error=event.detail or "Storage listing failed."))
+                        error = event.detail or "Storage listing failed."
                         return
                 elif isinstance(event, ErrorEvent):
-                    poster(StorageFailed(error=event.message))
+                    error = event.message
                     return
             if result_snapshot is not None:
                 self._cache_storage_snapshot(result_snapshot)
-                poster(StorageLoaded(snapshot=result_snapshot))
             else:
-                poster(StorageFailed(error="No storage data returned by backend."))
+                error = "No storage data returned by backend."
+        except Exception as exc:
+            error = str(exc)
         finally:
             with self._storage_refresh_lock:
+                receivers = self._storage_refresh_receivers
+                self._storage_refresh_receivers = []
                 self._storage_refresh_inflight = False
+            for receiver in receivers:
+                if error is not None:
+                    receiver.post_message(StorageFailed(error=error))
+                elif result_snapshot is not None:
+                    receiver.post_message(StorageLoaded(snapshot=result_snapshot))
 
     # ------------------------------------------------------------------
     # Storage: predownload

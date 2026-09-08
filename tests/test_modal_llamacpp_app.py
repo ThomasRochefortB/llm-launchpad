@@ -1,10 +1,28 @@
 from __future__ import annotations
 
 import unittest
+import os
 from unittest.mock import patch
 
 
 class ModalLlamaCppAppTests(unittest.TestCase):
+    def test_glm_runtime_builds_bundled_recipe_instead_of_pulling_local_tag(self) -> None:
+        from llm_launchpad.backends import modal_llamacpp_app as backend
+
+        with (
+            patch.dict(os.environ, {"LLAMA_CPP_BUILD_RECIPE": "llamacpp_glm5next.dockerfile", "LLAMA_CPP_CUDA_ARCHITECTURES": "100"}),
+            patch.object(backend.modal.Image, "from_dockerfile") as build,
+            patch.object(backend.modal.Image, "from_registry") as pull,
+        ):
+            backend._serving_image()
+        pull.assert_not_called()
+        path = build.call_args.args[0]
+        self.assertTrue(path.is_file())
+        self.assertIn("NVIDIA_TF32_OVERRIDE=0", path.read_text())
+        self.assertEqual(build.call_args.kwargs["add_python"], "3.12")
+        self.assertEqual(build.call_args.kwargs["build_args"], {"CUDA_ARCHITECTURES": "100"})
+        build.return_value.entrypoint.assert_called_once_with([])
+
     def _serve_command(self, n_gpu_layers: int | None) -> list[str]:
         from llm_launchpad.backends import modal_llamacpp_app
 

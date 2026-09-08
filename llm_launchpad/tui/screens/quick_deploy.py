@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ..widgets.vision_options import VisionOptions
+
 from dataclasses import replace
 
 from rich.markup import escape
@@ -32,7 +34,6 @@ from ...protocol.enums import (
 )
 from ...protocol.models import DeploymentConfig, InferencePlan
 from ..widgets.input_form import FormField, ToggleField
-from ..widgets.vision_options import VisionOptions
 from .copy_enabled import CopyEnabledScreen
 
 
@@ -216,7 +217,7 @@ class QuickDeployScreen(CopyEnabledScreen):
 
     BINDINGS = [
         Binding("escape", "pop_screen", "Back", show=True),
-        Binding("ctrl+d", "deploy", "Deploy", show=True),
+        Binding("ctrl+d", "deploy", "Deploy", show=True, priority=True),
     ]
 
     def __init__(

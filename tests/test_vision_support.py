@@ -814,15 +814,17 @@ class FastDeployTextOnlyTests(unittest.TestCase):
         metadata = GgufQuantMetadata(
             quantizations=["Q4_K_M"], vram_gb_by_quant={"Q4_K_M": 6.0}, architecture="llama",
         )
+        exclusions: list = []
         with patch(
             "llm_launchpad.core.quick_deploy_refresh._fetch_serving_metadata",
             return_value=metadata,
         ):
             resolved = _build_resolved_aa_model(
                 candidate, [ModalGpuSpec("A100-80GB", price_per_hour_usd=2.5)],
-                "unsloth/GLM-5.3-Flash-GGUF",
+                "unsloth/GLM-5.3-Flash-GGUF", exclusions=exclusions,
             )
         self.assertIsNotNone(resolved)
+        self.assertEqual(exclusions, [])
 
 class ProbeFailureIsolationTests(unittest.TestCase):
     """A failed image probe must not read as a failed deployment."""

@@ -1,0 +1,15 @@
+{
+  "schema_version": 2,
+  "runtime_id": "llama.cpp-glm5next-629b50552801-cuda12",
+  "runtime_build": "glm5next-629b50552801",
+  "image_ref": "llm-launchpad/llamacpp:glm5next-629b50552801",
+  "source_revision": "629b50552801912b3e2078f9799e4d77213197d7",
+  "source_url": "https://raw.githubusercontent.com/unslothai/llama.cpp/629b50552801912b3e2078f9799e4d77213197d7/src/llama-arch.cpp",
+  "generated_at": "2026-09-06T00:00:00Z",
+  "architectures": [
+    "glm5next"
+  ],
+  "mtp_architectures": [],
+  "build_recipe": "llamacpp_glm5next.dockerfile",
+  "notes": "Model-specific source build. Native MTP remains disabled until validated with Launchpad certification. Requires flash attention off and NVIDIA_TF32_OVERRIDE=0."
+}

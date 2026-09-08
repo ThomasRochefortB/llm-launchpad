@@ -24,6 +24,37 @@ from .diagnostics import log_exception
 from .naming import infer_instance_from_app_name
 from .prime_auth import PrimeConfig, load_prime_config
 from .provider_options import prime_provider_options
+from .runtime_support import load_llamacpp_support_manifest, llamacpp_build_recipe, llamacpp_cuda_architecture
+
+
+def _prime_projector_setup(config: DeploymentConfig) -> tuple[str, str]:
+    """Stage the exact projector atomically in the persistent llama cache."""
+    from huggingface_hub import hf_hub_url
+
+    artifact = config.vision.projector if config.vision else None
+    if artifact is None:
+        raise ValueError("Vision enabled without a resolved projector.")
+    identity = hashlib.sha256(f"{artifact.repo_id}@{artifact.revision}/{artifact.filename}".encode()).hexdigest()
+    root = "/data/llama.cpp" if prime_provider_options(config).disk_id else "/root/.cache/llama.cpp"
+    path = f"{root}/projectors/{identity}.gguf"
+    quoted = shlex.quote(path)
+    url = hf_hub_url(artifact.repo_id, artifact.filename, revision=artifact.revision)
+    size_check = f'[ "$(stat -c %s {quoted})" = {artifact.size_bytes} ]' if artifact.size_bytes else f"[ -s {quoted} ]"
+    # The pinned llama.cpp image includes curl. $HF_TOKEN survives shlex.join
+    # literally and is expanded by the container shell; the header is omitted
+    # entirely when no token is set, because an empty Bearer makes Hugging Face
+    # reject public files that an unauthenticated request would have served.
+    setup = (
+        f"mkdir -p {shlex.quote(root + '/projectors')} || exit $?; "
+        f"if ! {size_check}; then "
+        f"curl --fail --location --retry 3 --connect-timeout 20 "
+        '${HF_TOKEN:+--header "Authorization: Bearer $HF_TOKEN"} '
+        f'{shlex.quote(url)} -o {quoted}.tmp '
+        f"&& mv {quoted}.tmp {quoted} || exit $?; fi; "
+        f"{size_check} || exit 1; "
+        f'[ "$(head -c 4 {quoted})" = GGUF ] || exit 1; '
+    )
+    return setup, path
 
 
 def _runtime_catalog() -> dict[str, Any]:
@@ -81,41 +112,19 @@ def preferred_prime_offer_image(backend: BackendType) -> str:
     )
 
 
-def _prime_projector_setup(config: DeploymentConfig) -> tuple[str, str]:
-    """Stage the exact projector atomically in the persistent llama cache."""
-    from huggingface_hub import hf_hub_url
-
-    artifact = config.vision.projector if config.vision else None
-    if artifact is None:
-        raise ValueError("Vision enabled without a resolved projector.")
-    identity = hashlib.sha256(f"{artifact.repo_id}@{artifact.revision}/{artifact.filename}".encode()).hexdigest()
-    root = "/data/llama.cpp" if prime_provider_options(config).disk_id else "/root/.cache/llama.cpp"
-    path = f"{root}/projectors/{identity}.gguf"
-    quoted = shlex.quote(path)
-    url = hf_hub_url(artifact.repo_id, artifact.filename, revision=artifact.revision)
-    size_check = f'[ "$(stat -c %s {quoted})" = {artifact.size_bytes} ]' if artifact.size_bytes else f"[ -s {quoted} ]"
-    # The pinned llama.cpp image includes curl. $HF_TOKEN survives shlex.join
-    # literally and is expanded by the container shell; the header is omitted
-    # entirely when no token is set, because an empty Bearer makes Hugging Face
-    # reject public files that an unauthenticated request would have served.
-    setup = (
-        f"mkdir -p {shlex.quote(root + '/projectors')} || exit $?; "
-        f"if ! {size_check}; then "
-        f"curl --fail --location --retry 3 --connect-timeout 20 "
-        '${HF_TOKEN:+--header "Authorization: Bearer $HF_TOKEN"} '
-        f'{shlex.quote(url)} -o {quoted}.tmp '
-        f"&& mv {quoted}.tmp {quoted} || exit $?; fi; "
-        f"{size_check} || exit 1; "
-        f'[ "$(head -c 4 {quoted})" = GGUF ] || exit 1; '
-    )
-    return setup, path
-
-
 def resolve_prime_launch_spec(config: DeploymentConfig) -> PrimeLaunchSpec:
     """Resolve Prime's single supported Ubuntu bootstrap runtime."""
 
     offer_image = preferred_prime_offer_image(config.backend)
     container_image = default_prime_container_image(config.backend)
+    build_recipe = None
+    if config.backend == BackendType.LLAMACPP and not os.getenv(
+        "LLM_LAUNCHPAD_PRIME_LLAMACPP_CONTAINER_IMAGE", ""
+    ).strip():
+        runtime = load_llamacpp_support_manifest(config.gguf_architecture)
+        if runtime.build_recipe:
+            container_image = runtime.image_ref
+            build_recipe = llamacpp_build_recipe(config.gguf_architecture)
     if not container_image:
         raise ValueError(
             f"Prime {config.backend.value} portable runtime image is not configured."
@@ -123,6 +132,7 @@ def resolve_prime_launch_spec(config: DeploymentConfig) -> PrimeLaunchSpec:
     return PrimeLaunchSpec(
         offer_image=offer_image,
         container_image=container_image,
+        build_recipe=build_recipe,
     )
 
 
@@ -182,6 +192,7 @@ class PrimeLaunchSpec:
 
     offer_image: str
     container_image: str = ""
+    build_recipe: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1467,6 +1478,14 @@ class PrimeBackend:
     @staticmethod
     def _bootstrap_script(config: DeploymentConfig, launch: PrimeLaunchSpec) -> str:
         docker_command = PrimeBackend._bootstrap_docker_command(config, launch)
+        prepare_image = f"docker pull {shlex.quote(launch.container_image)}"
+        if launch.build_recipe:
+            cuda_arch = llamacpp_cuda_architecture(config.gpu_type)
+            build_flags = f"--build-arg CUDA_ARCHITECTURES={cuda_arch} " if cuda_arch else ""
+            prepare_image = (
+                f"docker build -t {shlex.quote(launch.container_image)} "
+                f"{build_flags}- < {PRIME_RUNTIME_ROOT}/runtime.dockerfile"
+            )
         return "\n".join(
             [
                 "#!/usr/bin/env bash",
@@ -1489,7 +1508,7 @@ class PrimeBackend:
                     ">&2; exit 127; }"
                 ),
                 "nvidia-smi >/dev/null",
-                f"docker pull {shlex.quote(launch.container_image)}",
+                prepare_image,
                 f"docker rm -f {PRIME_RUNTIME_CONTAINER_NAME} >/dev/null 2>&1 || true",
                 shlex.join(docker_command),
                 "",
@@ -1504,6 +1523,8 @@ class PrimeBackend:
         """Upload and asynchronously start a portable inference runtime."""
 
         launch = resolve_prime_launch_spec(config)
+        if launch.build_recipe:
+            self._write_remote_runtime_file(pod, "runtime.dockerfile", launch.build_recipe, mode="644")
         self._write_remote_runtime_file(
             pod,
             "runtime.env",

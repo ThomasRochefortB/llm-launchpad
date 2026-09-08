@@ -159,7 +159,7 @@ class OrchestratorLlamaCppDeployFlowTests(unittest.TestCase):
             backend=BackendType.LLAMACPP,
             repo_id="unsloth/GLM-5.3-Flash-GGUF",
             quant="UD-Q2_K_XL",
-            gguf_architecture="glm5next",
+            gguf_architecture="future-unsupported-arch",
             do_warmup=False,
         )
 
@@ -169,7 +169,7 @@ class OrchestratorLlamaCppDeployFlowTests(unittest.TestCase):
         run.assert_not_called()
         errors = [event for event in events if isinstance(event, ErrorEvent)]
         self.assertEqual(len(errors), 1)
-        self.assertIn("glm5next", errors[0].message)
+        self.assertIn("future-unsupported-arch", errors[0].message)
         completions = [event for event in events if isinstance(event, OperationCompleteEvent)]
         self.assertEqual(len(completions), 1)
         self.assertFalse(completions[0].success)

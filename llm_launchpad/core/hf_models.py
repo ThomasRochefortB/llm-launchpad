@@ -13,6 +13,7 @@ from typing import Any, Literal
 from .coerce import optional_str
 from .gguf_metadata import (
     GgufMtpCapability,
+    GgufServingMetadata,
     fetch_gguf_mtp_capability,
     fetch_gguf_serving_metadata,
 )
@@ -48,6 +49,7 @@ class GgufQuantMetadata:
     attention_head_count_kv: int | None = None
     attention_key_length: int | None = None
     attention_value_length: int | None = None
+    serving_metadata: GgufServingMetadata | None = None
 
 
 @dataclass(frozen=True)
@@ -481,6 +483,7 @@ def fetch_gguf_quant_metadata(
             attention_head_count_kv=cached_metadata.attention_head_count_kv,
             attention_key_length=cached_metadata.attention_key_length,
             attention_value_length=cached_metadata.attention_value_length,
+            serving_metadata=cached_metadata.serving_metadata,
         )
 
     try:
@@ -542,12 +545,8 @@ def fetch_gguf_quant_metadata(
         "attention_value_length",
         "head_dim",
     )
-    if inspect_serving and (
-        block_count is None
-        or embedding_length is None
-        or attention_head_count is None
-        or attention_head_count_kv is None
-    ):
+    serving_metadata = None
+    if inspect_serving:
         serving_metadata = fetch_gguf_serving_metadata(
             normalized_repo,
             siblings,
@@ -563,7 +562,8 @@ def fetch_gguf_quant_metadata(
                 serving_metadata.attention_head_count or attention_head_count
             )
             attention_head_count_kv = (
-                serving_metadata.attention_head_count_kv or attention_head_count_kv
+                serving_metadata.attention_head_count_kv
+                if serving_metadata.attention_head_count_kv is not None else attention_head_count_kv
             )
             attention_key_length = (
                 serving_metadata.attention_key_length or attention_key_length
@@ -605,6 +605,7 @@ def fetch_gguf_quant_metadata(
         attention_head_count_kv=attention_head_count_kv,
         attention_key_length=attention_key_length,
         attention_value_length=attention_value_length,
+        serving_metadata=serving_metadata,
     )
     _GGUF_QUANT_METADATA_CACHE[cache_key] = (now, metadata)
     return GgufQuantMetadata(
@@ -619,6 +620,7 @@ def fetch_gguf_quant_metadata(
         attention_head_count_kv=metadata.attention_head_count_kv,
         attention_key_length=metadata.attention_key_length,
         attention_value_length=metadata.attention_value_length,
+        serving_metadata=metadata.serving_metadata,
     )
 
 

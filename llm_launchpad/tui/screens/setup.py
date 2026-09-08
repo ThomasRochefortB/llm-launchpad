@@ -58,7 +58,7 @@ class SetupRequiredScreen(CopyEnabledScreen):
     def on_mount(self) -> None:
         self.query_one("#setup-recheck-btn", Button).focus()
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
+    async def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "setup-recheck-btn":
             self.action_recheck()
         elif event.button.id == "setup-copy-modal-btn":
@@ -66,7 +66,7 @@ class SetupRequiredScreen(CopyEnabledScreen):
         elif event.button.id == "setup-copy-prime-btn":
             self._copy_command(_PRIME_COMMAND)
         elif event.button.id == "setup-quit-btn":
-            self.action_quit_app()
+            await self.action_quit_app()
 
     def _copy_command(self, command: str) -> None:
         self.app.copy_to_clipboard(command)
@@ -85,9 +85,9 @@ class SetupRequiredScreen(CopyEnabledScreen):
             f"Run {_MODAL_COMMAND} or {_PRIME_COMMAND}, then re-check."
         )
 
-    def action_quit_app(self) -> None:
+    async def action_quit_app(self) -> None:
         quit_action = getattr(self.app, "action_request_quit", None)
         if callable(quit_action):
-            quit_action()
+            await quit_action()
             return
         self.app.exit()

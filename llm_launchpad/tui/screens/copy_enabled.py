@@ -113,6 +113,14 @@ class CopyEnabledScreen(Screen):
         density = str(getattr(self.app, "tui_density", DEFAULT_TUI_DENSITY))
         self.set_class(density == "compact", "density-compact")
 
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Keep priority shortcuts behind the same minimum-size gate as input."""
+        if self.has_class("viewport-too-small") and action not in {
+            "pop_screen", "go_back", "quit_app", "cancel",
+        }:
+            return False
+        return super().check_action(action, parameters)
+
     def on_key(self, event: events.Key) -> None:
         """Block clipped controls while the minimum-size overlay is active."""
         if not self.has_class("viewport-too-small"):

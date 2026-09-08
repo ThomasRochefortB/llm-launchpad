@@ -6,8 +6,11 @@ Keyboard-driven form navigation with enter-to-proceed.
 
 from __future__ import annotations
 
+from ..widgets.vision_options import VisionOptions
+
 import json
 
+from rich.markup import escape
 from textual.actions import SkipAction
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -26,6 +29,7 @@ from textual.widgets import (
 )
 from textual.widgets.option_list import Option
 
+from ...core.coerce import positive_int
 from ...core.hf_models import ModelCandidate, VllmMemoryBreakdown, fetch_vllm_memory_breakdown
 from ...core.inference_options import recommended_vllm_tool_call_parser
 from ...core.modal_gpu import ModalGpuSpec, fetch_modal_gpu_catalog
@@ -68,7 +72,6 @@ from ..workers import (
     VllmModelsLoaded,
 )
 from ..widgets.input_form import FormField, ToggleField
-from ..widgets.vision_options import VisionOptions
 from .copy_enabled import CopyEnabledScreen
 
 
@@ -433,7 +436,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         Binding("up", "navigate_option_list_up", show=False, priority=True),
         Binding("down", "navigate_option_list_down", show=False, priority=True),
         Binding("escape", "pop_screen", "Back", show=True),
-        Binding("ctrl+d", "do_deploy", "Deploy", show=True),
+        Binding("ctrl+d", "do_deploy", "Deploy", show=True, priority=True),
         Binding("ctrl+s", "open_storage", "Storage", show=True),
         Binding("p", "predownload_highlighted", "Pre-download", show=True),
     ]
@@ -809,7 +812,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
 
     def on_prime_offers_failed(self, message: PrimeOffersFailed) -> None:
         self.query_one("#prime-offer-status-llama", Static).update(
-            f"[red]Could not load Prime offers:[/red] {message.error}"
+            f"[red]Could not load Prime offers:[/red] {escape(message.error)}"
         )
 
     def _refresh_gpu_types(self) -> None:
@@ -887,7 +890,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
             return
         self._ranked_models = []
         self.query_one("#llama-model-list", OptionList).set_options([])
-        self._set_model_status(f"[yellow]Could not load cached models:[/yellow] {message.error}")
+        self._set_model_status(f"[yellow]Could not load cached models:[/yellow] {escape(message.error)}")
 
     def on_llama_cpp_models_failed(self, message: LlamaCppModelsFailed) -> None:
         if message.mode != self._rank_mode:
@@ -896,7 +899,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         self._repo_to_quants = {}
         self.query_one("#llama-model-list", OptionList).set_options([])
         self._set_model_status(
-            f"[yellow]Could not load model suggestions:[/yellow] {message.error} [dim](manual input still works)[/dim]"
+            f"[yellow]Could not load model suggestions:[/yellow] {escape(message.error)} [dim](manual input still works)[/dim]"
         )
 
     def on_llama_cpp_quants_loaded(self, message: LlamaCppQuantsLoaded) -> None:
@@ -921,7 +924,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
             auto_select=not self._quant_touched,
             vram_gb_by_quant=self._repo_to_quant_vram[repo_key],
         )
-        architecture_label = message.architecture or "unknown"
+        architecture_label = escape(message.architecture or "unknown")
         if message.compatibility_status == "supported":
             self._set_quant_status(
                 "[dim]Quantizations:[/dim] "
@@ -931,7 +934,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
             self._set_quant_status(
                 "[dim]Quantizations:[/dim] "
                 f"[red]Unsupported architecture {architecture_label}:[/red] "
-                f"{message.compatibility_message}"
+                f"{escape(message.compatibility_message)}"
             )
         else:
             detail = (
@@ -940,7 +943,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
             )
             self._set_quant_status(
                 f"[dim]Quantizations:[/dim] "
-                f"[yellow]Compatibility unknown:[/yellow] {detail}"
+                f"[yellow]Compatibility unknown:[/yellow] {escape(detail)}"
             )
         if self._prime_offers:
             self._refresh_prime_offer_options()
@@ -954,7 +957,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
             return
         self.query_one("#llama-quant-list", OptionList).set_options([])
         self._set_quant_status(
-            f"[yellow]Could not load quantizations:[/yellow] {message.error} [dim](manual quant still works)[/dim]"
+            f"[yellow]Could not load quantizations:[/yellow] {escape(message.error)} [dim](manual quant still works)[/dim]"
         )
 
     def action_do_deploy(self) -> None:
@@ -1047,16 +1050,17 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         config.host = h or None
         p = self.query_one("#port-input", Input).value.strip()
         if p:
-            try:
-                config.port = int(p)
-            except ValueError:
-                pass
+            config.port = positive_int(p)
+            if config.port is None or config.port > 65535:
+                self.app.notify("Port must be an integer from 1 to 65535.", severity="error", timeout=5)
+                return
         ngl = self.query_one("#n-gpu-layers", Input).value.strip()
         if ngl:
             try:
                 config.n_gpu_layers = int(ngl)
             except ValueError:
-                pass
+                self.app.notify("GPU layers must be an integer, or blank for auto.", severity="error", timeout=5)
+                return
         config.llamacpp_image_no_cache = self.query_one("#llama-image-no-cache", Switch).value
 
         model_hint = config.repo_id
@@ -1295,7 +1299,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
                 BackendType.LLAMACPP,
                 auto_instance_name_for_backend(BackendType.LLAMACPP, model_hint),
             )
-        self.query_one("#llama-app-preview", Static).update(f"[dim]App name preview: {preview}[/dim]")
+        self.query_one("#llama-app-preview", Static).update(f"[dim]App name preview: {escape(preview)}[/dim]")
 
     def action_pop_screen(self) -> None:
         self.app.pop_screen()
@@ -1311,7 +1315,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
         Binding("up", "navigate_option_list_up", show=False, priority=True),
         Binding("down", "navigate_option_list_down", show=False, priority=True),
         Binding("escape", "pop_screen", "Back", show=True),
-        Binding("ctrl+d", "do_deploy", "Deploy", show=True),
+        Binding("ctrl+d", "do_deploy", "Deploy", show=True, priority=True),
         Binding("ctrl+s", "open_storage", "Storage", show=True),
         Binding("p", "predownload_highlighted", "Pre-download", show=True),
     ]
@@ -1718,7 +1722,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
 
     def on_prime_offers_failed(self, message: PrimeOffersFailed) -> None:
         self.query_one("#prime-offer-status", Static).update(
-            f"[red]Could not load Prime offers:[/red] {message.error}"
+            f"[red]Could not load Prime offers:[/red] {escape(message.error)}"
         )
 
     def _refresh_gpu_types(self) -> None:
@@ -1831,7 +1835,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
             return
         self._ranked_models = []
         self.query_one("#vllm-model-list", OptionList).set_options([])
-        self._set_model_status(f"[yellow]Could not load cached models:[/yellow] {message.error}")
+        self._set_model_status(f"[yellow]Could not load cached models:[/yellow] {escape(message.error)}")
 
     def on_vllm_models_failed(self, message: VllmModelsFailed) -> None:
         if message.mode != self._rank_mode:
@@ -1839,7 +1843,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
         self._ranked_models = []
         self.query_one("#vllm-model-list", OptionList).set_options([])
         self._set_model_status(
-            f"[yellow]Could not load model suggestions:[/yellow] {message.error} [dim](manual input still works)[/dim]"
+            f"[yellow]Could not load model suggestions:[/yellow] {escape(message.error)} [dim](manual input still works)[/dim]"
         )
 
     def action_do_deploy(self) -> None:
@@ -2054,7 +2058,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
                 BackendType.VLLM,
                 auto_instance_name_for_backend(BackendType.VLLM, model_name),
             )
-        self.query_one("#vllm-app-preview", Static).update(f"[dim]App name preview: {preview}[/dim]")
+        self.query_one("#vllm-app-preview", Static).update(f"[dim]App name preview: {escape(preview)}[/dim]")
 
     def _do_deploy(self) -> None:
         config = DeploymentConfig(backend=BackendType.VLLM, provider=self._provider)
@@ -2094,10 +2098,10 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
             config.n_gpu = config.gpu_count
         else:
             n_gpu_str = self.query_one("#n-gpu", Input).value.strip()
-            try:
-                config.n_gpu = int(n_gpu_str) if n_gpu_str else 1
-            except ValueError:
-                config.n_gpu = 1
+            config.n_gpu = positive_int(n_gpu_str or "1")
+            if config.n_gpu is None:
+                self.app.notify("Tensor parallel size must be an integer >= 1.", severity="error", timeout=5)
+                return
         config.tool_call_parser = self.query_one("#tool-call-parser", Input).value.strip() or None
         # Advanced values are always read: collapsing the section must never
         # silently discard options the user entered before collapsing it.

@@ -531,16 +531,19 @@ VllmDeployScreen .gpu-config-panel {
     text-align: right;
 }
 
-#connection-card {
+#connection-card,
+#result-card {
     width: 100%;
     height: auto;
+    max-height: 65%;
     margin: 0 2 1 2;
     padding: 1 2;
     border: solid $primary;
     background: $surface-lighten-1;
 }
 
-#connection-card-body {
+#connection-card-body,
+#result-card-body {
     height: auto;
     text-wrap: wrap;
 }
@@ -553,6 +556,16 @@ VllmDeployScreen .gpu-config-panel {
 
 #connection-card-actions Button {
     margin: 0 1 0 0;
+}
+
+.viewport-narrow #connection-card-actions {
+    layout: grid;
+    grid-size: 2;
+    grid-rows: 3;
+}
+
+.viewport-minimal #connection-card-actions {
+    layout: vertical;
 }
 
 /* ---- Manage screen ---- */
@@ -613,6 +626,18 @@ VllmDeployScreen .gpu-config-panel {
 }
 
 /* ---- Settings screen ---- */
+
+#setup-required-actions,
+#connection-info-actions,
+#delete-confirm-actions,
+#result-card-actions {
+    height: auto;
+}
+
+.viewport-compact #setup-required-actions,
+.viewport-minimal #connection-info-actions {
+    layout: vertical;
+}
 
 #settings-scroll {
     align: center middle;

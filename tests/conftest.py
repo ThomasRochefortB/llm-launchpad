@@ -85,6 +85,23 @@ def _stub_orchestrator_llamacpp_metadata(monkeypatch: pytest.MonkeyPatch) -> Non
 
 
 @pytest.fixture(autouse=True)
+def _stub_deploy_screen_vllm_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep typing in vLLM UI tests from starting live Hugging Face requests."""
+    from llm_launchpad.core.hf_models import VllmMemoryBreakdown
+
+    monkeypatch.setattr(
+        "llm_launchpad.tui.screens.deploy.fetch_vllm_memory_breakdown",
+        lambda **_kwargs: VllmMemoryBreakdown(
+            total_gb=8.0,
+            weights_gb=4.0,
+            kv_cache_gb=2.0,
+            overhead_gb=2.0,
+            context_tokens=8192,
+        ),
+    )
+
+
+@pytest.fixture(autouse=True)
 def _stub_orchestrator_reasoning_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep deployment tests from inspecting live Hugging Face repositories."""
 

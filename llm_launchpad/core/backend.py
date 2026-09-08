@@ -22,6 +22,7 @@ from .modal_cli import resolve_modal_cli_path
 from .shutdown import is_shutting_down as _is_shutting_down
 from .shutdown import shutdown_event
 from .diagnostics import log_exception
+from .runtime_support import load_llamacpp_support_manifest, llamacpp_cuda_architecture
 from .naming import default_served_model_name
 from .naming import infer_backend_from_app_name, infer_instance_from_app_name, legacy_app_name
 from .naming import modal_function_name, modal_web_label
@@ -240,6 +241,12 @@ class ModalBackend:
         if config.function_slug:
             env["MODAL_FUNCTION_SLUG"] = config.function_slug
         if config.backend == BackendType.LLAMACPP:
+            runtime = load_llamacpp_support_manifest(config.gguf_architecture)
+            if runtime.build_recipe and not os.environ.get("LLAMA_CPP_IMAGE_REF", "").strip():
+                env["LLAMA_CPP_BUILD_RECIPE"] = runtime.build_recipe
+                cuda_arch = llamacpp_cuda_architecture(config.gpu_type)
+                if cuda_arch:
+                    env["LLAMA_CPP_CUDA_ARCHITECTURES"] = cuda_arch
             if config.llamacpp_image_no_cache is not None:
                 env["LLAMA_CPP_IMAGE_NO_CACHE"] = "true" if config.llamacpp_image_no_cache else "false"
             return env
