@@ -111,9 +111,15 @@ def merge_connections(
         if not cached:
             continue
         cached_url = str(cached.get("base_url") or "").removesuffix("/v1").rstrip("/")
-        same_resource = not row.app_id or row.app_id == str(cached.get("resource_id") or "")
-        same_url = not row.web_url or row.web_url.removesuffix("/v1").rstrip("/") == cached_url
-        if same_resource and same_url:
+        cached_resource = str(cached.get("resource_id") or "")
+        # Only a genuine contradiction means this record describes a different
+        # deployment. An identifier missing on either side is unknown, not
+        # mismatched -- records saved before the provider reported a resource id
+        # would otherwise never hand back their verification.
+        resource_conflict = bool(row.app_id and cached_resource and row.app_id != cached_resource)
+        row_url = (row.web_url or "").removesuffix("/v1").rstrip("/")
+        url_conflict = bool(row_url and cached_url and row_url != cached_url)
+        if not resource_conflict and not url_conflict:
             row.vision = row.vision or vision_from_dict(cached.get("vision"))
         row.web_url = row.web_url or str(cached.get("base_url") or "").removesuffix("/v1")
         row.served_model_name = row.served_model_name or str(cached.get("model_id") or "") or None

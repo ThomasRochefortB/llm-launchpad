@@ -883,6 +883,56 @@ class ProbeFailureIsolationTests(unittest.TestCase):
         persist.assert_not_called()
 
 
+class VisionHydrationTests(unittest.TestCase):
+    """Stored verification must reach the rows that management commands use."""
+
+    def _row(self, **kwargs) -> EndpointInfo:
+        return EndpointInfo(name="vl-app", backend=BackendType.LLAMACPP, **kwargs)
+
+    def _entry(self, **kwargs) -> dict:
+        entry = {
+            "base_url": "https://host/v1",
+            "vision": {
+                "supported": True, "enabled": True, "verification": "passed",
+                "fingerprint": "f" * 64, "message": "ok",
+            },
+        }
+        entry.update(kwargs)
+        return entry
+
+    def _merge(self, row: EndpointInfo, entry: dict) -> EndpointInfo:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "connections.json"
+            path.write_text(json.dumps({"entries": {"vl-app": entry}}), encoding="utf-8")
+            connection_store.merge_connections([row], path=path, persist_backfill=False)
+        return row
+
+    def test_missing_resource_id_still_hands_back_verification(self) -> None:
+        # Deploys that finish before the provider reports a resource id save an
+        # empty one; that is unknown, not a different deployment.
+        row = self._merge(self._row(app_id="ap-live-123"), self._entry(resource_id=""))
+        self.assertIsNotNone(row.vision)
+        self.assertEqual(row.vision.verification, VisionVerification.PASSED)
+
+    def test_matching_identifiers_hand_back_verification(self) -> None:
+        row = self._merge(
+            self._row(app_id="ap-1", web_url="https://host"),
+            self._entry(resource_id="ap-1"),
+        )
+        self.assertIsNotNone(row.vision)
+
+    def test_a_conflicting_resource_id_withholds_verification(self) -> None:
+        row = self._merge(self._row(app_id="ap-new"), self._entry(resource_id="ap-old"))
+        self.assertIsNone(row.vision)
+
+    def test_a_conflicting_url_withholds_verification(self) -> None:
+        row = self._merge(
+            self._row(app_id="ap-1", web_url="https://elsewhere"),
+            self._entry(resource_id="ap-1"),
+        )
+        self.assertIsNone(row.vision)
+
+
 class ImageTestCommandGuardTests(unittest.TestCase):
     """`--image-test` must never invent an image capability."""
 
