@@ -32,6 +32,7 @@ from ...protocol.enums import (
 )
 from ...protocol.models import DeploymentConfig, InferencePlan
 from ..widgets.input_form import FormField, ToggleField
+from ..widgets.vision_options import VisionOptions
 from .copy_enabled import CopyEnabledScreen
 
 
@@ -323,6 +324,10 @@ class QuickDeployScreen(CopyEnabledScreen):
                         id="quick-objective",
                         classes="quick-advanced",
                     )
+                # A guaranteed-fit plan cannot serve images, because image
+                # working memory is not part of the placement it certifies.
+                if self.plan.recipe.serving_requirements is None:
+                    yield VisionOptions(classes="quick-advanced")
                 yield FormField(
                     "Instance name (optional)",
                     "quick-instance-name",
@@ -506,6 +511,8 @@ class QuickDeployScreen(CopyEnabledScreen):
                     ).value,
                     auto_disk=self.query_one("#quick-prime-auto-disk", Switch).value,
                 )
+            for options in self.query(VisionOptions):
+                options.apply(candidate)
             return candidate
 
         config = _config_for_plan(self.plan)

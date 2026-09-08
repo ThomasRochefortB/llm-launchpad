@@ -10,6 +10,7 @@ from typing import Any
 
 from ..protocol.enums import BackendType, ComputeProvider
 from ..protocol.models import DeploymentConfig, EndpointInfo
+from .vision import vision_from_dict, vision_to_dict
 from .config import SETTINGS_DIR
 from .coerce import positive_int
 from .opencode import build_openai_connection_payload
@@ -76,6 +77,13 @@ def save_connection(
         "max_context_tokens": payload.get("context_limit"),
         "max_output_tokens": payload.get("output_limit"),
         "reasoning": payload.get("reasoning"),
+        "vision": payload.get("vision"),
+        "vision_mode": config.vision_mode.value,
+        "image_limit": config.image_limit,
+        "mm_processor_kwargs": config.mm_processor_kwargs,
+        "projector_repo": config.projector_repo,
+        "projector_revision": config.projector_revision,
+        "projector_file": config.projector_file,
         "runtime_attestation": runtime_attestation_to_dict(config.runtime_attestation),
         "api_key": config.endpoint_api_key or endpoint.endpoint_api_key or "",
         "cached_at_epoch": time.time(),
@@ -102,6 +110,17 @@ def merge_connections(
         cached = entries.get((row.name or "").strip())
         if not cached:
             continue
+        cached_url = str(cached.get("base_url") or "").removesuffix("/v1").rstrip("/")
+        cached_resource = str(cached.get("resource_id") or "")
+        # Only a genuine contradiction means this record describes a different
+        # deployment. An identifier missing on either side is unknown, not
+        # mismatched -- records saved before the provider reported a resource id
+        # would otherwise never hand back their verification.
+        resource_conflict = bool(row.app_id and cached_resource and row.app_id != cached_resource)
+        row_url = (row.web_url or "").removesuffix("/v1").rstrip("/")
+        url_conflict = bool(row_url and cached_url and row_url != cached_url)
+        if not resource_conflict and not url_conflict:
+            row.vision = row.vision or vision_from_dict(cached.get("vision"))
         row.web_url = row.web_url or str(cached.get("base_url") or "").removesuffix("/v1")
         row.served_model_name = row.served_model_name or str(cached.get("model_id") or "") or None
         row.display_name = row.display_name or str(cached.get("display_name") or "") or None
@@ -178,6 +197,7 @@ def rows_from_connection_cache(
                 max_context_tokens=positive_int(entry.get("max_context_tokens")),
                 max_output_tokens=positive_int(entry.get("max_output_tokens")),
                 reasoning=reasoning_capabilities_from_dict(entry.get("reasoning")),
+                vision=vision_from_dict(entry.get("vision")),
                 runtime_attestation=runtime_attestation_from_dict(
                     entry.get("runtime_attestation")
                 ),
@@ -349,3 +369,13 @@ def remove_connection(app_name: str, path: Path = CONNECTIONS_PATH) -> None:
     entries = load_connection_entries(path)
     if entries.pop(app_name, None) is not None:
         _write(entries, path)
+
+
+def update_vision_verification(app_name: str, url: str, vision: Any, path: Path = CONNECTIONS_PATH) -> None:
+    """Update only image state for the endpoint actually tested."""
+    entries = load_connection_entries(path)
+    entry = entries.get(app_name)
+    if entry is None or str(entry.get("base_url") or "").removesuffix("/v1").rstrip("/") != url.removesuffix("/v1").rstrip("/"):
+        return
+    entry["vision"] = vision_to_dict(vision)
+    _write(entries, path)

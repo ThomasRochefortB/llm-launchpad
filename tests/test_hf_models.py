@@ -121,8 +121,19 @@ class HFModelsTests(unittest.TestCase):
         fake_module = types.SimpleNamespace(HfApi=FakeApi)
         with patch.dict("sys.modules", {"huggingface_hub": fake_module}):
             result = hf_models._fetch_candidates(mode="trending", limit=2, target="vllm")
-        self.assertEqual(calls, [("text-generation", "trending_score", 6)])
-        self.assertEqual([m.repo_id for m in result], ["Qwen/Qwen3-Coder-Next", "zai-org/GLM-5"])
+        self.assertEqual(
+            calls,
+            [
+                ("text-generation", "trending_score", 6),
+                ("image-text-to-text", "trending_score", 6),
+            ],
+        )
+        # Vision models rank alongside text models, and the repeated rows from
+        # the second task list are deduplicated rather than appended again.
+        self.assertEqual(
+            [m.repo_id for m in result],
+            ["internlm/Intern-S1-Pro", "Qwen/Qwen3-Coder-Next"],
+        )
 
     def test_fetch_llamacpp_candidates_uses_gguf_filter(self) -> None:
         calls: list[tuple[object, str, int]] = []
@@ -156,7 +167,13 @@ class HFModelsTests(unittest.TestCase):
         fake_module = types.SimpleNamespace(HfApi=FakeApi)
         with patch.dict("sys.modules", {"huggingface_hub": fake_module}):
             result = hf_models._fetch_candidates(mode="downloads", limit=2, target="llamacpp")
-        self.assertEqual(calls, [(["text-generation", "gguf"], "downloads", 6)])
+        self.assertEqual(
+            calls,
+            [
+                (["text-generation", "gguf"], "downloads", 6),
+                (["image-text-to-text", "gguf"], "downloads", 6),
+            ],
+        )
         self.assertEqual([m.repo_id for m in result], ["Qwen/Qwen3-Coder-Next-GGUF"])
         self.assertEqual(result[0].quantizations, ("Q4_K_M", "Q8_0"))
 

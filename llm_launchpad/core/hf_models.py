@@ -48,6 +48,7 @@ class GgufQuantMetadata:
     attention_head_count_kv: int | None = None
     attention_key_length: int | None = None
     attention_value_length: int | None = None
+    has_projector: bool = False
 
 
 @dataclass(frozen=True)
@@ -59,10 +60,11 @@ class VllmMemoryBreakdown:
     kv_cache_gb: float
     overhead_gb: float
     context_tokens: int
+    vision_working_memory_gb: float | None = 0.0
 
 
 _CACHE_TTL_SECONDS = 300
-_VLLM_MEMORY_CACHE_SCHEMA_VERSION = 3
+_VLLM_MEMORY_CACHE_SCHEMA_VERSION = 4
 _HF_REQUEST_TIMEOUT_SECONDS = 10.0
 _HF_ETAG_TIMEOUT_SECONDS = 10.0
 _DEFAULT_CONTEXT_TOKENS = 8192
@@ -165,6 +167,9 @@ def fetch_vllm_memory_breakdown(
         if isinstance(repo_config, dict):
             primary_config = repo_config
 
+    multimodal = isinstance(primary_config.get("vision_config"), dict)
+    if isinstance(primary_config.get("text_config"), dict):
+        primary_config = primary_config["text_config"]
     weights_bytes = _extract_safetensors_total_bytes(safetensors)
     parameter_count = _extract_parameter_count(repo_id=normalized_repo, config=primary_config, safetensors=safetensors)
     if weights_bytes is None and parameter_count is None:
@@ -253,6 +258,7 @@ def fetch_vllm_memory_breakdown(
         return None
 
     estimate = VllmMemoryBreakdown(
+        vision_working_memory_gb=None if multimodal else 0.0,
         total_gb=total_bytes / 1_000_000_000.0,
         weights_gb=weights_bytes / 1_000_000_000.0,
         kv_cache_gb=kv_cache_bytes / 1_000_000_000.0,
@@ -476,6 +482,7 @@ def fetch_gguf_quant_metadata(
             attention_head_count_kv=cached_metadata.attention_head_count_kv,
             attention_key_length=cached_metadata.attention_key_length,
             attention_value_length=cached_metadata.attention_value_length,
+            has_projector=cached_metadata.has_projector,
         )
 
     try:
@@ -496,6 +503,7 @@ def fetch_gguf_quant_metadata(
     )
     siblings = getattr(info, "siblings", None)
     quantizations = _extract_gguf_quantizations(siblings)
+    has_projector = _has_projector_sibling(siblings)
     gguf_payload = getattr(info, "gguf", None)
     architecture = _extract_gguf_architecture(gguf_payload)
     context_length = _extract_gguf_positive_int(
@@ -600,6 +608,7 @@ def fetch_gguf_quant_metadata(
         attention_head_count_kv=attention_head_count_kv,
         attention_key_length=attention_key_length,
         attention_value_length=attention_value_length,
+        has_projector=has_projector,
     )
     _GGUF_QUANT_METADATA_CACHE[cache_key] = (now, metadata)
     return GgufQuantMetadata(
@@ -614,6 +623,7 @@ def fetch_gguf_quant_metadata(
         attention_head_count_kv=metadata.attention_head_count_kv,
         attention_key_length=metadata.attention_key_length,
         attention_value_length=metadata.attention_value_length,
+        has_projector=metadata.has_projector,
     )
 
 
@@ -627,29 +637,30 @@ def _fetch_candidates(mode: ModelRankMode, limit: int, target: ModelDiscoveryTar
 
     sort = _SORT_BY_MODE.get(mode, "downloads")
     api = HfApi()
-    if target == "llamacpp":
+    candidates_by_id: dict[str, ModelCandidate] = {}
+    best_rank: dict[str, int] = {}
+    for task in ("text-generation", "image-text-to-text"):
         rows = api.list_models(
-            filter=["text-generation", "gguf"],
-            sort=sort,
-            limit=limit * 3,
-            full=True,
+            filter=[task, "gguf"] if target == "llamacpp" else task,
+            sort=sort, limit=limit * 3, full=True,
         )
+        rank = 0
+        for row in rows:
+            candidate = _normalize_candidate(row, target=target)
+            if candidate is None:
+                continue
+            # Each task list arrives already ranked, so keep the better
+            # placement instead of letting merge order decide the winner.
+            if rank < best_rank.get(candidate.repo_id, rank + 1):
+                best_rank[candidate.repo_id] = rank
+            candidates_by_id.setdefault(candidate.repo_id, candidate)
+            rank += 1
+    candidates = list(candidates_by_id.values())
+    if mode == "downloads":
+        candidates.sort(key=lambda row: row.downloads or 0, reverse=True)
     else:
-        rows = api.list_models(
-            filter="text-generation",
-            sort=sort,
-            limit=limit * 3,
-            full=True,
-        )
-    candidates: list[ModelCandidate] = []
-    for row in rows:
-        candidate = _normalize_candidate(row, target=target)
-        if candidate is None:
-            continue
-        candidates.append(candidate)
-        if len(candidates) >= limit:
-            break
-    return candidates
+        candidates.sort(key=lambda row: best_rank[row.repo_id])
+    return candidates[:limit]
 
 
 def _normalize_candidate(row: Any, target: ModelDiscoveryTarget = "vllm") -> ModelCandidate | None:
@@ -675,12 +686,12 @@ def _normalize_candidate(row: Any, target: ModelDiscoveryTarget = "vllm") -> Mod
 
 
 def _is_text_generation(pipeline_tag: str | None, tags: Any) -> bool:
-    if pipeline_tag and pipeline_tag.strip() == "text-generation":
+    if pipeline_tag and pipeline_tag.strip() in {"text-generation", "image-text-to-text"}:
         return True
     if not isinstance(tags, list):
         return False
     lowered = {str(tag).strip().lower() for tag in tags}
-    return "text-generation" in lowered
+    return bool({"text-generation", "image-text-to-text"} & lowered)
 
 
 def _has_tag(tags: Any, expected: str) -> bool:
@@ -698,9 +709,22 @@ def _extract_gguf_quantizations(siblings: Any) -> list[str]:
         filename = str(getattr(sibling, "rfilename", "")).strip()
         if not filename or not filename.lower().endswith(".gguf"):
             continue
+        if any(marker in filename.casefold() for marker in ("mmproj", "imatrix", "draft", "eagle")):
+            continue
         for match in _QUANT_PATTERN.findall(filename):
             detected.add(_normalize_quant_label(match))
     return sorted(detected, key=_quant_sort_key)
+
+
+def _has_projector_sibling(siblings: Any) -> bool:
+    """Report whether the repository ships a llama.cpp vision projector."""
+    if not isinstance(siblings, list):
+        return False
+    return any(
+        "mmproj" in str(getattr(sibling, "rfilename", "")).casefold()
+        and str(getattr(sibling, "rfilename", "")).casefold().endswith(".gguf")
+        for sibling in siblings
+    )
 
 
 def _extract_gguf_architecture(gguf_payload: Any) -> str | None:

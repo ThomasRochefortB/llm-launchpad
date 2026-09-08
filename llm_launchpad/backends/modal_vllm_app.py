@@ -92,6 +92,8 @@ PREDOWNLOAD_TIMEOUT_MINUTES = _read_int_env("PREDOWNLOAD_TIMEOUT_MINUTES", 6 * 6
 SNAPSHOT_MAX_WORKERS = _read_int_env("HF_SNAPSHOT_MAX_WORKERS", 16)
 
 RUNTIME_ENV = {
+    "LIMIT_MM_PER_PROMPT": os.environ.get("LIMIT_MM_PER_PROMPT", '{"image":1,"video":0,"audio":0}'),
+    "MM_PROCESSOR_KWARGS": os.environ.get("MM_PROCESSOR_KWARGS", ""),
     "MODEL_NAME": DEPLOY_MODEL_NAME,
     "SERVED_MODEL_NAME": DEPLOY_SERVED_MODEL_NAME,
     "FAST_BOOT": "true" if DEPLOY_FAST_BOOT else "false",
@@ -113,13 +115,15 @@ if DEPLOY_ENABLE_AUTO_TOOL_CHOICE is not None:
 hf_cache_vol = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
 vllm_cache_vol = modal.Volume.from_name("vllm-cache", create_if_missing=True)
 
+# The official image already ships a CUDA-built vLLM, and ``serve`` execs that
+# image's own ``vllm`` binary, so vLLM is deliberately not reinstalled here.
+# Modal still needs its own interpreter (the image exposes ``python3`` but not
+# ``python``, which fails the image build), and ``predownload_model`` runs under
+# that interpreter, so huggingface-hub is installed for it alone.
 vllm_image = (
-    modal.Image.from_registry("nvidia/cuda:12.8.0-devel-ubuntu22.04", add_python="3.12")
+    modal.Image.from_registry("vllm/vllm-openai:v0.19.1", add_python="3.12")
     .entrypoint([])
-    .uv_pip_install(
-        "vllm==0.13.0",
-        "huggingface-hub==0.36.0",
-    )
+    .uv_pip_install("huggingface-hub")
     .env(
         {
             "HF_XET_HIGH_PERFORMANCE": "1",
@@ -209,6 +213,10 @@ def serve() -> None:
         str(n_gpu),
     ]
 
+    cmd += ["--limit-mm-per-prompt", os.environ.get("LIMIT_MM_PER_PROMPT", RUNTIME_ENV["LIMIT_MM_PER_PROMPT"])]
+    processor_kwargs = os.environ.get("MM_PROCESSOR_KWARGS", RUNTIME_ENV["MM_PROCESSOR_KWARGS"])
+    if processor_kwargs:
+        cmd += ["--mm-processor-kwargs", processor_kwargs]
     if model_revision:
         cmd += ["--revision", model_revision]
     if reasoning_parser:

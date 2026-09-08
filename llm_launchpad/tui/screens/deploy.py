@@ -68,6 +68,7 @@ from ..workers import (
     VllmModelsLoaded,
 )
 from ..widgets.input_form import FormField, ToggleField
+from ..widgets.vision_options import VisionOptions
 from .copy_enabled import CopyEnabledScreen
 
 
@@ -536,6 +537,8 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
                 yield Static("", id="llama-cost-preview")
 
             yield Static("")
+
+            yield VisionOptions(BackendType.LLAMACPP)
 
             # Advanced options (collapsed by default)
             yield Button("Advanced options...", id="toggle-advanced-llama", variant="default")
@@ -1073,6 +1076,11 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
                 config.provider, config.backend, config.instance_name
             )
 
+        try:
+            self.query_one(VisionOptions).apply(config)
+        except ValueError as exc:
+            self.app.notify(str(exc), severity="error", timeout=8)
+            return
         self.app.begin_deploy(config)  # type: ignore[attr-defined]
 
     def _set_model_status(self, text: str) -> None:
@@ -1407,6 +1415,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
                     classes="gpu-config-tensor-field",
                 )
                 yield Static("", id="vllm-cost-preview")
+            yield VisionOptions(BackendType.VLLM)
             yield Button("Advanced options...", id="toggle-advanced-vllm", variant="default")
             yield FormField(
                 "Model revision (optional)",
@@ -1917,10 +1926,18 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
             return
         tensor_parallel = self._current_tensor_parallel()
         per_gpu_gb = estimate.total_gb / max(1, tensor_parallel)
+        # An image encoder's working memory is not modelled, so say so rather
+        # than letting the total read as if it covered image requests.
+        vision_note = (
+            " — excludes unknown image working memory"
+            if estimate.vision_working_memory_gb is None
+            else ""
+        )
         self._set_vllm_memory_status(
             "[dim]"
             f"Estimated VRAM (heuristic, ctx={estimate.context_tokens}): "
             f"~{estimate.total_gb:.1f} GB total, ~{per_gpu_gb:.1f} GB/GPU @ TP={tensor_parallel}"
+            f"{vision_note}"
             "[/dim]"
         )
 
@@ -2128,6 +2145,11 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
                 config.provider, config.backend, config.instance_name
             )
 
+        try:
+            self.query_one(VisionOptions).apply(config)
+        except ValueError as exc:
+            self.app.notify(str(exc), severity="error", timeout=8)
+            return
         self.app.begin_deploy(config)  # type: ignore[attr-defined]
 
     def action_pop_screen(self) -> None:

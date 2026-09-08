@@ -132,3 +132,19 @@ class OperationType(str, Enum):
     STORAGE_LIST = "storage_list"
     STORAGE_PREDOWNLOAD = "storage_predownload"
     STORAGE_DELETE = "storage_delete"
+
+
+class VisionMode(str, Enum):
+    """Requested image input behavior."""
+
+    AUTO = "auto"
+    ON = "on"
+    OFF = "off"
+
+
+class VisionVerification(str, Enum):
+    """Result of exercising image input on a particular deployment."""
+
+    UNTESTED = "untested"
+    PASSED = "passed"
+    FAILED = "failed"

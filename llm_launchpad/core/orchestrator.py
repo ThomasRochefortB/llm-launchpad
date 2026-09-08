@@ -7,6 +7,9 @@ CLI both consume these generators.
 
 from __future__ import annotations
 
+from ..protocol.enums import VisionVerification
+from ..protocol.models import VisionCapabilities
+
 from .shutdown import is_shutting_down, shutdown_event
 
 from concurrent.futures import ThreadPoolExecutor
@@ -376,6 +379,23 @@ class Orchestrator:
                     operation=OperationType.DEPLOY,
                     is_milestone=True,
                 )
+        from .vision import prepare_vision
+        try:
+            vision = prepare_vision(config)
+        except (ValueError, OSError) as exc:
+            yield from fail_operation(OperationType.DEPLOY, str(exc), exit_code=2)
+            return
+        yield LogEvent(
+            line=f"Vision: {vision.message} Enabled: {vision.enabled}; verification: untested.",
+            operation=OperationType.DEPLOY,
+        )
+        if vision.enabled and config.serving_requirements is not None:
+            yield from fail_operation(
+                OperationType.DEPLOY,
+                "Vision working memory is not calibrated for guaranteed-fit deployment. "
+                "Use manual Deploy, or select text-only mode.", exit_code=2,
+            )
+            return
         if config.provider == ComputeProvider.PRIME:
             yield from self._deploy_prime(config)
             return
@@ -955,9 +975,17 @@ class Orchestrator:
         serving_requirements: ServingRequirements | None = None,
         placement_assessment: PlacementAssessment | None = None,
         runtime_id: str | None = None,
+        vision: VisionCapabilities | None = None,
     ) -> EventStream:
         """Probe endpoint readiness and optionally tail logs."""
-        yield from WarmupRunner().run(
+        if vision is None and app_name:
+            from .connection_store import load_connection_entries
+            from .vision import vision_from_dict
+            entry = load_connection_entries().get(app_name, {})
+            if str(entry.get("base_url") or "").removesuffix("/v1").rstrip("/") == server_url.removesuffix("/v1").rstrip("/"):
+                vision = vision_from_dict(entry.get("vision"))
+        for event in WarmupRunner().run(
+            vision=vision,
             backend=backend,
             server_url=server_url,
             timeout=timeout,
@@ -971,7 +999,18 @@ class Orchestrator:
             serving_requirements=serving_requirements,
             placement_assessment=placement_assessment,
             runtime_id=runtime_id,
-        )
+        ):
+            if (
+                isinstance(event, OperationCompleteEvent)
+                and app_name
+                and vision is not None
+                # A cancelled probe leaves this untested and teaches nothing, so
+                # the stored verification must survive untouched.
+                and vision.verification != VisionVerification.UNTESTED
+            ):
+                from .connection_store import update_vision_verification
+                update_vision_verification(app_name, server_url, vision)
+            yield event
 
     # ------------------------------------------------------------------
     # Logs

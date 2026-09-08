@@ -13,7 +13,8 @@ from typing import Any
 from collections.abc import Iterable
 
 from ..protocol.enums import BackendType, ComputeProvider
-from ..protocol.models import DeploymentConfig, EndpointInfo, ReasoningCapabilities
+from ..protocol.models import DeploymentConfig, EndpointInfo, ReasoningCapabilities, VisionCapabilities
+from .vision import image_input_verified, vision_to_dict, vision_from_dict
 from .config import SETTINGS_DIR
 from .coerce import positive_int
 from .diagnostics import log_debug, log_exception
@@ -60,6 +61,7 @@ class OpenCodeConnection:
     context_limit: int | None = None
     output_limit: int | None = None
     reasoning: ReasoningCapabilities | None = None
+    vision: VisionCapabilities | None = None
 
 
 @dataclass
@@ -218,6 +220,8 @@ def build_openai_connection_payload(
         payload["context_limit"] = context_limit
     if output_limit is not None:
         payload["output_limit"] = output_limit
+    if config.vision is not None:
+        payload["vision"] = vision_to_dict(config.vision)
     if config.reasoning is not None:
         payload["reasoning"] = reasoning_capabilities_to_dict(config.reasoning)
     return payload
@@ -248,6 +252,7 @@ def build_connection_from_config(
         context_limit=payload.get("context_limit"),
         output_limit=payload.get("output_limit"),
         reasoning=reasoning_capabilities_from_dict(payload.get("reasoning")),
+        vision=vision_from_dict(payload.get("vision")),
     )
 
 
@@ -315,6 +320,7 @@ def build_connection_from_endpoint(
         context_limit=context_limit,
         output_limit=output_limit,
         reasoning=row.reasoning,
+        vision=row.vision,
     )
 
 
@@ -655,6 +661,10 @@ def _provider_payload(connection: OpenCodeConnection) -> dict[str, Any]:
     if connection.api_key:
         options["apiKey"] = connection.api_key
     model: dict[str, Any] = {"name": connection.display_name}
+    model["modalities"] = {
+        "input": ["text", "image"] if image_input_verified(connection.vision) else ["text"],
+        "output": ["text"],
+    }
     context_limit, output_limit = _model_limits(
         connection.context_limit,
         connection.output_limit,
@@ -694,6 +704,7 @@ def _registry_entry_for_connection(connection: OpenCodeConnection) -> dict[str, 
         "context_limit": connection.context_limit,
         "output_limit": connection.output_limit,
         "reasoning": reasoning_capabilities_to_dict(connection.reasoning),
+        "vision": vision_to_dict(connection.vision),
     }
 
 

@@ -81,6 +81,36 @@ def preferred_prime_offer_image(backend: BackendType) -> str:
     )
 
 
+def _prime_projector_setup(config: DeploymentConfig) -> tuple[str, str]:
+    """Stage the exact projector atomically in the persistent llama cache."""
+    from huggingface_hub import hf_hub_url
+
+    artifact = config.vision.projector if config.vision else None
+    if artifact is None:
+        raise ValueError("Vision enabled without a resolved projector.")
+    identity = hashlib.sha256(f"{artifact.repo_id}@{artifact.revision}/{artifact.filename}".encode()).hexdigest()
+    root = "/data/llama.cpp" if prime_provider_options(config).disk_id else "/root/.cache/llama.cpp"
+    path = f"{root}/projectors/{identity}.gguf"
+    quoted = shlex.quote(path)
+    url = hf_hub_url(artifact.repo_id, artifact.filename, revision=artifact.revision)
+    size_check = f'[ "$(stat -c %s {quoted})" = {artifact.size_bytes} ]' if artifact.size_bytes else f"[ -s {quoted} ]"
+    # The pinned llama.cpp image includes curl. $HF_TOKEN survives shlex.join
+    # literally and is expanded by the container shell; the header is omitted
+    # entirely when no token is set, because an empty Bearer makes Hugging Face
+    # reject public files that an unauthenticated request would have served.
+    setup = (
+        f"mkdir -p {shlex.quote(root + '/projectors')} || exit $?; "
+        f"if ! {size_check}; then "
+        f"curl --fail --location --retry 3 --connect-timeout 20 "
+        '${HF_TOKEN:+--header "Authorization: Bearer $HF_TOKEN"} '
+        f'{shlex.quote(url)} -o {quoted}.tmp '
+        f"&& mv {quoted}.tmp {quoted} || exit $?; fi; "
+        f"{size_check} || exit 1; "
+        f'[ "$(head -c 4 {quoted})" = GGUF ] || exit 1; '
+    )
+    return setup, path
+
+
 def resolve_prime_launch_spec(config: DeploymentConfig) -> PrimeLaunchSpec:
     """Resolve Prime's single supported Ubuntu bootstrap runtime."""
 
@@ -1365,8 +1395,15 @@ class PrimeBackend:
                     "|| exit $?; fi; "
                     f"{attestation_marker}"
                 )
+            projector_setup = ""
+            if config.vision is not None:
+                if config.vision.enabled:
+                    projector_setup, projector_path = _prime_projector_setup(config)
+                    llama_args.extend(["--mmproj", projector_path])
+                else:
+                    llama_args.append("--no-mmproj")
             inner = (
-                f'{fit_guard}exec {shlex.join(llama_args)} '
+                f'{projector_setup}{fit_guard}exec {shlex.join(llama_args)} '
                 '--api-key "$LLAMA_ARG_API_KEY"'
             )
             if not options.disk_id:
@@ -1395,6 +1432,10 @@ class PrimeBackend:
             "--tensor-parallel-size",
             str(config.n_gpu or config.gpu_count or 1),
         ]
+        from .vision import vllm_vision_limits
+        vllm_args.extend(["--limit-mm-per-prompt", vllm_vision_limits(config)])
+        if config.mm_processor_kwargs:
+            vllm_args.extend(["--mm-processor-kwargs", config.mm_processor_kwargs])
         if config.model_revision:
             vllm_args.extend(["--revision", config.model_revision])
         if config.trust_remote_code:

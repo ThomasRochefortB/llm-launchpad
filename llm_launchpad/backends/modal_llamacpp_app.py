@@ -356,6 +356,8 @@ def _matched_snapshot_gguf_candidates(snapshot_dir: Path, allow_patterns: list[s
             continue
         if path.suffix.casefold() != ".gguf":
             continue
+        if any(marker in path.name.casefold() for marker in ("mmproj", "imatrix", "draft", "eagle")):
+            continue
         if allow_patterns and not _matches_any_pattern(path.name, allow_patterns):
             continue
         candidates.append(path)
@@ -457,6 +459,8 @@ def _snapshot_gguf_candidates(snapshot_dir: Path, quant: str | None) -> list[Pat
         if not path.is_file():
             continue
         if path.suffix.casefold() != ".gguf":
+            continue
+        if any(marker in path.name.casefold() for marker in ("mmproj", "imatrix", "draft", "eagle")):
             continue
         if quant_folded and quant_folded not in path.name.casefold():
             continue
@@ -922,6 +926,26 @@ def _estimate_incomplete_blob_size(repo_id: str) -> tuple[int, int]:
     return total_bytes, file_count
 
 
+@app.function(image=download_image, volumes={cache_dir: model_cache}, timeout=PREDOWNLOAD_TIMEOUT_MINUTES * MINUTES)
+def download_projector(artifact: dict[str, Any]) -> str:
+    """Cache an exact projector revision independently of the model quant."""
+    from huggingface_hub import hf_hub_download
+
+    repo, revision, filename = artifact["repo_id"], artifact["revision"], artifact["filename"]
+    with _acquire_download_lease(repo, revision, [filename]):
+        path = Path(hf_hub_download(repo_id=repo, revision=revision, filename=filename, cache_dir=str(HF_HUB_DIR)))
+        expected = artifact.get("size_bytes")
+        if expected and path.stat().st_size != expected:
+            path = Path(hf_hub_download(repo_id=repo, revision=revision, filename=filename, cache_dir=str(HF_HUB_DIR), force_download=True))
+        if path.stat().st_size == 0 or (expected and path.stat().st_size != expected):
+            raise RuntimeError("Projector download has an unexpected size.")
+        with path.open("rb") as handle:
+            if handle.read(4) != b"GGUF":
+                raise RuntimeError("Downloaded projector is not a GGUF file.")
+        model_cache.commit()
+        return str(path)
+
+
 @app.function(
     image=download_image,
     volumes={cache_dir: model_cache},
@@ -1234,6 +1258,16 @@ def serve():
         command += ["--n-gpu-layers", str(int(n_gpu_layers_cfg))]
     if not _server_args_define_alias(server_args):
         command += ["--alias", served_model_name]
+    vision = cfg.get("vision") or {}
+    if vision.get("enabled"):
+        projector = vision.get("projector")
+        if not projector:
+            raise RuntimeError("Vision enabled without a resolved projector.")
+        projector_path = download_projector.remote(projector)
+        model_cache.reload()
+        command += ["--mmproj", projector_path]
+    elif cfg.get("vision") is not None:
+        command += ["--no-mmproj"]
     command += server_args
 
     print("🦙 starting llama-server:")
@@ -1288,6 +1322,7 @@ def main(
     port: int = 8080,
     n_gpu_layers: int | None = None,
     serving_fingerprint: str | None = None,
+    vision_json: str | None = None,
     deploy: bool = False,
 ):
     """Configure, optionally preload weights, and optionally deploy the server.
@@ -1323,6 +1358,7 @@ def main(
         cfg.get("repo_id"),
         cfg.get("quant"),
     )
+    cfg["vision"] = json.loads(vision_json) if vision_json else None
     cfg["host"] = host
     cfg["port"] = int(port)
     cfg["n_gpu_layers"] = n_gpu_layers if n_gpu_layers is not None else None
@@ -1337,6 +1373,8 @@ def main(
     save_config_remote.remote(cfg)
     print(f"📝 Saved config (remote volume): {json.dumps(cfg, indent=2)}")
 
+    if preload and (cfg.get("vision") or {}).get("projector"):
+        download_projector.remote(cfg["vision"]["projector"])
     if preload:
         allow_patterns = _gguf_allow_patterns(cfg.get("quant"))
         matches = download_model.remote(cfg["repo_id"], allow_patterns, cfg.get("revision"))

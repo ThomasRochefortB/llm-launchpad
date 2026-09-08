@@ -207,3 +207,13 @@ def _isolate_user_settings(
     for module_name, attribute, relative in _SETTINGS_PATHS:
         monkeypatch.setattr(f"{module_name}.{attribute}", root / relative)
     return root
+
+
+@pytest.fixture(autouse=True)
+def _stub_vision_hub_inspection(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep existing deployment tests hermetic; vision tests override this boundary."""
+    from llm_launchpad.protocol.models import VisionCapabilities
+    monkeypatch.setattr(
+        "llm_launchpad.core.vision.inspect_model_vision",
+        lambda repo_id, revision=None: (VisionCapabilities(), {}),
+    )

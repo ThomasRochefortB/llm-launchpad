@@ -45,6 +45,7 @@ from ..core.naming import (
 from ..core.prime_auth import get_prime_auth_status
 from ..core.prime_backend import PrimeBackend
 from ..core.provider_options import prime_provider_options
+from ..core.vision_probe import is_vision_probe_failure
 from ..core.quick_deploy import QuickDeployProfile
 from ..core.reasoning_profiles import discover_reasoning_capabilities
 from ..core.runtime_support import evaluate_llamacpp_architecture
@@ -116,6 +117,7 @@ def _deploy_connection_summary_lines(config: DeploymentConfig, server_url: str) 
         f"Base URL: {base_url}",
         f"Model ID: {model_id}",
         f"Display name: {display_name}",
+        f"Vision: {config.vision_mode.value}; " + (f"{'enabled' if config.vision.enabled else 'disabled'}, {config.vision.verification.value}" if config.vision else "unknown"),
         (
             "API key: generated and stored locally"
             if config.endpoint_api_key
@@ -759,12 +761,14 @@ class TuiApp(App):
                 if config.serving_requirements is not None
                 else {}
             )
-            if config.provider != ComputeProvider.MODAL:
+            if config.provider != ComputeProvider.MODAL or config.endpoint_api_key:
                 certification_kwargs.update(
                     provider=config.provider,
                     api_key=config.endpoint_api_key,
                     pod_id=deployed_endpoint.app_id if deployed_endpoint else None,
                 )
+            if config.vision is not None:
+                certification_kwargs["vision"] = config.vision
             warmup_events = self._orchestrator.warmup(
                 backend=config.backend,
                 server_url=url,
@@ -810,7 +814,9 @@ class TuiApp(App):
                         config.provider == ComputeProvider.PRIME
                         and prime_provider_options(config).keep_failed_resource
                     )
-                    if not keep_failed_prime:
+                    # A server that answered readiness and then failed only the
+                    # image probe stays up so it can be inspected.
+                    if not keep_failed_prime and not is_vision_probe_failure(event):
                         resource_label = (
                             f"Prime pod {deployed_endpoint.app_id}"
                             if config.provider == ComputeProvider.PRIME

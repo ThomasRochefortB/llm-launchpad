@@ -7,6 +7,8 @@ from typing import Any
 
 from .enums import (
     BackendType,
+    VisionMode,
+    VisionVerification,
     BillingModel,
     CertificationState,
     ComputeProvider,
@@ -91,6 +93,30 @@ class ReasoningCapabilities:
     request_option_path: str
     enable_thinking: bool = True
     interleaved_field: str | None = None
+
+
+@dataclass(frozen=True)
+class ProjectorArtifact:
+    """A revision-pinned Hugging Face vision projector."""
+
+    repo_id: str
+    revision: str
+    filename: str
+    size_bytes: int | None = None
+
+
+@dataclass
+class VisionCapabilities:
+    """Model evidence and effective deployment image input state."""
+
+    supported: bool | None = None
+    enabled: bool = False
+    model_revision: str | None = None
+    runtime_id: str | None = None
+    projector: ProjectorArtifact | None = None
+    verification: VisionVerification = VisionVerification.UNTESTED
+    message: str = "Image capability has not been inspected."
+    fingerprint: str = ""
 
 
 @dataclass(frozen=True)
@@ -197,6 +223,14 @@ class DeploymentConfig:
 
     backend: BackendType = BackendType.LLAMACPP
     provider: ComputeProvider = ComputeProvider.MODAL
+
+    vision_mode: VisionMode = VisionMode.AUTO
+    vision: VisionCapabilities | None = None
+    projector_repo: str | None = None
+    projector_revision: str | None = None
+    projector_file: str | None = None
+    image_limit: int = 1
+    mm_processor_kwargs: str | None = None
 
     # llama.cpp specific
     preset: str | None = None
@@ -469,6 +503,7 @@ class EndpointInfo:
     max_context_tokens: int | None = None
     max_output_tokens: int | None = None
     reasoning: ReasoningCapabilities | None = None
+    vision: VisionCapabilities | None = None
     runtime_attestation: RuntimeAttestation | None = None
 
 

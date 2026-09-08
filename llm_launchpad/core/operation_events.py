@@ -11,6 +11,7 @@ which operation failed. Yielding from one helper makes the pairing structural.
 from __future__ import annotations
 
 from collections.abc import Generator
+from typing import Any
 
 from ..protocol.enums import OperationType
 from ..protocol.events import BaseEvent, ErrorEvent, OperationCompleteEvent
@@ -24,6 +25,7 @@ def fail_operation(
     recoverable: bool = True,
     detail: str | None = None,
     error_exit_code: int | None = None,
+    data: Any | None = None,
 ) -> Generator[BaseEvent, None, None]:
     """Yield the error and completion events that end ``operation`` in failure.
 
@@ -41,4 +43,5 @@ def fail_operation(
         success=False,
         exit_code=exit_code,
         detail=message if detail is None else detail,
+        data=data,
     )
