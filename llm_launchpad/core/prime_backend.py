@@ -24,37 +24,14 @@ from .diagnostics import log_exception
 from .naming import infer_instance_from_app_name
 from .prime_auth import PrimeConfig, load_prime_config
 from .provider_options import prime_provider_options
+from .serving_runtime import projector_setup, vllm_serve_args
 from .runtime_support import load_llamacpp_support_manifest, llamacpp_build_recipe, llamacpp_cuda_architecture
 
 
 def _prime_projector_setup(config: DeploymentConfig) -> tuple[str, str]:
     """Stage the exact projector atomically in the persistent llama cache."""
-    from huggingface_hub import hf_hub_url
-
-    artifact = config.vision.projector if config.vision else None
-    if artifact is None:
-        raise ValueError("Vision enabled without a resolved projector.")
-    identity = hashlib.sha256(f"{artifact.repo_id}@{artifact.revision}/{artifact.filename}".encode()).hexdigest()
     root = "/data/llama.cpp" if prime_provider_options(config).disk_id else "/root/.cache/llama.cpp"
-    path = f"{root}/projectors/{identity}.gguf"
-    quoted = shlex.quote(path)
-    url = hf_hub_url(artifact.repo_id, artifact.filename, revision=artifact.revision)
-    size_check = f'[ "$(stat -c %s {quoted})" = {artifact.size_bytes} ]' if artifact.size_bytes else f"[ -s {quoted} ]"
-    # The pinned llama.cpp image includes curl. $HF_TOKEN survives shlex.join
-    # literally and is expanded by the container shell; the header is omitted
-    # entirely when no token is set, because an empty Bearer makes Hugging Face
-    # reject public files that an unauthenticated request would have served.
-    setup = (
-        f"mkdir -p {shlex.quote(root + '/projectors')} || exit $?; "
-        f"if ! {size_check}; then "
-        f"curl --fail --location --retry 3 --connect-timeout 20 "
-        '${HF_TOKEN:+--header "Authorization: Bearer $HF_TOKEN"} '
-        f'{shlex.quote(url)} -o {quoted}.tmp '
-        f"&& mv {quoted}.tmp {quoted} || exit $?; fi; "
-        f"{size_check} || exit 1; "
-        f'[ "$(head -c 4 {quoted})" = GGUF ] || exit 1; '
-    )
-    return setup, path
+    return projector_setup(config, root=root)
 
 
 def _runtime_catalog() -> dict[str, Any]:
@@ -1426,43 +1403,7 @@ class PrimeBackend:
             )
             return command
 
-        model_name = str(config.model_name or "").strip()
-        served_name = str(config.served_model_name or model_name.rsplit("/", 1)[-1])
-        vllm_args = [
-            "vllm",
-            "serve",
-            model_name,
-            "--host",
-            "0.0.0.0",
-            "--port",
-            "8000",
-            "--uvicorn-log-level",
-            "info",
-            "--served-model-name",
-            served_name,
-            "--tensor-parallel-size",
-            str(config.n_gpu or config.gpu_count or 1),
-        ]
-        from .vision import vllm_vision_limits
-        vllm_args.extend(["--limit-mm-per-prompt", vllm_vision_limits(config)])
-        if config.mm_processor_kwargs:
-            vllm_args.extend(["--mm-processor-kwargs", config.mm_processor_kwargs])
-        if config.model_revision:
-            vllm_args.extend(["--revision", config.model_revision])
-        if config.trust_remote_code:
-            vllm_args.append("--trust-remote-code")
-        if config.fast_boot:
-            vllm_args.append("--enforce-eager")
-        if config.reasoning_parser:
-            vllm_args.extend(["--reasoning-parser", config.reasoning_parser])
-        if config.tool_call_parser:
-            vllm_args.extend(
-                ["--enable-auto-tool-choice", "--tool-call-parser", config.tool_call_parser]
-            )
-        if config.default_chat_template_kwargs:
-            vllm_args.extend(
-                ["--default-chat-template-kwargs", config.default_chat_template_kwargs]
-            )
+        vllm_args = list(vllm_serve_args(config, host="0.0.0.0", port=8000))
         inner = f'exec {shlex.join(vllm_args)} --api-key "$VLLM_API_KEY"'
         command.extend(
             [

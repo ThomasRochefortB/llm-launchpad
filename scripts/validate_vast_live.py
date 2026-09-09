@@ -20,8 +20,14 @@ import requests
 from llm_launchpad.core.orchestrator import Orchestrator
 from llm_launchpad.core.vast_backend import VastBackend
 from llm_launchpad.core.vast_deployment import VastDeploymentBackend
-from llm_launchpad.core.vast_runtime import VAST_RUNTIME_DIR, endpoint_healthy, verify_streaming
+from llm_launchpad.core.vast_runtime import (
+    GPU_INVENTORY_COMMAND,
+    VAST_RUNTIME_DIR,
+    endpoint_healthy,
+    verify_streaming,
+)
 from llm_launchpad.core.vast_ssh import VastSsh
+from llm_launchpad.core.vast_state import VastState
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider, VisionMode
 from llm_launchpad.protocol.events import LogEvent, OperationCompleteEvent, StateChangeEvent
 from llm_launchpad.protocol.models import DeploymentConfig, EndpointInfo, VastOfferQuery, VastProviderOptions
@@ -117,6 +123,89 @@ def long_stream(session: requests.Session, endpoint: EndpointInfo, seconds: int)
             if time.monotonic() - started >= seconds:
                 return {"seconds": time.monotonic() - started, "chunks": chunks, "client_cancelled": True}
     raise RuntimeError(f"Long stream ended early after {time.monotonic() - started:.1f} seconds.")
+
+
+def probe_image(args: argparse.Namespace) -> int:
+    """Rent one host on a candidate image and report what an SSH session sees.
+
+    Vast injects its own sshd over the image entrypoint, so a runtime that
+    works under `docker run` is not known to work here. Answer that for the
+    price of a couple of minutes rather than by designing around a guess.
+    """
+
+    api = VastBackend()
+    offer = api.get_offer(args.offer_id, VastOfferQuery(disk_gb=args.disk_gb))
+    hourly = offer.costs.total_per_hour_usd
+    if hourly is None or not math.isfinite(hourly) or hourly > args.max_hourly_cost:
+        raise ValueError("Offer price is unknown or above the approved ceiling.")
+    before = account_credit(api)
+    name = "llp-vast-probe-" + uuid.uuid4().hex[:10]
+    state = VastState()
+    ssh = VastSsh(state.directory(name))
+    report: dict[str, Any] = {
+        "started_at": datetime.now(timezone.utc).isoformat(), "name": name,
+        "image": args.image, "offer": asdict(offer), "credit_before": before,
+        "probes": {}, "success": False, "cleanup_confirmed": False,
+    }
+    args.report.parent.mkdir(parents=True, exist_ok=True)
+    instance_id: str | None = None
+    started = time.monotonic()
+    try:
+        instance_id = api.create_instance(
+            offer.id, image=args.image, disk_gb=args.disk_gb, label=name
+        )
+        print(f"PROBE {name}: rented {instance_id} on {args.image}", flush=True)
+        api.attach_key(instance_id, ssh.public_key())
+        deadline = time.monotonic() + args.max_minutes * 60
+        while True:
+            if time.monotonic() >= deadline:
+                raise RuntimeError("The probe host never offered SSH.")
+            instance = api.get_instance(instance_id)
+            if instance and instance.state == "running" and instance.ssh_host and instance.ssh_port:
+                try:
+                    ssh.run(instance, "true")
+                    break
+                except RuntimeError:
+                    pass
+            time.sleep(5)
+        assert instance is not None
+        report["ssh_ready_seconds"] = time.monotonic() - started
+        for label, command in (
+            ("entrypoint_binary", "command -v vllm || echo MISSING"),
+            ("vllm_version", "vllm --version 2>&1 | head -3 || echo FAILED"),
+            ("torch_import", "python3 -c 'import torch; print(torch.__version__, torch.cuda.is_available())' 2>&1 | tail -2"),
+            ("nvidia_smi", GPU_INVENTORY_COMMAND),
+            ("shm_kb", "df -k /dev/shm | tail -1"),
+            ("ld_library_path", "echo \"${LD_LIBRARY_PATH:-unset}\""),
+        ):
+            try:
+                report["probes"][label] = ssh.run(instance, f"{command}; exit 0").strip()
+            except RuntimeError as exc:
+                report["probes"][label] = f"ERROR: {exc}"
+            print(f"  {label}: {report['probes'][label][:160]}", flush=True)
+        report["success"] = True
+    except Exception as exc:
+        report["error"] = f"{type(exc).__name__}: {exc}"
+        print("PROBE FAILED: " + report["error"], flush=True)
+    finally:
+        if instance_id:
+            try:
+                api.destroy_instance(instance_id)
+                report["cleanup_confirmed"] = api.get_instance(instance_id) is None
+            except Exception as exc:
+                report["cleanup_error"] = str(exc)
+        else:
+            report["cleanup_confirmed"] = True
+        report["elapsed_seconds"] = time.monotonic() - started
+        report["credit_after"] = account_credit(VastBackend())
+        report["credit_delta_usd"] = before - report["credit_after"]
+        args.report.write_text(json.dumps(report, indent=2) + "\n")
+        print(
+            f"Report {args.report}; cleanup confirmed: {report['cleanup_confirmed']}; "
+            f"spent ${report['credit_delta_usd']:.4f}",
+            flush=True,
+        )
+    return 0 if report["success"] and report["cleanup_confirmed"] else 1
 
 
 def run(args: argparse.Namespace) -> int:
@@ -267,11 +356,21 @@ def main() -> int:
     parser.add_argument("--max-minutes", type=int, default=20)
     parser.add_argument("--stream-seconds", type=int, default=310)
     parser.add_argument("--report", type=Path, required=True)
+    parser.add_argument(
+        "--probe-image",
+        dest="image",
+        help="Rent one host on this image and report what an SSH session sees, instead of deploying.",
+    )
+    parser.add_argument("--disk-gb", type=int, default=100)
     args = parser.parse_args()
     if not args.live:
         parser.error("Pass --live to explicitly authorize a paid rental.")
     if not all(math.isfinite(value) and value > 0 for value in (args.max_hourly_cost, args.budget_usd)):
         parser.error("Price and budget must be finite and positive.")
+    if args.image:
+        if not 1 <= args.max_minutes <= 60:
+            parser.error("Use 1–60 minutes for the image probe deadline.")
+        return probe_image(args)
     if not 1 <= args.max_minutes <= 60 or not 1 <= args.stream_seconds < args.max_minutes * 60:
         parser.error("Use 1–60 minutes and a stream duration shorter than the deadline.")
     return run(args)

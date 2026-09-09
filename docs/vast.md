@@ -81,9 +81,10 @@ configured key.
 
 **Advanced deploy** offers Vast.ai as a compute provider on both the llama.cpp
 and vLLM forms. Selecting it swaps the Modal GPU picker for a **Vast.ai rental**
-list, sorted by hourly total and filtered to rentals that fit the
-model's estimated memory. The bound rental supplies the GPU shape and count, so
-the GPU fields become read-only, and vLLM tensor sharding stays at 1.
+list, sorted by hourly total and filtered to rentals whose combined GPU memory
+fits the model's estimate. The bound rental supplies the GPU shape and count, so
+the GPU fields become read-only and tensor sharding follows the rented count.
+At equal price the simpler topology is offered first.
 
 - **Vast disk size (GB)** lives under **Advanced options** and defaults to 100.
   It is rented with the GPU and included in the quoted hourly price.
@@ -164,9 +165,16 @@ changed keys. Remote model logs redact endpoint and Hugging Face tokens.
 
 Deployment requires health and streaming-chat checks before it reports success.
 Fast Deploy additionally runs the existing serving-plan certification before
-publishing to OpenCode. Model switching, vLLM, vision, custom-build runtimes,
-non-default revisions, suspend/resume, and persistent Vast volumes are outside
-this beta. Manual unsupported configurations fail before rental.
+publishing to OpenCode.
+
+Image input is available on **Advanced deploy** only, and that limit is not a
+Vast one: Fast Deploy refuses vision for every provider because vision working
+memory is not calibrated for guaranteed-fit placement. The projector is staged
+on the rental exactly as it is on Prime, over the same pinned image.
+
+Model switching, custom-build runtimes, non-default revisions, suspend/resume,
+and persistent Vast volumes are outside this beta. Unsupported configurations
+are refused in the form, before anything is rented.
 
 ### Recovery and billing
 

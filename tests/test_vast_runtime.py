@@ -10,11 +10,13 @@ from llm_launchpad.core.vast_runtime import (
     vast_refusal,
     vast_runtime,
     vast_runtime_image,
+    vast_runtime_script,
     verify_gpu_topology,
 )
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider
 from llm_launchpad.protocol.models import (
     DeploymentConfig,
+    ProjectorArtifact,
     VastProviderOptions,
     VisionCapabilities,
 )
@@ -52,11 +54,27 @@ class VastRefusalTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             vast_runtime(config(backend=BackendType.VLLM))
 
-    def test_vision_enabled_is_refused_before_rental(self) -> None:
+    def test_vision_enabled_stages_the_projector_and_passes_mmproj(self) -> None:
+        artifact = ProjectorArtifact(
+            repo_id="acme/model-GGUF", revision="main", filename="mmproj.gguf", size_bytes=1024
+        )
+        vision = VisionCapabilities(supported=True, enabled=True, projector=artifact)
+        candidate = config(vision=vision, endpoint_api_key="private-key")
+        self.assertIsNone(refuse(candidate))
+        script = vast_runtime_script(candidate)
+        self.assertIn("--mmproj", script)
+        self.assertNotIn("--no-mmproj", script)
+        self.assertIn("/root/.llm-launchpad/projectors/", script)
+        self.assertIn("curl --fail --location", script)
+
+    def test_vision_disabled_keeps_no_mmproj(self) -> None:
+        candidate = config(endpoint_api_key="private-key")
+        self.assertIn("--no-mmproj", vast_runtime_script(candidate))
+
+    def test_vision_enabled_without_a_projector_is_an_error(self) -> None:
         vision = VisionCapabilities(supported=True, enabled=True)
-        reason = refuse(config(vision=vision))
-        self.assertIsNotNone(reason)
-        self.assertIn("text models only", reason or "")
+        with self.assertRaises(ValueError):
+            vast_runtime_script(config(vision=vision, endpoint_api_key="k"))
 
     def test_pinned_revision_is_refused_before_rental(self) -> None:
         reason = refuse(config(revision="refs/pr/1"))

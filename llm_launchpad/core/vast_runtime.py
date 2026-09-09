@@ -11,6 +11,7 @@ import requests
 
 from ..protocol.models import DeploymentConfig
 from .runtime_support import load_llamacpp_support_manifest
+from .serving_runtime import projector_setup
 
 VAST_RUNTIME_DIR = "/root/.llm-launchpad"
 # CUDA_VERSION in the bundled b10689 image's immutable OCI config. Require
@@ -142,10 +143,17 @@ def vast_runtime_script(config: DeploymentConfig) -> str:
         raise ValueError("Vast endpoints require an API key.")
     arguments = [
         "/app/llama-server", "--hf-repo", f"{config.repo_id}:{config.quant}",
-        *shlex.split(config.server_args or ""), "--no-mmproj",
+        *shlex.split(config.server_args or ""),
         "--host", "127.0.0.1", "--port", "8000",
         "--alias", config.served_model_name or "model",
     ]
+    # The same pinned image Prime uses, so the projector stages identically.
+    setup = ""
+    if config.vision is not None and config.vision.enabled:
+        setup, projector_path = projector_setup(config, root=VAST_RUNTIME_DIR)
+        arguments.extend(["--mmproj", projector_path])
+    else:
+        arguments.append("--no-mmproj")
     if config.n_gpu_layers is not None:
         arguments.extend(["--n-gpu-layers", str(config.n_gpu_layers)])
     env = {
@@ -159,6 +167,8 @@ def vast_runtime_script(config: DeploymentConfig) -> str:
         env["HF_TOKEN"] = token
     lines = ["#!/bin/sh", "set -eu", "umask 077", f"mkdir -p {VAST_RUNTIME_DIR}/models"]
     lines.extend(f"export {name}={shlex.quote(value)}" for name, value in env.items())
+    if setup:
+        lines.append(setup)
     lines.append("exec " + shlex.join(arguments))
     return "\n".join(lines) + "\n"
 
