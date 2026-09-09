@@ -16,9 +16,10 @@ does not implement Vast suspend/resume. This supersedes the broader lifecycle
 and public-ingress proposals below for the current increment. These differences
 are displayed at deployment and stop confirmation.
 
-Pending live certification: pinned image startup on a real host, authenticated
-streaming and tool calls, long requests, startup/cost measurements, and final
-cleanup. The broader vLLM, multi-GPU, vision, model-switching, persistent-storage,
+Live certification is done on RTX 3060-class single-GPU hosts: pinned image
+startup, authenticated streaming and tool calls, a 310-second request, measured
+startup and cost, and confirmed cleanup. Repeat runs across more GPU models
+remain. The broader vLLM, multi-GPU, vision, model-switching, persistent-storage,
 and public HTTPS work remains planned. Mocked tests are not live certification.
 
 The work packages below retain the broader release plan; their completion
