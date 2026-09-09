@@ -338,3 +338,50 @@ class VastTransportTests(unittest.TestCase):
                 response.iter_lines.return_value = lines
                 with self.assertRaises(RuntimeError):
                     verify_streaming("http://127.0.0.1:48123", "key", "model")
+
+
+class VastVllmRecordTests(unittest.TestCase):
+    """A vLLM rental must not be filed as llama.cpp."""
+
+    def test_record_backend_shapes_the_published_endpoint(self) -> None:
+        from llm_launchpad.protocol.models import VastDeploymentRecord
+
+        record = VastDeploymentRecord(
+            name="llp-vast-vllm-test", label="llp-vast-x", account_id="12", offer_id="1",
+            machine_id="42", repo_id="", quant="", served_model_name="model",
+            endpoint_api_key="k", instance_id="900", backend="vllm", model_name="acme/model",
+        )
+        endpoint = VastDeploymentBackend._endpoint(record, "running", "http://127.0.0.1:1")
+        self.assertEqual(endpoint.backend, BackendType.VLLM)
+
+    def test_a_record_written_before_vllm_support_still_loads_as_llamacpp(self) -> None:
+        from llm_launchpad.protocol.models import VastDeploymentRecord
+
+        with TemporaryDirectory() as directory:
+            state = VastState(Path(directory))
+            record = VastDeploymentRecord(
+                name="legacy", label="llp-vast-y", account_id="12", offer_id="1",
+                machine_id="42", repo_id="acme/model-GGUF", quant="Q4_K_M",
+                served_model_name="model", endpoint_api_key="k", instance_id="901",
+            )
+            state.save(record)
+            loaded = state.load("legacy")
+            assert loaded is not None
+            self.assertEqual(loaded.backend, "llamacpp")
+            self.assertEqual(
+                VastDeploymentBackend._endpoint(loaded, "running", None).backend,
+                BackendType.LLAMACPP,
+            )
+
+    def test_an_unknown_recorded_backend_degrades_instead_of_crashing(self) -> None:
+        from llm_launchpad.protocol.models import VastDeploymentRecord
+
+        record = VastDeploymentRecord(
+            name="odd", label="llp-vast-z", account_id="12", offer_id="1", machine_id="42",
+            repo_id="", quant="", served_model_name="m", endpoint_api_key="k",
+            instance_id="902", backend="sglang",
+        )
+        self.assertEqual(
+            VastDeploymentBackend._endpoint(record, "running", None).backend,
+            BackendType.LLAMACPP,
+        )

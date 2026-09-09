@@ -1157,3 +1157,39 @@ class LlamaCppDeployFormPolishTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(config.gpu_type, "A100_PCIE")
             assert isinstance(config.provider_options, VastProviderOptions)
             self.assertEqual(config.provider_options.gpu_count, 4)
+
+
+class VastFieldGatingTests(unittest.IsolatedAsyncioTestCase):
+    """A disabled field without a reason reads as a broken tool."""
+
+    async def test_vast_disables_host_port_and_revision_with_reasons(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+            screen.on_vast_offers_loaded(VastOffersLoaded(offers=_vast_offers()))
+            screen.query_one("#provider-llama", Select).value = "vast"
+            await pilot.pause()
+
+            for field_id, expected in (
+                ("#host-input", "SSH tunnel"),
+                ("#port-input", "SSH tunnel"),
+                ("#revision", "default HF revision"),
+                ("#llama-image-no-cache", "published one"),
+            ):
+                widget = screen.query_one(field_id)
+                self.assertTrue(widget.disabled, field_id)
+                self.assertIn(expected, str(widget.tooltip or ""), field_id)
+
+    async def test_modal_leaves_those_fields_editable(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+            await pilot.pause()
+            for field_id in ("#host-input", "#port-input", "#revision"):
+                self.assertFalse(screen.query_one(field_id).disabled, field_id)

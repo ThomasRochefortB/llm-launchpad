@@ -68,9 +68,11 @@ _CAPABILITIES: dict[ComputeProvider, DeploymentCapabilities] = {
     ),
     ComputeProvider.VAST: DeploymentCapabilities(
         provider=ComputeProvider.VAST,
-        backends=frozenset({BackendType.LLAMACPP}),
+        backends=frozenset({BackendType.LLAMACPP, BackendType.VLLM}),
         max_gpu_count=VAST_MAX_GPU_COUNT,
         supports_vision=True,
+        # llama.cpp's --hf-repo cannot carry a revision; vLLM's --revision can.
+        pinned_revision_backends=frozenset({BackendType.VLLM}),
         supports_preload_only=False,
         supports_smoke_test_only=False,
         public_endpoint=False,
@@ -119,6 +121,17 @@ def refuse(config: DeploymentConfig) -> str | None:
     if caps.extra_refusal is not None:
         return caps.extra_refusal(config)
     return None
+
+
+def revision_refusal(provider: ComputeProvider, backend: BackendType) -> str | None:
+    """Explain why this provider cannot pin an HF revision for this runtime."""
+    caps = capabilities(provider)
+    if backend in caps.pinned_revision_backends:
+        return None
+    return (
+        f"{provider.display_name} {backend.display_name} currently supports only "
+        "the default HF revision."
+    )
 
 
 def connected_providers(

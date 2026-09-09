@@ -1034,7 +1034,7 @@ class VllmDeployFormPolishTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(screen._rank_mode, "downloads")
             self.assertEqual(app.fetch_calls, ["downloads"])
 
-    async def test_vast_vllm_is_refused_in_the_form_without_building_a_config(self) -> None:
+    async def test_vast_vllm_rental_binds_its_topology_and_reaches_the_config(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:
             app.push_screen(VllmDeployScreen())
@@ -1059,13 +1059,13 @@ class VllmDeployFormPolishTests(unittest.IsolatedAsyncioTestCase):
 
             screen._do_deploy()
 
-            # Vast serves llama.cpp only, so the form must refuse here rather
-            # than let the deploy fail after routing. WP3 flips this back.
-            self.assertIsNone(app.deployed_config)
-            self.assertTrue(
-                any("vLLM" in message for message, _ in app.notifications),
-                app.notifications,
-            )
+            config = app.deployed_config
+            self.assertIsNotNone(config)
+            self.assertEqual(config.provider, ComputeProvider.VAST)
+            self.assertEqual(config.gpu_type, "RTX_4090")
+            self.assertEqual(config.gpu_count, 1)
+            # A rental bills every GPU it bundles, so sharding uses all of them.
+            self.assertEqual(config.n_gpu, config.gpu_count)
 
     async def test_smoke_test_only_is_refused_for_vast(self) -> None:
         app = _TestApp()

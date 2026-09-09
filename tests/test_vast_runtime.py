@@ -5,6 +5,7 @@ import unittest
 
 from llm_launchpad.core.providers import capabilities, refuse
 from llm_launchpad.core.vast_runtime import (
+    VAST_RUNTIME_DIR,
     GpuDevice,
     parse_gpu_inventory,
     vast_refusal,
@@ -47,12 +48,14 @@ class VastRefusalTests(unittest.TestCase):
         self.assertEqual(runtime.image, vast_runtime_image(config()))
         self.assertGreaterEqual(runtime.min_cuda_version, 12.8)
 
-    def test_vllm_backend_is_refused_before_rental(self) -> None:
-        reason = refuse(config(backend=BackendType.VLLM))
-        self.assertIsNotNone(reason)
-        self.assertIn("vLLM", reason or "")
-        with self.assertRaises(ValueError):
-            vast_runtime(config(backend=BackendType.VLLM))
+    def test_vllm_resolves_its_own_pinned_image_and_driver_floor(self) -> None:
+        candidate = config(backend=BackendType.VLLM, model_name="acme/model", gpu_count=1, n_gpu=1)
+        self.assertIsNone(refuse(candidate))
+        runtime = vast_runtime(candidate)
+        self.assertIn("vllm/vllm-openai@sha256:", runtime.image)
+        # The vLLM image is built against a newer CUDA than llama.cpp's, which
+        # is why the floor travels with the image instead of being a constant.
+        self.assertGreater(runtime.min_cuda_version, vast_runtime(config()).min_cuda_version)
 
     def test_vision_enabled_stages_the_projector_and_passes_mmproj(self) -> None:
         artifact = ProjectorArtifact(
@@ -181,4 +184,41 @@ class TopologyVerificationTests(unittest.TestCase):
                 gpu_count=2,
                 per_device_required_gb=20.0,
             )
+
+
+class VastVllmRuntimeTests(unittest.TestCase):
+    def vllm(self, **overrides: object) -> DeploymentConfig:
+        base = config(
+            backend=BackendType.VLLM, model_name="acme/model", gpu_count=1, n_gpu=1,
+            endpoint_api_key="private-key", served_model_name="acme-model",
+        )
+        return replace(base, **overrides)  # type: ignore[arg-type]
+
+    def test_script_serves_loopback_with_tensor_parallel_and_no_key_in_argv(self) -> None:
+        script = vast_runtime_script(self.vllm(gpu_count=2, n_gpu=2))
+        self.assertIn("vllm serve acme/model", script)
+        self.assertIn("--host 127.0.0.1 --port 8000", script)
+        self.assertIn("--tensor-parallel-size 2", script)
+        self.assertIn("export VLLM_API_KEY=private-key", script)
+        self.assertNotIn("--api-key", script)
+        self.assertIn("VLLM_WORKER_MULTIPROC_METHOD=spawn", script)
+        self.assertIn(f"{VAST_RUNTIME_DIR}/hf", script)
+
+    def test_gpu_counts_that_cannot_shard_attention_heads_are_refused(self) -> None:
+        for count in (3, 5, 6, 7):
+            reason = refuse(self.vllm(gpu_count=count, n_gpu=count))
+            self.assertIsNotNone(reason, count)
+            self.assertIn("1, 2, 4, or 8", reason or "")
+
+    def test_leaving_rented_gpus_idle_is_refused_as_an_overcharge(self) -> None:
+        reason = refuse(self.vllm(gpu_count=4, n_gpu=2))
+        self.assertIsNotNone(reason)
+        self.assertIn("bills every GPU", reason or "")
+
+    def test_a_missing_model_name_is_refused(self) -> None:
+        self.assertIsNotNone(refuse(self.vllm(model_name="")))
+
+    def test_vllm_may_pin_a_revision_that_llamacpp_cannot(self) -> None:
+        self.assertIsNone(refuse(self.vllm(revision="abc123")))
+        self.assertIsNotNone(refuse(config(revision="abc123")))
 

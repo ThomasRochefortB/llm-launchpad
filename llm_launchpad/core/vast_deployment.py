@@ -148,7 +148,8 @@ class VastDeploymentBackend:
             if required > offer.gpu_memory_gib:
                 raise ValueError("The selected Vast GPU no longer fits the model's memory requirements.")
             config.endpoint_api_key = config.endpoint_api_key or secrets.token_urlsafe(32)
-            config.served_model_name = config.served_model_name or (config.repo_id or "model").rsplit("/", 1)[-1]
+            source = config.model_name if config.backend == BackendType.VLLM else config.repo_id
+            config.served_model_name = config.served_model_name or (source or "model").rsplit("/", 1)[-1]
             script = vast_runtime_script(config)
             yield StateChangeEvent(current=DeploymentState.DEPLOYING, operation=OperationType.DEPLOY, detail=f"Renting Vast offer {offer.id} at ${price:.4f}/hr including disk")
             if cancellation.is_set() or is_shutting_down():
@@ -158,6 +159,7 @@ class VastDeploymentBackend:
                 offer_id=offer.id, machine_id=offer.machine_id, repo_id=config.repo_id or "",
                 quant=config.quant or "", served_model_name=config.served_model_name,
                 endpoint_api_key=config.endpoint_api_key, max_context_tokens=config.max_context_tokens,
+                backend=config.backend.value, model_name=config.model_name or "",
             )
             self.state.save(record)  # Write intent before the billable request.
             record.instance_id = self.api.create_instance(offer.id, image=image, disk_gb=options.disk_gb, label=record.label)
@@ -196,7 +198,7 @@ class VastDeploymentBackend:
             ssh.connect(instance, record.local_port)
             url = f"http://127.0.0.1:{record.local_port}"
             yield StateChangeEvent(current=DeploymentState.DEPLOYING, operation=OperationType.DEPLOY, detail="Waiting for the Vast model through the local SSH tunnel")
-            deadline = time.monotonic() + 1800
+            deadline = time.monotonic() + (3600 if config.backend == BackendType.VLLM else 1800)
             while not endpoint_healthy(url, record.endpoint_api_key):
                 if cancellation.is_set() or is_shutting_down():
                     raise RuntimeError("Vast deployment cancelled.")
@@ -234,10 +236,14 @@ class VastDeploymentBackend:
 
     @staticmethod
     def _endpoint(record: VastDeploymentRecord, state: str, url: str | None) -> EndpointInfo:
+        try:
+            backend = BackendType(record.backend)
+        except ValueError:
+            backend = BackendType.LLAMACPP
         return EndpointInfo(
-            name=record.name, app_id=record.instance_id or "", backend=BackendType.LLAMACPP,
+            name=record.name, app_id=record.instance_id or "", backend=backend,
             provider=ComputeProvider.VAST, state=state, web_url=url,
-            instance_name=infer_instance_from_app_name(record.name, BackendType.LLAMACPP),
+            instance_name=infer_instance_from_app_name(record.name, backend),
             repo_id=record.repo_id, quant=record.quant, served_model_name=record.served_model_name,
             endpoint_api_key=record.endpoint_api_key, max_context_tokens=record.max_context_tokens,
         )

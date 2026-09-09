@@ -6,6 +6,8 @@ Keyboard-driven form navigation with enter-to-proceed.
 
 from __future__ import annotations
 
+import math
+
 from ..widgets.vision_options import VisionOptions
 
 import json
@@ -46,7 +48,7 @@ from ...core.prime_backend import (
     preferred_prime_offer_image,
 )
 from ...core.reasoning_profiles import discover_reasoning_capabilities
-from ...core.providers import refuse as refuse_deployment
+from ...core.providers import capabilities, refuse as refuse_deployment, revision_refusal as refuse_deployment_revision
 from ...core.vast_runtime import VAST_MAX_GPU_COUNT
 from ...core.vast_backend import VastBackend
 from ...protocol.enums import BackendType, ComputeProvider
@@ -413,6 +415,37 @@ def _prime_offer_status(
 # present shapes the deployment path can actually deliver.
 VAST_VRAM_HEADROOM_FACTOR = 1.05
 DEFAULT_VAST_DISK_GB = 100
+
+
+def _disable_with_reason(screen: object, field_id: str, reason: str | None) -> None:
+    """Disable a control and say why, because a grey field reads as broken."""
+    from textual.widgets import Input, Select, Switch
+
+    try:
+        widget = screen.query_one(field_id)  # type: ignore[attr-defined]
+    except Exception:
+        return
+    widget.disabled = reason is not None
+    if isinstance(widget, (Input, Select, Switch)):
+        widget.tooltip = reason
+
+
+def _provider_field_reasons(provider: ComputeProvider) -> dict[str, str]:
+    """Explain each control this provider ignores, in its own words."""
+    caps = capabilities(provider)
+    name = provider.display_name
+    reasons: dict[str, str] = {}
+    if not caps.public_endpoint:
+        reasons["host"] = (
+            f"{name} serves through an SSH tunnel bound to this computer, "
+            "so the rental's own host and port are fixed."
+        )
+        reasons["port"] = reasons["host"]
+    if provider != ComputeProvider.MODAL:
+        reasons["image_no_cache"] = f"Modal builds the image; {name} runs a published one."
+    if caps.gpu_shape_from_offer:
+        reasons["gpu"] = f"The bound {name} offer supplies the GPU shape and count."
+    return reasons
 
 
 def _compatible_vast_offers(
@@ -1032,9 +1065,18 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         # A bound Prime offer dictates the GPU shape and count, and the deploy
         # path overwrites whatever these hold. Leaving them editable invites
         # changes that are silently discarded.
+        reasons = _provider_field_reasons(self._provider)
         offer_bound = self._provider in (ComputeProvider.PRIME, ComputeProvider.VAST)
         for field_id in ("#gpu-type-llama", "#gpu-count-llama",):
-            self.query_one(field_id).disabled = offer_bound
+            _disable_with_reason(self, field_id, reasons.get("gpu") if offer_bound else None)
+        for field_id, key in (
+            ("#host-input", "host"),
+            ("#port-input", "port"),
+            ("#llama-image-no-cache", "image_no_cache"),
+        ):
+            _disable_with_reason(self, field_id, reasons.get(key))
+        revision_reason = refuse_deployment_revision(self._provider, BackendType.LLAMACPP)
+        _disable_with_reason(self, "#revision", revision_reason)
         advanced_visible = not self.query_one("#warmup").has_class("hidden")
         for provider_class, provider in (
             (".prime-only", ComputeProvider.PRIME),
@@ -2150,9 +2192,13 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
         # A bound Prime offer dictates the GPU shape and count, and the deploy
         # path overwrites whatever these hold. Leaving them editable invites
         # changes that are silently discarded.
+        reasons = _provider_field_reasons(self._provider)
         offer_bound = self._provider in (ComputeProvider.PRIME, ComputeProvider.VAST)
         for field_id in ("#gpu-type-vllm", "#gpu-count-vllm", "#n-gpu",):
-            self.query_one(field_id).disabled = offer_bound
+            _disable_with_reason(self, field_id, reasons.get("gpu") if offer_bound else None)
+        # The vLLM form has no host/port controls; vLLM binds its own.
+        revision_reason = refuse_deployment_revision(self._provider, BackendType.VLLM)
+        _disable_with_reason(self, "#model-revision", revision_reason)
         advanced_visible = not self.query_one("#model-revision").has_class("hidden")
         for provider_class, provider in (
             (".prime-only", ComputeProvider.PRIME),
@@ -2251,10 +2297,25 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
         )
 
     def _vast_disk_gb(self) -> int:
-        return positive_int(self.query_one("#vast-disk-vllm", Input).value) or DEFAULT_VAST_DISK_GB
+        return positive_int(self.query_one("#vast-disk-vllm", Input).value) or self._default_vast_disk_gb()
+
+    def _default_vast_disk_gb(self) -> int:
+        """Size the rental for fp16 weights plus the image and its caches.
+
+        The GGUF default is far too small for an unquantized checkpoint, and a
+        disk that fills mid-download is a rental the user pays for and cannot
+        use.
+        """
+        required = self._current_vllm_required_vram()
+        if not required or required <= 0:
+            return DEFAULT_VAST_DISK_GB
+        return max(DEFAULT_VAST_DISK_GB, math.ceil(required * 1.1) + 20)
 
     def _refresh_vast_offer_options(self) -> None:
         required_vram_gb = self._current_vllm_required_vram()
+        disk_field = self.query_one("#vast-disk-vllm", Input)
+        if not disk_field.value.strip():
+            disk_field.placeholder = str(self._default_vast_disk_gb())
         offers = _compatible_vast_offers(list(self._vast_offers.values()), required_vram_gb)
         options = _vast_offer_options(offers)
         selector = self.query_one("#vast-offer-vllm", Select)

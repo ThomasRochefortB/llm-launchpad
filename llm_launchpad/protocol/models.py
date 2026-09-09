@@ -687,6 +687,9 @@ class VastDeploymentRecord:
     local_port: int = 0
     state: str = "creating"
     max_context_tokens: int | None = None
+    # Defaults keep records written before Vast served vLLM readable.
+    backend: str = "llamacpp"
+    model_name: str = ""
 
 
 @dataclass

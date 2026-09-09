@@ -2,6 +2,8 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import lru_cache
+from importlib import resources
 import json
 import shlex
 import time
@@ -9,9 +11,12 @@ import time
 from huggingface_hub import get_token
 import requests
 
+from typing import Any
+
+from ..protocol.enums import BackendType
 from ..protocol.models import DeploymentConfig
 from .runtime_support import load_llamacpp_support_manifest
-from .serving_runtime import projector_setup
+from .serving_runtime import projector_setup, vllm_serve_args
 
 VAST_RUNTIME_DIR = "/root/.llm-launchpad"
 # CUDA_VERSION in the bundled b10689 image's immutable OCI config. Require
@@ -102,6 +107,34 @@ class VastRuntime:
     min_cuda_version: float
 
 
+@lru_cache(maxsize=1)
+def _vast_runtime_catalog() -> dict[str, Any]:
+    """Load the bundled non-llama.cpp runtime metadata."""
+    resource = resources.files("llm_launchpad.data").joinpath("vast_runtime.json")
+    payload = json.loads(resource.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or not isinstance(payload.get("runtimes"), dict):
+        raise RuntimeError("Vast runtime manifest must be a JSON object with runtimes")
+    return payload["runtimes"]
+
+
+def load_vast_runtime(backend: BackendType) -> VastRuntime:
+    """Return the pinned image and driver floor for a non-llama.cpp runtime."""
+    entry = _vast_runtime_catalog().get(backend.value)
+    if not isinstance(entry, dict):
+        raise ValueError(f"Vast has no published runtime for {backend.display_name}.")
+    digest = str(entry.get("image_digest") or "")
+    reference = str(entry.get("image_ref") or "")
+    floor = entry.get("min_cuda_version")
+    if not digest.startswith("sha256:") or not reference or not isinstance(floor, (int, float)):
+        raise ValueError(f"The Vast {backend.value} runtime entry is incomplete.")
+    return VastRuntime(image=f"{reference.split('@')[0]}@{digest}", min_cuda_version=float(floor))
+
+
+# vLLM shards attention heads across devices, so the count must divide them.
+# Powers of two are the shapes that hold for every supported architecture.
+VLLM_TENSOR_PARALLEL_COUNTS = frozenset({1, 2, 4, 8})
+
+
 def vast_refusal(config: DeploymentConfig) -> str | None:
     """Explain why a Vast rental cannot serve this configuration, or None.
 
@@ -109,6 +142,24 @@ def vast_refusal(config: DeploymentConfig) -> str | None:
     ``core/providers.py``; this covers what only the Vast runtime knows.
     """
 
+    if config.backend == BackendType.VLLM:
+        if not (config.model_name or "").strip():
+            return "Vast vLLM rentals require a model name."
+        count = config.gpu_count or 1
+        if count not in VLLM_TENSOR_PARALLEL_COUNTS:
+            return (
+                f"vLLM tensor parallelism needs 1, 2, 4, or 8 GPUs; this rental has {count}."
+            )
+        if (config.n_gpu or count) != count:
+            return (
+                "A Vast rental bills every GPU it bundles, so tensor parallelism "
+                f"must use all {count}."
+            )
+        try:
+            load_vast_runtime(BackendType.VLLM)
+        except ValueError as exc:
+            return str(exc)
+        return None
     if not config.repo_id or not config.quant:
         return "Vast requires a GGUF repository and quant."
     manifest = load_llamacpp_support_manifest(config.gguf_architecture)
@@ -124,6 +175,8 @@ def vast_runtime(config: DeploymentConfig) -> VastRuntime:
     reason = refuse(config)
     if reason:
         raise ValueError(reason)
+    if config.backend == BackendType.VLLM:
+        return load_vast_runtime(BackendType.VLLM)
     manifest = load_llamacpp_support_manifest(config.gguf_architecture)
     return VastRuntime(
         image=manifest.image_ref.split("@")[0] + "@" + manifest.image_digest,
@@ -141,6 +194,8 @@ def vast_runtime_script(config: DeploymentConfig) -> str:
     vast_runtime_image(config)
     if not config.endpoint_api_key:
         raise ValueError("Vast endpoints require an API key.")
+    if config.backend == BackendType.VLLM:
+        return _vllm_script(config)
     arguments = [
         "/app/llama-server", "--hf-repo", f"{config.repo_id}:{config.quant}",
         *shlex.split(config.server_args or ""),
@@ -169,6 +224,31 @@ def vast_runtime_script(config: DeploymentConfig) -> str:
     lines.extend(f"export {name}={shlex.quote(value)}" for name, value in env.items())
     if setup:
         lines.append(setup)
+    lines.append("exec " + shlex.join(arguments))
+    return "\n".join(lines) + "\n"
+
+
+def _vllm_script(config: DeploymentConfig) -> str:
+    """Serve vLLM on the rental's loopback interface, keyed by environment."""
+    arguments = list(vllm_serve_args(config, host="127.0.0.1", port=8000))
+    env = {
+        # vLLM reads this natively, so the key never reaches argv where anything
+        # able to list processes on the host could read it.
+        "VLLM_API_KEY": config.endpoint_api_key or "",
+        "HF_HOME": f"{VAST_RUNTIME_DIR}/hf",
+        "VLLM_CACHE_ROOT": f"{VAST_RUNTIME_DIR}/vllm",
+        # Tensor-parallel workers are separate processes; spawn avoids the fork
+        # interaction with CUDA that hangs multi-GPU startup.
+        "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+    }
+    token = get_token()
+    if token:
+        env["HF_TOKEN"] = token
+    lines = [
+        "#!/bin/sh", "set -eu", "umask 077",
+        f"mkdir -p {VAST_RUNTIME_DIR}/hf {VAST_RUNTIME_DIR}/vllm",
+    ]
+    lines.extend(f"export {name}={shlex.quote(value)}" for name, value in env.items())
     lines.append("exec " + shlex.join(arguments))
     return "\n".join(lines) + "\n"
 
