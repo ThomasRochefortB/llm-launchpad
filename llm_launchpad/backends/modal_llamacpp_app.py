@@ -1,7 +1,7 @@
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 import json
 import os
 import time
@@ -121,6 +121,14 @@ PREDOWNLOAD_TIMEOUT_MINUTES = _read_int_env("PREDOWNLOAD_TIMEOUT_MINUTES", 6 * 6
 SNAPSHOT_MAX_WORKERS = _read_int_env("HF_SNAPSHOT_MAX_WORKERS", 32)
 DOWNLOAD_CPU = _read_int_env("HF_DOWNLOAD_CPU", 4)
 SERVE_CPU = _read_int_env("LLAMACPP_SERVE_CPU", 4)
+# First llama-server mmap after a large volume write can exceed 30 minutes on a
+# cold Modal volume (GLM-5.3-Flash ~109GiB). Sequential hydration plus a longer
+# bind wait covers that first GPU host read; later starts stay fast.
+SERVE_TIMEOUT_MINUTES = _read_int_env("LLAMACPP_SERVE_TIMEOUT_MINUTES", 60)
+SERVE_STARTUP_TIMEOUT_MINUTES = _read_int_env("LLAMACPP_SERVE_STARTUP_TIMEOUT_MINUTES", 90)
+WARM_VOLUME = _read_bool_env("LLAMACPP_WARM_VOLUME", True)
+VOLUME_WARM_CHUNK_BYTES = _read_int_env("LLAMACPP_VOLUME_WARM_CHUNK_BYTES", 16 * 1024 * 1024)
+VOLUME_WARM_LOG_INTERVAL_SECONDS = _read_int_env("LLAMACPP_VOLUME_WARM_LOG_INTERVAL_SECONDS", 10)
 HF_HUB_DISABLE_XET_DEFAULT = _read_bool_env("HF_HUB_DISABLE_XET", True)
 HF_XET_HIGH_PERFORMANCE_DEFAULT = _read_optional_bool_env("HF_XET_HIGH_PERFORMANCE")
 LLAMA_CPP_IMAGE_REF = (
@@ -547,6 +555,99 @@ def _pick_preferred_gguf_entrypoint(candidates: list[Path]) -> Path:
     if unsplit:
         return _largest(unsplit)
     return _largest(split_nonfirst)
+
+
+def _gguf_weight_paths(entrypoint: Path | str) -> list[Path]:
+    """Return the files llama.cpp opens for this GGUF, including split shards."""
+    path = Path(entrypoint)
+    parent = path.parent
+    match = _GGUF_SPLIT_RE.search(path.name)
+    if match is None or not parent.is_dir():
+        return [path]
+    prefix = path.name[: match.start()]
+    expected_total = int(match.group(2))
+    found: dict[int, Path] = {}
+    try:
+        entries = list(parent.iterdir())
+    except OSError:
+        return [path]
+    for candidate in entries:
+        if not candidate.is_file():
+            continue
+        shard_match = _GGUF_SPLIT_RE.search(candidate.name)
+        if shard_match is None or candidate.name[: shard_match.start()] != prefix:
+            continue
+        if int(shard_match.group(2)) != expected_total:
+            continue
+        found[int(shard_match.group(1))] = candidate
+    if not found:
+        return [path]
+    return [found[index] for index in sorted(found)]
+
+
+def _warm_volume_paths(
+    paths: Sequence[Path | str],
+    *,
+    chunk_bytes: int | None = None,
+) -> None:
+    """Read weight files sequentially so the first GPU mmap is not a cold volume fault."""
+    chunk = VOLUME_WARM_CHUNK_BYTES if chunk_bytes is None else chunk_bytes
+    if chunk <= 0:
+        raise RuntimeError("LLAMACPP_VOLUME_WARM_CHUNK_BYTES must be a positive integer.")
+    files: list[Path] = []
+    seen: set[str] = set()
+    total = 0
+    for raw in paths:
+        path = Path(raw)
+        try:
+            resolved = str(path.resolve())
+        except OSError:
+            resolved = str(path)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        if not path.is_file():
+            print(f"🦙 skip volume warm; missing {path}")
+            continue
+        files.append(path)
+        try:
+            total += path.stat().st_size
+        except OSError:
+            continue
+    if not files:
+        return
+
+    print(
+        f"🦙 warming {len(files)} volume file(s) ({total / (1024 ** 3):.2f}GiB) "
+        "before llama-server starts"
+    )
+    started = time.time()
+    done = 0
+    last_log = started
+    log_interval = max(1, VOLUME_WARM_LOG_INTERVAL_SECONDS)
+    for path in files:
+        with path.open("rb") as handle:
+            while True:
+                data = handle.read(chunk)
+                if not data:
+                    break
+                done += len(data)
+                now = time.time()
+                if now - last_log >= log_interval:
+                    elapsed = max(now - started, 1e-6)
+                    rate = (done / (1024 ** 2)) / elapsed
+                    print(
+                        "🦙 volume warm in progress... "
+                        f"elapsed={int(elapsed)}s size={done / (1024 ** 3):.2f}GiB/"
+                        f"{total / (1024 ** 3):.2f}GiB avg_rate={rate:.2f}MiB/s"
+                    )
+                    last_log = now
+    elapsed = max(time.time() - started, 1e-6)
+    rate = (done / (1024 ** 2)) / elapsed
+    print(
+        f"🦙 volume warm complete: {done / (1024 ** 3):.2f}GiB in {elapsed:.1f}s "
+        f"({rate:.2f}MiB/s)"
+    )
 
 
 def _download_lease_key(repo_id: str, revision: str | None) -> str:
@@ -1184,11 +1285,15 @@ except Exception:
     volumes={cache_dir: model_cache},
     gpu=GPU_CONFIG,
     cpu=SERVE_CPU,
-    timeout=60 * MINUTES,  # allow long cold starts
+    timeout=SERVE_TIMEOUT_MINUTES * MINUTES,
     scaledown_window=SCALEDOWN_WINDOW,  # keep container warm after requests (overridable via env)
     max_containers=1,  # cap number of containers (replicas) to 1
 )
-@modal.web_server(8080, startup_timeout=30 * 60, label=WEB_LABEL)
+@modal.web_server(
+    8080,
+    startup_timeout=SERVE_STARTUP_TIMEOUT_MINUTES * MINUTES,
+    label=WEB_LABEL,
+)
 def serve():
     """Run llama.cpp's HTTP server for the specified model.
 
@@ -1224,6 +1329,21 @@ def serve():
         print(f"🦙 using llama-server cwd: {server_cwd}")
 
     server_args = extra_server_args or DEFAULT_SERVER_ARGS
+    vision = cfg.get("vision") or {}
+    projector_path: str | None = None
+    if vision.get("enabled"):
+        projector = vision.get("projector")
+        if not projector:
+            raise RuntimeError("Vision enabled without a resolved projector.")
+        projector_path = download_projector.remote(projector)
+        model_cache.reload()
+
+    if WARM_VOLUME:
+        warm_paths: list[Path | str] = [*_gguf_weight_paths(model_path)]
+        if projector_path:
+            warm_paths.append(projector_path)
+        _warm_volume_paths(warm_paths)
+
     if serving_fingerprint:
         fit_binary = _resolve_fit_binary()
         if fit_binary:
@@ -1271,13 +1391,7 @@ def serve():
         command += ["--n-gpu-layers", str(int(n_gpu_layers_cfg))]
     if not _server_args_define_alias(server_args):
         command += ["--alias", served_model_name]
-    vision = cfg.get("vision") or {}
-    if vision.get("enabled"):
-        projector = vision.get("projector")
-        if not projector:
-            raise RuntimeError("Vision enabled without a resolved projector.")
-        projector_path = download_projector.remote(projector)
-        model_cache.reload()
+    if projector_path:
         command += ["--mmproj", projector_path]
     elif cfg.get("vision") is not None:
         command += ["--no-mmproj"]

@@ -7,6 +7,9 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- First llama.cpp Modal deploy after a large Hugging Face download no longer dies at the 30-minute web-server startup timeout. The GPU container sequentially hydrates GGUF shards (and a projector, if any) before `llama-server` starts, and the bind wait defaults to 90 minutes (`LLAMACPP_SERVE_STARTUP_TIMEOUT_MINUTES`).
+
 ### Added
 - Added an always-on rotating debug log under `~/.llm_launchpad/logs/` and routed previously silent failure paths (cache persistence, auth probing, log-tail cleanup, SSH key permissions) to it.
 - Added `llm-launchpad doctor`, a self-check command that verifies the Modal CLI, Modal/Prime/Hugging Face authentication, the optional Artificial Analysis key, and state-directory writability, with fix hints per failure.
