@@ -112,7 +112,7 @@ checked again immediately before rental.
 
 The default query requests up to 100 single-GPU, verified, on-demand NVIDIA
 offers on x86-64 hosts, with a reliability score of at least 0.99 and space for
-100 GiB of disk. The TUI previews single-GPU offers; the CLI can inspect other
+100 GiB of disk. The TUI deploys supported single-GPU offers; the CLI can inspect other
 GPU counts with `--gpu-count`, without implying deployment support. `--region`
 accepts a two-letter country code for Vast. `--secure-only` adds Vast's
 datacenter filter; verified hosts alone are not labeled as secure cloud.

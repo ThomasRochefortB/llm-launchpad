@@ -831,7 +831,11 @@ class FastDeployScreen(CopyEnabledScreen):
         if self._phase == "infra":
             if option_id in self._vast_rows:
                 self.query_one("#fast-deploy-detail", Static).update(vast_comparison_detail(self._vast_rows[option_id]))
-                self.notify("Vast offer comparison only; deployment is not enabled yet.", timeout=4)
+                self.notify(
+                    "Comparison only: the Vast beta deploys single-GPU text-only "
+                    "llama.cpp offers.",
+                    timeout=4,
+                )
                 return
             row = self._infra_rows.get(option_id)
             if row is not None:

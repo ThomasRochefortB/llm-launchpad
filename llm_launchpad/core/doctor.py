@@ -111,8 +111,8 @@ def run_doctor_checks(
     try:
         vast_credentials = resolve_vast_credentials()
         vast_detail = (
-            f"configured ({vast_credentials.source}); offer preview only, not verified"
-            if vast_credentials.api_key else "not configured (optional offer preview)"
+            f"configured ({vast_credentials.source}); key not verified over the network"
+            if vast_credentials.api_key else "not configured (optional)"
         )
         vast_ok = bool(vast_credentials.api_key)
     except ValueError as exc:

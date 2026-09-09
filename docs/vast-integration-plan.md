@@ -1,7 +1,7 @@
 # Vast.ai integration plan
 
-Status: implementation started, 2026-09-08. No Vast resources have been created
-or live-certified.
+Status: live-validated on 2026-09-09. Real single-GPU rentals were created,
+exercised, and destroyed; every rental was confirmed absent afterwards.
 
 The implemented increments cover auth and quotes; model-aware Fast Deploy
 prices and filters; and a deployable single-GPU, text-only llama.cpp beta. Vast
