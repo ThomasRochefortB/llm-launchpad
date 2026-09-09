@@ -13,7 +13,7 @@ from textual.geometry import Size
 from textual.selection import Selection
 from textual.screen import Screen
 from textual.widget import Widget
-from textual.widgets import DataTable, Input, OptionList, Select, Static
+from textual.widgets import DataTable, Footer, Input, OptionList, Select, Static
 
 from ..responsive import (
     MIN_TERMINAL_HEIGHT,
@@ -59,6 +59,7 @@ class CopyEnabledScreen(Screen):
                 self.set_class(class_name in active_classes, class_name)
             self._viewport_profile = profile
             self._sync_visual_classes()
+            self._sync_footer_hints(profile)
             self.refresh(repaint=True, layout=True)
             self.viewport_profile_changed(profile, previous)
 
@@ -85,6 +86,16 @@ class CopyEnabledScreen(Screen):
             self._focus_before_size_gate = None
             if previous_focus.is_mounted and previous_focus.can_focus:
                 previous_focus.focus()
+
+    def _sync_footer_hints(self, profile: ViewportProfile) -> None:
+        """Drop the command-palette hint where it would crowd the bindings.
+
+        The footer right-aligns "^p palette" against left-aligned key hints; on
+        a narrow terminal the two run together. The palette stays reachable by
+        its shortcut either way, so the hint is what gives way.
+        """
+        for footer in self.query(Footer):
+            footer.show_command_palette = not profile.narrow
 
     @property
     def viewport_profile(self) -> ViewportProfile:

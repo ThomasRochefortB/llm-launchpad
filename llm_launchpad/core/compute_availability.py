@@ -24,6 +24,8 @@ from ..protocol.models import (
     PrimeProviderOptions,
     ProviderQuote,
     WorkloadProfile,
+    VastOffer,
+    VastOfferQuery,
 )
 from .inference_options import (
     estimate_cost_per_million_output_tokens,
@@ -42,6 +44,8 @@ from .prime_backend import (
     supports_prime_image,
 )
 from .quick_deploy import QuickDeployProfile, quick_deploy_recipe
+from .vast_auth import VastCredentials, resolve_vast_credentials
+from .vast_backend import VastBackend
 
 _MODAL_GPU_COUNT_MAX = 8
 _GPU_MEMORY_GB: dict[str, float] = {
@@ -72,16 +76,28 @@ def load_compute_availability() -> ComputeAvailabilitySnapshot:
         include_prime = get_prime_auth_status().authenticated
     except Exception as exc:
         errors.append(f"Prime authentication check failed: {exc}")
+    vast_credentials = VastCredentials()
+    try:
+        vast_credentials = resolve_vast_credentials()
+    except ValueError as exc:
+        errors.append(f"Vast key unavailable: {exc}")
 
     modal_catalog: Sequence[ModalGpuSpec] = ()
     prime_offers: Sequence[ComputeOffer] = ()
     modal_future: Future[list[ModalGpuSpec]] | None = None
     prime_future: Future[list[ComputeOffer]] | None = None
-    with ThreadPoolExecutor(max_workers=2) as executor:
+    vast_future: Future[list[VastOffer]] | None = None
+    vast_offers: Sequence[VastOffer] = ()
+    with ThreadPoolExecutor(max_workers=3) as executor:
         if include_modal:
             modal_future = executor.submit(fetch_modal_gpu_catalog)
         if include_prime:
             prime_future = executor.submit(PrimeBackend().list_offers)
+        if vast_credentials.api_key:
+            vast_future = executor.submit(
+                VastBackend(vast_credentials).list_offers,
+                VastOfferQuery(gpu_count=None, limit=500),
+            )
         if modal_future is not None:
             try:
                 modal_catalog = modal_future.result()
@@ -92,8 +108,13 @@ def load_compute_availability() -> ComputeAvailabilitySnapshot:
                 prime_offers = prime_future.result()
             except Exception as exc:
                 errors.append(f"Prime availability unavailable: {exc}")
+        if vast_future is not None:
+            try:
+                vast_offers = vast_future.result()
+            except Exception as exc:
+                errors.append(f"Vast availability unavailable: {exc}")
 
-    if not include_modal and not include_prime and not errors:
+    if not include_modal and not include_prime and not vast_credentials.api_key and not errors:
         errors.append("Connect a compute provider to load availability.")
     providers = tuple(
         provider
@@ -107,7 +128,10 @@ def load_compute_availability() -> ComputeAvailabilitySnapshot:
         modal_catalog=modal_catalog,
         prime_offers=prime_offers,
     )
-    return replace(snapshot, errors=tuple(errors), providers=providers)
+    return replace(
+        snapshot, errors=tuple(errors), providers=providers,
+        vast_offers=tuple(vast_offers), vast_configured=bool(vast_credentials.api_key),
+    )
 
 
 def aggregate_compute_availability(

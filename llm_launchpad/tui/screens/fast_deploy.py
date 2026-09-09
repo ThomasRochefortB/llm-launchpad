@@ -24,6 +24,7 @@ from ...core.compute_availability import (
 from ...core.llamacpp_planner import assessment_score
 from ...core.serving_tiers import ServingTier, serving_tiers
 from ...core.runtime_support import load_llamacpp_support_manifest
+from ...core.vast_comparison import vast_gpu_label, vast_offers_for_model, vast_plan_for_offer
 from ...protocol.enums import ServingObjective
 from ...core.deploy_log_summary import SUMMARY_SPINNER_FRAMES
 from ...core.quick_deploy import (
@@ -42,8 +43,11 @@ from ...protocol.models import (
     CatalogExclusion,
     ComputeAvailabilitySnapshot,
     ComputeConfiguration,
+    ComputePlacement,
     InferencePlan,
+    VastModelOffer,
 )
+from ..vast_comparison import vast_comparison_detail, vast_comparison_option
 from ..responsive import ViewportProfile, WidthMode
 from .copy_enabled import CopyEnabledScreen
 
@@ -156,6 +160,7 @@ def _subtitle(info: QuickDeployCatalogInfo) -> str:
 def _model_cheapest_price(
     model: QuickDeployModel,
     snapshot: ComputeAvailabilitySnapshot | None = None,
+    gpu_type: str = "any",
 ) -> tuple[float | None, bool]:
     """Return the cheapest hourly price and whether it is an estimate."""
 
@@ -167,14 +172,15 @@ def _model_cheapest_price(
         return catalog, True
     priced = [
         row
-        for row in infra_rows_for_model(model, snapshot)
+        for row in _filter_infra_rows(infra_rows_for_model(model, snapshot), gpu_type)
         if row.plan.quote.price_per_hour_usd is not None
     ]
     if not priced:
-        return catalog, True
+        can_use_catalog = snapshot.providers is None or ComputeProvider.MODAL in snapshot.providers
+        return (catalog if gpu_type == "any" and can_use_catalog else None), True
     best = min(
         priced,
-        key=lambda row: row.plan.quote.price_per_hour_usd or float("inf"),
+        key=lambda row: row.plan.quote.price_per_hour_usd,
     )
     return best.plan.quote.price_per_hour_usd, best.plan.quote.is_estimate
 
@@ -182,8 +188,15 @@ def _model_cheapest_price(
 def _model_cost_label(
     model: QuickDeployModel,
     snapshot: ComputeAvailabilitySnapshot | None = None,
+    gpu_type: str = "any",
 ) -> str:
-    price, estimate = _model_cheapest_price(model, snapshot)
+    price, estimate = _model_cheapest_price(model, snapshot, gpu_type)
+    if snapshot is not None:
+        comparisons = tuple(row for row in vast_offers_for_model(model, snapshot.vast_offers)
+                            if gpu_type in {"any", row.gpu_label})
+        vast_price = comparisons[0].costs.total_per_hour_usd if comparisons else None
+        if vast_price is not None and (price is None or vast_price < price):
+            return f"{_format_price(vast_price, estimate=True)} Vast preview"
     if price is None:
         return "price n/a"
     if snapshot is None:
@@ -195,8 +208,9 @@ def _model_option(
     model: QuickDeployModel,
     width_mode: WidthMode = WidthMode.WIDE,
     snapshot: ComputeAvailabilitySnapshot | None = None,
+    gpu_type: str = "any",
 ) -> str:
-    cost = _model_cost_label(model, snapshot)
+    cost = _model_cost_label(model, snapshot, gpu_type)
     score = (
         f"AAI {_format_aa_index(model.quality_score)}"
         if model.quality_score is not None
@@ -329,6 +343,26 @@ def infra_rows_for_model(
                         alternative_plans=tuple(provider_plans),
                     )
                 )
+    profiles = {quick_deploy_recipe(profile).id: profile for profile in model.profiles}
+    for comparison in vast_offers_for_model(model, snapshot.vast_offers):
+        profile = profiles[comparison.recipe.id]
+        plan = vast_plan_for_offer(comparison, profile)
+        if plan is None:
+            continue
+        quote = plan.quote
+        placement = ComputePlacement(
+            id=quote.id, provider=quote.provider, provider_reference=quote.provider_reference,
+            gpu_type=quote.gpu_type, gpu_memory_gb=comparison.offer.gpu_memory_gib,
+            gpu_count_min=1, gpu_count_max=1, price_per_hour_usd=quote.price_per_hour_usd,
+            billing_model=quote.billing_model, availability=quote.availability,
+            supported_backends=frozenset({profile.backend}), region=quote.region,
+            provider_options=quote.provider_options,
+        )
+        configuration = ComputeConfiguration(
+            id="vast:" + comparison.gpu_label, gpu_type=comparison.gpu_label,
+            gpu_memory_gb=comparison.offer.gpu_memory_gib, placements=(placement,),
+        )
+        rows.append(_InfraRow(profile, plan, configuration, (plan,)))
     rows.sort(key=_infra_sort_key)
     return tuple(rows)
 
@@ -457,25 +491,28 @@ def _infra_sort_key(row: _InfraRow) -> tuple[int, float, str, int]:
 def _gpu_filter_options(snapshot: ComputeAvailabilitySnapshot) -> list[tuple[str, str]]:
     """Return Select options for unique GPU types, cheapest first."""
     options: list[tuple[str, str]] = [("Any GPU", "any")]
-    ranked: list[tuple[str, float | None]] = []
-    seen: set[str] = set()
+    ranked: dict[str, tuple[float | None, bool]] = {}
     for configuration in snapshot.configurations:
         gpu_type = configuration.gpu_type.strip()
-        if not gpu_type or gpu_type in seen:
+        if not gpu_type:
             continue
-        seen.add(gpu_type)
-        prices = [
-            row.minimum_price_per_hour_usd
-            for row in snapshot.configurations
-            if row.gpu_type == gpu_type and row.minimum_price_per_hour_usd is not None
-        ]
-        ranked.append((gpu_type, min(prices) if prices else None))
-    ranked.sort(key=lambda item: (1 if item[1] is None else 0, item[1] or 0.0, item[0].casefold()))
-    for gpu_type, price in ranked:
+        ranked[gpu_type] = (configuration.minimum_price_per_hour_usd, False)
+    for offer in snapshot.vast_offers:
+        gpu_type = vast_gpu_label(offer)
+        price = offer.costs.total_per_hour_usd
+        old = ranked.get(gpu_type)
+        if old is None or (price is not None and (old[0] is None or price < old[0])):
+            ranked[gpu_type] = (price, True)
+    ordered = sorted(ranked.items(), key=lambda item: (
+        item[1][0] is None, item[1][0] or 0.0, item[0].casefold(),
+    ))
+    for gpu_type, (price, preview) in ordered:
         # "from" repeats on every row and pushes the longest entries past the
         # dropdown width, wrapping them mid-phrase. The prices are already
         # ascending, so the word earns nothing.
         label = gpu_type if price is None else f"{gpu_type} · {_format_price(price)}"
+        if preview:
+            label += " · Vast.ai"
         options.append((label, gpu_type))
     return options
 
@@ -487,12 +524,10 @@ def _model_fits_gpu_type(
 ) -> bool:
     """Return True when the model has at least one fulfillment on ``gpu_type``."""
     configurations = [row for row in snapshot.configurations if row.gpu_type == gpu_type]
-    if not configurations:
-        return False
     for profile in representative_profiles_for_model(model):
         if any(plans_for_compute_profile(configuration, profile) for configuration in configurations):
             return True
-    return False
+    return any(row.gpu_label == gpu_type for row in vast_offers_for_model(model, snapshot.vast_offers))
 
 
 def _model_matches_query(model: QuickDeployModel, query: str) -> bool:
@@ -614,6 +649,7 @@ class FastDeployScreen(CopyEnabledScreen):
         Binding("/", "focus_model_search", "Search", show=True),
         Binding("a", "toggle_all_placements", "Compare all", show=True),
         Binding("x", "show_excluded_models", "Excluded models", show=True),
+        Binding("r", "refresh_availability", "Refresh offers", show=True),
     ]
 
     def __init__(self) -> None:
@@ -627,6 +663,7 @@ class FastDeployScreen(CopyEnabledScreen):
         self._model_by_id = {model.id: model for model in self._models}
         self._selected_model: QuickDeployModel | None = None
         self._infra_rows: dict[str, _InfraRow] = {}
+        self._vast_rows: dict[str, VastModelOffer] = {}
         self._fallback_profiles: dict[str, QuickDeployProfile] = {}
         self._availability_inflight = False
         self._availability_request_id = 0
@@ -682,6 +719,9 @@ class FastDeployScreen(CopyEnabledScreen):
             if model is not None:
                 self._update_model_detail(model)
         elif self._phase == "infra":
+            if option_id in self._vast_rows:
+                self.query_one("#fast-deploy-detail", Static).update(vast_comparison_detail(self._vast_rows[option_id]))
+                return
             row = self._infra_rows.get(option_id)
             if row is not None:
                 self._update_infra_detail(row)
@@ -789,6 +829,10 @@ class FastDeployScreen(CopyEnabledScreen):
         if self._availability_inflight:
             return
         if self._phase == "infra":
+            if option_id in self._vast_rows:
+                self.query_one("#fast-deploy-detail", Static).update(vast_comparison_detail(self._vast_rows[option_id]))
+                self.notify("Vast offer comparison only; deployment is not enabled yet.", timeout=4)
+                return
             row = self._infra_rows.get(option_id)
             if row is not None:
                 alternatives: list[InferencePlan] = []
@@ -898,14 +942,18 @@ class FastDeployScreen(CopyEnabledScreen):
         self,
         message: FastDeployAvailabilityLoaded,
     ) -> None:
-        self._snapshot = message.snapshot
+        if message.request_id is not None and message.request_id != self._availability_request_id:
+            return
         if message.purpose == "filter":
+            self._snapshot = message.snapshot
             self._populate_gpu_filter(message.snapshot)
             if self._phase == "models":
                 self._render_model_list(preferred_id=self._highlighted_model_id())
             return
         if not self._is_current_availability_request(message.request_id):
             return
+        self._snapshot = message.snapshot
+        self._populate_gpu_filter(message.snapshot)
         model = self._selected_model
         if model is None:
             self._availability_inflight = False
@@ -916,7 +964,14 @@ class FastDeployScreen(CopyEnabledScreen):
         self,
         message: FastDeployAvailabilityFailed,
     ) -> None:
+        if message.request_id is not None and message.request_id != self._availability_request_id:
+            return
         if message.purpose == "filter":
+            self._snapshot = None
+            self._populate_gpu_filter(ComputeAvailabilitySnapshot(configurations=()))
+            if self._phase == "models":
+                self._render_model_list(preferred_id=self._highlighted_model_id())
+                self.query_one("#fast-deploy-status", Static).update(escape(message.error))
             return
         if not self._is_current_availability_request(message.request_id):
             return
@@ -957,6 +1012,20 @@ class FastDeployScreen(CopyEnabledScreen):
         if self._snapshot is not None:
             self._render_infra_from_snapshot(self._selected_model, self._snapshot)
 
+    def action_refresh_availability(self) -> None:
+        """Reload prices and credentials, invalidating pending results."""
+        if self._phase == "models":
+            self._load_availability(purpose="filter")
+        elif self._selected_model is not None:
+            self._phase = "loading"
+            self._infra_rows = {}
+            self._vast_rows = {}
+            self.query_one("#fast-deploy-list", OptionList).set_options([
+                Option("  Refreshing infrastructure…", disabled=True),
+            ])
+            self._load_availability(purpose="infra")
+        self.query_one("#fast-deploy-status", Static).update("[dim]Refreshing live offers…[/dim]")
+
     def _render_infra_from_snapshot(
         self,
         model: QuickDeployModel,
@@ -965,13 +1034,17 @@ class FastDeployScreen(CopyEnabledScreen):
         excluded: list[str] = []
         all_rows = infra_rows_for_model(model, snapshot, rejected=excluded)
         rows = _filter_infra_rows(all_rows, self._gpu_filter)
-        if not rows:
-            if all_rows and self._gpu_filter not in {"", "any"}:
+        comparisons = vast_offers_for_model(model, snapshot.vast_offers)
+        deployable_ids = {row.plan.quote.provider_reference for row in all_rows if row.plan.quote.provider == ComputeProvider.VAST}
+        vast_rows = tuple(row for row in comparisons if row.offer.id not in deployable_ids and self._gpu_filter in {"", "any", row.gpu_label})
+        self._vast_rows = {row.id: row for row in vast_rows}
+        if not rows and not vast_rows:
+            if (all_rows or comparisons) and self._gpu_filter not in {"", "any"}:
                 self._render_empty_gpu_filter()
                 return
             self._render_fallback(
                 model,
-                reason="No connected placement fits this model's requirements.",
+                reason=" ".join(("No connected placement fits this model's requirements.", *snapshot.errors)),
             )
             return
         self._phase = "infra"
@@ -1002,14 +1075,25 @@ class FastDeployScreen(CopyEnabledScreen):
                     for row in rows
                 ]
             )
-            option_list.highlighted = 0
-            self._update_infra_detail(rows[0])
+            if rows:
+                option_list.highlighted = 0
+                self._update_infra_detail(rows[0])
+        if vast_rows:
+            option_list.add_options([
+                Option("[bold]Vast.ai comparisons · deployment unavailable[/bold]", disabled=True),
+                *(Option(vast_comparison_option(row), id=row.id) for row in (
+                    vast_rows if self._show_all_placements else vast_rows[:3]
+                )),
+            ])
+            if not rows:
+                option_list.highlighted = 1
+                self.query_one("#fast-deploy-detail", Static).update(vast_comparison_detail(vast_rows[0]))
         self.query_one("#fast-deploy-subtitle", Static).update(
             f"Pick infrastructure · {escape(self._catalog_info.source_label)}"
         )
         if tiers:
             status = (
-                f"[bold]Every option runs the full "
+                f"[bold]Deployable options run the full "
                 f"{model.max_context_tokens:,}-token context[/bold] "
                 f"[dim]· press a to compare all {len(rows)} placements[/dim]"
             )
@@ -1021,6 +1105,10 @@ class FastDeployScreen(CopyEnabledScreen):
             )
         if self._gpu_filter not in {"", "any"}:
             status += f" [dim]· GPU {escape(self._gpu_filter)}[/dim]"
+        if vast_rows:
+            status += f"\n[dim]{len(vast_rows)} Vast comparisons fit estimated full-context memory · a shows all · r refreshes[/dim]"
+        elif snapshot.vast_configured and not any(row.plan.quote.provider == ComputeProvider.VAST for row in rows):
+            status += "\n[dim]No Vast offers with a confirmed memory estimate and sufficient disk fit this model.[/dim]"
         if excluded:
             # A shorter list with no explanation reads as missing hardware
             # rather than as hardware that would not have worked.
@@ -1191,6 +1279,7 @@ class FastDeployScreen(CopyEnabledScreen):
                             model,
                             self.viewport_profile.width_mode,
                             snapshot=self._snapshot,
+                            gpu_type=self._gpu_filter,
                         ),
                         id=model.id,
                     )
@@ -1229,6 +1318,10 @@ class FastDeployScreen(CopyEnabledScreen):
         self.query_one("#fast-deploy-status", Static).update(
             f"[dim]{len(visible)} model{plural}{filter_note}{search_note}{excluded_note} · "
             f"{escape(self._catalog_info.source_label)}[/dim]"
+            + (f"\n[dim]{len(self._snapshot.vast_offers)} Vast offers included for comparison · r refreshes[/dim]"
+               if self._snapshot is not None and self._snapshot.vast_configured else "")
+            + ("\n[yellow]Partial results: " + escape("; ".join(self._snapshot.errors)) + "[/yellow]"
+               if self._snapshot is not None and self._snapshot.errors else "")
         )
         if getattr(self.focused, "id", "") not in {
             "fast-deploy-gpu-filter", "fast-deploy-model-search",
@@ -1241,8 +1334,12 @@ class FastDeployScreen(CopyEnabledScreen):
         current = self._gpu_filter
         values = {value for _label, value in options}
         if current not in values:
-            current = "any"
-            self._gpu_filter = "any"
+            if self._selected_model is not None:
+                # A disappeared offer must not silently switch the user's GPU.
+                options.append((current, current))
+            else:
+                current = "any"
+                self._gpu_filter = "any"
         self._updating_gpu_filter = True
         selector.set_options(options)
         selector.value = current
@@ -1266,6 +1363,7 @@ class FastDeployScreen(CopyEnabledScreen):
         self._phase = "models"
         self._selected_model = None
         self._infra_rows = {}
+        self._vast_rows = {}
         self._fallback_profiles = {}
         self._availability_inflight = False
         self._apply_model_catalog(force=True)
@@ -1275,7 +1373,16 @@ class FastDeployScreen(CopyEnabledScreen):
         self._availability_request_id += 1
 
     def _update_model_detail(self, model: QuickDeployModel) -> None:
-        self.query_one("#fast-deploy-detail", Static).update(_model_detail(model))
+        detail = _model_detail(model)
+        if self._snapshot is not None:
+            comparisons = tuple(row for row in vast_offers_for_model(model, self._snapshot.vast_offers)
+                                if self._gpu_filter in {"any", row.gpu_label})
+            if comparisons:
+                price = comparisons[0].costs.total_per_hour_usd
+                deploy_price, estimate = _model_cheapest_price(model, self._snapshot, self._gpu_filter)
+                detail += f"\n[dim]Deploy from {_format_price(deploy_price, estimate=estimate)} · Vast from {_format_price(price, estimate=True)} incl. disk; traffic extra.[/dim]"
+                detail += "\n[dim]Vast single-GPU deployments use a local SSH endpoint; multi-GPU offers are comparisons.[/dim]"
+        self.query_one("#fast-deploy-detail", Static).update(detail)
 
     def _update_infra_detail(self, row: _InfraRow) -> None:
         self.query_one("#fast-deploy-detail", Static).update(_infra_detail(row))

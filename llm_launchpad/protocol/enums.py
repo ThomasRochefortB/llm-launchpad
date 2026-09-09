@@ -67,13 +67,22 @@ class ComputeProvider(str, Enum):
 
     MODAL = "modal"
     PRIME = "prime"
+    VAST = "vast"
 
     @property
     def display_name(self) -> str:
         return {
             ComputeProvider.MODAL: "Modal",
             ComputeProvider.PRIME: "Prime Intellect",
+            ComputeProvider.VAST: "Vast.ai",
         }[self]
+
+
+class OfferProvider(str, Enum):
+    """Marketplaces with offer discovery, independently of deployment support."""
+
+    PRIME = "prime"
+    VAST = "vast"
 
 
 class BillingModel(str, Enum):

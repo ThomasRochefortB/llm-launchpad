@@ -48,6 +48,7 @@ class SetupRequiredScreen(CopyEnabledScreen):
                     id="setup-required-hint",
                 )
                 yield Static("", id="setup-required-feedback")
+                yield Button("Vast.ai rentals (beta)", id="setup-vast-preview-btn")
                 with Horizontal(id="setup-required-actions"):
                     yield Button("Re-check", id="setup-recheck-btn", variant="primary")
                     yield Button("Copy modal setup", id="setup-copy-modal-btn")
@@ -67,6 +68,10 @@ class SetupRequiredScreen(CopyEnabledScreen):
             self._copy_command(_PRIME_COMMAND)
         elif event.button.id == "setup-quit-btn":
             await self.action_quit_app()
+        elif event.button.id == "setup-vast-preview-btn":
+            from .vast import VastPreviewScreen
+
+            self.app.push_screen(VastPreviewScreen())
 
     def _copy_command(self, command: str) -> None:
         self.app.copy_to_clipboard(command)

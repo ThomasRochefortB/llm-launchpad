@@ -20,7 +20,7 @@ from llm_launchpad.core.quick_deploy import (
 )
 from llm_launchpad.core.prime_backend import preferred_prime_offer_image
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider
-from llm_launchpad.protocol.models import CatalogExclusion, ComputeOffer, InferencePlan
+from llm_launchpad.protocol.models import CatalogExclusion, ComputeAvailabilitySnapshot, ComputeOffer, InferencePlan
 from llm_launchpad.tui.app import TuiApp
 from llm_launchpad.tui.screens.fast_deploy import (
     FastDeployAvailabilityFailed,
@@ -369,7 +369,7 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_prime_only_no_fit_does_not_route_catalog_fallback_to_modal(self) -> None:
         model = _model((_profile("too-large", required_vram_gb=200.0),))
-        snapshot = SimpleNamespace(
+        snapshot = ComputeAvailabilitySnapshot(
             configurations=(),
             errors=(),
             providers=(ComputeProvider.PRIME,),

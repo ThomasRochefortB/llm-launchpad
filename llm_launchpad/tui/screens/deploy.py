@@ -46,13 +46,18 @@ from ...core.prime_backend import (
     preferred_prime_offer_image,
 )
 from ...core.reasoning_profiles import discover_reasoning_capabilities
+from ...core.vast_backend import VastBackend
 from ...protocol.enums import BackendType, ComputeProvider
 from ...protocol.models import (
     ComputeOffer,
     DeploymentConfig,
     PrimeProviderOptions,
     StorageSnapshot,
+    VastOffer,
+    VastOfferQuery,
+    VastProviderOptions,
 )
+from ..format import clip
 from ..gpu_config import (
     DEFAULT_GPU_COUNT,
     DEFAULT_GPU_TYPE,
@@ -94,6 +99,55 @@ _RANKING_SUBTITLES: dict[str, dict[str, str]] = {
 def _ranking_subtitle(backend: BackendType, mode: str) -> str:
     subtitles = _RANKING_SUBTITLES.get(backend) or {}
     return subtitles.get(mode) or "models cached in your storage volumes"
+
+
+_GPU_PANEL_SUBTITLES: dict[str, dict[ComputeProvider, str]] = {
+    BackendType.LLAMACPP: {
+        ComputeProvider.MODAL: "Select a Modal GPU shape.",
+        ComputeProvider.PRIME: "GPU shape and count come from the Prime offer bound above.",
+        ComputeProvider.VAST: "GPU shape comes from the Vast.ai rental bound above; rentals are single-GPU.",
+    },
+    BackendType.VLLM: {
+        ComputeProvider.MODAL: (
+            "Choose deployment GPUs and in-replica tensor sharding. "
+            "Base Modal hourly price per GPU is shown when available."
+        ),
+        ComputeProvider.PRIME: (
+            "GPU shape and count come from the Prime offer bound above; "
+            "tensor sharding follows its GPU count."
+        ),
+        ComputeProvider.VAST: (
+            "GPU shape comes from the Vast.ai rental bound above; rentals are "
+            "single-GPU, so tensor sharding stays at 1."
+        ),
+    },
+}
+
+
+def _gpu_panel_subtitle(backend: BackendType, provider: ComputeProvider) -> str:
+    """Return GPU-panel help text that matches the selected compute provider."""
+    by_provider = _GPU_PANEL_SUBTITLES[backend]
+    return by_provider.get(provider, by_provider[ComputeProvider.MODAL])
+
+
+def _set_option_list(option_list: OptionList, options: list[Option]) -> None:
+    """Replace an option list's contents, hiding it while it has none.
+
+    An empty ``OptionList`` still paints its border, so a picker that has not
+    loaded yet reads as a broken empty box and costs three rows of a short
+    terminal. Hiding it through the shared ``hidden`` class also keeps it out
+    of keyboard navigation until it holds something selectable.
+    """
+    option_list.set_options(options)
+    option_list.set_class(not options, "hidden")
+
+
+_MODEL_COLUMN_WIDTH = 38
+
+
+def _model_row(repo_id: str, detail: str) -> str:
+    """Render a model picker row with a stable repo-id column."""
+    return f"  {clip(repo_id, _MODEL_COLUMN_WIDTH):<{_MODEL_COLUMN_WIDTH}} {detail}"
 
 
 def _format_hourly_cost(value: float | None) -> str:
@@ -146,6 +200,22 @@ class PrimeOffersLoaded(Message):
 
 class PrimeOffersFailed(Message):
     """Prime availability fetch failed."""
+
+    def __init__(self, error: str) -> None:
+        super().__init__()
+        self.error = error
+
+
+class VastOffersLoaded(Message):
+    """Vast.ai availability was fetched successfully."""
+
+    def __init__(self, offers: list[VastOffer]) -> None:
+        super().__init__()
+        self.offers = offers
+
+
+class VastOffersFailed(Message):
+    """Vast.ai availability fetch failed."""
 
     def __init__(self, error: str) -> None:
         super().__init__()
@@ -283,16 +353,24 @@ def _prime_offer_options(
 ) -> list[tuple[str, str]]:
     options: list[tuple[str, str]] = []
     for offer in offers:
-        location = offer.country or offer.region or offer.data_center or "-"
+        location = offer.country or offer.region or offer.data_center or "unknown location"
         price = (
             f"${offer.price_per_hour:.3f}/hr"
             if offer.price_per_hour is not None
             else "price n/a"
         )
+        memory = (
+            f" · {offer.gpu_memory_gb:.0f} GB VRAM"
+            if offer.gpu_memory_gb is not None
+            else ""
+        )
+        # Price leads because that is what these rows are compared on; the
+        # opaque offer id is last and labelled, so it reads as a reference
+        # rather than as the name of the thing being chosen.
         options.append(
             (
-                f"{offer.id} · {offer.gpu_count}x {offer.gpu_type} · "
-                f"{location} · {price}",
+                f"{price} · {offer.gpu_count}x {offer.gpu_type}{memory} · "
+                f"in {location} · offer {clip(offer.id, 8)}",
                 offer.id,
             )
         )
@@ -304,7 +382,9 @@ def _prime_offer_status(
     required_vram_gb: float | None,
     backend: BackendType = BackendType.LLAMACPP,
 ) -> str:
-    strategy = f"portable {preferred_prime_offer_image(backend)}"
+    # The provider's image identifier ("ubuntu_22_cuda_12") is an internal
+    # detail; the user is choosing capacity, not a base image.
+    strategy = "secure on-demand"
     if required_vram_gb is None:
         if offer_count:
             return (
@@ -313,8 +393,7 @@ def _prime_offer_status(
                 "choose a model to narrow them.[/dim]"
             )
         return (
-            f"[yellow]No secure on-demand {strategy} GPU offers are "
-            "currently available.[/yellow]"
+            f"[yellow]No {strategy} GPU offers are currently available.[/yellow]"
         )
     required_with_headroom = required_vram_gb * PRIME_VRAM_HEADROOM_FACTOR
     if offer_count:
@@ -325,6 +404,68 @@ def _prime_offer_status(
     return (
         f"[yellow]No live {strategy} GPU offer has enough memory for this model's "
         f"~{required_with_headroom:.1f} GB requirement.[/yellow]"
+    )
+
+
+# The Vast deployment path rents exactly one GPU and re-quotes the offer at
+# deploy time, so the picker must not present shapes it cannot deliver.
+VAST_SINGLE_GPU_COUNT = 1
+VAST_VRAM_HEADROOM_FACTOR = 1.05
+DEFAULT_VAST_DISK_GB = 100
+
+
+def _compatible_vast_offers(
+    offers: list[VastOffer],
+    required_vram_gb: float | None,
+) -> list[VastOffer]:
+    """Return priced single-GPU rentals that fit one model requirement."""
+    required = (required_vram_gb or 0.0) * VAST_VRAM_HEADROOM_FACTOR
+    fitting = [
+        offer
+        for offer in offers
+        if offer.gpu_count == VAST_SINGLE_GPU_COUNT
+        and offer.costs.total_per_hour_usd is not None
+        and offer.gpu_memory_gib >= required
+    ]
+    return sorted(fitting, key=lambda offer: offer.costs.total_per_hour_usd or 0.0)
+
+
+def _vast_offer_options(offers: list[VastOffer]) -> list[tuple[str, str]]:
+    options: list[tuple[str, str]] = []
+    for offer in offers:
+        price = offer.costs.total_per_hour_usd
+        price_text = f"${price:.3f}/hr" if price is not None else "price n/a"
+        location = offer.location or "unknown location"
+        options.append(
+            (
+                f"{price_text} incl. disk · 1x {offer.gpu_type} · "
+                f"{offer.gpu_memory_gb:.0f} GB VRAM · in {location} · "
+                f"offer {clip(offer.id, 8)}",
+                offer.id,
+            )
+        )
+    return options
+
+
+def _vast_offer_status(offer_count: int, required_vram_gb: float | None) -> str:
+    if required_vram_gb is None:
+        if offer_count:
+            return (
+                f"[dim]{offer_count} live single-GPU rentals. Prices include disk; "
+                "network traffic is billed separately. Choose a model to narrow "
+                "them.[/dim]"
+            )
+        return "[yellow]No live single-GPU Vast.ai rentals are currently available.[/yellow]"
+    required_with_headroom = required_vram_gb * VAST_VRAM_HEADROOM_FACTOR
+    if offer_count:
+        return (
+            f"[dim]{offer_count} live single-GPU rentals fit this model's "
+            f"~{required_with_headroom:.1f} GB requirement. Prices include disk; "
+            "network traffic is billed separately.[/dim]"
+        )
+    return (
+        "[yellow]No live single-GPU Vast.ai rental has enough memory for this "
+        f"model's ~{required_with_headroom:.1f} GB requirement.[/yellow]"
     )
 
 
@@ -371,12 +512,49 @@ class _CostPreviewMixin:
     _prime_offers: dict[str, ComputeOffer]
     _selected_prime_offer_id: str | None
     _selected_gpu_type: str | None
+    _vast_offers: dict[str, VastOffer]
+    _selected_vast_offer_id: str | None
 
     def _current_gpu_hourly_price(self) -> float | None:
         if self._provider == ComputeProvider.PRIME:
             offer = self._prime_offers.get(self._selected_prime_offer_id or "")
             return offer.price_per_hour if offer is not None else None
+        if self._provider == ComputeProvider.VAST:
+            vast_offer = self._vast_offers.get(self._selected_vast_offer_id or "")
+            return vast_offer.costs.total_per_hour_usd if vast_offer is not None else None
         return self._gpu_price_by_value.get((self._selected_gpu_type or "").strip())
+
+    def _build_vast_provider_options(self, disk_field_id: str) -> VastProviderOptions | None:
+        """Validate the bound Vast rental and approve its quoted hourly total.
+
+        The deploy path re-quotes the offer and refuses anything above the
+        approved price, so the cap is exactly what the picker showed: the user
+        approves the number they read, not a padded one.
+        """
+        from textual.widgets import Input
+
+        offer = self._vast_offers.get(self._selected_vast_offer_id or "")
+        if offer is None:
+            self.app.notify("Select a live Vast.ai rental.", severity="error", timeout=5)
+            return None
+        price = offer.costs.total_per_hour_usd
+        if price is None or price <= 0:
+            self.app.notify(
+                "The selected Vast.ai rental has no quoted hourly price. Refresh rentals.",
+                severity="error",
+                timeout=6,
+            )
+            return None
+        disk_gb = positive_int(self.query_one(disk_field_id, Input).value)
+        if disk_gb is None:
+            self.app.notify("Vast disk size must be an integer >= 1 GB.", severity="error", timeout=5)
+            return None
+        return VastProviderOptions(
+            offer_id=offer.id,
+            disk_gb=disk_gb,
+            max_hourly_cost_usd=price,
+            machine_id=offer.machine_id,
+        )
 
     def _update_cost_preview(self, preview_id: str) -> None:
         from textual.widgets import Static
@@ -407,8 +585,18 @@ class BackendSelectScreen(CopyEnabledScreen):
             yield Static("[bold #7bf168]Advanced deploy[/]  [dim]Step 1: Choose serving engine[/dim]")
             yield Static("")
             yield OptionList(
-                Option("  llama.cpp (GGUF) ( Recommended )", id="llamacpp"),
-                Option("  vLLM", id="vllm"),
+                Option(
+                    "  [bold]llama.cpp (GGUF)[/bold]  [dim]· recommended[/dim]\n"
+                    "  [dim]Quantized single-file models. Smaller GPUs, faster cold starts,\n"
+                    "  one request at a time.[/dim]",
+                    id="llamacpp",
+                ),
+                Option(
+                    "  [bold]vLLM[/bold]\n"
+                    "  [dim]Full-precision Hugging Face models. Higher throughput under\n"
+                    "  concurrency, tensor parallelism across GPUs.[/dim]",
+                    id="vllm",
+                ),
                 id="backend-list",
             )
         yield Footer()
@@ -440,6 +628,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         Binding("ctrl+s", "open_storage", "Storage", show=True),
         Binding("p", "predownload_highlighted", "Pre-download", show=True),
     ]
+    _MODEL_LIST_ID = "llama-model-list"
     OPTION_LIST_IDS = ("llama-rank-mode", "llama-model-list", "llama-quant-list")
     NAVIGATION_ORDER = (
         "llama-rank-mode",
@@ -449,11 +638,21 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         "llama-quant-list",
         "provider-llama",
         "prime-offer-llama",
+        "vast-offer-llama",
         "gpu-type-llama",
         "gpu-count-llama",
+        "vision-mode",
+        "projector-repo",
+        "projector-revision",
+        "projector-file",
         "toggle-advanced-llama",
         "warmup",
         "revision",
+        "prime-auto-disk-llama",
+        "prime-disk-id-llama",
+        "prime-insecure-http-llama",
+        "prime-keep-failed-llama",
+        "vast-disk-llama",
         "server-args",
         "host-input",
         "port-input",
@@ -495,7 +694,11 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
 
             yield Static("Compute provider", classes="form-label")
             yield Select(
-                options=[("Modal", "modal"), ("Prime Intellect", "prime")],
+                options=[
+                    ("Modal", "modal"),
+                    ("Prime Intellect", "prime"),
+                    ("Vast.ai", "vast"),
+                ],
                 value="modal",
                 allow_blank=False,
                 id="provider-llama",
@@ -512,12 +715,25 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
                 id="prime-offer-status-llama",
                 classes="prime-only",
             )
+            yield Static("Vast.ai rental", classes="form-label vast-only")
+            yield Select(
+                options=[],
+                prompt="Select a live Vast.ai rental",
+                id="vast-offer-llama",
+                classes="vast-only",
+            )
+            yield Static(
+                "[dim]Vast.ai rentals are single-GPU and priced including disk.[/dim]",
+                id="vast-offer-status-llama",
+                classes="vast-only",
+            )
 
             # Options
             with Vertical(classes="gpu-config-panel"):
                 yield Static("GPU configuration", classes="form-section-title")
                 yield Static(
-                    "Select a Modal GPU shape or bind an exact live Prime offer.",
+                    "Select a Modal GPU shape.",
+                    id="gpu-config-subtitle-llama",
                     classes="form-section-subtitle",
                 )
                 with Horizontal(id="gpu-config-row-llama", classes="gpu-config-main-row"):
@@ -571,7 +787,15 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
                 default=False,
                 classes="llama-advanced prime-only",
             )
-            yield Static("[bold]Runtime[/bold]", classes="llama-advanced")
+            yield FormField(
+                "Vast disk size (GB)",
+                "vast-disk-llama",
+                default=str(DEFAULT_VAST_DISK_GB),
+                input_type="integer",
+                hint="Rented alongside the GPU and included in the quoted price",
+                classes="llama-advanced vast-only",
+            )
+            yield Static("Runtime", classes="form-group-heading llama-advanced")
             yield FormField(
                 "Server args",
                 "server-args",
@@ -599,7 +823,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
             )
 
             yield Static("")
-            yield Static("[bold]Naming[/bold]", classes="llama-advanced")
+            yield Static("Naming", classes="form-group-heading llama-advanced")
             yield FormField(
                 "Instance name (optional)",
                 "instance-name-llama",
@@ -638,13 +862,26 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         self._updating_quant_input = False
         self._quant_touched = False
         self._selected_gpu_type = DEFAULT_GPU_TYPE
+        # Binding a Prime offer overwrites the GPU dropdown with that offer's
+        # GPU. Remember the Modal choice so switching back does not leave a
+        # Prime-only GPU name selected for a Modal deploy.
+        self._last_modal_gpu_type = DEFAULT_GPU_TYPE
+        self._modal_gpu_values: set[str] = {DEFAULT_GPU_TYPE}
         self._provider = ComputeProvider.MODAL
         self._prime_offers: dict[str, ComputeOffer] = {}
         self._selected_prime_offer_id: str | None = None
+        self._vast_offers: dict[str, VastOffer] = {}
+        self._selected_vast_offer_id: str | None = None
         self._gpu_price_by_value: dict[str, float] = {}
+        self._rank_mode_touched = False
+        self._focus_model_list_when_loaded = False
+        for list_id in ("#llama-model-list", "#llama-quant-list"):
+            self.query_one(list_id, OptionList).add_class("hidden")
         for widget in self.query(".llama-advanced"):
             widget.add_class("hidden")
         for widget in self.query(".prime-only"):
+            widget.add_class("hidden")
+        for widget in self.query(".vast-only"):
             widget.add_class("hidden")
         rank_mode_list = self.query_one("#llama-rank-mode", OptionList)
         if rank_mode_list.option_count > 0:
@@ -662,12 +899,13 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
             selected_mode = self._resolve_rank_mode(event.option.id or "")
             if selected_mode is None:
                 return
+            self._rank_mode_touched = True
             if selected_mode != self._rank_mode:
                 self._rank_mode = selected_mode
                 self._set_ranking_title()
                 self._ranked_models = []
                 self._set_model_status("[dim]Loading model suggestions...[/dim]")
-                self.query_one("#llama-model-list", OptionList).set_options([])
+                _set_option_list(self.query_one("#llama-model-list", OptionList), [])
                 if self._rank_mode == "cached":
                     self._set_model_status("[dim]Loading cached models from storage...[/dim]")
                     if self._has_cached_snapshot:
@@ -675,6 +913,10 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
                     self._refresh_cached_models_from_storage()
                 else:
                     self.app.begin_fetch_llamacpp_models(self._rank_mode, self)  # type: ignore[attr-defined]
+            model_list = self.query_one("#llama-model-list", OptionList)
+            # The picker is hidden until it has rows, so a still-loading list
+            # cannot take focus yet. Hand it over once the rows land.
+            self._focus_model_list_when_loaded = model_list.option_count == 0
             _advance_deploy_focus(self, self.NAVIGATION_ORDER)
             return
 
@@ -724,9 +966,30 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
             self._sync_prime_visibility()
             if self._provider == ComputeProvider.PRIME and not self._prime_offers:
                 self._refresh_prime_offers()
+            elif self._provider == ComputeProvider.VAST:
+                if self._vast_offers:
+                    self._refresh_vast_offer_options()
+                else:
+                    self._refresh_vast_offers()
             elif self._provider == ComputeProvider.MODAL:
+                self._selected_gpu_type = self._last_modal_gpu_type
+                self._selected_prime_offer_id = None
+                self._selected_vast_offer_id = None
                 self._refresh_gpu_types()
             self._refresh_app_preview()
+            self._update_cost_preview("llama-cost-preview")
+            return
+        if event.select.id == "vast-offer-llama":
+            if not isinstance(event.value, str):
+                return
+            self._selected_vast_offer_id = event.value
+            offer = self._vast_offers.get(event.value)
+            if offer is not None:
+                self._selected_gpu_type = offer.gpu_type
+                gpu_type_select = self.query_one("#gpu-type-llama", Select)
+                gpu_type_select.set_options([(offer.gpu_type, offer.gpu_type)])
+                gpu_type_select.value = offer.gpu_type
+                self.query_one("#gpu-count-llama", Input).value = str(VAST_SINGLE_GPU_COUNT)
             self._update_cost_preview("llama-cost-preview")
             return
         if event.select.id == "prime-offer-llama":
@@ -747,15 +1010,30 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
             return
         if isinstance(event.value, str) and event.value.strip():
             self._selected_gpu_type = normalize_gpu_type(event.value)
+            if self._selected_gpu_type in self._modal_gpu_values:
+                self._last_modal_gpu_type = self._selected_gpu_type
         self._update_cost_preview("llama-cost-preview")
 
     def _sync_prime_visibility(self) -> None:
+        self.query_one("#gpu-config-subtitle-llama", Static).update(
+            _gpu_panel_subtitle(BackendType.LLAMACPP, self._provider)
+        )
+        # A bound Prime offer dictates the GPU shape and count, and the deploy
+        # path overwrites whatever these hold. Leaving them editable invites
+        # changes that are silently discarded.
+        offer_bound = self._provider in (ComputeProvider.PRIME, ComputeProvider.VAST)
+        for field_id in ("#gpu-type-llama", "#gpu-count-llama",):
+            self.query_one(field_id).disabled = offer_bound
         advanced_visible = not self.query_one("#warmup").has_class("hidden")
-        for widget in self.query(".prime-only"):
-            hide = self._provider != ComputeProvider.PRIME
-            if widget.has_class("llama-advanced") and not advanced_visible:
-                hide = True
-            widget.set_class(hide, "hidden")
+        for provider_class, provider in (
+            (".prime-only", ComputeProvider.PRIME),
+            (".vast-only", ComputeProvider.VAST),
+        ):
+            for widget in self.query(provider_class):
+                hide = self._provider != provider
+                if widget.has_class("llama-advanced") and not advanced_visible:
+                    hide = True
+                widget.set_class(hide, "hidden")
 
     def _refresh_prime_offers(self) -> None:
         self.query_one("#prime-offer-status-llama", Static).update(
@@ -815,6 +1093,53 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
             f"[red]Could not load Prime offers:[/red] {escape(message.error)}"
         )
 
+    def _refresh_vast_offers(self) -> None:
+        self.query_one("#vast-offer-status-llama", Static).update(
+            "[dim]Loading Vast.ai rentals...[/dim]"
+        )
+        self.run_worker(
+            self._run_fetch_vast_offers,
+            name="llamacpp-fetch-vast-offers",
+            thread=True,
+        )
+
+    def _run_fetch_vast_offers(self) -> None:
+        try:
+            offers = VastBackend().list_offers(
+                VastOfferQuery(gpu_count=VAST_SINGLE_GPU_COUNT, disk_gb=self._vast_disk_gb())
+            )
+        except Exception as exc:
+            self.post_message(VastOffersFailed(str(exc)))
+            return
+        self.post_message(VastOffersLoaded(offers))
+
+    def on_vast_offers_loaded(self, message: VastOffersLoaded) -> None:
+        self._vast_offers = {offer.id: offer for offer in message.offers}
+        self._refresh_vast_offer_options()
+
+    def on_vast_offers_failed(self, message: VastOffersFailed) -> None:
+        self.query_one("#vast-offer-status-llama", Static).update(
+            f"[red]Could not load Vast.ai rentals:[/red] {escape(message.error)}"
+        )
+
+    def _vast_disk_gb(self) -> int:
+        return positive_int(self.query_one("#vast-disk-llama", Input).value) or DEFAULT_VAST_DISK_GB
+
+    def _refresh_vast_offer_options(self) -> None:
+        required_vram_gb = self._current_llamacpp_required_vram()
+        offers = _compatible_vast_offers(list(self._vast_offers.values()), required_vram_gb)
+        options = _vast_offer_options(offers)
+        selector = self.query_one("#vast-offer-llama", Select)
+        selector.set_options(options)
+        if options:
+            self._selected_vast_offer_id = options[0][1]
+            selector.value = options[0][1]
+        else:
+            self._selected_vast_offer_id = None
+        self.query_one("#vast-offer-status-llama", Static).update(
+            _vast_offer_status(len(options), required_vram_gb)
+        )
+
     def _refresh_gpu_types(self) -> None:
         self.run_worker(
             lambda: self._run_fetch_gpu_types(),
@@ -837,6 +1162,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         dropdown = self.query_one("#gpu-type-llama", Select)
         options = build_gpu_type_options(message.gpu_types)
         option_values = [value for _, value in options]
+        self._modal_gpu_values = set(option_values)
         if self._selected_gpu_type and self._selected_gpu_type not in option_values:
             options.insert(0, (self._selected_gpu_type, self._selected_gpu_type))
             option_values.insert(0, self._selected_gpu_type)
@@ -867,13 +1193,14 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         for idx, model in enumerate(message.models):
             downloads = f"{model.downloads:,}" if model.downloads is not None else "-"
             likes = f"{model.likes:,}" if model.likes is not None else "-"
-            label = f"  {model.repo_id:<38} downloads={downloads:<10} likes={likes}"
+            label = _model_row(model.repo_id, f"downloads={downloads:<10} likes={likes}")
             options.append(Option(label, id=f"model-{idx}"))
-        model_list.set_options(options)
+        _set_option_list(model_list, options)
 
         if message.models:
             mode_label = "Most downloaded" if self._rank_mode == "downloads" else "Trending"
             self._set_model_status(f"[dim]{mode_label} models loaded. Select one to prefill repo-id.[/dim]")
+            self._focus_model_list_if_pending()
         else:
             self._set_model_status("[yellow]No matching GGUF text-generation models found.[/yellow]")
             self._repo_to_quants = {}
@@ -889,7 +1216,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         if self._rank_mode != "cached":
             return
         self._ranked_models = []
-        self.query_one("#llama-model-list", OptionList).set_options([])
+        _set_option_list(self.query_one("#llama-model-list", OptionList), [])
         self._set_model_status(f"[yellow]Could not load cached models:[/yellow] {escape(message.error)}")
 
     def on_llama_cpp_models_failed(self, message: LlamaCppModelsFailed) -> None:
@@ -897,7 +1224,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
             return
         self._ranked_models = []
         self._repo_to_quants = {}
-        self.query_one("#llama-model-list", OptionList).set_options([])
+        _set_option_list(self.query_one("#llama-model-list", OptionList), [])
         self._set_model_status(
             f"[yellow]Could not load model suggestions:[/yellow] {escape(message.error)} [dim](manual input still works)[/dim]"
         )
@@ -955,7 +1282,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
             return
         if (message.revision or "").strip() != current_revision:
             return
-        self.query_one("#llama-quant-list", OptionList).set_options([])
+        _set_option_list(self.query_one("#llama-quant-list", OptionList), [])
         self._set_quant_status(
             f"[yellow]Could not load quantizations:[/yellow] {escape(message.error)} [dim](manual quant still works)[/dim]"
         )
@@ -985,6 +1312,14 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
             provider=self._provider,
         )
         config.repo_id = self.query_one("#repo-id", Input).value.strip() or None
+        if not config.repo_id:
+            self.app.notify(
+                "Enter a Hugging Face repo-id before deploying.",
+                severity="error",
+                timeout=5,
+            )
+            self.query_one("#repo-id", Input).focus()
+            return
         config.quant = self.query_one("#quant", Input).value.strip() or None
         config.required_vram_gb = self._current_llamacpp_required_vram()
         rev = self.query_one("#revision", Input).value.strip()
@@ -1041,6 +1376,14 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
                 ).value,
                 auto_disk=self.query_one("#prime-auto-disk-llama", Switch).value,
             )
+        elif self._provider == ComputeProvider.VAST:
+            vast_options = self._build_vast_provider_options("#vast-disk-llama")
+            if vast_options is None:
+                return
+            config.provider_options = vast_options
+            vast_offer = self._vast_offers[vast_options.offer_id]
+            config.gpu_type = vast_offer.gpu_type
+            config.gpu_count = VAST_SINGLE_GPU_COUNT
 
         # Advanced values are always read: collapsing the section must never
         # silently discard options the user entered before collapsing it.
@@ -1087,6 +1430,18 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
             return
         self.app.begin_deploy(config)  # type: ignore[attr-defined]
 
+    def _focus_model_list_if_pending(self) -> None:
+        """Give the model picker focus once a requested ranking has loaded."""
+        if not self._focus_model_list_when_loaded:
+            return
+        model_list = self.query_one(f"#{self._MODEL_LIST_ID}", OptionList)
+        if model_list.option_count == 0:
+            return
+        self._focus_model_list_when_loaded = False
+        model_list.focus()
+        if model_list.highlighted is None:
+            model_list.highlighted = 0
+
     def _set_model_status(self, text: str) -> None:
         self.query_one("#llama-model-status", Static).update(text)
 
@@ -1125,13 +1480,33 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
             quant_preview = ", ".join(model.quantizations[:3]) if model.quantizations else "-"
             if len(model.quantizations) > 3:
                 quant_preview = f"{quant_preview}, ..."
-            label = f"  {model.repo_id:<38} quants={quant_preview}"
+            label = _model_row(model.repo_id, f"quants={quant_preview}")
             options.append(Option(label, id=f"model-{idx}"))
-        model_list.set_options(options)
+        _set_option_list(model_list, options)
         if self._ranked_models:
             self._set_model_status("[dim]Cached models loaded. Select one to prefill repo-id.[/dim]")
+            self._focus_model_list_if_pending()
+        elif self._fall_back_to_downloads_ranking():
+            return
         else:
             self._set_model_status("[yellow]No cached llama.cpp models found in storage.[/yellow]")
+
+    def _fall_back_to_downloads_ranking(self) -> bool:
+        """Switch an empty default "Cached in storage" view to "Most downloaded".
+
+        A first-time user has nothing cached, so the default ranking mode opens
+        the form on an empty picker and a warning. Only the automatic default
+        is replaced: once the mode has been chosen by hand it is left alone.
+        """
+        if self._rank_mode_touched or self._rank_mode != "cached" or not self._has_cached_snapshot:
+            return False
+        self._rank_mode = "downloads"
+        rank_mode_list = self.query_one("#llama-rank-mode", OptionList)
+        rank_mode_list.highlighted = 1
+        self._set_ranking_title()
+        self._set_model_status("[dim]Nothing cached yet. Loading popular models...[/dim]")
+        self.app.begin_fetch_llamacpp_models("downloads", self)  # type: ignore[attr-defined]
+        return True
 
     def _apply_ranked_model_selection(self, option_id: str) -> None:
         selected = _model_from_option_id(option_id, self._ranked_models)
@@ -1143,7 +1518,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         cached_vram = self._repo_to_quant_vram.get(repo_key, {})
         if selected.quantizations:
             self._apply_quantizations(
-                list(selected.quantizations),
+                self._display_quantizations_for_repo(repo_key, list(selected.quantizations)),
                 auto_select=True,
                 vram_gb_by_quant=cached_vram,
             )
@@ -1159,23 +1534,28 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         return _model_from_option_id(option_id or "", self._ranked_models)
 
     def _display_quantizations_for_repo(self, repo_key: str, quantizations: list[str]) -> list[str]:
-        if self._rank_mode != "cached":
-            return list(quantizations)
-        cached_quants = self._cached_repo_to_quants.get(repo_key)
-        if not cached_quants:
-            return list(quantizations)
-        allowed = {quant.strip().upper() for quant in cached_quants}
-        filtered = [quant for quant in quantizations if quant.strip().upper() in allowed]
-        if filtered:
-            return filtered
-        return list(cached_quants)
+        """Return every known quantization for a repo, cached or not.
+
+        Which quantizations a repo publishes has nothing to do with which model
+        list is being browsed, so the ranking mode must not narrow this. What
+        is already in storage is shown as a per-row marker instead.
+        """
+        cached_quants = self._cached_repo_to_quants.get(repo_key) or ()
+        merged = list(quantizations)
+        seen = {quant.strip().upper() for quant in merged}
+        merged.extend(quant for quant in cached_quants if quant.strip().upper() not in seen)
+        return merged
+
+    def _cached_quants_for_current_repo(self) -> set[str]:
+        repo_key = self.query_one("#repo-id", Input).value.strip().casefold()
+        return {quant.strip().upper() for quant in self._cached_repo_to_quants.get(repo_key, ())}
 
     def _lookup_quantizations_for_current_repo(self, force_refresh: bool = False) -> None:
         self._cancel_quantization_lookup()
         repo_id = self.query_one("#repo-id", Input).value.strip()
         revision = self.query_one("#revision", Input).value.strip()
         if not repo_id:
-            self.query_one("#llama-quant-list", OptionList).set_options([])
+            _set_option_list(self.query_one("#llama-quant-list", OptionList), [])
             self._set_quant_status("[dim]Quantizations: enter repo-id to detect GGUF variants[/dim]")
             self._last_quant_lookup = None
             return
@@ -1243,11 +1623,14 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         else:
             sorted_quantizations = list(quantizations)
         quant_list = self.query_one("#llama-quant-list", OptionList)
-        options = [
-            Option(f"  {_format_quant_with_vram(quant, normalized_vram)}", id=f"quant-{quant}")
-            for quant in sorted_quantizations
-        ]
-        quant_list.set_options(options)
+        cached = self._cached_quants_for_current_repo()
+        options = []
+        for quant in sorted_quantizations:
+            label = f"  {_format_quant_with_vram(quant, normalized_vram)}"
+            if quant.strip().upper() in cached:
+                label = f"{label}  [dim]· in storage[/dim]"
+            options.append(Option(label, id=f"quant-{quant}"))
+        _set_option_list(quant_list, options)
         if quantizations:
             self._set_quant_status("[dim]Quantizations:[/dim]")
         else:
@@ -1319,18 +1702,28 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
         Binding("ctrl+s", "open_storage", "Storage", show=True),
         Binding("p", "predownload_highlighted", "Pre-download", show=True),
     ]
+    _MODEL_LIST_ID = "vllm-model-list"
     OPTION_LIST_IDS = ("vllm-rank-mode", "vllm-model-list")
     NAVIGATION_ORDER = (
         "vllm-rank-mode",
         "vllm-model-list",
         "model-name",
+        "provider-vllm",
+        "prime-offer-vllm",
+        "vast-offer-vllm",
         "gpu-type-vllm",
         "gpu-count-vllm",
         "n-gpu",
-        "provider-vllm",
-        "prime-offer-vllm",
+        "vision-mode",
+        "image-limit",
+        "mm-processor-kwargs",
         "toggle-advanced-vllm",
         "model-revision",
+        "prime-auto-disk",
+        "prime-disk-id",
+        "prime-insecure-http",
+        "prime-keep-failed",
+        "vast-disk-vllm",
         "smoke-only-vllm",
         "warmup-vllm",
         "fast-boot",
@@ -1371,7 +1764,11 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
             yield Static("[dim]Estimated VRAM: enter model name to compute[/dim]", id="vllm-vram-status")
             yield Static("Compute provider", classes="form-label")
             yield Select(
-                options=[("Modal", "modal"), ("Prime Intellect", "prime")],
+                options=[
+                    ("Modal", "modal"),
+                    ("Prime Intellect", "prime"),
+                    ("Vast.ai", "vast"),
+                ],
                 value="modal",
                 allow_blank=False,
                 id="provider-vllm",
@@ -1388,10 +1785,24 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
                 id="prime-offer-status",
                 classes="prime-only",
             )
+            yield Static("Vast.ai rental", classes="form-label vast-only")
+            yield Select(
+                options=[],
+                prompt="Select a live Vast.ai rental",
+                id="vast-offer-vllm",
+                classes="vast-only",
+            )
+            yield Static(
+                "[dim]Vast.ai rentals are single-GPU and priced including disk.[/dim]",
+                id="vast-offer-status-vllm",
+                classes="vast-only",
+            )
             with Vertical(classes="gpu-config-panel"):
                 yield Static("GPU configuration", classes="form-section-title")
                 yield Static(
-                    "Choose deployment GPUs and in-replica tensor sharding. Base Modal hourly price per GPU is shown when available.",
+                    "Choose deployment GPUs and in-replica tensor sharding. "
+                    "Base Modal hourly price per GPU is shown when available.",
+                    id="gpu-config-subtitle-vllm",
                     classes="form-section-subtitle",
                 )
                 with Horizontal(id="gpu-config-row-vllm", classes="gpu-config-main-row"):
@@ -1404,7 +1815,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
                             id="gpu-type-vllm",
                         )
                     with Vertical(id="gpu-count-group-vllm"):
-                        yield Static("GPU count", classes="form-label")
+                        yield Static("GPUs attached", classes="form-label")
                         yield Input(
                             value=str(DEFAULT_GPU_COUNT),
                             placeholder="1",
@@ -1415,7 +1826,9 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
                     "Tensor parallel size",
                     "n-gpu",
                     default="1",
-                    hint="vLLM --tensor-parallel-size (separate from GPU count)",
+                    input_type="integer",
+                    hint="Shards one model across the attached GPUs "
+                    "(vLLM --tensor-parallel-size)",
                     classes="gpu-config-tensor-field",
                 )
                 yield Static("", id="vllm-cost-preview")
@@ -1451,6 +1864,14 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
                 default=False,
                 classes="vllm-advanced prime-only",
             )
+            yield FormField(
+                "Vast disk size (GB)",
+                "vast-disk-vllm",
+                default=str(DEFAULT_VAST_DISK_GB),
+                input_type="integer",
+                hint="Rented alongside the GPU and included in the quoted price",
+                classes="vllm-advanced vast-only",
+            )
             yield ToggleField(
                 "Smoke test only (no deploy)",
                 "smoke-only-vllm",
@@ -1481,7 +1902,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
                 default=False,
                 classes="vllm-advanced",
             )
-            yield Static("[bold]Runtime[/bold]", classes="vllm-advanced")
+            yield Static("Runtime", classes="form-group-heading vllm-advanced")
             yield FormField(
                 "Served model alias",
                 "served-model-name",
@@ -1506,7 +1927,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
                 hint='e.g., {"enable_thinking": false}',
                 classes="vllm-advanced",
             )
-            yield Static("[bold]Naming[/bold]", classes="vllm-advanced")
+            yield Static("Naming", classes="form-group-heading vllm-advanced")
             yield FormField(
                 "Instance name (optional)",
                 "instance-name-vllm",
@@ -1519,7 +1940,11 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
                 hint="Advanced: explicit deployment name",
                 classes="vllm-advanced",
             )
-            yield Static("[dim]App name preview: auto[/dim]", id="vllm-app-preview")
+            yield Static(
+                "[dim]App name preview: auto[/dim]",
+                id="vllm-app-preview",
+                classes="vllm-advanced",
+            )
 
             yield Static("")
             yield Button("Deploy", id="deploy-vllm-btn", variant="primary")
@@ -1531,9 +1956,16 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
         self._cached_models: list[ModelCandidate] = []
         self._has_cached_snapshot = False
         self._selected_gpu_type = DEFAULT_GPU_TYPE
+        # Binding a Prime offer overwrites the GPU dropdown with that offer's
+        # GPU. Remember the Modal choice so switching back does not leave a
+        # Prime-only GPU name selected for a Modal deploy.
+        self._last_modal_gpu_type = DEFAULT_GPU_TYPE
+        self._modal_gpu_values: set[str] = {DEFAULT_GPU_TYPE}
         self._provider = ComputeProvider.MODAL
         self._prime_offers: dict[str, ComputeOffer] = {}
         self._selected_prime_offer_id: str | None = None
+        self._vast_offers: dict[str, VastOffer] = {}
+        self._selected_vast_offer_id: str | None = None
         self._served_alias_touched = False
         self._updating_served_alias = False
         self._last_auto_served_alias = ""
@@ -1544,9 +1976,14 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
         self._last_memory_lookup: tuple[str, str] | None = None
         self._memory_lookup_timer: Timer | None = None
         self._gpu_price_by_value: dict[str, float] = {}
+        self._rank_mode_touched = False
+        self._focus_model_list_when_loaded = False
+        self.query_one("#vllm-model-list", OptionList).add_class("hidden")
         for widget in self.query(".vllm-advanced"):
             widget.add_class("hidden")
         for widget in self.query(".prime-only"):
+            widget.add_class("hidden")
+        for widget in self.query(".vast-only"):
             widget.add_class("hidden")
         rank_mode_list = self.query_one("#vllm-rank-mode", OptionList)
         if rank_mode_list.option_count > 0:
@@ -1567,12 +2004,13 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
             selected_mode = self._resolve_rank_mode(event.option.id or "")
             if selected_mode is None:
                 return
+            self._rank_mode_touched = True
             if selected_mode != self._rank_mode:
                 self._rank_mode = selected_mode
                 self._set_ranking_title()
                 self._ranked_models = []
                 self._set_model_status("[dim]Loading model suggestions...[/dim]")
-                self.query_one("#vllm-model-list", OptionList).set_options([])
+                _set_option_list(self.query_one("#vllm-model-list", OptionList), [])
                 if self._rank_mode == "cached":
                     self._set_model_status("[dim]Loading cached models from storage...[/dim]")
                     if self._has_cached_snapshot:
@@ -1580,6 +2018,10 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
                     self._refresh_cached_models_from_storage()
                 else:
                     self.app.begin_fetch_vllm_models(self._rank_mode, self)  # type: ignore[attr-defined]
+            model_list = self.query_one("#vllm-model-list", OptionList)
+            # The picker is hidden until it has rows, so a still-loading list
+            # cannot take focus yet. Hand it over once the rows land.
+            self._focus_model_list_when_loaded = model_list.option_count == 0
             _advance_deploy_focus(self, self.NAVIGATION_ORDER)
             return
 
@@ -1634,9 +2076,31 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
             self._sync_prime_visibility()
             if self._provider == ComputeProvider.PRIME and not self._prime_offers:
                 self._refresh_prime_offers()
+            elif self._provider == ComputeProvider.VAST:
+                if self._vast_offers:
+                    self._refresh_vast_offer_options()
+                else:
+                    self._refresh_vast_offers()
             elif self._provider == ComputeProvider.MODAL:
+                self._selected_gpu_type = self._last_modal_gpu_type
+                self._selected_prime_offer_id = None
+                self._selected_vast_offer_id = None
                 self._refresh_gpu_types()
             self._refresh_app_preview()
+            self._update_cost_preview("vllm-cost-preview")
+            return
+        if event.select.id == "vast-offer-vllm":
+            if not isinstance(event.value, str):
+                return
+            self._selected_vast_offer_id = event.value
+            offer = self._vast_offers.get(event.value)
+            if offer is not None:
+                self._selected_gpu_type = offer.gpu_type
+                gpu_type_select = self.query_one("#gpu-type-vllm", Select)
+                gpu_type_select.set_options([(offer.gpu_type, offer.gpu_type)])
+                gpu_type_select.value = offer.gpu_type
+                self.query_one("#gpu-count-vllm", Input).value = str(VAST_SINGLE_GPU_COUNT)
+                self.query_one("#n-gpu", Input).value = str(VAST_SINGLE_GPU_COUNT)
             self._update_cost_preview("vllm-cost-preview")
             return
         if event.select.id == "prime-offer-vllm":
@@ -1658,15 +2122,30 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
             return
         if isinstance(event.value, str) and event.value.strip():
             self._selected_gpu_type = normalize_gpu_type(event.value)
+            if self._selected_gpu_type in self._modal_gpu_values:
+                self._last_modal_gpu_type = self._selected_gpu_type
         self._update_cost_preview("vllm-cost-preview")
 
     def _sync_prime_visibility(self) -> None:
+        self.query_one("#gpu-config-subtitle-vllm", Static).update(
+            _gpu_panel_subtitle(BackendType.VLLM, self._provider)
+        )
+        # A bound Prime offer dictates the GPU shape and count, and the deploy
+        # path overwrites whatever these hold. Leaving them editable invites
+        # changes that are silently discarded.
+        offer_bound = self._provider in (ComputeProvider.PRIME, ComputeProvider.VAST)
+        for field_id in ("#gpu-type-vllm", "#gpu-count-vllm", "#n-gpu",):
+            self.query_one(field_id).disabled = offer_bound
         advanced_visible = not self.query_one("#model-revision").has_class("hidden")
-        for widget in self.query(".prime-only"):
-            hide = self._provider != ComputeProvider.PRIME
-            if widget.has_class("vllm-advanced") and not advanced_visible:
-                hide = True
-            widget.set_class(hide, "hidden")
+        for provider_class, provider in (
+            (".prime-only", ComputeProvider.PRIME),
+            (".vast-only", ComputeProvider.VAST),
+        ):
+            for widget in self.query(provider_class):
+                hide = self._provider != provider
+                if widget.has_class("vllm-advanced") and not advanced_visible:
+                    hide = True
+                widget.set_class(hide, "hidden")
 
     def _refresh_prime_offers(self) -> None:
         self.query_one("#prime-offer-status", Static).update("[dim]Loading Prime offers...[/dim]")
@@ -1725,6 +2204,53 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
             f"[red]Could not load Prime offers:[/red] {escape(message.error)}"
         )
 
+    def _refresh_vast_offers(self) -> None:
+        self.query_one("#vast-offer-status-vllm", Static).update(
+            "[dim]Loading Vast.ai rentals...[/dim]"
+        )
+        self.run_worker(
+            self._run_fetch_vast_offers,
+            name="vllm-fetch-vast-offers",
+            thread=True,
+        )
+
+    def _run_fetch_vast_offers(self) -> None:
+        try:
+            offers = VastBackend().list_offers(
+                VastOfferQuery(gpu_count=VAST_SINGLE_GPU_COUNT, disk_gb=self._vast_disk_gb())
+            )
+        except Exception as exc:
+            self.post_message(VastOffersFailed(str(exc)))
+            return
+        self.post_message(VastOffersLoaded(offers))
+
+    def on_vast_offers_loaded(self, message: VastOffersLoaded) -> None:
+        self._vast_offers = {offer.id: offer for offer in message.offers}
+        self._refresh_vast_offer_options()
+
+    def on_vast_offers_failed(self, message: VastOffersFailed) -> None:
+        self.query_one("#vast-offer-status-vllm", Static).update(
+            f"[red]Could not load Vast.ai rentals:[/red] {escape(message.error)}"
+        )
+
+    def _vast_disk_gb(self) -> int:
+        return positive_int(self.query_one("#vast-disk-vllm", Input).value) or DEFAULT_VAST_DISK_GB
+
+    def _refresh_vast_offer_options(self) -> None:
+        required_vram_gb = self._current_vllm_required_vram()
+        offers = _compatible_vast_offers(list(self._vast_offers.values()), required_vram_gb)
+        options = _vast_offer_options(offers)
+        selector = self.query_one("#vast-offer-vllm", Select)
+        selector.set_options(options)
+        if options:
+            self._selected_vast_offer_id = options[0][1]
+            selector.value = options[0][1]
+        else:
+            self._selected_vast_offer_id = None
+        self.query_one("#vast-offer-status-vllm", Static).update(
+            _vast_offer_status(len(options), required_vram_gb)
+        )
+
     def _refresh_gpu_types(self) -> None:
         self.run_worker(
             lambda: self._run_fetch_gpu_types(),
@@ -1747,6 +2273,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
         dropdown = self.query_one("#gpu-type-vllm", Select)
         options = build_gpu_type_options(message.gpu_types)
         option_values = [value for _, value in options]
+        self._modal_gpu_values = set(option_values)
         if self._selected_gpu_type and self._selected_gpu_type not in option_values:
             options.insert(0, (self._selected_gpu_type, self._selected_gpu_type))
             option_values.insert(0, self._selected_gpu_type)
@@ -1814,13 +2341,14 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
         for idx, model in enumerate(message.models):
             downloads = f"{model.downloads:,}" if model.downloads is not None else "-"
             likes = f"{model.likes:,}" if model.likes is not None else "-"
-            label = f"  {model.repo_id:<38} downloads={downloads:<10} likes={likes}"
+            label = _model_row(model.repo_id, f"downloads={downloads:<10} likes={likes}")
             options.append(Option(label, id=f"model-{idx}"))
-        model_list.set_options(options)
+        _set_option_list(model_list, options)
 
         if message.models:
             mode_label = "Most downloaded" if self._rank_mode == "downloads" else "Trending"
             self._set_model_status(f"[dim]{mode_label} models loaded. Select one to prefill Model name.[/dim]")
+            self._focus_model_list_if_pending()
         else:
             self._set_model_status("[yellow]No matching text-generation models found.[/yellow]")
 
@@ -1834,14 +2362,14 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
         if self._rank_mode != "cached":
             return
         self._ranked_models = []
-        self.query_one("#vllm-model-list", OptionList).set_options([])
+        _set_option_list(self.query_one("#vllm-model-list", OptionList), [])
         self._set_model_status(f"[yellow]Could not load cached models:[/yellow] {escape(message.error)}")
 
     def on_vllm_models_failed(self, message: VllmModelsFailed) -> None:
         if message.mode != self._rank_mode:
             return
         self._ranked_models = []
-        self.query_one("#vllm-model-list", OptionList).set_options([])
+        _set_option_list(self.query_one("#vllm-model-list", OptionList), [])
         self._set_model_status(
             f"[yellow]Could not load model suggestions:[/yellow] {escape(message.error)} [dim](manual input still works)[/dim]"
         )
@@ -1860,6 +2388,18 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
             model_id=selected.repo_id,
             revision=revision,
         )
+
+    def _focus_model_list_if_pending(self) -> None:
+        """Give the model picker focus once a requested ranking has loaded."""
+        if not self._focus_model_list_when_loaded:
+            return
+        model_list = self.query_one(f"#{self._MODEL_LIST_ID}", OptionList)
+        if model_list.option_count == 0:
+            return
+        self._focus_model_list_when_loaded = False
+        model_list.focus()
+        if model_list.highlighted is None:
+            model_list.highlighted = 0
 
     def _set_model_status(self, text: str) -> None:
         self.query_one("#vllm-model-status", Static).update(text)
@@ -1891,11 +2431,31 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
         self._ranked_models = list(self._cached_models)
         model_list = self.query_one("#vllm-model-list", OptionList)
         options = [Option(f"  {model.repo_id}", id=f"model-{idx}") for idx, model in enumerate(self._ranked_models)]
-        model_list.set_options(options)
+        _set_option_list(model_list, options)
         if self._ranked_models:
             self._set_model_status("[dim]Cached models loaded. Select one to prefill Model name.[/dim]")
+            self._focus_model_list_if_pending()
+        elif self._fall_back_to_downloads_ranking():
+            return
         else:
             self._set_model_status("[yellow]No cached vLLM models found in storage.[/yellow]")
+
+    def _fall_back_to_downloads_ranking(self) -> bool:
+        """Switch an empty default "Cached in storage" view to "Most downloaded".
+
+        A first-time user has nothing cached, so the default ranking mode opens
+        the form on an empty picker and a warning. Only the automatic default
+        is replaced: once the mode has been chosen by hand it is left alone.
+        """
+        if self._rank_mode_touched or self._rank_mode != "cached" or not self._has_cached_snapshot:
+            return False
+        self._rank_mode = "downloads"
+        rank_mode_list = self.query_one("#vllm-rank-mode", OptionList)
+        rank_mode_list.highlighted = 1
+        self._set_ranking_title()
+        self._set_model_status("[dim]Nothing cached yet. Loading popular models...[/dim]")
+        self.app.begin_fetch_vllm_models("downloads", self)  # type: ignore[attr-defined]
+        return True
 
     def _apply_ranked_model_selection(self, option_id: str) -> None:
         selected = _model_from_option_id(option_id, self._ranked_models)
@@ -2063,6 +2623,14 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
     def _do_deploy(self) -> None:
         config = DeploymentConfig(backend=BackendType.VLLM, provider=self._provider)
         config.model_name = self.query_one("#model-name", Input).value.strip() or None
+        if not config.model_name:
+            self.app.notify(
+                "Enter a model name before deploying.",
+                severity="error",
+                timeout=5,
+            )
+            self.query_one("#model-name", Input).focus()
+            return
         config.model_revision = self.query_one("#model-revision", Input).value.strip() or None
         config.required_vram_gb = self._current_vllm_required_vram()
         gpu_type = normalize_gpu_type(self._selected_gpu_type)
@@ -2071,7 +2639,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
             return
         gpu_count = parse_gpu_count(self.query_one("#gpu-count-vllm", Input).value, default=0)
         if gpu_count <= 0:
-            self.app.notify("GPU count must be an integer >= 1.", severity="error", timeout=5)
+            self.app.notify("GPUs attached must be an integer >= 1.", severity="error", timeout=5)
             return
         config.gpu_type = gpu_type
         config.gpu_count = gpu_count
@@ -2090,11 +2658,19 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
                 keep_failed_resource=self.query_one("#prime-keep-failed", Switch).value,
                 auto_disk=self.query_one("#prime-auto-disk", Switch).value,
             )
+        elif self._provider == ComputeProvider.VAST:
+            vast_options = self._build_vast_provider_options("#vast-disk-vllm")
+            if vast_options is None:
+                return
+            config.provider_options = vast_options
+            vast_offer = self._vast_offers[vast_options.offer_id]
+            config.gpu_type = vast_offer.gpu_type
+            config.gpu_count = VAST_SINGLE_GPU_COUNT
         alias = self.query_one("#served-model-name", Input).value.strip()
         config.served_model_name = alias or default_served_model_name(config.model_name)
         config.fast_boot = self.query_one("#fast-boot", Switch).value
         config.trust_remote_code = self.query_one("#trust-remote-code", Switch).value
-        if self._provider == ComputeProvider.PRIME:
+        if self._provider in (ComputeProvider.PRIME, ComputeProvider.VAST):
             config.n_gpu = config.gpu_count
         else:
             n_gpu_str = self.query_one("#n-gpu", Input).value.strip()
@@ -2126,8 +2702,12 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
                 return
             config.default_chat_template_kwargs = kwargs_raw
         smoke_only = self.query_one("#smoke-only-vllm", Switch).value
-        if smoke_only and self._provider == ComputeProvider.PRIME:
-            self.app.notify("Prime does not support smoke-test-only mode.", severity="error", timeout=5)
+        if smoke_only and self._provider != ComputeProvider.MODAL:
+            self.app.notify(
+                f"{self._provider.display_name} does not support smoke-test-only mode.",
+                severity="error",
+                timeout=5,
+            )
             return
         config.do_deploy = not smoke_only
         config.run_smoke = smoke_only

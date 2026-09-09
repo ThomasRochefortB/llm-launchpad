@@ -8,7 +8,11 @@ import unittest
 
 import pytest
 
+from llm_launchpad.core.artificial_analysis import ArtificialAnalysisAuthStatus
+from llm_launchpad.core.hf_auth import HuggingFaceAuthStatus
+from llm_launchpad.core.modal_auth import ModalAuthStatus
 from llm_launchpad.core.modal_gpu import ModalGpuSpec
+from llm_launchpad.core.prime_auth import PrimeAuthStatus
 from llm_launchpad.core.hf_models import GgufQuantMetadata
 
 
@@ -67,6 +71,56 @@ def _stub_deploy_screen_gpu_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "llm_launchpad.tui.screens.deploy.fetch_modal_gpu_catalog",
         lambda: [ModalGpuSpec("A100-80GB", price_per_hour_usd=2.50)],
+    )
+
+
+@pytest.fixture(autouse=True)
+def _stub_main_menu_catalog_build(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the live catalog build out of unrelated UI tests.
+
+    ``MainMenuScreen.on_mount`` starts a worker running
+    ``build_live_quick_deploy_catalog``: rankings parse plus up to 24
+    concurrent HF lookups. Any UI test that mounts ``MainMenuScreen`` (or
+    boots the full ``TuiApp``, whose ``on_mount`` enters the main menu)
+    otherwise pays for that build and races with it. The catalog lifecycle
+    has focused tests of its own, so stub the worker body here; the entry
+    point (warm-snapshot activation + worker dispatch) stays real.
+    """
+    from llm_launchpad.tui.screens.main_menu import MainMenuScreen
+
+    monkeypatch.setattr(
+        MainMenuScreen,
+        "_run_refresh_quick_deploy_catalog",
+        lambda self: None,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _stub_provider_status_probes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep home-screen auth probes off the network in UI tests.
+
+    ``MainMenuScreen`` fans out to four auth CLIs (Modal subprocess, HF
+    ``whoami`` HTTPS, Prime config, AAI key check). Auth status has focused
+    unit tests of its own; UI tests that mount the menu without patching all
+    four paths otherwise serialize on real subprocess/HTTPS latency on every
+    ``run_test()`` boot. Stub at the narrow helper boundary; tests that
+    exercise a probe override the stub locally.
+    """
+    monkeypatch.setattr(
+        "llm_launchpad.tui.screens.main_menu.get_modal_auth_status",
+        lambda: ModalAuthStatus(authenticated=False),
+    )
+    monkeypatch.setattr(
+        "llm_launchpad.tui.screens.main_menu.get_prime_auth_status",
+        lambda: PrimeAuthStatus(authenticated=False),
+    )
+    monkeypatch.setattr(
+        "llm_launchpad.tui.screens.main_menu.get_huggingface_auth_status",
+        lambda: HuggingFaceAuthStatus(authenticated=False),
+    )
+    monkeypatch.setattr(
+        "llm_launchpad.tui.screens.main_menu.get_artificial_analysis_auth_status",
+        lambda: ArtificialAnalysisAuthStatus(authenticated=False),
     )
 
 

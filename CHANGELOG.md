@@ -7,15 +7,22 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Fixed
-- First llama.cpp Modal deploy after a large Hugging Face download no longer dies at the 30-minute web-server startup timeout. The GPU container sequentially hydrates GGUF shards (and a projector, if any) before `llama-server` starts, and the bind wait defaults to 90 minutes (`LLAMACPP_SERVE_STARTUP_TIMEOUT_MINUTES`).
-
 ### Added
+- Vast.ai rentals (beta): Fast Deploy quotes, GPU filters, and serving-tier competition for verified on-demand NVIDIA offers. Supported single-GPU, text-only llama.cpp GGUF placements can be rented; the endpoint is a loopback SSH tunnel on this computer. Multi-GPU and unsupported-runtime offers remain comparisons. Stop destroys the rental and its disk. No real Vast host has been live-certified yet.
+- `llm-launchpad vast-auth` (login/status/logout), `vast connect`, `offers --provider vast`, and `--provider vast` on deploy/list/status/logs/stop. `doctor` reports a local Vast key as optional and does not authenticate it over the network.
+- Advanced deploy can bind a selected Vast rental on llama.cpp and vLLM (tensor parallel stays 1). Disk size is quoted with the GPU.
+- Docs for the beta and the broader release plan: `docs/vast.md`, `docs/vast-integration-plan.md`.
 - Added an always-on rotating debug log under `~/.llm_launchpad/logs/` and routed previously silent failure paths (cache persistence, auth probing, log-tail cleanup, SSH key permissions) to it.
 - Added `llm-launchpad doctor`, a self-check command that verifies the Modal CLI, Modal/Prime/Hugging Face authentication, the optional Artificial Analysis key, and state-directory writability, with fix hints per failure.
 - Added `llm-launchpad --version`.
 - Added documentation pages under `docs/` (deploy catalog, Prime provider, storage and costs, OpenCode, troubleshooting) and a generated CLI reference (`docs/cli.md`) via `scripts/generate_cli_reference.py`.
 - Added GitHub issue templates for bug reports and feature requests.
+
+### Changed
+- Vision option fields keep visible labels, and projector/image details hide when vision is set to text only.
+
+### Fixed
+- First llama.cpp Modal deploy after a large Hugging Face download no longer dies at the 30-minute web-server startup timeout. The GPU container sequentially hydrates GGUF shards (and a projector, if any) before `llama-server` starts, and the bind wait defaults to 90 minutes (`LLAMACPP_SERVE_STARTUP_TIMEOUT_MINUTES`).
 
 ## [1.1.1] - 2026-08-22
 

@@ -12,6 +12,7 @@ from .hf_auth import get_huggingface_auth_status
 from .modal_auth import get_modal_auth_status
 from .prime_auth import get_prime_auth_status
 from .artificial_analysis import get_artificial_analysis_auth_status
+from .vast_auth import resolve_vast_credentials
 
 
 @dataclass(frozen=True)
@@ -106,6 +107,20 @@ def run_doctor_checks(
                 hint="run: prime login (or set PRIME_API_KEY)",
             )
         )
+
+    try:
+        vast_credentials = resolve_vast_credentials()
+        vast_detail = (
+            f"configured ({vast_credentials.source}); offer preview only, not verified"
+            if vast_credentials.api_key else "not configured (optional offer preview)"
+        )
+        vast_ok = bool(vast_credentials.api_key)
+    except ValueError as exc:
+        vast_detail, vast_ok = str(exc), False
+    checks.append(DoctorCheck(
+        name="Vast.ai key", ok=vast_ok, required=False, detail=vast_detail,
+        hint="optional: run llm-launchpad vast-auth login",
+    ))
 
     hf_status = get_huggingface_auth_status()
     if hf_status.authenticated:

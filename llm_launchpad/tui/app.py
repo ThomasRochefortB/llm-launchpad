@@ -44,6 +44,8 @@ from ..core.naming import (
 )
 from ..core.prime_auth import get_prime_auth_status
 from ..core.prime_backend import PrimeBackend
+from ..core.vast_auth import resolve_vast_credentials
+from ..core.vast_deployment import VastDeploymentBackend
 from ..core.provider_options import prime_provider_options
 from ..core.vision_probe import is_vision_probe_failure
 from ..core.quick_deploy import QuickDeployProfile
@@ -465,7 +467,11 @@ class TuiApp(App):
     def _provider_is_configured(self) -> bool:
         modal_available = ModalBackend.is_cli_available()
         prime_available = get_prime_auth_status().authenticated
-        return modal_available or prime_available
+        try:
+            vast_available = bool(resolve_vast_credentials().api_key)
+        except ValueError:
+            vast_available = False
+        return modal_available or prime_available or vast_available
 
     def _enter_main_menu(self) -> None:
         self.push_screen(MainMenuScreen(username="", version=self._version))
@@ -836,6 +842,12 @@ class TuiApp(App):
                             provider=config.provider,
                         ):
                             _dispatch_event(monitor, cleanup_event)
+                            if (
+                                config.provider == ComputeProvider.VAST
+                                and isinstance(cleanup_event, OperationCompleteEvent)
+                                and not cleanup_event.success
+                            ):
+                                config.fallback_configs = ()
                     if self._advance_to_fallback(
                         config,
                         monitor,
@@ -1180,13 +1192,18 @@ class TuiApp(App):
         rows: list[EndpointInfo] = []
         prune_providers: list[ComputeProvider] = []
         prime_enabled = get_prime_auth_status().authenticated
-        with ThreadPoolExecutor(max_workers=2 if prime_enabled else 1) as executor:
+        try:
+            vast_enabled = bool(resolve_vast_credentials().api_key)
+        except ValueError:
+            vast_enabled = False
+        with ThreadPoolExecutor(max_workers=3) as executor:
             modal_future = executor.submit(ModalBackend.list_apps)
             prime_future = (
                 executor.submit(PrimeBackend().list_deployments)
                 if prime_enabled
                 else None
             )
+            vast_future = executor.submit(VastDeploymentBackend().list_deployments) if vast_enabled else None
             try:
                 modal_rows = modal_future.result()
             except Exception:
@@ -1195,6 +1212,10 @@ class TuiApp(App):
                 prime_rows = prime_future.result() if prime_future is not None else None
             except Exception:
                 prime_rows = None
+            try:
+                vast_rows = vast_future.result() if vast_future is not None else None
+            except Exception:
+                vast_rows = None
 
         if modal_rows is not None:
             rows.extend(modal_rows)
@@ -1202,6 +1223,9 @@ class TuiApp(App):
         if prime_rows is not None:
             rows.extend(prime_rows)
             prune_providers.append(ComputeProvider.PRIME)
+        if vast_rows is not None:
+            rows.extend(vast_rows)
+            prune_providers.append(ComputeProvider.VAST)
         self._merge_deploy_connection_cache(rows)
         return visible_launchpad_rows(rows), tuple(prune_providers)
 

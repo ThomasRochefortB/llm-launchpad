@@ -62,6 +62,11 @@ class ManageScreenHelpersTests(unittest.TestCase):
         self.assertEqual(_available_actions(failed), frozenset({"logs"}))
         self.assertEqual(_available_actions(starting), frozenset({"logs", "stop"}))
 
+    def test_vast_recovery_records_allow_cleanup_in_failed_and_uncertain_states(self) -> None:
+        for state in ("creating", "destroying", "failed", "destroyed"):
+            row = EndpointInfo(backend=BackendType.LLAMACPP, provider=ComputeProvider.VAST, state=state)
+            self.assertIn("stop", _available_actions(row))
+
 
 if __name__ == "__main__":
     unittest.main()

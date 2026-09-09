@@ -18,6 +18,11 @@ class StatusHeader(Static):
         padding: 0 2;
         background: $surface;
         border-bottom: solid $border;
+        /* The operation detail is a full provider command line. Letting it
+           wrap turns the context bar into three lines of truncated JSON; the
+           log pane below already carries the command in full. */
+        text-wrap: nowrap;
+        text-overflow: ellipsis;
     }
     """
 

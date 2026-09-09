@@ -36,6 +36,7 @@ class FormField(Vertical):
         hint: str = "",
         password: bool = False,
         required: bool = False,
+        input_type: str = "text",
         **kwargs: object,
     ) -> None:
         super().__init__(**kwargs)
@@ -45,6 +46,7 @@ class FormField(Vertical):
         self._hint = hint
         self._password = password
         self._required = required
+        self._input_type = input_type
 
     def compose(self) -> ComposeResult:
         yield Static(self._label, classes="form-label")
@@ -55,6 +57,7 @@ class FormField(Vertical):
             placeholder=placeholder,
             password=self._password,
             id=self._field_id,
+            type=self._input_type,
             validators=validators,
         )
         if self._hint:

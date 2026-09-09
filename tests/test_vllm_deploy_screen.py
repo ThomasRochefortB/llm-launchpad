@@ -10,10 +10,18 @@ from textual.widgets import Input, OptionList, Select, Static, Switch
 from llm_launchpad.core.hf_models import ModelCandidate, VllmMemoryBreakdown
 from llm_launchpad.core.modal_gpu import ModalGpuSpec
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider
-from llm_launchpad.protocol.models import ComputeOffer, StorageSnapshot, StoredModelInfo
+from llm_launchpad.protocol.models import (
+    ComputeOffer,
+    OfferCostBreakdown,
+    StorageSnapshot,
+    StoredModelInfo,
+    VastOffer,
+    VastProviderOptions,
+)
 from llm_launchpad.tui.screens.deploy import (
     GpuTypesLoaded,
     PrimeOffersLoaded,
+    VastOffersLoaded,
     VllmDeployScreen,
     VllmMemoryFailed,
     VllmMemoryLoaded,
@@ -50,6 +58,33 @@ class _TestApp(App[None]):
 
     def notify(self, message: object, *, severity: str = "information", **kwargs: object) -> None:
         self.notifications.append((str(message), severity))
+
+
+def _vast_offers() -> list[VastOffer]:
+    return [
+        VastOffer(
+            id="9001",
+            machine_id="m1",
+            gpu_type="RTX_4090",
+            gpu_count=1,
+            gpu_memory_gb=24.0,
+            reliability=0.99,
+            disk_gb=100,
+            costs=OfferCostBreakdown(total_per_hour_usd=0.412),
+            location="Poland",
+        ),
+        VastOffer(
+            id="9003",
+            machine_id="m3",
+            gpu_type="A100_PCIE",
+            gpu_count=4,
+            gpu_memory_gb=80.0,
+            reliability=0.99,
+            disk_gb=100,
+            costs=OfferCostBreakdown(total_per_hour_usd=6.00),
+            location="USA",
+        ),
+    ]
 
 
 class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
@@ -254,9 +289,24 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             self.assertEqual(app.fetch_calls, ["downloads"])
+            # The picker is hidden until it has rows, so focus is handed over
+            # when the requested ranking arrives rather than before.
+            screen.on_vllm_models_loaded(
+                VllmModelsLoaded(
+                    mode="downloads",
+                    models=[ModelCandidate(repo_id="Qwen/Qwen3-32B")],
+                )
+            )
+            await pilot.pause()
+
             self.assertTrue(model_list.has_focus)
 
-    async def test_down_from_model_name_moves_focus_to_gpu_type_select(self) -> None:
+    async def test_down_from_model_name_follows_the_visual_form_order(self) -> None:
+        """Arrow navigation must not jump past the compute provider select.
+
+        The provider select sits between the model name and the GPU shape on
+        screen, and choosing it changes what the GPU fields even mean.
+        """
         app = _TestApp()
         async with app.run_test() as pilot:
             app.push_screen(VllmDeployScreen())
@@ -265,9 +315,15 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             assert isinstance(screen, VllmDeployScreen)
 
             model_name = screen.query_one("#model-name", Input)
+            provider = screen.query_one("#provider-vllm", Select)
             gpu_type = screen.query_one("#gpu-type-vllm", Select)
             model_name.focus()
             await pilot.pause()
+            await pilot.press("down")
+            await pilot.pause()
+
+            self.assertTrue(provider.has_focus)
+
             await pilot.press("down")
             await pilot.pause()
 
@@ -408,6 +464,7 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             assert isinstance(screen, VllmDeployScreen)
             self.assertFalse(screen.query_one("#fast-boot", Switch).value)
             self.assertFalse(screen.query_one("#trust-remote-code", Switch).value)
+            screen.query_one("#model-name", Input).value = "Qwen/Qwen3-0.6B"
             screen._do_deploy()
             self.assertIsNotNone(app.deployed_config)
             self.assertFalse(app.deployed_config.fast_boot)
@@ -421,6 +478,7 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
             screen = app.screen
             assert isinstance(screen, VllmDeployScreen)
+            screen.query_one("#model-name", Input).value = "Qwen/Qwen3-0.6B"
             screen._do_deploy()
             self.assertIsNotNone(app.deployed_config)
             self.assertTrue(app.deployed_config.do_deploy)
@@ -438,6 +496,7 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 w.remove_class("hidden")
             screen.query_one("#smoke-only-vllm", Switch).value = True
             screen.query_one("#warmup-vllm", Switch).value = True
+            screen.query_one("#model-name", Input).value = "Qwen/Qwen3-0.6B"
             screen._do_deploy()
             self.assertIsNotNone(app.deployed_config)
             self.assertFalse(app.deployed_config.do_deploy)
@@ -591,6 +650,7 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             for widget in screen.query(".vllm-advanced"):
                 widget.remove_class("hidden")
             debug_toggle.value = True
+            screen.query_one("#model-name", Input).value = "Qwen/Qwen3-0.6B"
             screen._do_deploy()
 
             self.assertIsNotNone(app.deployed_config)
@@ -615,6 +675,7 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 w.remove_class("hidden")
 
             revision_input.value = "main"
+            screen.query_one("#model-name", Input).value = "Qwen/Qwen3-0.6B"
             screen._do_deploy()
 
             self.assertIsNotNone(app.deployed_config)
@@ -630,6 +691,7 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             assert isinstance(screen, VllmDeployScreen)
             screen.query_one("#gpu-count-vllm", Input).value = "2"
             screen.query_one("#n-gpu", Input).value = "4"
+            screen.query_one("#model-name", Input).value = "Qwen/Qwen3-0.6B"
             screen._do_deploy()
 
             self.assertIsNotNone(app.deployed_config)
@@ -695,6 +757,7 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             for w in screen.query(".vllm-advanced"):
                 w.remove_class("hidden")
 
+            screen.query_one("#model-name", Input).value = "Qwen/Qwen3-0.6B"
             screen._do_deploy()
             self.assertIsNone(app.deployed_config)
             self.assertTrue(app.notifications)
@@ -890,3 +953,148 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VllmDeployFormPolishTests(unittest.IsolatedAsyncioTestCase):
+    """Behavior added while auditing the Advanced deploy flow."""
+
+    async def test_deploy_without_a_model_name_is_refused(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+
+            screen._do_deploy()
+
+            self.assertIsNone(app.deployed_config)
+            self.assertIn(
+                ("Enter a model name before deploying.", "error"), app.notifications
+            )
+
+    async def test_switching_back_to_modal_drops_the_bound_prime_gpu(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+            catalog = GpuTypesLoaded(gpu_types=[ModalGpuSpec("A100-80GB", price_per_hour_usd=2.5)])
+            screen.on_gpu_types_loaded(catalog)
+            screen.on_prime_offers_loaded(
+                PrimeOffersLoaded(
+                    offers=[
+                        ComputeOffer(
+                            id="off1",
+                            cloud_id="c1",
+                            provider_name="prime",
+                            gpu_type="RTX2000Ada_16GB",
+                            gpu_count=1,
+                            gpu_memory_gb=16.0,
+                            price_per_hour=0.257,
+                            security="secure_cloud",
+                            images=("ubuntu_22_cuda_12",),
+                            stock_status="Available",
+                        )
+                    ]
+                )
+            )
+            await pilot.pause()
+
+            provider = screen.query_one("#provider-vllm", Select)
+            provider.value = "prime"
+            await pilot.pause()
+            self.assertEqual(screen._selected_gpu_type, "RTX2000ADA_16GB")
+
+            provider.value = "modal"
+            await pilot.pause()
+            screen.on_gpu_types_loaded(catalog)
+            await pilot.pause()
+
+            self.assertEqual(screen._selected_gpu_type, "A100-80GB")
+            self.assertNotIn(
+                "RTX2000ADA_16GB",
+                [value for _, value in screen.query_one("#gpu-type-vllm", Select)._options],
+            )
+
+    async def test_empty_storage_falls_back_to_the_downloads_ranking(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+            app.fetch_calls.clear()
+
+            screen.on_storage_loaded(
+                StorageLoaded(snapshot=StorageSnapshot(llamacpp_models=[], vllm_models=[]))
+            )
+            await pilot.pause()
+
+            self.assertEqual(screen._rank_mode, "downloads")
+            self.assertEqual(app.fetch_calls, ["downloads"])
+
+    async def test_vast_rental_binds_a_single_gpu_and_reaches_the_config(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+            screen.query_one("#model-name", Input).value = "Qwen/Qwen3-32B"
+
+            provider = screen.query_one("#provider-vllm", Select)
+            self.assertIn("vast", [value for _, value in provider._options])
+
+            screen.on_vast_offers_loaded(VastOffersLoaded(offers=_vast_offers()))
+            provider.value = "vast"
+            await pilot.pause()
+
+            rentals = screen.query_one("#vast-offer-vllm", Select)
+            self.assertEqual(
+                [value for _, value in rentals._options if isinstance(value, str)],
+                ["9001"],
+            )
+            self.assertTrue(screen.query_one("#n-gpu", Input).disabled)
+
+            screen._do_deploy()
+
+            config = app.deployed_config
+            self.assertIsNotNone(config)
+            self.assertEqual(config.provider, ComputeProvider.VAST)
+            self.assertEqual(config.gpu_type, "RTX_4090")
+            self.assertEqual(config.gpu_count, 1)
+            self.assertEqual(config.n_gpu, 1)
+            self.assertEqual(
+                config.provider_options,
+                VastProviderOptions(
+                    offer_id="9001",
+                    disk_gb=100,
+                    max_hourly_cost_usd=0.412,
+                    machine_id="m1",
+                ),
+            )
+
+    async def test_smoke_test_only_is_refused_for_vast(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+            screen.query_one("#model-name", Input).value = "Qwen/Qwen3-32B"
+            screen.on_vast_offers_loaded(VastOffersLoaded(offers=_vast_offers()))
+            screen.query_one("#provider-vllm", Select).value = "vast"
+            await pilot.pause()
+            for widget in screen.query(".vllm-advanced"):
+                widget.remove_class("hidden")
+            screen.query_one("#smoke-only-vllm", Switch).value = True
+
+            screen._do_deploy()
+
+            self.assertIsNone(app.deployed_config)
+            self.assertIn(
+                ("Vast.ai does not support smoke-test-only mode.", "error"),
+                app.notifications,
+            )

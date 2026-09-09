@@ -49,6 +49,8 @@ from ..core.naming import (
     slugify_instance_name,
 )
 from ..core.prime_backend import PrimeBackend
+from ..core.vast_auth import resolve_vast_credentials
+from ..core.vast_deployment import VastDeploymentBackend
 from ..core.prime_auth import get_prime_auth_status
 from ..core.provider_options import prime_provider_options
 from ..core.opencode import (
@@ -62,7 +64,7 @@ from ..core.runtime_support import (
     evaluate_llamacpp_architecture,
     load_llamacpp_support_manifest,
 )
-from ..protocol.enums import BackendType, ComputeProvider, OperationType
+from ..protocol.enums import BackendType, ComputeProvider, OfferProvider, OperationType
 from ..protocol.events import (
     EndpointAvailableEvent,
     ErrorEvent,
@@ -70,7 +72,8 @@ from ..protocol.events import (
     OperationCompleteEvent,
     StateChangeEvent,
 )
-from ..protocol.models import DeploymentConfig, EndpointInfo, PrimeProviderOptions
+from ..protocol.models import DeploymentConfig, EndpointInfo, PrimeProviderOptions, VastProviderOptions
+from .vast import vast_app, vast_auth_app, print_vast_offers
 
 app = typer.Typer(
     help="llm-launchpad CLI - configure and deploy LLM backends on Modal.",
@@ -80,6 +83,8 @@ opencode_app = typer.Typer(help="OpenCode integration commands.")
 app.add_typer(opencode_app, name="opencode")
 aai_auth_app = typer.Typer(help="Manage the stored Artificial Analysis API key.")
 app.add_typer(aai_auth_app, name="aai-auth")
+app.add_typer(vast_auth_app, name="vast-auth")
+app.add_typer(vast_app, name="vast")
 
 
 def _version_callback(value: bool) -> None:
@@ -196,9 +201,13 @@ def _ensure_tui_runtime() -> None:
             err=True,
         )
         raise typer.Exit(code=1)
-    if not ModalBackend.is_cli_available() and not get_prime_auth_status().authenticated:
+    if (
+        not ModalBackend.is_cli_available()
+        and not get_prime_auth_status().authenticated
+        and not resolve_vast_credentials().api_key
+    ):
         typer.echo(
-            "Error: no compute provider is configured. Run `modal setup` or `prime login`.",
+            "Error: no compute provider is configured. Run `modal setup`, `prime login`, or `llm-launchpad vast-auth login`.",
             err=True,
         )
         raise typer.Exit(code=1)
@@ -237,7 +246,7 @@ def _provider_instances(
 ) -> list[EndpointInfo]:
     if provider == ComputeProvider.MODAL:
         return _backend_instances(backend)
-    rows = PrimeBackend().list_deployments()
+    rows = VastDeploymentBackend().list_deployments() if provider == ComputeProvider.VAST else PrimeBackend().list_deployments()
     return [row for row in rows if row.backend == backend]
 
 
@@ -319,6 +328,11 @@ def _connected_compute_providers() -> tuple[ComputeProvider, ...]:
             providers.append(ComputeProvider.PRIME)
     except Exception:
         log_exception("Prime auth probe failed while listing connected providers")
+    try:
+        if resolve_vast_credentials().api_key:
+            providers.append(ComputeProvider.VAST)
+    except ValueError:
+        pass
     return tuple(providers)
 
 
@@ -328,7 +342,7 @@ def _load_visible_launchpad_rows(
     rows = (
         ModalBackend.list_apps()
         if provider == ComputeProvider.MODAL
-        else PrimeBackend().list_deployments()
+        else (VastDeploymentBackend().list_deployments() if provider == ComputeProvider.VAST else PrimeBackend().list_deployments())
     )
     if rows is None:
         return None
@@ -341,7 +355,7 @@ def _list_provider_deployments(provider: ComputeProvider) -> list[EndpointInfo] 
         rows = (
             ModalBackend.list_apps()
             if provider == ComputeProvider.MODAL
-            else PrimeBackend().list_deployments()
+            else (VastDeploymentBackend().list_deployments() if provider == ComputeProvider.VAST else PrimeBackend().list_deployments())
         )
     except Exception:
         return None
@@ -577,21 +591,21 @@ def _deploy_and_maybe_warmup(
                 isinstance(event, OperationCompleteEvent)
                 and not event.success
                 and event.operation == OperationType.WARMUP
-                and config.provider == ComputeProvider.PRIME
+                and config.provider in {ComputeProvider.PRIME, ComputeProvider.VAST}
                 and deployed_endpoint is not None
-                and not prime_provider_options(config).keep_failed_resource
+                and (config.provider == ComputeProvider.VAST or not prime_provider_options(config).keep_failed_resource)
                 # A pod that only failed the image probe is still serving, so
                 # keep it for diagnosis instead of terminating it.
                 and not is_vision_probe_failure(event)
             ):
                 typer.echo(
-                    f"Warmup failed; terminating Prime pod {deployed_endpoint.app_id}."
+                    f"Warmup failed; terminating {config.provider.display_name} instance {deployed_endpoint.app_id}."
                 )
                 for cleanup_event in orch.stop_app(
                     backend,
                     app_name=config.app_name,
                     app_id=deployed_endpoint.app_id,
-                    provider=ComputeProvider.PRIME,
+                    provider=config.provider,
                 ):
                     _print_event(cleanup_event, summarizer=summarizer)
                 remove_connection(config.app_name or "")
@@ -781,16 +795,36 @@ def llamacpp_support(
 
 
 @app.command("offers")
-def prime_offers(
+def offers(
     gpu_type: str | None = typer.Option(None, help="GPU type filter"),
     gpu_count: int | None = typer.Option(None, min=1, help="GPU count filter"),
     region: str | None = typer.Option(None, help="Region or country filter"),
     disk_id: str | None = typer.Option(None, help="Only offers compatible with a Prime disk"),
-    secure_only: bool = typer.Option(True, help="Show only secure-cloud offers"),
+    secure_only: bool | None = typer.Option(None, help="Datacenter offers only. Default: on for Prime, off for Vast."),
     on_demand_only: bool = typer.Option(True, help="Hide spot offers"),
     output_json: bool = typer.Option(False, "--json", help="Print machine-readable JSON"),
+    provider: OfferProvider = typer.Option(OfferProvider.PRIME, help="Marketplace: prime or vast."),
+    disk_gb: int | None = typer.Option(None, min=1, help="Vast disk allocation for pricing in GiB (default 100)."),
+    min_reliability: float | None = typer.Option(None, min=0, max=1, help="Vast minimum reliability score (default 0.99)."),
+    limit: int | None = typer.Option(None, min=1, max=500, help="Vast maximum search results (default 100)."),
 ) -> None:
-    """List current Prime Intellect GPU availability and offer IDs."""
+    """List Prime availability or verified on-demand Vast rentals."""
+    if provider == OfferProvider.VAST:
+        from ..protocol.models import VastOfferQuery
+
+        if disk_id is not None or not on_demand_only:
+            raise typer.BadParameter("Vast supports on-demand instances without a Prime disk ID.")
+        print_vast_offers(VastOfferQuery(
+            gpu_type=gpu_type, gpu_count=gpu_count or 1, country=region,
+            disk_gb=disk_gb if disk_gb is not None else 100,
+            min_reliability=min_reliability if min_reliability is not None else 0.99,
+            datacenter_only=bool(secure_only), limit=limit if limit is not None else 100,
+        ), output_json=output_json)
+        return
+    if provider != OfferProvider.PRIME:
+        raise typer.BadParameter("Unsupported offer provider.")
+    if any(value is not None for value in (disk_gb, min_reliability, limit)):
+        raise typer.BadParameter("--disk-gb, --min-reliability, and --limit require --provider vast.")
     orch, _ = _preflight(ComputeProvider.PRIME)
     try:
         rows = orch.prime_backend.list_offers(
@@ -802,7 +836,7 @@ def prime_offers(
     except Exception as exc:
         typer.echo(f"Error: {exc}", err=True)
         raise typer.Exit(code=1) from exc
-    if secure_only:
+    if secure_only is not False:
         rows = [row for row in rows if (row.security or "").casefold() == "secure_cloud"]
     if on_demand_only:
         rows = [row for row in rows if not row.is_spot]
@@ -829,6 +863,9 @@ def prime_offers(
 
 @app.command()
 def deploy(
+    vast_offer_id: str | None = typer.Option(None, help="Exact Vast offer to rent (single-GPU llama.cpp)."),
+    vast_disk_gb: int = typer.Option(100, min=1, help="Vast disk allocation in GB."),
+    max_hourly_cost: float | None = typer.Option(None, min=0.001, help="Maximum Vast hourly total including disk; required for Vast."),
     vision: VisionMode = typer.Option(VisionMode.AUTO, help="Image input: auto, on, or off"),
     projector_repo: str | None = typer.Option(None, help="llama.cpp projector HF repository override"),
     projector_revision: str | None = typer.Option(None, help="llama.cpp projector HF revision override"),
@@ -837,7 +874,7 @@ def deploy(
     mm_processor_kwargs: str | None = typer.Option(None, help="vLLM image processor kwargs JSON"),
     provider: ComputeProvider = typer.Option(
         ComputeProvider.MODAL,
-        help="Compute provider: modal or prime",
+        help="Compute provider: modal, prime, or vast",
     ),
     backend: BackendType = typer.Option(
         BackendType.LLAMACPP,
@@ -905,8 +942,10 @@ def deploy(
         help="Show raw backend logs instead of the concise progress view",
     ),
 ) -> None:
-    """Deploy a server to Modal or Prime Intellect."""
+    """Deploy a server to Modal, Prime Intellect, or Vast.ai."""
     compute_provider = ComputeProvider(provider)
+    if compute_provider == ComputeProvider.VAST and (not vast_offer_id or max_hourly_cost is None):
+        raise typer.BadParameter("Vast requires --vast-offer-id and --max-hourly-cost.")
     orch, username = _preflight(compute_provider)
     _print_banner()
 
@@ -961,7 +1000,7 @@ def deploy(
                 auto_disk=prime_disk,
             )
             if compute_provider == ComputeProvider.PRIME
-            else None
+            else (VastProviderOptions(vast_offer_id or "", vast_disk_gb, max_hourly_cost or 0) if compute_provider == ComputeProvider.VAST else None)
         ),
     )
     typer.echo(
@@ -969,6 +1008,8 @@ def deploy(
         f"instance={resolved_instance} app={resolved_app_name}"
     )
 
+    if compute_provider == ComputeProvider.VAST:
+        config.gpu_count = gpu_count or 1
     _deploy_and_maybe_warmup(
         orch,
         username=username,
@@ -987,7 +1028,7 @@ def deploy(
 def warmup(
     provider: ComputeProvider = typer.Option(
         ComputeProvider.MODAL,
-        help="Compute provider: modal or prime",
+        help="Compute provider: modal, prime, or vast",
     ),
     backend: BackendType = typer.Option(
         BackendType.LLAMACPP,
@@ -1099,7 +1140,7 @@ def warmup(
 def list_apps(
     provider: ComputeProvider = typer.Option(
         ComputeProvider.MODAL,
-        help="Compute provider: modal or prime",
+        help="Compute provider: modal, prime, or vast",
     ),
 ) -> None:
     """List launchpad deployments for a compute provider."""
@@ -1134,7 +1175,7 @@ def list_apps(
 def status(
     provider: ComputeProvider = typer.Option(
         ComputeProvider.MODAL,
-        help="Compute provider: modal or prime",
+        help="Compute provider: modal, prime, or vast",
     ),
     backend: BackendType = typer.Option(
         BackendType.LLAMACPP,
@@ -1199,7 +1240,7 @@ def status(
 def benchmark(
     provider: ComputeProvider = typer.Option(
         ComputeProvider.MODAL,
-        help="Compute provider: modal or prime",
+        help="Compute provider: modal, prime, or vast",
     ),
     backend: BackendType = typer.Option(
         BackendType.LLAMACPP,
@@ -1296,7 +1337,7 @@ def benchmark(
 def logs(
     provider: ComputeProvider = typer.Option(
         ComputeProvider.MODAL,
-        help="Compute provider: modal or prime",
+        help="Compute provider: modal, prime, or vast",
     ),
     backend: BackendType = typer.Option(
         BackendType.LLAMACPP,
@@ -1332,7 +1373,7 @@ def logs(
 def stop(
     provider: ComputeProvider = typer.Option(
         ComputeProvider.MODAL,
-        help="Compute provider: modal or prime",
+        help="Compute provider: modal, prime, or vast",
     ),
     backend: BackendType = typer.Option(
         BackendType.LLAMACPP,
@@ -1342,7 +1383,7 @@ def stop(
     instance_name: str | None = typer.Option(None, help="Target instance name"),
     app_name: str | None = typer.Option(None, help="Target deployment name"),
 ) -> None:
-    """Stop a deployed backend app."""
+    """Stop a deployed backend app. Vast destroys the rental and its disk."""
     compute_provider = ComputeProvider(provider)
     orch, username = _preflight(compute_provider)
     _print_banner()
@@ -1350,7 +1391,12 @@ def stop(
     target = _resolve_manage_target(bt, compute_provider, app_name, instance_name)
     target_app_name = target.name
     if not yes:
-        confirmed = typer.confirm(f"Stop deployed app '{target_app_name}'?")
+        question = (
+            f"Destroy Vast rental '{target_app_name}' and permanently delete its disk?"
+            if compute_provider == ComputeProvider.VAST
+            else f"Stop deployed app '{target_app_name}'?"
+        )
+        confirmed = typer.confirm(question)
         if not confirmed:
             typer.echo("Aborted.")
             raise typer.Exit(code=1)
@@ -1491,7 +1537,7 @@ def switch(
     mm_processor_kwargs: str | None = typer.Option(None, help="vLLM image processor kwargs JSON"),
     provider: ComputeProvider = typer.Option(
         ComputeProvider.MODAL,
-        help="Compute provider: modal or prime",
+        help="Compute provider: modal, prime, or vast",
     ),
     backend: BackendType = typer.Option(
         BackendType.LLAMACPP,
@@ -1553,6 +1599,8 @@ def switch(
 ) -> None:
     """Switch model and optionally redeploy."""
     compute_provider = ComputeProvider(provider)
+    if compute_provider == ComputeProvider.VAST:
+        raise typer.BadParameter("Vast model switching is not supported. Stop the old rental and deploy a new selected offer.")
     orch, username = _preflight(compute_provider)
     _print_banner()
     bt = BackendType(backend)
@@ -1675,7 +1723,7 @@ def switch(
 def opencode_sync(
     provider: ComputeProvider | None = typer.Option(
         None,
-        help="Limit to modal or prime. Default: every connected compute provider.",
+        help="Limit to modal, prime, or vast. Default: every connected compute provider.",
     ),
     backend: BackendType | None = typer.Option(
         None,

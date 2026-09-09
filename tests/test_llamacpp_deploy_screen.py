@@ -11,14 +11,18 @@ from llm_launchpad.core.modal_gpu import ModalGpuSpec
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider
 from llm_launchpad.protocol.models import (
     ComputeOffer,
+    OfferCostBreakdown,
     PrimeProviderOptions,
     StorageSnapshot,
     StoredModelInfo,
+    VastOffer,
+    VastProviderOptions,
 )
 from llm_launchpad.tui.screens.deploy import (
     GpuTypesLoaded,
     LlamaCppDeployScreen,
     PrimeOffersLoaded,
+    VastOffersLoaded,
 )
 from llm_launchpad.tui.workers import LlamaCppModelsLoaded, LlamaCppQuantsLoaded, StorageLoaded
 
@@ -56,6 +60,59 @@ class _TestApp(App[None]):
 
     def notify(self, message: object, *, severity: str = "information", **kwargs: object) -> None:
         self.notifications.append((str(message), severity))
+
+
+def _prime_offer() -> ComputeOffer:
+    return ComputeOffer(
+        id="off1",
+        cloud_id="c1",
+        provider_name="prime",
+        gpu_type="RTX2000Ada_16GB",
+        gpu_count=1,
+        gpu_memory_gb=16.0,
+        price_per_hour=0.257,
+        security="secure_cloud",
+        images=("ubuntu_22_cuda_12",),
+        stock_status="Available",
+    )
+
+
+def _vast_offers() -> list[VastOffer]:
+    return [
+        VastOffer(
+            id="9001",
+            machine_id="m1",
+            gpu_type="RTX_4090",
+            gpu_count=1,
+            gpu_memory_gb=24.0,
+            reliability=0.99,
+            disk_gb=100,
+            costs=OfferCostBreakdown(total_per_hour_usd=0.412),
+            location="Poland",
+        ),
+        VastOffer(
+            id="9002",
+            machine_id="m2",
+            gpu_type="H100_SXM",
+            gpu_count=1,
+            gpu_memory_gb=80.0,
+            reliability=0.99,
+            disk_gb=100,
+            costs=OfferCostBreakdown(total_per_hour_usd=2.10),
+            location="Germany",
+        ),
+        VastOffer(
+            id="9003",
+            machine_id="m3",
+            gpu_type="A100_PCIE",
+            gpu_count=4,
+            gpu_memory_gb=80.0,
+            reliability=0.99,
+            disk_gb=100,
+            costs=OfferCostBreakdown(total_per_hour_usd=6.00),
+            location="USA"
+        ),
+    ]
 
 
 class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
@@ -231,6 +288,16 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             self.assertEqual(app.fetch_calls, ["downloads"])
+            # The picker is hidden until it has rows, so focus is handed over
+            # when the requested ranking arrives rather than before.
+            screen.on_llama_cpp_models_loaded(
+                LlamaCppModelsLoaded(
+                    mode="downloads",
+                    models=[ModelCandidate(repo_id="unsloth/Qwen3-32B-GGUF")],
+                )
+            )
+            await pilot.pause()
+
             self.assertTrue(model_list.has_focus)
 
     async def test_enter_on_quant_list_commits_and_exits_to_provider(self) -> None:
@@ -410,7 +477,7 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.fetch_calls, [])
             self.assertEqual(app.quant_fetch_calls, [("Qwen/Qwen2.5-Coder-7B-Instruct-GGUF", None)])
 
-    async def test_cached_mode_keeps_quant_list_filtered_after_metadata_lookup(self) -> None:
+    async def test_cached_mode_marks_stored_quants_without_hiding_the_rest(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:
             app.push_screen(LlamaCppDeployScreen())
@@ -448,12 +515,19 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             )
 
             quant_list = screen.query_one("#llama-quant-list", OptionList)
-            self.assertEqual(quant_list.option_count, 1)
-            self.assertIn("Q4_K_M", quant_list.get_option_at_index(0).prompt)
+            prompts = [
+                quant_list.get_option_at_index(index).prompt
+                for index in range(quant_list.option_count)
+            ]
+            self.assertEqual(len(prompts), 3)
+            self.assertTrue(any("Q3_K_S" in prompt for prompt in prompts))
+            self.assertTrue(any("Q5_K_M" in prompt for prompt in prompts))
+            cached_rows = [prompt for prompt in prompts if "in storage" in prompt]
+            self.assertEqual(len(cached_rows), 1)
+            self.assertIn("Q4_K_M", cached_rows[0])
 
             screen._lookup_quantizations_for_current_repo()
-            self.assertEqual(quant_list.option_count, 1)
-            self.assertIn("Q4_K_M", quant_list.get_option_at_index(0).prompt)
+            self.assertEqual(quant_list.option_count, 3)
 
     async def test_quants_loaded_shows_vram_in_option_list_and_status(self) -> None:
         app = _TestApp()
@@ -736,6 +810,7 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             debug_toggle = screen.query_one("#show-debug-logs-llama", Switch)
             self.assertFalse(debug_toggle.value)
 
+            screen.query_one("#repo-id", Input).value = "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF"
             for widget in screen.query(".llama-advanced"):
                 widget.remove_class("hidden")
             debug_toggle.value = True
@@ -805,6 +880,7 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             screen = app.screen
             assert isinstance(screen, LlamaCppDeployScreen)
 
+            screen.query_one("#repo-id", Input).value = "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF"
             screen.query_one("#instance-name-llama", Input).value = "Team Prod"
             screen._do_deploy()
             self.assertEqual(app.deployed_config.instance_name, "team-prod")
@@ -868,3 +944,186 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LlamaCppDeployFormPolishTests(unittest.IsolatedAsyncioTestCase):
+    """Behavior added while auditing the Advanced deploy flow."""
+
+    async def test_deploy_without_a_repo_id_is_refused(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+
+            screen._do_deploy()
+
+            self.assertIsNone(app.deployed_config)
+            self.assertIn(
+                ("Enter a Hugging Face repo-id before deploying.", "error"),
+                app.notifications,
+            )
+
+    async def test_switching_back_to_modal_drops_the_bound_prime_gpu(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+            screen.on_gpu_types_loaded(
+                GpuTypesLoaded(gpu_types=[ModalGpuSpec("A100-80GB", price_per_hour_usd=2.5)])
+            )
+            screen.on_prime_offers_loaded(PrimeOffersLoaded(offers=[_prime_offer()]))
+            await pilot.pause()
+
+            provider = screen.query_one("#provider-llama", Select)
+            provider.value = "prime"
+            await pilot.pause()
+            self.assertEqual(screen._selected_gpu_type, "RTX2000ADA_16GB")
+
+            provider.value = "modal"
+            await pilot.pause()
+            screen.on_gpu_types_loaded(
+                GpuTypesLoaded(gpu_types=[ModalGpuSpec("A100-80GB", price_per_hour_usd=2.5)])
+            )
+            await pilot.pause()
+
+            gpu_type = screen.query_one("#gpu-type-llama", Select)
+            self.assertEqual(screen._selected_gpu_type, "A100-80GB")
+            self.assertNotIn(
+                "RTX2000ADA_16GB", [value for _, value in gpu_type._options]
+            )
+
+    async def test_empty_storage_falls_back_to_the_downloads_ranking(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+            app.fetch_calls.clear()
+
+            screen.on_storage_loaded(
+                StorageLoaded(snapshot=StorageSnapshot(llamacpp_models=[], vllm_models=[]))
+            )
+            await pilot.pause()
+
+            self.assertEqual(screen._rank_mode, "downloads")
+            self.assertEqual(app.fetch_calls, ["downloads"])
+
+    async def test_a_hand_picked_ranking_is_never_replaced(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+            screen._rank_mode_touched = True
+            app.fetch_calls.clear()
+
+            screen.on_storage_loaded(
+                StorageLoaded(snapshot=StorageSnapshot(llamacpp_models=[], vllm_models=[]))
+            )
+            await pilot.pause()
+
+            self.assertEqual(screen._rank_mode, "cached")
+            self.assertEqual(app.fetch_calls, [])
+
+    async def test_empty_pickers_are_hidden_rather_than_drawn_empty(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+
+            model_list = screen.query_one("#llama-model-list", OptionList)
+            quant_list = screen.query_one("#llama-quant-list", OptionList)
+            self.assertTrue(model_list.has_class("hidden"))
+            self.assertTrue(quant_list.has_class("hidden"))
+
+            screen.on_llama_cpp_models_loaded(
+                LlamaCppModelsLoaded(
+                    mode="cached",
+                    models=[ModelCandidate(repo_id="unsloth/Qwen3-32B-GGUF")],
+                )
+            )
+            await pilot.pause()
+
+            self.assertFalse(model_list.has_class("hidden"))
+
+    async def test_long_repo_ids_keep_the_detail_column_aligned(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+            screen._rank_mode = "downloads"
+
+            screen.on_llama_cpp_models_loaded(
+                LlamaCppModelsLoaded(
+                    mode="downloads",
+                    models=[
+                        ModelCandidate(repo_id="unsloth/Qwen3-32B-GGUF", downloads=1, likes=2),
+                        ModelCandidate(
+                            repo_id="bartowski/Mistral-Small-24B-Instruct-2501-GGUF",
+                            downloads=3,
+                            likes=4,
+                        ),
+                    ],
+                )
+            )
+            await pilot.pause()
+
+            model_list = screen.query_one("#llama-model-list", OptionList)
+            columns = {
+                str(model_list.get_option_at_index(index).prompt).index("downloads=")
+                for index in range(model_list.option_count)
+            }
+            self.assertEqual(len(columns), 1)
+
+    async def test_vast_rental_binds_the_gpu_and_reaches_the_deploy_config(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+            screen.query_one("#repo-id", Input).value = "unsloth/Qwen3-32B-GGUF"
+
+            provider = screen.query_one("#provider-llama", Select)
+            self.assertIn("vast", [value for _, value in provider._options])
+
+            screen.on_vast_offers_loaded(VastOffersLoaded(offers=_vast_offers()))
+            provider.value = "vast"
+            await pilot.pause()
+
+            rentals = screen.query_one("#vast-offer-llama", Select)
+            # The four-GPU rental is filtered out: the Vast deploy path rents
+            # exactly one GPU.
+            self.assertEqual(
+                [value for _, value in rentals._options if isinstance(value, str)],
+                ["9001", "9002"],
+            )
+            self.assertTrue(screen.query_one("#gpu-type-llama", Select).disabled)
+            self.assertTrue(screen.query_one("#gpu-count-llama", Input).disabled)
+
+            screen._do_deploy()
+
+            config = app.deployed_config
+            self.assertIsNotNone(config)
+            self.assertEqual(config.provider, ComputeProvider.VAST)
+            self.assertEqual(config.gpu_type, "RTX_4090")
+            self.assertEqual(config.gpu_count, 1)
+            self.assertEqual(
+                config.provider_options,
+                VastProviderOptions(
+                    offer_id="9001",
+                    disk_gb=100,
+                    max_hourly_cost_usd=0.412,
+                    machine_id="m1",
+                ),
+            )

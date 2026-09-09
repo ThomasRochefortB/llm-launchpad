@@ -13,9 +13,9 @@ def clip(value: str, width: int) -> str:
     return f"{text[:width - 3]}..."
 
 
-def format_money(value: float) -> str:
-    """Render a USD amount with two decimals."""
-    return f"${value:,.2f}"
+def format_money(value: float, *, decimals: int = 2) -> str:
+    """Render a USD amount, allowing extra precision for per-unit rates."""
+    return f"${value:,.{decimals}f}"
 
 
 def format_gib(value: float) -> str:

@@ -19,6 +19,7 @@ from llm_launchpad.core.doctor import (
 from llm_launchpad.core.hf_auth import HuggingFaceAuthStatus
 from llm_launchpad.core.modal_auth import ModalAuthStatus
 from llm_launchpad.core.prime_auth import PrimeAuthStatus
+from llm_launchpad.core.vast_auth import VastCredentials
 from llm_launchpad.core.artificial_analysis import ArtificialAnalysisAuthStatus
 
 
@@ -62,6 +63,10 @@ class DoctorCheckLogicTests(unittest.TestCase):
 class RunDoctorChecksTests(unittest.TestCase):
     def setUp(self) -> None:
         patchers = [
+            mock.patch.object(
+                doctor_module, "resolve_vast_credentials",
+                return_value=VastCredentials("test-key", "stored"),
+            ),
             mock.patch.object(ModalBackend, "is_cli_available", return_value=True),
             mock.patch.object(
                 doctor_module,
@@ -99,6 +104,17 @@ class RunDoctorChecksTests(unittest.TestCase):
         self.assertIn("Hugging Face auth", by_name)
         self.assertIn("Debug log", by_name)
         self.assertEqual(doctor_exit_code(checks), 0)
+
+    def test_missing_vast_key_is_optional_and_does_not_contact_api(self) -> None:
+        with mock.patch.object(doctor_module, "resolve_vast_credentials", return_value=VastCredentials()), mock.patch(
+            "llm_launchpad.core.vast_backend.requests.request"
+        ) as request:
+            checks = run_doctor_checks(settings_dir=Path(tempfile.gettempdir()))
+        vast = next(check for check in checks if check.name == "Vast.ai key")
+        self.assertFalse(vast.ok)
+        self.assertFalse(vast.required)
+        self.assertEqual(doctor_exit_code(checks), 0)
+        request.assert_not_called()
 
     def test_missing_modal_cli_reports_hint(self) -> None:
         with mock.patch.object(ModalBackend, "is_cli_available", return_value=False):

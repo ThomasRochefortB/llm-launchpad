@@ -37,6 +37,7 @@ class TuiAuditInteractionTests(unittest.IsolatedAsyncioTestCase):
             screen = LlamaCppDeployScreen()
             app.push_screen(screen)
             await pilot.pause()
+            screen.query_one("#repo-id", Input).value = "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF"
             await pilot.press("ctrl+d")
             self.assertIsNone(app.deployed_config)
             await pilot.resize_terminal(80, 24)
@@ -59,34 +60,30 @@ class TuiAuditInteractionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.clipboard, "https://example.test/v1")
             self.assertIs(app.screen, screen)
 
-    async def test_invalid_advanced_llamacpp_numbers_do_not_start_deploy(self) -> None:
-        for field, value in (
-            ("port-input", "abc"), ("port-input", "0"),
-            ("port-input", "65536"), ("n-gpu-layers", "abc"),
+    async def test_invalid_deploy_numbers_do_not_start_deploy(self) -> None:
+        for screen_type, app_factory, cases in (
+            (LlamaCppDeployScreen, LlamaApp, (
+                ("port-input", "abc"), ("port-input", "0"),
+                ("port-input", "65536"), ("n-gpu-layers", "abc"),
+            )),
+            (VllmDeployScreen, VllmApp, (
+                ("n-gpu", "abc"), ("n-gpu", "0"), ("n-gpu", "-1"),
+            )),
         ):
-            with self.subTest(field=field, value=value):
-                app = LlamaApp()
+            with self.subTest(screen=screen_type.__name__):
+                app = app_factory()
                 async with app.run_test() as pilot:
-                    screen = LlamaCppDeployScreen()
+                    screen = screen_type()
                     app.push_screen(screen)
                     await pilot.pause()
-                    screen.query_one(f"#{field}", Input).value = value
-                    await pilot.press("ctrl+d")
-                    self.assertIsNone(app.deployed_config)
-                    self.assertTrue(app.notifications)
-
-    async def test_invalid_tensor_parallel_does_not_start_deploy(self) -> None:
-        for value in ("abc", "0", "-1"):
-            with self.subTest(value=value):
-                app = VllmApp()
-                async with app.run_test() as pilot:
-                    screen = VllmDeployScreen()
-                    app.push_screen(screen)
-                    await pilot.pause()
-                    screen.query_one("#n-gpu", Input).value = value
-                    await pilot.press("ctrl+d")
-                    self.assertIsNone(app.deployed_config)
-                    self.assertTrue(app.notifications)
+                    for field, value in cases:
+                        with self.subTest(field=field, value=value):
+                            screen.query_one(f"#{field}", Input).value = value
+                            await pilot.press("ctrl+d")
+                            self.assertIsNone(app.deployed_config)
+                            self.assertTrue(app.notifications)
+                            app.notifications.clear()
+                            app.deployed_config = None
 
     async def test_storage_error_is_displayed_as_literal_text(self) -> None:
         app = StorageApp()
