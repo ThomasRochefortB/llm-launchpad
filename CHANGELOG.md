@@ -10,7 +10,7 @@ and this project follows [Semantic Versioning](https://semver.org/).
 ### Added
 - Vast.ai rentals (beta): Fast Deploy quotes, GPU filters, and serving-tier competition for verified on-demand NVIDIA offers. Supported single-GPU, text-only llama.cpp GGUF placements can be rented; the endpoint is a loopback SSH tunnel on this computer. Multi-GPU and unsupported-runtime offers remain comparisons. Stop destroys the rental and its disk. No real Vast host has been live-certified yet.
 - `llm-launchpad vast-auth` (login/status/logout), `vast connect`, `offers --provider vast`, and `--provider vast` on deploy/list/status/logs/stop. `doctor` reports a local Vast key as optional and does not authenticate it over the network.
-- Advanced deploy can bind a selected Vast rental on llama.cpp and vLLM (tensor parallel stays 1). Disk size is quoted with the GPU.
+- Advanced deploy can bind a selected Vast rental on llama.cpp. Disk size is quoted with the GPU.
 - Docs for the beta and the broader release plan: `docs/vast.md`, `docs/vast-integration-plan.md`.
 - Added an always-on rotating debug log under `~/.llm_launchpad/logs/` and routed previously silent failure paths (cache persistence, auth probing, log-tail cleanup, SSH key permissions) to it.
 - Added `llm-launchpad doctor`, a self-check command that verifies the Modal CLI, Modal/Prime/Hugging Face authentication, the optional Artificial Analysis key, and state-directory writability, with fix hints per failure.
@@ -19,6 +19,8 @@ and this project follows [Semantic Versioning](https://semver.org/).
 - Added GitHub issue templates for bug reports and feature requests.
 
 ### Changed
+- Multi-GPU llama.cpp placements no longer predict faster single-request decoding. The estimate previously assumed roughly 1.6x more decode speed per extra GPU, but llama.cpp splits layers across devices by default, so one request walks them in sequence: extra GPUs buy memory, not speed. **This affects Modal and Prime as well as Vast** -- a multi-GPU placement that previously appeared in the Fastest or Balanced tier on that estimate may now rank lower. Measured attestations are unaffected and still take precedence.
+- Deploy forms and `llm-launchpad deploy` now refuse a configuration its provider cannot run before anything is allocated, rather than failing after the deployment has been routed. Vast.ai previously accepted vLLM, vision, and pinned-revision configurations in the Advanced deploy form and rejected them later.
 - Vision option fields keep visible labels, and projector/image details hide when vision is set to text only.
 
 ### Fixed
