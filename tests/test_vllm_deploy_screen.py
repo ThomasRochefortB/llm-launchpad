@@ -16,7 +16,6 @@ from llm_launchpad.protocol.models import (
     StorageSnapshot,
     StoredModelInfo,
     VastOffer,
-    VastProviderOptions,
 )
 from llm_launchpad.tui.screens.deploy import (
     GpuTypesLoaded,
@@ -1035,7 +1034,7 @@ class VllmDeployFormPolishTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(screen._rank_mode, "downloads")
             self.assertEqual(app.fetch_calls, ["downloads"])
 
-    async def test_vast_rental_binds_a_single_gpu_and_reaches_the_config(self) -> None:
+    async def test_vast_vllm_is_refused_in_the_form_without_building_a_config(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:
             app.push_screen(VllmDeployScreen())
@@ -1060,20 +1059,12 @@ class VllmDeployFormPolishTests(unittest.IsolatedAsyncioTestCase):
 
             screen._do_deploy()
 
-            config = app.deployed_config
-            self.assertIsNotNone(config)
-            self.assertEqual(config.provider, ComputeProvider.VAST)
-            self.assertEqual(config.gpu_type, "RTX_4090")
-            self.assertEqual(config.gpu_count, 1)
-            self.assertEqual(config.n_gpu, 1)
-            self.assertEqual(
-                config.provider_options,
-                VastProviderOptions(
-                    offer_id="9001",
-                    disk_gb=100,
-                    max_hourly_cost_usd=0.412,
-                    machine_id="m1",
-                ),
+            # Vast serves llama.cpp only, so the form must refuse here rather
+            # than let the deploy fail after routing. WP3 flips this back.
+            self.assertIsNone(app.deployed_config)
+            self.assertTrue(
+                any("vLLM" in message for message, _ in app.notifications),
+                app.notifications,
             )
 
     async def test_smoke_test_only_is_refused_for_vast(self) -> None:

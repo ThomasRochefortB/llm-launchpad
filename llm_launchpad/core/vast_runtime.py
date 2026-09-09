@@ -1,5 +1,6 @@
 """Pinned llama.cpp runtime and streaming verification for Vast rentals."""
 
+from dataclasses import dataclass
 import json
 import shlex
 import time
@@ -7,7 +8,6 @@ import time
 from huggingface_hub import get_token
 import requests
 
-from ..protocol.enums import BackendType
 from ..protocol.models import DeploymentConfig
 from .runtime_support import load_llamacpp_support_manifest
 
@@ -18,18 +18,46 @@ VAST_RUNTIME_DIR = "/root/.llm-launchpad"
 VAST_MIN_CUDA_VERSION = 12.8
 
 
-def vast_runtime_image(config: DeploymentConfig) -> str:
-    """Resolve a digest-pinned runtime before allocating a rental."""
-    if config.backend != BackendType.LLAMACPP or config.gpu_count != 1:
-        raise ValueError("Vast deployment currently supports single-GPU llama.cpp only.")
-    if not config.repo_id or not config.quant or config.revision:
-        raise ValueError("Vast requires a GGUF repository and quant on the default revision.")
-    if config.vision is not None and config.vision.enabled:
-        raise ValueError("Vast deployment currently supports text models only.")
+@dataclass(frozen=True)
+class VastRuntime:
+    """A pinned image and the driver floor that image was built against."""
+
+    image: str
+    min_cuda_version: float
+
+
+def vast_refusal(config: DeploymentConfig) -> str | None:
+    """Explain why a Vast rental cannot serve this configuration, or None.
+
+    Provider-level checks (backend, vision, revision, GPU count) live in
+    ``core/providers.py``; this covers what only the Vast runtime knows.
+    """
+
+    if not config.repo_id or not config.quant:
+        return "Vast requires a GGUF repository and quant."
     manifest = load_llamacpp_support_manifest(config.gguf_architecture)
     if manifest.build_recipe or not manifest.image_digest.startswith("sha256:"):
-        raise ValueError("Vast requires a published, digest-pinned runtime image for this architecture.")
-    return manifest.image_ref.split("@")[0] + "@" + manifest.image_digest
+        return "Vast requires a published, digest-pinned runtime image for this architecture."
+    return None
+
+
+def vast_runtime(config: DeploymentConfig) -> VastRuntime:
+    """Resolve a digest-pinned runtime before allocating a rental."""
+    from .providers import refuse
+
+    reason = refuse(config)
+    if reason:
+        raise ValueError(reason)
+    manifest = load_llamacpp_support_manifest(config.gguf_architecture)
+    return VastRuntime(
+        image=manifest.image_ref.split("@")[0] + "@" + manifest.image_digest,
+        min_cuda_version=VAST_MIN_CUDA_VERSION,
+    )
+
+
+def vast_runtime_image(config: DeploymentConfig) -> str:
+    """Return only the pinned image reference for this configuration."""
+    return vast_runtime(config).image
 
 
 def vast_runtime_script(config: DeploymentConfig) -> str:

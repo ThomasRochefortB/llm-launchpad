@@ -46,6 +46,7 @@ from ...core.prime_backend import (
     preferred_prime_offer_image,
 )
 from ...core.reasoning_profiles import discover_reasoning_capabilities
+from ...core.providers import refuse as refuse_deployment
 from ...core.vast_backend import VastBackend
 from ...protocol.enums import BackendType, ComputeProvider
 from ...protocol.models import (
@@ -1428,6 +1429,12 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         except ValueError as exc:
             self.app.notify(str(exc), severity="error", timeout=8)
             return
+        # Refuse here rather than after routing, so the form never accepts a
+        # configuration its provider will reject.
+        reason = refuse_deployment(config)
+        if reason:
+            self.app.notify(reason, severity="error", timeout=8)
+            return
         self.app.begin_deploy(config)  # type: ignore[attr-defined]
 
     def _focus_model_list_if_pending(self) -> None:
@@ -2733,6 +2740,12 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
             self.query_one(VisionOptions).apply(config)
         except ValueError as exc:
             self.app.notify(str(exc), severity="error", timeout=8)
+            return
+        # Refuse here rather than after routing, so the form never accepts a
+        # configuration its provider will reject.
+        reason = refuse_deployment(config)
+        if reason:
+            self.app.notify(reason, severity="error", timeout=8)
             return
         self.app.begin_deploy(config)  # type: ignore[attr-defined]
 

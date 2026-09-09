@@ -18,7 +18,7 @@ from .naming import infer_instance_from_app_name
 from .operation_events import fail_operation
 from .shutdown import is_shutting_down
 from .vast_backend import VastApiError, VastBackend
-from .vast_runtime import VAST_MIN_CUDA_VERSION, VAST_RUNTIME_DIR, endpoint_healthy, vast_runtime_image, vast_runtime_script, verify_endpoint_auth, verify_streaming
+from .vast_runtime import VAST_RUNTIME_DIR, endpoint_healthy, vast_runtime, vast_runtime_script, verify_endpoint_auth, verify_streaming
 from .vast_ssh import VastSsh
 from .vast_state import VastState
 
@@ -105,9 +105,8 @@ class VastDeploymentBackend:
         record: VastDeploymentRecord | None = None
         completed = False
         try:
-            if not config.do_deploy:
-                raise ValueError("Vast has no preload-only operation; select Deploy to rent an instance.")
-            image = vast_runtime_image(config)
+            runtime = vast_runtime(config)
+            image = runtime.image
             if not math.isfinite(options.max_hourly_cost_usd) or options.max_hourly_cost_usd <= 0:
                 raise ValueError("Vast requires a positive maximum hourly price.")
             ok, account, error = self.preflight()
@@ -124,8 +123,8 @@ class VastDeploymentBackend:
             ))
             if options.machine_id and offer.machine_id != options.machine_id:
                 raise ValueError("The selected Vast machine has changed. Refresh offers.")
-            if offer.cuda_max_good is None or offer.cuda_max_good < VAST_MIN_CUDA_VERSION:
-                raise ValueError(f"The pinned Vast runtime requires a host reporting CUDA {VAST_MIN_CUDA_VERSION} or newer.")
+            if offer.cuda_max_good is None or offer.cuda_max_good < runtime.min_cuda_version:
+                raise ValueError(f"The pinned Vast runtime requires a host reporting CUDA {runtime.min_cuda_version} or newer.")
             price = offer.costs.total_per_hour_usd
             if price is None or price > options.max_hourly_cost_usd + 1e-9:
                 raise ValueError("The Vast hourly total is unknown or exceeds the approved price. Refresh offers.")

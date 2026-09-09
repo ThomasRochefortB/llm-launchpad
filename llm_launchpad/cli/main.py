@@ -49,6 +49,7 @@ from ..core.naming import (
     slugify_instance_name,
 )
 from ..core.prime_backend import PrimeBackend
+from ..core.providers import refuse as refuse_deployment
 from ..core.vast_auth import resolve_vast_credentials
 from ..core.vast_deployment import VastDeploymentBackend
 from ..core.prime_auth import get_prime_auth_status
@@ -1010,6 +1011,11 @@ def deploy(
 
     if compute_provider == ComputeProvider.VAST:
         config.gpu_count = gpu_count or 1
+    # Refuse before preflight spends anything, with the same sentence the TUI shows.
+    reason = refuse_deployment(config)
+    if reason:
+        typer.secho(reason, fg=typer.colors.RED, err=True)
+        raise typer.Exit(code=2)
     _deploy_and_maybe_warmup(
         orch,
         username=username,
