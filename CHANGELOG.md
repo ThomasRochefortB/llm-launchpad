@@ -8,7 +8,7 @@ and this project follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
-- Vast.ai rentals (beta): Fast Deploy quotes, GPU filters, and serving-tier competition for verified on-demand NVIDIA offers. Supported single-GPU, text-only llama.cpp GGUF placements can be rented; the endpoint is a loopback SSH tunnel on this computer. Multi-GPU and unsupported-runtime offers remain comparisons. Stop destroys the rental and its disk. No real Vast host has been live-certified yet.
+- Vast.ai rentals (beta): Fast Deploy quotes, GPU filters, and serving-tier competition for verified on-demand NVIDIA offers. Supported text-only llama.cpp GGUF placements on one to eight GPUs can be rented; the endpoint is a loopback SSH tunnel on this computer. Offers whose runtime is unsupported remain comparisons. A rented host's GPUs are inventoried over SSH before serving, so a bundle with a different device count, mixed GPU models, or too little free memory per device is refused and destroyed. Stop destroys the rental and its disk.
 - `llm-launchpad vast-auth` (login/status/logout), `vast connect`, `offers --provider vast`, and `--provider vast` on deploy/list/status/logs/stop. `doctor` reports a local Vast key as optional and does not authenticate it over the network.
 - Advanced deploy can bind a selected Vast rental on llama.cpp. Disk size is quoted with the GPU.
 - Docs for the beta and the broader release plan: `docs/vast.md`, `docs/vast-integration-plan.md`.

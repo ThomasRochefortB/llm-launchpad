@@ -1,5 +1,6 @@
 """Pinned llama.cpp runtime and streaming verification for Vast rentals."""
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 import json
 import shlex
@@ -16,6 +17,80 @@ VAST_RUNTIME_DIR = "/root/.llm-launchpad"
 # native driver support instead of assuming CUDA forward compatibility on
 # arbitrary marketplace GPUs. Recheck this alongside runtime image updates.
 VAST_MIN_CUDA_VERSION = 12.8
+# Vast bundles at most eight GPUs; the offer search already asks for that range.
+VAST_MAX_GPU_COUNT = 8
+
+GPU_INVENTORY_COMMAND = (
+    "nvidia-smi --query-gpu=index,name,memory.total,memory.used "
+    "--format=csv,noheader,nounits"
+)
+
+
+@dataclass(frozen=True)
+class GpuDevice:
+    """One GPU as the rented host actually reports it."""
+
+    index: int
+    name: str
+    memory_total_mib: int
+    memory_used_mib: int
+
+    @property
+    def memory_free_gib(self) -> float:
+        return max(0, self.memory_total_mib - self.memory_used_mib) / 1024
+
+
+def parse_gpu_inventory(output: str) -> tuple[GpuDevice, ...]:
+    """Parse nvidia-smi CSV. Malformed rows are dropped, never guessed at."""
+    devices: list[GpuDevice] = []
+    for line in output.splitlines():
+        fields = [field.strip() for field in line.split(",")]
+        if len(fields) != 4:
+            continue
+        try:
+            devices.append(
+                GpuDevice(
+                    index=int(fields[0]),
+                    name=fields[1],
+                    memory_total_mib=int(fields[2]),
+                    memory_used_mib=int(fields[3]),
+                )
+            )
+        except ValueError:
+            continue
+    return tuple(sorted(devices, key=lambda device: device.index))
+
+
+def verify_gpu_topology(
+    devices: Sequence[GpuDevice], *, gpu_count: int, per_device_required_gb: float
+) -> None:
+    """Refuse a rental whose real devices do not match the approved placement.
+
+    An offer advertises one GPU model and one memory size for every device it
+    bundles. That is an assumption the memory plan divides by, not a promise,
+    so confirm it against the host before serving anything.
+    """
+
+    if not devices:
+        raise ValueError("The Vast host did not report any GPUs.")
+    if len(devices) != gpu_count:
+        raise ValueError(
+            f"Vast rented {gpu_count} GPUs but the host exposes {len(devices)}."
+        )
+    names = {device.name.strip().casefold() for device in devices}
+    if len(names) > 1:
+        listed = ", ".join(sorted(device.name.strip() for device in devices))
+        raise ValueError(
+            f"This Vast host mixes GPU models ({listed}); the memory plan assumes identical devices."
+        )
+    if per_device_required_gb > 0:
+        starved = min(devices, key=lambda device: device.memory_free_gib)
+        if starved.memory_free_gib < per_device_required_gb:
+            raise ValueError(
+                f"GPU {starved.index} has {starved.memory_free_gib:.1f} GiB free of "
+                f"{starved.memory_total_mib / 1024:.1f} GiB; the plan needs "
+                f"{per_device_required_gb:.1f} GiB per device."
+            )
 
 
 @dataclass(frozen=True)

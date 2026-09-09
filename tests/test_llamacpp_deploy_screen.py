@@ -1102,12 +1102,15 @@ class LlamaCppDeployFormPolishTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             rentals = screen.query_one("#vast-offer-llama", Select)
-            # The four-GPU rental is filtered out: the Vast deploy path rents
-            # exactly one GPU.
+            # Multi-GPU bundles are rentable, and the cheapest fit is offered
+            # first with its topology spelled out.
             self.assertEqual(
                 [value for _, value in rentals._options if isinstance(value, str)],
-                ["9001", "9002"],
+                ["9001", "9002", "9003"],
             )
+            labels = [label for label, _ in rentals._options if isinstance(label, str)]
+            self.assertTrue(any("4x A100_PCIE" in label for label in labels), labels)
+            self.assertTrue(any("320 GB total" in label for label in labels), labels)
             self.assertTrue(screen.query_one("#gpu-type-llama", Select).disabled)
             self.assertTrue(screen.query_one("#gpu-count-llama", Input).disabled)
 
@@ -1125,5 +1128,32 @@ class LlamaCppDeployFormPolishTests(unittest.IsolatedAsyncioTestCase):
                     disk_gb=100,
                     max_hourly_cost_usd=0.412,
                     machine_id="m1",
+                    gpu_count=1,
                 ),
             )
+
+    async def test_selecting_a_multi_gpu_rental_binds_its_whole_topology(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+            screen.query_one("#repo-id", Input).value = "unsloth/Qwen3-32B-GGUF"
+
+            screen.on_vast_offers_loaded(VastOffersLoaded(offers=_vast_offers()))
+            screen.query_one("#provider-llama", Select).value = "vast"
+            await pilot.pause()
+            screen.query_one("#vast-offer-llama", Select).value = "9003"
+            await pilot.pause()
+
+            self.assertEqual(screen.query_one("#gpu-count-llama", Input).value, "4")
+
+            screen._do_deploy()
+
+            config = app.deployed_config
+            self.assertIsNotNone(config)
+            self.assertEqual(config.gpu_count, 4)
+            self.assertEqual(config.gpu_type, "A100_PCIE")
+            assert isinstance(config.provider_options, VastProviderOptions)
+            self.assertEqual(config.provider_options.gpu_count, 4)

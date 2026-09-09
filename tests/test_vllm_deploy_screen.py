@@ -1053,7 +1053,7 @@ class VllmDeployFormPolishTests(unittest.IsolatedAsyncioTestCase):
             rentals = screen.query_one("#vast-offer-vllm", Select)
             self.assertEqual(
                 [value for _, value in rentals._options if isinstance(value, str)],
-                ["9001"],
+                ["9001", "9003"],
             )
             self.assertTrue(screen.query_one("#n-gpu", Input).disabled)
 

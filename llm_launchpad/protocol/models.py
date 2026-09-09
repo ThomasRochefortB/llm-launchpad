@@ -43,6 +43,10 @@ class VastProviderOptions:
     disk_gb: int
     max_hourly_cost_usd: float
     machine_id: str | None = None
+    # None means the offer's own count is authoritative, which is what the CLI
+    # can promise without a lookup. An integer is a shape the user approved,
+    # and a rental that no longer matches it is refused like a price increase.
+    gpu_count: int | None = None
 
 
 ProviderOptions = ModalProviderOptions | PrimeProviderOptions | VastProviderOptions

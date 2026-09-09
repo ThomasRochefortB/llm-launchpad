@@ -4,7 +4,14 @@ from dataclasses import replace
 import unittest
 
 from llm_launchpad.core.providers import capabilities, refuse
-from llm_launchpad.core.vast_runtime import vast_refusal, vast_runtime, vast_runtime_image
+from llm_launchpad.core.vast_runtime import (
+    GpuDevice,
+    parse_gpu_inventory,
+    vast_refusal,
+    vast_runtime,
+    vast_runtime_image,
+    verify_gpu_topology,
+)
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider
 from llm_launchpad.protocol.models import (
     DeploymentConfig,
@@ -56,10 +63,12 @@ class VastRefusalTests(unittest.TestCase):
         self.assertIsNotNone(reason)
         self.assertIn("default HF revision", reason or "")
 
-    def test_multi_gpu_is_refused_while_the_beta_is_single_gpu(self) -> None:
-        reason = refuse(config(gpu_count=2))
+    def test_multi_gpu_is_allowed_up_to_the_bundle_ceiling(self) -> None:
+        for count in (1, 2, 4, 8):
+            self.assertIsNone(refuse(config(gpu_count=count)), count)
+        reason = refuse(config(gpu_count=9))
         self.assertIsNotNone(reason)
-        self.assertIn("single GPU", reason or "")
+        self.assertIn("at most 8 GPUs", reason or "")
 
     def test_preload_only_is_refused_because_a_rental_must_serve(self) -> None:
         reason = refuse(config(do_deploy=False))
@@ -105,3 +114,53 @@ class ProviderCapabilityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GpuInventoryTests(unittest.TestCase):
+    def test_parses_nvidia_smi_rows_in_device_order(self) -> None:
+        devices = parse_gpu_inventory(
+            "1, NVIDIA A100-PCIE-80GB, 81920, 512\n0, NVIDIA A100-PCIE-80GB, 81920, 0"
+        )
+        self.assertEqual([device.index for device in devices], [0, 1])
+        self.assertAlmostEqual(devices[0].memory_free_gib, 80.0)
+
+    def test_malformed_output_yields_no_devices_rather_than_a_guess(self) -> None:
+        for output in ("", "no devices found", "0, GPU, notanumber, 0", "0, GPU, 100"):
+            self.assertEqual(parse_gpu_inventory(output), ())
+
+
+def device(index: int, name: str = "NVIDIA RTX 4090", total: int = 24564, used: int = 0) -> GpuDevice:
+    return GpuDevice(index=index, name=name, memory_total_mib=total, memory_used_mib=used)
+
+
+class TopologyVerificationTests(unittest.TestCase):
+    def test_matching_homogeneous_devices_pass(self) -> None:
+        verify_gpu_topology(
+            [device(0), device(1)], gpu_count=2, per_device_required_gb=20.0
+        )
+
+    def test_a_host_reporting_no_gpus_is_refused(self) -> None:
+        with self.assertRaisesRegex(ValueError, "did not report any GPUs"):
+            verify_gpu_topology([], gpu_count=1, per_device_required_gb=0.0)
+
+    def test_a_device_count_that_differs_from_the_rental_is_refused(self) -> None:
+        with self.assertRaisesRegex(ValueError, "rented 2 GPUs but the host exposes 1"):
+            verify_gpu_topology([device(0)], gpu_count=2, per_device_required_gb=0.0)
+
+    def test_mixed_gpu_models_are_refused_because_the_plan_divides_evenly(self) -> None:
+        with self.assertRaisesRegex(ValueError, "mixes GPU models"):
+            verify_gpu_topology(
+                [device(0), device(1, name="NVIDIA RTX 3090")],
+                gpu_count=2,
+                per_device_required_gb=0.0,
+            )
+
+    def test_a_device_without_enough_free_memory_is_refused(self) -> None:
+        # A leftover process on one card is invisible in the offer listing.
+        with self.assertRaisesRegex(ValueError, "GPU 1 has"):
+            verify_gpu_topology(
+                [device(0), device(1, used=20000)],
+                gpu_count=2,
+                per_device_required_gb=20.0,
+            )
+

@@ -864,7 +864,7 @@ def offers(
 
 @app.command()
 def deploy(
-    vast_offer_id: str | None = typer.Option(None, help="Exact Vast offer to rent (single-GPU llama.cpp)."),
+    vast_offer_id: str | None = typer.Option(None, help="Exact Vast offer to rent."),
     vast_disk_gb: int = typer.Option(100, min=1, help="Vast disk allocation in GB."),
     max_hourly_cost: float | None = typer.Option(None, min=0.001, help="Maximum Vast hourly total including disk; required for Vast."),
     vision: VisionMode = typer.Option(VisionMode.AUTO, help="Image input: auto, on, or off"),

@@ -13,7 +13,7 @@ from .llamacpp_planner import assess_memory_placement
 from .quick_deploy import QuickDeployModel, QuickDeployProfile, quick_deploy_recipe
 from .inference_options import estimate_monthly_compute_cost
 from .runtime_support import load_llamacpp_support_manifest
-from .vast_runtime import VAST_MIN_CUDA_VERSION
+from .vast_runtime import VAST_MAX_GPU_COUNT, VAST_MIN_CUDA_VERSION
 
 
 def vast_gpu_label(offer: VastOffer) -> str:
@@ -22,21 +22,23 @@ def vast_gpu_label(offer: VastOffer) -> str:
 
 
 def vast_plan_for_offer(row: VastModelOffer, profile: QuickDeployProfile) -> InferencePlan | None:
-    """Promote the supported single-GPU runtime to a deployable local endpoint."""
+    """Promote a supported runtime to a deployable local endpoint."""
     price = row.costs.total_per_hour_usd
     manifest = load_llamacpp_support_manifest(profile.gguf_architecture)
-    if row.offer.gpu_count != 1 or price is None or price <= 0 or manifest.build_recipe:
+    if not 1 <= row.offer.gpu_count <= VAST_MAX_GPU_COUNT or price is None or price <= 0 or manifest.build_recipe:
         return None
     if row.offer.cuda_max_good is None or row.offer.cuda_max_good < VAST_MIN_CUDA_VERSION:
         return None
     quote = ProviderQuote(
         id=row.id.replace(":comparison:", ":deploy:"), recipe_id=row.recipe.id,
         provider=ComputeProvider.VAST, provider_reference=row.offer.id,
-        gpu_type=row.offer.gpu_type, gpu_count=1, gpu_memory_gb=row.offer.gpu_memory_gib,
+        gpu_type=row.offer.gpu_type, gpu_count=row.offer.gpu_count, gpu_memory_gb=row.offer.gpu_memory_gib,
         price_per_hour_usd=price, billing_model=BillingModel.PROVISIONED,
         availability=QuoteAvailability.AVAILABLE, region=row.offer.location,
         security="datacenter" if row.offer.datacenter else "verified marketplace",
-        provider_options=VastProviderOptions(row.offer.id, row.disk_gb, price, row.offer.machine_id),
+        provider_options=VastProviderOptions(
+            row.offer.id, row.disk_gb, price, row.offer.machine_id, row.offer.gpu_count
+        ),
         is_estimate=True,
     )
     return InferencePlan(

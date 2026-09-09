@@ -60,7 +60,13 @@ class VastLifecycleTests(unittest.TestCase):
         self.addCleanup(ssh_patch.stop)
         self.ssh.public_key.return_value = "ssh-ed25519 PUBLICKEY"
         self.ssh.connected.return_value = True
-        self.ssh.run.return_value = ""
+        # The rented host answers the inventory probe; every other command is
+        # whatever a test wants the remote shell to say.
+        self.gpu_inventory = "0, NVIDIA GeForce RTX 4090, 24564, 12"
+        self.ssh_output = ""
+        self.ssh.run.side_effect = lambda instance, command, **kwargs: (
+            self.gpu_inventory if "nvidia-smi" in command else self.ssh_output
+        )
         stream_patch = patch("llm_launchpad.core.vast_deployment.verify_streaming")
         self.stream = stream_patch.start()
         self.addCleanup(stream_patch.stop)
@@ -124,6 +130,37 @@ class VastLifecycleTests(unittest.TestCase):
             self.api.get_offer.return_value = vast_offer(cuda_max_good=version)
             self.assertFalse(self.deploy().success)
         self.api.create_instance.assert_not_called()
+
+    def test_a_host_whose_topology_differs_from_the_rental_is_refused(self) -> None:
+        self.api.get_offer.return_value = vast_offer(num_gpus=2)
+        self.config.provider_options = replace(self.config.provider_options, gpu_count=2)
+        # Rented two, host shows one.
+        self.assertFalse(self.deploy().success)
+        self.api.destroy_instance.assert_called_once_with("900")
+        self.assertEqual(self.state.records(), [])
+        self.stream.assert_not_called()
+
+    def test_a_host_that_mixes_gpu_models_is_refused(self) -> None:
+        self.api.get_offer.return_value = vast_offer(num_gpus=2)
+        self.config.provider_options = replace(self.config.provider_options, gpu_count=2)
+        self.gpu_inventory = (
+            "0, NVIDIA GeForce RTX 4090, 24564, 12\n1, NVIDIA GeForce RTX 3090, 24564, 12"
+        )
+        event = self.deploy()
+        self.assertFalse(event.success)
+        self.assertIn("mixes GPU models", event.detail or "")
+        self.api.destroy_instance.assert_called_once_with("900")
+
+    def test_a_multi_gpu_rental_serves_once_its_devices_match(self) -> None:
+        self.api.get_offer.return_value = vast_offer(num_gpus=2)
+        self.config.provider_options = replace(self.config.provider_options, gpu_count=2)
+        self.gpu_inventory = (
+            "0, NVIDIA GeForce RTX 4090, 24564, 12\n1, NVIDIA GeForce RTX 4090, 24564, 12"
+        )
+        event = self.deploy()
+        self.assertTrue(event.success, event.detail)
+        self.assertEqual(self.config.gpu_count, 2)
+        self.assertEqual(self.api.get_offer.call_args.args[1].gpu_count, 2)
 
     def test_stream_failure_destroys_instance_and_does_not_publish(self) -> None:
         self.stream.side_effect = RuntimeError("stream failed")
@@ -220,7 +257,7 @@ class VastLifecycleTests(unittest.TestCase):
 
     def test_logs_redact_credentials(self) -> None:
         self.assertTrue(self.deploy().success)
-        self.ssh.run.return_value = f"{self.config.endpoint_api_key} hf_private123\nloaded"
+        self.ssh_output = f"{self.config.endpoint_api_key} hf_private123\nloaded"
         lines = self.backend.logs("900")
         self.assertEqual(lines, ["[redacted] [redacted]", "loaded"])
 
@@ -269,7 +306,11 @@ class VastTransportTests(unittest.TestCase):
         self.assertNotIn("--api-key", script)
         self.assertIn("export LLAMA_API_KEY=private-key", script)
         self.assertIn("export LD_LIBRARY_PATH=/app:", script)
+        # Multi-GPU rentals share the pinned image; only shapes Vast cannot
+        # bundle are refused.
         candidate.gpu_count = 2
+        self.assertIn("@sha256:", vast_runtime_image(candidate))
+        candidate.gpu_count = 9
         with self.assertRaises(ValueError):
             vast_runtime_image(candidate)
 

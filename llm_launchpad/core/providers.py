@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 
 from ..protocol.enums import BackendType, ComputeProvider
 from ..protocol.models import DeploymentConfig, EndpointInfo
+from .vast_runtime import VAST_MAX_GPU_COUNT
 
 
 @dataclass(frozen=True)
@@ -68,7 +69,7 @@ _CAPABILITIES: dict[ComputeProvider, DeploymentCapabilities] = {
     ComputeProvider.VAST: DeploymentCapabilities(
         provider=ComputeProvider.VAST,
         backends=frozenset({BackendType.LLAMACPP}),
-        max_gpu_count=1,
+        max_gpu_count=VAST_MAX_GPU_COUNT,
         supports_vision=False,
         supports_preload_only=False,
         supports_smoke_test_only=False,

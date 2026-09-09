@@ -52,9 +52,16 @@ class VastModelComparisonTests(unittest.TestCase):
         rows = infra_rows_for_model(comparison_model(), snapshot)
         tiers = serving_tiers([row.plan for row in rows], ServingObjective.GENERAL_PURPOSE)
         economy = next(tier for tier in tiers if tier.key == "economy")
+        # A cheaper multi-GPU bundle is deployable and wins on price. These
+        # rows used to be shown but not rentable, which is what made the
+        # cheapest offers on the screen unreachable.
         self.assertEqual(economy.plan.quote.provider, ComputeProvider.VAST)
-        self.assertEqual(economy.price_per_hour_usd, 0.42)
-        self.assertTrue(all(row.plan.quote.gpu_count == 1 for row in rows))
+        self.assertEqual(economy.price_per_hour_usd, 0.2)
+        self.assertEqual(economy.plan.quote.gpu_count, 2)
+        self.assertEqual(
+            {row.plan.quote.gpu_count for row in rows if row.plan.quote.provider == ComputeProvider.VAST},
+            {1, 2},
+        )
 
     def test_search_includes_single_and_multi_gpu_topologies(self) -> None:
         query = VastOfferQuery(gpu_count=None, limit=500)
@@ -183,11 +190,14 @@ class VastAvailabilityTests(unittest.TestCase):
 
 
 class VastFastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
-    async def test_single_gpu_is_deployable_and_multi_gpu_stays_a_comparison(self) -> None:
+    async def test_supported_offers_deploy_and_unsupported_hosts_stay_comparisons(self) -> None:
         model = comparison_model()
         snapshot = replace(
             aggregate_compute_availability(modal_catalog=[ModalGpuSpec("L4", price_per_hour_usd=0.8)]),
-            vast_offers=(vast_offer(), vast_offer(id=1002, num_gpus=2)), vast_configured=True, providers=(ComputeProvider.MODAL,),
+            # The second host's driver predates the pinned runtime, so it can
+            # be priced but never rented.
+            vast_offers=(vast_offer(), vast_offer(id=1002, num_gpus=2, cuda_max_good=12.4)),
+            vast_configured=True, providers=(ComputeProvider.MODAL,),
         )
         with patch("llm_launchpad.tui.screens.fast_deploy.list_quick_deploy_models", return_value=(model,)), patch(
             "llm_launchpad.tui.screens.fast_deploy.load_compute_availability", return_value=snapshot
@@ -211,7 +221,6 @@ class VastFastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 screen._choose(next(key for key, row in screen._infra_rows.items() if row.plan.quote.provider == ComputeProvider.VAST))
                 self.assertEqual(len(app.quick_deploy_calls), 1)
                 self.assertEqual(app.quick_deploy_calls[0][0].quote.provider, ComputeProvider.VAST)
-                self.assertTrue(all(plan.quote.gpu_count == 1 for plan in app.quick_deploy_calls[0][1]))
 
     async def test_vast_only_fit_survives_filter_and_refresh_discards_old_prices(self) -> None:
         model = comparison_model()

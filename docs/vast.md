@@ -1,9 +1,13 @@
 # Vast.ai rentals (beta)
 
 Vast offers participate in Fast Deploy's prices, GPU filters, serving tiers,
-and eligible deployment fallbacks. The deployable beta supports **single-GPU,
-text-only llama.cpp GGUF models** with a published, digest-pinned runtime.
-Multi-GPU and unsupported-runtime offers remain comparisons.
+and eligible deployment fallbacks. The deployable beta supports **text-only
+llama.cpp GGUF models on one to eight GPUs** with a published, digest-pinned
+runtime. Offers whose runtime is unsupported remain comparisons.
+
+A rented host's GPUs are inventoried over SSH before anything is served: a
+bundle that reports a different device count, mixed GPU models, or too little
+free memory per device is refused and destroyed rather than served.
 
 Endpoints use a managed SSH tunnel bound to `127.0.0.1`: they work on this
 computer only. OpenSSH and a POSIX system are required. Closing Launchpad leaves
@@ -61,7 +65,7 @@ configured key.
 
 - A cheaper fitting Vast offer changes the model's **from** price and can win a
   serving tier. Vast GPU types also appear in the GPU filter.
-- Supported single-GPU placements are selectable in step 2 and appear in the
+- Supported placements are selectable in step 2 and appear in the
   confirmation's fulfillment choices. Confirmation explains local connectivity,
   continuous billing, disk deletion, and separate transfer charges.
 - Multi-GPU and unsupported-runtime comparisons are labeled **Vast preview**.
@@ -77,7 +81,7 @@ configured key.
 
 **Advanced deploy** offers Vast.ai as a compute provider on both the llama.cpp
 and vLLM forms. Selecting it swaps the Modal GPU picker for a **Vast.ai rental**
-list, sorted by hourly total and filtered to single-GPU rentals that fit the
+list, sorted by hourly total and filtered to rentals that fit the
 model's estimated memory. The bound rental supplies the GPU shape and count, so
 the GPU fields become read-only, and vLLM tensor sharding stays at 1.
 
@@ -110,9 +114,9 @@ checked again immediately before rental.
 
 ## Offer query details
 
-The default query requests up to 100 single-GPU, verified, on-demand NVIDIA
+The default query requests up to 100 verified, on-demand NVIDIA
 offers on x86-64 hosts, with a reliability score of at least 0.99 and space for
-100 GiB of disk. The TUI deploys supported single-GPU offers; the CLI can inspect other
+100 GiB of disk. The TUI deploys supported offers; the CLI can inspect other
 GPU counts with `--gpu-count`, without implying deployment support. `--region`
 accepts a two-letter country code for Vast. `--secure-only` adds Vast's
 datacenter filter; verified hosts alone are not labeled as secure cloud.

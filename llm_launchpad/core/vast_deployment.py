@@ -18,7 +18,17 @@ from .naming import infer_instance_from_app_name
 from .operation_events import fail_operation
 from .shutdown import is_shutting_down
 from .vast_backend import VastApiError, VastBackend
-from .vast_runtime import VAST_RUNTIME_DIR, endpoint_healthy, vast_runtime, vast_runtime_script, verify_endpoint_auth, verify_streaming
+from .vast_runtime import (
+    GPU_INVENTORY_COMMAND,
+    VAST_RUNTIME_DIR,
+    endpoint_healthy,
+    parse_gpu_inventory,
+    vast_runtime,
+    vast_runtime_script,
+    verify_endpoint_auth,
+    verify_gpu_topology,
+    verify_streaming,
+)
 from .vast_ssh import VastSsh
 from .vast_state import VastState
 
@@ -119,7 +129,7 @@ class VastDeploymentBackend:
             ssh = VastSsh(self.state.directory(name))
             public_key = ssh.public_key()
             offer = self.api.get_offer(options.offer_id, VastOfferQuery(
-                gpu_type=config.gpu_type, gpu_count=1, disk_gb=options.disk_gb,
+                gpu_type=config.gpu_type, gpu_count=options.gpu_count, disk_gb=options.disk_gb,
             ))
             if options.machine_id and offer.machine_id != options.machine_id:
                 raise ValueError("The selected Vast machine has changed. Refresh offers.")
@@ -128,10 +138,12 @@ class VastDeploymentBackend:
             price = offer.costs.total_per_hour_usd
             if price is None or price > options.max_hourly_cost_usd + 1e-9:
                 raise ValueError("The Vast hourly total is unknown or exceeds the approved price. Refresh offers.")
+            config.gpu_count = offer.gpu_count
             assessment = config.placement_assessment
             required = (
                 max(assessment.memory.per_device_required_gb, default=assessment.memory.total_gb)
-                if assessment else (config.required_vram_gb or 0) * 1.05
+                if assessment
+                else (config.required_vram_gb or 0) * 1.05 / max(1, offer.gpu_count)
             )
             if required > offer.gpu_memory_gib:
                 raise ValueError("The selected Vast GPU no longer fits the model's memory requirements.")
@@ -169,6 +181,11 @@ class VastDeploymentBackend:
             else:
                 raise RuntimeError("Vast instance did not provide SSH within 15 minutes.")
             assert instance is not None
+            devices = parse_gpu_inventory(ssh.run(instance, GPU_INVENTORY_COMMAND))
+            yield LogEvent(line="Rented GPUs: " + (", ".join(
+                f"{device.index}:{device.name} {device.memory_free_gib:.1f} GiB free" for device in devices
+            ) or "none reported"))
+            verify_gpu_topology(devices, gpu_count=offer.gpu_count, per_device_required_gb=required)
             ssh.run(instance, f"umask 077; mkdir -p {VAST_RUNTIME_DIR}; cat > {VAST_RUNTIME_DIR}/runtime.sh", input_text=script)
             ssh.run(instance, f"nohup sh {VAST_RUNTIME_DIR}/runtime.sh > {VAST_RUNTIME_DIR}/server.log 2>&1 < /dev/null &")
             # Save the selected port before opening a detached SSH process.

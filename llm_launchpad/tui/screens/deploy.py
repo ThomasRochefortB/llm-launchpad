@@ -47,6 +47,7 @@ from ...core.prime_backend import (
 )
 from ...core.reasoning_profiles import discover_reasoning_capabilities
 from ...core.providers import refuse as refuse_deployment
+from ...core.vast_runtime import VAST_MAX_GPU_COUNT
 from ...core.vast_backend import VastBackend
 from ...protocol.enums import BackendType, ComputeProvider
 from ...protocol.models import (
@@ -106,7 +107,7 @@ _GPU_PANEL_SUBTITLES: dict[str, dict[ComputeProvider, str]] = {
     BackendType.LLAMACPP: {
         ComputeProvider.MODAL: "Select a Modal GPU shape.",
         ComputeProvider.PRIME: "GPU shape and count come from the Prime offer bound above.",
-        ComputeProvider.VAST: "GPU shape comes from the Vast.ai rental bound above; rentals are single-GPU.",
+        ComputeProvider.VAST: "GPU shape comes from the Vast.ai rental bound above.",
     },
     BackendType.VLLM: {
         ComputeProvider.MODAL: (
@@ -118,8 +119,8 @@ _GPU_PANEL_SUBTITLES: dict[str, dict[ComputeProvider, str]] = {
             "tensor sharding follows its GPU count."
         ),
         ComputeProvider.VAST: (
-            "GPU shape comes from the Vast.ai rental bound above; rentals are "
-            "single-GPU, so tensor sharding stays at 1."
+            "GPU shape comes from the Vast.ai rental bound above, so tensor "
+            "sharding matches the rented device count."
         ),
     },
 }
@@ -408,9 +409,8 @@ def _prime_offer_status(
     )
 
 
-# The Vast deployment path rents exactly one GPU and re-quotes the offer at
-# deploy time, so the picker must not present shapes it cannot deliver.
-VAST_SINGLE_GPU_COUNT = 1
+# A Vast rental re-quotes its offer at deploy time, so the picker must only
+# present shapes the deployment path can actually deliver.
 VAST_VRAM_HEADROOM_FACTOR = 1.05
 DEFAULT_VAST_DISK_GB = 100
 
@@ -419,16 +419,18 @@ def _compatible_vast_offers(
     offers: list[VastOffer],
     required_vram_gb: float | None,
 ) -> list[VastOffer]:
-    """Return priced single-GPU rentals that fit one model requirement."""
+    """Return priced rentals whose combined GPUs fit one model requirement."""
     required = (required_vram_gb or 0.0) * VAST_VRAM_HEADROOM_FACTOR
     fitting = [
         offer
         for offer in offers
-        if offer.gpu_count == VAST_SINGLE_GPU_COUNT
+        if 1 <= offer.gpu_count <= VAST_MAX_GPU_COUNT
         and offer.costs.total_per_hour_usd is not None
-        and offer.gpu_memory_gib >= required
+        and offer.gpu_memory_gib * offer.gpu_count >= required
     ]
-    return sorted(fitting, key=lambda offer: offer.costs.total_per_hour_usd or 0.0)
+    # At equal price prefer the simpler topology: fewer devices means fewer
+    # ways for a marketplace host to disagree with the memory plan.
+    return sorted(fitting, key=lambda offer: (offer.costs.total_per_hour_usd or 0.0, offer.gpu_count))
 
 
 def _vast_offer_options(offers: list[VastOffer]) -> list[tuple[str, str]]:
@@ -437,11 +439,16 @@ def _vast_offer_options(offers: list[VastOffer]) -> list[tuple[str, str]]:
         price = offer.costs.total_per_hour_usd
         price_text = f"${price:.3f}/hr" if price is not None else "price n/a"
         location = offer.location or "unknown location"
+        total = offer.gpu_memory_gb * offer.gpu_count
+        memory = (
+            f"{offer.gpu_memory_gb:.0f} GB each ({total:.0f} GB total)"
+            if offer.gpu_count > 1
+            else f"{offer.gpu_memory_gb:.0f} GB VRAM"
+        )
         options.append(
             (
-                f"{price_text} incl. disk · 1x {offer.gpu_type} · "
-                f"{offer.gpu_memory_gb:.0f} GB VRAM · in {location} · "
-                f"offer {clip(offer.id, 8)}",
+                f"{price_text} incl. disk · {offer.gpu_count}x {offer.gpu_type} · "
+                f"{memory} · in {location} · offer {clip(offer.id, 8)}",
                 offer.id,
             )
         )
@@ -452,20 +459,20 @@ def _vast_offer_status(offer_count: int, required_vram_gb: float | None) -> str:
     if required_vram_gb is None:
         if offer_count:
             return (
-                f"[dim]{offer_count} live single-GPU rentals. Prices include disk; "
+                f"[dim]{offer_count} live rentals. Prices include disk; "
                 "network traffic is billed separately. Choose a model to narrow "
                 "them.[/dim]"
             )
-        return "[yellow]No live single-GPU Vast.ai rentals are currently available.[/yellow]"
+        return "[yellow]No live Vast.ai rentals are currently available.[/yellow]"
     required_with_headroom = required_vram_gb * VAST_VRAM_HEADROOM_FACTOR
     if offer_count:
         return (
-            f"[dim]{offer_count} live single-GPU rentals fit this model's "
+            f"[dim]{offer_count} live rentals fit this model's "
             f"~{required_with_headroom:.1f} GB requirement. Prices include disk; "
             "network traffic is billed separately.[/dim]"
         )
     return (
-        "[yellow]No live single-GPU Vast.ai rental has enough memory for this "
+        "[yellow]No live Vast.ai rental has enough memory for this "
         f"model's ~{required_with_headroom:.1f} GB requirement.[/yellow]"
     )
 
@@ -555,6 +562,9 @@ class _CostPreviewMixin:
             disk_gb=disk_gb,
             max_hourly_cost_usd=price,
             machine_id=offer.machine_id,
+            # The user approved this topology at this price; a rental that no
+            # longer matches it is refused rather than silently substituted.
+            gpu_count=offer.gpu_count,
         )
 
     def _update_cost_preview(self, preview_id: str) -> None:
@@ -724,7 +734,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
                 classes="vast-only",
             )
             yield Static(
-                "[dim]Vast.ai rentals are single-GPU and priced including disk.[/dim]",
+                "[dim]Vast.ai rentals are priced including disk.[/dim]",
                 id="vast-offer-status-llama",
                 classes="vast-only",
             )
@@ -990,7 +1000,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
                 gpu_type_select = self.query_one("#gpu-type-llama", Select)
                 gpu_type_select.set_options([(offer.gpu_type, offer.gpu_type)])
                 gpu_type_select.value = offer.gpu_type
-                self.query_one("#gpu-count-llama", Input).value = str(VAST_SINGLE_GPU_COUNT)
+                self.query_one("#gpu-count-llama", Input).value = str(offer.gpu_count)
             self._update_cost_preview("llama-cost-preview")
             return
         if event.select.id == "prime-offer-llama":
@@ -1107,7 +1117,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
     def _run_fetch_vast_offers(self) -> None:
         try:
             offers = VastBackend().list_offers(
-                VastOfferQuery(gpu_count=VAST_SINGLE_GPU_COUNT, disk_gb=self._vast_disk_gb())
+                VastOfferQuery(gpu_count=None, disk_gb=self._vast_disk_gb())
             )
         except Exception as exc:
             self.post_message(VastOffersFailed(str(exc)))
@@ -1384,7 +1394,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
             config.provider_options = vast_options
             vast_offer = self._vast_offers[vast_options.offer_id]
             config.gpu_type = vast_offer.gpu_type
-            config.gpu_count = VAST_SINGLE_GPU_COUNT
+            config.gpu_count = vast_offer.gpu_count
 
         # Advanced values are always read: collapsing the section must never
         # silently discard options the user entered before collapsing it.
@@ -1800,7 +1810,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
                 classes="vast-only",
             )
             yield Static(
-                "[dim]Vast.ai rentals are single-GPU and priced including disk.[/dim]",
+                "[dim]Vast.ai rentals are priced including disk.[/dim]",
                 id="vast-offer-status-vllm",
                 classes="vast-only",
             )
@@ -2106,8 +2116,8 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
                 gpu_type_select = self.query_one("#gpu-type-vllm", Select)
                 gpu_type_select.set_options([(offer.gpu_type, offer.gpu_type)])
                 gpu_type_select.value = offer.gpu_type
-                self.query_one("#gpu-count-vllm", Input).value = str(VAST_SINGLE_GPU_COUNT)
-                self.query_one("#n-gpu", Input).value = str(VAST_SINGLE_GPU_COUNT)
+                self.query_one("#gpu-count-vllm", Input).value = str(offer.gpu_count)
+                self.query_one("#n-gpu", Input).value = str(offer.gpu_count)
             self._update_cost_preview("vllm-cost-preview")
             return
         if event.select.id == "prime-offer-vllm":
@@ -2224,7 +2234,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
     def _run_fetch_vast_offers(self) -> None:
         try:
             offers = VastBackend().list_offers(
-                VastOfferQuery(gpu_count=VAST_SINGLE_GPU_COUNT, disk_gb=self._vast_disk_gb())
+                VastOfferQuery(gpu_count=None, disk_gb=self._vast_disk_gb())
             )
         except Exception as exc:
             self.post_message(VastOffersFailed(str(exc)))
@@ -2672,7 +2682,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
             config.provider_options = vast_options
             vast_offer = self._vast_offers[vast_options.offer_id]
             config.gpu_type = vast_offer.gpu_type
-            config.gpu_count = VAST_SINGLE_GPU_COUNT
+            config.gpu_count = vast_offer.gpu_count
         alias = self.query_one("#served-model-name", Input).value.strip()
         config.served_model_name = alias or default_served_model_name(config.model_name)
         config.fast_boot = self.query_one("#fast-boot", Switch).value

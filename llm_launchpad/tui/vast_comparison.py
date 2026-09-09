@@ -30,5 +30,5 @@ def vast_comparison_detail(row: VastModelOffer) -> str:
         f"Traffic: down {down}/GB · up {up}/GB.\n"
         f"[dim]Estimated full-context GPU memory fit · offer {escape(row.offer.id)} · "
         "storage stays billable when stopped. Host/runtime not validated.[/dim]\n"
-        "[yellow]Comparison only: the beta deploys single-GPU text-only llama.cpp offers.[/yellow]"
+        "[yellow]Comparison only: this offer is outside the deployable runtime.[/yellow]"
     )

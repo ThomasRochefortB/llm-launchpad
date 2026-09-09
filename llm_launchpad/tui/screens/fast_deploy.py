@@ -353,7 +353,8 @@ def infra_rows_for_model(
         placement = ComputePlacement(
             id=quote.id, provider=quote.provider, provider_reference=quote.provider_reference,
             gpu_type=quote.gpu_type, gpu_memory_gb=comparison.offer.gpu_memory_gib,
-            gpu_count_min=1, gpu_count_max=1, price_per_hour_usd=quote.price_per_hour_usd,
+            gpu_count_min=comparison.offer.gpu_count, gpu_count_max=comparison.offer.gpu_count,
+            price_per_hour_usd=quote.price_per_hour_usd,
             billing_model=quote.billing_model, availability=quote.availability,
             supported_backends=frozenset({profile.backend}), region=quote.region,
             provider_options=quote.provider_options,
@@ -832,8 +833,7 @@ class FastDeployScreen(CopyEnabledScreen):
             if option_id in self._vast_rows:
                 self.query_one("#fast-deploy-detail", Static).update(vast_comparison_detail(self._vast_rows[option_id]))
                 self.notify(
-                    "Comparison only: the Vast beta deploys single-GPU text-only "
-                    "llama.cpp offers.",
+                    "Comparison only: this offer is outside the deployable runtime.",
                     timeout=4,
                 )
                 return
@@ -1385,7 +1385,7 @@ class FastDeployScreen(CopyEnabledScreen):
                 price = comparisons[0].costs.total_per_hour_usd
                 deploy_price, estimate = _model_cheapest_price(model, self._snapshot, self._gpu_filter)
                 detail += f"\n[dim]Deploy from {_format_price(deploy_price, estimate=estimate)} · Vast from {_format_price(price, estimate=True)} incl. disk; traffic extra.[/dim]"
-                detail += "\n[dim]Vast single-GPU deployments use a local SSH endpoint; multi-GPU offers are comparisons.[/dim]"
+                detail += "\n[dim]Vast deployments use a local SSH endpoint on this computer.[/dim]"
         self.query_one("#fast-deploy-detail", Static).update(detail)
 
     def _update_infra_detail(self, row: _InfraRow) -> None:
