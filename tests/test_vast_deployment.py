@@ -433,3 +433,37 @@ class VastThrottlingTests(VastLifecycleTests):
         self.api.get_instance.side_effect = fail_once
         self.assertFalse(self.deploy().success)
         self.api.destroy_instance.assert_called_once_with("900")
+
+
+class VastTeardownThrottlingTests(VastLifecycleTests):
+    """An unconfirmed destroy leaves a rental billing, so it must not give up."""
+
+    def test_destroy_retries_through_a_rate_limit(self) -> None:
+        self.deploy()
+        record = self.state.load(self.config.app_name or "")
+        assert record is not None
+        calls = {"n": 0}
+        real = self.api.destroy_instance.side_effect
+
+        def throttle_once(instance_id: str) -> None:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise VastApiError("Vast rate limit reached.", status_code=429)
+            real(instance_id)
+
+        self.api.destroy_instance.side_effect = throttle_once
+        with patch("llm_launchpad.core.vast_deployment.time.sleep"):
+            self.backend.destroy(name=record.name, instance_id="900")
+        self.assertIsNone(self.state.load(record.name))
+        self.assertIsNone(self.remote)
+
+    def test_a_persistent_rate_limit_keeps_the_recovery_record(self) -> None:
+        self.deploy()
+        record = self.state.load(self.config.app_name or "")
+        assert record is not None
+        self.api.destroy_instance.side_effect = VastApiError("nope", status_code=429)
+        with patch("llm_launchpad.core.vast_deployment.time.sleep"):
+            with self.assertRaises(VastApiError):
+                self.backend.destroy(name=record.name, instance_id="900")
+        # The record must survive so the rental can still be reclaimed.
+        self.assertIsNotNone(self.state.load(record.name))

@@ -1,6 +1,7 @@
 """Recoverable Vast rentals, serving startup, and local endpoint management."""
 
-from collections.abc import Generator
+from typing import Any
+from collections.abc import Callable, Generator
 import math
 import os
 import re
@@ -68,16 +69,35 @@ class VastDeploymentBackend:
             raise VastApiError("Vast instance identity differs from the recorded rental; refusing to manage it.")
         return instance
 
+    @staticmethod
+    def _retry_while_throttled(call: Callable[[], Any], attempts: int = 6) -> Any:
+        """Keep trying through rate limits when giving up would cost money.
+
+        Teardown is the one place a 429 must never win: an unconfirmed destroy
+        leaves a rental billing, which is worse than any delay here.
+        """
+
+        delay = 2.0
+        for remaining in range(attempts - 1, -1, -1):
+            try:
+                return call()
+            except VastApiError as exc:
+                if exc.status_code != 429 or not remaining:
+                    raise
+                time.sleep(delay)
+                delay = min(delay * 2, 30.0)
+        raise VastApiError("Vast remained rate limited.")
+
     def _destroy(self, record: VastDeploymentRecord) -> None:
         instance = self._instance(record)
         if instance is not None:
             record.state = "destroying"
             self.state.save(record)
-            self.api.destroy_instance(instance.id)
-            for _ in range(10):
-                if self.api.get_instance(instance.id) is None:
+            self._retry_while_throttled(lambda: self.api.destroy_instance(instance.id))
+            for attempt in range(10):
+                if self._retry_while_throttled(lambda: self.api.get_instance(instance.id)) is None:
                     break
-                time.sleep(1)
+                time.sleep(1 + attempt)
             else:
                 raise VastApiError("Vast destruction is not yet confirmed. The recovery record has been retained.")
             try:
