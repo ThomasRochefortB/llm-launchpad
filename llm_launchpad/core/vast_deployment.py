@@ -30,7 +30,7 @@ from .vast_runtime import (
     verify_gpu_topology,
     verify_streaming,
 )
-from .vast_ssh import VastSsh, ssh_key_startup
+from .vast_ssh import VastSsh
 from .vast_state import VastState
 
 _CANCELLATIONS: dict[str, threading.Event] = {}
@@ -148,7 +148,6 @@ class VastDeploymentBackend:
                 raise ValueError("A Vast rental is already recorded for this name. Connect to or destroy it before deploying again.")
             ssh = VastSsh(self.state.directory(name))
             public_key = ssh.public_key()
-            onstart = ssh_key_startup(public_key)
             offer = self.api.get_offer(options.offer_id, VastOfferQuery(
                 gpu_type=config.gpu_type, gpu_count=options.gpu_count, disk_gb=options.disk_gb,
             ))
@@ -192,9 +191,12 @@ class VastDeploymentBackend:
                 backend=config.backend.value, model_name=config.model_name or "",
             )
             self.state.save(record)  # Write intent before the billable request.
+            # No onstart hook: a supplied script displaces the image's own
+            # /root/onstart.sh, and with it Vast's sshd provisioning, so the
+            # rental then refuses every key. Vast's own key attachment below
+            # installs it correctly.
             record.instance_id = self.api.create_instance(
                 offer.id, image=image, disk_gb=options.disk_gb, label=record.label,
-                onstart=onstart,
             )
             self.state.save(record)  # Persist identity before yielding control.
             self.api.attach_key(record.instance_id, public_key)

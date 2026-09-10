@@ -105,9 +105,11 @@ class VastLifecycleTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE((self.state.directory(record.name) / "record.json").stat().st_mode), 0o600)
         self.stream.assert_called_once()
         self.api.attach_key.assert_called_once_with("900", "ssh-ed25519 PUBLICKEY")
-        onstart = self.api.create_instance.call_args.kwargs["onstart"]
-        self.assertIn("ssh-ed25519 PUBLICKEY", onstart)
-        self.assertNotIn(record.endpoint_api_key, onstart)
+        # No startup hook is sent: a supplied script replaces the image's own
+        # /root/onstart.sh and Vast's sshd provisioning with it, after which
+        # the rental refuses every key. Verified live: identical host, image
+        # and code connected without the hook and never connected with it.
+        self.assertNotIn("onstart", self.api.create_instance.call_args.kwargs)
         self.assertEqual(self.backend.list_deployments()[0].app_id, "900")
         self.assertEqual(self.backend.connect("900").web_url, event.data.web_url)
         self.backend.destroy(name=record.name, instance_id="900")

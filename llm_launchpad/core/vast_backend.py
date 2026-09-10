@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import json
+import os
 from typing import Any
 
 import requests
@@ -182,7 +183,19 @@ class VastBackend:
                     "Vast rate limit reached. Wait briefly and retry.", status_code=429
                 )
             if not 200 <= response.status_code < 300:
-                raise VastApiError(f"Vast request failed (HTTP {response.status_code}).", status_code=response.status_code)
+                # Vast explains its rejections in the body, but a response can
+                # echo the request back -- environment and startup script
+                # included -- so it stays out of the message unless someone
+                # explicitly asks to see it.
+                body = response.text
+                detail = ""
+                if os.environ.get("LLM_LAUNCHPAD_API_DEBUG") == "1" and isinstance(body, str):
+                    reason = " ".join(body.split())[:200]
+                    detail = f" {reason}" if reason else ""
+                raise VastApiError(
+                    f"Vast request failed (HTTP {response.status_code}).{detail}",
+                    status_code=response.status_code,
+                )
             try:
                 data = response.json()
             except ValueError:

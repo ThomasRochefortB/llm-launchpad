@@ -202,7 +202,7 @@ def probe_image(args: argparse.Namespace) -> int:
     try:
         instance_id = api.create_instance(
             offer.id, image=args.image, disk_gb=args.disk_gb, label=name,
-            onstart=onstart,
+            onstart="" if args.without_key_hook else onstart,
         )
         print(f"PROBE {name}: rented {instance_id} on {args.image}", flush=True)
         api.attach_key(instance_id, public_key)
@@ -221,6 +221,9 @@ def probe_image(args: argparse.Namespace) -> int:
         assert instance is not None
         report["ssh_ready_seconds"] = time.monotonic() - started
         for label, command in (
+            ("authorized_keys", "cat /root/.ssh/authorized_keys 2>&1 | cut -c1-60"),
+            ("onstart_log", "cat /root/onstart.log 2>&1 | tail -20"),
+            ("onstart_script", "ls -la /root/onstart.sh /root/.launchpad_onstart 2>&1"),
             ("entrypoint_binary", "command -v vllm || echo MISSING"),
             ("vllm_version", "vllm --version 2>&1 | head -3 || echo FAILED"),
             ("torch_import", "python3 -c 'import torch; print(torch.__version__, torch.cuda.is_available())' 2>&1 | tail -2"),
@@ -466,6 +469,7 @@ def main() -> int:
         help="Rent one host on this image and report what an SSH session sees, instead of deploying.",
     )
     parser.add_argument("--disk-gb", type=int, default=100)
+    parser.add_argument("--without-key-hook", action="store_true", help="Create without the onstart key install, to isolate its effect.")
     parser.add_argument(
         "--stage",
         default="llamacpp_single_gpu",
