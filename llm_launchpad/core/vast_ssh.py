@@ -3,10 +3,29 @@
 import os
 from pathlib import Path
 import re
+import shlex
 import socket
 import subprocess
 
 from ..protocol.models import VastInstance
+
+
+def ssh_key_startup(public_key: str, *, root: str = "/root") -> str:
+    """Install the rental's public key after Vast initializes the container."""
+    if not re.fullmatch(r"ssh-ed25519 [A-Za-z0-9+/=]+(?: [^\r\n]+)?", public_key):
+        raise ValueError("A single Ed25519 public key is required for Vast startup.")
+    directory = shlex.quote(root + "/.ssh")
+    authorized = shlex.quote(root + "/.ssh/authorized_keys")
+    key = shlex.quote(public_key)
+    # Only the public key goes in instance metadata. Appending preserves keys
+    # installed by Vast, and a leading newline handles files without one.
+    return (
+        f"set -eu; umask 077; mkdir -p {directory}; "
+        f"chmod go-w {shlex.quote(root)}; chmod 700 {directory}; "
+        f"touch {authorized}; chmod 600 {authorized}; "
+        f"if ! grep -qxF -- {key} {authorized}; then "
+        f"printf '\\n%s\\n' {key} >> {authorized}; fi"
+    )
 
 
 class VastSsh:

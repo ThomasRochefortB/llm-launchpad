@@ -1,9 +1,11 @@
 # Vast.ai rentals (beta)
 
 Vast offers participate in Fast Deploy's prices, GPU filters, serving tiers,
-and eligible deployment fallbacks. The deployable beta supports **text-only
-llama.cpp GGUF models on one to eight GPUs** with a published, digest-pinned
-runtime. Offers whose runtime is unsupported remain comparisons.
+and eligible deployment fallbacks. The beta supports **llama.cpp GGUF models
+on one to eight GPUs** and **vLLM on one, two, four, or eight GPUs**, with
+published, digest-pinned runtimes. Advanced deploy also supports image input;
+Fast Deploy remains text-only. Offers whose runtime is unsupported remain
+comparisons. See the validation limits below before choosing a runtime.
 
 A rented host's GPUs are inventoried over SSH before anything is served: a
 bundle that reports a different device count, mixed GPU models, or too little
@@ -14,9 +16,14 @@ computer only. OpenSSH and a POSIX system are required. Closing Launchpad leaves
 a completed rental and its tunnel running. **Stop destroys the rental and its
 disk**, including cached models. Rentals bill continuously until destroyed.
 
-The lifecycle and UI have hermetic test coverage. No real Vast host has been
-live-certified yet; runtime startup, long streams, tool calls, and measured costs
-remain release validation work. This is not general provider certification.
+The [live validation recorded in PR #77](https://github.com/ThomasRochefortB/llm-launchpad/pull/77)
+covered single-GPU llama.cpp startup, authentication, tool calls, a five-minute
+stream, reconnect, warm restart, and Fast Deploy through the TUI. A separate
+two-GPU llama.cpp run verified that model weights spanned both devices.
+vLLM serving, vision projector staging, and Advanced deploy through a real
+rental remain uncertified. vLLM runs encountered persistent SSH key refusals;
+the startup key installation described below still needs a live retest. These
+results do not certify every host or GPU topology.
 
 ## Account setup
 
@@ -68,7 +75,7 @@ configured key.
 - Supported placements are selectable in step 2 and appear in the
   confirmation's fulfillment choices. Confirmation explains local connectivity,
   continuous billing, disk deletion, and separate transfer charges.
-- Multi-GPU and unsupported-runtime comparisons are labeled **Vast preview**.
+- Unsupported-runtime comparisons are labeled **Vast preview**.
   Selecting one shows cost and memory fit but cannot rent it. **a** shows all
   comparison rows.
 - An equivalent Vast placement can enter the accepted fallback list within its
@@ -157,9 +164,15 @@ verifies streaming without renting another GPU. If another application owns the
 port, reconnect fails rather than publishing an unrelated endpoint. The SSH
 master survives CLI/TUI exit but may disconnect after sleep or network loss.
 
-Launchpad generates a per-rental SSH key and endpoint bearer token. Startup
-transfers the private runtime script through SSH stdin; the Vast account key is
-never sent to the host. An existing Hugging Face login is used for model download.
+Launchpad generates a per-rental SSH key and endpoint bearer token. The public
+key is included in Vast's `onstart` hook, which installs it in the container's
+`authorized_keys` after Vast initializes the container. This avoids depending
+only on delayed key propagation during a large image pull. The hook preserves
+existing keys and sets SSH file permissions; it contains no private key, endpoint
+token, or Hugging Face token. Per-instance key attachment still requires an
+explicit API success response. Startup transfers the private runtime script
+through SSH stdin; the Vast account key is never sent to the host. An existing
+Hugging Face login is used for model download.
 SSH uses a private known-hosts file, accepts the first host key, and rejects
 changed keys. Remote model logs redact endpoint and Hugging Face tokens.
 
@@ -172,9 +185,10 @@ Vast one: Fast Deploy refuses vision for every provider because vision working
 memory is not calibrated for guaranteed-fit placement. The projector is staged
 on the rental exactly as it is on Prime, over the same pinned image.
 
-Model switching, custom-build runtimes, non-default revisions, suspend/resume,
-and persistent Vast volumes are outside this beta. Unsupported configurations
-are refused in the form, before anything is rented.
+Model switching, custom-build runtimes, non-default llama.cpp revisions,
+suspend/resume, and persistent Vast volumes are outside this beta. vLLM can pin
+a model revision. Unsupported configurations are refused in the form, before
+anything is rented.
 
 ### Recovery and billing
 
@@ -191,12 +205,16 @@ cleanup after an interrupted attempt. The confirmation explicitly describes disk
 deletion; `--yes` skips it. Launchpad only removes the recovery record after the
 provider reports the instance absent. If creation is still uncertain, inspect the
 recorded ownership label in Vast's console before taking further action. API
-outages can delay cleanup while billing continues.
+outages can delay cleanup while billing continues. Rate limits are retried with
+bounded backoff during account verification, instance lookup or label
+reconciliation, destruction, and absence confirmation. Exhausted retries retain
+the recovery record so cleanup can be attempted again.
 
 The hourly cap excludes traffic and does not impose a maximum session duration.
 Inspect the offer's download/upload rates before deployment. A budgeted live test
 must account for image/model download charges as well as runtime, and verify
-final destruction. No paid test has been run by this implementation.
+final destruction. Historical live results are linked above; they do not replace
+validation of subsequent runtime or bootstrap changes.
 
 ## API and transport contracts
 

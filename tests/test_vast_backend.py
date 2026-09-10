@@ -209,6 +209,33 @@ class VastBackendTests(unittest.TestCase):
         self.response.status_code = 404
         self.assertIsNone(self.backend.get_instance("900"))
 
+    def test_create_includes_the_public_key_startup_hook(self) -> None:
+        self.response.json.return_value = {"success": True, "new_contract": 900}
+        self.backend.create_instance(
+            "1001", image="image", disk_gb=100, label="owned", onstart="key setup",
+        )
+        self.assertEqual(self.request.call_args.kwargs["json"]["onstart"], "key setup")
+
+    def test_account_lookup_preserves_rate_limit_for_cleanup_retries(self) -> None:
+        self.response.status_code = 429
+        with self.assertRaises(VastApiError) as caught:
+            self.backend.account_id()
+        self.assertEqual(caught.exception.status_code, 429)
+        self.assertFalse(self.backend.auth_status().authenticated)
+
+    def test_rejected_key_attachment_is_never_assumed_to_be_a_duplicate(self) -> None:
+        for status in (400, 409):
+            with self.subTest(status=status):
+                self.response.status_code = status
+                with self.assertRaises(VastApiError) as caught:
+                    self.backend.attach_key("900", "ssh-ed25519 PUBLIC")
+                self.assertEqual(caught.exception.status_code, status)
+        self.response.status_code = 200
+        for payload in ({}, {"success": False}):
+            self.response.json.return_value = payload
+            with self.assertRaises(VastApiError):
+                self.backend.attach_key("900", "ssh-ed25519 PUBLIC")
+
     def test_reconcile_paginates_and_checks_exact_label(self) -> None:
         self.response.json.side_effect = [
             {"instances": [{"id": 800, "label": "other"}], "next_token": "page2"},

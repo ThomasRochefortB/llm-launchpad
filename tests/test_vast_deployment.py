@@ -13,7 +13,7 @@ from llm_launchpad.core.connection_store import merge_connections
 from llm_launchpad.core.vast_backend import VastApiError, VastBackend
 from llm_launchpad.core.vast_deployment import VastDeploymentBackend
 from llm_launchpad.core.vast_runtime import vast_runtime_image, vast_runtime_script, verify_endpoint_auth, verify_streaming
-from llm_launchpad.core.vast_ssh import VastSsh
+from llm_launchpad.core.vast_ssh import VastSsh, ssh_key_startup
 from llm_launchpad.core.vast_state import VastState
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider, OperationType
 from llm_launchpad.protocol.events import OperationCompleteEvent
@@ -38,6 +38,7 @@ class VastLifecycleTests(unittest.TestCase):
         self.state = VastState(Path(temporary.name))
         self.api = Mock(spec=VastBackend)
         self.api.auth_status.return_value = VastAuthStatus(True, account_id="12")
+        self.api.account_id.return_value = "12"
         self.api.get_offer.return_value = vast_offer()
         self.remote: VastInstance | None = None
         self.api.create_instance.side_effect = self.create
@@ -104,6 +105,9 @@ class VastLifecycleTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE((self.state.directory(record.name) / "record.json").stat().st_mode), 0o600)
         self.stream.assert_called_once()
         self.api.attach_key.assert_called_once_with("900", "ssh-ed25519 PUBLICKEY")
+        onstart = self.api.create_instance.call_args.kwargs["onstart"]
+        self.assertIn("ssh-ed25519 PUBLICKEY", onstart)
+        self.assertNotIn(record.endpoint_api_key, onstart)
         self.assertEqual(self.backend.list_deployments()[0].app_id, "900")
         self.assertEqual(self.backend.connect("900").web_url, event.data.web_url)
         self.backend.destroy(name=record.name, instance_id="900")
@@ -195,6 +199,15 @@ class VastLifecycleTests(unittest.TestCase):
         self.assertFalse(self.deploy().success)
         self.api.destroy_instance.assert_called_once_with("900")
 
+    def test_rejected_ssh_key_destroys_rental_without_waiting_for_ssh(self) -> None:
+        self.api.attach_key.side_effect = VastApiError("Key rejected", status_code=400)
+        event = self.deploy()
+        self.assertFalse(event.success)
+        self.assertIn("Key rejected", event.detail or "")
+        self.ssh.run.assert_not_called()
+        self.api.destroy_instance.assert_called_once_with("900")
+        self.assertEqual(self.state.records(), [])
+
     def test_create_timeout_reconciles_label_without_creating_again(self) -> None:
         def uncertain(*args, **kwargs):
             self.create(*args, **kwargs)
@@ -260,10 +273,10 @@ class VastLifecycleTests(unittest.TestCase):
 
     def test_account_or_label_mismatch_refuses_destroy(self) -> None:
         self.assertTrue(self.deploy().success)
-        self.api.auth_status.return_value = VastAuthStatus(True, account_id="other")
+        self.api.account_id.return_value = "other"
         with self.assertRaises(VastApiError):
             self.backend.destroy(instance_id="900")
-        self.api.auth_status.return_value = VastAuthStatus(True, account_id="12")
+        self.api.account_id.return_value = "12"
         assert self.remote is not None
         self.remote = replace(self.remote, label="someone-else")
         with self.assertRaises(VastApiError):
@@ -438,6 +451,42 @@ class VastThrottlingTests(VastLifecycleTests):
 class VastTeardownThrottlingTests(VastLifecycleTests):
     """An unconfirmed destroy leaves a rental billing, so it must not give up."""
 
+    def test_teardown_retries_account_and_instance_lookups_before_destroy(self) -> None:
+        self.deploy()
+        self.api.account_id.side_effect = [VastApiError("throttled", status_code=429), "12"]
+        self.api.get_instance.side_effect = [
+            VastApiError("throttled", status_code=429), self.remote, None,
+        ]
+        with patch("llm_launchpad.core.vast_deployment.time.sleep"):
+            self.backend.destroy(instance_id="900")
+        self.api.destroy_instance.assert_called_once_with("900")
+        self.assertEqual(self.state.records(), [])
+
+    def test_uncertain_create_retries_throttled_label_reconciliation(self) -> None:
+        def uncertain(*args, **kwargs):
+            self.create(*args, **kwargs)
+            self.api.find_instances.side_effect = [
+                VastApiError("throttled", status_code=429), [self.remote],
+            ]
+            raise VastApiError("request timed out")
+
+        self.api.create_instance.side_effect = uncertain
+        with patch("llm_launchpad.core.vast_deployment.time.sleep"):
+            self.assertFalse(self.deploy().success)
+        self.api.create_instance.assert_called_once()
+        self.api.destroy_instance.assert_called_once_with("900")
+        self.assertEqual(self.state.records(), [])
+
+    def test_persistent_identity_throttle_preserves_rental_record(self) -> None:
+        self.deploy()
+        self.api.get_instance.side_effect = VastApiError("throttled", status_code=429)
+        with patch("llm_launchpad.core.vast_deployment.time.sleep"):
+            with self.assertRaises(VastApiError):
+                self.backend.destroy(instance_id="900")
+        self.api.destroy_instance.assert_not_called()
+        self.assertIsNotNone(self.state.load(self.config.app_name or ""))
+
+
     def test_destroy_retries_through_a_rate_limit(self) -> None:
         self.deploy()
         record = self.state.load(self.config.app_name or "")
@@ -490,3 +539,40 @@ class VastSshDiagnosticsTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError) as caught:
                     VastSsh._run(["ssh", "host"])
         self.assertIn("Permission denied", str(caught.exception))
+
+
+class VastSshStartupTests(unittest.TestCase):
+    def test_startup_installs_key_once_preserving_existing_keys_and_permissions(self) -> None:
+        with TemporaryDirectory() as temporary:
+            root = Path(temporary) / "rental's home"
+            directory = root / ".ssh"
+            directory.mkdir(parents=True)
+            authorized = directory / "authorized_keys"
+            existing = "ssh-ed25519 EXISTING"
+            authorized.write_text(existing)  # Missing trailing newline.
+            root.chmod(0o777)
+            directory.chmod(0o777)
+            authorized.chmod(0o666)
+            # Shell metacharacters in a comment must stay literal.
+            public_key = "ssh-ed25519 PUBLICKEY user'; $(exit 17) `exit 18`"
+            script = ssh_key_startup(public_key, root=str(root))
+            for _ in range(2):
+                subprocess.run(["sh", "-c", script], check=True, capture_output=True)
+            self.assertEqual(authorized.read_text().splitlines(), [existing, public_key])
+            self.assertEqual(stat.S_IMODE(root.stat().st_mode) & 0o022, 0)
+            self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o700)
+            self.assertEqual(stat.S_IMODE(authorized.stat().st_mode), 0o600)
+
+    def test_startup_creates_missing_ssh_directory(self) -> None:
+        with TemporaryDirectory() as temporary:
+            script = ssh_key_startup("ssh-ed25519 PUBLICKEY", root=temporary)
+            subprocess.run(["sh", "-c", script], check=True, capture_output=True)
+            self.assertEqual(
+                (Path(temporary) / ".ssh/authorized_keys").read_text().strip(),
+                "ssh-ed25519 PUBLICKEY",
+            )
+
+    def test_startup_refuses_missing_or_multiple_keys(self) -> None:
+        for key in ("", "private key", "ssh-ed25519 KEY\nssh-ed25519 OTHER"):
+            with self.assertRaises(ValueError):
+                ssh_key_startup(key)

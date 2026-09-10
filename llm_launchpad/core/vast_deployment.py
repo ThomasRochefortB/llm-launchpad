@@ -30,7 +30,7 @@ from .vast_runtime import (
     verify_gpu_topology,
     verify_streaming,
 )
-from .vast_ssh import VastSsh
+from .vast_ssh import VastSsh, ssh_key_startup
 from .vast_state import VastState
 
 _CANCELLATIONS: dict[str, threading.Event] = {}
@@ -51,8 +51,8 @@ class VastDeploymentBackend:
         return status.authenticated, status.account_id or "", status.error or ""
 
     def _account(self, record: VastDeploymentRecord) -> None:
-        status = self.api.auth_status()
-        if not status.authenticated or status.account_id != record.account_id:
+        account_id = self._retry_while_throttled(self.api.account_id)
+        if account_id != record.account_id:
             raise VastApiError("Use the Vast account that owns this recorded deployment.")
 
     def _instance(self, record: VastDeploymentRecord) -> VastInstance | None:
@@ -89,7 +89,7 @@ class VastDeploymentBackend:
         raise VastApiError("Vast remained rate limited.")
 
     def _destroy(self, record: VastDeploymentRecord) -> None:
-        instance = self._instance(record)
+        instance = self._retry_while_throttled(lambda: self._instance(record))
         if instance is not None:
             record.state = "destroying"
             self.state.save(record)
@@ -148,6 +148,7 @@ class VastDeploymentBackend:
                 raise ValueError("A Vast rental is already recorded for this name. Connect to or destroy it before deploying again.")
             ssh = VastSsh(self.state.directory(name))
             public_key = ssh.public_key()
+            onstart = ssh_key_startup(public_key)
             offer = self.api.get_offer(options.offer_id, VastOfferQuery(
                 gpu_type=config.gpu_type, gpu_count=options.gpu_count, disk_gb=options.disk_gb,
             ))
@@ -187,7 +188,10 @@ class VastDeploymentBackend:
                 backend=config.backend.value, model_name=config.model_name or "",
             )
             self.state.save(record)  # Write intent before the billable request.
-            record.instance_id = self.api.create_instance(offer.id, image=image, disk_gb=options.disk_gb, label=record.label)
+            record.instance_id = self.api.create_instance(
+                offer.id, image=image, disk_gb=options.disk_gb, label=record.label,
+                onstart=onstart,
+            )
             self.state.save(record)  # Persist identity before yielding control.
             self.api.attach_key(record.instance_id, public_key)
             # A rental cannot answer SSH until its image is pulled, and the

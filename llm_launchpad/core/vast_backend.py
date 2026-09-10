@@ -193,16 +193,21 @@ class VastBackend:
         finally:
             response.close()
 
+    def account_id(self) -> str:
+        """Read the account identity, preserving errors for lifecycle retries."""
+        data = self._request("GET", "/users/current/")
+        account_id = positive_int(data.get("id"))
+        if account_id is None:
+            raise VastApiError("Vast account response is missing a valid account ID.")
+        return str(account_id)
+
     def auth_status(self) -> VastAuthStatus:
         """Validate the effective credential without exposing account secrets."""
         try:
-            data = self._request("GET", "/users/current/")
-            account_id = positive_int(data.get("id"))
-            if account_id is None:
-                raise VastApiError("Vast account response is missing a valid account ID.")
+            account_id = self.account_id()
         except (VastApiError, ValueError) as exc:
             return VastAuthStatus(False, source=self.credentials.source, error=str(exc))
-        return VastAuthStatus(True, source=self.credentials.source, account_id=str(account_id))
+        return VastAuthStatus(True, source=self.credentials.source, account_id=account_id)
 
     def list_offers(self, query: VastOfferQuery | None = None) -> list[VastOffer]:
         """Fetch a bounded preview of eligible offers, with unknown prices last."""
@@ -238,13 +243,18 @@ class VastBackend:
                     return offer
         raise VastApiError("The selected Vast offer is no longer available with these requirements.")
 
-    def create_instance(self, offer_id: str, *, image: str, disk_gb: int, label: str) -> str:
+    def create_instance(
+        self, offer_id: str, *, image: str, disk_gb: int, label: str, onstart: str = "",
+    ) -> str:
         """Accept an offer once. Never automatically retry this billable request."""
-        data = self._request("PUT", f"/asks/{_resource_id(offer_id)}/", {
+        payload = {
             "client_id": "me", "image": image, "disk": disk_gb,
             "label": label, "runtype": "ssh", "target_state": "running",
             "cancel_unavail": True,
-        })
+        }
+        if onstart:
+            payload["onstart"] = onstart
+        data = self._request("PUT", f"/asks/{_resource_id(offer_id)}/", payload)
         instance_id = positive_int(data.get("new_contract"))
         if data.get("success") is not True or instance_id is None:
             raise VastApiError("Vast rental result is uncertain; reconcile the recorded label before retrying.")
@@ -291,18 +301,8 @@ class VastBackend:
         raise VastApiError("Vast instance pagination did not complete; rental state remains uncertain.")
 
     def attach_key(self, instance_id: str, public_key: str) -> None:
-        """Authorize only the newly created instance, not the whole account.
-
-        Offering a key the instance already holds is not a failure: callers
-        re-offer it because a container started before the first attach never
-        reads it, and refusing the retry would hide that recovery.
-        """
-        try:
-            data = self._request("POST", f"/instances/{_resource_id(instance_id)}/ssh/", {"ssh_key": public_key})
-        except VastApiError as exc:
-            if exc.status_code in {400, 409}:
-                return
-            raise
+        """Authorize one instance and require explicit confirmation from Vast."""
+        data = self._request("POST", f"/instances/{_resource_id(instance_id)}/ssh/", {"ssh_key": public_key})
         if data.get("success") is not True:
             raise VastApiError("Vast did not confirm SSH key attachment.")
 

@@ -27,7 +27,7 @@ from llm_launchpad.core.vast_runtime import (
     parse_gpu_inventory,
     verify_streaming,
 )
-from llm_launchpad.core.vast_ssh import VastSsh
+from llm_launchpad.core.vast_ssh import VastSsh, ssh_key_startup
 from llm_launchpad.core.vast_state import VastState
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider, VisionMode
 from llm_launchpad.protocol.events import LogEvent, OperationCompleteEvent, StateChangeEvent
@@ -182,6 +182,8 @@ def probe_image(args: argparse.Namespace) -> int:
     name = "llp-vast-probe-" + uuid.uuid4().hex[:10]
     state = VastState()
     ssh = VastSsh(state.directory(name))
+    public_key = ssh.public_key()
+    onstart = ssh_key_startup(public_key)
     report: dict[str, Any] = {
         "started_at": datetime.now(timezone.utc).isoformat(), "name": name,
         "image": args.image, "offer": asdict(offer), "credit_before": before,
@@ -192,10 +194,11 @@ def probe_image(args: argparse.Namespace) -> int:
     started = time.monotonic()
     try:
         instance_id = api.create_instance(
-            offer.id, image=args.image, disk_gb=args.disk_gb, label=name
+            offer.id, image=args.image, disk_gb=args.disk_gb, label=name,
+            onstart=onstart,
         )
         print(f"PROBE {name}: rented {instance_id} on {args.image}", flush=True)
-        api.attach_key(instance_id, ssh.public_key())
+        api.attach_key(instance_id, public_key)
         deadline = time.monotonic() + args.max_minutes * 60
         while True:
             if time.monotonic() >= deadline:
