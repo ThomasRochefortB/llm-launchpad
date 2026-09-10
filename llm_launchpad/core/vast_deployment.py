@@ -199,8 +199,6 @@ class VastDeploymentBackend:
             ssh_reported = False
             ssh_first_try = time.monotonic()
             ssh_backoff = 5.0
-            key_reattaches = 0
-            key_offered_running = False
             while time.monotonic() < deadline:
                 if cancellation.is_set() or is_shutting_down():
                     raise RuntimeError("Vast deployment cancelled.")
@@ -217,16 +215,6 @@ class VastDeploymentBackend:
                     continue
                 if instance is None or instance.state in {"error", "exited", "offline", "destroyed"}:
                     raise RuntimeError("Vast instance stopped before the runtime became ready.")
-                if instance.state == "running" and not key_offered_running:
-                    # Vast writes a container's authorized_keys when the
-                    # container starts. A key attached while the host was still
-                    # pulling a multi-gigabyte image is registered but never
-                    # read, so offer it again now that the container exists.
-                    key_offered_running = True
-                    try:
-                        self.api.attach_key(record.instance_id, public_key)
-                    except VastApiError as attach_error:
-                        yield LogEvent(line=f"Could not re-attach the SSH key: {attach_error}")
                 if instance.state != last_state:
                     # Pulling a large image can take many minutes. Say which
                     # step is slow instead of reporting a bare timeout.
@@ -240,19 +228,6 @@ class VastDeploymentBackend:
                         if time.monotonic() - ssh_first_try > 120 and not ssh_reported:
                             ssh_reported = True
                             yield LogEvent(line=f"Vast host is running but not accepting SSH yet: {exc}")
-                        # A key attached moments after creation can be missed by
-                        # a host that then spends minutes pulling its image.
-                        # Vast documents post-create attachment for Docker
-                        # instances, so offer the key again before giving up.
-                        if key_reattaches < 2 and time.monotonic() - ssh_first_try > 90 * (key_reattaches + 1):
-                            key_reattaches += 1
-                            try:
-                                self.api.attach_key(record.instance_id, public_key)
-                                yield LogEvent(line="Re-attached the rental's SSH key.")
-                            except VastApiError as attach_error:
-                                # Say why. A silent retry that fails leaves the
-                                # deployment looking like a slow host.
-                                yield LogEvent(line=f"Could not re-attach the SSH key: {attach_error}")
                         # Back off rather than retrying every few seconds. A
                         # host that is up but refusing keys will not change its
                         # mind quickly, and hundreds of failed authentications

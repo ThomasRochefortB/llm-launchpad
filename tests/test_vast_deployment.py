@@ -6,7 +6,7 @@ import stat
 import subprocess
 from tempfile import TemporaryDirectory
 import unittest
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, patch
 
 from llm_launchpad.core.orchestrator import Orchestrator
 from llm_launchpad.core.connection_store import merge_connections
@@ -103,12 +103,7 @@ class VastLifecycleTests(unittest.TestCase):
         self.assertNotIn(record.endpoint_api_key, repr(record))
         self.assertEqual(stat.S_IMODE((self.state.directory(record.name) / "record.json").stat().st_mode), 0o600)
         self.stream.assert_called_once()
-        # Offered at creation and again once the container is running, because
-        # a container that started mid-pull never reads the first one.
-        self.assertEqual(
-            self.api.attach_key.call_args_list,
-            [call("900", "ssh-ed25519 PUBLICKEY")] * 2,
-        )
+        self.api.attach_key.assert_called_once_with("900", "ssh-ed25519 PUBLICKEY")
         self.assertEqual(self.backend.list_deployments()[0].app_id, "900")
         self.assertEqual(self.backend.connect("900").web_url, event.data.web_url)
         self.backend.destroy(name=record.name, instance_id="900")
