@@ -190,7 +190,10 @@ class VastDeploymentBackend:
             record.instance_id = self.api.create_instance(offer.id, image=image, disk_gb=options.disk_gb, label=record.label)
             self.state.save(record)  # Persist identity before yielding control.
             self.api.attach_key(record.instance_id, public_key)
-            deadline = time.monotonic() + 900
+            # A rental cannot answer SSH until its image is pulled, and the
+            # vLLM image is several times the size of the llama.cpp one. On a
+            # modest link that is minutes of legitimate waiting, not a failure.
+            deadline = time.monotonic() + (1800 if config.backend == BackendType.VLLM else 900)
             instance = None
             last_state = ""
             ssh_reported = False
@@ -235,7 +238,7 @@ class VastDeploymentBackend:
                 cancellation.wait(3)
             else:
                 raise RuntimeError(
-                    f"Vast instance did not provide SSH within 15 minutes (last state: {last_state})."
+                    f"Vast instance did not provide SSH before the deadline (last state: {last_state})."
                 )
             assert instance is not None
             devices = parse_gpu_inventory(ssh.run(instance, GPU_INVENTORY_COMMAND))

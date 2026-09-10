@@ -641,6 +641,9 @@ class VastOffer:
     # A modern driver on an old card still cannot run a modern CUDA build:
     # CUDA 13 dropped Maxwell, Pascal and Volta.
     compute_capability: float | None = None
+    # Pulling a multi-gigabyte runtime image is often the slowest part of a
+    # rental's startup, and marketplace links vary by an order of magnitude.
+    inet_down_mbps: float | None = None
 
     @property
     def gpu_memory_gib(self) -> float:

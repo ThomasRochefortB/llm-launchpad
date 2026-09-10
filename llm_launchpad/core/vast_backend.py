@@ -140,6 +140,7 @@ def parse_vast_offer(raw: Any, query: VastOfferQuery) -> VastOffer | None:
         disk_capacity_gb=disk,
         cuda_max_good=_nonnegative(raw.get("cuda_max_good")),
         compute_capability=_compute_capability(raw.get("compute_cap")),
+        inet_down_mbps=_nonnegative(raw.get("inet_down")),
         location=_text(raw.get("geolocation")), datacenter=datacenter,
         cpu_memory_gb=cpu_ram / 1000 if cpu_ram is not None else None,
         max_duration_hours=duration / 3600 if duration is not None else None,
