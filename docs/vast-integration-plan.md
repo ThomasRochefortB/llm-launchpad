@@ -1,10 +1,15 @@
 # Vast.ai integration plan
 
-Status: live-validated on 2026-09-09. Real single-GPU rentals were created,
-exercised, and destroyed; every rental was confirmed absent afterwards.
+Status: beta implementation with partial live certification. Real single-GPU
+and two-GPU llama.cpp rentals were exercised and destroyed; every rental in the
+recorded certification work was confirmed absent afterwards.
 
 The implemented increments cover auth and quotes; model-aware Fast Deploy
-prices and filters; and a deployable single-GPU, text-only llama.cpp beta. Vast
+prices and filters; and llama.cpp (one to eight GPUs) and vLLM (one, two, four,
+or eight GPUs) runtime implementations. Advanced deploy exposes image input;
+Fast Deploy remains text-only. vLLM and image input require the explicit
+`LLM_LAUNCHPAD_VAST_EXPERIMENTAL=1` opt-in until live certification is complete.
+Implementation does not imply certification. Vast
 placements now compete in serving tiers and accepted fallbacks. The lifecycle
 includes repricing, durable rental intent, create reconciliation, private SSH
 startup, health/stream verification, listing, logs, reconnect, and confirmed
@@ -16,11 +21,14 @@ does not implement Vast suspend/resume. This supersedes the broader lifecycle
 and public-ingress proposals below for the current increment. These differences
 are displayed at deployment and stop confirmation.
 
-Live certification is done on RTX 3060-class single-GPU hosts: pinned image
+Recorded live certification covers RTX 3060-class single-GPU hosts: pinned image
 startup, authenticated streaming and tool calls, a 310-second request, measured
-startup and cost, and confirmed cleanup. Repeat runs across more GPU models
-remain. The broader vLLM, multi-GPU, vision, model-switching, persistent-storage,
-and public HTTPS work remains planned. Mocked tests are not live certification.
+startup and cost, and confirmed cleanup. A separate two-GPU llama.cpp run
+demonstrated weights split across both cards. Current-code vLLM serving,
+vLLM tensor parallelism, image inference, and Advanced deploy through a real
+rental remain uncertified. Repeat runs across more GPU models also remain.
+Model switching, persistent storage, suspend/resume, and public HTTPS are future
+scope. Mocked tests are not live certification.
 
 The work packages below retain the broader release plan; their completion
 criteria are not a description of currently implemented support.

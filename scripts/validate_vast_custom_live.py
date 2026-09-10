@@ -10,6 +10,7 @@ import json
 import math
 from pathlib import Path
 import time
+from typing import Any
 from unittest.mock import patch
 import uuid
 
@@ -22,10 +23,10 @@ from llm_launchpad.core.vast_runtime import GPU_INVENTORY_COMMAND, parse_gpu_inv
 from llm_launchpad.core.vast_ssh import VastSsh
 from llm_launchpad.core.vision_probe import assistant_text, image_probe_payload
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider
-from llm_launchpad.protocol.models import DeploymentConfig, VastOfferQuery, VastProviderOptions
+from llm_launchpad.protocol.models import DeploymentConfig, EndpointInfo, VastOfferQuery, VastProviderOptions
 from llm_launchpad.tui.screens.deploy import LlamaCppDeployScreen, VastOffersLoaded, VllmDeployScreen
 from scripts.validate_prime_live import LiveTuiApp
-from scripts.validate_vast_live import account_credit, long_stream, probe_chat
+from scripts.validate_vast_live import account_credit, budget_estimate, long_stream, probe_chat
 from scripts.validate_vast_tui_live import settle
 
 
@@ -61,17 +62,37 @@ class CustomVastApp(LiveTuiApp):
         super().begin_deploy(config)
 
 
+def probe_vision(
+    session: requests.Session, endpoint: EndpointInfo, config: DeploymentConfig,
+) -> dict[str, Any]:
+    """Check image inference using each engine's own vision configuration."""
+    if config.vision is None or not config.vision.enabled:
+        raise ValueError("The form did not enable image input.")
+    if not endpoint.web_url or not endpoint.endpoint_api_key or not endpoint.served_model_name:
+        raise ValueError("Vision verification requires a complete serving endpoint.")
+    checks: dict[str, Any] = {"vision_verification": config.vision.verification.value}
+    if config.backend == BackendType.LLAMACPP:
+        if config.vision.projector is None:
+            raise ValueError("llama.cpp vision requires a staged projector.")
+        checks["projector"] = asdict(config.vision.projector)
+    with session.post(
+        endpoint.web_url + "/v1/chat/completions",
+        headers={"Authorization": "Bearer " + endpoint.endpoint_api_key},
+        json=image_probe_payload(endpoint.served_model_name), timeout=90,
+    ) as response:
+        response.raise_for_status()
+        answer = assistant_text(response.json()["choices"][0]["message"])
+    if not answer.strip():
+        raise RuntimeError("Image request returned no text.")
+    checks["image_answer"] = answer
+    return checks
+
+
 async def validate(args: argparse.Namespace) -> int:
     backend = VastDeploymentBackend()
     offer = backend.api.get_offer(args.offer_id, VastOfferQuery(gpu_count=None))
-    rates = (offer.costs.total_per_hour_usd, offer.costs.download_per_gb_usd, offer.costs.upload_per_gb_usd)
-    if any(rate is None or not math.isfinite(rate) for rate in rates):
-        raise ValueError("Live testing requires known hourly and transfer prices.")
-    hourly, down, up = (float(rate) for rate in rates if rate is not None)
-    estimate = hourly * args.max_minutes / 60 + down * args.transfer_gb + up
     before = account_credit(backend.api)
-    if hourly > args.max_hourly_cost or estimate > args.budget_usd or before < args.budget_usd:
-        raise ValueError("The offer exceeds the approved live-test budget.")
+    estimate = budget_estimate(offer, args, before)
     kind = BackendType(args.backend)
     name = f"llp-vast-{kind.value}-custom-" + uuid.uuid4().hex[:10]
     app = CustomVastApp(kind, name, offer.id, args.model, args.rehearse)
@@ -167,19 +188,7 @@ async def validate(args: argparse.Namespace) -> int:
                         with requests.Session() as session:
                             session.trust_env = False
                             if args.vision:
-                                assert config.vision is not None and config.vision.projector is not None
-                                checks["projector"] = asdict(config.vision.projector)
-                                checks["vision_verification"] = config.vision.verification.value
-                                with session.post(
-                                    endpoint.web_url + "/v1/chat/completions",
-                                    headers={"Authorization": "Bearer " + endpoint.endpoint_api_key},
-                                    json=image_probe_payload(endpoint.served_model_name), timeout=90,
-                                ) as response:
-                                    response.raise_for_status()
-                                    answer = assistant_text(response.json()["choices"][0]["message"])
-                                if not answer.strip():
-                                    raise RuntimeError("Image request returned no text.")
-                                checks["image_answer"] = answer
+                                checks.update(await asyncio.to_thread(probe_vision, session, endpoint, config))
                             else:
                                 await asyncio.to_thread(probe_chat, session, endpoint, checks)
                                 checks["long_stream"] = await asyncio.to_thread(long_stream, session, endpoint, args.stream_seconds)
@@ -205,8 +214,11 @@ async def validate(args: argparse.Namespace) -> int:
         except Exception as exc:
             report["cleanup_error"] = str(exc)
         report["elapsed_seconds"] = time.monotonic() - started
-        report["credit_after"] = account_credit(backend.api)
-        report["credit_delta_usd"] = before - report["credit_after"]
+        try:
+            report["credit_after"] = account_credit(backend.api)
+            report["credit_delta_usd"] = before - report["credit_after"]
+        except Exception:
+            report["credit_after"] = None
         save()
         print(f"Report {args.report}; cleanup confirmed: {report['cleanup_confirmed']}", flush=True)
     return 0 if report["success"] and report["cleanup_confirmed"] else 1

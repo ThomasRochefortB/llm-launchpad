@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 import unittest
+from unittest.mock import patch
 
 from llm_launchpad.core.providers import capabilities, refuse
 from llm_launchpad.core.vast_runtime import (
@@ -40,6 +41,7 @@ def config(**overrides: object) -> DeploymentConfig:
     return replace(base, **overrides)  # type: ignore[arg-type]
 
 
+@patch.dict("os.environ", {"LLM_LAUNCHPAD_VAST_EXPERIMENTAL": "1"})
 class VastRefusalTests(unittest.TestCase):
     def test_supported_config_resolves_a_digest_pinned_image(self) -> None:
         runtime = vast_runtime(config())
@@ -186,6 +188,7 @@ class TopologyVerificationTests(unittest.TestCase):
             )
 
 
+@patch.dict("os.environ", {"LLM_LAUNCHPAD_VAST_EXPERIMENTAL": "1"})
 class VastVllmRuntimeTests(unittest.TestCase):
     def vllm(self, **overrides: object) -> DeploymentConfig:
         base = config(
@@ -223,6 +226,7 @@ class VastVllmRuntimeTests(unittest.TestCase):
         self.assertIsNotNone(refuse(config(revision="abc123")))
 
 
+@patch.dict("os.environ", {"LLM_LAUNCHPAD_VAST_EXPERIMENTAL": "1"})
 class ArchitectureFloorTests(unittest.TestCase):
     """A modern driver on an old card is still an unusable rental."""
 
@@ -254,3 +258,25 @@ class ArchitectureFloorTests(unittest.TestCase):
         self.assertIsNone(_compute_capability(None))
         self.assertIsNone(_compute_capability(0))
 
+
+
+class VastCertificationGateTests(unittest.TestCase):
+    @patch.dict("os.environ", {"LLM_LAUNCHPAD_VAST_EXPERIMENTAL": ""})
+    def test_uncertified_engines_and_image_input_are_refused_by_default(self) -> None:
+        from llm_launchpad.protocol.enums import VisionMode
+
+        for candidate in (
+            config(backend=BackendType.VLLM, model_name="acme/model"),
+            config(vision_mode=VisionMode.ON),
+            config(vision=VisionCapabilities(supported=True, enabled=True)),
+        ):
+            with self.subTest(backend=candidate.backend, vision=candidate.vision_mode):
+                self.assertIn("EXPERIMENTAL=1", refuse(candidate) or "")
+                with self.assertRaisesRegex(ValueError, "live certification"):
+                    vast_runtime_script(candidate)
+        self.assertIsNone(refuse(config()))
+
+    @patch.dict("os.environ", {"LLM_LAUNCHPAD_VAST_EXPERIMENTAL": "1"})
+    def test_opt_in_preserves_normal_runtime_validation(self) -> None:
+        self.assertIsNone(refuse(config(backend=BackendType.VLLM, model_name="acme/model")))
+        self.assertIn("model name", refuse(config(backend=BackendType.VLLM)) or "")

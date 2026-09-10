@@ -1036,6 +1036,7 @@ class VllmDeployFormPolishTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(screen._rank_mode, "downloads")
             self.assertEqual(app.fetch_calls, ["downloads"])
 
+    @patch.dict("os.environ", {"LLM_LAUNCHPAD_VAST_EXPERIMENTAL": "1"})
     async def test_vast_vllm_rental_binds_its_topology_and_reaches_the_config(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:
@@ -1068,6 +1069,22 @@ class VllmDeployFormPolishTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(config.gpu_count, 1)
             # A rental bills every GPU it bundles, so sharding uses all of them.
             self.assertEqual(config.n_gpu, config.gpu_count)
+
+    @patch.dict("os.environ", {"LLM_LAUNCHPAD_VAST_EXPERIMENTAL": ""})
+    async def test_vast_vllm_requires_opt_in_before_starting_a_worker(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+            screen.query_one("#model-name", Input).value = "Qwen/Qwen3-0.6B"
+            screen.on_vast_offers_loaded(VastOffersLoaded(offers=_vast_offers()))
+            screen.query_one("#provider-vllm", Select).value = "vast"
+            await pilot.pause()
+            screen._do_deploy()
+            self.assertIsNone(app.deployed_config)
+            self.assertTrue(any("EXPERIMENTAL=1" in message for message, _ in app.notifications))
 
     async def test_smoke_test_only_is_refused_for_vast(self) -> None:
         app = _TestApp()

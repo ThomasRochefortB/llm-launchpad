@@ -818,6 +818,9 @@ class FastDeployTextOnlyTests(unittest.TestCase):
         with patch(
             "llm_launchpad.core.quick_deploy_refresh._fetch_serving_metadata",
             return_value=metadata,
+        ), patch(
+            "llm_launchpad.core.quick_deploy_refresh.fetch_model_max_context",
+            return_value=32768,
         ):
             resolved = _build_resolved_aa_model(
                 candidate, [ModalGpuSpec("A100-80GB", price_per_hour_usd=2.5)],

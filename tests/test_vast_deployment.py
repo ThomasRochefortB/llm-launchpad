@@ -123,6 +123,17 @@ class VastLifecycleTests(unittest.TestCase):
             self.assertFalse(event.success)
         self.api.create_instance.assert_not_called()
 
+    @patch.dict("os.environ", {"LLM_LAUNCHPAD_VAST_EXPERIMENTAL": ""})
+    def test_uncertified_vllm_is_refused_before_any_rental(self) -> None:
+        self.config.backend = BackendType.VLLM
+        self.config.model_name = "Qwen/Qwen3-0.6B"
+        event = self.deploy()
+        self.assertFalse(event.success)
+        self.assertIn("EXPERIMENTAL=1", event.detail or "")
+        self.api.create_instance.assert_not_called()
+        self.api.attach_key.assert_not_called()
+        self.assertEqual(self.state.records(), [])
+
     def test_changed_machine_or_insufficient_memory_cannot_rent(self) -> None:
         self.api.get_offer.return_value = vast_offer(machine_id=43)
         self.assertFalse(self.deploy().success)

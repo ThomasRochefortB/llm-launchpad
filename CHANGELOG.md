@@ -27,7 +27,9 @@ and this project follows [Semantic Versioning](https://semver.org/).
 - Vision option fields keep visible labels, and projector/image details hide when vision is set to text only.
 
 ### Fixed
-- Vast rental startup installs its public SSH key through the container startup hook and no longer treats rejected key-attachment requests as success. Live vLLM retesting is still required.
+- Vast rental startup requires a successful per-instance SSH key attachment and omits the reverted container startup hook, which caused SSH failures. Live vLLM serving retesting is still required.
+- Vast live validation uses production-style SSH startup, checks total runtime and transfer estimates with cleanup headroom, and retains recovery records after uncertain image-probe creation. The Advanced deploy vision check supports vLLM without requiring a GGUF projector.
+- Uncertified Vast vLLM and image-input deployments now require `LLM_LAUNCHPAD_VAST_EXPERIMENTAL=1` before renting. Text-only llama.cpp remains enabled normally.
 - Vast cleanup retries rate-limited account and instance identity checks, including reconciliation after uncertain creation, before destroying the rental.
 - First llama.cpp Modal deploy after a large Hugging Face download no longer dies at the 30-minute web-server startup timeout. The GPU container sequentially hydrates GGUF shards (and a projector, if any) before `llama-server` starts, and the bind wait defaults to 90 minutes (`LLAMACPP_SERVE_STARTUP_TIMEOUT_MINUTES`).
 

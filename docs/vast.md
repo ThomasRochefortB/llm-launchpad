@@ -1,11 +1,13 @@
 # Vast.ai rentals (beta)
 
 Vast offers participate in Fast Deploy's prices, GPU filters, serving tiers,
-and eligible deployment fallbacks. The beta supports **llama.cpp GGUF models
-on one to eight GPUs** and **vLLM on one, two, four, or eight GPUs**, with
-published, digest-pinned runtimes. Advanced deploy also supports image input;
-Fast Deploy remains text-only. Offers whose runtime is unsupported remain
-comparisons. See the validation limits below before choosing a runtime.
+and eligible deployment fallbacks. The beta enables **text-only llama.cpp GGUF
+models on one to eight GPUs**, with published, digest-pinned runtimes.
+**vLLM and image input require `LLM_LAUNCHPAD_VAST_EXPERIMENTAL=1`** until their
+live certification is complete. The experimental vLLM runtime supports one,
+two, four, or eight GPUs; image input is Advanced deploy only. Fast Deploy
+remains text-only. Offers whose runtime is unsupported remain comparisons.
+See the validation limits below before choosing a runtime.
 
 A rented host's GPUs are inventoried over SSH before anything is served: a
 bundle that reports a different device count, mixed GPU models, or too little
@@ -22,8 +24,14 @@ stream, reconnect, warm restart, and Fast Deploy through the TUI. A separate
 two-GPU llama.cpp run verified that model weights spanned both devices.
 vLLM serving, vision projector staging, and Advanced deploy through a real
 rental remain uncertified. vLLM runs encountered persistent SSH key refusals;
-the startup key installation described below still needs a live retest. These
+the current configuration omits the reverted `onstart` hook and still needs
+a complete serving retest. These
 results do not certify every host or GPU topology.
+
+The experimental gate applies to CLI, Advanced deploy, and direct backend
+deployment before a rental is created. Opting in does not certify the runtime;
+a failed startup can still incur charges. See the
+[certification matrix and run instructions](vast-certification.md).
 
 ## Account setup
 
@@ -164,13 +172,13 @@ verifies streaming without renting another GPU. If another application owns the
 port, reconnect fails rather than publishing an unrelated endpoint. The SSH
 master survives CLI/TUI exit but may disconnect after sleep or network loss.
 
-Launchpad generates a per-rental SSH key and endpoint bearer token. The public
-key is included in Vast's `onstart` hook, which installs it in the container's
-`authorized_keys` after Vast initializes the container. This avoids depending
-only on delayed key propagation during a large image pull. The hook preserves
-existing keys and sets SSH file permissions; it contains no private key, endpoint
-token, or Hugging Face token. Per-instance key attachment still requires an
-explicit API success response. Startup transfers the private runtime script
+Launchpad generates a per-rental SSH key and endpoint bearer token. It attaches
+the public key through Vast's per-instance SSH API and requires an explicit
+success response. It sends **no `onstart` hook**: the attempted key-installation
+hook displaced the image's startup script and caused SSH failures in control
+runs. A successful key attachment does not by itself prove SSH readiness;
+Launchpad waits with backoff for an authenticated connection.
+Startup transfers the private runtime script
 through SSH stdin; the Vast account key is never sent to the host. An existing
 Hugging Face login is used for model download.
 SSH uses a private known-hosts file, accepts the first host key, and rejects
@@ -189,6 +197,15 @@ Model switching, custom-build runtimes, non-default llama.cpp revisions,
 suspend/resume, and persistent Vast volumes are outside this beta. vLLM can pin
 a model revision. Unsupported configurations are refused in the form, before
 anything is rented.
+
+### Screenshots
+
+These captures use synthetic offers and model metadata. They demonstrate the
+UI, not live prices, performance, or serving certification.
+
+![Vast account and offer browser with fixture data](images/pr77/vast-settings.svg)
+
+![Fast Deploy placement selection with fixture data](images/pr77/vast-fast-deploy.svg)
 
 ### Recovery and billing
 

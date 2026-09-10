@@ -28,11 +28,11 @@ from llm_launchpad.core.vast_runtime import (
     parse_gpu_inventory,
     verify_streaming,
 )
-from llm_launchpad.core.vast_ssh import VastSsh, ssh_key_startup
+from llm_launchpad.core.vast_ssh import VastSsh
 from llm_launchpad.core.vast_state import VastState
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider, VisionMode
 from llm_launchpad.protocol.events import LogEvent, OperationCompleteEvent, StateChangeEvent
-from llm_launchpad.protocol.models import DeploymentConfig, EndpointInfo, VastOfferQuery, VastProviderOptions
+from llm_launchpad.protocol.models import DeploymentConfig, EndpointInfo, VastDeploymentRecord, VastOffer, VastOfferQuery, VastProviderOptions
 
 
 class _StageComplete(Exception):
@@ -43,6 +43,26 @@ def account_credit(api: VastBackend) -> float:
     """Read credit without recording account credentials or personal fields."""
     row = api._request("GET", "/users/current/")
     return float(row["credit"]) + float(row["balance"])
+
+
+def budget_estimate(offer: VastOffer, args: argparse.Namespace, credit: float) -> float:
+    """Refuse unknown costs and reserve runtime, transfer, and cleanup headroom."""
+    rates = (offer.costs.total_per_hour_usd, offer.costs.download_per_gb_usd, offer.costs.upload_per_gb_usd)
+    if any(rate is None or not math.isfinite(rate) or rate < 0 for rate in rates):
+        raise ValueError("Live validation requires known, nonnegative hourly and transfer prices.")
+    if not all(math.isfinite(value) and value > 0 for value in (
+        args.max_hourly_cost, args.budget_usd, args.max_minutes, args.transfer_gb,
+    )):
+        raise ValueError("Live validation requires positive finite budgets and a deadline.")
+    hourly, download, upload = (float(rate) for rate in rates if rate is not None)
+    # Reserve five additional minutes for bounded destruction retries.
+    estimate = hourly * (args.max_minutes + 5) / 60 + download * args.transfer_gb + upload
+    if (
+        hourly > args.max_hourly_cost or estimate > args.budget_usd
+        or not math.isfinite(credit) or credit < args.budget_usd
+    ):
+        raise ValueError("Offer or available credit does not meet the live budget guard.")
+    return estimate
 
 
 def expired(signum: int, frame: Any) -> None:
@@ -182,35 +202,42 @@ def probe_image(args: argparse.Namespace) -> int:
         if args.offer_id is None
         else api.get_offer(args.offer_id, VastOfferQuery(disk_gb=args.disk_gb))
     )
-    hourly = offer.costs.total_per_hour_usd
-    if hourly is None or not math.isfinite(hourly) or hourly > args.max_hourly_cost:
-        raise ValueError("Offer price is unknown or above the approved ceiling.")
     before = account_credit(api)
+    estimate = budget_estimate(offer, args, before)
     name = "llp-vast-probe-" + uuid.uuid4().hex[:10]
     state = VastState()
     ssh = VastSsh(state.directory(name))
     public_key = ssh.public_key()
-    onstart = ssh_key_startup(public_key)
+    backend = VastDeploymentBackend(api, state)
+    record = VastDeploymentRecord(
+        name=name, label=name, account_id=api.account_id(), offer_id=offer.id,
+        machine_id=offer.machine_id, repo_id="", quant="", served_model_name="",
+        endpoint_api_key="",
+    )
     report: dict[str, Any] = {
         "started_at": datetime.now(timezone.utc).isoformat(), "name": name,
         "image": args.image, "offer": asdict(offer), "credit_before": before,
+        "budget_usd": args.budget_usd, "estimated_cost_with_headroom_usd": estimate,
         "probes": {}, "success": False, "cleanup_confirmed": False,
     }
     args.report.parent.mkdir(parents=True, exist_ok=True)
     instance_id: str | None = None
     started = time.monotonic()
     try:
+        state.save(record)
         instance_id = api.create_instance(
             offer.id, image=args.image, disk_gb=args.disk_gb, label=name,
-            onstart="" if args.without_key_hook else onstart,
         )
+        record.instance_id = instance_id
+        state.save(record)
+        report["instance_id"] = instance_id
         print(f"PROBE {name}: rented {instance_id} on {args.image}", flush=True)
         api.attach_key(instance_id, public_key)
         deadline = time.monotonic() + args.max_minutes * 60
         while True:
             if time.monotonic() >= deadline:
                 raise RuntimeError("The probe host never offered SSH.")
-            instance = api.get_instance(instance_id)
+            instance = backend._retry_while_throttled(lambda: backend._instance(record))
             if instance and instance.state == "running" and instance.ssh_host and instance.ssh_port:
                 try:
                     ssh.run(instance, "true")
@@ -241,21 +268,21 @@ def probe_image(args: argparse.Namespace) -> int:
         report["error"] = f"{type(exc).__name__}: {exc}"
         print("PROBE FAILED: " + report["error"], flush=True)
     finally:
-        if instance_id:
-            try:
-                api.destroy_instance(instance_id)
-                report["cleanup_confirmed"] = api.get_instance(instance_id) is None
-            except Exception as exc:
-                report["cleanup_error"] = str(exc)
-        else:
-            report["cleanup_confirmed"] = True
+        try:
+            backend.destroy(name=name)
+            report["cleanup_confirmed"] = state.load(name) is None
+        except Exception as exc:
+            report["cleanup_error"] = str(exc)
         report["elapsed_seconds"] = time.monotonic() - started
-        report["credit_after"] = account_credit(VastBackend())
-        report["credit_delta_usd"] = before - report["credit_after"]
+        try:
+            report["credit_after"] = account_credit(api)
+            report["credit_delta_usd"] = before - report["credit_after"]
+        except Exception:
+            report["credit_after"] = None
         args.report.write_text(json.dumps(report, indent=2) + "\n")
         print(
             f"Report {args.report}; cleanup confirmed: {report['cleanup_confirmed']}; "
-            f"spent ${report['credit_delta_usd']:.4f}",
+            f"credit delta: {report.get('credit_delta_usd')}",
             flush=True,
         )
     return 0 if report["success"] and report["cleanup_confirmed"] else 1
@@ -269,17 +296,9 @@ def run(args: argparse.Namespace) -> int:
         if args.offer_id is None
         else api.get_offer(args.offer_id, VastOfferQuery(disk_gb=args.disk_gb, gpu_count=None))
     )
-    costs = offer.costs
-    rates = (costs.total_per_hour_usd, costs.download_per_gb_usd, costs.upload_per_gb_usd)
-    if any(value is None or not math.isfinite(value) for value in rates):
-        raise ValueError("Live validation requires known hourly and transfer prices.")
-    hourly, download, upload = (float(value) for value in rates if value is not None)
-    # This small model is <1 GB; allow 20 GB inbound for image extraction,
-    # model/bootstrap downloads and retries, plus 1 GB outbound headroom.
-    estimate = hourly * args.max_minutes / 60 + download * args.transfer_gb + upload
     before = account_credit(api)
-    if hourly > args.max_hourly_cost or estimate > args.budget_usd or before < args.budget_usd:
-        raise ValueError("Offer or available credit does not meet the live budget guard.")
+    estimate = budget_estimate(offer, args, before)
+    hourly = offer.costs.total_per_hour_usd
     stage = args.stage
     vllm = stage.startswith("vllm")
     kind = "vllm" if vllm else "llamacpp"
@@ -469,7 +488,7 @@ def main() -> int:
         help="Rent one host on this image and report what an SSH session sees, instead of deploying.",
     )
     parser.add_argument("--disk-gb", type=int, default=100)
-    parser.add_argument("--without-key-hook", action="store_true", help="Create without the onstart key install, to isolate its effect.")
+    parser.add_argument("--without-key-hook", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--stage",
         default="llamacpp_single_gpu",
