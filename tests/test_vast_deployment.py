@@ -467,3 +467,26 @@ class VastTeardownThrottlingTests(VastLifecycleTests):
                 self.backend.destroy(name=record.name, instance_id="900")
         # The record must survive so the rental can still be reclaimed.
         self.assertIsNotNone(self.state.load(record.name))
+
+
+class VastSshDiagnosticsTests(unittest.TestCase):
+    """Transport errors stay silent unless someone asks to see them."""
+
+    def _failing(self) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(["ssh"], 255, "", "Permission denied (publickey).")
+
+    def test_stderr_is_withheld_by_default(self) -> None:
+        with patch("llm_launchpad.core.vast_ssh.subprocess.run", return_value=self._failing()):
+            with patch.dict("os.environ", {}, clear=False):
+                import os as _os
+                _os.environ.pop("LLM_LAUNCHPAD_SSH_DEBUG", None)
+                with self.assertRaises(RuntimeError) as caught:
+                    VastSsh._run(["ssh", "host"])
+        self.assertNotIn("publickey", str(caught.exception))
+
+    def test_stderr_is_surfaced_when_explicitly_enabled(self) -> None:
+        with patch("llm_launchpad.core.vast_ssh.subprocess.run", return_value=self._failing()):
+            with patch.dict("os.environ", {"LLM_LAUNCHPAD_SSH_DEBUG": "1"}):
+                with self.assertRaises(RuntimeError) as caught:
+                    VastSsh._run(["ssh", "host"])
+        self.assertIn("Permission denied", str(caught.exception))

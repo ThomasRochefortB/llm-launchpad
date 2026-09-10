@@ -1,5 +1,6 @@
 """Dedicated keys and persistent loopback-only SSH forwards for Vast."""
 
+import os
 from pathlib import Path
 import re
 import socket
@@ -43,8 +44,16 @@ class VastSsh:
         except (OSError, subprocess.TimeoutExpired):
             raise RuntimeError("Vast SSH command could not complete. Check OpenSSH and connectivity.") from None
         if result.returncode:
-            # Never echo command arguments, stderr, or a credential-bearing script.
-            raise RuntimeError("Vast SSH command failed. Check connectivity and the saved host key.")
+            # Never echo command arguments, stderr, or a credential-bearing
+            # script: a runtime script carries the endpoint key, and arguments
+            # carry paths. Diagnosing a host that refuses every connection
+            # needs the transport's own words, so allow opting in explicitly.
+            detail = ""
+            if os.environ.get("LLM_LAUNCHPAD_SSH_DEBUG") == "1":
+                detail = " " + " ".join((result.stderr or "").split())[:400]
+            raise RuntimeError(
+                "Vast SSH command failed. Check connectivity and the saved host key." + detail
+            )
         return result
 
     def run(self, instance: VastInstance, command: str, *, input_text: str | None = None) -> str:
