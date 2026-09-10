@@ -291,8 +291,18 @@ class VastBackend:
         raise VastApiError("Vast instance pagination did not complete; rental state remains uncertain.")
 
     def attach_key(self, instance_id: str, public_key: str) -> None:
-        """Authorize only the newly created instance, not the whole account."""
-        data = self._request("POST", f"/instances/{_resource_id(instance_id)}/ssh/", {"ssh_key": public_key})
+        """Authorize only the newly created instance, not the whole account.
+
+        Offering a key the instance already holds is not a failure: callers
+        re-offer it because a container started before the first attach never
+        reads it, and refusing the retry would hide that recovery.
+        """
+        try:
+            data = self._request("POST", f"/instances/{_resource_id(instance_id)}/ssh/", {"ssh_key": public_key})
+        except VastApiError as exc:
+            if exc.status_code in {400, 409}:
+                return
+            raise
         if data.get("success") is not True:
             raise VastApiError("Vast did not confirm SSH key attachment.")
 
