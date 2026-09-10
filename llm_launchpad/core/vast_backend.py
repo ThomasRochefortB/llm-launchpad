@@ -168,7 +168,9 @@ class VastBackend:
             if response.status_code in {401, 403}:
                 raise VastApiError("Vast rejected the API key or its permissions.")
             if response.status_code == 429:
-                raise VastApiError("Vast rate limit reached. Wait briefly and retry.")
+                raise VastApiError(
+                    "Vast rate limit reached. Wait briefly and retry.", status_code=429
+                )
             if not 200 <= response.status_code < 300:
                 raise VastApiError(f"Vast request failed (HTTP {response.status_code}).", status_code=response.status_code)
             try:

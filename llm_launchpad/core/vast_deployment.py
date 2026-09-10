@@ -167,21 +167,51 @@ class VastDeploymentBackend:
             self.api.attach_key(record.instance_id, public_key)
             deadline = time.monotonic() + 900
             instance = None
+            last_state = ""
+            ssh_reported = False
+            ssh_first_try = time.monotonic()
+            ssh_backoff = 5.0
             while time.monotonic() < deadline:
                 if cancellation.is_set() or is_shutting_down():
                     raise RuntimeError("Vast deployment cancelled.")
-                instance = self._instance(record)
+                try:
+                    instance = self._instance(record)
+                except VastApiError as exc:
+                    # The rental is already paid for and this loop polls every
+                    # few seconds. Throttling says nothing about the instance,
+                    # so wait it out rather than destroying a live host.
+                    if exc.status_code != 429:
+                        raise
+                    yield LogEvent(line="Vast is throttling status checks; still waiting for the rental.")
+                    cancellation.wait(15)
+                    continue
                 if instance is None or instance.state in {"error", "exited", "offline", "destroyed"}:
                     raise RuntimeError("Vast instance stopped before the runtime became ready.")
+                if instance.state != last_state:
+                    # Pulling a large image can take many minutes. Say which
+                    # step is slow instead of reporting a bare timeout.
+                    last_state = instance.state
+                    yield LogEvent(line=f"Vast instance state: {instance.state}")
                 if instance.state == "running" and instance.ssh_host and instance.ssh_port:
                     try:
                         ssh.run(instance, "true")
                         break
-                    except RuntimeError:
-                        pass
+                    except RuntimeError as exc:
+                        if time.monotonic() - ssh_first_try > 120 and not ssh_reported:
+                            ssh_reported = True
+                            yield LogEvent(line=f"Vast host is running but not accepting SSH yet: {exc}")
+                        # Back off rather than retrying every few seconds. A
+                        # host that is up but refusing keys will not change its
+                        # mind quickly, and hundreds of failed authentications
+                        # look like an attack to Vast's SSH proxy.
+                        cancellation.wait(ssh_backoff)
+                        ssh_backoff = min(ssh_backoff * 2, 60)
+                        continue
                 cancellation.wait(3)
             else:
-                raise RuntimeError("Vast instance did not provide SSH within 15 minutes.")
+                raise RuntimeError(
+                    f"Vast instance did not provide SSH within 15 minutes (last state: {last_state})."
+                )
             assert instance is not None
             devices = parse_gpu_inventory(ssh.run(instance, GPU_INVENTORY_COMMAND))
             yield LogEvent(line="Rented GPUs: " + (", ".join(

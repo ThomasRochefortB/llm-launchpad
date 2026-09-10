@@ -385,3 +385,36 @@ class VastVllmRecordTests(unittest.TestCase):
             VastDeploymentBackend._endpoint(record, "running", None).backend,
             BackendType.LLAMACPP,
         )
+
+
+class VastThrottlingTests(VastLifecycleTests):
+    """A paid rental must survive throttling it did not cause."""
+
+    def test_a_rate_limited_status_check_waits_instead_of_destroying(self) -> None:
+        calls = {"n": 0}
+        real = self.api.get_instance.side_effect
+
+        def throttle_once(instance_id: str):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise VastApiError("Vast rate limit reached.", status_code=429)
+            return real(instance_id)
+
+        self.api.get_instance.side_effect = throttle_once
+        event = self.deploy()
+        self.assertTrue(event.success, event.detail)
+        self.api.destroy_instance.assert_not_called()
+
+    def test_other_api_failures_still_stop_the_deployment(self) -> None:
+        calls = {"n": 0}
+        real = self.api.get_instance.side_effect
+
+        def fail_once(instance_id: str):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise VastApiError("gone", status_code=500)
+            return real(instance_id)
+
+        self.api.get_instance.side_effect = fail_once
+        self.assertFalse(self.deploy().success)
+        self.api.destroy_instance.assert_called_once_with("900")

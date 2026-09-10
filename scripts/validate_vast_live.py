@@ -24,6 +24,7 @@ from llm_launchpad.core.vast_runtime import (
     GPU_INVENTORY_COMMAND,
     VAST_RUNTIME_DIR,
     endpoint_healthy,
+    parse_gpu_inventory,
     verify_streaming,
 )
 from llm_launchpad.core.vast_ssh import VastSsh
@@ -31,6 +32,10 @@ from llm_launchpad.core.vast_state import VastState
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider, VisionMode
 from llm_launchpad.protocol.events import LogEvent, OperationCompleteEvent, StateChangeEvent
 from llm_launchpad.protocol.models import DeploymentConfig, EndpointInfo, VastOfferQuery, VastProviderOptions
+
+
+class _StageComplete(Exception):
+    """A stage finished everything it certifies, before the shared tail."""
 
 
 def account_credit(api: VastBackend) -> float:
@@ -125,6 +130,35 @@ def long_stream(session: requests.Session, endpoint: EndpointInfo, seconds: int)
     raise RuntimeError(f"Long stream ended early after {time.monotonic() - started:.1f} seconds.")
 
 
+def select_offer(api: VastBackend, args: argparse.Namespace) -> Any:
+    """Choose a rentable offer now, rather than trusting an id from minutes ago.
+
+    Marketplace offers are claimed by other users constantly, so a stale id is
+    the most common way a certification run dies before it rents anything.
+    """
+
+    offers = api.list_offers(
+        VastOfferQuery(gpu_count=args.gpu_count, disk_gb=args.disk_gb, limit=100)
+    )
+    western = (
+        "US", "CA", "GB", "DE", "NL", "FR", "PL", "SE", "NO", "FI",
+        "ES", "IT", "CZ", "AT", "CH", "IE", "EE", "LT", "PT", "DK",
+    )
+    fitting = [
+        offer
+        for offer in offers
+        if offer.costs.total_per_hour_usd
+        and offer.costs.total_per_hour_usd <= args.max_hourly_cost
+        and offer.gpu_memory_gib >= args.min_gpu_memory_gb
+        and (offer.cuda_max_good or 0) >= args.min_cuda
+        and (not args.western_only or any(offer.location.strip().endswith(c) for c in western))
+    ]
+    if not fitting:
+        raise ValueError("No rentable offer matches this stage's requirements.")
+    fitting.sort(key=lambda offer: offer.costs.total_per_hour_usd or 0.0)
+    return fitting[0]
+
+
 def probe_image(args: argparse.Namespace) -> int:
     """Rent one host on a candidate image and report what an SSH session sees.
 
@@ -211,7 +245,11 @@ def probe_image(args: argparse.Namespace) -> int:
 def run(args: argparse.Namespace) -> int:
     api = VastBackend()
     backend = VastDeploymentBackend(api)
-    offer = api.get_offer(args.offer_id, VastOfferQuery(disk_gb=100))
+    offer = (
+        select_offer(api, args)
+        if args.offer_id is None
+        else api.get_offer(args.offer_id, VastOfferQuery(disk_gb=args.disk_gb, gpu_count=None))
+    )
     costs = offer.costs
     rates = (costs.total_per_hour_usd, costs.download_per_gb_usd, costs.upload_per_gb_usd)
     if any(value is None or not math.isfinite(value) for value in rates):
@@ -219,11 +257,14 @@ def run(args: argparse.Namespace) -> int:
     hourly, download, upload = (float(value) for value in rates if value is not None)
     # This small model is <1 GB; allow 20 GB inbound for image extraction,
     # model/bootstrap downloads and retries, plus 1 GB outbound headroom.
-    estimate = hourly * args.max_minutes / 60 + download * 20 + upload
+    estimate = hourly * args.max_minutes / 60 + download * args.transfer_gb + upload
     before = account_credit(api)
     if hourly > args.max_hourly_cost or estimate > args.budget_usd or before < args.budget_usd:
         raise ValueError("Offer or available credit does not meet the live budget guard.")
-    name = "llp-vast-llamacpp-live-" + uuid.uuid4().hex[:10]
+    stage = args.stage
+    vllm = stage.startswith("vllm")
+    kind = "vllm" if vllm else "llamacpp"
+    name = f"llp-vast-{kind}-live-" + uuid.uuid4().hex[:10]
     report: dict[str, Any] = {
         "started_at": datetime.now(timezone.utc).isoformat(), "name": name,
         "offer": asdict(offer), "budget_usd": args.budget_usd,
@@ -235,14 +276,34 @@ def run(args: argparse.Namespace) -> int:
     def save() -> None:
         args.report.write_text(json.dumps(report, indent=2) + "\n")
 
-    config = DeploymentConfig(
-        backend=BackendType.LLAMACPP, provider=ComputeProvider.VAST,
-        app_name=name, instance_name=name.removeprefix("llp-vast-llamacpp-"),
-        repo_id="Qwen/Qwen3-0.6B-GGUF", quant="Q8_0", served_model_name="vast-live-qwen3",
-        gpu_type=offer.gpu_type, gpu_count=1, do_deploy=True, vision_mode=VisionMode.OFF,
-        server_args=shlex.join(["--ctx-size", "4096", "--parallel", "1", "--context-shift", "--n-gpu-layers", "all", "--jinja", "--chat-template-kwargs", '{"enable_thinking":false}']),
-        provider_options=VastProviderOptions(offer.id, 100, args.max_hourly_cost, offer.machine_id),
+    report["stage"] = stage
+    report["gpu_count"] = offer.gpu_count
+    options = VastProviderOptions(
+        offer.id, args.disk_gb, args.max_hourly_cost, offer.machine_id, offer.gpu_count
     )
+    if vllm:
+        config = DeploymentConfig(
+            backend=BackendType.VLLM, provider=ComputeProvider.VAST,
+            app_name=name, instance_name=name.removeprefix("llp-vast-vllm-"),
+            model_name=args.model, served_model_name="vast-live-model",
+            gpu_type=offer.gpu_type, gpu_count=offer.gpu_count, n_gpu=offer.gpu_count,
+            do_deploy=True, vision_mode=VisionMode.OFF, fast_boot=True,
+            provider_options=options,
+        )
+    else:
+        config = DeploymentConfig(
+            backend=BackendType.LLAMACPP, provider=ComputeProvider.VAST,
+            app_name=name, instance_name=name.removeprefix("llp-vast-llamacpp-"),
+            repo_id=args.model, quant=args.quant, served_model_name="vast-live-model",
+            gpu_type=offer.gpu_type, gpu_count=offer.gpu_count, do_deploy=True,
+            vision_mode=VisionMode.OFF,
+            server_args=shlex.join([
+                "--ctx-size", "4096", "--parallel", "1", "--context-shift",
+                "--n-gpu-layers", "all", "--jinja",
+                "--chat-template-kwargs", '{"enable_thinking":false}',
+            ]),
+            provider_options=options,
+        )
     save()
     print(f"LIVE {name}: offer {offer.id}, ${hourly:.4f}/hr, headroom estimate ${estimate:.3f}", flush=True)
     signal.signal(signal.SIGALRM, expired)
@@ -281,6 +342,16 @@ def run(args: argparse.Namespace) -> int:
         instance = api.get_instance(instance_id)
         assert instance is not None
         ssh = VastSsh(backend.state.directory(name))
+        # A layer split that silently used one card leaves the others empty.
+        loaded = parse_gpu_inventory(ssh.run(instance, GPU_INVENTORY_COMMAND))
+        checks["devices_after_load"] = [
+            {"index": d.index, "name": d.name, "memory_used_mib": d.memory_used_mib}
+            for d in loaded
+        ]
+        idle = [d.index for d in loaded if d.memory_used_mib < 512]
+        checks["every_device_holds_weights"] = not idle and len(loaded) == offer.gpu_count
+        if offer.gpu_count > 1 and idle:
+            raise RuntimeError(f"GPUs {idle} hold no weights; the model did not span the rental.")
         logs = backend.logs(instance_id)
         checks["logs"] = {"lines": len(logs), "gpu_offload_reported": any("offloaded" in line for line in logs)}
         ssh.disconnect(instance)
@@ -292,6 +363,12 @@ def run(args: argparse.Namespace) -> int:
         # Hugging Face downloads land as content-addressed blobs with no
         # .gguf suffix, so the cache is every file the runtime kept, by size.
         cache_listing = f"find {VAST_RUNTIME_DIR}/models -type f -printf '%p %s %T@\\n'"
+        if vllm:
+            # vLLM's warm path is its own HF cache; the llama.cpp restart below
+            # does not apply, and the certification for it is the cold start.
+            report["success"] = True
+            save()
+            raise _StageComplete
         before_cache = ssh.run(instance, cache_listing)
         ssh.run(instance, "pkill -x llama-server")
         warm_start = time.monotonic()
@@ -315,6 +392,8 @@ def run(args: argparse.Namespace) -> int:
         if not checks["warm_restart"]["cache_unchanged"]:
             raise RuntimeError("Warm restart did not preserve the model cache.")
         report["success"] = True
+    except _StageComplete:
+        pass
     except Exception as exc:
         report["error"] = str(exc).replace(config.endpoint_api_key or "<no-key>", "[redacted]")
         print("FAILED: " + report["error"], flush=True)
@@ -350,7 +429,11 @@ def run(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--live", action="store_true", help="Authorize a billable test and destruction of its rental.")
-    parser.add_argument("--offer-id", required=True)
+    parser.add_argument("--offer-id", help="Rent this exact offer. Omitted, the cheapest fit is chosen at rental time.")
+    parser.add_argument("--gpu-count", type=int, default=1)
+    parser.add_argument("--min-gpu-memory-gb", type=float, default=0.0)
+    parser.add_argument("--min-cuda", type=float, default=12.8)
+    parser.add_argument("--western-only", action="store_true", help="Prefer hosts with fast registry access.")
     parser.add_argument("--max-hourly-cost", required=True, type=float)
     parser.add_argument("--budget-usd", required=True, type=float)
     parser.add_argument("--max-minutes", type=int, default=20)
@@ -362,6 +445,20 @@ def main() -> int:
         help="Rent one host on this image and report what an SSH session sees, instead of deploying.",
     )
     parser.add_argument("--disk-gb", type=int, default=100)
+    parser.add_argument(
+        "--stage",
+        default="llamacpp_single_gpu",
+        choices=[
+            "llamacpp_single_gpu",
+            "llamacpp_multi_gpu",
+            "vllm_single_gpu",
+            "vllm_tensor_parallel",
+        ],
+        help="What this rental certifies. vLLM stages stop after streaming verification.",
+    )
+    parser.add_argument("--model", default="Qwen/Qwen3-0.6B-GGUF", help="GGUF repo, or HF model for vLLM.")
+    parser.add_argument("--quant", default="Q8_0")
+    parser.add_argument("--transfer-gb", type=float, default=20.0, help="Inbound GB to budget for.")
     args = parser.parse_args()
     if not args.live:
         parser.error("Pass --live to explicitly authorize a paid rental.")
