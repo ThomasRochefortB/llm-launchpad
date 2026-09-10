@@ -638,6 +638,9 @@ class VastOffer:
     max_duration_hours: float | None = None
     disk_capacity_gb: float | None = None
     cuda_max_good: float | None = None
+    # A modern driver on an old card still cannot run a modern CUDA build:
+    # CUDA 13 dropped Maxwell, Pascal and Volta.
+    compute_capability: float | None = None
 
     @property
     def gpu_memory_gib(self) -> float:

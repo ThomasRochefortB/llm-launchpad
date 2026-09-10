@@ -23,6 +23,9 @@ VAST_RUNTIME_DIR = "/root/.llm-launchpad"
 # native driver support instead of assuming CUDA forward compatibility on
 # arbitrary marketplace GPUs. Recheck this alongside runtime image updates.
 VAST_MIN_CUDA_VERSION = 12.8
+# The bundled llama.cpp image is a CUDA 12.x build, which still supports
+# Maxwell and newer. Read this from the image alongside its CUDA version.
+VAST_MIN_COMPUTE_CAPABILITY = 5.0
 # Vast bundles at most eight GPUs; the offer search already asks for that range.
 VAST_MAX_GPU_COUNT = 8
 
@@ -101,10 +104,11 @@ def verify_gpu_topology(
 
 @dataclass(frozen=True)
 class VastRuntime:
-    """A pinned image and the driver floor that image was built against."""
+    """A pinned image with the driver and architecture floors it was built for."""
 
     image: str
     min_cuda_version: float
+    min_compute_capability: float
 
 
 @lru_cache(maxsize=1)
@@ -125,9 +129,19 @@ def load_vast_runtime(backend: BackendType) -> VastRuntime:
     digest = str(entry.get("image_digest") or "")
     reference = str(entry.get("image_ref") or "")
     floor = entry.get("min_cuda_version")
-    if not digest.startswith("sha256:") or not reference or not isinstance(floor, (int, float)):
+    architecture = entry.get("min_compute_capability")
+    if (
+        not digest.startswith("sha256:")
+        or not reference
+        or not isinstance(floor, (int, float))
+        or not isinstance(architecture, (int, float))
+    ):
         raise ValueError(f"The Vast {backend.value} runtime entry is incomplete.")
-    return VastRuntime(image=f"{reference.split('@')[0]}@{digest}", min_cuda_version=float(floor))
+    return VastRuntime(
+        image=f"{reference.split('@')[0]}@{digest}",
+        min_cuda_version=float(floor),
+        min_compute_capability=float(architecture),
+    )
 
 
 # vLLM shards attention heads across devices, so the count must divide them.
@@ -181,6 +195,7 @@ def vast_runtime(config: DeploymentConfig) -> VastRuntime:
     return VastRuntime(
         image=manifest.image_ref.split("@")[0] + "@" + manifest.image_digest,
         min_cuda_version=VAST_MIN_CUDA_VERSION,
+        min_compute_capability=VAST_MIN_COMPUTE_CAPABILITY,
     )
 
 

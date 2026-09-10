@@ -19,7 +19,7 @@ def offer_payload(**changes: object) -> dict[str, object]:
         "id": 1001, "machine_id": 42, "gpu_name": "RTX 4090", "num_gpus": 1,
         "gpu_ram": 24576, "cpu_ram": 64000, "disk_space": 200,
         "gpu_arch": "nvidia", "cpu_arch": "amd64",
-        "cuda_max_good": 12.8,
+        "cuda_max_good": 12.8, "compute_cap": 890,
         "verification": "verified", "rentable": True, "rented": False,
         "is_bid": False, "reliability": 0.999, "datacenter": False,
         "duration": 86400, "geolocation": "US",

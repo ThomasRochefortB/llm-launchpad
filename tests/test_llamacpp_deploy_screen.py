@@ -86,6 +86,7 @@ def _vast_offers() -> list[VastOffer]:
             gpu_count=1,
             gpu_memory_gb=24.0,
             reliability=0.99,
+            compute_capability=8.9,
             disk_gb=100,
             costs=OfferCostBreakdown(total_per_hour_usd=0.412),
             location="Poland",
@@ -97,6 +98,7 @@ def _vast_offers() -> list[VastOffer]:
             gpu_count=1,
             gpu_memory_gb=80.0,
             reliability=0.99,
+            compute_capability=8.9,
             disk_gb=100,
             costs=OfferCostBreakdown(total_per_hour_usd=2.10),
             location="Germany",
@@ -108,6 +110,7 @@ def _vast_offers() -> list[VastOffer]:
             gpu_count=4,
             gpu_memory_gb=80.0,
             reliability=0.99,
+            compute_capability=8.9,
             disk_gb=100,
             costs=OfferCostBreakdown(total_per_hour_usd=6.00),
             location="USA"

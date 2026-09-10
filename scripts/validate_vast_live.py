@@ -151,6 +151,7 @@ def select_offer(api: VastBackend, args: argparse.Namespace) -> Any:
         and offer.costs.total_per_hour_usd <= args.max_hourly_cost
         and offer.gpu_memory_gib >= args.min_gpu_memory_gb
         and (offer.cuda_max_good or 0) >= args.min_cuda
+        and (offer.compute_capability or 0) >= args.min_compute
         and (not args.western_only or any(offer.location.strip().endswith(c) for c in western))
     ]
     if not fitting:
@@ -168,7 +169,11 @@ def probe_image(args: argparse.Namespace) -> int:
     """
 
     api = VastBackend()
-    offer = api.get_offer(args.offer_id, VastOfferQuery(disk_gb=args.disk_gb))
+    offer = (
+        select_offer(api, args)
+        if args.offer_id is None
+        else api.get_offer(args.offer_id, VastOfferQuery(disk_gb=args.disk_gb))
+    )
     hourly = offer.costs.total_per_hour_usd
     if hourly is None or not math.isfinite(hourly) or hourly > args.max_hourly_cost:
         raise ValueError("Offer price is unknown or above the approved ceiling.")
@@ -433,6 +438,7 @@ def main() -> int:
     parser.add_argument("--gpu-count", type=int, default=1)
     parser.add_argument("--min-gpu-memory-gb", type=float, default=0.0)
     parser.add_argument("--min-cuda", type=float, default=12.8)
+    parser.add_argument("--min-compute", type=float, default=0.0, help="Oldest GPU architecture the runtime supports.")
     parser.add_argument("--western-only", action="store_true", help="Prefer hosts with fast registry access.")
     parser.add_argument("--max-hourly-cost", required=True, type=float)
     parser.add_argument("--budget-usd", required=True, type=float)

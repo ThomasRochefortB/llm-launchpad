@@ -222,3 +222,35 @@ class VastVllmRuntimeTests(unittest.TestCase):
         self.assertIsNone(refuse(self.vllm(revision="abc123")))
         self.assertIsNotNone(refuse(config(revision="abc123")))
 
+
+class ArchitectureFloorTests(unittest.TestCase):
+    """A modern driver on an old card is still an unusable rental."""
+
+    def test_vllm_requires_a_newer_architecture_than_llamacpp(self) -> None:
+        vllm = vast_runtime(
+            config(backend=BackendType.VLLM, model_name="acme/model", gpu_count=1, n_gpu=1)
+        )
+        llamacpp = vast_runtime(config())
+        # CUDA 13 dropped Maxwell, Pascal and Volta, so the vLLM image needs
+        # Turing or newer while the CUDA 12 llama.cpp image does not.
+        self.assertGreaterEqual(vllm.min_compute_capability, 7.5)
+        self.assertLess(llamacpp.min_compute_capability, vllm.min_compute_capability)
+
+    def test_a_volta_card_suits_llamacpp_but_not_vllm(self) -> None:
+        # Exactly the rental that failed live: driver reported CUDA 13, but
+        # the V100's architecture was dropped by that CUDA release.
+        volta = 7.0
+        vllm = vast_runtime(
+            config(backend=BackendType.VLLM, model_name="acme/model", gpu_count=1, n_gpu=1)
+        )
+        self.assertLess(volta, vllm.min_compute_capability)
+        self.assertGreaterEqual(volta, vast_runtime(config()).min_compute_capability)
+
+    def test_packed_compute_capability_is_read_as_a_version(self) -> None:
+        from llm_launchpad.core.vast_backend import _compute_capability
+
+        self.assertEqual(_compute_capability(860), 8.6)
+        self.assertEqual(_compute_capability(700), 7.0)
+        self.assertIsNone(_compute_capability(None))
+        self.assertIsNone(_compute_capability(0))
+

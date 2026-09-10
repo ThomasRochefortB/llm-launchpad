@@ -77,6 +77,14 @@ def vast_offer_search_payload(query: VastOfferQuery) -> dict[str, Any]:
     return payload
 
 
+def _compute_capability(value: Any) -> float | None:
+    """Convert Vast's packed compute capability (860) to its real form (8.6)."""
+    packed = _nonnegative(value)
+    if packed is None or packed <= 0:
+        return None
+    return round(packed / 100.0, 1)
+
+
 def parse_vast_offer(raw: Any, query: VastOfferQuery) -> VastOffer | None:
     """Normalize known rental fields and reject invalid or ineligible rows."""
     if not isinstance(raw, dict):
@@ -131,6 +139,7 @@ def parse_vast_offer(raw: Any, query: VastOfferQuery) -> VastOffer | None:
         reliability=reliability, disk_gb=query.disk_gb,
         disk_capacity_gb=disk,
         cuda_max_good=_nonnegative(raw.get("cuda_max_good")),
+        compute_capability=_compute_capability(raw.get("compute_cap")),
         location=_text(raw.get("geolocation")), datacenter=datacenter,
         cpu_memory_gb=cpu_ram / 1000 if cpu_ram is not None else None,
         max_duration_hours=duration / 3600 if duration is not None else None,

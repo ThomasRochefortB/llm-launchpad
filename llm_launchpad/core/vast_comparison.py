@@ -13,7 +13,7 @@ from .llamacpp_planner import assess_memory_placement
 from .quick_deploy import QuickDeployModel, QuickDeployProfile, quick_deploy_recipe
 from .inference_options import estimate_monthly_compute_cost
 from .runtime_support import load_llamacpp_support_manifest
-from .vast_runtime import VAST_MAX_GPU_COUNT, VAST_MIN_CUDA_VERSION
+from .vast_runtime import VAST_MAX_GPU_COUNT, VAST_MIN_COMPUTE_CAPABILITY, VAST_MIN_CUDA_VERSION
 
 
 def vast_gpu_label(offer: VastOffer) -> str:
@@ -28,6 +28,8 @@ def vast_plan_for_offer(row: VastModelOffer, profile: QuickDeployProfile) -> Inf
     if not 1 <= row.offer.gpu_count <= VAST_MAX_GPU_COUNT or price is None or price <= 0 or manifest.build_recipe:
         return None
     if row.offer.cuda_max_good is None or row.offer.cuda_max_good < VAST_MIN_CUDA_VERSION:
+        return None
+    if row.offer.compute_capability is None or row.offer.compute_capability < VAST_MIN_COMPUTE_CAPABILITY:
         return None
     quote = ProviderQuote(
         id=row.id.replace(":comparison:", ":deploy:"), recipe_id=row.recipe.id,

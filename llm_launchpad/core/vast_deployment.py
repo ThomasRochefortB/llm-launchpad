@@ -135,6 +135,11 @@ class VastDeploymentBackend:
                 raise ValueError("The selected Vast machine has changed. Refresh offers.")
             if offer.cuda_max_good is None or offer.cuda_max_good < runtime.min_cuda_version:
                 raise ValueError(f"The pinned Vast runtime requires a host reporting CUDA {runtime.min_cuda_version} or newer.")
+            if offer.compute_capability is None or offer.compute_capability < runtime.min_compute_capability:
+                raise ValueError(
+                    f"This GPU's compute capability {offer.compute_capability} is older than the "
+                    f"{runtime.min_compute_capability} the pinned runtime was built for."
+                )
             price = offer.costs.total_per_hour_usd
             if price is None or price > options.max_hourly_cost_usd + 1e-9:
                 raise ValueError("The Vast hourly total is unknown or exceeds the approved price. Refresh offers.")

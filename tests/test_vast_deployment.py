@@ -162,6 +162,21 @@ class VastLifecycleTests(unittest.TestCase):
         self.assertEqual(self.config.gpu_count, 2)
         self.assertEqual(self.api.get_offer.call_args.args[1].gpu_count, 2)
 
+    def test_a_gpu_older_than_the_runtime_cannot_rent(self) -> None:
+        # The driver can be new while the silicon is too old for the image's
+        # CUDA build. A Volta card still suits llama.cpp's CUDA 12 image, so
+        # this uses a Kepler one; the vLLM floor is asserted separately.
+        self.api.get_offer.return_value = vast_offer(compute_cap=350)
+        event = self.deploy()
+        self.assertFalse(event.success)
+        self.assertIn("compute capability", event.detail or "")
+        self.api.create_instance.assert_not_called()
+
+    def test_an_offer_without_a_reported_architecture_cannot_rent(self) -> None:
+        self.api.get_offer.return_value = vast_offer(compute_cap=None)
+        self.assertFalse(self.deploy().success)
+        self.api.create_instance.assert_not_called()
+
     def test_stream_failure_destroys_instance_and_does_not_publish(self) -> None:
         self.stream.side_effect = RuntimeError("stream failed")
         event = self.deploy()

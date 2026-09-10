@@ -1,12 +1,13 @@
 {
   "schema_version": 1,
-  "_comment": "min_cuda_version is CUDA_VERSION read from each image's immutable OCI config (skopeo inspect --config, or the registry blob). Never guess it: renting a host whose driver predates the image is a paid failure. Recheck when bumping a digest.",
+  "_comment": "min_cuda_version is CUDA_VERSION read from each image's immutable OCI config (skopeo inspect --config, or the registry blob). min_compute_capability is the oldest GPU architecture that CUDA build supports: CUDA 13 dropped Maxwell, Pascal and Volta, so a CUDA 13 image needs Turing (7.5) or newer. Never guess either: a host that satisfies the driver but not the architecture rents and then fails to serve. Recheck both when bumping a digest.",
   "runtimes": {
     "vllm": {
       "runtime_id": "vllm-0.29.0",
       "image_ref": "vllm/vllm-openai",
       "image_digest": "sha256:c2914767605584b6d8f45686b82de173ecc99e781897aa3d0a66dacd72c51ae1",
-      "min_cuda_version": 13.0
+      "min_cuda_version": 13.0,
+      "min_compute_capability": 7.5
     }
   }
 }
