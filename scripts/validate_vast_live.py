@@ -17,6 +17,7 @@ import uuid
 
 import requests
 
+from llm_launchpad.core.inference_options import recommended_vllm_tool_call_parser
 from llm_launchpad.core.orchestrator import Orchestrator
 from llm_launchpad.core.vast_backend import VastBackend
 from llm_launchpad.core.vast_deployment import VastDeploymentBackend
@@ -101,17 +102,23 @@ def long_stream(session: requests.Session, endpoint: EndpointInfo, seconds: int)
     """Keep one real generation stream open, then test client cancellation."""
     started = time.monotonic()
     chunks = 0
+    constraints = (
+        {"structured_outputs": {"regex": "(hello world )+"}}
+        if endpoint.backend == BackendType.VLLM
+        else {"grammar": 'root ::= ("hello world ")+'}
+    )
     with session.post(
         (endpoint.web_url or "") + "/v1/chat/completions",
         headers={"Authorization": "Bearer " + (endpoint.endpoint_api_key or "")},
         json={
             "model": endpoint.served_model_name,
             "messages": [{"role": "user", "content": "Write a very long story about a voyage through space."}],
-            "max_tokens": 131072, "stream": True, "ignore_eos": True,
+            "max_tokens": 32768 if endpoint.backend == BackendType.VLLM else 131072,
+            "stream": True, "ignore_eos": True,
             # A constrained repeating response keeps this transport stress
             # test producing text instead of sampling invisible special tokens
             # after an ordinary story has ended.
-            "grammar": 'root ::= ("hello world ")+',
+            **constraints,
             "chat_template_kwargs": {"enable_thinking": False},
         }, timeout=(5, 60), stream=True,
     ) as response:
@@ -297,6 +304,9 @@ def run(args: argparse.Namespace) -> int:
             model_name=args.model, served_model_name="vast-live-model",
             gpu_type=offer.gpu_type, gpu_count=offer.gpu_count, n_gpu=offer.gpu_count,
             do_deploy=True, vision_mode=VisionMode.OFF, fast_boot=True,
+            # vLLM answers a tool call with 400 unless it was started with a
+            # parser, so certify the configuration a user would actually get.
+            tool_call_parser=recommended_vllm_tool_call_parser(args.model),
             provider_options=options,
         )
     else:

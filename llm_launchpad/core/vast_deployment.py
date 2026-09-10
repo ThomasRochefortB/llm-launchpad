@@ -172,7 +172,11 @@ class VastDeploymentBackend:
                 else (config.required_vram_gb or 0) * 1.05 / max(1, offer.gpu_count)
             )
             if required > offer.gpu_memory_gib:
-                raise ValueError("The selected Vast GPU no longer fits the model's memory requirements.")
+                raise ValueError(
+                    f"The selected Vast GPU no longer fits the model's memory requirements: "
+                    f"{required:.1f} GiB required per GPU, {offer.gpu_memory_gib:.1f} GiB "
+                    f"available on each of {offer.gpu_count} GPUs."
+                )
             config.endpoint_api_key = config.endpoint_api_key or secrets.token_urlsafe(32)
             source = config.model_name if config.backend == BackendType.VLLM else config.repo_id
             config.served_model_name = config.served_model_name or (source or "model").rsplit("/", 1)[-1]
