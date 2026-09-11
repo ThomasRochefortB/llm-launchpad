@@ -198,13 +198,16 @@ to produce one at launch, which is the apt traffic against
 reason sshd binds minutes after the container reports `running`. It is also why
 sending an `onstart` hook broke SSH: it displaced the script doing that work.
 
-`llm_launchpad/data/vast_llamacpp_ssh.dockerfile` removes the install step by
-deriving the same pinned image with `openssh-server` already in it. It is built
-and verified but **not published**, so nothing uses it yet: publishing trades
-the property that Vast rents a digest-pinned *upstream* image for one this
-project has to maintain and re-cut on every llama.cpp bump.
+`llm_launchpad/data/vast_llamacpp_ssh.dockerfile` would remove the install step
+by deriving the same pinned image with `openssh-server` already in it. It is
+built and verified, and **deliberately not published**: Vast rents a
+digest-pinned *upstream* image today, and publishing would replace that with one
+this project has to maintain and re-cut on every llama.cpp bump. The recipe is
+kept because the diagnosis behind it is worth not losing, not because adopting
+it is planned.
 
-To adopt it, publish the image and point Vast at it:
+Should that trade ever look worth making, publish the image and point Vast at
+it:
 
 ```bash
 podman build --format docker \

@@ -1,5 +1,10 @@
 # The llama.cpp server image Vast rents, with an SSH server already in it.
 #
+# NOT PUBLISHED AND NOT USED. Kept as the record of why a rental waits before
+# answering SSH, and as the recipe if that trade is ever worth making. Vast
+# rents a digest-pinned upstream image today; see docs/vast.md before changing
+# that.
+#
 # Vast's `runtype: ssh` provisioning has to produce an sshd before a rental can
 # be reached, and the upstream image carries none: it is Ubuntu 24.04 with
 # `/app/llama-server` as its entrypoint and no openssh package at all. The host
