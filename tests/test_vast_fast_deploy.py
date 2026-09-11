@@ -12,7 +12,8 @@ from llm_launchpad.core.modal_gpu import ModalGpuSpec
 from llm_launchpad.core.quick_deploy import QuickDeployModel
 from llm_launchpad.core.vast_auth import VastCredentials
 from llm_launchpad.core.vast_backend import VastApiError, parse_vast_offer, vast_offer_search_payload
-from llm_launchpad.core.vast_comparison import vast_offers_for_model
+from llm_launchpad.core.quick_deploy import quick_deploy_profile_for_plan
+from llm_launchpad.core.vast_comparison import vast_offers_for_model, vast_plan_for_offer
 from llm_launchpad.core.serving_tiers import serving_tiers
 from llm_launchpad.protocol.enums import ComputeProvider, ServingObjective
 from llm_launchpad.protocol.models import MemoryEstimate, RuntimeTuning, ServingRequirements, VastOffer, VastOfferQuery
@@ -187,6 +188,39 @@ class VastAvailabilityTests(unittest.TestCase):
             snapshot = load_compute_availability()
         backend.assert_not_called()
         self.assertFalse(snapshot.vast_configured)
+
+
+class VastPlanIdentityTests(unittest.TestCase):
+    """A Vast plan must say which catalog configuration it realizes.
+
+    The deploy screen resolves a plan's profile through `configuration_id`, the
+    way Modal and Prime plans already did. Without it a Vast plan fell back to
+    matching recipe ids against a separately cached catalog; when those two came
+    from different refreshes the lookup raised KeyError and took the TUI down
+    between picking a GPU and confirming.
+    """
+
+    def test_a_vast_plan_names_its_catalog_configuration(self) -> None:
+        model = comparison_model()
+        profile = model.profiles[0]
+        rows = vast_offers_for_model(model, (vast_offer(),))
+        self.assertTrue(rows)
+        plan = vast_plan_for_offer(rows[0], profile)
+        self.assertIsNotNone(plan)
+        assert plan is not None
+        self.assertEqual(plan.quote.configuration_id, profile.id)
+        self.assertIs(quick_deploy_profile_for_plan(plan, (profile,)), profile)
+
+    def test_the_profile_resolves_without_a_matching_recipe_in_the_catalog(self) -> None:
+        # The catalog offered here carries a different recipe, which is exactly
+        # the situation that used to raise.
+        model = comparison_model()
+        profile = model.profiles[0]
+        rows = vast_offers_for_model(model, (vast_offer(),))
+        plan = vast_plan_for_offer(rows[0], profile)
+        assert plan is not None
+        decoy = replace(comparison_model(weights=4, total=9).profiles[0], id="unrelated-config")
+        self.assertIs(quick_deploy_profile_for_plan(plan, (decoy, profile)), profile)
 
 
 class VastFastDeployScreenTests(unittest.IsolatedAsyncioTestCase):

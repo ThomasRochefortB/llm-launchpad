@@ -49,6 +49,10 @@ def vast_plan_for_offer(row: VastModelOffer, profile: QuickDeployProfile) -> Inf
     assert price is not None
     quote = ProviderQuote(
         id=row.id.replace(":comparison:", ":deploy:"), recipe_id=row.recipe.id,
+        # Modal and Prime quotes carry this, and the deploy screen resolves a
+        # plan's catalog profile through it. Without it a Vast plan fell back to
+        # matching recipe ids across a separately cached catalog, which failed.
+        configuration_id=profile.id,
         provider=ComputeProvider.VAST, provider_reference=row.offer.id,
         gpu_type=row.offer.gpu_type, gpu_count=row.offer.gpu_count, gpu_memory_gb=row.offer.gpu_memory_gib,
         price_per_hour_usd=price, billing_model=BillingModel.PROVISIONED,

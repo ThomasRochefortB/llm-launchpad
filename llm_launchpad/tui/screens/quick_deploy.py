@@ -241,11 +241,15 @@ class QuickDeployScreen(CopyEnabledScreen):
         profile_id: str | QuickDeployProfile | InferencePlan,
         *,
         alternative_plans: tuple[InferencePlan, ...] | None = None,
+        profile: QuickDeployProfile | None = None,
     ) -> None:
         super().__init__()
         if isinstance(profile_id, InferencePlan):
             self.plan = profile_id
-            self.profile = quick_deploy_profile_for_plan(profile_id)
+            # Prefer the profile the caller already resolved. Re-deriving it by
+            # searching the global catalog fails whenever that catalog and the
+            # plan came from different refreshes.
+            self.profile = profile if profile is not None else quick_deploy_profile_for_plan(profile_id)
         elif isinstance(profile_id, QuickDeployProfile):
             self.profile = profile_id
             self.plan = resolve_quick_deploy_plans((profile_id,))[0]

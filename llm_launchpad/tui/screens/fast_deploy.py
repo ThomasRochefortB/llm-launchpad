@@ -849,6 +849,7 @@ class FastDeployScreen(CopyEnabledScreen):
                 self.app.push_quick_deploy(  # type: ignore[attr-defined]
                     row.plan,
                     alternative_plans=tuple(alternatives),
+                    catalog_profile=row.profile,
                 )
             return
         profile = self._fallback_profiles.get(option_id)

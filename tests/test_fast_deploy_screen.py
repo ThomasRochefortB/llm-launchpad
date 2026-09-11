@@ -104,6 +104,7 @@ class _TestApp(App[None]):
         super().__init__()
         self.fast_deploy_calls = 0
         self.quick_deploy_calls: list[tuple[InferencePlan, tuple[InferencePlan, ...]]] = []
+        self.catalog_profiles: list[QuickDeployProfile | None] = []
 
     def action_push_deploy(self) -> None:
         self.fast_deploy_calls += 1
@@ -126,9 +127,11 @@ class _TestApp(App[None]):
         profile: str | QuickDeployProfile | InferencePlan,
         *,
         alternative_plans: tuple[InferencePlan, ...] | None = None,
+        catalog_profile: QuickDeployProfile | None = None,
     ) -> None:
         if not isinstance(profile, InferencePlan):
             return
+        self.catalog_profiles.append(catalog_profile)
         self.quick_deploy_calls.append((profile, alternative_plans or ()))
 
 

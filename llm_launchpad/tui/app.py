@@ -555,13 +555,24 @@ class TuiApp(App):
         profile: str | QuickDeployProfile | InferencePlan,
         *,
         alternative_plans: tuple[InferencePlan, ...] | None = None,
+        catalog_profile: QuickDeployProfile | None = None,
     ) -> None:
-        self.push_screen(
-            QuickDeployScreen(
+        try:
+            screen = QuickDeployScreen(
                 profile_id=profile,
                 alternative_plans=alternative_plans,
+                profile=catalog_profile,
             )
-        )
+        except KeyError as exc:
+            # A placement whose profile cannot be resolved is a bug, but it must
+            # not take the whole TUI down between picking a GPU and confirming.
+            self.notify(
+                f"That placement could not be opened: {exc}",
+                severity="error",
+                timeout=10,
+            )
+            return
+        self.push_screen(screen)
 
     # ------------------------------------------------------------------
     # Deploy
