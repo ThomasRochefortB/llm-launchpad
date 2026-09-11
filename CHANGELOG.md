@@ -15,12 +15,13 @@ and this project follows [Semantic Versioning](https://semver.org/).
 - Advanced deploy can bind a selected Vast rental on either runtime. Disk size is quoted with the GPU.
 - Docs for the provider and the broader release plan: `docs/vast.md`, `docs/vast-integration-plan.md`.
 - Added an always-on rotating debug log under `~/.llm_launchpad/logs/` and routed previously silent failure paths (cache persistence, auth probing, log-tail cleanup, SSH key permissions) to it.
-- Added `llm-launchpad doctor`, a self-check command that verifies the Modal CLI, Modal/Prime/Vast/Hugging Face authentication, the optional Artificial Analysis key, and state-directory writability, with fix hints per failure.
+- Added `llm-launchpad doctor`, a self-check command that verifies the Modal CLI, Modal/Prime/Vast/Hugging Face authentication, that at least one compute provider is usable, the optional Artificial Analysis key, and state-directory writability, with fix hints per failure.
 - Added `llm-launchpad --version`.
 - Added documentation pages under `docs/` (deploy catalog, Prime provider, storage and costs, OpenCode, troubleshooting) and a generated CLI reference (`docs/cli.md`) via `scripts/generate_cli_reference.py`.
 - Added GitHub issue templates for bug reports and feature requests.
 
 ### Changed
+- `doctor` requires one authenticated compute provider rather than all of them, which is what the TUI already gates on. Each provider reports for itself and only warns, and a new **Compute provider** check fails when none is configured. Previously a user deploying happily on Modal still got a failing run and a non-zero exit for not having a Prime key.
 - Multi-GPU llama.cpp placements no longer predict faster single-request decoding. The estimate previously assumed roughly 1.6x more decode speed per extra GPU, but llama.cpp splits layers across devices by default, so one request walks them in sequence: extra GPUs buy memory, not speed. **This affects Modal and Prime as well as Vast** -- a multi-GPU placement that previously appeared in the Fastest or Balanced tier on that estimate may now rank lower. Measured attestations are unaffected and still take precedence.
 - Deploy forms disable controls their provider ignores and say why, instead of greying them out silently. Vast.ai host/port are fixed by its SSH tunnel, image rebuilds are Modal-only, and llama.cpp cannot pin an HF revision on any marketplace provider.
 - Deploy forms and `llm-launchpad deploy` now refuse a configuration its provider cannot run before anything is allocated, rather than failing after the deployment has been routed. Vast.ai previously accepted vLLM, vision, and pinned-revision configurations in the Advanced deploy form and rejected them later.

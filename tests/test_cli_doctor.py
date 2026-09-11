@@ -28,7 +28,8 @@ def _ok_checks() -> tuple[DoctorCheck, ...]:
         DoctorCheck(name="Local state directory", ok=True, detail="/tmp/state"),
         DoctorCheck(name="Modal auth", ok=True, detail="authenticated"),
         DoctorCheck(name="Prime Intellect auth", ok=True, detail="API key found"),
-        DoctorCheck(name="Vast.ai auth", ok=True, detail="API key found (stored)"),
+        DoctorCheck(name="Vast.ai auth", ok=True, required=False, detail="API key found (stored)"),
+        DoctorCheck(name="Compute provider", ok=True, detail="Modal, Prime Intellect, Vast.ai"),
         DoctorCheck(name="Hugging Face auth", ok=True, detail="logged in"),
         DoctorCheck(
             name="Artificial Analysis key", ok=True, required=False, detail="validated"
@@ -103,20 +104,23 @@ class RunDoctorChecksTests(unittest.TestCase):
         self.assertIn("Modal auth", by_name)
         self.assertIn("Prime Intellect auth", by_name)
         self.assertIn("Vast.ai auth", by_name)
+        self.assertIn("Compute provider", by_name)
         self.assertIn("Hugging Face auth", by_name)
         self.assertIn("Debug log", by_name)
         self.assertEqual(doctor_exit_code(checks), 0)
 
-    def test_missing_vast_key_fails_like_any_provider_without_contacting_the_api(self) -> None:
+    def test_missing_vast_key_warns_without_contacting_the_api(self) -> None:
         with mock.patch.object(doctor_module, "resolve_vast_credentials", return_value=VastCredentials()), mock.patch(
             "llm_launchpad.core.vast_backend.requests.request"
         ) as request:
             checks = run_doctor_checks(settings_dir=Path(tempfile.gettempdir()))
         vast = next(check for check in checks if check.name == "Vast.ai auth")
         self.assertFalse(vast.ok)
-        self.assertTrue(vast.required)
+        self.assertFalse(vast.required)
         self.assertIn("vast-auth login", vast.hint or "")
-        self.assertEqual(doctor_exit_code(checks), 1)
+        # Modal and Prime are authenticated here, so a provider nobody uses
+        # must not fail the run.
+        self.assertEqual(doctor_exit_code(checks), 0)
         # Resolving a key is a local read, exactly like the Modal and Prime probes.
         request.assert_not_called()
 
@@ -127,7 +131,7 @@ class RunDoctorChecksTests(unittest.TestCase):
         modal_cli = next(check for check in checks if check.name == "Modal CLI")
         self.assertFalse(modal_cli.ok)
         self.assertIn("modal setup", modal_cli.hint or "")
-        self.assertEqual(doctor_exit_code(checks), 1)
+        self.assertEqual(doctor_exit_code(checks), 0)
 
     def test_unauthenticated_modal_reports_hint(self) -> None:
         with mock.patch.object(
@@ -140,6 +144,34 @@ class RunDoctorChecksTests(unittest.TestCase):
         modal_auth = next(check for check in checks if check.name == "Modal auth")
         self.assertFalse(modal_auth.ok)
         self.assertIn("modal setup", modal_auth.hint or "")
+        self.assertEqual(doctor_exit_code(checks), 0)
+
+    def test_one_authenticated_provider_is_enough_and_none_is_a_failure(self) -> None:
+        """Deploying needs one provider, which is what the TUI gates on."""
+        for present in ("modal", "prime", "vast"):
+            with self.subTest(provider=present), mock.patch.object(
+                ModalBackend, "is_cli_available", return_value=present == "modal",
+            ), mock.patch.object(
+                doctor_module, "get_prime_auth_status",
+                return_value=PrimeAuthStatus(authenticated=present == "prime"),
+            ), mock.patch.object(
+                doctor_module, "resolve_vast_credentials",
+                return_value=VastCredentials("k", "stored") if present == "vast" else VastCredentials(),
+            ):
+                checks = run_doctor_checks(settings_dir=Path(tempfile.gettempdir()))
+            provider = next(check for check in checks if check.name == "Compute provider")
+            self.assertTrue(provider.ok)
+            self.assertEqual(doctor_exit_code(checks), 0)
+
+        with mock.patch.object(ModalBackend, "is_cli_available", return_value=False), mock.patch.object(
+            doctor_module, "get_prime_auth_status", return_value=PrimeAuthStatus(authenticated=False),
+        ), mock.patch.object(
+            doctor_module, "resolve_vast_credentials", return_value=VastCredentials(),
+        ):
+            checks = run_doctor_checks(settings_dir=Path(tempfile.gettempdir()))
+        provider = next(check for check in checks if check.name == "Compute provider")
+        self.assertFalse(provider.ok)
+        self.assertTrue(provider.required)
         self.assertEqual(doctor_exit_code(checks), 1)
 
     def test_unwritable_state_dir_fails(self) -> None:

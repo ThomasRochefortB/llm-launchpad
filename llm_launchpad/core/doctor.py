@@ -59,18 +59,24 @@ def run_doctor_checks(
 
     checks.append(_state_dir_check(settings_dir))
 
+    # Deploying needs one compute provider, not all of them: that is what the
+    # TUI gates on. Each provider reports for itself and only warns, so an
+    # unused one never fails the run; the aggregate below is the requirement.
+    modal_available = False
     if ModalBackend.is_cli_available():
         modal_status = get_modal_auth_status()
+        modal_available = modal_status.authenticated
         if modal_status.authenticated:
             profile = f" (profile: {modal_status.profile})" if modal_status.profile else ""
             checks.append(
-                DoctorCheck(name="Modal auth", ok=True, detail=f"authenticated{profile}")
+                DoctorCheck(name="Modal auth", ok=True, required=False, detail=f"authenticated{profile}")
             )
         else:
             checks.append(
                 DoctorCheck(
                     name="Modal auth",
                     ok=False,
+                    required=False,
                     detail=modal_status.error or "not authenticated",
                     hint="run: modal setup",
                 )
@@ -80,20 +86,24 @@ def run_doctor_checks(
             DoctorCheck(
                 name="Modal CLI",
                 ok=False,
+                required=False,
                 detail="modal executable not found",
                 hint="reinstall llm-launchpad, then run: modal setup",
             )
         )
 
+    prime_available = False
     try:
         prime_status = get_prime_auth_status()
+        prime_available = prime_status.authenticated
         if prime_status.authenticated:
-            checks.append(DoctorCheck(name="Prime Intellect auth", ok=True, detail="API key found"))
+            checks.append(DoctorCheck(name="Prime Intellect auth", ok=True, required=False, detail="API key found"))
         else:
             checks.append(
                 DoctorCheck(
                     name="Prime Intellect auth",
                     ok=False,
+                    required=False,
                     detail=prime_status.error or "no API key configured",
                     hint="run: prime login (or set PRIME_API_KEY)",
                 )
@@ -103,6 +113,7 @@ def run_doctor_checks(
             DoctorCheck(
                 name="Prime Intellect auth",
                 ok=False,
+                required=False,
                 detail=str(exc),
                 hint="run: prime login (or set PRIME_API_KEY)",
             )
@@ -120,8 +131,20 @@ def run_doctor_checks(
     except ValueError as exc:
         vast_detail, vast_ok = str(exc), False
     checks.append(DoctorCheck(
-        name="Vast.ai auth", ok=vast_ok, detail=vast_detail,
+        name="Vast.ai auth", ok=vast_ok, required=False, detail=vast_detail,
         hint="run: llm-launchpad vast-auth login (or set VAST_API_KEY)",
+    ))
+
+    configured = [
+        name for name, available in (
+            ("Modal", modal_available), ("Prime Intellect", prime_available), ("Vast.ai", vast_ok),
+        ) if available
+    ]
+    checks.append(DoctorCheck(
+        name="Compute provider",
+        ok=bool(configured),
+        detail=", ".join(configured) if configured else "none authenticated",
+        hint="authenticate one: modal setup | prime login | llm-launchpad vast-auth login",
     ))
 
     hf_status = get_huggingface_auth_status()
