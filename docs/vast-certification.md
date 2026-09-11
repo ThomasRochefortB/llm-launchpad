@@ -41,6 +41,10 @@ The image falls back to CPU rather than refusing to start, which is why a
 driver check before rental is the only thing standing between a user and GPU
 prices for CPU inference.
 
+That run settled at $0.0082 ($9.1752 to $9.1670), against the $0.0041 its own
+report recorded at destruction: transfer billing landing minutes later again.
+Read the account, not the report.
+
 Two harness gaps this exposed, both now closed:
 
 - `devices_after_load` did not exist when single-GPU llama.cpp was certified, so
