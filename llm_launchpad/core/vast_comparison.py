@@ -21,16 +21,32 @@ def vast_gpu_label(offer: VastOffer) -> str:
     return canonical_gpu_identity(offer.gpu_type, offer.gpu_memory_gib)[1]
 
 
+def vast_offer_is_rentable(offer: VastOffer) -> bool:
+    """Whether a rental could serve *something*, independently of the model.
+
+    The GPU filter spans every model, so it can only apply the checks that do
+    not depend on one: bundle size, a known price, and the driver/architecture
+    floors the pinned runtime was built against.
+    """
+    price = offer.costs.total_per_hour_usd
+    return (
+        1 <= offer.gpu_count <= VAST_MAX_GPU_COUNT
+        and price is not None and price > 0
+        and offer.cuda_max_good is not None and offer.cuda_max_good >= VAST_MIN_CUDA_VERSION
+        and offer.compute_capability is not None
+        and offer.compute_capability >= VAST_MIN_COMPUTE_CAPABILITY
+    )
+
+
 def vast_plan_for_offer(row: VastModelOffer, profile: QuickDeployProfile) -> InferencePlan | None:
     """Promote a supported runtime to a deployable local endpoint."""
     price = row.costs.total_per_hour_usd
     manifest = load_llamacpp_support_manifest(profile.gguf_architecture)
-    if not 1 <= row.offer.gpu_count <= VAST_MAX_GPU_COUNT or price is None or price <= 0 or manifest.build_recipe:
+    # An architecture Launchpad can only build has no pinned image to rent, so
+    # no offer can serve it however capable the hardware is.
+    if manifest.build_recipe or not vast_offer_is_rentable(row.offer):
         return None
-    if row.offer.cuda_max_good is None or row.offer.cuda_max_good < VAST_MIN_CUDA_VERSION:
-        return None
-    if row.offer.compute_capability is None or row.offer.compute_capability < VAST_MIN_COMPUTE_CAPABILITY:
-        return None
+    assert price is not None
     quote = ProviderQuote(
         id=row.id.replace(":comparison:", ":deploy:"), recipe_id=row.recipe.id,
         provider=ComputeProvider.VAST, provider_reference=row.offer.id,
@@ -46,6 +62,24 @@ def vast_plan_for_offer(row: VastModelOffer, profile: QuickDeployProfile) -> Inf
     return InferencePlan(
         recipe=row.recipe, quote=quote, assessment=row.assessment,
         estimated_monthly_cost_usd=estimate_monthly_compute_cost(quote, WorkloadProfile()),
+    )
+
+
+@lru_cache(maxsize=128)
+def deployable_vast_offers(
+    model: QuickDeployModel,
+    offers: tuple[VastOffer, ...],
+) -> tuple[VastModelOffer, ...]:
+    """Return only the rows a user can actually rent for this model.
+
+    Fast Deploy showed every memory-fitting offer and labelled the unrentable
+    ones, which advertised prices and GPU types that led nowhere.
+    """
+    profiles = {quick_deploy_recipe(profile).id: profile for profile in model.profiles}
+    return tuple(
+        row for row in vast_offers_for_model(model, offers)
+        if row.recipe.id in profiles
+        and vast_plan_for_offer(row, profiles[row.recipe.id]) is not None
     )
 
 

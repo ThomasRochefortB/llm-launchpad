@@ -14,6 +14,7 @@ Rows marked 2026-09-10 were measured on the release configuration, after the
 | vLLM tensor parallelism | 2026-09-10, two RTX 3060s: 531.1s cold start with 11641 MiB resident on both devices; 60s stream over 1563 chunks; post-cancel chat; reconnect to the same URL; confirmed destruction | Enabled for two-way; four- and eight-way are not individually certified |
 | Advanced deploy on a real rental, with llama.cpp image input | 2026-09-10, RTX 3060: the Advanced form drove a real rental; a 108.8 MB GGUF projector staged at a pinned revision; the model answered a question about an image; 97.7s deploy and warmup; confirmed destruction | Enabled |
 | vLLM image input | No live run has served an image through vLLM | Enabled; implemented on vLLM's native multimodal path but not live-certified |
+| Hosts below the image's CUDA build version | 2026-09-11, RTX 3060 reporting `cuda_max_good` 12.2 (offer 45598047): 403.2s cold start, 401 on unauthorized requests, structured tool call, 60s stream over 1849 chunks, post-cancel chat, reconnect, 6.2s warm restart, confirmed destruction — but `nvidia-smi` reported **25 MiB** used on the device | Refused. The server ran; the weights did not reach the GPU |
 
 The 2026-09-10 stages cost $0.050 in total, measured as reported credit before
 the first stage and after billing settled ($9.2250 to $9.1752). Each stage
@@ -25,6 +26,30 @@ deltas sum to $0.035 — about 30% short, because Vast keeps charging transfer
 against the account for several minutes afterwards. The earlier llama.cpp
 certification cost $0.78. These figures are historical, not an estimate for the
 next run.
+
+## The CUDA floor is measured, not assumed
+
+`VAST_MIN_CUDA_VERSION` is 12.8 because that is the CUDA version in the pinned
+llama.cpp image's OCI config. CUDA minor version compatibility suggests a 12.8
+image should run on any 12.x driver, and on that reasoning the floor excludes
+51 of 463 live offers on otherwise capable hardware, so it was tested.
+
+The test passed every functional check and still failed the one that matters:
+on a CUDA 12.2 host the device held 25 MiB while serving, against 7729/7791 MiB
+on the certified two-GPU 12.8 run using the same RTX 3060 hardware and harness.
+The image falls back to CPU rather than refusing to start, which is why a
+driver check before rental is the only thing standing between a user and GPU
+prices for CPU inference.
+
+Two harness gaps this exposed, both now closed:
+
+- `devices_after_load` did not exist when single-GPU llama.cpp was certified, so
+  that run never verified GPU residency at all.
+- The idle-device guard only raised for multi-GPU rentals, so a single idle GPU
+  reported `success: true`. It now fails at any GPU count.
+
+`logs.gpu_offload_reported` is **not** evidence either way: it is false on the
+certified 12.8 run too, because the log line it greps for is not emitted.
 
 ## Before another paid run
 

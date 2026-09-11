@@ -5,8 +5,8 @@ participate in Fast Deploy's prices, GPU filters, serving tiers, and eligible
 deployment fallbacks. It runs **llama.cpp GGUF models on one to eight GPUs**,
 with published, digest-pinned runtimes, and **vLLM on one, two, four, or eight
 GPUs**. Image input is Advanced deploy only; Fast Deploy remains text-only.
-Offers whose runtime is unsupported remain comparisons. See the validation
-limits below before choosing a runtime.
+Offers whose runtime is unsupported are left out rather than shown as
+unselectable rows. See the validation limits below before choosing a runtime.
 
 A rented host's GPUs are inventoried over SSH before anything is served: a
 bundle that reports a different device count, mixed GPU models, or too little
@@ -83,9 +83,11 @@ configured key.
 - Supported placements are selectable in step 2 and appear in the
   confirmation's fulfillment choices. Confirmation explains local connectivity,
   continuous billing, disk deletion, and separate transfer charges.
-- Unsupported-runtime comparisons are labeled **Vast comparison**.
-  Selecting one shows cost and memory fit but cannot rent it. **a** shows all
-  comparison rows.
+- Only rentable offers are shown. An offer whose host cannot run the pinned
+  runtime, whose price is unknown, or whose architecture Launchpad can only
+  build rather than pull, is left out of the placement list, the model's
+  **from** price, and the GPU filter, instead of being listed as an option that
+  refuses to deploy.
 - An equivalent Vast placement can enter the accepted fallback list within its
   price ceiling. Uncertain creation or unconfirmed destruction blocks further
   fallback rentals.

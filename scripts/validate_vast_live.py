@@ -391,8 +391,11 @@ def run(args: argparse.Namespace) -> int:
         ]
         idle = [d.index for d in loaded if d.memory_used_mib < 512]
         checks["every_device_holds_weights"] = not idle and len(loaded) == offer.gpu_count
-        if offer.gpu_count > 1 and idle:
-            raise RuntimeError(f"GPUs {idle} hold no weights; the model did not span the rental.")
+        # A single idle GPU means the runtime fell back to CPU on a rental the
+        # user is paying GPU prices for. That passed silently until a CUDA 12.2
+        # host served correctly with 25 MiB resident.
+        if idle:
+            raise RuntimeError(f"GPUs {idle} hold no weights; the model did not run on the rental's GPUs.")
         logs = backend.logs(instance_id)
         checks["logs"] = {"lines": len(logs), "gpu_offload_reported": any("offloaded" in line for line in logs)}
         ssh.disconnect(instance)

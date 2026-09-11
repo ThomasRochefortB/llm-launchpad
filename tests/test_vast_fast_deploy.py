@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from textual.widgets import OptionList, Static
+from textual.widgets import OptionList
 
 from llm_launchpad.core.compute_availability import aggregate_compute_availability, load_compute_availability
 from llm_launchpad.core.modal_gpu import ModalGpuSpec
@@ -190,13 +190,18 @@ class VastAvailabilityTests(unittest.TestCase):
 
 
 class VastFastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
-    async def test_supported_offers_deploy_and_unsupported_hosts_stay_comparisons(self) -> None:
+    async def test_only_rentable_offers_reach_the_placement_list(self) -> None:
+        """An offer nobody can rent is absent, not labelled.
+
+        Fast Deploy used to list unrentable hosts as priced comparisons, which
+        advertised a placement the user could never select.
+        """
         model = comparison_model()
         snapshot = replace(
             aggregate_compute_availability(modal_catalog=[ModalGpuSpec("L4", price_per_hour_usd=0.8)]),
-            # The second host's driver predates the pinned runtime, so it can
-            # be priced but never rented.
-            vast_offers=(vast_offer(), vast_offer(id=1002, num_gpus=2, cuda_max_good=12.4)),
+            # The second host's driver predates every supported runtime, so it
+            # can be priced but never rented.
+            vast_offers=(vast_offer(), vast_offer(id=1002, num_gpus=2, cuda_max_good=11.4)),
             vast_configured=True, providers=(ComputeProvider.MODAL,),
         )
         with patch("llm_launchpad.tui.screens.fast_deploy.list_quick_deploy_models", return_value=(model,)), patch(
@@ -210,15 +215,14 @@ class VastFastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 screen._open_model(model.id)
                 await pilot.pause()
                 options = screen.query_one(OptionList)
-                self.assertTrue(any("Vast comparison" in str(options.get_option_at_index(i).prompt) for i in range(options.option_count)))
-                comparison_id = next(iter(screen._vast_rows))
-                options.highlighted = options.get_option_index(comparison_id)
-                options.focus()
-                await pilot.press("enter")
-                await pilot.pause()
-                self.assertEqual(app.quick_deploy_calls, [])
-                self.assertIn("Comparison only", str(screen.query_one("#fast-deploy-detail", Static).content))
-                screen._choose(next(key for key, row in screen._infra_rows.items() if row.plan.quote.provider == ComputeProvider.VAST))
+                prompts = [str(options.get_option_at_index(i).prompt) for i in range(options.option_count)]
+                self.assertFalse([text for text in prompts if "comparison" in text.casefold()])
+                self.assertFalse([text for text in prompts if "1002" in text])
+                # The rentable host is still offered, and still deploys.
+                vast_ids = [key for key, row in screen._infra_rows.items() if row.plan.quote.provider == ComputeProvider.VAST]
+                self.assertEqual(len(vast_ids), 1)
+                self.assertNotIn("1002", str(screen._infra_rows[vast_ids[0]].plan.quote.provider_reference))
+                screen._choose(vast_ids[0])
                 self.assertEqual(len(app.quick_deploy_calls), 1)
                 self.assertEqual(app.quick_deploy_calls[0][0].quote.provider, ComputeProvider.VAST)
 
@@ -237,13 +241,11 @@ class VastFastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 screen._open_model(model.id)
                 await pilot.pause()
                 self.assertEqual(screen._phase, "infra")
-                self.assertFalse(screen._vast_rows)
                 self.assertEqual(len(screen._infra_rows), 1)
                 old_request = screen._availability_request_id
                 load.return_value = replace(snapshot, vast_offers=(), errors=("Vast unavailable",))
                 screen.action_refresh_availability()
                 await pilot.pause()
-                self.assertFalse(screen._vast_rows)
                 self.assertFalse(screen._snapshot.vast_offers)
                 screen.on_fast_deploy_availability_loaded(FastDeployAvailabilityLoaded(snapshot, request_id=old_request, purpose="filter"))
                 self.assertFalse(screen._snapshot.vast_offers)

@@ -21,7 +21,11 @@ from .serving_runtime import projector_setup, vllm_serve_args
 VAST_RUNTIME_DIR = "/root/.llm-launchpad"
 # CUDA_VERSION in the bundled b10689 image's immutable OCI config. Require
 # native driver support instead of assuming CUDA forward compatibility on
-# arbitrary marketplace GPUs. Recheck this alongside runtime image updates.
+# arbitrary marketplace GPUs: a paid run on a CUDA 12.2 RTX 3060 (offer
+# 45598047, 2026-09-11) served chat, tools and a 60s stream, but nvidia-smi
+# reported 25 MiB used on the device, so the weights were not on the GPU.
+# Renting a GPU to run on CPU is worse than refusing the host.
+# Recheck this alongside runtime image updates.
 VAST_MIN_CUDA_VERSION = 12.8
 # The bundled llama.cpp image is a CUDA 12.x build, which still supports
 # Maxwell and newer. Read this from the image alongside its CUDA version.
