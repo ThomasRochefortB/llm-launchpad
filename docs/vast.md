@@ -24,9 +24,11 @@ two-GPU llama.cpp run verified that model weights spanned both devices. Later
 rentals certified vLLM text serving on one GPU, two-way vLLM tensor parallelism
 with weights resident on both devices, and Advanced deploy through a real rental
 serving a llama.cpp model with a staged GGUF projector answering an image.
-Image input through vLLM has no such run: it uses vLLM's native multimodal path,
-the same one Modal and Prime use, but no live Vast rental has served an image
-through it. These results do not certify every host or GPU topology. See the
+A further rental served an image through vLLM's native multimodal path on an
+RTX A5000, so every runtime and feature pairing the provider offers now has a
+live run behind it. As on llama.cpp, that verifies the request path and a
+non-empty answer, not visual accuracy. These results do not certify every host
+or GPU topology. See the
 [certification matrix and run instructions](vast-certification.md).
 
 The earlier vLLM SSH refusals turned out to be Vast's sshd binding late after a
@@ -185,6 +187,44 @@ through SSH stdin; the Vast account key is never sent to the host. An existing
 Hugging Face login is used for model download.
 SSH uses a private known-hosts file, accepts the first host key, and rejects
 changed keys. Remote model logs redact endpoint and Hugging Face tokens.
+
+### Why a rental waits before answering SSH
+
+The pinned llama.cpp image carries no SSH server. Inspecting it directly shows
+Ubuntu 24.04 with `/app/llama-server` as the entrypoint, `apt-get` present, and
+`sshd`, `ssh` and any openssh package absent. Vast's `runtype: ssh` therefore has
+to produce one at launch, which is the apt traffic against
+`archive.ubuntu.com/ubuntu noble` visible in an instance's `status_msg`, and the
+reason sshd binds minutes after the container reports `running`. It is also why
+sending an `onstart` hook broke SSH: it displaced the script doing that work.
+
+`llm_launchpad/data/vast_llamacpp_ssh.dockerfile` removes the install step by
+deriving the same pinned image with `openssh-server` already in it. It is built
+and verified but **not published**, so nothing uses it yet: publishing trades
+the property that Vast rents a digest-pinned *upstream* image for one this
+project has to maintain and re-cut on every llama.cpp bump.
+
+To adopt it, publish the image and point Vast at it:
+
+```bash
+podman build --format docker \
+  -f llm_launchpad/data/vast_llamacpp_ssh.dockerfile \
+  -t ghcr.io/<owner>/llm-launchpad-llamacpp:b10689 .
+podman push ghcr.io/<owner>/llm-launchpad-llamacpp:b10689
+skopeo inspect docker://ghcr.io/<owner>/llm-launchpad-llamacpp:b10689 | jq -r .Digest
+```
+
+Then add a `llamacpp` entry to `llm_launchpad/data/vast_runtime.json` beside the
+existing `vllm` one, carrying that digest with `min_cuda_version` 12.8 and
+`min_compute_capability` 5.0, and have `vast_runtime` read it for llama.cpp the
+way it already does for vLLM. `--format docker` matters: the OCI format drops
+the base image's HEALTHCHECK.
+
+**The saving is unmeasured.** It removes downloading and unpacking
+`openssh-server`, but if Vast's provisioning runs `apt-get update`
+unconditionally then the index refresh stays, and the indices were most of the
+observed traffic. Time a rental against the 99.8s cold start recorded for
+offer 45601619 before treating this as a fix.
 
 Deployment requires health and streaming-chat checks before it reports success.
 Fast Deploy additionally runs the existing serving-plan certification before

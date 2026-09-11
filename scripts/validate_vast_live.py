@@ -478,7 +478,11 @@ def main() -> int:
     parser.add_argument("--min-gpu-memory-gb", type=float, default=0.0)
     parser.add_argument("--min-cuda", type=float, default=12.8)
     parser.add_argument("--min-compute", type=float, default=0.0, help="Oldest GPU architecture the runtime supports.")
-    parser.add_argument("--min-inet-down", type=float, default=0.0, help="Mbps needed to pull a large image in time.")
+    parser.add_argument(
+        "--min-inet-down", type=float, default=0.0,
+        help="Mbps floor for the image pull. Not a readiness predictor: hosts at "
+             "1890 and 2065 Mbps both failed to answer SSH inside 900s on 2026-09-11.",
+    )
     parser.add_argument("--western-only", action="store_true", help="Prefer hosts with fast registry access.")
     parser.add_argument("--max-hourly-cost", required=True, type=float)
     parser.add_argument("--budget-usd", required=True, type=float)

@@ -13,10 +13,10 @@ Rows marked 2026-09-10 were measured on the release configuration, after the
 | Single-GPU vLLM | 2026-09-10, RTX 3060: 876.6s cold start; unauthorized requests rejected (401, 401); structured tool call; 60s stream; confirmed destruction | Enabled |
 | vLLM tensor parallelism | 2026-09-10, two RTX 3060s: 531.1s cold start with 11641 MiB resident on both devices; 60s stream over 1563 chunks; post-cancel chat; reconnect to the same URL; confirmed destruction | Enabled for two-way; four- and eight-way are not individually certified |
 | Advanced deploy on a real rental, with llama.cpp image input | 2026-09-10, RTX 3060: the Advanced form drove a real rental; a 108.8 MB GGUF projector staged at a pinned revision; the model answered a question about an image; 97.7s deploy and warmup; confirmed destruction | Enabled |
-| vLLM image input | No live run has served an image through vLLM | Enabled; implemented on vLLM's native multimodal path but not live-certified |
+| vLLM image input | 2026-09-11, RTX A5000 (offer 48465829): Advanced deploy drove a real rental; 232.2s deploy and warmup; 19309 MiB resident; the model answered an image request and chatted afterwards; confirmed destruction | Enabled. Verifies the request path and a non-empty answer, not visual accuracy |
 | Hosts below the image's CUDA build version | 2026-09-11, RTX 3060 reporting `cuda_max_good` 12.2 (offer 45598047): 403.2s cold start, 401 on unauthorized requests, structured tool call, 60s stream over 1849 chunks, post-cancel chat, reconnect, 6.2s warm restart, confirmed destruction — but `nvidia-smi` reported **25 MiB** used on the device | Refused. The server ran; the weights did not reach the GPU |
 
-The single-GPU llama.cpp rerun settled at $0.0083. The 2026-09-10 stages cost
+The single-GPU llama.cpp rerun settled at $0.0083 and the vLLM image-input stage at $0.0097. The 2026-09-10 stages cost
 $0.050 in total, measured as reported credit before
 the first stage and after billing settled ($9.2250 to $9.1752). Each stage
 confirmed destruction and absence before the next one started.
@@ -160,8 +160,10 @@ renting. `scripts/validate_vast_custom_live.py` requires `--offer-id` and
 re-prices it at launch, so read a current offer immediately before running it.
 Use the normal product configuration and preserve the no-hook startup.
 
-`vllm` with image input is the one release path with no live run behind it;
-certifying it is the obvious next paid stage.
+Every runtime and feature pairing the provider offers now has a live run behind
+it. The vision stages verify the request path and a non-empty answer: the probe
+sends a 64x64 solid-red PNG and `verify_image_request` does not judge visual
+accuracy, so neither engine's row claims the model perceived the image well.
 
 ## The large-image SSH refusal was a startup race, not a rejected key
 
@@ -203,6 +205,12 @@ Treat `--min-inet-down` as a floor that excludes hosts too slow to finish, not
 as a predictor, and set `--max-minutes` with room for the slower outcome. A
 20-minute deadline left the single-GPU stage about four minutes of margin, which
 is thinner than it looks for a stage whose pull dominates the run.
+
+The 2026-09-11 runs put a number on how weak a predictor it is: hosts
+advertising 1890 and 2065 Mbps both failed to answer SSH inside 900s, while the
+891 Mbps host connected. Raising the floor would have selected *against* the
+host that worked. It bounds the pull, which is 11-78s of the wait; it says
+nothing about unpacking or provisioning, which are the rest.
 
 Transfer price deserves more attention than the hourly rate, because
 `select_offer` filters on `--min-inet-down` and then sorts by hourly price
