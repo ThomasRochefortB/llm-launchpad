@@ -161,6 +161,26 @@ def _screen_passthrough_sequence(text: str) -> str:
     return f"\x1bP{_osc_52_sequence(text)}\x1b\\"
 
 
+def _defers_completion_footer(
+    event: OperationCompleteEvent,
+    *,
+    config: DeploymentConfig,
+    will_run_warmup: bool,
+) -> bool:
+    """Whether this completion is not the end of the user's operation.
+
+    The footer says "Operation complete/failed" and offers to return or retry,
+    which is wrong while the same monitor session carries on: a successful
+    deploy that warmup follows, and a failed deploy that a fallback placement
+    answers. The failure reason is already on screen as its own error line.
+    """
+    if event.operation != OperationType.DEPLOY:
+        return False
+    if event.success:
+        return will_run_warmup
+    return bool(config.fallback_configs)
+
+
 class TuiApp(App):
     """llm-launchpad interactive terminal UI."""
 
@@ -741,7 +761,9 @@ class TuiApp(App):
                 # When warmup immediately follows a successful deploy in the same
                 # monitor session, suppress the intermediate completion footer
                 # ("Operation complete... Press esc") to keep the summary cleaner.
-                if will_run_warmup and event.success and event.operation == OperationType.DEPLOY:
+                if _defers_completion_footer(
+                    event, config=config, will_run_warmup=will_run_warmup
+                ):
                     continue
                 if (
                     event.success
