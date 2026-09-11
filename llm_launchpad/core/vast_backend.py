@@ -234,6 +234,33 @@ class VastBackend:
             return VastAuthStatus(False, source=self.credentials.source, error=str(exc))
         return VastAuthStatus(True, source=self.credentials.source, account_id=account_id)
 
+    def billing_credit(self) -> tuple[dict[str, float] | None, str | None]:
+        """Return spendable credit and an optional error message.
+
+        Vast bills against credit rather than invoicing a workspace, so the
+        number that matters before renting is what remains. `balance` can be
+        negative when an account owes, which is exactly when it is worth
+        showing, so it is not clamped.
+        """
+        try:
+            payload = self._request("GET", "/users/current/")
+        except VastApiError as exc:
+            return None, str(exc)
+        except Exception as exc:  # pragma: no cover - defensive around transport
+            return None, f"Vast credit request failed: {exc}"
+        credit = optional_float(payload.get("credit"))
+        balance = optional_float(payload.get("balance"))
+        if credit is None and balance is None:
+            return None, "Vast returned no credit figures."
+        available = (credit or 0.0) + (balance or 0.0)
+        if not math.isfinite(available):
+            return None, "Vast returned an unusable credit figure."
+        return {
+            "credit_usd": credit or 0.0,
+            "balance_usd": balance or 0.0,
+            "available_usd": available,
+        }, None
+
     def list_offers(self, query: VastOfferQuery | None = None) -> list[VastOffer]:
         """Fetch a bounded preview of eligible offers, with unknown prices last."""
         query = query or VastOfferQuery()
