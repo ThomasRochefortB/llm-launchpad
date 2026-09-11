@@ -1,13 +1,15 @@
 # Vast.ai rentals (beta)
 
 Vast offers participate in Fast Deploy's prices, GPU filters, serving tiers,
-and eligible deployment fallbacks. The beta enables **text-only llama.cpp GGUF
-models on one to eight GPUs**, with published, digest-pinned runtimes.
-**vLLM and image input require `LLM_LAUNCHPAD_VAST_EXPERIMENTAL=1`** until their
-live certification is complete. The experimental vLLM runtime supports one,
-two, four, or eight GPUs; image input is Advanced deploy only. Fast Deploy
-remains text-only. Offers whose runtime is unsupported remain comparisons.
-See the validation limits below before choosing a runtime.
+and eligible deployment fallbacks. The beta enables **llama.cpp GGUF models on
+one to eight GPUs**, with published, digest-pinned runtimes, and **vLLM on one,
+two, four, or eight GPUs**. Image input is Advanced deploy only; Fast Deploy
+remains text-only. Live rentals certified llama.cpp text, llama.cpp image input,
+vLLM text, and two-way vLLM tensor parallelism.
+**Image input through vLLM still requires `LLM_LAUNCHPAD_VAST_EXPERIMENTAL=1`**,
+because no live run has served an image through vLLM. Offers whose runtime is
+unsupported remain comparisons. See the validation limits below before choosing
+a runtime.
 
 A rented host's GPUs are inventoried over SSH before anything is served: a
 bundle that reports a different device count, mixed GPU models, or too little
@@ -21,12 +23,15 @@ disk**, including cached models. Rentals bill continuously until destroyed.
 The [live validation recorded in PR #77](https://github.com/ThomasRochefortB/llm-launchpad/pull/77)
 covered single-GPU llama.cpp startup, authentication, tool calls, a five-minute
 stream, reconnect, warm restart, and Fast Deploy through the TUI. A separate
-two-GPU llama.cpp run verified that model weights spanned both devices.
-vLLM serving, vision projector staging, and Advanced deploy through a real
-rental remain uncertified. vLLM runs encountered persistent SSH key refusals;
-the current configuration omits the reverted `onstart` hook and still needs
-a complete serving retest. These
-results do not certify every host or GPU topology.
+two-GPU llama.cpp run verified that model weights spanned both devices. Later
+rentals certified vLLM text serving on one GPU, two-way vLLM tensor parallelism
+with weights resident on both devices, and Advanced deploy through a real rental
+serving a llama.cpp model with a staged GGUF projector answering an image.
+Image input through vLLM has no such run. These results do not certify every
+host or GPU topology.
+
+The earlier vLLM SSH refusals turned out to be Vast's sshd binding late after a
+long image pull, not a rejected key; the deploy loop waits that out with backoff.
 
 The experimental gate applies to CLI, Advanced deploy, and direct backend
 deployment before a rental is created. Opting in does not certify the runtime;

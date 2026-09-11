@@ -1071,7 +1071,24 @@ class VllmDeployFormPolishTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(config.n_gpu, config.gpu_count)
 
     @patch.dict("os.environ", {"LLM_LAUNCHPAD_VAST_EXPERIMENTAL": ""})
-    async def test_vast_vllm_requires_opt_in_before_starting_a_worker(self) -> None:
+    async def test_vast_vllm_image_input_requires_opt_in_before_starting_a_worker(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+            screen.query_one("#model-name", Input).value = "Qwen/Qwen3-0.6B"
+            screen.on_vast_offers_loaded(VastOffersLoaded(offers=_vast_offers()))
+            screen.query_one("#provider-vllm", Select).value = "vast"
+            screen.query_one("#vision-mode", Select).value = "on"
+            await pilot.pause()
+            screen._do_deploy()
+            self.assertIsNone(app.deployed_config)
+            self.assertTrue(any("EXPERIMENTAL=1" in message for message, _ in app.notifications))
+
+    @patch.dict("os.environ", {"LLM_LAUNCHPAD_VAST_EXPERIMENTAL": ""})
+    async def test_vast_vllm_text_deploys_without_an_opt_in(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:
             app.push_screen(VllmDeployScreen())
@@ -1083,8 +1100,7 @@ class VllmDeployFormPolishTests(unittest.IsolatedAsyncioTestCase):
             screen.query_one("#provider-vllm", Select).value = "vast"
             await pilot.pause()
             screen._do_deploy()
-            self.assertIsNone(app.deployed_config)
-            self.assertTrue(any("EXPERIMENTAL=1" in message for message, _ in app.notifications))
+            self.assertIsNotNone(app.deployed_config)
 
     async def test_smoke_test_only_is_refused_for_vast(self) -> None:
         app = _TestApp()

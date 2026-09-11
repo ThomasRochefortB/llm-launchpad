@@ -153,12 +153,17 @@ VAST_EXPERIMENTAL_ENV = "LLM_LAUNCHPAD_VAST_EXPERIMENTAL"
 
 
 def _certification_refusal(config: DeploymentConfig) -> str | None:
-    """Keep unverified serving paths behind an explicit experimental opt-in."""
+    """Keep the one uncertified serving path behind an explicit opt-in.
+
+    Live rentals certified vLLM text serving on a single GPU and on two-way
+    tensor parallelism, and llama.cpp image input with a staged GGUF projector.
+    No live run has served images through vLLM, so that pairing stays opt-in.
+    """
     vision = config.vision_mode == VisionMode.ON or (config.vision is not None and config.vision.enabled)
-    if (config.backend == BackendType.VLLM or vision) and os.environ.get(VAST_EXPERIMENTAL_ENV) != "1":
+    if config.backend == BackendType.VLLM and vision and os.environ.get(VAST_EXPERIMENTAL_ENV) != "1":
         return (
-            "Vast vLLM and image input have not completed live certification. "
-            f"Use text-only llama.cpp, or explicitly opt in with {VAST_EXPERIMENTAL_ENV}=1. "
+            "Vast vLLM image input has not completed live certification. "
+            f"Use llama.cpp for image input, or explicitly opt in with {VAST_EXPERIMENTAL_ENV}=1. "
             "Experimental rentals may fail to serve and still incur charges."
         )
     return None

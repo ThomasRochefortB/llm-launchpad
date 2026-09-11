@@ -7,9 +7,10 @@ recorded certification work was confirmed absent afterwards.
 The implemented increments cover auth and quotes; model-aware Fast Deploy
 prices and filters; and llama.cpp (one to eight GPUs) and vLLM (one, two, four,
 or eight GPUs) runtime implementations. Advanced deploy exposes image input;
-Fast Deploy remains text-only. vLLM and image input require the explicit
-`LLM_LAUNCHPAD_VAST_EXPERIMENTAL=1` opt-in until live certification is complete.
-Implementation does not imply certification. Vast
+Fast Deploy remains text-only. Live rentals certified llama.cpp text, llama.cpp
+image input, vLLM text, and two-way vLLM tensor parallelism; only image input
+through vLLM still requires the explicit `LLM_LAUNCHPAD_VAST_EXPERIMENTAL=1`
+opt-in. Implementation does not imply certification. Vast
 placements now compete in serving tiers and accepted fallbacks. The lifecycle
 includes repricing, durable rental intent, create reconciliation, private SSH
 startup, health/stream verification, listing, logs, reconnect, and confirmed

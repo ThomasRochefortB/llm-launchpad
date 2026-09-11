@@ -262,19 +262,36 @@ class ArchitectureFloorTests(unittest.TestCase):
 
 class VastCertificationGateTests(unittest.TestCase):
     @patch.dict("os.environ", {"LLM_LAUNCHPAD_VAST_EXPERIMENTAL": ""})
-    def test_uncertified_engines_and_image_input_are_refused_by_default(self) -> None:
+    def test_vllm_image_input_is_the_only_path_refused_by_default(self) -> None:
         from llm_launchpad.protocol.enums import VisionMode
 
         for candidate in (
+            config(backend=BackendType.VLLM, model_name="acme/model", vision_mode=VisionMode.ON),
+            config(
+                backend=BackendType.VLLM,
+                model_name="acme/model",
+                vision=VisionCapabilities(supported=True, enabled=True),
+            ),
+        ):
+            with self.subTest(vision=candidate.vision_mode):
+                self.assertIn("EXPERIMENTAL=1", refuse(candidate) or "")
+                with self.assertRaisesRegex(ValueError, "live certification"):
+                    vast_runtime_script(candidate)
+
+    @patch.dict("os.environ", {"LLM_LAUNCHPAD_VAST_EXPERIMENTAL": ""})
+    def test_live_certified_paths_need_no_opt_in(self) -> None:
+        from llm_launchpad.protocol.enums import VisionMode
+
+        # A real rental served each of these, so none needs an opt-in flag.
+        for candidate in (
+            config(),
             config(backend=BackendType.VLLM, model_name="acme/model"),
+            config(backend=BackendType.VLLM, model_name="acme/model", gpu_count=2, n_gpu=2),
             config(vision_mode=VisionMode.ON),
             config(vision=VisionCapabilities(supported=True, enabled=True)),
         ):
             with self.subTest(backend=candidate.backend, vision=candidate.vision_mode):
-                self.assertIn("EXPERIMENTAL=1", refuse(candidate) or "")
-                with self.assertRaisesRegex(ValueError, "live certification"):
-                    vast_runtime_script(candidate)
-        self.assertIsNone(refuse(config()))
+                self.assertIsNone(refuse(candidate))
 
     @patch.dict("os.environ", {"LLM_LAUNCHPAD_VAST_EXPERIMENTAL": "1"})
     def test_opt_in_preserves_normal_runtime_validation(self) -> None:

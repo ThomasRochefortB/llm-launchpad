@@ -124,9 +124,12 @@ class VastLifecycleTests(unittest.TestCase):
         self.api.create_instance.assert_not_called()
 
     @patch.dict("os.environ", {"LLM_LAUNCHPAD_VAST_EXPERIMENTAL": ""})
-    def test_uncertified_vllm_is_refused_before_any_rental(self) -> None:
+    def test_uncertified_vllm_image_input_is_refused_before_any_rental(self) -> None:
+        from llm_launchpad.protocol.enums import VisionMode
+
         self.config.backend = BackendType.VLLM
         self.config.model_name = "Qwen/Qwen3-0.6B"
+        self.config.vision_mode = VisionMode.ON
         event = self.deploy()
         self.assertFalse(event.success)
         self.assertIn("EXPERIMENTAL=1", event.detail or "")
