@@ -314,9 +314,21 @@ def verify_streaming(url: str, api_key: str, model: str) -> None:
                 if "text/event-stream" not in response.headers.get("Content-Type", ""):
                     raise ValueError("Endpoint did not return an SSE stream.")
                 saw_chunk = False
+                # Say which limit ended the stream. This check is stricter than
+                # the shared warmup calibration, which tolerates a missing
+                # [DONE] entirely, so when it rejects a rental the user has
+                # already paid for, the reason needs to be in the message.
+                ended = "the server closed it"
                 deadline = time.monotonic() + 60
                 for index, line in enumerate(response.iter_lines()):
-                    if index > 256 or len(line) > 65536 or time.monotonic() >= deadline:
+                    if index > 256:
+                        ended = "it exceeded 256 lines"
+                        break
+                    if len(line) > 65536:
+                        ended = "a line exceeded 64 KiB"
+                        break
+                    if time.monotonic() >= deadline:
+                        ended = "it passed the 60s deadline"
                         break
                     if not line.startswith(b"data:"):
                         continue
@@ -324,10 +336,14 @@ def verify_streaming(url: str, api_key: str, model: str) -> None:
                     if value == b"[DONE]":
                         if saw_chunk:
                             return
+                        ended = "[DONE] arrived before any content"
                         break
                     data = json.loads(value)
                     if isinstance(data, dict) and isinstance(data.get("choices"), list) and data["choices"]:
                         saw_chunk = True
     except (requests.RequestException, ValueError):
         raise RuntimeError("Vast endpoint failed streaming chat verification.") from None
-    raise RuntimeError("Vast chat stream ended without a valid completion marker.")
+    raise RuntimeError(
+        "Vast chat stream ended without a valid completion marker: "
+        f"{ended} after {'some' if saw_chunk else 'no'} content."
+    )

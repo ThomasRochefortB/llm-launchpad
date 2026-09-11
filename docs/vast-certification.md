@@ -103,6 +103,31 @@ The rerun that closed this also exercised the new wait: the host reported a
 docker pull line at 32s, nothing at 64s, and reached SSH without the stall
 window closing. Cold start was 99.8s against 403.2s on the slower host.
 
+## Open finding: Vast's streaming check is stricter than every other provider's
+
+A Fast Deploy run on 2026-09-11 rented an H100 NVL (offer 31183489, $3.93/hr),
+reached SSH, served, and was then rejected by `verify_streaming` with "Vast chat
+stream ended without a valid completion marker". The rental was destroyed and
+confirmed absent, and the deploy fell through to Prime (whose offer had gone)
+and then to Modal, which succeeded. The attempt cost $0.55.
+
+`verify_streaming` in `core/vast_runtime.py` requires an explicit `[DONE]`
+within 256 lines and 60 seconds. The shared warmup calibration in `core/warmup.py`,
+which every provider including Vast passes through afterwards, tolerates a
+missing `[DONE]` outright and imposes neither limit. So a rental can serve well
+enough for the calibration that certifies it and still be refused by the check
+that runs first.
+
+The 60s deadline is the most likely trip for a 27B model with a 262,144-token
+context doing first-token prompt processing on a cold server: a read timeout
+would have raised the other message, so data was arriving, just not to
+completion. That is a hypothesis, not a measurement. The failure message now
+names which limit ended the stream, so the next occurrence says so outright
+rather than needing another paid rental to guess at.
+
+Do not loosen the check on the hypothesis alone. Either read a rejection that
+names its limit, or reproduce the stream against a local SSE server.
+
 ## Before another paid run
 
 1. Choose an explicit total spend limit and reserve part for cleanup. Check
