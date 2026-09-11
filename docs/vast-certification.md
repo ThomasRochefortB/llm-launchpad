@@ -7,7 +7,7 @@ Rows marked 2026-09-10 were measured on the release configuration, after the
 
 | Path | Recorded evidence | Release behavior |
 | --- | --- | --- |
-| Single-GPU text-only llama.cpp | 48.7s cold start; unauthorized requests rejected; structured tool call; 310s stream; reconnect; 8.8s warm restart; confirmed destruction. **Predates `devices_after_load`, so GPU residency was never verified** | Enabled |
+| Single-GPU text-only llama.cpp | 2026-09-11, RTX 3060 (offer 45601619): 99.8s cold start; **1245 MiB resident on the device**; 401 on unauthorized requests; structured tool call; 60s stream over 5882 chunks; 6.1s warm restart; confirmed destruction. Supersedes the original 48.7s run, which predated `devices_after_load` | Enabled |
 | Two-GPU text-only llama.cpp | 15.7 GB Q8_0 model split over two RTX 3060s, with 7729/7791 MiB used; chat, tools, 60s stream; confirmed destruction | Enabled; other topologies are not individually certified |
 | Fast Deploy TUI | Real llama.cpp rental deployed and warmed through UI/worker path; confirmed destruction | Enabled |
 | Single-GPU vLLM | 2026-09-10, RTX 3060: 876.6s cold start; unauthorized requests rejected (401, 401); structured tool call; 60s stream; confirmed destruction | Enabled |
@@ -16,7 +16,8 @@ Rows marked 2026-09-10 were measured on the release configuration, after the
 | vLLM image input | No live run has served an image through vLLM | Enabled; implemented on vLLM's native multimodal path but not live-certified |
 | Hosts below the image's CUDA build version | 2026-09-11, RTX 3060 reporting `cuda_max_good` 12.2 (offer 45598047): 403.2s cold start, 401 on unauthorized requests, structured tool call, 60s stream over 1849 chunks, post-cancel chat, reconnect, 6.2s warm restart, confirmed destruction — but `nvidia-smi` reported **25 MiB** used on the device | Refused. The server ran; the weights did not reach the GPU |
 
-The 2026-09-10 stages cost $0.050 in total, measured as reported credit before
+The single-GPU llama.cpp rerun settled at $0.0083. The 2026-09-10 stages cost
+$0.050 in total, measured as reported credit before
 the first stage and after billing settled ($9.2250 to $9.1752). Each stage
 confirmed destruction and absence before the next one started.
 
@@ -35,8 +36,18 @@ image should run on any 12.x driver, and on that reasoning the floor excludes
 51 of 463 live offers on otherwise capable hardware, so it was tested.
 
 The test passed every functional check and still failed the one that matters:
-on a CUDA 12.2 host the device held 25 MiB while serving, against 7729/7791 MiB
-on the certified two-GPU 12.8 run using the same RTX 3060 hardware and harness.
+on a CUDA 12.2 host the device held 25 MiB while serving. A later run put the
+same model and quant on the same GPU model above the floor, which settles it:
+
+| | CUDA 12.2 (45598047) | CUDA 12.8 (45601619) |
+| --- | --- | --- |
+| GPU memory in use | 25 MiB | **1245 MiB** |
+| `every_device_holds_weights` | false | **true** |
+| 60s stream | 1849 chunks | **5882 chunks** |
+| Cold start | 403.2s | 99.8s |
+
+Identical RTX 3060 hardware, model, quant and harness, 3.2x the tokens, and
+weights actually resident.
 The image falls back to CPU rather than refusing to start, which is why a
 driver check before rental is the only thing standing between a user and GPU
 prices for CPU inference.
@@ -48,7 +59,8 @@ Read the account, not the report.
 Two harness gaps this exposed, both now closed:
 
 - `devices_after_load` did not exist when single-GPU llama.cpp was certified, so
-  that run never verified GPU residency at all.
+  that run never verified GPU residency at all. The row above is now a rerun
+  that does.
 - The idle-device guard only raised for multi-GPU rentals, so a single idle GPU
   reported `success: true`. It now fails at any GPU count.
 
@@ -87,9 +99,9 @@ hosts had NVMe-class disks (2538 and 3679 MB/s). `cpu_cores_effective` remains
 an untested candidate, since layer decompression is CPU-bound and the New
 Brunswick host was allotted 4 of its 16 cores.
 
-Single-GPU llama.cpp is still certified only by its original run, which predates
-`devices_after_load` and so never verified that the weights reached the GPU.
-Re-running it is now worth another attempt under both fixes.
+The rerun that closed this also exercised the new wait: the host reported a
+docker pull line at 32s, nothing at 64s, and reached SSH without the stall
+window closing. Cold start was 99.8s against 403.2s on the slower host.
 
 ## Before another paid run
 
