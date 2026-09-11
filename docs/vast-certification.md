@@ -15,9 +15,14 @@ Rows marked 2026-09-10 were measured on the release configuration, after the
 | Advanced deploy on a real rental, with llama.cpp image input | 2026-09-10, RTX 3060: the Advanced form drove a real rental; a 108.8 MB GGUF projector staged at a pinned revision; the model answered a question about an image; 97.7s deploy and warmup; confirmed destruction | Enabled |
 | vLLM image input | No live run has served an image through vLLM | Experimental opt-in required |
 
-The 2026-09-10 stages cost $0.047 in total, measured as reported credit before
-the first stage and after the last ($9.2250 to $9.1784). Each stage confirmed
-destruction and absence before the next one started. The earlier llama.cpp
+The 2026-09-10 stages cost $0.050 in total, measured as reported credit before
+the first stage and after billing settled ($9.2250 to $9.1752). Each stage
+confirmed destruction and absence before the next one started.
+
+Read that total from the account, not by adding the stages up. Each report's
+`credit_delta_usd` is taken the moment its rental is destroyed, and the three
+deltas sum to $0.035 — about 30% short, because Vast keeps charging transfer
+against the account for several minutes afterwards. The earlier llama.cpp
 certification cost $0.78. These figures are historical, not an estimate for the
 next run.
 
@@ -32,7 +37,9 @@ next run.
 3. Run one stage at a time and confirm absence before starting another. The
    scripts estimate selected runtime plus five cleanup minutes, inbound traffic,
    and 1 GB outbound. Actual transfer volume and provider delays can differ;
-   reconcile reported credit changes between stages.
+   reconcile reported credit changes between stages, and read the account again
+   a few minutes after the last rental, because transfer charges keep landing
+   after destruction is confirmed.
 4. Save the report and screenshots. Do not remove the recovery record while
    creation or destruction is uncertain. Do not publish credentials or private
    runtime scripts with the evidence.
