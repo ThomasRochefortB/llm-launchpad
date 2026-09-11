@@ -1301,7 +1301,7 @@ class FastDeployScreen(CopyEnabledScreen):
         self.query_one("#fast-deploy-status", Static).update(
             f"[dim]{len(visible)} model{plural}{filter_note}{search_note}{excluded_note} · "
             f"{escape(self._catalog_info.source_label)}[/dim]"
-            + (f"\n[dim]{len(self._snapshot.vast_offers)} Vast offers included for comparison · r refreshes[/dim]"
+            + (f"\n[dim]{len(self._snapshot.vast_offers)} Vast offers priced · r refreshes[/dim]"
                if self._snapshot is not None and self._snapshot.vast_configured else "")
             + ("\n[yellow]Partial results: " + escape("; ".join(self._snapshot.errors)) + "[/yellow]"
                if self._snapshot is not None and self._snapshot.errors else "")

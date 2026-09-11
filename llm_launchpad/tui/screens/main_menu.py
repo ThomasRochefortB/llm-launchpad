@@ -29,6 +29,7 @@ from ...core.hf_auth import HuggingFaceAuthStatus, get_huggingface_auth_status
 from ...core.modal_auth import ModalAuthStatus, get_modal_auth_status
 from ...core.prime_auth import PrimeAuthStatus, get_prime_auth_status
 from ...core.prime_backend import PrimeBackend
+from ...core.vast_auth import resolve_vast_credentials
 from ...core.quick_deploy import (
     QuickDeployCatalogInfo,
     QuickDeployProfile,
@@ -204,6 +205,18 @@ def _render_prime_auth_status(status: PrimeAuthStatus | None = None) -> str:
     return "[yellow]◆ Prime Intellect not authenticated (run: prime login)[/yellow]"
 
 
+def _render_vast_auth_status() -> str:
+    """Report the local Vast key the way doctor does: no network, no rental."""
+    try:
+        credentials = resolve_vast_credentials()
+    except ValueError as exc:
+        detail = escape(clip(str(exc), 72))
+        return f"[yellow]❖ Vast.ai key unreadable: {detail}[/yellow]"
+    if credentials.api_key:
+        return f"[green]❖ Vast.ai key configured ({escape(credentials.source)})[/green]"
+    return "[yellow]❖ Vast.ai not configured (run: llm-launchpad vast-auth login)[/yellow]"
+
+
 def _render_artificial_analysis_auth_status(
     status: ArtificialAnalysisAuthStatus | None = None,
 ) -> str:
@@ -231,6 +244,7 @@ def _render_auth_status_block(
 ) -> str:
     lines: list[str] = [_render_modal_auth_status(modal_status)]
     lines.append(_render_prime_auth_status(prime_status))
+    lines.append(_render_vast_auth_status())
     lines.append(_render_hf_auth_status(hf_status))
     lines.append(_render_artificial_analysis_auth_status(aai_status))
     return "\n".join(lines)
@@ -793,7 +807,7 @@ class MainMenuScreen(CopyEnabledScreen):
                             id="compact-menu-header",
                         )
                         yield Static(
-                            f"[bold]{version_text}[/bold][dim]Modal + Prime LLM backends[/dim]",
+                            f"[bold]{version_text}[/bold][dim]Modal + Prime Intellect + Vast.ai LLM backends[/dim]",
                             classes="centered main-menu-version",
                         )
                         yield Static("", classes="decorative-spacer")

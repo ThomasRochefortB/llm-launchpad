@@ -165,7 +165,7 @@ class TuiApp(App):
     """llm-launchpad interactive terminal UI."""
 
     TITLE = "llm-launchpad"
-    SUB_TITLE = "Modal + Prime LLM backends"
+    SUB_TITLE = "Modal + Prime Intellect + Vast.ai LLM backends"
 
     CSS_PATH = Path(__file__).with_name("theme.tcss")
 
