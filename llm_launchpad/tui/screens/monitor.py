@@ -295,9 +295,30 @@ class MonitorScreen(CopyEnabledScreen):
         if self._success:
             self._show_connection_card()
 
+    # An operation that ended is no longer publishing, deploying or warming up.
+    # Without this the context bar kept its last in-progress state forever, so a
+    # finished deploy still read "state: publishing · Publishing verified
+    # endpoint" while the log below said the operation was complete.
+    _TERMINAL_STATES = {
+        OperationType.DEPLOY: DeploymentState.HEALTHY,
+        OperationType.WARMUP: DeploymentState.HEALTHY,
+        OperationType.SMOKE_TEST: DeploymentState.HEALTHY,
+        OperationType.STOP: DeploymentState.STOPPED,
+    }
+
     def on_operation_done(self, message: OperationDone) -> None:
         self._done = True
         self._success = message.success
+        # There is no failed state in DeploymentState, so a failure keeps the
+        # state it reached and only drops the detail, which described an action
+        # that is no longer running.
+        if message.success:
+            self.status_header.update_from_event(
+                state=self._TERMINAL_STATES.get(message.operation)
+            )
+        # update_from_event keeps the old detail when given an empty one, so
+        # clear it directly rather than loosening that for every caller.
+        self.status_header.detail = ""
         self._append_log_line("")
         if message.success:
             self._append_log_line(f"Operation complete ({message.operation.value}).")

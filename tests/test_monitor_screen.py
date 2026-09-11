@@ -40,6 +40,63 @@ class _HomeApp(App[None]):
 
 
 class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_finished_operation_leaves_no_in_progress_state(self) -> None:
+        """The context bar outlived the operation it described.
+
+        A completed deploy kept reading "state: publishing · Publishing
+        verified endpoint" while the log below said the operation was done.
+        """
+        from llm_launchpad.tui.widgets.status_header import StatusHeader
+
+        for operation, success, expected in (
+            (OperationType.DEPLOY, True, "healthy"),
+            (OperationType.WARMUP, True, "healthy"),
+            (OperationType.STOP, True, "stopped"),
+        ):
+            with self.subTest(operation=operation, success=success):
+                app = _TestApp()
+                async with app.run_test() as pilot:
+                    app.push_screen(MonitorScreen("Deploy"))
+                    await pilot.pause()
+                    screen = app.screen
+                    assert isinstance(screen, MonitorScreen)
+                    header = screen.query_one("#monitor-status-header", StatusHeader)
+                    header.update_from_event(
+                        state=DeploymentState.PUBLISHING,
+                        operation=OperationType.WARMUP,
+                        detail="Publishing verified endpoint",
+                    )
+                    screen.on_operation_done(
+                        OperationDone(operation=operation, success=success)
+                    )
+                    await pilot.pause()
+                    self.assertEqual(header.state, expected)
+                    self.assertEqual(header.detail, "")
+
+    async def test_a_failed_operation_drops_the_stale_detail(self) -> None:
+        # DeploymentState has no failed member, so the state it reached stands;
+        # the detail must not keep advertising work that stopped.
+        from llm_launchpad.tui.widgets.status_header import StatusHeader
+
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(MonitorScreen("Deploy"))
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, MonitorScreen)
+            header = screen.query_one("#monitor-status-header", StatusHeader)
+            header.update_from_event(
+                state=DeploymentState.DEPLOYING,
+                operation=OperationType.DEPLOY,
+                detail="Provisioning machine",
+            )
+            screen.on_operation_done(
+                OperationDone(operation=OperationType.DEPLOY, success=False, exit_code=1)
+            )
+            await pilot.pause()
+            self.assertEqual(header.state, "deploying")
+            self.assertEqual(header.detail, "")
+
     def test_log_history_prunes_in_chunks_at_the_retention_limit(self) -> None:
         lines = list(range(MAX_RETAINED_LOG_LINES + 1))
 
