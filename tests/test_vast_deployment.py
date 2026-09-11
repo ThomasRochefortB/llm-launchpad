@@ -630,6 +630,20 @@ class VastProvisioningProgressTests(unittest.TestCase):
     rather than waiting out a fixed clock.
     """
 
+    def test_a_multi_line_status_arrives_as_one_readable_line(self) -> None:
+        from llm_launchpad.core.vast_backend import _parse_instance
+
+        raw = {
+            "id": 900, "label": "l", "actual_status": "loading", "machine_id": 42,
+            "status_msg": "404ad8037495: Verifying Checksum\n404ad8037495: Download complete\n",
+        }
+        instance = _parse_instance(raw)
+        # Dropping the newline outright ran the two lines into one word.
+        self.assertEqual(
+            instance.status_msg,
+            "404ad8037495: Verifying Checksum 404ad8037495: Download complete",
+        )
+
     def test_a_ticking_buildkit_counter_is_not_progress(self) -> None:
         # Same step, same work, later timestamp: the host has not advanced.
         first = VastInstance("1", "l", "loading", "42", status_msg="#6 62.25 Get:8 http://archive.ubuntu.com noble InRelease")

@@ -37,6 +37,18 @@ def _text(value: Any) -> str:
     return "".join(char for char in value if char.isprintable()).strip() if isinstance(value, str) else ""
 
 
+def _progress_text(value: Any) -> str:
+    """Flatten a multi-line provider status into one readable line.
+
+    Vast's status_msg carries several lines of pull and build output. Dropping
+    the newlines outright ran them together, so "Verifying Checksum" and the
+    next line arrived as one word.
+    """
+    if not isinstance(value, str):
+        return ""
+    return " ".join(_text(line) for line in value.splitlines() if _text(line))
+
+
 def _boolean(value: Any) -> bool | None:
     if isinstance(value, bool):
         return value
@@ -344,5 +356,5 @@ def _parse_instance(raw: Any) -> VastInstance:
         id=str(raw["id"]), label=_text(raw.get("label")),
         state=_text(raw.get("actual_status")), machine_id=str(raw.get("machine_id") or ""),
         ssh_host=_text(raw.get("ssh_host")), ssh_port=positive_int(raw.get("ssh_port")) or 0,
-        status_msg=_text(raw.get("status_msg")),
+        status_msg=_progress_text(raw.get("status_msg")),
     )
