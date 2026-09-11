@@ -7,7 +7,7 @@ Rows marked 2026-09-10 were measured on the release configuration, after the
 
 | Path | Recorded evidence | Release behavior |
 | --- | --- | --- |
-| Single-GPU text-only llama.cpp | 48.7s cold start; unauthorized requests rejected; structured tool call; 310s stream; reconnect; 8.8s warm restart; confirmed destruction | Enabled |
+| Single-GPU text-only llama.cpp | 48.7s cold start; unauthorized requests rejected; structured tool call; 310s stream; reconnect; 8.8s warm restart; confirmed destruction. **Predates `devices_after_load`, so GPU residency was never verified** | Enabled |
 | Two-GPU text-only llama.cpp | 15.7 GB Q8_0 model split over two RTX 3060s, with 7729/7791 MiB used; chat, tools, 60s stream; confirmed destruction | Enabled; other topologies are not individually certified |
 | Fast Deploy TUI | Real llama.cpp rental deployed and warmed through UI/worker path; confirmed destruction | Enabled |
 | Single-GPU vLLM | 2026-09-10, RTX 3060: 876.6s cold start; unauthorized requests rejected (401, 401); structured tool call; 60s stream; confirmed destruction | Enabled |
@@ -55,6 +55,33 @@ Two harness gaps this exposed, both now closed:
 `logs.gpu_offload_reported` is **not** evidence either way: it is false on the
 certified 12.8 run too, because the log line it greps for is not emitted.
 
+## Open finding: the llama.cpp SSH deadline is marginal
+
+`core/vast_deployment.py:206` gives a rental 900s to answer SSH on llama.cpp
+and 1800s on vLLM, reasoning that the vLLM image is the larger pull. Three
+attempts on 2026-09-11 suggest 900s is not enough for llama.cpp either:
+
+| Host | Link | Result |
+| --- | --- | --- |
+| RTX 3060, Poland (45598047) | 891 Mbps | SSH in time; 403.2s cold start |
+| RTX 3060, New Brunswick (48529480) | 1890 Mbps | reached `running`, refused SSH past 900s |
+| RTX 3060, New Jersey (44022327) | 2065 Mbps | still `loading` at 900s |
+
+Two of three failed, and the faster links failed, so advertised bandwidth does
+not predict it: sshd binds only after Vast's own provisioning finishes, which
+the instance `status_msg` shows running apt inside the image. Both failures
+destroyed their rental and confirmed absence, at $0.0273 for no result.
+
+The user has already paid for the pull when this fires, so giving up returns
+nothing for the money. Matching vLLM's 1800s is the obvious candidate, with the
+tradeoff that a genuinely broken rental then bills twice as long before the
+deploy path gives up. Not changed here: it is a billing-sensitive default that
+wants a decision, not a drive-by edit.
+
+Because of this, the single-GPU llama.cpp row above is **still** certified only
+by its original run, which predates `devices_after_load` and therefore never
+verified that the weights reached the GPU.
+
 ## Before another paid run
 
 1. Choose an explicit total spend limit and reserve part for cleanup. Check
@@ -69,7 +96,11 @@ certified 12.8 run too, because the log line it greps for is not emitted.
    reconcile reported credit changes between stages, and read the account again
    a few minutes after the last rental, because transfer charges keep landing
    after destruction is confirmed.
-4. Save the report and screenshots. Do not remove the recovery record while
+4. Expect the llama.cpp SSH deadline, not `--max-minutes`, to end a slow
+   rental. `core/vast_deployment.py` allows 900s for a rental to answer SSH on
+   llama.cpp against 1800s on vLLM, and raising `--max-minutes` does not move
+   it. See the open finding below.
+5. Save the report and screenshots. Do not remove the recovery record while
    creation or destruction is uncertain. Do not publish credentials or private
    runtime scripts with the evidence.
 
