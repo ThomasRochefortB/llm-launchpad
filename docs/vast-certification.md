@@ -55,11 +55,10 @@ Two harness gaps this exposed, both now closed:
 `logs.gpu_offload_reported` is **not** evidence either way: it is false on the
 certified 12.8 run too, because the log line it greps for is not emitted.
 
-## Open finding: the llama.cpp SSH deadline is marginal
+## Why a rental gets 1800s to answer SSH
 
-`core/vast_deployment.py:206` gives a rental 900s to answer SSH on llama.cpp
-and 1800s on vLLM, reasoning that the vLLM image is the larger pull. Three
-attempts on 2026-09-11 suggest 900s is not enough for llama.cpp either:
+The deploy path used to allow 900s on llama.cpp and 1800s on vLLM, scaled on
+image size. Three attempts on 2026-09-11 showed that is the wrong variable:
 
 | Host | Link | Result |
 | --- | --- | --- |
@@ -67,20 +66,30 @@ attempts on 2026-09-11 suggest 900s is not enough for llama.cpp either:
 | RTX 3060, New Brunswick (48529480) | 1890 Mbps | reached `running`, refused SSH past 900s |
 | RTX 3060, New Jersey (44022327) | 2065 Mbps | still `loading` at 900s |
 
-Two of three failed, and the faster links failed, so advertised bandwidth does
-not predict it: sshd binds only after Vast's own provisioning finishes, which
-the instance `status_msg` shows running apt inside the image. Both failures
-destroyed their rental and confirmed absence, at $0.0273 for no result.
+Two of three failed and the faster links were the ones that failed, at $0.0273
+for no result. The pull cannot explain it: the pinned images are 2.59 GB
+(llama.cpp, 13 layers) and 8.67 GB (vLLM, 37 layers) compressed, which is 11s
+and 37s at 1890 Mbps. What actually runs before sshd binds is unpacking those
+layers and Vast's own provisioning, which installs the SSH server the pinned
+upstream images do not carry — visible in the instance `status_msg` as BuildKit
+steps fetching from `archive.ubuntu.com`. Neither scales with the image, and
+neither is measured by `inet_down`, which is a speedtest figure.
 
-The user has already paid for the pull when this fires, so giving up returns
-nothing for the money. Matching vLLM's 1800s is the obvious candidate, with the
-tradeoff that a genuinely broken rental then bills twice as long before the
-deploy path gives up. Not changed here: it is a billing-sensitive default that
-wants a decision, not a drive-by edit.
+So both runtimes now get the same 1800s (`VAST_READY_DEADLINE_SECONDS`), and a
+host that stops reporting progress for 360s before SSH is reachable is
+abandoned early (`VAST_PROVISION_STALL_SECONDS`) rather than billed to the
+deadline. Progress is read from `status_msg`, with BuildKit's `#step elapsed`
+prefix stripped first: that counter keeps ticking while a step is wedged, so
+the raw string is not a progress signal.
 
-Because of this, the single-GPU llama.cpp row above is **still** certified only
-by its original run, which predates `devices_after_load` and therefore never
-verified that the weights reached the GPU.
+This does not make `inet_down` predictive. `disk_bw` is not either — both failed
+hosts had NVMe-class disks (2538 and 3679 MB/s). `cpu_cores_effective` remains
+an untested candidate, since layer decompression is CPU-bound and the New
+Brunswick host was allotted 4 of its 16 cores.
+
+Single-GPU llama.cpp is still certified only by its original run, which predates
+`devices_after_load` and so never verified that the weights reached the GPU.
+Re-running it is now worth another attempt under both fixes.
 
 ## Before another paid run
 
@@ -96,10 +105,9 @@ verified that the weights reached the GPU.
    reconcile reported credit changes between stages, and read the account again
    a few minutes after the last rental, because transfer charges keep landing
    after destruction is confirmed.
-4. Expect the llama.cpp SSH deadline, not `--max-minutes`, to end a slow
-   rental. `core/vast_deployment.py` allows 900s for a rental to answer SSH on
-   llama.cpp against 1800s on vLLM, and raising `--max-minutes` does not move
-   it. See the open finding below.
+4. Remember that `--max-minutes` is the harness's own clock, not the deploy
+   path's. A rental now gets 1800s to answer SSH on either runtime, and is
+   abandoned sooner if it stops reporting progress. See the section below.
 5. Save the report and screenshots. Do not remove the recovery record while
    creation or destruction is uncertain. Do not publish credentials or private
    runtime scripts with the evidence.

@@ -674,6 +674,9 @@ class VastInstance:
     machine_id: str
     ssh_host: str = ""
     ssh_port: int = 0
+    # Vast's own provisioning progress line. The deploy loop uses it to tell a
+    # slow host from a stuck one; ``state`` alone sits on "loading" throughout.
+    status_msg: str = ""
 
 
 @dataclass

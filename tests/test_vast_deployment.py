@@ -11,7 +11,10 @@ from unittest.mock import Mock, patch
 from llm_launchpad.core.orchestrator import Orchestrator
 from llm_launchpad.core.connection_store import merge_connections
 from llm_launchpad.core.vast_backend import VastApiError, VastBackend
-from llm_launchpad.core.vast_deployment import VastDeploymentBackend
+from llm_launchpad.core.vast_deployment import (
+    VAST_PROVISION_STALL_SECONDS, VAST_READY_DEADLINE_SECONDS,
+    VastDeploymentBackend, vast_progress_key,
+)
 from llm_launchpad.core.vast_runtime import vast_runtime_image, vast_runtime_script, verify_endpoint_auth, verify_streaming
 from llm_launchpad.core.vast_ssh import VastSsh, ssh_key_startup
 from llm_launchpad.core.vast_state import VastState
@@ -143,6 +146,32 @@ class VastLifecycleTests(unittest.TestCase):
         self.config.required_vram_gb = 50
         self.assertFalse(self.deploy().success)
         self.api.create_instance.assert_not_called()
+
+    def test_a_host_that_goes_silent_while_provisioning_is_given_back(self) -> None:
+        """Silence before SSH is reachable is a stuck host, not a slow one.
+
+        Vast leaves ``actual_status`` on "loading" for the whole pull and
+        provisioning, so only ``status_msg`` distinguishes the two.
+        """
+        def stalled_create(offer_id: str, **kwargs: object) -> str:
+            self.remote = VastInstance(
+                "900", str(kwargs["label"]), "loading", "42",
+                status_msg="#6 1.0 Get:8 http://archive.ubuntu.com noble InRelease",
+            )
+            return "900"
+
+        self.api.create_instance.side_effect = stalled_create
+        # 100s of provisioning time per clock read closes the 360s stall window
+        # on the second pass, far short of the 1800s deadline.
+        clock = iter(range(0, 1_000_000, 100))
+        with patch("llm_launchpad.core.vast_deployment.time.monotonic", side_effect=lambda: next(clock)):
+            event = self.deploy()
+
+        self.assertFalse(event.success)
+        self.assertIn("stopped making progress", event.detail or "")
+        # The rental is handed back rather than billed out to the deadline.
+        self.api.destroy_instance.assert_called_once_with("900")
+        self.assertEqual(self.state.records(), [])
 
     def test_incompatible_or_unknown_cuda_driver_cannot_rent(self) -> None:
         for version in (None, 12.6):
@@ -591,3 +620,32 @@ class VastSshStartupTests(unittest.TestCase):
         for key in ("", "private key", "ssh-ed25519 KEY\nssh-ed25519 OTHER"):
             with self.assertRaises(ValueError):
                 ssh_key_startup(key)
+
+
+class VastProvisioningProgressTests(unittest.TestCase):
+    """A rental that is slow is not a rental that is stuck.
+
+    Vast reports provisioning in ``status_msg`` while ``actual_status`` sits on
+    "loading" throughout, so the deploy loop reads progress from the message
+    rather than waiting out a fixed clock.
+    """
+
+    def test_a_ticking_buildkit_counter_is_not_progress(self) -> None:
+        # Same step, same work, later timestamp: the host has not advanced.
+        first = VastInstance("1", "l", "loading", "42", status_msg="#6 62.25 Get:8 http://archive.ubuntu.com noble InRelease")
+        later = VastInstance("1", "l", "loading", "42", status_msg="#6 127.1 Get:8 http://archive.ubuntu.com noble InRelease")
+        self.assertEqual(vast_progress_key(first), vast_progress_key(later))
+
+    def test_a_new_step_or_state_is_progress(self) -> None:
+        base = VastInstance("1", "l", "loading", "42", status_msg="#6 62.25 Get:8 noble InRelease")
+        self.assertNotEqual(
+            vast_progress_key(base),
+            vast_progress_key(replace(base, status_msg="#6 63.10 Get:9 noble/main Packages")),
+        )
+        self.assertNotEqual(vast_progress_key(base), vast_progress_key(replace(base, state="running")))
+
+    def test_both_runtimes_get_the_same_allowance(self) -> None:
+        # The old limits were 900s for llama.cpp and 1800s for vLLM, scaled on
+        # image size. Nothing in the wait scales with the image.
+        self.assertEqual(VAST_READY_DEADLINE_SECONDS, 1800)
+        self.assertLess(VAST_PROVISION_STALL_SECONDS, VAST_READY_DEADLINE_SECONDS)

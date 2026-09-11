@@ -344,4 +344,5 @@ def _parse_instance(raw: Any) -> VastInstance:
         id=str(raw["id"]), label=_text(raw.get("label")),
         state=_text(raw.get("actual_status")), machine_id=str(raw.get("machine_id") or ""),
         ssh_host=_text(raw.get("ssh_host")), ssh_port=positive_int(raw.get("ssh_port")) or 0,
+        status_msg=_text(raw.get("status_msg")),
     )

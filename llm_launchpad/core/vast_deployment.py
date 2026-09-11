@@ -36,6 +36,26 @@ from .vast_state import VastState
 _CANCELLATIONS: dict[str, threading.Event] = {}
 _CANCELLATIONS_LOCK = threading.Lock()
 
+# How long a rental may take to answer SSH, and how long it may show no sign of
+# progress before that is called stuck. The old limits were scaled on image
+# size (900s llama.cpp, 1800s vLLM), but the pull is the smallest part of the
+# wait: 2.59 GB and 8.67 GB compressed are seconds to a minute on these hosts,
+# while the host still has to unpack them and run Vast's own provisioning,
+# which installs the SSH server the pinned upstream images do not carry.
+# Neither scales with the image, so both runtimes get the same allowance and a
+# stalled host is caught by its silence instead of by a clock.
+VAST_READY_DEADLINE_SECONDS = 1800
+VAST_PROVISION_STALL_SECONDS = 360
+
+# BuildKit prefixes every progress line with its step number and an elapsed
+# counter, so the raw string keeps changing even while a step is wedged.
+_BUILDKIT_STEP_PREFIX = re.compile(r"^#\d+\s+\d+(?:\.\d+)?\s+")
+
+
+def vast_progress_key(instance: VastInstance) -> str:
+    """Reduce a status line to what changes only when work actually advances."""
+    return f"{instance.state}|{_BUILDKIT_STEP_PREFIX.sub('', instance.status_msg).strip()}"
+
 
 class VastDeploymentBackend:
     """Keep remote identities durable and publish only tested SSH endpoints."""
@@ -203,10 +223,15 @@ class VastDeploymentBackend:
             # A rental cannot answer SSH until its image is pulled, and the
             # vLLM image is several times the size of the llama.cpp one. On a
             # modest link that is minutes of legitimate waiting, not a failure.
-            deadline = time.monotonic() + (1800 if config.backend == BackendType.VLLM else 900)
+            started = time.monotonic()
+            deadline = started + VAST_READY_DEADLINE_SECONDS
             instance = None
             last_state = ""
+            progress_key = ""
+            progress_at = started
+            reported_at = started
             ssh_reported = False
+            ssh_attempted = False
             ssh_first_try = time.monotonic()
             ssh_backoff = 5.0
             while time.monotonic() < deadline:
@@ -230,7 +255,29 @@ class VastDeploymentBackend:
                     # step is slow instead of reporting a bare timeout.
                     last_state = instance.state
                     yield LogEvent(line=f"Vast instance state: {instance.state}")
+                current_key = vast_progress_key(instance)
+                if current_key != progress_key:
+                    progress_key, progress_at = current_key, time.monotonic()
+                elif not ssh_attempted and time.monotonic() - progress_at > VAST_PROVISION_STALL_SECONDS:
+                    # Silence before SSH is reachable means the host stopped
+                    # working, not that it is slow. Give the money back sooner.
+                    raise RuntimeError(
+                        "Vast instance stopped making progress while provisioning "
+                        f"(last state: {last_state}, silent for "
+                        f"{int(time.monotonic() - progress_at)}s)."
+                    )
+                # A minutes-long wait with one log line reads as a hang. Report
+                # what the host is doing without echoing every BuildKit line.
+                if time.monotonic() - reported_at >= 30:
+                    reported_at = time.monotonic()
+                    detail = instance.status_msg[:120]
+                    elapsed = int(time.monotonic() - started)
+                    yield LogEvent(
+                        line=f"Vast rental preparing ({elapsed}s): {detail}" if detail
+                        else f"Vast rental preparing ({elapsed}s); no progress reported yet."
+                    )
                 if instance.state == "running" and instance.ssh_host and instance.ssh_port:
+                    ssh_attempted = True
                     try:
                         ssh.run(instance, "true")
                         break
