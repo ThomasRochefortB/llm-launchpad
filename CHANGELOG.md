@@ -8,14 +8,14 @@ and this project follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
-- Vast.ai rentals (beta): Fast Deploy quotes, GPU filters, and serving-tier competition for verified on-demand NVIDIA offers. Supported text-only llama.cpp GGUF placements on one to eight GPUs can be rented; the endpoint is a loopback SSH tunnel on this computer. Offers whose runtime is unsupported remain comparisons. A rented host's GPUs are inventoried over SSH before serving, so a bundle with a different device count, mixed GPU models, or too little free memory per device is refused and destroyed. Stop destroys the rental and its disk.
+- Vast.ai as a third compute provider, alongside Modal and Prime Intellect: Fast Deploy quotes, GPU filters, and serving-tier competition for verified on-demand NVIDIA offers. Supported llama.cpp GGUF placements on one to eight GPUs can be rented; the endpoint is a loopback SSH tunnel on this computer. Offers whose runtime is unsupported remain comparisons. A rented host's GPUs are inventoried over SSH before serving, so a bundle with a different device count, mixed GPU models, or too little free memory per device is refused and destroyed. Stop destroys the rental and its disk.
 - vLLM on Vast.ai rentals, on a digest-pinned image whose CUDA floor is read from its own OCI config (13.0, above llama.cpp's 12.8). Tensor parallelism uses every GPU the rental bundles and is limited to counts that can shard attention heads. The API key is passed by environment, never on the command line.
-- Image input on Vast.ai rentals through Advanced deploy. The projector is staged on the rental over the same pinned llama.cpp image Prime uses. Fast Deploy still refuses vision for every provider, because vision working memory is not calibrated for guaranteed-fit placement.
-- `llm-launchpad vast-auth` (login/status/logout), `vast connect`, `offers --provider vast`, and `--provider vast` on deploy/list/status/logs/stop. `doctor` reports a local Vast key as optional and does not authenticate it over the network.
-- Advanced deploy can bind a selected Vast rental on llama.cpp. Disk size is quoted with the GPU.
-- Docs for the beta and the broader release plan: `docs/vast.md`, `docs/vast-integration-plan.md`.
+- Image input on Vast.ai rentals through Advanced deploy, on both runtimes. The llama.cpp projector is staged on the rental over the same pinned image Prime uses; vLLM serves images through its native multimodal path. Fast Deploy still refuses vision for every provider, because vision working memory is not calibrated for guaranteed-fit placement.
+- `llm-launchpad vast-auth` (login/status/logout), `vast connect`, `offers --provider vast`, and `--provider vast` on deploy/list/status/logs/stop. `doctor` checks for a local Vast key the way it checks Modal and Prime, without authenticating it over the network.
+- Advanced deploy can bind a selected Vast rental on either runtime. Disk size is quoted with the GPU.
+- Docs for the provider and the broader release plan: `docs/vast.md`, `docs/vast-integration-plan.md`.
 - Added an always-on rotating debug log under `~/.llm_launchpad/logs/` and routed previously silent failure paths (cache persistence, auth probing, log-tail cleanup, SSH key permissions) to it.
-- Added `llm-launchpad doctor`, a self-check command that verifies the Modal CLI, Modal/Prime/Hugging Face authentication, the optional Artificial Analysis key, and state-directory writability, with fix hints per failure.
+- Added `llm-launchpad doctor`, a self-check command that verifies the Modal CLI, Modal/Prime/Vast/Hugging Face authentication, the optional Artificial Analysis key, and state-directory writability, with fix hints per failure.
 - Added `llm-launchpad --version`.
 - Added documentation pages under `docs/` (deploy catalog, Prime provider, storage and costs, OpenCode, troubleshooting) and a generated CLI reference (`docs/cli.md`) via `scripts/generate_cli_reference.py`.
 - Added GitHub issue templates for bug reports and feature requests.
@@ -29,7 +29,7 @@ and this project follows [Semantic Versioning](https://semver.org/).
 ### Fixed
 - Vast rental startup requires a successful per-instance SSH key attachment and omits the reverted container startup hook, which caused SSH failures. Live rentals then certified vLLM serving on one GPU and on two-way tensor parallelism: the remaining `Connection refused` on a large image is Vast's sshd binding after the image pull, which the deploy loop already waits out.
 - Vast live validation uses production-style SSH startup, checks total runtime and transfer estimates with cleanup headroom, and retains recovery records after uncertain image-probe creation. The Advanced deploy vision check supports vLLM without requiring a GGUF projector.
-- Vast image input through vLLM requires `LLM_LAUNCHPAD_VAST_EXPERIMENTAL=1` before renting, because no live run has served an image through vLLM. llama.cpp text, llama.cpp image input, vLLM text, and two-way vLLM tensor parallelism are certified against real rentals and need no opt-in.
+- Vast live certification covers llama.cpp text, llama.cpp image input, vLLM text, and two-way vLLM tensor parallelism against real rentals. Image input through vLLM is the one release path with no live run behind it; it is served by vLLM's native multimodal path and is recorded as uncertified in `docs/vast-certification.md`.
 - Vast cleanup retries rate-limited account and instance identity checks, including reconciliation after uncertain creation, before destroying the rental.
 - First llama.cpp Modal deploy after a large Hugging Face download no longer dies at the 30-minute web-server startup timeout. The GPU container sequentially hydrates GGUF shards (and a projector, if any) before `llama-server` starts, and the bind wait defaults to 90 minutes (`LLAMACPP_SERVE_STARTUP_TIMEOUT_MINUTES`).
 

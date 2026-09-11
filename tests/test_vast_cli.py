@@ -96,7 +96,7 @@ class VastCliTests(unittest.TestCase):
             result = self.runner.invoke(app, ["offers", "--provider", "vast"])
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("unknown", result.output)
-        self.assertIn("Single-GPU llama.cpp", result.output)
+        self.assertIn("--provider vast", result.output)
         self.assertIn("0.0020", result.output)
 
     def test_api_error_and_incompatible_flags_have_nonzero_exit(self) -> None:

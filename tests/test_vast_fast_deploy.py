@@ -210,7 +210,7 @@ class VastFastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 screen._open_model(model.id)
                 await pilot.pause()
                 options = screen.query_one(OptionList)
-                self.assertTrue(any("Vast preview" in str(options.get_option_at_index(i).prompt) for i in range(options.option_count)))
+                self.assertTrue(any("Vast comparison" in str(options.get_option_at_index(i).prompt) for i in range(options.option_count)))
                 comparison_id = next(iter(screen._vast_rows))
                 options.highlighted = options.get_option_index(comparison_id)
                 options.focus()

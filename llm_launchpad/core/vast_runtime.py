@@ -5,7 +5,6 @@ from dataclasses import dataclass
 from functools import lru_cache
 from importlib import resources
 import json
-import os
 import shlex
 import time
 
@@ -14,7 +13,7 @@ import requests
 
 from typing import Any
 
-from ..protocol.enums import BackendType, VisionMode
+from ..protocol.enums import BackendType
 from ..protocol.models import DeploymentConfig
 from .runtime_support import load_llamacpp_support_manifest
 from .serving_runtime import projector_setup, vllm_serve_args
@@ -149,25 +148,6 @@ def load_vast_runtime(backend: BackendType) -> VastRuntime:
 # Powers of two are the shapes that hold for every supported architecture.
 VLLM_TENSOR_PARALLEL_COUNTS = frozenset({1, 2, 4, 8})
 
-VAST_EXPERIMENTAL_ENV = "LLM_LAUNCHPAD_VAST_EXPERIMENTAL"
-
-
-def _certification_refusal(config: DeploymentConfig) -> str | None:
-    """Keep the one uncertified serving path behind an explicit opt-in.
-
-    Live rentals certified vLLM text serving on a single GPU and on two-way
-    tensor parallelism, and llama.cpp image input with a staged GGUF projector.
-    No live run has served images through vLLM, so that pairing stays opt-in.
-    """
-    vision = config.vision_mode == VisionMode.ON or (config.vision is not None and config.vision.enabled)
-    if config.backend == BackendType.VLLM and vision and os.environ.get(VAST_EXPERIMENTAL_ENV) != "1":
-        return (
-            "Vast vLLM image input has not completed live certification. "
-            f"Use llama.cpp for image input, or explicitly opt in with {VAST_EXPERIMENTAL_ENV}=1. "
-            "Experimental rentals may fail to serve and still incur charges."
-        )
-    return None
-
 
 def vast_refusal(config: DeploymentConfig) -> str | None:
     """Explain why a Vast rental cannot serve this configuration, or None.
@@ -193,13 +173,13 @@ def vast_refusal(config: DeploymentConfig) -> str | None:
             load_vast_runtime(BackendType.VLLM)
         except ValueError as exc:
             return str(exc)
-        return _certification_refusal(config)
+        return None
     if not config.repo_id or not config.quant:
         return "Vast requires a GGUF repository and quant."
     manifest = load_llamacpp_support_manifest(config.gguf_architecture)
     if manifest.build_recipe or not manifest.image_digest.startswith("sha256:"):
         return "Vast requires a published, digest-pinned runtime image for this architecture."
-    return _certification_refusal(config)
+    return None
 
 
 def vast_runtime(config: DeploymentConfig) -> VastRuntime:

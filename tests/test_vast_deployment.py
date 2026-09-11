@@ -123,19 +123,18 @@ class VastLifecycleTests(unittest.TestCase):
             self.assertFalse(event.success)
         self.api.create_instance.assert_not_called()
 
-    @patch.dict("os.environ", {"LLM_LAUNCHPAD_VAST_EXPERIMENTAL": ""})
-    def test_uncertified_vllm_image_input_is_refused_before_any_rental(self) -> None:
+    def test_vllm_image_input_rents_like_every_other_supported_path(self) -> None:
+        """Vast gates no runtime behind an opt-in that Modal and Prime lack."""
         from llm_launchpad.protocol.enums import VisionMode
 
         self.config.backend = BackendType.VLLM
         self.config.model_name = "Qwen/Qwen3-0.6B"
         self.config.vision_mode = VisionMode.ON
+        # The vLLM image's own CUDA floor is 13.0, above llama.cpp's.
+        self.api.get_offer.return_value = vast_offer(cuda_max_good=13.0)
         event = self.deploy()
-        self.assertFalse(event.success)
-        self.assertIn("EXPERIMENTAL=1", event.detail or "")
-        self.api.create_instance.assert_not_called()
-        self.api.attach_key.assert_not_called()
-        self.assertEqual(self.state.records(), [])
+        self.assertTrue(event.success, event.detail)
+        self.api.create_instance.assert_called_once()
 
     def test_changed_machine_or_insufficient_memory_cannot_rent(self) -> None:
         self.api.get_offer.return_value = vast_offer(machine_id=43)

@@ -682,6 +682,12 @@ VllmDeployScreen Select:disabled > SelectCurrent {
     layout: vertical;
 }
 
+/* One action per authenticable provider, plus re-check and quit, has to fit a
+   standard 80-column terminal before the compact rule stacks them. */
+#setup-required-actions Button {
+    min-width: 14;
+}
+
 #settings-scroll {
     align: center middle;
 }

@@ -28,6 +28,7 @@ def _ok_checks() -> tuple[DoctorCheck, ...]:
         DoctorCheck(name="Local state directory", ok=True, detail="/tmp/state"),
         DoctorCheck(name="Modal auth", ok=True, detail="authenticated"),
         DoctorCheck(name="Prime Intellect auth", ok=True, detail="API key found"),
+        DoctorCheck(name="Vast.ai auth", ok=True, detail="API key found (stored)"),
         DoctorCheck(name="Hugging Face auth", ok=True, detail="logged in"),
         DoctorCheck(
             name="Artificial Analysis key", ok=True, required=False, detail="validated"
@@ -101,19 +102,22 @@ class RunDoctorChecksTests(unittest.TestCase):
         by_name = {check.name for check in checks}
         self.assertIn("Modal auth", by_name)
         self.assertIn("Prime Intellect auth", by_name)
+        self.assertIn("Vast.ai auth", by_name)
         self.assertIn("Hugging Face auth", by_name)
         self.assertIn("Debug log", by_name)
         self.assertEqual(doctor_exit_code(checks), 0)
 
-    def test_missing_vast_key_is_optional_and_does_not_contact_api(self) -> None:
+    def test_missing_vast_key_fails_like_any_provider_without_contacting_the_api(self) -> None:
         with mock.patch.object(doctor_module, "resolve_vast_credentials", return_value=VastCredentials()), mock.patch(
             "llm_launchpad.core.vast_backend.requests.request"
         ) as request:
             checks = run_doctor_checks(settings_dir=Path(tempfile.gettempdir()))
-        vast = next(check for check in checks if check.name == "Vast.ai key")
+        vast = next(check for check in checks if check.name == "Vast.ai auth")
         self.assertFalse(vast.ok)
-        self.assertFalse(vast.required)
-        self.assertEqual(doctor_exit_code(checks), 0)
+        self.assertTrue(vast.required)
+        self.assertIn("vast-auth login", vast.hint or "")
+        self.assertEqual(doctor_exit_code(checks), 1)
+        # Resolving a key is a local read, exactly like the Modal and Prime probes.
         request.assert_not_called()
 
     def test_missing_modal_cli_reports_hint(self) -> None:

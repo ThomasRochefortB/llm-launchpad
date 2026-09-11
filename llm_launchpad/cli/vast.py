@@ -98,7 +98,7 @@ def print_vast_offers(query: VastOfferQuery, *, output_json: bool) -> None:
     if output_json:
         typer.echo(json.dumps([asdict(row) for row in rows], indent=2, allow_nan=False))
         return
-    typer.echo(f"Vast offers: up to {query.limit} results, {query.disk_gb} GiB disk each. Single-GPU llama.cpp deployment is available (beta).")
+    typer.echo(f"Vast offers: up to {query.limit} results, {query.disk_gb} GiB disk each. Deploy a selected offer with --provider vast.")
     if not rows:
         typer.echo("No eligible Vast offers matched the requested filters.")
         return

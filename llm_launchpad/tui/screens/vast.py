@@ -48,8 +48,8 @@ class VastPreviewScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="vast-scroll"):
-            yield Static("[bold]Vast.ai rentals (beta)[/bold]")
-            yield Static("Browse verified, on-demand NVIDIA rentals. Use Fast Deploy to rent a supported text model.")
+            yield Static("[bold]Vast.ai rentals[/bold]")
+            yield Static("Browse verified, on-demand NVIDIA rentals. Use Deploy model to rent one.")
             yield Static("API key (hidden; leave blank to use the configured key)")
             yield Input(password=True, id="vast-key")
             with Horizontal(classes="vast-actions"):
@@ -141,7 +141,7 @@ class VastPreviewScreen(CopyEnabledScreen):
                     detail += " VAST_API_KEY takes precedence over the saved key."
             else:
                 offers = VastBackend().list_offers(query)
-                detail = f"Found {len(offers)} eligible rental offers. Use Fast Deploy to select a supported model."
+                detail = f"Found {len(offers)} eligible rental offers. Use Deploy model to select one."
         except (ValueError, OSError, VastApiError) as exc:
             detail = f"Error: {exc}"
         self.post_message(VastPreviewResult(detail, offers))

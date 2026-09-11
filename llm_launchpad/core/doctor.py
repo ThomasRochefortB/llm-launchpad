@@ -108,18 +108,20 @@ def run_doctor_checks(
             )
         )
 
+    # Resolving the key is a local read, like the Modal and Prime probes: a
+    # missing key is reported without spending a request to authenticate it.
     try:
         vast_credentials = resolve_vast_credentials()
         vast_detail = (
-            f"configured ({vast_credentials.source}); key not verified over the network"
-            if vast_credentials.api_key else "not configured (optional)"
+            f"API key found ({vast_credentials.source}); not verified over the network"
+            if vast_credentials.api_key else "no API key configured"
         )
         vast_ok = bool(vast_credentials.api_key)
     except ValueError as exc:
         vast_detail, vast_ok = str(exc), False
     checks.append(DoctorCheck(
-        name="Vast.ai key", ok=vast_ok, required=False, detail=vast_detail,
-        hint="optional: run llm-launchpad vast-auth login",
+        name="Vast.ai auth", ok=vast_ok, detail=vast_detail,
+        hint="run: llm-launchpad vast-auth login (or set VAST_API_KEY)",
     ))
 
     hf_status = get_huggingface_auth_status()

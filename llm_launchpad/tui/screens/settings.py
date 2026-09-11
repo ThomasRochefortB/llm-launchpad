@@ -51,7 +51,7 @@ class SettingsScreen(CopyEnabledScreen):
         with VerticalScroll(id="settings-scroll", classes="screen-scroll"):
             with Vertical(id="settings-form"):
                 yield Static("[bold #7bf168]Settings[/]")
-                yield Button("Vast.ai rentals (beta)", id="vast-preview-btn")
+                yield Button("Vast.ai rentals", id="vast-preview-btn")
                 yield Static("")
                 yield Static("[bold]Deployment[/bold]")
                 yield FormField(

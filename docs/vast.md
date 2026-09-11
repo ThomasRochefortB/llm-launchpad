@@ -1,15 +1,12 @@
-# Vast.ai rentals (beta)
+# Vast.ai provider
 
-Vast offers participate in Fast Deploy's prices, GPU filters, serving tiers,
-and eligible deployment fallbacks. The beta enables **llama.cpp GGUF models on
-one to eight GPUs**, with published, digest-pinned runtimes, and **vLLM on one,
-two, four, or eight GPUs**. Image input is Advanced deploy only; Fast Deploy
-remains text-only. Live rentals certified llama.cpp text, llama.cpp image input,
-vLLM text, and two-way vLLM tensor parallelism.
-**Image input through vLLM still requires `LLM_LAUNCHPAD_VAST_EXPERIMENTAL=1`**,
-because no live run has served an image through vLLM. Offers whose runtime is
-unsupported remain comparisons. See the validation limits below before choosing
-a runtime.
+Vast is a compute provider alongside Modal and Prime Intellect. Its offers
+participate in Fast Deploy's prices, GPU filters, serving tiers, and eligible
+deployment fallbacks. It runs **llama.cpp GGUF models on one to eight GPUs**,
+with published, digest-pinned runtimes, and **vLLM on one, two, four, or eight
+GPUs**. Image input is Advanced deploy only; Fast Deploy remains text-only.
+Offers whose runtime is unsupported remain comparisons. See the validation
+limits below before choosing a runtime.
 
 A rented host's GPUs are inventoried over SSH before anything is served: a
 bundle that reports a different device count, mixed GPU models, or too little
@@ -27,16 +24,13 @@ two-GPU llama.cpp run verified that model weights spanned both devices. Later
 rentals certified vLLM text serving on one GPU, two-way vLLM tensor parallelism
 with weights resident on both devices, and Advanced deploy through a real rental
 serving a llama.cpp model with a staged GGUF projector answering an image.
-Image input through vLLM has no such run. These results do not certify every
-host or GPU topology.
+Image input through vLLM has no such run: it uses vLLM's native multimodal path,
+the same one Modal and Prime use, but no live Vast rental has served an image
+through it. These results do not certify every host or GPU topology. See the
+[certification matrix and run instructions](vast-certification.md).
 
 The earlier vLLM SSH refusals turned out to be Vast's sshd binding late after a
 long image pull, not a rejected key; the deploy loop waits that out with backoff.
-
-The experimental gate applies to CLI, Advanced deploy, and direct backend
-deployment before a rental is created. Opting in does not certify the runtime;
-a failed startup can still incur charges. See the
-[certification matrix and run instructions](vast-certification.md).
 
 ## Account setup
 
@@ -60,8 +54,9 @@ The effective key is resolved in this order:
 Login validates the provided key before saving it. Status verifies the effective
 key; `--local` only reports its source. Logout removes Launchpad's file without
 revoking the key or changing environment variables or the Vast CLI file. It
-reports when a key remains configured elsewhere. `doctor` reports local Vast
-configuration as optional and does not authenticate it over the network.
+reports when a key remains configured elsewhere. `doctor` checks for a local
+Vast key the way it checks Modal and Prime, and does not authenticate it over
+the network.
 The Vast CLI is not required. Deployment requires `ssh` and `ssh-keygen`.
 
 ## Browse offers
@@ -73,8 +68,8 @@ llm-launchpad offers --provider vast --gpu-type RTX_4090 --region US \
 llm-launchpad offers --provider vast --secure-only --json
 ```
 
-In the TUI, open **Settings -> Vast.ai rentals (beta)**, or use the Vast button
-on the setup-required screen. Enter and validate a key, or use an existing
+In the TUI, open **Settings -> Vast.ai rentals**, or use the Vast button on
+the setup-required screen. Enter and validate a key, or use an existing
 configured key, then refresh offers. Browsing does not rent a GPU.
 
 ## Fast Deploy
@@ -88,7 +83,7 @@ configured key.
 - Supported placements are selectable in step 2 and appear in the
   confirmation's fulfillment choices. Confirmation explains local connectivity,
   continuous billing, disk deletion, and separate transfer charges.
-- Unsupported-runtime comparisons are labeled **Vast preview**.
+- Unsupported-runtime comparisons are labeled **Vast comparison**.
   Selecting one shows cost and memory fit but cannot rent it. **a** shows all
   comparison rows.
 - An equivalent Vast placement can enter the accepted fallback list within its
@@ -199,7 +194,7 @@ memory is not calibrated for guaranteed-fit placement. The projector is staged
 on the rental exactly as it is on Prime, over the same pinned image.
 
 Model switching, custom-build runtimes, non-default llama.cpp revisions,
-suspend/resume, and persistent Vast volumes are outside this beta. vLLM can pin
+suspend/resume, and persistent Vast volumes are not supported. vLLM can pin
 a model revision. Unsupported configurations are refused in the form, before
 anything is rented.
 
@@ -258,7 +253,7 @@ Fast Deploy uses raw GPU MiB / 1024 for the GiB-based memory planner. Rental
 duration is normalized to hours and disk allocation is included in search pricing.
 [Official CLI](https://github.com/vast-ai/vast-python/blob/master/vast.py).
 
-The beta uses SSH forwarding rather than Instance Portal quick tunnels, which
+Launchpad uses SSH forwarding rather than Instance Portal quick tunnels, which
 have SSE limitations. It does not expose a public plaintext server or require a
 separate ingress account. A public HTTPS endpoint remains future work.
 [SSH connections](https://docs.vast.ai/guides/instances/connect/ssh),

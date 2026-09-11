@@ -2,7 +2,6 @@
 
 from dataclasses import replace
 import unittest
-from unittest.mock import patch
 
 from llm_launchpad.core.providers import capabilities, refuse
 from llm_launchpad.core.vast_runtime import (
@@ -41,7 +40,6 @@ def config(**overrides: object) -> DeploymentConfig:
     return replace(base, **overrides)  # type: ignore[arg-type]
 
 
-@patch.dict("os.environ", {"LLM_LAUNCHPAD_VAST_EXPERIMENTAL": "1"})
 class VastRefusalTests(unittest.TestCase):
     def test_supported_config_resolves_a_digest_pinned_image(self) -> None:
         runtime = vast_runtime(config())
@@ -188,7 +186,6 @@ class TopologyVerificationTests(unittest.TestCase):
             )
 
 
-@patch.dict("os.environ", {"LLM_LAUNCHPAD_VAST_EXPERIMENTAL": "1"})
 class VastVllmRuntimeTests(unittest.TestCase):
     def vllm(self, **overrides: object) -> DeploymentConfig:
         base = config(
@@ -226,7 +223,6 @@ class VastVllmRuntimeTests(unittest.TestCase):
         self.assertIsNotNone(refuse(config(revision="abc123")))
 
 
-@patch.dict("os.environ", {"LLM_LAUNCHPAD_VAST_EXPERIMENTAL": "1"})
 class ArchitectureFloorTests(unittest.TestCase):
     """A modern driver on an old card is still an unusable rental."""
 
@@ -260,40 +256,43 @@ class ArchitectureFloorTests(unittest.TestCase):
 
 
 
-class VastCertificationGateTests(unittest.TestCase):
-    @patch.dict("os.environ", {"LLM_LAUNCHPAD_VAST_EXPERIMENTAL": ""})
-    def test_vllm_image_input_is_the_only_path_refused_by_default(self) -> None:
+class VastProviderParityTests(unittest.TestCase):
+    """Vast refuses what a rental cannot serve, and nothing else.
+
+    No supported runtime sits behind an environment opt-in that Modal and Prime
+    do not also require, so every serving shape the provider advertises has to
+    clear the same refusal gate the other two clear.
+    """
+
+    def test_every_advertised_serving_shape_is_deployable(self) -> None:
         from llm_launchpad.protocol.enums import VisionMode
 
+        key = {"endpoint_api_key": "private-key"}
+        # llama.cpp needs a staged projector for images; vLLM serves them on its
+        # own multimodal path, so only one of these carries an artifact.
+        seen = VisionCapabilities(
+            supported=True,
+            enabled=True,
+            projector=ProjectorArtifact(
+                repo_id="acme/model-GGUF", revision="main", filename="mmproj.gguf", size_bytes=1024
+            ),
+        )
         for candidate in (
-            config(backend=BackendType.VLLM, model_name="acme/model", vision_mode=VisionMode.ON),
+            config(**key),
+            config(backend=BackendType.VLLM, model_name="acme/model", **key),
+            config(backend=BackendType.VLLM, model_name="acme/model", gpu_count=2, n_gpu=2, **key),
+            config(vision=seen, **key),
+            config(backend=BackendType.VLLM, model_name="acme/model", vision_mode=VisionMode.ON, **key),
             config(
                 backend=BackendType.VLLM,
                 model_name="acme/model",
                 vision=VisionCapabilities(supported=True, enabled=True),
+                **key,
             ),
-        ):
-            with self.subTest(vision=candidate.vision_mode):
-                self.assertIn("EXPERIMENTAL=1", refuse(candidate) or "")
-                with self.assertRaisesRegex(ValueError, "live certification"):
-                    vast_runtime_script(candidate)
-
-    @patch.dict("os.environ", {"LLM_LAUNCHPAD_VAST_EXPERIMENTAL": ""})
-    def test_live_certified_paths_need_no_opt_in(self) -> None:
-        from llm_launchpad.protocol.enums import VisionMode
-
-        # A real rental served each of these, so none needs an opt-in flag.
-        for candidate in (
-            config(),
-            config(backend=BackendType.VLLM, model_name="acme/model"),
-            config(backend=BackendType.VLLM, model_name="acme/model", gpu_count=2, n_gpu=2),
-            config(vision_mode=VisionMode.ON),
-            config(vision=VisionCapabilities(supported=True, enabled=True)),
         ):
             with self.subTest(backend=candidate.backend, vision=candidate.vision_mode):
                 self.assertIsNone(refuse(candidate))
+                self.assertTrue(vast_runtime_script(candidate))
 
-    @patch.dict("os.environ", {"LLM_LAUNCHPAD_VAST_EXPERIMENTAL": "1"})
-    def test_opt_in_preserves_normal_runtime_validation(self) -> None:
-        self.assertIsNone(refuse(config(backend=BackendType.VLLM, model_name="acme/model")))
+    def test_runtime_validation_still_refuses_what_a_rental_cannot_serve(self) -> None:
         self.assertIn("model name", refuse(config(backend=BackendType.VLLM)) or "")

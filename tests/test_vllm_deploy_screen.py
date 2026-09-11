@@ -9,7 +9,7 @@ from textual.widgets import Input, OptionList, Select, Static, Switch
 
 from llm_launchpad.core.hf_models import ModelCandidate, VllmMemoryBreakdown
 from llm_launchpad.core.modal_gpu import ModalGpuSpec
-from llm_launchpad.protocol.enums import BackendType, ComputeProvider
+from llm_launchpad.protocol.enums import BackendType, ComputeProvider, VisionMode
 from llm_launchpad.protocol.models import (
     ComputeOffer,
     OfferCostBreakdown,
@@ -1036,7 +1036,6 @@ class VllmDeployFormPolishTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(screen._rank_mode, "downloads")
             self.assertEqual(app.fetch_calls, ["downloads"])
 
-    @patch.dict("os.environ", {"LLM_LAUNCHPAD_VAST_EXPERIMENTAL": "1"})
     async def test_vast_vllm_rental_binds_its_topology_and_reaches_the_config(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:
@@ -1070,8 +1069,7 @@ class VllmDeployFormPolishTests(unittest.IsolatedAsyncioTestCase):
             # A rental bills every GPU it bundles, so sharding uses all of them.
             self.assertEqual(config.n_gpu, config.gpu_count)
 
-    @patch.dict("os.environ", {"LLM_LAUNCHPAD_VAST_EXPERIMENTAL": ""})
-    async def test_vast_vllm_image_input_requires_opt_in_before_starting_a_worker(self) -> None:
+    async def test_vast_vllm_image_input_deploys_without_an_opt_in(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:
             app.push_screen(VllmDeployScreen())
@@ -1084,11 +1082,14 @@ class VllmDeployFormPolishTests(unittest.IsolatedAsyncioTestCase):
             screen.query_one("#vision-mode", Select).value = "on"
             await pilot.pause()
             screen._do_deploy()
-            self.assertIsNone(app.deployed_config)
-            self.assertTrue(any("EXPERIMENTAL=1" in message for message, _ in app.notifications))
+            # Vast asks for no environment opt-in that Modal and Prime skip.
+            config = app.deployed_config
+            self.assertIsNotNone(config)
+            assert config is not None
+            self.assertEqual(config.vision_mode, VisionMode.ON)
+            self.assertFalse([message for message, severity in app.notifications if severity == "error"])
 
-    @patch.dict("os.environ", {"LLM_LAUNCHPAD_VAST_EXPERIMENTAL": ""})
-    async def test_vast_vllm_text_deploys_without_an_opt_in(self) -> None:
+    async def test_vast_vllm_text_deploys_normally(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:
             app.push_screen(VllmDeployScreen())

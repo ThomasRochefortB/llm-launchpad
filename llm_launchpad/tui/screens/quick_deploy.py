@@ -280,7 +280,7 @@ class QuickDeployScreen(CopyEnabledScreen):
                 yield Static("Fulfillment", classes="form-label")
                 if any(plan.quote.provider == ComputeProvider.VAST for plan in self._alternative_plans):
                     yield Static(
-                        "[yellow]Vast.ai beta uses an SSH endpoint on this computer only. "
+                        "[yellow]Vast.ai serves through an SSH endpoint on this computer only. "
                         "The rental bills continuously; Stop destroys the instance and its disk. "
                         "Hourly prices include disk; traffic costs extra.[/yellow]",
                         id="quick-vast-note",

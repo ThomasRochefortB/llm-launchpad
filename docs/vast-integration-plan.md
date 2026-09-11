@@ -1,22 +1,23 @@
 # Vast.ai integration plan
 
-Status: beta implementation with partial live certification. Real single-GPU
-and two-GPU llama.cpp rentals were exercised and destroyed; every rental in the
-recorded certification work was confirmed absent afterwards.
+Status: shipped as a compute provider alongside Modal and Prime Intellect,
+with partial live certification. Real single-GPU and two-GPU llama.cpp rentals
+were exercised and destroyed; every rental in the recorded certification work
+was confirmed absent afterwards.
 
 The implemented increments cover auth and quotes; model-aware Fast Deploy
 prices and filters; and llama.cpp (one to eight GPUs) and vLLM (one, two, four,
 or eight GPUs) runtime implementations. Advanced deploy exposes image input;
 Fast Deploy remains text-only. Live rentals certified llama.cpp text, llama.cpp
-image input, vLLM text, and two-way vLLM tensor parallelism; only image input
-through vLLM still requires the explicit `LLM_LAUNCHPAD_VAST_EXPERIMENTAL=1`
-opt-in. Implementation does not imply certification. Vast
+image input, vLLM text, and two-way vLLM tensor parallelism; image input through
+vLLM is implemented but has not been served on a live rental.
+Implementation does not imply certification. Vast
 placements now compete in serving tiers and accepted fallbacks. The lifecycle
 includes repricing, durable rental intent, create reconciliation, private SSH
 startup, health/stream verification, listing, logs, reconnect, and confirmed
 destruction. See [current behavior](vast.md).
 
-The beta's explicit scope decision is a persistent loopback SSH endpoint, usable
+The explicit scope decision is a persistent loopback SSH endpoint, usable
 on this computer only. **Launchpad Stop destroys the rental and its disk.** It
 does not implement Vast suspend/resume. This supersedes the broader lifecycle
 and public-ingress proposals below for the current increment. These differences

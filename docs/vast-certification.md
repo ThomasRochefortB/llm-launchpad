@@ -13,7 +13,7 @@ Rows marked 2026-09-10 were measured on the release configuration, after the
 | Single-GPU vLLM | 2026-09-10, RTX 3060: 876.6s cold start; unauthorized requests rejected (401, 401); structured tool call; 60s stream; confirmed destruction | Enabled |
 | vLLM tensor parallelism | 2026-09-10, two RTX 3060s: 531.1s cold start with 11641 MiB resident on both devices; 60s stream over 1563 chunks; post-cancel chat; reconnect to the same URL; confirmed destruction | Enabled for two-way; four- and eight-way are not individually certified |
 | Advanced deploy on a real rental, with llama.cpp image input | 2026-09-10, RTX 3060: the Advanced form drove a real rental; a 108.8 MB GGUF projector staged at a pinned revision; the model answered a question about an image; 97.7s deploy and warmup; confirmed destruction | Enabled |
-| vLLM image input | No live run has served an image through vLLM | Experimental opt-in required |
+| vLLM image input | No live run has served an image through vLLM | Enabled; implemented on vLLM's native multimodal path but not live-certified |
 
 The 2026-09-10 stages cost $0.050 in total, measured as reported credit before
 the first stage and after billing settled ($9.2250 to $9.1752). Each stage
@@ -80,7 +80,8 @@ renting. `scripts/validate_vast_custom_live.py` requires `--offer-id` and
 re-prices it at launch, so read a current offer immediately before running it.
 Use the normal product configuration and preserve the no-hook startup.
 
-Only `vllm` with image input still needs `LLM_LAUNCHPAD_VAST_EXPERIMENTAL=1`.
+`vllm` with image input is the one release path with no live run behind it;
+certifying it is the obvious next paid stage.
 
 ## The large-image SSH refusal was a startup race, not a rejected key
 

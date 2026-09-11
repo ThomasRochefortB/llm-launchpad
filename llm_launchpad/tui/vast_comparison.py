@@ -11,7 +11,7 @@ def vast_comparison_option(row: VastModelOffer) -> str:
     price = row.costs.total_per_hour_usd
     cost = f"~{format_money(price, decimals=3)}/hr" if price is not None else "price unknown"
     return (
-        f"  Vast preview · {cost} · {escape(row.gpu_label)} x{row.offer.gpu_count} "
+        f"  Vast comparison · {cost} · {escape(row.gpu_label)} x{row.offer.gpu_count} "
         f"[dim]{escape(row.recipe.quant or '')}[/dim]"
     )
 

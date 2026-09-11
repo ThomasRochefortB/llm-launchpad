@@ -196,7 +196,7 @@ def _model_cost_label(
                             if gpu_type in {"any", row.gpu_label})
         vast_price = comparisons[0].costs.total_per_hour_usd if comparisons else None
         if vast_price is not None and (price is None or vast_price < price):
-            return f"{_format_price(vast_price, estimate=True)} Vast preview"
+            return f"{_format_price(vast_price, estimate=True)} Vast comparison"
     if price is None:
         return "price n/a"
     if snapshot is None:
@@ -1084,7 +1084,7 @@ class FastDeployScreen(CopyEnabledScreen):
                 self._update_infra_detail(rows[0])
         if vast_rows:
             option_list.add_options([
-                Option("[bold]Vast.ai comparisons · deployment unavailable[/bold]", disabled=True),
+                Option("[bold]Vast.ai price comparisons · unsupported runtime[/bold]", disabled=True),
                 *(Option(vast_comparison_option(row), id=row.id) for row in (
                     vast_rows if self._show_all_placements else vast_rows[:3]
                 )),
