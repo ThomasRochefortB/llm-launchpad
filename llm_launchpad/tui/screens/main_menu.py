@@ -12,6 +12,7 @@ from dataclasses import replace
 import time
 from typing import Any, Literal
 
+from rich.cells import cell_len
 from rich.markup import escape
 
 from ..format import clip, format_free_tier, format_gib, format_money
@@ -848,6 +849,36 @@ def _render_provider_billing_body(
     return f"{modal_section}\n\n{prime_section}\n\n{vast_section}"
 
 
+_ActionLabels = tuple[tuple[str, str], ...]
+
+# Fullest first. `_fit_action_labels` takes the first one that fits the width
+# the option list actually receives, so a description is shortened rather than
+# wrapped onto a second line that breaks the two-column grid.
+_ACTION_LABEL_TIERS: tuple[_ActionLabels, ...] = (
+    (
+        ("deploy", "  Deploy model       Pick a model, get a live placement"),
+        ("custom-deploy", "  Advanced deploy    llama.cpp / vLLM expert form"),
+        ("manage", "  Manage             Status, logs, benchmark, stop"),
+        ("storage", "  Storage            Cached models, pre-download, delete"),
+        ("settings", "  Settings           Appearance and deploy defaults"),
+    ),
+    (
+        ("deploy", "  Deploy model       Pick a model and deploy"),
+        ("custom-deploy", "  Advanced deploy    llama.cpp / vLLM form"),
+        ("manage", "  Manage             Status, logs, stop"),
+        ("storage", "  Storage            Cached models"),
+        ("settings", "  Settings           Appearance, defaults"),
+    ),
+    (
+        ("deploy", "  Deploy model"),
+        ("custom-deploy", "  Advanced deploy"),
+        ("manage", "  Manage endpoints"),
+        ("storage", "  Storage"),
+        ("settings", "  Settings"),
+    ),
+)
+
+
 class MainMenuScreen(CopyEnabledScreen):
     """Top-level menu: deploy a model, custom deploy, manage, storage, settings."""
 
@@ -901,6 +932,8 @@ class MainMenuScreen(CopyEnabledScreen):
         self._runtime_rows_fingerprint: tuple[tuple[object, ...], ...] = ()
         self._runtime_rows_cached_at = 0.0
         self._fleet_discovery: FleetDiscovery | None = None
+        self._action_labels: _ActionLabels | None = None
+        self._action_label_ceiling = 0
 
     def compose(self) -> ComposeResult:
         with Vertical(id="main-menu-root"):
@@ -1055,28 +1088,44 @@ class MainMenuScreen(CopyEnabledScreen):
 
     def _refresh_action_labels(self, profile: ViewportProfile) -> None:
         """Use concise action records when descriptive columns no longer fit."""
+        # A compact terminal deliberately drops the description column for
+        # concise names; measurement may shorten labels further but must never
+        # talk that decision back up into a padded two-column grid.
+        self._action_label_ceiling = len(_ACTION_LABEL_TIERS) - 1 if profile.compact else 0
+        self._apply_action_labels(_ACTION_LABEL_TIERS[self._action_label_ceiling])
+        # The terminal is not the width these labels have to fit. Whenever the
+        # side column is showing, the list gets what is left of a layout capped
+        # at 126 columns -- which is how "Cached models, pre-download, delete"
+        # came to wrap, orphaning "delete" on its own line, on a 120-column
+        # terminal that the breakpoints called wide.
+        self.call_after_refresh(self._fit_action_labels)
+
+    def _fit_action_labels(self) -> None:
+        """Shorten the labels if the list is narrower than the terminal implied."""
         try:
             action_list = self.query_one("#action-list", OptionList)
         except Exception:
             return
+        available = action_list.content_size.width
+        if available <= 0:
+            return
+        for tier in _ACTION_LABEL_TIERS[self._action_label_ceiling:]:
+            if max(cell_len(label) for _option_id, label in tier) <= available:
+                self._apply_action_labels(tier)
+                return
+        self._apply_action_labels(_ACTION_LABEL_TIERS[-1])
+
+    def _apply_action_labels(self, labels: _ActionLabels) -> None:
+        """Install a label set, keeping whichever action was highlighted."""
+        try:
+            action_list = self.query_one("#action-list", OptionList)
+        except Exception:
+            return
+        if self._action_labels == labels:
+            return
         highlighted = action_list.highlighted_option
         selected_id = str(highlighted.id) if highlighted is not None else "deploy"
-        if profile.compact:
-            labels = (
-                ("deploy", "  Deploy model"),
-                ("custom-deploy", "  Advanced deploy"),
-                ("manage", "  Manage endpoints"),
-                ("storage", "  Storage"),
-                ("settings", "  Settings"),
-            )
-        else:
-            labels = (
-                ("deploy", "  Deploy model       Pick a model, get a live placement"),
-                ("custom-deploy", "  Advanced deploy    llama.cpp / vLLM expert form"),
-                ("manage", "  Manage             Status, logs, benchmark, stop"),
-                ("storage", "  Storage            Cached models, pre-download, delete"),
-                ("settings", "  Settings           Appearance and deploy defaults"),
-            )
+        self._action_labels = labels
         action_list.set_options(
             [Option(label, id=option_id) for option_id, label in labels]
         )
