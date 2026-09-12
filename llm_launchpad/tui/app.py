@@ -445,6 +445,17 @@ class TuiApp(App):
                 timeout=3,
             )
 
+    def _handle_exception(self, error: Exception) -> None:
+        """Record an unhandled exception before Textual tears the app down.
+
+        Textual renders the traceback to a terminal that is about to be
+        restored, and `run()` returns normally afterwards, so neither a
+        try/except around it nor sys.excepthook ever sees this. Without the
+        log, a crash leaves nothing behind to read.
+        """
+        log_exception(f"TUI crashed with an unhandled {type(error).__name__}")
+        super()._handle_exception(error)
+
     def on_mount(self) -> None:
         """Launch the TUI when at least one compute provider is configured.
 

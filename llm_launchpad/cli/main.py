@@ -36,7 +36,7 @@ from ..core.connection_store import (
     rows_from_connection_cache,
     save_connection,
 )
-from ..core.diagnostics import log_exception, setup_logging
+from ..core.diagnostics import log_debug, log_exception, setup_logging
 from ..core.deploy_log_summary import DeployLogSummarizer, beautify_summary_line
 from ..core.hf_models import fetch_gguf_quant_metadata
 from ..core.modal_gpu import fetch_modal_gpu_types
@@ -684,6 +684,12 @@ def tui(
     finally:
         from ..core.backend import ModalBackend
         ModalBackend.terminate_all()
+    # Textual swallows unhandled exceptions: it prints the traceback, sets a
+    # return code and lets run() return normally. Reporting success after that
+    # hides a crash from anything scripting the CLI.
+    return_code = getattr(app_instance, "return_code", None)
+    if isinstance(return_code, int) and return_code:
+        raise typer.Exit(code=return_code)
 
 
 # -----------------------------------------------------------------------
@@ -1916,6 +1922,11 @@ def main() -> None:
     setup_logging()
     if len(sys.argv) == 1:
         sys.argv.append("tui")
+    # One line per session so the log says which run a later failure belongs
+    # to, and so an empty file means "nothing failed" rather than "logging is
+    # broken". Only the subcommand is recorded: the rest of argv can carry
+    # things worth not writing down.
+    log_debug(f"llm-launchpad starting: {sys.argv[1]}")
     app()
 
 
