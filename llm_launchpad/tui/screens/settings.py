@@ -26,6 +26,8 @@ from .copy_enabled import CopyEnabledScreen
 class SettingsScreen(CopyEnabledScreen):
     """Edit and persist scaledown, appearance, and TUI behavior settings."""
 
+    AUTO_FOCUS = "#scaledown-window"
+
     BINDINGS = [
         Binding("escape", "pop_screen", "Back", show=True),
         Binding("ctrl+s", "save", "Save", show=True),
@@ -110,6 +112,10 @@ class SettingsScreen(CopyEnabledScreen):
         yield FittedFooter()
 
     def on_mount(self) -> None:
+        # Land on the first field. Textual's default auto-focus took the
+        # scrolling container instead, so the screen opened with nothing
+        # visibly focused and the first keystroke went nowhere.
+        self.query_one("#scaledown-window", Input).focus()
         # Only edits that arrive after the initial values have settled count.
         self.call_after_refresh(self._start_accepting_edits)
 

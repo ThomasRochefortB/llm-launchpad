@@ -338,18 +338,17 @@ class MonitorScreen(CopyEnabledScreen):
     def on_operation_done(self, message: OperationDone) -> None:
         self._done = True
         self._success = message.success
-        # There is no failed state in DeploymentState, so a failure keeps the
-        # state it reached and only drops the detail, which described an action
-        # that is no longer running.
         if message.success:
             self.status_header.update_from_event(
                 state=self._TERMINAL_STATES.get(
                     message.operation, DeploymentState.IDLE
                 )
             )
-        # update_from_event keeps the old detail when given an empty one, so
-        # clear it directly rather than loosening that for every caller.
-        self.status_header.detail = ""
+            # update_from_event keeps the old detail when given an empty one,
+            # so clear it directly rather than loosening that for every caller.
+            self.status_header.detail = ""
+        else:
+            self.status_header.report_failure()
         self._append_log_line("")
         if message.success:
             self._append_log_line(f"Operation complete ({message.operation.value}).")
