@@ -51,6 +51,7 @@ class SettingsScreen(CopyEnabledScreen):
         with VerticalScroll(id="settings-scroll", classes="screen-scroll"):
             with Vertical(id="settings-form"):
                 yield Static("[bold #7bf168]Settings[/]")
+                yield Button("Vast.ai rentals", id="vast-preview-btn")
                 yield Static("")
                 yield Static("[bold]Deployment[/bold]")
                 yield FormField(
@@ -118,6 +119,10 @@ class SettingsScreen(CopyEnabledScreen):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "save-btn":
             self._save()
+        elif event.button.id == "vast-preview-btn":
+            from .vast import VastPreviewScreen
+
+            self.app.push_screen(VastPreviewScreen())
 
     def on_input_changed(self, event: Input.Changed) -> None:
         self._mark_dirty()

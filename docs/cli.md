@@ -24,6 +24,10 @@ Run `uv run python scripts/generate_cli_reference.py` after changing a command.
 - [`llm-launchpad stop`](#llm-launchpad-stop)
 - [`llm-launchpad switch`](#llm-launchpad-switch)
 - [`llm-launchpad tui`](#llm-launchpad-tui)
+- [`llm-launchpad vast connect`](#llm-launchpad-vast-connect)
+- [`llm-launchpad vast-auth login`](#llm-launchpad-vast-auth-login)
+- [`llm-launchpad vast-auth logout`](#llm-launchpad-vast-auth-logout)
+- [`llm-launchpad vast-auth status`](#llm-launchpad-vast-auth-status)
 - [`llm-launchpad warmup`](#llm-launchpad-warmup)
 
 ## `llm-launchpad`
@@ -46,17 +50,19 @@ Run `uv run python scripts/generate_cli_reference.py` after changing a command.
 │ doctor             Check local prerequisites and print a fix hint for each failure.              │
 │ gpu-types          Fetch Modal GPU type values from the Modal docs page.                         │
 │ llamacpp-support   List supported llama.cpp architectures or preflight one GGUF repo.            │
-│ offers             List current Prime Intellect GPU availability and offer IDs.                  │
-│ deploy             Deploy a server to Modal or Prime Intellect.                                  │
+│ offers             List Prime availability or verified on-demand Vast rentals.                   │
+│ deploy             Deploy a server to Modal, Prime Intellect, or Vast.ai.                        │
 │ warmup             Cold start the container by probing the server.                               │
 │ list               List launchpad deployments for a compute provider.                            │
 │ status             Check endpoint readiness.                                                     │
 │ benchmark          Benchmark a deployed OpenAI-compatible backend with AIPerf.                   │
 │ logs               Show logs for a deployed backend.                                             │
-│ stop               Stop a deployed backend app.                                                  │
+│ stop               Stop a deployed backend app. Vast destroys the rental and its disk.           │
 │ switch             Switch model and optionally redeploy.                                         │
 │ opencode           OpenCode integration commands.                                                │
 │ aai-auth           Manage the stored Artificial Analysis API key.                                │
+│ vast-auth          Manage Vast.ai credentials for offer discovery.                               │
+│ vast               Manage local SSH connections to Vast rentals.                                 │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -112,7 +118,7 @@ Run `uv run python scripts/generate_cli_reference.py` after changing a command.
  Benchmark a deployed OpenAI-compatible backend with AIPerf.
 
 ╭─ Options ────────────────────────────────────────────────────────────────────────────────────────╮
-│ --provider                       <modal|prime>       Compute provider: modal or prime            │
+│ --provider                       <modal|prime|vast>  Compute provider: modal, prime, or vast     │
 │                                                      [default: modal]                            │
 │ --backend                        <llamacpp|vllm>     Backend: llamacpp or vllm                   │
 │                                                      [default: llamacpp]                         │
@@ -145,103 +151,117 @@ Run `uv run python scripts/generate_cli_reference.py` after changing a command.
 
  Usage: llm-launchpad deploy [OPTIONS]
 
- Deploy a server to Modal or Prime Intellect.
+ Deploy a server to Modal, Prime Intellect, or Vast.ai.
 
 ╭─ Options ────────────────────────────────────────────────────────────────────────────────────────╮
-│ --vision                                             <auto|on|off>       Image input: auto, on,  │
-│                                                                          or off                  │
-│                                                                          [default: auto]         │
-│ --projector-repo                                     <str>               llama.cpp projector HF  │
-│                                                                          repository override     │
-│ --projector-revision                                 <str>               llama.cpp projector HF  │
-│                                                                          revision override       │
-│ --projector-file                                     <str>               Exact llama.cpp         │
-│                                                                          projector filename      │
-│ --image-limit                                        <int range> [x>=1]  vLLM images per prompt  │
-│                                                                          [default: 1]            │
-│ --mm-processor-kwargs                                <str>               vLLM image processor    │
-│                                                                          kwargs JSON             │
-│ --provider                                           <modal|prime>       Compute provider: modal │
-│                                                                          or prime                │
-│                                                                          [default: modal]        │
-│ --backend                                            <llamacpp|vllm>     Backend: llamacpp or    │
-│                                                                          vllm                    │
-│                                                                          [default: llamacpp]     │
-│ --do-warmup                --no-do-warmup                                Verify readiness after  │
-│                                                                          deploy                  │
-│                                                                          [default: no-do-warmup] │
-│ --preset                                             <str>               llama.cpp preset name   │
-│                                                                          (Modal only)            │
-│ --repo-id                                            <str>               llama.cpp Hugging Face  │
-│                                                                          GGUF repo ID            │
-│ --quant                                              <str>               llama.cpp GGUF          │
-│                                                                          quantization            │
-│ --revision                                           <str>               llama.cpp HF revision   │
-│                                                                          (Modal only)            │
-│ --server-args                                        <str>               Additional llama-server │
-│                                                                          arguments               │
-│ --n-gpu-layers                                       <int>               llama.cpp GPU layers    │
-│                                                                          (default: auto)         │
-│ --model-name                                         <str>               vLLM MODEL_NAME         │
-│ --model-revision                                     <str>               vLLM MODEL_REVISION     │
-│ --served-model-name                                  <str>               vLLM SERVED_MODEL_NAME  │
-│ --fast-boot                --no-fast-boot                                vLLM FAST_BOOT          │
-│ --n-gpu                                              <int>               vLLM N_GPU              │
-│ --gpu-type                                           <str>               Prime GPU type filter   │
-│ --gpu-count                                          <int range> [x>=1]  Prime GPU count filter  │
-│ --prime-offer-id                                     <str>               Exact six-character     │
-│                                                                          Prime availability      │
-│                                                                          offer ID                │
-│ --prime-region                                       <str>               Prime region or country │
-│                                                                          filter                  │
-│ --prime-disk-id                                      <str>               Existing Prime disk ID  │
-│                                                                          to attach               │
-│ --prime-disk               --no-prime-disk                               Auto-attach a           │
-│                                                                          persistent Prime disk   │
-│                                                                          so model weights        │
-│                                                                          survive redeploys       │
-│                                                                          [default: prime-disk]   │
-│ --keep-failed-pod          --no-keep-failed-pod                          Keep a failed Prime pod │
-│                                                                          instead of terminating  │
-│                                                                          it                      │
-│                                                                          [default:               │
-│                                                                          no-keep-failed-pod]     │
-│ --allow-insecure-http      --no-allow-insecure-h…                        Bypass Prime Tunnel and │
-│                                                                          use a direct HTTP       │
-│                                                                          endpoint                │
-│                                                                          [default:               │
-│                                                                          no-allow-insecure-http] │
-│ --trust-remote-code        --no-trust-remote-code                        vLLM TRUST_REMOTE_CODE  │
-│                                                                          (allow model custom     │
-│                                                                          code from Hugging Face) │
-│ --reasoning-parser                                   <str>               vLLM reasoning parser   │
-│                                                                          (e.g. qwen3,            │
-│                                                                          deepseek_r1, granite)   │
-│ --tool-call-parser                                   <str>               vLLM tool call parser   │
-│                                                                          (e.g. hermes,           │
-│                                                                          qwen3_xml, llama3_json) │
-│ --default-chat-templat…                              <str>               vLLM default chat       │
-│                                                                          template kwargs JSON    │
-│                                                                          (e.g.                   │
-│                                                                          '{"enable_thinking":    │
-│                                                                          false}' or              │
-│                                                                          '{"thinking": true}')   │
-│ --instance-name                                      <str>               Instance name           │
-│                                                                          (auto-generated from    │
-│                                                                          model when omitted)     │
-│ --app-name                                           <str>               Explicit deployment     │
-│                                                                          name override           │
-│ --server-url                                         <str>               Deployed web URL        │
-│ --timeout                                            <int>               Warmup timeout seconds  │
-│                                                                          [default: 1800]         │
-│ --tail-logs                --no-tail-logs                                Tail logs during warmup │
-│                                                                          [default: tail-logs]    │
-│ --debug-logs               --summary-logs                                Show raw backend logs   │
-│                                                                          instead of the concise  │
-│                                                                          progress view           │
-│                                                                          [default: summary-logs] │
-│ --help                                                                   Show this message and   │
-│                                                                          exit.                   │
+│ --vast-offer-id                                    <str>                  Exact Vast offer to    │
+│                                                                           rent (single-GPU       │
+│                                                                           llama.cpp).            │
+│ --vast-disk-gb                                     <int range> [x>=1]     Vast disk allocation   │
+│                                                                           in GB.                 │
+│                                                                           [default: 100]         │
+│ --max-hourly-cost                                  <float range>          Maximum Vast hourly    │
+│                                                    [x>=0.001]             total including disk;  │
+│                                                                           required for Vast.     │
+│ --vision                                           <auto|on|off>          Image input: auto, on, │
+│                                                                           or off                 │
+│                                                                           [default: auto]        │
+│ --projector-repo                                   <str>                  llama.cpp projector HF │
+│                                                                           repository override    │
+│ --projector-revision                               <str>                  llama.cpp projector HF │
+│                                                                           revision override      │
+│ --projector-file                                   <str>                  Exact llama.cpp        │
+│                                                                           projector filename     │
+│ --image-limit                                      <int range> [x>=1]     vLLM images per prompt │
+│                                                                           [default: 1]           │
+│ --mm-processor-kwargs                              <str>                  vLLM image processor   │
+│                                                                           kwargs JSON            │
+│ --provider                                         <modal|prime|vast>     Compute provider:      │
+│                                                                           modal, prime, or vast  │
+│                                                                           [default: modal]       │
+│ --backend                                          <llamacpp|vllm>        Backend: llamacpp or   │
+│                                                                           vllm                   │
+│                                                                           [default: llamacpp]    │
+│ --do-warmup               --no-do-warmup                                  Verify readiness after │
+│                                                                           deploy                 │
+│                                                                           [default:              │
+│                                                                           no-do-warmup]          │
+│ --preset                                           <str>                  llama.cpp preset name  │
+│                                                                           (Modal only)           │
+│ --repo-id                                          <str>                  llama.cpp Hugging Face │
+│                                                                           GGUF repo ID           │
+│ --quant                                            <str>                  llama.cpp GGUF         │
+│                                                                           quantization           │
+│ --revision                                         <str>                  llama.cpp HF revision  │
+│                                                                           (Modal only)           │
+│ --server-args                                      <str>                  Additional             │
+│                                                                           llama-server arguments │
+│ --n-gpu-layers                                     <int>                  llama.cpp GPU layers   │
+│                                                                           (default: auto)        │
+│ --model-name                                       <str>                  vLLM MODEL_NAME        │
+│ --model-revision                                   <str>                  vLLM MODEL_REVISION    │
+│ --served-model-name                                <str>                  vLLM SERVED_MODEL_NAME │
+│ --fast-boot               --no-fast-boot                                  vLLM FAST_BOOT         │
+│ --n-gpu                                            <int>                  vLLM N_GPU             │
+│ --gpu-type                                         <str>                  Prime GPU type filter  │
+│ --gpu-count                                        <int range> [x>=1]     Prime GPU count filter │
+│ --prime-offer-id                                   <str>                  Exact six-character    │
+│                                                                           Prime availability     │
+│                                                                           offer ID               │
+│ --prime-region                                     <str>                  Prime region or        │
+│                                                                           country filter         │
+│ --prime-disk-id                                    <str>                  Existing Prime disk ID │
+│                                                                           to attach              │
+│ --prime-disk              --no-prime-disk                                 Auto-attach a          │
+│                                                                           persistent Prime disk  │
+│                                                                           so model weights       │
+│                                                                           survive redeploys      │
+│                                                                           [default: prime-disk]  │
+│ --keep-failed-pod         --no-keep-failed-pod                            Keep a failed Prime    │
+│                                                                           pod instead of         │
+│                                                                           terminating it         │
+│                                                                           [default:              │
+│                                                                           no-keep-failed-pod]    │
+│ --allow-insecure-http     --no-allow-insecure-…                           Bypass Prime Tunnel    │
+│                                                                           and use a direct HTTP  │
+│                                                                           endpoint               │
+│                                                                           [default:              │
+│                                                                           no-allow-insecure-htt… │
+│ --trust-remote-code       --no-trust-remote-co…                           vLLM TRUST_REMOTE_CODE │
+│                                                                           (allow model custom    │
+│                                                                           code from Hugging      │
+│                                                                           Face)                  │
+│ --reasoning-parser                                 <str>                  vLLM reasoning parser  │
+│                                                                           (e.g. qwen3,           │
+│                                                                           deepseek_r1, granite)  │
+│ --tool-call-parser                                 <str>                  vLLM tool call parser  │
+│                                                                           (e.g. hermes,          │
+│                                                                           qwen3_xml,             │
+│                                                                           llama3_json)           │
+│ --default-chat-templa…                             <str>                  vLLM default chat      │
+│                                                                           template kwargs JSON   │
+│                                                                           (e.g.                  │
+│                                                                           '{"enable_thinking":   │
+│                                                                           false}' or             │
+│                                                                           '{"thinking": true}')  │
+│ --instance-name                                    <str>                  Instance name          │
+│                                                                           (auto-generated from   │
+│                                                                           model when omitted)    │
+│ --app-name                                         <str>                  Explicit deployment    │
+│                                                                           name override          │
+│ --server-url                                       <str>                  Deployed web URL       │
+│ --timeout                                          <int>                  Warmup timeout seconds │
+│                                                                           [default: 1800]        │
+│ --tail-logs               --no-tail-logs                                  Tail logs during       │
+│                                                                           warmup                 │
+│                                                                           [default: tail-logs]   │
+│ --debug-logs              --summary-logs                                  Show raw backend logs  │
+│                                                                           instead of the concise │
+│                                                                           progress view          │
+│                                                                           [default:              │
+│                                                                           summary-logs]          │
+│ --help                                                                    Show this message and  │
+│                                                                           exit.                  │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -281,8 +301,8 @@ Run `uv run python scripts/generate_cli_reference.py` after changing a command.
  List launchpad deployments for a compute provider.
 
 ╭─ Options ────────────────────────────────────────────────────────────────────────────────────────╮
-│ --provider        <modal|prime>  Compute provider: modal or prime [default: modal]               │
-│ --help                           Show this message and exit.                                     │
+│ --provider        <modal|prime|vast>  Compute provider: modal, prime, or vast [default: modal]   │
+│ --help                                Show this message and exit.                                │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -313,13 +333,14 @@ Run `uv run python scripts/generate_cli_reference.py` after changing a command.
  Show logs for a deployed backend.
 
 ╭─ Options ────────────────────────────────────────────────────────────────────────────────────────╮
-│ --provider                        <modal|prime>    Compute provider: modal or prime              │
-│                                                    [default: modal]                              │
-│ --backend                         <llamacpp|vllm>  Backend: llamacpp or vllm [default: llamacpp] │
-│ --follow           --no-follow                     Follow log stream [default: follow]           │
-│ --instance-name                   <str>            Target instance name                          │
-│ --app-name                        <str>            Target deployment name                        │
-│ --help                                             Show this message and exit.                   │
+│ --provider                        <modal|prime|vast>  Compute provider: modal, prime, or vast    │
+│                                                       [default: modal]                           │
+│ --backend                         <llamacpp|vllm>     Backend: llamacpp or vllm                  │
+│                                                       [default: llamacpp]                        │
+│ --follow           --no-follow                        Follow log stream [default: follow]        │
+│ --instance-name                   <str>               Target instance name                       │
+│ --app-name                        <str>               Target deployment name                     │
+│ --help                                                Show this message and exit.                │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -329,20 +350,30 @@ Run `uv run python scripts/generate_cli_reference.py` after changing a command.
 
  Usage: llm-launchpad offers [OPTIONS]
 
- List current Prime Intellect GPU availability and offer IDs.
+ List Prime availability or verified on-demand Vast rentals.
 
 ╭─ Options ────────────────────────────────────────────────────────────────────────────────────────╮
-│ --gpu-type                                 <str>               GPU type filter                   │
-│ --gpu-count                                <int range> [x>=1]  GPU count filter                  │
-│ --region                                   <str>               Region or country filter          │
-│ --disk-id                                  <str>               Only offers compatible with a     │
-│                                                                Prime disk                        │
-│ --secure-only       --no-secure-only                           Show only secure-cloud offers     │
-│                                                                [default: secure-only]            │
-│ --on-demand-only    --no-on-demand-only                        Hide spot offers                  │
-│                                                                [default: on-demand-only]         │
-│ --json                                                         Print machine-readable JSON       │
-│ --help                                                         Show this message and exit.       │
+│ --gpu-type                                  <str>                    GPU type filter             │
+│ --gpu-count                                 <int range> [x>=1]       GPU count filter            │
+│ --region                                    <str>                    Region or country filter    │
+│ --disk-id                                   <str>                    Only offers compatible with │
+│                                                                      a Prime disk                │
+│ --secure-only        --no-secure-only                                Datacenter offers only.     │
+│                                                                      Default: on for Prime, off  │
+│                                                                      for Vast.                   │
+│ --on-demand-only     --no-on-demand-only                             Hide spot offers            │
+│                                                                      [default: on-demand-only]   │
+│ --json                                                               Print machine-readable JSON │
+│ --provider                                  <prime|vast>             Marketplace: prime or vast. │
+│                                                                      [default: prime]            │
+│ --disk-gb                                   <int range> [x>=1]       Vast disk allocation for    │
+│                                                                      pricing in GiB (default     │
+│                                                                      100).                       │
+│ --min-reliability                           <float range> [0<=x<=1]  Vast minimum reliability    │
+│                                                                      score (default 0.99).       │
+│ --limit                                     <int range> [1<=x<=500]  Vast maximum search results │
+│                                                                      (default 100).              │
+│ --help                                                               Show this message and exit. │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -355,15 +386,15 @@ Run `uv run python scripts/generate_cli_reference.py` after changing a command.
  Sync Launchpad-managed deployments into OpenCode config.
 
 ╭─ Options ────────────────────────────────────────────────────────────────────────────────────────╮
-│ --provider                         <modal|prime>    Limit to modal or prime. Default: every      │
-│                                                     connected compute provider.                  │
-│ --backend                          <llamacpp|vllm>  Backend: llamacpp or vllm                    │
-│ --instance-name                    <str>            Target instance name                         │
-│ --app-name                         <str>            Target deployment name                       │
-│ --dry-run          --no-dry-run                     Print the intended sync changes without      │
-│                                                     writing files                                │
-│                                                     [default: no-dry-run]                        │
-│ --help                                              Show this message and exit.                  │
+│ --provider                         <modal|prime|vast>  Limit to modal, prime, or vast. Default:  │
+│                                                        every connected compute provider.         │
+│ --backend                          <llamacpp|vllm>     Backend: llamacpp or vllm                 │
+│ --instance-name                    <str>               Target instance name                      │
+│ --app-name                         <str>               Target deployment name                    │
+│ --dry-run          --no-dry-run                        Print the intended sync changes without   │
+│                                                        writing files                             │
+│                                                        [default: no-dry-run]                     │
+│ --help                                                 Show this message and exit.               │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -376,15 +407,16 @@ Run `uv run python scripts/generate_cli_reference.py` after changing a command.
  Check endpoint readiness.
 
 ╭─ Options ────────────────────────────────────────────────────────────────────────────────────────╮
-│ --provider                 <modal|prime>    Compute provider: modal or prime [default: modal]    │
-│ --backend                  <llamacpp|vllm>  Backend: llamacpp or vllm [default: llamacpp]        │
-│ --server-url               <str>            Deployed web URL                                     │
-│ --served-model-name        <str>            Served model name for llama.cpp probes               │
-│ --function-slug            <str>            Modal function slug suffix used in endpoint URL      │
-│ --timeout                  <int>            Timeout seconds [default: 60]                        │
-│ --instance-name            <str>            Target instance name                                 │
-│ --app-name                 <str>            Target deployment name                               │
-│ --help                                      Show this message and exit.                          │
+│ --provider                 <modal|prime|vast>  Compute provider: modal, prime, or vast           │
+│                                                [default: modal]                                  │
+│ --backend                  <llamacpp|vllm>     Backend: llamacpp or vllm [default: llamacpp]     │
+│ --server-url               <str>               Deployed web URL                                  │
+│ --served-model-name        <str>               Served model name for llama.cpp probes            │
+│ --function-slug            <str>               Modal function slug suffix used in endpoint URL   │
+│ --timeout                  <int>               Timeout seconds [default: 60]                     │
+│ --instance-name            <str>               Target instance name                              │
+│ --app-name                 <str>               Target deployment name                            │
+│ --help                                         Show this message and exit.                       │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -394,15 +426,16 @@ Run `uv run python scripts/generate_cli_reference.py` after changing a command.
 
  Usage: llm-launchpad stop [OPTIONS]
 
- Stop a deployed backend app.
+ Stop a deployed backend app. Vast destroys the rental and its disk.
 
 ╭─ Options ────────────────────────────────────────────────────────────────────────────────────────╮
-│ --provider             <modal|prime>    Compute provider: modal or prime [default: modal]        │
-│ --backend              <llamacpp|vllm>  Backend: llamacpp or vllm [default: llamacpp]            │
-│ --yes                                   Skip confirmation                                        │
-│ --instance-name        <str>            Target instance name                                     │
-│ --app-name             <str>            Target deployment name                                   │
-│ --help                                  Show this message and exit.                              │
+│ --provider             <modal|prime|vast>  Compute provider: modal, prime, or vast               │
+│                                            [default: modal]                                      │
+│ --backend              <llamacpp|vllm>     Backend: llamacpp or vllm [default: llamacpp]         │
+│ --yes                                      Skip confirmation                                     │
+│ --instance-name        <str>               Target instance name                                  │
+│ --app-name             <str>               Target deployment name                                │
+│ --help                                     Show this message and exit.                           │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -428,8 +461,8 @@ Run `uv run python scripts/generate_cli_reference.py` after changing a command.
 │                                                                          [default: 1]            │
 │ --mm-processor-kwargs                                <str>               vLLM image processor    │
 │                                                                          kwargs JSON             │
-│ --provider                                           <modal|prime>       Compute provider: modal │
-│                                                                          or prime                │
+│ --provider                                           <modal|prime|vast>  Compute provider:       │
+│                                                                          modal, prime, or vast   │
 │                                                                          [default: modal]        │
 │ --backend                                            <llamacpp|vllm>     Backend: llamacpp or    │
 │                                                                          vllm                    │
@@ -517,6 +550,63 @@ Run `uv run python scripts/generate_cli_reference.py` after changing a command.
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
+## `llm-launchpad vast connect`
+
+```text
+
+ Usage: llm-launchpad vast connect [OPTIONS] {instance_id}
+
+ Reconnect a Launchpad rental's local SSH endpoint and test streaming.
+
+╭─ Arguments ──────────────────────────────────────────────────────────────────────────────────────╮
+│ *    instance_id      <str>  [required]                                                          │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭─ Options ────────────────────────────────────────────────────────────────────────────────────────╮
+│ --help          Show this message and exit.                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+```
+
+## `llm-launchpad vast-auth login`
+
+```text
+
+ Usage: llm-launchpad vast-auth login [OPTIONS]
+
+ Validate and store a Vast API key; prompt with hidden input by default.
+
+╭─ Options ────────────────────────────────────────────────────────────────────────────────────────╮
+│ --key-stdin          Read the key from standard input.                                           │
+│ --help               Show this message and exit.                                                 │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+```
+
+## `llm-launchpad vast-auth logout`
+
+```text
+
+ Usage: llm-launchpad vast-auth logout [OPTIONS]
+
+ Remove Launchpad's saved key; do not revoke or change other credentials.
+
+╭─ Options ────────────────────────────────────────────────────────────────────────────────────────╮
+│ --help          Show this message and exit.                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+```
+
+## `llm-launchpad vast-auth status`
+
+```text
+
+ Usage: llm-launchpad vast-auth status [OPTIONS]
+
+ Show the effective key source, verifying it unless --local is given.
+
+╭─ Options ────────────────────────────────────────────────────────────────────────────────────────╮
+│ --local          Show credential source without contacting Vast.                                 │
+│ --help           Show this message and exit.                                                     │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+```
+
 ## `llm-launchpad warmup`
 
 ```text
@@ -526,25 +616,26 @@ Run `uv run python scripts/generate_cli_reference.py` after changing a command.
  Cold start the container by probing the server.
 
 ╭─ Options ────────────────────────────────────────────────────────────────────────────────────────╮
-│ --provider                                <modal|prime>    Compute provider: modal or prime      │
-│                                                            [default: modal]                      │
-│ --backend                                 <llamacpp|vllm>  Backend: llamacpp or vllm             │
-│                                                            [default: llamacpp]                   │
-│ --image-test           --no-image-test                     Explicitly verify an image request    │
-│                                                            [default: no-image-test]              │
-│ --server-url                              <str>            Deployed web URL                      │
-│ --served-model-name                       <str>            Served model name for llama.cpp       │
-│                                                            probes                                │
-│ --function-slug                           <str>            Modal function slug suffix used in    │
-│                                                            endpoint URL                          │
-│ --timeout                                 <int>            Seconds to wait [default: 1800]       │
-│ --tail-logs            --no-tail-logs                      Tail logs during warmup               │
-│                                                            [default: tail-logs]                  │
-│ --debug-logs           --summary-logs                      Show raw backend logs instead of the  │
-│                                                            concise progress view                 │
-│                                                            [default: summary-logs]               │
-│ --instance-name                           <str>            Target instance name                  │
-│ --app-name                                <str>            Target deployment name                │
-│ --help                                                     Show this message and exit.           │
+│ --provider                                <modal|prime|vast>  Compute provider: modal, prime, or │
+│                                                               vast                               │
+│                                                               [default: modal]                   │
+│ --backend                                 <llamacpp|vllm>     Backend: llamacpp or vllm          │
+│                                                               [default: llamacpp]                │
+│ --image-test           --no-image-test                        Explicitly verify an image request │
+│                                                               [default: no-image-test]           │
+│ --server-url                              <str>               Deployed web URL                   │
+│ --served-model-name                       <str>               Served model name for llama.cpp    │
+│                                                               probes                             │
+│ --function-slug                           <str>               Modal function slug suffix used in │
+│                                                               endpoint URL                       │
+│ --timeout                                 <int>               Seconds to wait [default: 1800]    │
+│ --tail-logs            --no-tail-logs                         Tail logs during warmup            │
+│                                                               [default: tail-logs]               │
+│ --debug-logs           --summary-logs                         Show raw backend logs instead of   │
+│                                                               the concise progress view          │
+│                                                               [default: summary-logs]            │
+│ --instance-name                           <str>               Target instance name               │
+│ --app-name                                <str>               Target deployment name             │
+│ --help                                                        Show this message and exit.        │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```

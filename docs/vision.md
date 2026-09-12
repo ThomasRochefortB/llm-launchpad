@@ -1,7 +1,7 @@
 # Image input (vision)
 
 LLM-Launchpad enables image input automatically for models that prove they
-support it, on both backends and both providers. Image input means images in,
+support it, on both backends and every provider. Image input means images in,
 text out; audio, video, and image generation are out of scope.
 
 ## Modes
@@ -86,7 +86,7 @@ quantization lists shown in the model pickers.
 
 ## vLLM
 
-Both providers serve vLLM `v0.19.1`. Image requests use vLLM's native
+Every provider serves vLLM `v0.19.1`. Image requests use vLLM's native
 multimodal path, controlled by two vLLM-specific options:
 
 - `--image-limit` — maximum images per prompt (default `1`).

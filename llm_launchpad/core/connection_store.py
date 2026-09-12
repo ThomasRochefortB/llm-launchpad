@@ -121,7 +121,10 @@ def merge_connections(
         url_conflict = bool(row_url and cached_url and row_url != cached_url)
         if not resource_conflict and not url_conflict:
             row.vision = row.vision or vision_from_dict(cached.get("vision"))
-        row.web_url = row.web_url or str(cached.get("base_url") or "").removesuffix("/v1")
+        # A missing Vast URL means its local SSH tunnel is disconnected. A
+        # cached listener address cannot establish that the tunnel is alive.
+        if row.provider != ComputeProvider.VAST:
+            row.web_url = row.web_url or str(cached.get("base_url") or "").removesuffix("/v1")
         row.served_model_name = row.served_model_name or str(cached.get("model_id") or "") or None
         row.display_name = row.display_name or str(cached.get("display_name") or "") or None
         row.model_name = row.model_name or str(cached.get("model_name") or "") or None

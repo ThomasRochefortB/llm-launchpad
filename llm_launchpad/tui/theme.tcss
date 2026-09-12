@@ -504,6 +504,49 @@ VllmDeployScreen .gpu-config-panel {
     background: $surface-lighten-1;
 }
 
+/* Section headings are separated from the field that follows them; bare
+   label+control pairs otherwise collide with their neighbours because only
+   FormField/ToggleField carry bottom padding. */
+.form-group-heading {
+    color: $text;
+    text-style: bold;
+    height: auto;
+    text-wrap: wrap;
+    padding: 1 0 1 0;
+}
+
+#vllm-vram-status {
+    height: auto;
+    text-wrap: wrap;
+    padding: 0 0 1 0;
+}
+
+VisionOptions Select {
+    margin-bottom: 1;
+}
+
+/* Offer status lines wrap to two rows on a narrow terminal; without a gap the
+   second row butts against the GPU panel below. */
+#prime-offer-status-llama,
+#prime-offer-status,
+#vast-offer-status-llama,
+#vast-offer-status-vllm {
+    height: auto;
+    text-wrap: wrap;
+    padding: 0 0 1 0;
+}
+
+/* A provider offer dictates these, so they must read as reported values
+   rather than as fields that merely happen to be filled in. */
+LlamaCppDeployScreen Input:disabled,
+VllmDeployScreen Input:disabled,
+LlamaCppDeployScreen Select:disabled > SelectCurrent,
+VllmDeployScreen Select:disabled > SelectCurrent {
+    border: tall $panel;
+    color: $text-muted;
+    background: $surface;
+}
+
 /* ---- Monitor screen ---- */
 
 #monitor-layout {
@@ -639,6 +682,12 @@ VllmDeployScreen .gpu-config-panel {
     layout: vertical;
 }
 
+/* One action per authenticable provider, plus re-check and quit, has to fit a
+   standard 80-column terminal before the compact rule stacks them. */
+#setup-required-actions Button {
+    min-width: 14;
+}
+
 #settings-scroll {
     align: center middle;
 }
@@ -699,7 +748,7 @@ VllmDeployScreen .gpu-config-panel {
 }
 
 .gpu-config-tensor-field {
-    padding: 0;
+    padding: 0 0 1 0;
 }
 
 /* ---- Utility classes ---- */

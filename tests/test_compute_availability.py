@@ -76,6 +76,16 @@ def _prime_offer(
 
 
 class ComputeAvailabilityTests(unittest.TestCase):
+    def setUp(self) -> None:
+        from llm_launchpad.core.vast_auth import VastCredentials
+
+        patcher = patch(
+            "llm_launchpad.core.compute_availability.resolve_vast_credentials",
+            return_value=VastCredentials(),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_load_records_authenticated_provider_when_fetch_fails(self) -> None:
         with patch(
             "llm_launchpad.core.compute_availability.resolve_modal_cli_path",

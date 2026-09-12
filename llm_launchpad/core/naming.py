@@ -82,8 +82,8 @@ def build_deployment_name(
     instance_name: str | None,
 ) -> str:
     """Compose a provider-safe deployment resource name."""
-    if provider == ComputeProvider.PRIME:
-        return f"llp-prime-{_BACKEND_PREFIX[backend]}-{slugify_instance_name(instance_name or 'default')}"
+    if provider in {ComputeProvider.PRIME, ComputeProvider.VAST}:
+        return f"llp-{provider.value}-{_BACKEND_PREFIX[backend]}-{slugify_instance_name(instance_name or 'default')}"
     return build_app_name(backend, instance_name)
 
 
@@ -94,6 +94,8 @@ def infer_provider_from_app_name(app_name: str) -> ComputeProvider | None:
         return None
     if name.startswith("llp-prime-"):
         return ComputeProvider.PRIME
+    if name.startswith("llp-vast-"):
+        return ComputeProvider.VAST
     if infer_backend_from_app_name(name) is not None:
         return ComputeProvider.MODAL
     return None
@@ -105,12 +107,14 @@ def infer_backend_from_app_name(app_name: str) -> BackendType | None:
         app_name == _LEGACY_APP_NAMES[BackendType.VLLM]
         or app_name.startswith("vllm-")
         or app_name.startswith("llp-prime-vllm-")
+        or app_name.startswith("llp-vast-vllm-")
     ):
         return BackendType.VLLM
     if (
         app_name == _LEGACY_APP_NAMES[BackendType.LLAMACPP]
         or app_name.startswith("llamacpp-")
         or app_name.startswith("llp-prime-llamacpp-")
+        or app_name.startswith("llp-vast-llamacpp-")
     ):
         return BackendType.LLAMACPP
     return None
@@ -126,6 +130,9 @@ def infer_instance_from_app_name(app_name: str, backend: BackendType | None) -> 
     prime_prefix = f"llp-prime-{_BACKEND_PREFIX[backend]}-"
     if app_name.startswith(prime_prefix):
         return app_name[len(prime_prefix) :] or "default"
+    vast_prefix = f"llp-vast-{_BACKEND_PREFIX[backend]}-"
+    if app_name.startswith(vast_prefix):
+        return app_name[len(vast_prefix) :] or "default"
     prefix = _BACKEND_PREFIX[backend] + "-"
     if app_name.startswith(prefix):
         return app_name[len(prefix) :] or "default"

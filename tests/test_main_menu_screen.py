@@ -21,6 +21,7 @@ from llm_launchpad.tui.screens.main_menu import (
     _render_prime_billing_load_error,
     _render_prime_billing_report,
     _render_provider_billing_body,
+    _render_vast_billing_report,
     _should_show_in_panel,
 )
 from llm_launchpad.core.hf_auth import HuggingFaceAuthStatus
@@ -240,6 +241,51 @@ class MainMenuStatusRenderTests(unittest.TestCase):
             str(render_markup(rendered)).splitlines()[-1],
             "denied [bold]401[/bold]",
         )
+
+    def test_vast_credit_is_reported_beside_modal_and_prime(self) -> None:
+        """Vast bills against credit, so the panel that names every provider's
+        spend had no business omitting the one that runs out."""
+        body = _render_provider_billing_body(
+            modal_payload={"summary": {"total_usd": 12.5}},
+            modal_error=None,
+            prime_state="loaded",
+            prime_payload={"balance_usd": 3},
+            prime_error=None,
+            vast_state="loaded",
+            vast_payload={"credit_usd": 8.13, "balance_usd": 0.0, "available_usd": 8.13},
+        )
+        self.assertIn("Workspace Spend", body)
+        self.assertIn("Prime Intellect Wallet", body)
+        self.assertIn("Vast.ai Credit", body)
+        self.assertIn("[bold]$8.13[/bold]", body)
+
+    def test_an_unconfigured_vast_key_names_the_command(self) -> None:
+        body = _render_provider_billing_body(
+            modal_payload=None, modal_error=None,
+            prime_state="loading", prime_payload=None, prime_error=None,
+            vast_state="unavailable",
+        )
+        self.assertIn("llm-launchpad vast-auth login", body)
+
+    def test_a_failed_vast_read_shows_its_reason(self) -> None:
+        body = _render_provider_billing_body(
+            modal_payload=None, modal_error=None,
+            prime_state="loading", prime_payload=None, prime_error=None,
+            vast_state="failed", vast_error="Vast request failed (HTTP 429).",
+        )
+        self.assertIn("Credit unavailable.", body)
+        self.assertIn("HTTP 429", body)
+
+    def test_an_owed_balance_is_called_out(self) -> None:
+        rendered = _render_vast_billing_report(
+            {"credit_usd": 0.0, "balance_usd": -4.25, "available_usd": -4.25}
+        )
+        self.assertIn("owed $4.25", rendered)
+
+    def test_a_malformed_credit_payload_does_not_raise(self) -> None:
+        for payload in (None, {}, {"available_usd": None}, "nonsense"):
+            with self.subTest(payload=payload):
+                self.assertIn("Vast.ai Credit", _render_vast_billing_report(payload))
 
     def test_provider_billing_body_combines_modal_and_prime_sections(self) -> None:
         body = _render_provider_billing_body(

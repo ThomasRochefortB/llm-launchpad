@@ -331,6 +331,62 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
+    async def test_the_billing_warning_follows_the_selected_provider(self) -> None:
+        """The Vast caution described the menu, not the plan being deployed.
+
+        A fulfillment list containing any Vast option told someone deploying to
+        Modal that their endpoint would be local and bill continuously.
+        """
+        from llm_launchpad.protocol.models import VastProviderOptions
+
+        profile = get_quick_deploy_profile("qwen35-397b-rtxpro")
+        recipe = quick_deploy_recipe(profile)
+        modal_plan = InferencePlan(
+            recipe=recipe,
+            quote=ProviderQuote(
+                id="modal:compute:h100", recipe_id=recipe.id,
+                provider=ComputeProvider.MODAL, provider_reference="H100",
+                gpu_type="H100", gpu_count=4, price_per_hour_usd=15.8,
+                billing_model=BillingModel.SCALE_TO_ZERO, is_estimate=True,
+                provider_options=ModalProviderOptions(),
+            ),
+            estimated_monthly_cost_usd=948.0,
+        )
+        vast_plan = InferencePlan(
+            recipe=recipe,
+            quote=ProviderQuote(
+                id="vast:deploy:1001", recipe_id=recipe.id,
+                provider=ComputeProvider.VAST, provider_reference="1001",
+                gpu_type="RTX 4090", gpu_count=1, price_per_hour_usd=0.42,
+                billing_model=BillingModel.PROVISIONED, is_estimate=True,
+                provider_options=VastProviderOptions("1001", 100, 0.42, "42", 1),
+            ),
+            estimated_monthly_cost_usd=302.4,
+        )
+
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(QuickDeployScreen(
+                profile_id=modal_plan, alternative_plans=(modal_plan, vast_plan),
+            ))
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, QuickDeployScreen)
+            note = screen.query_one("#quick-vast-note", Static)
+
+            # Modal is selected, so the Vast billing shape must not be claimed.
+            self.assertFalse(note.display)
+            self.assertEqual(str(note.content), "")
+
+            screen.query_one("#quick-fulfillment", Select).value = vast_plan.quote.id
+            await pilot.pause()
+            self.assertTrue(note.display)
+            self.assertIn("SSH endpoint on this computer only", str(note.content))
+
+            screen.query_one("#quick-fulfillment", Select).value = modal_plan.quote.id
+            await pilot.pause()
+            self.assertFalse(note.display)
+
     async def test_compute_flow_can_change_fulfillment_during_review(self) -> None:
         profile = get_quick_deploy_profile("qwen35-397b-rtxpro")
         recipe = quick_deploy_recipe(profile)

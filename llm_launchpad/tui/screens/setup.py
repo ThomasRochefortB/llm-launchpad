@@ -11,6 +11,7 @@ from .copy_enabled import CopyEnabledScreen
 
 _MODAL_COMMAND = "modal setup"
 _PRIME_COMMAND = "prime login"
+_VAST_COMMAND = "llm-launchpad vast-auth login"
 
 
 class SetupRequiredScreen(CopyEnabledScreen):
@@ -43,15 +44,23 @@ class SetupRequiredScreen(CopyEnabledScreen):
                     classes="setup-option",
                 )
                 yield Static(
+                    "[bold]Option 3 · Vast.ai[/bold]\n"
+                    "[dim]Save a marketplace API key, here or in your terminal:[/dim]\n"
+                    f"  {_VAST_COMMAND}",
+                    classes="setup-option",
+                )
+                yield Static(
                     "[dim]Authenticate in another terminal, then press "
                     "[bold]r[/bold] to re-check. Quit with esc.[/dim]",
                     id="setup-required-hint",
                 )
                 yield Static("", id="setup-required-feedback")
+                yield Button("Set up Vast.ai key", id="setup-vast-preview-btn")
                 with Horizontal(id="setup-required-actions"):
                     yield Button("Re-check", id="setup-recheck-btn", variant="primary")
-                    yield Button("Copy modal setup", id="setup-copy-modal-btn")
-                    yield Button("Copy prime login", id="setup-copy-prime-btn")
+                    yield Button("Copy modal", id="setup-copy-modal-btn")
+                    yield Button("Copy prime", id="setup-copy-prime-btn")
+                    yield Button("Copy vast", id="setup-copy-vast-btn")
                     yield Button("Quit", id="setup-quit-btn", variant="error")
         yield Footer()
 
@@ -65,8 +74,14 @@ class SetupRequiredScreen(CopyEnabledScreen):
             self._copy_command(_MODAL_COMMAND)
         elif event.button.id == "setup-copy-prime-btn":
             self._copy_command(_PRIME_COMMAND)
+        elif event.button.id == "setup-copy-vast-btn":
+            self._copy_command(_VAST_COMMAND)
         elif event.button.id == "setup-quit-btn":
             await self.action_quit_app()
+        elif event.button.id == "setup-vast-preview-btn":
+            from .vast import VastPreviewScreen
+
+            self.app.push_screen(VastPreviewScreen())
 
     def _copy_command(self, command: str) -> None:
         self.app.copy_to_clipboard(command)
@@ -82,7 +97,8 @@ class SetupRequiredScreen(CopyEnabledScreen):
             return
         self.query_one("#setup-required-feedback", Static).update(
             "[yellow]Still no authenticated provider.[/yellow] "
-            f"Run {_MODAL_COMMAND} or {_PRIME_COMMAND}, then re-check."
+            f"Run {_MODAL_COMMAND}, {_PRIME_COMMAND}, or {_VAST_COMMAND}, "
+            "then re-check."
         )
 
     async def action_quit_app(self) -> None:

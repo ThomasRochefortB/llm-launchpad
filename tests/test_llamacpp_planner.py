@@ -13,6 +13,7 @@ from llm_launchpad.core.llamacpp_planner import (
     compile_server_args,
     estimate_memory,
     load_runtime_attestation,
+    predict_performance,
     save_runtime_attestation,
     QUANTIZED_KV_ARCHITECTURES,
     default_cache_type,
@@ -324,3 +325,38 @@ class KvCacheTypeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TopologyEstimateTests(unittest.TestCase):
+    """A second GPU buys memory, not decode speed, under layer split."""
+
+    def _single_stream_tps(self, gpu_count: int) -> float:
+        points = predict_performance(
+            weights_gb=40.0,
+            gpu_type="RTX 4090",
+            gpu_count=gpu_count,
+            tuning=RuntimeTuning(parallel_slots=1),
+            price_per_hour_usd=1.0,
+        )
+        return next(point.output_tokens_per_second for point in points if point.concurrency == 1)
+
+    def test_layer_split_topology_does_not_inflate_single_stream_speed(self) -> None:
+        single = self._single_stream_tps(1)
+        for count in (2, 4, 8):
+            self.assertEqual(
+                self._single_stream_tps(count),
+                single,
+                f"{count} GPUs must not predict faster single-stream decode",
+            )
+
+    def test_estimates_are_never_marked_measured(self) -> None:
+        points = predict_performance(
+            weights_gb=10.0,
+            gpu_type="RTX 4090",
+            gpu_count=4,
+            tuning=RuntimeTuning(parallel_slots=4),
+            price_per_hour_usd=2.0,
+        )
+        self.assertTrue(points)
+        self.assertFalse(any(point.measured for point in points))
+

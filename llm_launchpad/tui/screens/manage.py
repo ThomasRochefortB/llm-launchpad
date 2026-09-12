@@ -12,7 +12,7 @@ from textual.widgets.option_list import Option
 
 from ...core.benchmark import parse_concurrency_values
 from ...core.vision_probe import image_test_command
-from ...protocol.enums import VisionVerification
+from ...protocol.enums import ComputeProvider, VisionVerification
 from ...protocol.models import EndpointInfo, VisionCapabilities
 from ..connection import endpoint_connection_payload, resolve_openai_base_url
 from ..navigation import move_focus_across_widgets
@@ -90,7 +90,7 @@ def _available_actions(row: EndpointInfo) -> frozenset[str]:
     state = _normalized_state(row.state)
     if state in _READY_STATES or bool((row.web_url or "").strip()):
         actions.update(("status", "benchmark", "connection"))
-    if _is_stoppable_state(state):
+    if _is_stoppable_state(state) or row.provider == ComputeProvider.VAST:
         actions.add("stop")
     return frozenset(actions)
 
@@ -827,12 +827,19 @@ class StopConfirmScreen(CopyEnabledScreen):
                 f"{escape(self.endpoint.app_id or self.endpoint.name)}[/dim]"
             )
             yield Static(
-                "[yellow]This will terminate the selected deployment.[/yellow]",
+                (
+                    "[yellow]This destroys the Vast.ai rental and permanently deletes its disk and model cache.[/yellow]"
+                    if self.endpoint.provider == ComputeProvider.VAST
+                    else "[yellow]This will terminate the selected deployment.[/yellow]"
+                ),
                 id="stop-warning",
             )
             with Horizontal(id="stop-confirm-actions"):
                 yield Button("Cancel", id="stop-cancel")
-                yield Button("Stop endpoint", id="stop-confirm", variant="error")
+                yield Button(
+                    "Destroy rental and disk" if self.endpoint.provider == ComputeProvider.VAST else "Stop endpoint",
+                    id="stop-confirm", variant="error",
+                )
         yield Footer()
 
     def on_mount(self) -> None:

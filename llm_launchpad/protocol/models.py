@@ -35,7 +35,21 @@ class PrimeProviderOptions:
     auto_disk: bool = True
 
 
-ProviderOptions = ModalProviderOptions | PrimeProviderOptions
+@dataclass(frozen=True)
+class VastProviderOptions:
+    """Selected on-demand rental and the maximum approved hourly total."""
+
+    offer_id: str
+    disk_gb: int
+    max_hourly_cost_usd: float
+    machine_id: str | None = None
+    # None means the offer's own count is authoritative, which is what the CLI
+    # can promise without a lookup. An integer is a shape the user approved,
+    # and a rental that no longer matches it is refused like a price increase.
+    gpu_count: int | None = None
+
+
+ProviderOptions = ModalProviderOptions | PrimeProviderOptions | VastProviderOptions
 
 
 @dataclass
@@ -494,6 +508,8 @@ class ComputeAvailabilitySnapshot:
     configurations: tuple[ComputeConfiguration, ...]
     errors: tuple[str, ...] = ()
     providers: tuple[ComputeProvider, ...] | None = None
+    vast_offers: tuple[VastOffer, ...] = ()
+    vast_configured: bool = False
 
 
 @dataclass
@@ -567,6 +583,122 @@ class ComputeOffer:
     memory_default_gb: int | None = None
     images: tuple[str, ...] = ()
     raw: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class VastAuthStatus:
+    """Account validation result; configured credentials alone are not auth."""
+
+    authenticated: bool
+    source: str = "none"
+    account_id: str | None = None
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class VastOfferQuery:
+    """Constraints for read-only discovery of verified on-demand rentals."""
+
+    gpu_type: str | None = None
+    # None discovers topologies with one through eight GPUs for Fast Deploy.
+    gpu_count: int | None = 1
+    country: str | None = None
+    disk_gb: int = 100
+    min_reliability: float = 0.99
+    datacenter_only: bool = False
+    limit: int = 100
+
+
+@dataclass(frozen=True)
+class OfferCostBreakdown:
+    """Provider-quoted hourly and transfer prices; missing is not free."""
+
+    compute_per_hour_usd: float | None = None
+    disk_per_hour_usd: float | None = None
+    total_per_hour_usd: float | None = None
+    download_per_gb_usd: float | None = None
+    upload_per_gb_usd: float | None = None
+
+
+@dataclass(frozen=True)
+class VastOffer:
+    """Normalized marketplace rental; not a certified inference placement."""
+
+    id: str
+    machine_id: str
+    gpu_type: str
+    gpu_count: int
+    gpu_memory_gb: float
+    reliability: float
+    disk_gb: int
+    costs: OfferCostBreakdown
+    location: str = ""
+    datacenter: bool = False
+    cpu_memory_gb: float | None = None
+    max_duration_hours: float | None = None
+    disk_capacity_gb: float | None = None
+    cuda_max_good: float | None = None
+    # A modern driver on an old card still cannot run a modern CUDA build:
+    # CUDA 13 dropped Maxwell, Pascal and Volta.
+    compute_capability: float | None = None
+    # Pulling a multi-gigabyte runtime image is often the slowest part of a
+    # rental's startup, and marketplace links vary by an order of magnitude.
+    inet_down_mbps: float | None = None
+
+    @property
+    def gpu_memory_gib(self) -> float:
+        """Convert Vast CLI display units back to MiB, then to planner GiB."""
+        return self.gpu_memory_gb * 1000 / 1024
+
+
+@dataclass(frozen=True)
+class VastModelOffer:
+    """Model-sized rental comparison, deliberately separate from deployable plans."""
+
+    id: str
+    recipe: InferenceRecipe
+    offer: VastOffer
+    gpu_label: str
+    disk_gb: int
+    costs: OfferCostBreakdown
+    assessment: PlacementAssessment
+
+
+@dataclass(frozen=True)
+class VastInstance:
+    """Non-secret instance identity and SSH connection metadata."""
+
+    id: str
+    label: str
+    state: str
+    machine_id: str
+    ssh_host: str = ""
+    ssh_port: int = 0
+    # Vast's own provisioning progress line. The deploy loop uses it to tell a
+    # slow host from a stuck one; ``state`` alone sits on "loading" throughout.
+    status_msg: str = ""
+
+
+@dataclass
+class VastDeploymentRecord:
+    """Durable rental intent retained until remote destruction is confirmed."""
+
+    name: str
+    label: str
+    account_id: str
+    offer_id: str
+    machine_id: str
+    repo_id: str
+    quant: str
+    served_model_name: str
+    endpoint_api_key: str = field(repr=False)
+    instance_id: str | None = None
+    local_port: int = 0
+    state: str = "creating"
+    max_context_tokens: int | None = None
+    # Defaults keep records written before Vast served vLLM readable.
+    backend: str = "llamacpp"
+    model_name: str = ""
 
 
 @dataclass

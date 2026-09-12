@@ -29,6 +29,8 @@ from ...core.hf_auth import HuggingFaceAuthStatus, get_huggingface_auth_status
 from ...core.modal_auth import ModalAuthStatus, get_modal_auth_status
 from ...core.prime_auth import PrimeAuthStatus, get_prime_auth_status
 from ...core.prime_backend import PrimeBackend
+from ...core.vast_auth import resolve_vast_credentials
+from ...core.vast_backend import VastBackend
 from ...core.quick_deploy import (
     QuickDeployCatalogInfo,
     QuickDeployProfile,
@@ -111,6 +113,22 @@ class PrimeBillingReportLoaded(Message):
 
 class PrimeBillingReportLoadFailed(Message):
     """Main-menu Prime billing fetch failed."""
+
+    def __init__(self, error: str) -> None:
+        super().__init__()
+        self.error = error
+
+
+class VastBillingCreditLoaded(Message):
+    """Main-menu Vast credit fetch completed."""
+
+    def __init__(self, payload: Any) -> None:
+        super().__init__()
+        self.payload = payload
+
+
+class VastBillingCreditLoadFailed(Message):
+    """Main-menu Vast credit fetch failed."""
 
     def __init__(self, error: str) -> None:
         super().__init__()
@@ -204,6 +222,18 @@ def _render_prime_auth_status(status: PrimeAuthStatus | None = None) -> str:
     return "[yellow]◆ Prime Intellect not authenticated (run: prime login)[/yellow]"
 
 
+def _render_vast_auth_status() -> str:
+    """Report the local Vast key the way doctor does: no network, no rental."""
+    try:
+        credentials = resolve_vast_credentials()
+    except ValueError as exc:
+        detail = escape(clip(str(exc), 72))
+        return f"[yellow]❖ Vast.ai key unreadable: {detail}[/yellow]"
+    if credentials.api_key:
+        return f"[green]❖ Vast.ai key configured ({escape(credentials.source)})[/green]"
+    return "[yellow]❖ Vast.ai not configured (run: llm-launchpad vast-auth login)[/yellow]"
+
+
 def _render_artificial_analysis_auth_status(
     status: ArtificialAnalysisAuthStatus | None = None,
 ) -> str:
@@ -231,6 +261,7 @@ def _render_auth_status_block(
 ) -> str:
     lines: list[str] = [_render_modal_auth_status(modal_status)]
     lines.append(_render_prime_auth_status(prime_status))
+    lines.append(_render_vast_auth_status())
     lines.append(_render_hf_auth_status(hf_status))
     lines.append(_render_artificial_analysis_auth_status(aai_status))
     return "\n".join(lines)
@@ -687,6 +718,34 @@ def _render_prime_billing_load_error(error: str) -> str:
     )
 
 
+def _render_vast_billing_report(payload: Any) -> str:
+    """Render remaining Vast credit for the shared panel."""
+
+    lines = ["[bold]Vast.ai Credit[/bold]"]
+    if not isinstance(payload, dict):
+        lines.append("[dim]Credit data unavailable.[/dim]")
+        return "\n".join(lines)
+    available = _coerce_float(payload.get("available_usd"))
+    if available is None:
+        lines.append("[dim]Credit unavailable in account payload.[/dim]")
+        return "\n".join(lines)
+    lines.append(f"[dim]available[/dim] [bold]{format_money(available)}[/bold]")
+    balance = _coerce_float(payload.get("balance_usd"))
+    if balance is not None and balance < 0:
+        # An owed balance is the one case worth spelling out separately.
+        lines.append(f"[yellow]owed {format_money(abs(balance))}[/yellow]")
+    lines.append("[dim]rentals bill continuously; transfer is charged separately[/dim]")
+    return "\n".join(lines)
+
+
+def _render_vast_billing_load_error(error: str) -> str:
+    return (
+        "[bold]Vast.ai Credit[/bold]\n"
+        "[yellow]Credit unavailable.[/yellow]\n"
+        f"[dim]{escape(clip(error, 80))}[/dim]"
+    )
+
+
 def _render_provider_billing_body(
     *,
     modal_payload: Any | None,
@@ -694,9 +753,12 @@ def _render_provider_billing_body(
     prime_state: Literal["loading", "loaded", "failed", "unavailable"],
     prime_payload: Any | None,
     prime_error: str | None,
+    vast_state: Literal["loading", "loaded", "failed", "unavailable"] = "unavailable",
+    vast_payload: Any | None = None,
+    vast_error: str | None = None,
     storage_snapshot: StorageSnapshot | None = None,
 ) -> str:
-    """Compose the Modal and Prime billing sections of the shared panel."""
+    """Compose the Modal, Prime and Vast billing sections of the shared panel."""
 
     if modal_error is not None:
         modal_section = _render_billing_load_error(modal_error)
@@ -728,7 +790,24 @@ def _render_provider_billing_body(
             "[dim]Refreshing wallet...[/dim]"
         )
 
-    return f"{modal_section}\n\n{prime_section}"
+    if vast_state == "unavailable":
+        vast_section = (
+            "[bold]Vast.ai Credit[/bold]\n"
+            "[dim]No key configured (run: llm-launchpad vast-auth login)[/dim]"
+        )
+    elif vast_state == "failed":
+        vast_section = _render_vast_billing_load_error(
+            vast_error or "Could not read Vast credit."
+        )
+    elif vast_state == "loaded":
+        vast_section = _render_vast_billing_report(vast_payload)
+    else:
+        vast_section = (
+            "[bold]Vast.ai Credit[/bold]\n"
+            "[dim]Refreshing credit...[/dim]"
+        )
+
+    return f"{modal_section}\n\n{prime_section}\n\n{vast_section}"
 
 
 class MainMenuScreen(CopyEnabledScreen):
@@ -766,6 +845,10 @@ class MainMenuScreen(CopyEnabledScreen):
         self._billing_payload: Any | None = None
         self._billing_error: str | None = None
         self._prime_billing_refresh_inflight = False
+        self._vast_billing_refresh_inflight = False
+        self._vast_billing_state: Literal["loading", "loaded", "failed", "unavailable"] = "loading"
+        self._vast_billing_payload: Any | None = None
+        self._vast_billing_error: str | None = None
         self._prime_billing_state: Literal["loading", "loaded", "failed", "unavailable"] = "loading"
         self._prime_billing_payload: Any | None = None
         self._prime_billing_error: str | None = None
@@ -793,7 +876,7 @@ class MainMenuScreen(CopyEnabledScreen):
                             id="compact-menu-header",
                         )
                         yield Static(
-                            f"[bold]{version_text}[/bold][dim]Modal + Prime LLM backends[/dim]",
+                            f"[bold]{version_text}[/bold][dim]Modal + Prime Intellect + Vast.ai LLM backends[/dim]",
                             classes="centered main-menu-version",
                         )
                         yield Static("", classes="decorative-spacer")
@@ -1251,6 +1334,7 @@ class MainMenuScreen(CopyEnabledScreen):
         self._last_billing_refresh_at = time.monotonic()
         self._refresh_billing_report()
         self._refresh_prime_billing_report()
+        self._refresh_vast_billing_credit()
 
     def _is_active_screen(self) -> bool:
         """Return whether this screen is the visible top of the app stack."""
@@ -1343,6 +1427,9 @@ class MainMenuScreen(CopyEnabledScreen):
                 prime_state=self._prime_billing_state,
                 prime_payload=self._prime_billing_payload,
                 prime_error=self._prime_billing_error,
+                vast_state=self._vast_billing_state,
+                vast_payload=self._vast_billing_payload,
+                vast_error=self._vast_billing_error,
                 storage_snapshot=self._storage_snapshot,
             )
         )
@@ -1386,6 +1473,41 @@ class MainMenuScreen(CopyEnabledScreen):
             name="main-menu-prime-billing-worker",
             thread=True,
         )
+
+    def _refresh_vast_billing_credit(self) -> None:
+        if self._vast_billing_refresh_inflight:
+            return
+        # Resolving the key is a local read, so an unconfigured account never
+        # reaches the network.
+        try:
+            configured = bool(resolve_vast_credentials().api_key)
+        except ValueError:
+            configured = False
+        if not configured:
+            self._vast_billing_state = "unavailable"
+            self._vast_billing_error = None
+            self._update_billing_panel()
+            return
+        self._vast_billing_refresh_inflight = True
+        self.run_worker(
+            self._run_load_vast_billing_credit,
+            name="main-menu-vast-billing-worker",
+            thread=True,
+        )
+
+    def _run_load_vast_billing_credit(self) -> None:
+        poster = getattr(self, "post_message", None)
+        if poster is None:
+            return
+        try:
+            payload, error = VastBackend().billing_credit()
+        except Exception as exc:
+            poster(VastBillingCreditLoadFailed(error=str(exc)))
+            return
+        if payload is None:
+            poster(VastBillingCreditLoadFailed(error=error or "Could not read Vast credit."))
+            return
+        poster(VastBillingCreditLoaded(payload=payload))
 
     def _run_load_prime_billing_report(self) -> None:
         poster = getattr(self, "post_message", None)
@@ -1463,6 +1585,19 @@ class MainMenuScreen(CopyEnabledScreen):
         self._prime_billing_refresh_inflight = False
         self._prime_billing_state = "failed"
         self._prime_billing_error = message.error
+        self._update_billing_panel()
+
+    def on_vast_billing_credit_loaded(self, message: VastBillingCreditLoaded) -> None:
+        self._vast_billing_refresh_inflight = False
+        self._vast_billing_state = "loaded"
+        self._vast_billing_payload = message.payload
+        self._vast_billing_error = None
+        self._update_billing_panel()
+
+    def on_vast_billing_credit_load_failed(self, message: VastBillingCreditLoadFailed) -> None:
+        self._vast_billing_refresh_inflight = False
+        self._vast_billing_state = "failed"
+        self._vast_billing_error = message.error
         self._update_billing_panel()
 
     def on_storage_loaded(self, message: StorageLoaded) -> None:

@@ -212,6 +212,22 @@ def _fulfillment_option(plan: InferencePlan, *, recommended: bool = False) -> st
     )
 
 
+def _fulfillment_caution(plan: InferencePlan) -> str:
+    """Warn about the plan the user is about to deploy, not the menu's contents.
+
+    The fulfillment list mixes providers, so keying this off "any alternative is
+    Vast" told someone deploying to Modal or Prime that their endpoint would be
+    local and bill continuously.
+    """
+    if plan.quote.provider != ComputeProvider.VAST:
+        return ""
+    return (
+        "[yellow]Vast.ai serves through an SSH endpoint on this computer only. "
+        "The rental bills continuously; Stop destroys the instance and its disk. "
+        "Hourly prices include disk; traffic costs extra.[/yellow]"
+    )
+
+
 class QuickDeployScreen(CopyEnabledScreen):
     """Deploy one curated inference plan with minimal overrides."""
 
@@ -225,11 +241,15 @@ class QuickDeployScreen(CopyEnabledScreen):
         profile_id: str | QuickDeployProfile | InferencePlan,
         *,
         alternative_plans: tuple[InferencePlan, ...] | None = None,
+        profile: QuickDeployProfile | None = None,
     ) -> None:
         super().__init__()
         if isinstance(profile_id, InferencePlan):
             self.plan = profile_id
-            self.profile = quick_deploy_profile_for_plan(profile_id)
+            # Prefer the profile the caller already resolved. Re-deriving it by
+            # searching the global catalog fails whenever that catalog and the
+            # plan came from different refreshes.
+            self.profile = profile if profile is not None else quick_deploy_profile_for_plan(profile_id)
         elif isinstance(profile_id, QuickDeployProfile):
             self.profile = profile_id
             self.plan = resolve_quick_deploy_plans((profile_id,))[0]
@@ -278,6 +298,9 @@ class QuickDeployScreen(CopyEnabledScreen):
                 )
             with Vertical(id="quick-deploy-form"):
                 yield Static("Fulfillment", classes="form-label")
+                caution = Static(_fulfillment_caution(self.plan), id="quick-vast-note")
+                caution.display = bool(_fulfillment_caution(self.plan))
+                yield caution
                 if len(self._alternative_plans) > 1:
                     yield Select(
                         options=[
@@ -444,6 +467,7 @@ class QuickDeployScreen(CopyEnabledScreen):
                     ]
                 )
                 fulfillment.value = self.plan.quote.id
+            self._sync_fulfillment_caution()
             return
         if event.select.id != "quick-fulfillment":
             return
@@ -454,7 +478,15 @@ class QuickDeployScreen(CopyEnabledScreen):
         self.query_one("#quick-deploy-profile-body", Static).update(
             _render_profile_summary(self.profile, self.plan)
         )
+        self._sync_fulfillment_caution()
         self._sync_prime_option_visibility()
+
+    def _sync_fulfillment_caution(self) -> None:
+        """Keep the billing warning matched to the selected provider."""
+        caution = _fulfillment_caution(self.plan)
+        note = self.query_one("#quick-vast-note", Static)
+        note.update(caution)
+        note.display = bool(caution)
 
     def _sync_prime_option_visibility(self) -> None:
         advanced_visible = any(

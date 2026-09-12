@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import unittest
 
+from llm_launchpad.core.llamacpp_planner import predict_performance
 from llm_launchpad.core.serving_tiers import (
     BALANCED,
     ECONOMY,
@@ -237,3 +238,62 @@ class ServingTierTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EstimatedTopologyTierTests(unittest.TestCase):
+    """Estimated multi-GPU rows must not win on speed they cannot deliver."""
+
+    def _estimated_plan(self, quote_id: str, *, gpu_count: int, price: float, gpu_type: str) -> InferencePlan:
+        tuning = RuntimeTuning(parallel_slots=4)
+        performance = predict_performance(
+            weights_gb=40.0,
+            gpu_type=gpu_type,
+            gpu_count=gpu_count,
+            tuning=tuning,
+            price_per_hour_usd=price,
+        )
+        recipe = InferenceRecipe(
+            id="recipe",
+            model_key="model",
+            display_name="Model",
+            backend=BackendType.LLAMACPP,
+            model_id="org/model",
+        )
+        quote = ProviderQuote(
+            id=quote_id,
+            recipe_id="recipe",
+            provider=ComputeProvider.VAST if gpu_count > 1 else ComputeProvider.MODAL,
+            provider_reference=quote_id,
+            gpu_type=gpu_type,
+            gpu_count=gpu_count,
+            price_per_hour_usd=price,
+            billing_model=BillingModel.PROVISIONED,
+            gpu_memory_gb=24.0,
+        )
+        assessment = PlacementAssessment(
+            fingerprint=quote_id,
+            memory=_memory(),
+            tuning=tuning,
+            performance=performance,
+            certification=CertificationState.ESTIMATED,
+            fits=True,
+            gpu_resident=True,
+        )
+        return InferencePlan(recipe=recipe, quote=quote, assessment=assessment)
+
+    def test_cheap_multi_gpu_estimate_does_not_win_the_fastest_tier(self) -> None:
+        cheap_four = self._estimated_plan("vast-4x", gpu_count=4, price=0.90, gpu_type="RTX 3060")
+        single_fast = self._estimated_plan("modal-1x", gpu_count=1, price=4.00, gpu_type="H100")
+
+        tiers = {tier.key: tier for tier in serving_tiers([cheap_four, single_fast])}
+
+        # The cheap 4x row is the cheapest and should say so -- and nothing
+        # more. Every speed-ranked role belongs to the card that is actually
+        # faster. Under the old 1.62x-per-GPU estimate the 4x row took the
+        # value tier on throughput-per-dollar it could not deliver.
+        self.assertEqual(tiers[ECONOMY].plan.quote.id, "vast-4x")
+        speed_roles = [key for key in (BALANCED, FASTEST) if key in tiers]
+        self.assertTrue(speed_roles)
+        for key in speed_roles:
+            self.assertEqual(tiers[key].plan.quote.id, "modal-1x")
+

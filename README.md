@@ -1,5 +1,5 @@
 <h1 align="center">LLM-Launchpad</h1>
-<p align="center">Spin up personal LLM endpoints on Modal or Prime Intellect</p>
+<p align="center">Spin up personal LLM endpoints on Modal, Prime Intellect, or Vast.ai</p>
 <p align="center">
   <img src="docs/assets/llm_launchpad_header.png" alt="LLM Launchpad header" width="900" />
 </p>
@@ -10,7 +10,7 @@
 
 ## Prerequisites
 - **uv** for Python, environment, and CLI tool management (install with `curl -LsSf https://astral.sh/uv/install.sh | sh`)
-- A **Modal account**, a **Prime Intellect account**, or both
+- A **Modal account**, a **Prime Intellect account**, a **Vast.ai account**, or any combination
 - **Hugging Face account**
 - Optional: [OpenCode](https://github.com/anomalyco/opencode) (install with `curl -fsSL https://opencode.ai/install | bash`)
 
@@ -29,6 +29,8 @@ Get up and running in four steps:
    modal setup
    # or
    prime login
+   # or
+   llm-launchpad vast-auth login
    ```
 
 3. Authenticate Hugging Face:
@@ -117,6 +119,29 @@ llm-launchpad deploy \
 See the [Prime Intellect provider guide](docs/prime.md) for the tunnel and
 security model, persistent cache disks, and maintainer certification.
 
+## Vast.ai
+
+Vast rents a specific marketplace offer, inventories its GPUs over SSH before
+serving, and publishes the endpoint through a loopback SSH tunnel that works on
+the machine running Launchpad:
+
+```bash
+llm-launchpad vast-auth login
+llm-launchpad offers --provider vast --gpu-type RTX_4090
+llm-launchpad deploy \
+  --provider vast \
+  --backend llamacpp \
+  --repo-id Qwen/Qwen3-0.6B-GGUF \
+  --quant Q4_K_M \
+  --vast-offer-id 123456 \
+  --max-hourly-cost 0.50 \
+  --instance-name qwen3-vast
+```
+
+A rental bills continuously until it is destroyed, and `stop` deletes its disk
+along with any cached models. See the [Vast.ai provider guide](docs/vast.md) for
+pricing, recovery records, and the SSH transport.
+
 ## OpenCode integration
 
 LLM-Launchpad automatically detects a local OpenCode installation and syncs
@@ -131,6 +156,7 @@ llm-launchpad opencode sync --dry-run
 - [Fast Deploy hybrid model support](docs/fast-deploy-model-support.md)
 - [Image input (vision)](docs/vision.md)
 - [Prime Intellect provider](docs/prime.md)
+- [Vast.ai provider](docs/vast.md)
 - [Storage and costs](docs/storage-and-costs.md)
 - [OpenCode integration](docs/opencode.md)
 - [Troubleshooting and debug log](docs/troubleshooting.md)

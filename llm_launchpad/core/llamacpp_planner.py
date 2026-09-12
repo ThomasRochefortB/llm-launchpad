@@ -561,8 +561,13 @@ def predict_performance(
 
     index = _gpu_index(gpu_type)
     weight_factor = (10.0 / max(1.0, weights_gb)) ** 0.82
-    topology_factor = 1.0 + 0.62 * (max(1, gpu_count) - 1)
-    single_tps = max(1.0, 24.0 * index * weight_factor * topology_factor)
+    # llama.cpp splits layers across devices (--split-mode layer, the default
+    # everywhere in this codebase -- nothing here emits --tensor-split). One
+    # request walks those layers in sequence, so a second GPU buys memory, not
+    # decode speed. A real number for a topology comes from the measured
+    # attestation, never from this estimate.
+    del gpu_count
+    single_tps = max(1.0, 24.0 * index * weight_factor)
     points: list[PerformancePoint] = []
     for concurrency in (1, 2, 4, 8):
         if concurrency > max(1, tuning.parallel_slots):

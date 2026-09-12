@@ -73,6 +73,7 @@ from .prime_backend import (
 )
 from .prime_disks import bind_prime_disk, resolve_prime_offer_and_disk
 from .provider_options import prime_provider_options
+from .vast_deployment import VastDeploymentBackend
 from .reasoning_profiles import discover_selected_model_reasoning
 from .runtime_support import (
     RuntimeCompatibility,
@@ -229,10 +230,19 @@ class Orchestrator:
         config_store: ConfigStore | None = None,
         backend: ModalBackend | None = None,
         prime_backend: PrimeBackend | None = None,
+        vast_backend: VastDeploymentBackend | None = None,
     ) -> None:
         self.config_store = config_store or ConfigStore()
         self.backend = backend or ModalBackend()
         self._prime_backend = prime_backend
+        self._vast_backend = vast_backend
+
+    @property
+    def vast_backend(self) -> VastDeploymentBackend:
+        """Load Vast credentials only for Vast operations."""
+        if self._vast_backend is None:
+            self._vast_backend = VastDeploymentBackend()
+        return self._vast_backend
 
     @property
     def prime_backend(self) -> PrimeBackend:
@@ -256,6 +266,8 @@ class Orchestrator:
         if provider == ComputeProvider.PRIME:
             ok, error = self.prime_backend.preflight()
             return ok, self.prime_backend.config.user_id or "", error
+        if provider == ComputeProvider.VAST:
+            return self.vast_backend.preflight()
         if not ModalBackend.is_cli_available():
             return False, "", "Modal CLI not found. Reinstall llm-launchpad, then run: modal setup"
         status = get_modal_auth_status()
@@ -399,6 +411,9 @@ class Orchestrator:
             return
         if config.provider == ComputeProvider.PRIME:
             yield from self._deploy_prime(config)
+            return
+        if config.provider == ComputeProvider.VAST:
+            yield from self.vast_backend.deploy(config)
             return
         if config.do_deploy and config.backend != BackendType.VLLM and not config.function_slug:
             config.function_slug = random_function_slug()
@@ -1027,6 +1042,23 @@ class Orchestrator:
         provider: ComputeProvider = ComputeProvider.MODAL,
     ) -> EventStream:
         """Tail logs for the selected provider and backend."""
+        if provider == ComputeProvider.VAST:
+            previous: list[str] = []
+            while True:
+                try:
+                    lines = self.vast_backend.logs(app_id or "")
+                except Exception as exc:
+                    yield from fail_operation(OperationType.LOGS, str(exc))
+                    return
+                overlap = max((n for n in range(min(len(previous), len(lines)) + 1) if n == 0 or previous[-n:] == lines[:n]), default=0)
+                for line in lines[overlap:]:
+                    yield LogEvent(line=line, operation=OperationType.LOGS)
+                previous = lines
+                if not follow:
+                    yield OperationCompleteEvent(operation=OperationType.LOGS, success=True)
+                    return
+                if shutdown_event().wait(timeout=2):
+                    return
         if provider == ComputeProvider.PRIME:
             pod_id = (app_id or "").strip()
             if not pod_id:
@@ -1398,6 +1430,18 @@ class Orchestrator:
             current=DeploymentState.RUNNING, operation=OperationType.LIST
         )
 
+        if provider == ComputeProvider.VAST:
+            try:
+                rows = self.vast_backend.list_deployments()
+            except Exception as exc:
+                yield from fail_operation(OperationType.LIST, str(exc))
+                return
+            yield LogEvent(line="Vast launchpad deployments:" if rows else "No Vast launchpad deployments found.")
+            for info in rows:
+                connection = info.web_url or f"reconnect with llm-launchpad vast connect {info.app_id}"
+                yield LogEvent(line=f"  provider=vast instance={info.instance_name or '-'} app={info.name} state={info.state} ({info.app_id}) {connection}")
+            yield OperationCompleteEvent(operation=OperationType.LIST, success=True, data=rows)
+            return
         if provider == ComputeProvider.PRIME:
             try:
                 rows = self.prime_backend.list_deployments()
@@ -2005,6 +2049,15 @@ class Orchestrator:
         provider: ComputeProvider = ComputeProvider.MODAL,
     ) -> EventStream:
         """Stop a deployed app."""
+        if provider == ComputeProvider.VAST:
+            try:
+                self.vast_backend.destroy(name=app_name, instance_id=app_id)
+            except Exception as exc:
+                yield from fail_operation(OperationType.STOP, str(exc))
+                return
+            yield LogEvent(line="Vast rental and disk destroyed.", operation=OperationType.STOP)
+            yield OperationCompleteEvent(operation=OperationType.STOP, success=True)
+            return
         if provider == ComputeProvider.PRIME:
             pod_id = (app_id or "").strip()
             if not pod_id:

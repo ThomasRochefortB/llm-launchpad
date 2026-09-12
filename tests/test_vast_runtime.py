@@ -1,0 +1,298 @@
+"""Vast refusals, which must land before anything billable happens."""
+
+from dataclasses import replace
+import unittest
+
+from llm_launchpad.core.providers import capabilities, refuse
+from llm_launchpad.core.vast_runtime import (
+    VAST_RUNTIME_DIR,
+    GpuDevice,
+    parse_gpu_inventory,
+    vast_refusal,
+    vast_runtime,
+    vast_runtime_image,
+    vast_runtime_script,
+    verify_gpu_topology,
+)
+from llm_launchpad.protocol.enums import BackendType, ComputeProvider
+from llm_launchpad.protocol.models import (
+    DeploymentConfig,
+    ProjectorArtifact,
+    VastProviderOptions,
+    VisionCapabilities,
+)
+
+
+def config(**overrides: object) -> DeploymentConfig:
+    """A supported Vast llama.cpp deployment, before any refusal is provoked."""
+    base = DeploymentConfig(
+        backend=BackendType.LLAMACPP,
+        provider=ComputeProvider.VAST,
+        app_name="llp-vast-llamacpp-test",
+        repo_id="acme/model-GGUF",
+        quant="Q4_K_M",
+        gpu_type="RTX 4090",
+        gpu_count=1,
+        do_deploy=True,
+        provider_options=VastProviderOptions("1001", 100, 0.42, "42"),
+        gguf_architecture="llama",
+    )
+    return replace(base, **overrides)  # type: ignore[arg-type]
+
+
+class VastRefusalTests(unittest.TestCase):
+    def test_supported_config_resolves_a_digest_pinned_image(self) -> None:
+        runtime = vast_runtime(config())
+        self.assertIsNone(refuse(config()))
+        self.assertIn("@sha256:", runtime.image)
+        self.assertEqual(runtime.image, vast_runtime_image(config()))
+        self.assertGreaterEqual(runtime.min_cuda_version, 12.8)
+
+    def test_vllm_resolves_its_own_pinned_image_and_driver_floor(self) -> None:
+        candidate = config(backend=BackendType.VLLM, model_name="acme/model", gpu_count=1, n_gpu=1)
+        self.assertIsNone(refuse(candidate))
+        runtime = vast_runtime(candidate)
+        self.assertIn("vllm/vllm-openai@sha256:", runtime.image)
+        # The vLLM image is built against a newer CUDA than llama.cpp's, which
+        # is why the floor travels with the image instead of being a constant.
+        self.assertGreater(runtime.min_cuda_version, vast_runtime(config()).min_cuda_version)
+
+    def test_vision_enabled_stages_the_projector_and_passes_mmproj(self) -> None:
+        artifact = ProjectorArtifact(
+            repo_id="acme/model-GGUF", revision="main", filename="mmproj.gguf", size_bytes=1024
+        )
+        vision = VisionCapabilities(supported=True, enabled=True, projector=artifact)
+        candidate = config(vision=vision, endpoint_api_key="private-key")
+        self.assertIsNone(refuse(candidate))
+        script = vast_runtime_script(candidate)
+        self.assertIn("--mmproj", script)
+        self.assertNotIn("--no-mmproj", script)
+        self.assertIn("/root/.llm-launchpad/projectors/", script)
+        self.assertIn("curl --fail --location", script)
+
+    def test_vision_disabled_keeps_no_mmproj(self) -> None:
+        candidate = config(endpoint_api_key="private-key")
+        self.assertIn("--no-mmproj", vast_runtime_script(candidate))
+
+    def test_vision_enabled_without_a_projector_is_an_error(self) -> None:
+        vision = VisionCapabilities(supported=True, enabled=True)
+        with self.assertRaises(ValueError):
+            vast_runtime_script(config(vision=vision, endpoint_api_key="k"))
+
+    def test_pinned_revision_is_refused_before_rental(self) -> None:
+        reason = refuse(config(revision="refs/pr/1"))
+        self.assertIsNotNone(reason)
+        self.assertIn("default HF revision", reason or "")
+
+    def test_multi_gpu_is_allowed_up_to_the_bundle_ceiling(self) -> None:
+        for count in (1, 2, 4, 8):
+            self.assertIsNone(refuse(config(gpu_count=count)), count)
+        reason = refuse(config(gpu_count=9))
+        self.assertIsNotNone(reason)
+        self.assertIn("at most 8 GPUs", reason or "")
+
+    def test_preload_only_is_refused_because_a_rental_must_serve(self) -> None:
+        reason = refuse(config(do_deploy=False))
+        self.assertIsNotNone(reason)
+        self.assertIn("preload-only", reason or "")
+
+    def test_smoke_test_only_is_refused(self) -> None:
+        reason = refuse(config(run_smoke=True))
+        self.assertIsNotNone(reason)
+        self.assertIn("smoke-test-only", reason or "")
+
+    def test_missing_repo_or_quant_is_refused_by_the_runtime(self) -> None:
+        self.assertIsNotNone(vast_refusal(config(repo_id="")))
+        self.assertIsNotNone(vast_refusal(config(quant="")))
+
+    def test_architecture_without_a_pinned_image_is_refused(self) -> None:
+        # glm5next ships a build recipe rather than a published digest.
+        reason = refuse(config(gguf_architecture="glm5next"))
+        self.assertIsNotNone(reason)
+        self.assertIn("digest-pinned", reason or "")
+
+
+class ProviderCapabilityTests(unittest.TestCase):
+    def test_modal_keeps_every_capability_it_had(self) -> None:
+        caps = capabilities(ComputeProvider.MODAL)
+        self.assertEqual(caps.backends, frozenset({BackendType.LLAMACPP, BackendType.VLLM}))
+        self.assertTrue(caps.supports_vision)
+        self.assertTrue(caps.supports_smoke_test_only)
+        self.assertFalse(caps.gpu_shape_from_offer)
+
+    def test_prime_refuses_smoke_tests_and_llamacpp_revisions(self) -> None:
+        prime = config(provider=ComputeProvider.PRIME, provider_options=None)
+        self.assertIn("smoke-test-only", refuse(replace(prime, run_smoke=True)) or "")
+        self.assertIn("default HF revision", refuse(replace(prime, revision="abc")) or "")
+        # vLLM can pin a revision; llama.cpp cannot.
+        vllm = replace(prime, backend=BackendType.VLLM, revision="abc", model_name="acme/model")
+        self.assertIsNone(refuse(vllm))
+
+    def test_unknown_provider_is_an_error_not_a_silent_pass(self) -> None:
+        with self.assertRaises(ValueError):
+            capabilities("nope")  # type: ignore[arg-type]
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class GpuInventoryTests(unittest.TestCase):
+    def test_parses_nvidia_smi_rows_in_device_order(self) -> None:
+        devices = parse_gpu_inventory(
+            "1, NVIDIA A100-PCIE-80GB, 81920, 512\n0, NVIDIA A100-PCIE-80GB, 81920, 0"
+        )
+        self.assertEqual([device.index for device in devices], [0, 1])
+        self.assertAlmostEqual(devices[0].memory_free_gib, 80.0)
+
+    def test_malformed_output_yields_no_devices_rather_than_a_guess(self) -> None:
+        for output in ("", "no devices found", "0, GPU, notanumber, 0", "0, GPU, 100"):
+            self.assertEqual(parse_gpu_inventory(output), ())
+
+
+def device(index: int, name: str = "NVIDIA RTX 4090", total: int = 24564, used: int = 0) -> GpuDevice:
+    return GpuDevice(index=index, name=name, memory_total_mib=total, memory_used_mib=used)
+
+
+class TopologyVerificationTests(unittest.TestCase):
+    def test_matching_homogeneous_devices_pass(self) -> None:
+        verify_gpu_topology(
+            [device(0), device(1)], gpu_count=2, per_device_required_gb=20.0
+        )
+
+    def test_a_host_reporting_no_gpus_is_refused(self) -> None:
+        with self.assertRaisesRegex(ValueError, "did not report any GPUs"):
+            verify_gpu_topology([], gpu_count=1, per_device_required_gb=0.0)
+
+    def test_a_device_count_that_differs_from_the_rental_is_refused(self) -> None:
+        with self.assertRaisesRegex(ValueError, "rented 2 GPUs but the host exposes 1"):
+            verify_gpu_topology([device(0)], gpu_count=2, per_device_required_gb=0.0)
+
+    def test_mixed_gpu_models_are_refused_because_the_plan_divides_evenly(self) -> None:
+        with self.assertRaisesRegex(ValueError, "mixes GPU models"):
+            verify_gpu_topology(
+                [device(0), device(1, name="NVIDIA RTX 3090")],
+                gpu_count=2,
+                per_device_required_gb=0.0,
+            )
+
+    def test_a_device_without_enough_free_memory_is_refused(self) -> None:
+        # A leftover process on one card is invisible in the offer listing.
+        with self.assertRaisesRegex(ValueError, "GPU 1 has"):
+            verify_gpu_topology(
+                [device(0), device(1, used=20000)],
+                gpu_count=2,
+                per_device_required_gb=20.0,
+            )
+
+
+class VastVllmRuntimeTests(unittest.TestCase):
+    def vllm(self, **overrides: object) -> DeploymentConfig:
+        base = config(
+            backend=BackendType.VLLM, model_name="acme/model", gpu_count=1, n_gpu=1,
+            endpoint_api_key="private-key", served_model_name="acme-model",
+        )
+        return replace(base, **overrides)  # type: ignore[arg-type]
+
+    def test_script_serves_loopback_with_tensor_parallel_and_no_key_in_argv(self) -> None:
+        script = vast_runtime_script(self.vllm(gpu_count=2, n_gpu=2))
+        self.assertIn("vllm serve acme/model", script)
+        self.assertIn("--host 127.0.0.1 --port 8000", script)
+        self.assertIn("--tensor-parallel-size 2", script)
+        self.assertIn("export VLLM_API_KEY=private-key", script)
+        self.assertNotIn("--api-key", script)
+        self.assertIn("VLLM_WORKER_MULTIPROC_METHOD=spawn", script)
+        self.assertIn(f"{VAST_RUNTIME_DIR}/hf", script)
+
+    def test_gpu_counts_that_cannot_shard_attention_heads_are_refused(self) -> None:
+        for count in (3, 5, 6, 7):
+            reason = refuse(self.vllm(gpu_count=count, n_gpu=count))
+            self.assertIsNotNone(reason, count)
+            self.assertIn("1, 2, 4, or 8", reason or "")
+
+    def test_leaving_rented_gpus_idle_is_refused_as_an_overcharge(self) -> None:
+        reason = refuse(self.vllm(gpu_count=4, n_gpu=2))
+        self.assertIsNotNone(reason)
+        self.assertIn("bills every GPU", reason or "")
+
+    def test_a_missing_model_name_is_refused(self) -> None:
+        self.assertIsNotNone(refuse(self.vllm(model_name="")))
+
+    def test_vllm_may_pin_a_revision_that_llamacpp_cannot(self) -> None:
+        self.assertIsNone(refuse(self.vllm(revision="abc123")))
+        self.assertIsNotNone(refuse(config(revision="abc123")))
+
+
+class ArchitectureFloorTests(unittest.TestCase):
+    """A modern driver on an old card is still an unusable rental."""
+
+    def test_vllm_requires_a_newer_architecture_than_llamacpp(self) -> None:
+        vllm = vast_runtime(
+            config(backend=BackendType.VLLM, model_name="acme/model", gpu_count=1, n_gpu=1)
+        )
+        llamacpp = vast_runtime(config())
+        # CUDA 13 dropped Maxwell, Pascal and Volta, so the vLLM image needs
+        # Turing or newer while the CUDA 12 llama.cpp image does not.
+        self.assertGreaterEqual(vllm.min_compute_capability, 7.5)
+        self.assertLess(llamacpp.min_compute_capability, vllm.min_compute_capability)
+
+    def test_a_volta_card_suits_llamacpp_but_not_vllm(self) -> None:
+        # Exactly the rental that failed live: driver reported CUDA 13, but
+        # the V100's architecture was dropped by that CUDA release.
+        volta = 7.0
+        vllm = vast_runtime(
+            config(backend=BackendType.VLLM, model_name="acme/model", gpu_count=1, n_gpu=1)
+        )
+        self.assertLess(volta, vllm.min_compute_capability)
+        self.assertGreaterEqual(volta, vast_runtime(config()).min_compute_capability)
+
+    def test_packed_compute_capability_is_read_as_a_version(self) -> None:
+        from llm_launchpad.core.vast_backend import _compute_capability
+
+        self.assertEqual(_compute_capability(860), 8.6)
+        self.assertEqual(_compute_capability(700), 7.0)
+        self.assertIsNone(_compute_capability(None))
+        self.assertIsNone(_compute_capability(0))
+
+
+
+class VastProviderParityTests(unittest.TestCase):
+    """Vast refuses what a rental cannot serve, and nothing else.
+
+    No supported runtime sits behind an environment opt-in that Modal and Prime
+    do not also require, so every serving shape the provider advertises has to
+    clear the same refusal gate the other two clear.
+    """
+
+    def test_every_advertised_serving_shape_is_deployable(self) -> None:
+        from llm_launchpad.protocol.enums import VisionMode
+
+        key = {"endpoint_api_key": "private-key"}
+        # llama.cpp needs a staged projector for images; vLLM serves them on its
+        # own multimodal path, so only one of these carries an artifact.
+        seen = VisionCapabilities(
+            supported=True,
+            enabled=True,
+            projector=ProjectorArtifact(
+                repo_id="acme/model-GGUF", revision="main", filename="mmproj.gguf", size_bytes=1024
+            ),
+        )
+        for candidate in (
+            config(**key),
+            config(backend=BackendType.VLLM, model_name="acme/model", **key),
+            config(backend=BackendType.VLLM, model_name="acme/model", gpu_count=2, n_gpu=2, **key),
+            config(vision=seen, **key),
+            config(backend=BackendType.VLLM, model_name="acme/model", vision_mode=VisionMode.ON, **key),
+            config(
+                backend=BackendType.VLLM,
+                model_name="acme/model",
+                vision=VisionCapabilities(supported=True, enabled=True),
+                **key,
+            ),
+        ):
+            with self.subTest(backend=candidate.backend, vision=candidate.vision_mode):
+                self.assertIsNone(refuse(candidate))
+                self.assertTrue(vast_runtime_script(candidate))
+
+    def test_runtime_validation_still_refuses_what_a_rental_cannot_serve(self) -> None:
+        self.assertIn("model name", refuse(config(backend=BackendType.VLLM)) or "")

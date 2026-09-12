@@ -12,6 +12,7 @@ failure.
 - Hugging Face download errors: run `huggingface-cli login` and verify the model license or gated-repo access in your Hugging Face account.
 - Warmup stays queued: Modal may still be scheduling the requested GPU. Try a smaller GPU configuration or wait for capacity.
 - Endpoint status fails after deploy: inspect `llm-launchpad logs --backend <backend> --instance-name <name>` for backend startup errors.
+- First llama.cpp deploy after a large download dies at Modal's web-server startup timeout: the GPU container now sequentially reads GGUF shards (and a projector, if any) before `llama-server` starts, and the bind wait defaults to 90 minutes. Raise `LLAMACPP_SERVE_STARTUP_TIMEOUT_MINUTES` if a still-larger first read needs more time, or set `LLAMACPP_WARM_VOLUME=false` only to skip hydration.
 - Prime pod cannot be managed: Launchpad's local `ssh`/`ssh-keygen` binaries must be available; the bootstrap key lives under `~/.llm_launchpad/prime/`.
 - Settings look reset: `settings.json` may be corrupt; the TUI Settings screen shows load diagnostics.
 

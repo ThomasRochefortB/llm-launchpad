@@ -7,6 +7,7 @@ from textual.widgets import Input, Select, Static
 from ...protocol.enums import BackendType, VisionMode
 from ...protocol.models import DeploymentConfig
 from ...core.vision import validate_vision_options
+from .input_form import FormField
 
 
 class VisionOptions(Vertical):
@@ -24,14 +25,54 @@ class VisionOptions(Vertical):
             [("Automatic vision", "auto"), ("Require vision", "on"), ("Text only", "off")],
             value="auto", allow_blank=False, id="vision-mode",
         )
-        if self.backend == BackendType.LLAMACPP:
-            yield Input(placeholder="Projector repository override (optional)", id="projector-repo")
-            yield Input(placeholder="Projector revision override (optional)", id="projector-revision")
-            yield Input(placeholder="Exact projector filename (optional)", id="projector-file")
-        elif self.backend == BackendType.VLLM:
-            yield Static("Maximum images per prompt", classes="form-label")
-            yield Input(value="1", type="integer", id="image-limit")
-            yield Input(placeholder="Image processor kwargs JSON (optional)", id="mm-processor-kwargs")
+        # Everything below only describes how images are handled, so it is
+        # hidden outright once the deployment is text-only. Each field carries
+        # a real label: a placeholder disappears the moment it is typed into.
+        with Vertical(id="vision-detail-fields"):
+            if self.backend == BackendType.LLAMACPP:
+                yield FormField(
+                    "Projector repository (optional)",
+                    "projector-repo",
+                    hint="Overrides the mmproj repo auto-detected from the model",
+                )
+                yield FormField(
+                    "Projector revision (optional)",
+                    "projector-revision",
+                    hint="Leave blank to use the projector repo's default branch",
+                )
+                yield FormField(
+                    "Projector filename (optional)",
+                    "projector-file",
+                    hint="e.g., mmproj-model-f16.gguf",
+                )
+            elif self.backend == BackendType.VLLM:
+                yield FormField(
+                    "Maximum images per prompt",
+                    "image-limit",
+                    default="1",
+                    input_type="integer",
+                    hint="vLLM --limit-mm-per-prompt image",
+                )
+                yield FormField(
+                    "Image processor kwargs (JSON, optional)",
+                    "mm-processor-kwargs",
+                    hint='e.g., {"max_pixels": 1003520}',
+                )
+
+    def on_mount(self) -> None:
+        self._sync_detail_visibility()
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "vision-mode":
+            self._sync_detail_visibility()
+
+    def _sync_detail_visibility(self) -> None:
+        try:
+            detail = self.query_one("#vision-detail-fields", Vertical)
+        except Exception:
+            return
+        mode = self.query_one("#vision-mode", Select).value
+        detail.set_class(mode == VisionMode.OFF.value, "hidden")
 
     def apply(self, config: DeploymentConfig) -> None:
         """Copy and validate form values before beginning deployment."""

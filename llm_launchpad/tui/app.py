@@ -19,6 +19,7 @@ from typing import Any
 from textual.app import App
 from textual.binding import Binding
 from textual.filter import Monochrome
+from textual.message import Message
 from textual.widgets import Input, TextArea
 
 from ..core.backend import ModalBackend
@@ -44,6 +45,8 @@ from ..core.naming import (
 )
 from ..core.prime_auth import get_prime_auth_status
 from ..core.prime_backend import PrimeBackend
+from ..core.vast_auth import resolve_vast_credentials
+from ..core.vast_deployment import VastDeploymentBackend
 from ..core.provider_options import prime_provider_options
 from ..core.vision_probe import is_vision_probe_failure
 from ..core.quick_deploy import QuickDeployProfile
@@ -159,11 +162,39 @@ def _screen_passthrough_sequence(text: str) -> str:
     return f"\x1bP{_osc_52_sequence(text)}\x1b\\"
 
 
+def _defers_completion_footer(
+    event: OperationCompleteEvent,
+    *,
+    config: DeploymentConfig,
+    will_run_warmup: bool,
+) -> bool:
+    """Whether this completion is not the end of the user's operation.
+
+    The footer says "Operation complete/failed" and offers to return or retry,
+    which is wrong while the same monitor session carries on: a successful
+    deploy that warmup follows, and a failed deploy that a fallback placement
+    answers. The failure reason is already on screen as its own error line.
+    """
+    if event.operation != OperationType.DEPLOY:
+        return False
+    if event.success:
+        return will_run_warmup
+    return bool(config.fallback_configs)
+
+
+class AbandonedDeploymentsChecked(Message):
+    """Journal entries that providers still report, after verification."""
+
+    def __init__(self, entries: tuple[InFlightDeployment, ...]) -> None:
+        super().__init__()
+        self.entries = entries
+
+
 class TuiApp(App):
     """llm-launchpad interactive terminal UI."""
 
     TITLE = "llm-launchpad"
-    SUB_TITLE = "Modal + Prime LLM backends"
+    SUB_TITLE = "Modal + Prime Intellect + Vast.ai LLM backends"
 
     CSS_PATH = Path(__file__).with_name("theme.tcss")
 
@@ -423,6 +454,17 @@ class TuiApp(App):
                 timeout=3,
             )
 
+    def _handle_exception(self, error: Exception) -> None:
+        """Record an unhandled exception before Textual tears the app down.
+
+        Textual renders the traceback to a terminal that is about to be
+        restored, and `run()` returns normally afterwards, so neither a
+        try/except around it nor sys.excepthook ever sees this. Without the
+        log, a crash leaves nothing behind to read.
+        """
+        log_exception(f"TUI crashed with an unhandled {type(error).__name__}")
+        super()._handle_exception(error)
+
     def on_mount(self) -> None:
         """Launch the TUI when at least one compute provider is configured.
 
@@ -435,21 +477,66 @@ class TuiApp(App):
         self._enter_main_menu()
         self._warn_about_abandoned_deployments()
 
+    # Warning about every journal entry meant a deployment that had already
+    # finished, been stopped elsewhere, or never survived its provider kept
+    # raising an alarm -- with a dollar figure -- on every launch, forever.
+    _ABANDONED_WARNING_LIMIT = 3
+
     def _warn_about_abandoned_deployments(self) -> None:
-        """Tell the user about deployments a previous session left running.
+        """Ask the providers what survived before alarming anyone.
 
         Nothing is stopped automatically: the journal records that a deploy was
         interrupted, not that the resource is unwanted, and terminating an
-        endpoint someone is using would be worse than the leak.
+        endpoint someone is using would be worse than the leak. But an entry a
+        provider positively reports as gone is resolved, not abandoned, and
+        saying otherwise costs the user a search for a rental that never
+        existed.
         """
 
-        abandoned = self.recover_abandoned_deployments()
-        if not abandoned:
+        if not self.recover_abandoned_deployments():
             return
-        for entry in abandoned:
+        self.run_worker(
+            self._run_check_abandoned_deployments,
+            name="abandoned-deploy-check-worker",
+            thread=True,
+        )
+
+    def _run_check_abandoned_deployments(self) -> None:
+        """Resolve journal entries against live provider listings, off the UI."""
+        entries = self.recover_abandoned_deployments()
+        if not entries:
+            return
+        try:
+            rows, enumerated = self._visible_rows_and_prune_scope()
+        except Exception:
+            # A listing that failed says nothing about the resource, so every
+            # entry stays and the user still gets told.
+            log_exception("Could not verify abandoned deployments against providers")
+            rows, enumerated = [], ()
+        live_names = {row.name for row in rows} | {
+            row.instance_name for row in rows if row.instance_name
+        }
+        unresolved: list[InFlightDeployment] = []
+        for entry in entries:
+            confirmed_gone = (
+                entry.compute_provider in enumerated
+                and entry.app_name not in live_names
+                and (entry.instance_name or entry.app_name) not in live_names
+            )
+            if confirmed_gone:
+                clear_in_flight(entry.app_name)
+            else:
+                unresolved.append(entry)
+        poster = getattr(self, "post_message", None)
+        if callable(poster) and unresolved:
+            poster(AbandonedDeploymentsChecked(tuple(unresolved)))
+
+    def on_abandoned_deployments_checked(self, message: AbandonedDeploymentsChecked) -> None:
+        shown = message.entries[: self._ABANDONED_WARNING_LIMIT]
+        for entry in shown:
             exposure = entry.exposure_usd()
-            # Phrased as a ceiling, not a bill: the journal knows the deploy
-            # never resolved, not whether the resource still exists.
+            # Phrased as a ceiling, not a bill: the provider still lists it, but
+            # the journal does not know what it has been doing since.
             spend = (
                 f" (up to ~${exposure:.2f} if it still is)"
                 if exposure is not None and exposure >= 0.01
@@ -461,11 +548,25 @@ class TuiApp(App):
                 severity="warning",
                 timeout=15,
             )
+        remaining = len(message.entries) - len(shown)
+        if remaining:
+            # Stacked toasts cover the screen on a small terminal; the rest are
+            # in Deployments, which is where acting on them happens anyway.
+            self.notify(
+                f"{remaining} more unresolved deployment"
+                f"{'s' if remaining != 1 else ''}. Check Deployments.",
+                severity="warning",
+                timeout=15,
+            )
 
     def _provider_is_configured(self) -> bool:
         modal_available = ModalBackend.is_cli_available()
         prime_available = get_prime_auth_status().authenticated
-        return modal_available or prime_available
+        try:
+            vast_available = bool(resolve_vast_credentials().api_key)
+        except ValueError:
+            vast_available = False
+        return modal_available or prime_available or vast_available
 
     def _enter_main_menu(self) -> None:
         self.push_screen(MainMenuScreen(username="", version=self._version))
@@ -549,13 +650,24 @@ class TuiApp(App):
         profile: str | QuickDeployProfile | InferencePlan,
         *,
         alternative_plans: tuple[InferencePlan, ...] | None = None,
+        catalog_profile: QuickDeployProfile | None = None,
     ) -> None:
-        self.push_screen(
-            QuickDeployScreen(
+        try:
+            screen = QuickDeployScreen(
                 profile_id=profile,
                 alternative_plans=alternative_plans,
+                profile=catalog_profile,
             )
-        )
+        except KeyError as exc:
+            # A placement whose profile cannot be resolved is a bug, but it must
+            # not take the whole TUI down between picking a GPU and confirming.
+            self.notify(
+                f"That placement could not be opened: {exc}",
+                severity="error",
+                timeout=10,
+            )
+            return
+        self.push_screen(screen)
 
     # ------------------------------------------------------------------
     # Deploy
@@ -724,7 +836,9 @@ class TuiApp(App):
                 # When warmup immediately follows a successful deploy in the same
                 # monitor session, suppress the intermediate completion footer
                 # ("Operation complete... Press esc") to keep the summary cleaner.
-                if will_run_warmup and event.success and event.operation == OperationType.DEPLOY:
+                if _defers_completion_footer(
+                    event, config=config, will_run_warmup=will_run_warmup
+                ):
                     continue
                 if (
                     event.success
@@ -836,6 +950,12 @@ class TuiApp(App):
                             provider=config.provider,
                         ):
                             _dispatch_event(monitor, cleanup_event)
+                            if (
+                                config.provider == ComputeProvider.VAST
+                                and isinstance(cleanup_event, OperationCompleteEvent)
+                                and not cleanup_event.success
+                            ):
+                                config.fallback_configs = ()
                     if self._advance_to_fallback(
                         config,
                         monitor,
@@ -1180,13 +1300,18 @@ class TuiApp(App):
         rows: list[EndpointInfo] = []
         prune_providers: list[ComputeProvider] = []
         prime_enabled = get_prime_auth_status().authenticated
-        with ThreadPoolExecutor(max_workers=2 if prime_enabled else 1) as executor:
+        try:
+            vast_enabled = bool(resolve_vast_credentials().api_key)
+        except ValueError:
+            vast_enabled = False
+        with ThreadPoolExecutor(max_workers=3) as executor:
             modal_future = executor.submit(ModalBackend.list_apps)
             prime_future = (
                 executor.submit(PrimeBackend().list_deployments)
                 if prime_enabled
                 else None
             )
+            vast_future = executor.submit(VastDeploymentBackend().list_deployments) if vast_enabled else None
             try:
                 modal_rows = modal_future.result()
             except Exception:
@@ -1195,6 +1320,10 @@ class TuiApp(App):
                 prime_rows = prime_future.result() if prime_future is not None else None
             except Exception:
                 prime_rows = None
+            try:
+                vast_rows = vast_future.result() if vast_future is not None else None
+            except Exception:
+                vast_rows = None
 
         if modal_rows is not None:
             rows.extend(modal_rows)
@@ -1202,6 +1331,9 @@ class TuiApp(App):
         if prime_rows is not None:
             rows.extend(prime_rows)
             prune_providers.append(ComputeProvider.PRIME)
+        if vast_rows is not None:
+            rows.extend(vast_rows)
+            prune_providers.append(ComputeProvider.VAST)
         self._merge_deploy_connection_cache(rows)
         return visible_launchpad_rows(rows), tuple(prune_providers)
 
