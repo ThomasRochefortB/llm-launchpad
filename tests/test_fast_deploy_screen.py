@@ -730,9 +730,11 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 assert isinstance(screen, FastDeployScreen)
                 option_list = screen.query_one("#fast-deploy-list", OptionList)
                 self.assertEqual(option_list.option_count, 1)
+                # The catalog's provenance is the subtitle's job; the status
+                # line counts what is currently listed.
                 self.assertIn(
                     "Bundled catalog",
-                    str(screen.query_one("#fast-deploy-status", Static).renderable),
+                    str(screen.query_one("#fast-deploy-subtitle", Static).renderable),
                 )
 
                 catalog_models[0] = (first, second)
@@ -747,7 +749,7 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(option_list.option_count, 2)
                 self.assertIn(
                     "Live AAI rankings",
-                    str(screen.query_one("#fast-deploy-status", Static).renderable),
+                    str(screen.query_one("#fast-deploy-subtitle", Static).renderable),
                 )
 
     async def test_layout_css_gives_the_model_list_flexible_height(self) -> None:

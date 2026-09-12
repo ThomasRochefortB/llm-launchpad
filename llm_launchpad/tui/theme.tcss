@@ -334,7 +334,8 @@ Button:focus {
     padding: 0 0 1 0;
 }
 
-#fast-deploy-gpu-label {
+#fast-deploy-gpu-label,
+#fast-deploy-search-label {
     color: $text-muted;
     height: 1;
     padding: 0;
@@ -346,22 +347,38 @@ Button:focus {
     height: auto;
 }
 
-#fast-deploy-gpu-filter {
+/* The group owns the width so the Select can simply fill it; the narrow
+   override below then stretches both together. */
+#fast-deploy-gpu-group {
+    width: 36;
+    height: auto;
+    margin: 0 2 1 0;
+}
+
+/* The search box takes what the GPU filter does not. Capping both at 36 left
+   the row more than half empty on a wide terminal while long model names in
+   the box below still had to be truncated. */
+#fast-deploy-search-group {
     width: 1fr;
-    max-width: 36;
+    max-width: 72;
+    height: auto;
+    margin: 0 0 1 0;
+}
+
+#fast-deploy-gpu-filter {
+    width: 100%;
     /* Select draws its own bordered value row; pinning the outer height
        squeezes that border into the line the value should occupy. */
     height: auto;
-    margin: 0 1 1 0;
+    margin: 0;
     padding: 0;
 }
 
 #fast-deploy-model-search {
-    width: 1fr;
-    max-width: 36;
+    width: 100%;
     height: 3;
     min-height: 3;
-    margin: 0 0 1 0;
+    margin: 0;
     padding: 0;
 }
 
@@ -996,17 +1013,19 @@ StatusHeader.state-warming-up {
 
 .viewport-narrow #fast-deploy-subtitle,
 .viewport-narrow #fast-deploy-gpu-label,
-.viewport-narrow #fast-deploy-model-search,
+.viewport-narrow #fast-deploy-search-group,
 .viewport-compact #fast-deploy-subtitle,
 .viewport-compact #fast-deploy-gpu-label,
-.viewport-minimal #fast-deploy-model-search,
-.viewport-short #fast-deploy-model-search {
+.viewport-compact #fast-deploy-search-label,
+.viewport-minimal #fast-deploy-search-group,
+.viewport-short #fast-deploy-search-group {
     display: none;
 }
 
-.viewport-narrow #fast-deploy-gpu-filter,
-.viewport-minimal #fast-deploy-gpu-filter {
-    max-width: 100%;
+.viewport-narrow #fast-deploy-gpu-group,
+.viewport-minimal #fast-deploy-gpu-group {
+    width: 100%;
+    margin-right: 0;
     margin-right: 0;
 }
 
@@ -1082,6 +1101,7 @@ StatusHeader.state-warming-up {
 
 .viewport-short #fast-deploy-subtitle,
 .viewport-short #fast-deploy-gpu-label,
+.viewport-short #fast-deploy-search-label,
 .viewport-short #fast-deploy-detail {
     display: none;
 }

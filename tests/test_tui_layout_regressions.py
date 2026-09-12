@@ -7,6 +7,7 @@ because the responsive checks deliberately exempt scrolling content.
 
 from __future__ import annotations
 
+import pathlib
 import re
 import unicodedata
 import unittest
@@ -580,6 +581,120 @@ class DuplicatedChromeTests(unittest.IsolatedAsyncioTestCase):
             # The footer is where those keys belong, and it still carries them.
             self.assertIn("esc Back", rendered)
             self.assertIn("r Refresh", rendered)
+
+
+class SetupScreenTests(unittest.IsolatedAsyncioTestCase):
+    """The screen that explains how to authenticate opened past its own text."""
+
+    async def test_it_opens_at_the_top_rather_than_at_its_focused_button(self) -> None:
+        from llm_launchpad.tui.screens.setup import SetupRequiredScreen
+
+        for size in ((60, 20), (80, 24), (140, 45)):
+            with self.subTest(size=size):
+                app = _StyledApp()
+                async with app.run_test(size=size) as pilot:
+                    app.push_screen(SetupRequiredScreen())
+                    await pilot.pause()
+                    await pilot.pause()
+                    rendered = _rendered_lines(app)
+                    self.assertIn(
+                        "Compute provider required",
+                        "\n".join(rendered[:3]),
+                        f"the screen opened scrolled past its title at {size}",
+                    )
+                    self.assertIn("Option 1", "\n".join(rendered))
+
+    async def test_the_recheck_button_still_takes_focus(self) -> None:
+        from llm_launchpad.tui.screens.setup import SetupRequiredScreen
+
+        app = _StyledApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.push_screen(SetupRequiredScreen())
+            await pilot.pause()
+            self.assertEqual(getattr(app.focused, "id", None), "setup-recheck-btn")
+
+    def test_provider_names_in_button_labels_are_capitalised(self) -> None:
+        source = (
+            pathlib.Path("llm_launchpad/tui/screens/setup.py").read_text()
+        )
+        for wrong in ('"Copy modal"', '"Copy prime"', '"Copy vast"'):
+            self.assertNotIn(wrong, source)
+
+
+class FastDeployHeaderTests(unittest.IsolatedAsyncioTestCase):
+    """The top three lines said the same two things two or three times."""
+
+    async def _screen(self, pilot, app):
+        from llm_launchpad.core.compute_availability import aggregate_compute_availability
+        from llm_launchpad.tui.screens.fast_deploy import FastDeployScreen
+
+        with patch(
+            "llm_launchpad.tui.screens.fast_deploy.load_compute_availability",
+            return_value=aggregate_compute_availability(),
+        ):
+            app.push_screen(FastDeployScreen())
+            await pilot.pause()
+            await pilot.pause()
+        return app.screen
+
+    async def test_the_catalog_source_is_named_once(self) -> None:
+        app = _StyledApp()
+        async with app.run_test(size=(140, 45)) as pilot:
+            screen = await self._screen(pilot, app)
+            subtitle = str(screen.query_one("#fast-deploy-subtitle", Static).render())
+            status = str(screen.query_one("#fast-deploy-status", Static).render())
+            self.assertTrue(subtitle.strip())
+            self.assertNotIn(subtitle.strip(), status)
+
+    async def test_the_title_does_not_repeat_itself_in_the_subtitle(self) -> None:
+        app = _StyledApp()
+        async with app.run_test(size=(140, 45)) as pilot:
+            screen = await self._screen(pilot, app)
+            title = str(screen.query_one("#fast-deploy-title", Static).render())
+            subtitle = str(screen.query_one("#fast-deploy-subtitle", Static).render())
+            self.assertIn("Pick a model", title)
+            self.assertNotIn("Pick a model", subtitle)
+
+    async def test_both_filter_controls_carry_a_label(self) -> None:
+        app = _StyledApp()
+        async with app.run_test(size=(140, 45)) as pilot:
+            screen = await self._screen(pilot, app)
+            for label_id in ("#fast-deploy-gpu-label", "#fast-deploy-search-label"):
+                label = screen.query_one(label_id, Static)
+                self.assertTrue(str(label.render()).strip(), label_id)
+                self.assertTrue(_is_drawn(app, label), label_id)
+
+    async def test_the_search_box_uses_the_width_the_filter_leaves(self) -> None:
+        from textual.widgets import Input
+
+        app = _StyledApp()
+        async with app.run_test(size=(140, 45)) as pilot:
+            screen = await self._screen(pilot, app)
+            search = screen.query_one("#fast-deploy-model-search", Input)
+            self.assertGreater(search.region.width, 36)
+
+    def test_an_unscored_model_shows_no_score_rather_than_the_word_unranked(
+        self,
+    ) -> None:
+        """Without an Artificial Analysis key every row was "unranked"."""
+        from dataclasses import replace
+
+        from llm_launchpad.tui.screens.fast_deploy import (
+            _model_option,
+            _model_score_segment,
+        )
+        from tests.test_fast_deploy_screen import _model, _profile
+
+        scored = _model((_profile("p", required_vram_gb=10.0),))
+        unscored = replace(scored, quality_score=None)
+
+        self.assertEqual(_model_score_segment(unscored), "")
+        self.assertIn("AAI", _model_score_segment(scored))
+
+        row = _model_option(unscored)
+        self.assertNotIn("unranked", row)
+        self.assertIn("from", row)
+        self.assertIn("AAI", _model_option(scored))
 
 
 if __name__ == "__main__":
