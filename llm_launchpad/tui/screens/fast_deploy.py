@@ -685,6 +685,11 @@ class FastDeployScreen(CopyEnabledScreen):
         self._availability_request_id = 0
         self._phase = "models"
         self._snapshot: ComputeAvailabilitySnapshot | None = None
+        # First paint prices models from the cached catalog, which holds a
+        # Modal list rate for the shape the planner picked when the catalog
+        # was built. Live placements routinely come in several times cheaper,
+        # so the provisional number has to say that it is one.
+        self._pricing_pending = False
         self._gpu_filter = "any"
         self._model_search = ""
         self._updating_gpu_filter = False
@@ -909,6 +914,8 @@ class FastDeployScreen(CopyEnabledScreen):
         request_id = self._availability_request_id
         if purpose == "infra":
             self._availability_inflight = True
+        if purpose == "filter":
+            self._pricing_pending = True
 
         def run_load() -> None:
             self._run_load_availability(request_id, purpose=purpose)
@@ -956,6 +963,7 @@ class FastDeployScreen(CopyEnabledScreen):
             return
         if message.purpose == "filter":
             self._snapshot = message.snapshot
+            self._pricing_pending = False
             self._populate_gpu_filter(message.snapshot)
             if self._phase == "models":
                 self._render_model_list(preferred_id=self._highlighted_model_id())
@@ -978,6 +986,7 @@ class FastDeployScreen(CopyEnabledScreen):
             return
         if message.purpose == "filter":
             self._snapshot = None
+            self._pricing_pending = False
             self._populate_gpu_filter(ComputeAvailabilitySnapshot(configurations=()))
             if self._phase == "models":
                 self._render_model_list(preferred_id=self._highlighted_model_id())
@@ -1330,6 +1339,8 @@ class FastDeployScreen(CopyEnabledScreen):
                if self._snapshot is not None and self._snapshot.vast_configured else "")
             + ("\n[yellow]Partial results: " + escape("; ".join(self._snapshot.errors)) + "[/yellow]"
                if self._snapshot is not None and self._snapshot.errors else "")
+            + ("\n[yellow]Catalog estimates; pricing live placements…[/yellow]"
+               if self._pricing_pending and self._snapshot is None else "")
         )
         if getattr(self.focused, "id", "") not in {
             "fast-deploy-gpu-filter", "fast-deploy-model-search",

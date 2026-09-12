@@ -188,6 +188,43 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
         self._availability_patch.stop()
         _qd._reset_quick_deploy_catalog_cache()
 
+
+    async def test_catalog_prices_are_marked_provisional_until_providers_answer(self) -> None:
+        """First paint prices from the cached catalog, which is Modal list rate.
+
+        Live placements routinely come in several times cheaper, so the number
+        shown before the availability worker returns has to say it is an
+        estimate rather than read like the answer.
+        """
+        model = _model((_profile("available", required_vram_gb=8.0),))
+        info = QuickDeployCatalogInfo(source_label="test")
+        released = threading.Event()
+
+        def _slow_availability() -> ComputeAvailabilitySnapshot:
+            released.wait(5)
+            return aggregate_compute_availability()
+
+        app = _StyledApp()
+        with (
+            patch("llm_launchpad.tui.screens.fast_deploy.list_quick_deploy_models", return_value=(model,)),
+            patch("llm_launchpad.tui.screens.fast_deploy.get_quick_deploy_catalog_info", return_value=info),
+            patch("llm_launchpad.tui.screens.fast_deploy.load_compute_availability", _slow_availability),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                screen = FastDeployScreen()
+                app.push_screen(screen)
+                await pilot.pause()
+                pending = str(screen.query_one("#fast-deploy-status", Static).content)
+                self.assertIn("Catalog estimates", pending)
+
+                released.set()
+                for _ in range(80):
+                    await pilot.pause()
+                    if not screen._pricing_pending:
+                        break
+                settled = str(screen.query_one("#fast-deploy-status", Static).content)
+                self.assertNotIn("Catalog estimates", settled)
+
     async def test_excluded_models_explain_missing_entries_and_return_to_selection(self) -> None:
         model = _model((_profile("available", required_vram_gb=8.0),))
         info = QuickDeployCatalogInfo(source_label="test", exclusions=(
