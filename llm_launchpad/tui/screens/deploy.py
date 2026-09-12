@@ -22,7 +22,6 @@ from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import (
     Button,
-    Footer,
     Input,
     OptionList,
     Select,
@@ -81,6 +80,7 @@ from ..workers import (
     VllmModelsLoaded,
 )
 from ..widgets.input_form import FormField, ToggleField
+from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
 
 
@@ -643,7 +643,7 @@ class BackendSelectScreen(CopyEnabledScreen):
                 ),
                 id="backend-list",
             )
-        yield Footer()
+        yield FittedFooter()
 
     def on_mount(self) -> None:
         backend_list = self.query_one("#backend-list", OptionList)
@@ -887,7 +887,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
             )
             yield Static("")
             yield Button("Deploy", id="deploy-btn", variant="primary")
-        yield Footer()
+        yield FittedFooter()
 
     def on_mount(self) -> None:
         self._rank_mode = "cached"
@@ -2007,7 +2007,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
 
             yield Static("")
             yield Button("Deploy", id="deploy-vllm-btn", variant="primary")
-        yield Footer()
+        yield FittedFooter()
 
     def on_mount(self) -> None:
         self._rank_mode = "cached"

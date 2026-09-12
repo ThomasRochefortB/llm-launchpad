@@ -14,7 +14,8 @@ class StatusHeader(Static):
 
     DEFAULT_CSS = """
     StatusHeader {
-        height: 3;
+        /* One content row plus the bottom border; render() is a single line. */
+        height: 2;
         padding: 0 2;
         background: $surface;
         border-bottom: solid $border;
@@ -30,14 +31,20 @@ class StatusHeader(Static):
     state: reactive[str] = reactive("idle")
     operation: reactive[str] = reactive("--")
     detail: reactive[str] = reactive("")
+    failed: reactive[bool] = reactive(False)
 
     def render(self) -> str:
-        state_icon = _state_icon(self.state)
+        # The state a deployment reached and whether the operation driving it
+        # failed are two different facts, and the bar has to carry both: an
+        # operation that exited non-zero used to leave this reading
+        # `state: deploying`, describing work that had stopped.
+        state_icon = _state_icon(FAILED_STATE if self.failed else self.state)
+        state_text = f"{self.state} (failed)" if self.failed else self.state
         compact = self.screen.has_class("viewport-compact")
         short = self.screen.has_class("viewport-short")
         parts = [
             f"[bold]backend:[/] {escape(self.backend)}",
-            f"  {state_icon} [bold]state:[/] {escape(self.state)}",
+            f"  {state_icon} [bold]state:[/] {escape(state_text)}",
         ]
         if not compact and self.operation and self.operation != "--":
             parts.append(f"  [bold]op:[/] {escape(self.operation)}")
@@ -51,6 +58,21 @@ class StatusHeader(Static):
             self.remove_class(f"state-{name.value.replace('_', '-')}")
         self.add_class(f"state-{state.replace('_', '-')}")
 
+    def watch_failed(self, failed: bool) -> None:
+        self.set_class(failed, f"state-{FAILED_STATE}")
+
+    def report_failure(self) -> None:
+        """Record that the operation driving this deployment failed.
+
+        ``DeploymentState`` has no failed member, so this used to leave the bar
+        showing whichever state the deployment reached -- an operation that had
+        just exited non-zero still read ``state: idle`` or ``state: deploying``,
+        on a screen whose only other line said it had failed. The state it
+        reached is still true and is kept; the failure is said alongside it.
+        """
+        self.failed = True
+        self.detail = ""
+
     def update_from_event(
         self,
         state: DeploymentState | None = None,
@@ -58,6 +80,9 @@ class StatusHeader(Static):
         operation: OperationType | None = None,
         detail: str = "",
     ) -> None:
+        if state is not None:
+            # A new state means a new attempt; the previous failure is over.
+            self.failed = False
         if backend is not None:
             self.backend = backend.value
         if state is not None:
@@ -68,17 +93,32 @@ class StatusHeader(Static):
             self.detail = detail
 
 
+# Not a DeploymentState: the protocol tracks where a deployment got to, not
+# whether the operation driving it exited non-zero. The bar has to say both.
+FAILED_STATE = "error"
+
+
+# Deliberately ASCII: these have to stay readable with colour stripped, which
+# is what the monochrome theme and low-colour terminals do. Every marker is
+# padded to the same width so `state:` does not shift sideways as the state
+# changes underneath it.
+_STATE_MARKER_WIDTH = 2
+
+# No marker may begin with "[": these are interpolated into Rich markup.
+_STATE_MARKERS: dict[str, tuple[str, str]] = {
+    "idle": ("..", "dim"),
+    "queued": ("~~", "yellow"),
+    "running": (">>", "green"),
+    "deploying": ("^^", "green"),
+    "warming_up": ("**", "yellow"),
+    "healthy": ("OK", "green"),
+    "unhealthy": ("!!", "red"),
+    "stopped": ("--", "dim"),
+    "error": ("XX", "red"),
+    "cancelled": ("//", "dim"),
+}
+
+
 def _state_icon(state: str) -> str:
-    icons = {
-        "idle": "[dim]o[/]",
-        "queued": "[yellow]~[/]",
-        "running": "[green]>[/]",
-        "deploying": "[green]>>[/]",
-        "warming_up": "[yellow]*[/]",
-        "healthy": "[green]OK[/]",
-        "unhealthy": "[red]X[/]",
-        "stopped": "[dim].[/]",
-        "error": "[red]![/]",
-        "cancelled": "[dim]-[/]",
-    }
-    return icons.get(state, "[dim]?[/]")
+    marker, style = _STATE_MARKERS.get(state, ("??", "dim"))
+    return f"[{style}]{marker:<{_STATE_MARKER_WIDTH}}[/]"

@@ -14,6 +14,18 @@
     scrollbar-background-active: $scrollbar-background-active;
     scrollbar-color-active: $scrollbar-active;
     scrollbar-size: 1 1;
+}
+
+/* A stable gutter belongs only on containers whose content genuinely grows and
+   shrinks, where a scrollbar appearing mid-update would otherwise reflow the
+   text beside it. Applying it to `*` taxed every widget one row and one column
+   whether or not it could ever scroll: a three-option OptionList occupied six
+   rows instead of five, every bordered panel showed a dead column inside its
+   right edge, and `DataTable { min-height: 3 }` was left with zero content rows
+   -- the Storage inventory rendered neither its models nor its header at 80x24.
+   The Footer needed a hand-written exemption for the same reason. */
+VerticalScroll,
+LogViewer Log {
     scrollbar-gutter: stable;
 }
 
@@ -44,12 +56,9 @@ Footer {
     color: $footer-foreground;
     border-top: solid $border;
     /* Restore Textual's own footer scrollbar settings, which the global `*`
-       rule above overrides. The gutter is the damaging one: reserving it
-       collapses every auto grid column in the footer to zero width, so once
-       the hints no longer fit the terminal the whole row rendered blank --
-       the main menu lost every key at 80 columns, Fast Deploy at 100. The
-       size matters too: the border leaves exactly one content row, and a
-       horizontal scrollbar would spend it. */
+       rule above overrides. The border leaves exactly one content row, and a
+       horizontal scrollbar would spend it; a reserved gutter collapses every
+       auto grid column to zero width and blanks the whole row. */
     scrollbar-gutter: auto;
     scrollbar-size: 0 0;
 }
@@ -57,7 +66,9 @@ Footer {
 /* ---- Status header widget ---- */
 
 StatusHeader {
-    height: 4;
+    /* One content row plus the bottom border. The widget renders a single
+       line; the extra row this used to reserve was always blank. */
+    height: 2;
     padding: 0 2;
     background: $surface;
     border-bottom: solid $border;
@@ -118,10 +129,14 @@ LogViewer Log {
     overflow-y: auto;
 }
 
+/* Takes the column height that billing does not, rather than capping at 14
+   rows and scrolling its own content while the rows below it stay blank. Two
+   deployments were already enough to clip an entry mid-endpoint with ten
+   unused rows directly underneath. */
 #deployment-status-panel {
     width: 100%;
-    height: auto;
-    max-height: 14;
+    height: 1fr;
+    min-height: 6;
     overflow-y: auto;
     padding: 0 2;
     border: solid $border;
@@ -131,6 +146,8 @@ LogViewer Log {
 #billing-report-panel {
     width: 100%;
     height: auto;
+    max-height: 50%;
+    overflow-y: auto;
     margin: 1 0 0 0;
     padding: 0 2;
     border: solid $border;
@@ -204,7 +221,11 @@ DataTable {
     background: $surface;
     border: solid $border;
     height: 1fr;
-    min-height: 3;
+    /* Two rows go to the border, so a floor of 3 left a single content row for
+       the header and none for the data. A table that shows no rows is worse
+       than one that pushes its neighbours into a scroll, so the floor is the
+       header plus three rows. */
+    min-height: 6;
     max-height: 20;
     color: $text;
 }
@@ -319,7 +340,8 @@ Button:focus {
     padding: 0 0 1 0;
 }
 
-#fast-deploy-gpu-label {
+#fast-deploy-gpu-label,
+#fast-deploy-search-label {
     color: $text-muted;
     height: 1;
     padding: 0;
@@ -331,22 +353,38 @@ Button:focus {
     height: auto;
 }
 
-#fast-deploy-gpu-filter {
+/* The group owns the width so the Select can simply fill it; the narrow
+   override below then stretches both together. */
+#fast-deploy-gpu-group {
+    width: 36;
+    height: auto;
+    margin: 0 2 1 0;
+}
+
+/* The search box takes what the GPU filter does not. Capping both at 36 left
+   the row more than half empty on a wide terminal while long model names in
+   the box below still had to be truncated. */
+#fast-deploy-search-group {
     width: 1fr;
-    max-width: 36;
+    max-width: 72;
+    height: auto;
+    margin: 0 0 1 0;
+}
+
+#fast-deploy-gpu-filter {
+    width: 100%;
     /* Select draws its own bordered value row; pinning the outer height
        squeezes that border into the line the value should occupy. */
     height: auto;
-    margin: 0 1 1 0;
+    margin: 0;
     padding: 0;
 }
 
 #fast-deploy-model-search {
-    width: 1fr;
-    max-width: 36;
+    width: 100%;
     height: 3;
     min-height: 3;
-    margin: 0 0 1 0;
+    margin: 0;
     padding: 0;
 }
 
@@ -640,7 +678,6 @@ VllmDeployScreen Select:disabled > SelectCurrent {
 #manage-title,
 #manage-status,
 #manage-selection-detail,
-#manage-help,
 #stop-warning {
     height: auto;
 }
@@ -706,21 +743,79 @@ VllmDeployScreen Select:disabled > SelectCurrent {
     min-width: 14;
 }
 
+/* Centering a child that is taller than the viewport pushes its head and tail
+   off both ends at once, which is how Save and every save/discard message
+   ended up permanently below the fold. Anchoring to the top keeps the form
+   scrollable in the one direction that can reach them. */
 #settings-scroll {
-    align: center middle;
+    align: center top;
 }
 
 #storage-controls {
     height: auto;
 }
 
+/* The inventory is the reason this screen exists, so it gets a real viewport
+   rather than whatever `1fr` has left over once the filters above it have
+   taken their share. The screen itself scrolls. */
+#storage-table {
+    min-height: 9;
+}
+
+#storage-empty {
+    height: auto;
+    padding: 1 1;
+    border: solid $border;
+    background: $surface;
+    text-wrap: wrap;
+}
+
+/* A 60-column cap wrapped every hint onto a second line in a terminal with
+   room to spare, and those wrapped lines are what pushed the form past the
+   bottom of the screen. */
 #settings-form {
     width: 100%;
-    max-width: 60;
+    max-width: 88;
     height: auto;
     padding: 1 2;
     border: solid $border;
     background: $surface;
+}
+
+/* Section rhythm comes from margins rather than blank Static spacers, so the
+   spacing is uniform and does not have to be re-counted when a field moves. */
+.settings-section {
+    height: 1;
+    margin-top: 1;
+    color: $text;
+}
+
+/* Fields carry their own bottom padding; the section margin on top of it
+   opened a double gap before every heading that followed one. */
+#settings-form FormField,
+#settings-form ToggleField {
+    padding-bottom: 0;
+}
+
+/* Direct children only. A hint nested inside a FormField cannot collapse its
+   margin against the next heading's, so scoping this to the loose hints keeps
+   every gap exactly one row. */
+#settings-form > .form-hint {
+    margin-bottom: 1;
+}
+
+#settings-actions {
+    height: auto;
+    margin-top: 1;
+}
+
+#settings-actions Button {
+    margin-right: 2;
+}
+
+#save-feedback {
+    height: auto;
+    text-wrap: wrap;
 }
 
 /* ---- Deploy screen GPU row ---- */
@@ -804,6 +899,10 @@ StatusHeader.state-warming-up {
     border-bottom: solid $warning;
 }
 
+StatusHeader.state-error {
+    border-bottom: solid $error;
+}
+
 #monitor-search {
     width: 100%;
     margin: 0;
@@ -843,6 +942,13 @@ StatusHeader.state-warming-up {
     width: 100%;
     max-width: 100%;
     margin: 0 0 1 0;
+}
+
+/* Let it take a second line rather than stop mid-phrase; the narrow left
+   column cut this to "... Vast.ai LLM" with no ellipsis to say so. */
+.main-menu-version {
+    height: auto;
+    text-wrap: wrap;
 }
 
 .viewport-compact #banner-text,
@@ -917,17 +1023,19 @@ StatusHeader.state-warming-up {
 
 .viewport-narrow #fast-deploy-subtitle,
 .viewport-narrow #fast-deploy-gpu-label,
-.viewport-narrow #fast-deploy-model-search,
+.viewport-narrow #fast-deploy-search-group,
 .viewport-compact #fast-deploy-subtitle,
 .viewport-compact #fast-deploy-gpu-label,
-.viewport-minimal #fast-deploy-model-search,
-.viewport-short #fast-deploy-model-search {
+.viewport-compact #fast-deploy-search-label,
+.viewport-minimal #fast-deploy-search-group,
+.viewport-short #fast-deploy-search-group {
     display: none;
 }
 
-.viewport-narrow #fast-deploy-gpu-filter,
-.viewport-minimal #fast-deploy-gpu-filter {
-    max-width: 100%;
+.viewport-narrow #fast-deploy-gpu-group,
+.viewport-minimal #fast-deploy-gpu-group {
+    width: 100%;
+    margin-right: 0;
     margin-right: 0;
 }
 
@@ -976,12 +1084,16 @@ StatusHeader.state-warming-up {
 }
 
 .viewport-short StatusHeader {
-    height: 2;
     padding: 0 1;
 }
 
-.viewport-short #manage-selection-detail,
-.viewport-short #manage-help {
+/* A short terminal has no rows to spare for a nine-row inventory; the header
+   plus two rows still says what the screen is showing. */
+.viewport-short #storage-table {
+    min-height: 5;
+}
+
+.viewport-short #manage-selection-detail {
     display: none;
 }
 
@@ -999,6 +1111,7 @@ StatusHeader.state-warming-up {
 
 .viewport-short #fast-deploy-subtitle,
 .viewport-short #fast-deploy-gpu-label,
+.viewport-short #fast-deploy-search-label,
 .viewport-short #fast-deploy-detail {
     display: none;
 }

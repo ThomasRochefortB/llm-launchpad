@@ -172,8 +172,8 @@ def _defers_completion_footer(
 ) -> bool:
     """Whether this completion is not the end of the user's operation.
 
-    The footer says "Operation complete/failed" and offers to return or retry,
-    which is wrong while the same monitor session carries on: a successful
+    The footer says "Operation complete/failed" and offers to return, which is
+    wrong while the same monitor session carries on: a successful
     deploy that warmup follows, and a failed deploy that a fallback placement
     answers. The failure reason is already on screen as its own error line.
     """
@@ -201,7 +201,16 @@ class TuiApp(App):
     CSS_PATH = Path(__file__).with_name("theme.tcss")
 
     BINDINGS = [
-        Binding("ctrl+c", "request_quit", show=False, priority=True, system=True),
+        # Described, not silent: this binding outranks Textual's own ctrl+c
+        # (which claims to copy the selection), so the help overlay used to
+        # name a shortcut that never ran and never named the quit key at all.
+        Binding(
+            "ctrl+c",
+            "request_quit",
+            "Copy selection, or quit",
+            show=False,
+            priority=True,
+        ),
         Binding(
             "ctrl+v,ctrl+shift+v,super+v,meta+v,cmd+v,command+v",
             "paste_from_clipboard",

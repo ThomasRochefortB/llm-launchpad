@@ -13,7 +13,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
-from textual.widgets import Footer, Input, OptionList, Select, Static
+from textual.widgets import Input, OptionList, Select, Static
 from textual.widgets.option_list import Option
 
 from ...core.compute_availability import (
@@ -51,6 +51,7 @@ from ...protocol.models import (
     InferencePlan,
 )
 from ..responsive import ViewportProfile, WidthMode
+from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
 
 
@@ -156,7 +157,8 @@ def _availability_label(configuration: ComputeConfiguration) -> str:
 
 
 def _subtitle(info: QuickDeployCatalogInfo) -> str:
-    return f"Pick a model · {escape(info.source_label)}"
+    """Where the catalog came from. The title already says what to do here."""
+    return escape(info.source_label)
 
 
 def _model_cheapest_price(
@@ -211,11 +213,11 @@ def _model_option(
     gpu_type: str = "any",
 ) -> str:
     cost = _model_cost_label(model, snapshot, gpu_type)
-    score = (
-        f"AAI {_format_aa_index(model.quality_score)}"
-        if model.quality_score is not None
-        else "unranked"
-    )
+    # Without an Artificial Analysis key nothing is ranked, and the word
+    # "unranked" then repeats down every row of the list saying nothing. An
+    # absent score reads as absent; the detail panel names it for the one
+    # model the reader has actually selected.
+    score = _model_score_segment(model)
     size = (model.profiles[0].model_size_label or "").strip()
     metrics = f"{size} · " if size else ""
     if width_mode == WidthMode.MINIMAL:
@@ -226,7 +228,7 @@ def _model_option(
     if width_mode == WidthMode.COMPACT:
         return (
             f"  {escape(clip(model.display_name, 28)):<28} "
-            f"[dim]{score} · {cost}[/dim]"
+            f"[dim]{score}{cost}[/dim]"
         )
     if width_mode == WidthMode.STANDARD:
         # The size bucket is already the section heading this row sits under,
@@ -235,12 +237,19 @@ def _model_option(
         # splitting "~$2.00/hr" across the box border.
         return (
             f"  {escape(clip(model.display_name, 34)):<34} "
-            f"[dim]{score} · from {cost}[/dim]"
+            f"[dim]{score}from {cost}[/dim]"
         )
     return (
         f"  {escape(clip(model.display_name, 34)):<34} "
-        f"[dim]{metrics}{score} · from {cost}[/dim]"
+        f"[dim]{metrics}{score}from {cost}[/dim]"
     )
+
+
+def _model_score_segment(model: QuickDeployModel) -> str:
+    """`"AAI 42 · "`, or nothing at all when the model carries no score."""
+    if model.quality_score is None:
+        return ""
+    return f"AAI {_format_aa_index(model.quality_score)} · "
 
 
 def _model_size_section(model: QuickDeployModel) -> str:
@@ -651,7 +660,7 @@ class CatalogExclusionsScreen(CopyEnabledScreen):
                 id="fast-deploy-list",
             )
             yield Static("", id="fast-deploy-detail")
-        yield Footer()
+        yield FittedFooter()
 
     def on_mount(self) -> None:
         self.query_one(OptionList).focus()
@@ -740,22 +749,27 @@ class FastDeployScreen(CopyEnabledScreen):
                 id="fast-deploy-title",
             )
             yield Static(_subtitle(self._catalog_info), id="fast-deploy-subtitle")
-            yield Static("[dim]GPU filter[/dim]", id="fast-deploy-gpu-label")
+            # Each control carries its own label. A single label above the row
+            # sat over the Select and left the search box beside it unnamed.
             with Horizontal(id="fast-deploy-filter-row"):
-                yield Select(
-                    options=[("Any GPU", "any")],
-                    value="any",
-                    allow_blank=False,
-                    id="fast-deploy-gpu-filter",
-                )
-                yield Input(
-                    placeholder="Search models (type to filter)",
-                    id="fast-deploy-model-search",
-                )
+                with Vertical(id="fast-deploy-gpu-group"):
+                    yield Static("[dim]GPU filter[/dim]", id="fast-deploy-gpu-label")
+                    yield Select(
+                        options=[("Any GPU", "any")],
+                        value="any",
+                        allow_blank=False,
+                        id="fast-deploy-gpu-filter",
+                    )
+                with Vertical(id="fast-deploy-search-group"):
+                    yield Static("[dim]Search[/dim]", id="fast-deploy-search-label")
+                    yield Input(
+                        placeholder="Search models (type to filter)",
+                        id="fast-deploy-model-search",
+                    )
             yield Static("[dim]Loading models...[/dim]", id="fast-deploy-status")
             yield OptionList(id="fast-deploy-list")
             yield Static("", id="fast-deploy-detail")
-        yield Footer()
+        yield FittedFooter()
 
     def on_mount(self) -> None:
         self._availability_inflight = False
@@ -1371,9 +1385,10 @@ class FastDeployScreen(CopyEnabledScreen):
             f" · {len(self._catalog_info.exclusions)} excluded (x)"
             if self._catalog_info.exclusions else ""
         )
+        # The source label belongs to the subtitle; repeating it here put the
+        # same sentence on screen twice, three lines apart.
         self.query_one("#fast-deploy-status", Static).update(
-            f"[dim]{len(visible)} model{plural}{filter_note}{search_note}{excluded_note} · "
-            f"{escape(self._catalog_info.source_label)}[/dim]"
+            f"[dim]{len(visible)} model{plural}{filter_note}{search_note}{excluded_note}[/dim]"
             + (f"\n[dim]{len(self._snapshot.vast_offers)} Vast offers priced · r refreshes[/dim]"
                if self._snapshot is not None and self._snapshot.vast_configured else "")
             + ("\n[yellow]Partial results: " + escape("; ".join(self._snapshot.errors)) + "[/yellow]"

@@ -27,7 +27,7 @@ from llm_launchpad.protocol.models import (
     SpeculativeDecodingConfig,
 )
 from llm_launchpad.tui.app import TuiApp
-from llm_launchpad.tui.screens.quick_deploy import QuickDeployScreen
+from llm_launchpad.tui.screens.quick_deploy import QuickDeployScreen, _summary_row
 
 
 class _TestApp(App[None]):
@@ -69,10 +69,10 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("262,144 ctx", summary)
             self.assertNotIn("Cheap but good", summary)
             self.assertIn("UD-Q4_K_XL", summary)
-            self.assertIn("[bold]Provider[/bold] Modal", summary)
-            self.assertIn("[bold]Billing[/bold]  Scale to zero", summary)
-            self.assertIn("[bold]Hourly[/bold]   ~$15.15/hr", summary)
-            self.assertIn("[bold]Monthly[/bold]  ~$909.00/mo", summary)
+            self.assertIn(_summary_row("Provider", "Modal"), summary)
+            self.assertIn(_summary_row("Billing", "Scale to zero"), summary)
+            self.assertIn(_summary_row("Hourly", "~$15.15/hr"), summary)
+            self.assertIn(_summary_row("Monthly", "~$909.00/mo"), summary)
             self.assertIn("llama.cpp (GGUF)", summary)
             self.assertIn("unsloth/Kimi-K2.5-GGUF", summary)
 
@@ -151,7 +151,7 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             summary = str(screen.query_one("#quick-deploy-profile-body", Static).content)
 
         self.assertIn("vLLM (OpenAI-compatible)", summary)
-        self.assertIn("[bold]Model[/bold]    org/example", summary)
+        self.assertIn(_summary_row("Model", "org/example"), summary)
         self.assertNotIn("[bold]Quant[/bold]", summary)
 
     async def test_screen_moves_tier_and_vram_details_to_summary(self) -> None:
@@ -181,9 +181,9 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             screen = app.screen
             assert isinstance(screen, QuickDeployScreen)
             summary = str(screen.query_one("#quick-deploy-profile-body", Static).content)
-            self.assertIn("[bold]Tier[/bold]     $$$ B200", summary)
-            self.assertIn("[bold]VRAM[/bold]     141 GB required", summary)
-            self.assertIn("[bold]Context[/bold]  Full 196,608 ctx", summary)
+            self.assertIn(_summary_row("Tier", "$$$ B200"), summary)
+            self.assertIn(_summary_row("VRAM", "141 GB required"), summary)
+            self.assertIn(_summary_row("Context", "Full 196,608 ctx"), summary)
 
     async def test_deploy_uses_blank_override_defaults(self) -> None:
         app = _TestApp()
@@ -292,8 +292,8 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 app.screen.query_one("#quick-deploy-profile-body", Static).content
             )
 
-        self.assertIn("[bold]Monthly[/bold]  ~$240.00/mo", summary)
-        self.assertIn("[bold]If left up[/bold] ~$720.00/mo at 24/7", summary)
+        self.assertIn(_summary_row("Monthly", "~$240.00/mo"), summary)
+        self.assertIn(_summary_row("If left up", "~$720.00/mo at 24/7"), summary)
         self.assertIn(workload_basis_label(), summary)
 
     async def test_a_scale_to_zero_plan_omits_the_continuous_figure(self) -> None:
@@ -559,7 +559,7 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             summary = str(
                 screen.query_one("#quick-deploy-profile-body", Static).content
             )
-            self.assertIn("[bold]Provider[/bold] Modal", summary)
+            self.assertIn(_summary_row("Provider", "Modal"), summary)
             screen._deploy()
 
         self.assertIsNotNone(app.deployed_config)
