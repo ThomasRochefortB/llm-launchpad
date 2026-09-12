@@ -10,7 +10,7 @@ from rich.markup import escape
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
-from textual.widgets import Button, Footer, Input, Select, Static, Switch
+from textual.widgets import Button, Input, Select, Static, Switch
 
 from ...core.compute_availability import display_gpu_type
 from ...core.inference_options import (
@@ -40,6 +40,7 @@ from ...protocol.enums import (
 )
 from ...protocol.models import DeploymentConfig, InferencePlan
 from ..widgets.input_form import FormField, ToggleField
+from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
 
 
@@ -51,6 +52,18 @@ def _render_profile_label(profile: QuickDeployProfile, *, accent: str = "") -> s
     if not quant_suffix:
         return label_markup
     return f"{label_markup} [dim]{escape(quant_suffix)}[/dim]"
+
+
+# The widest label in the summary, so every value starts in the same column.
+# These rows used to pad themselves: most landed on column 9, but Availability,
+# Placement, Default slug, If left up and Spec decode were all longer than the
+# padding assumed and pushed their values out of line.
+_SUMMARY_LABEL_WIDTH = 13
+
+
+def _summary_row(label: str, value: str) -> str:
+    """Render one aligned `label  value` row of the profile summary."""
+    return f"[bold]{label}[/bold]{' ' * (_SUMMARY_LABEL_WIDTH - len(label))}{value}"
 
 
 def _render_profile_summary(profile: QuickDeployProfile, plan: InferencePlan) -> str:
@@ -69,38 +82,38 @@ def _render_profile_summary(profile: QuickDeployProfile, plan: InferencePlan) ->
         tier_detail = profile.resource_tier_label
         if profile.profile_label and profile.profile_label != profile.resource_tier_label:
             tier_detail = f"{tier_detail} {profile.profile_label}"
-        lines.append(f"[bold]Tier[/bold]     {escape(tier_detail)}")
+        lines.append(_summary_row("Tier", escape(tier_detail)))
     lines.extend(
         [
-            f"[bold]Provider[/bold] {escape(plan.quote.provider.display_name)}",
-            f"[bold]Billing[/bold]  {escape(_billing_label(plan.quote.billing_model))}",
-            f"[bold]Backend[/bold]  {escape(plan.recipe.backend.display_name)}",
-            f"[bold]GPU[/bold]      {escape(display_gpu_type(plan.quote.gpu_type))} x{plan.quote.gpu_count}",
+            _summary_row("Provider", escape(plan.quote.provider.display_name)),
+            _summary_row("Billing", escape(_billing_label(plan.quote.billing_model))),
+            _summary_row("Backend", escape(plan.recipe.backend.display_name)),
+            _summary_row("GPU", f"{escape(display_gpu_type(plan.quote.gpu_type))} x{plan.quote.gpu_count}"),
         ]
     )
     if plan.quote.region:
-        lines.append(f"[bold]Region[/bold]   {escape(plan.quote.region)}")
+        lines.append(_summary_row("Region", escape(plan.quote.region)))
     lines.append(
-        f"[bold]Availability[/bold] {escape(_availability_label(plan))}"
+        _summary_row("Availability", escape(_availability_label(plan)))
     )
     reference = (plan.quote.provider_reference or "").strip()
     if reference and _show_placement_reference(reference, plan.quote.gpu_type):
         lines.append(
-            f"[bold]Placement[/bold] {escape(reference)}"
+            _summary_row("Placement", escape(reference))
         )
     if profile.quant:
-        lines.insert(-1, f"[bold]Quant[/bold]    {escape(profile.quant)}")
+        lines.insert(-1, _summary_row("Quant", escape(profile.quant)))
     required_memory = (
         plan.assessment.memory.total_gb
         if plan.assessment is not None
         else profile.required_vram_gb
     )
     if required_memory:
-        lines.append(f"[bold]VRAM[/bold]     {required_memory:.0f} GB required")
+        lines.append(_summary_row("VRAM", f"{required_memory:.0f} GB required"))
     requirements = plan.recipe.serving_requirements
     if requirements is not None:
         lines.append(
-            f"[bold]Optimize[/bold] {escape(requirements.objective.display_name)}"
+            _summary_row("Optimize", escape(requirements.objective.display_name))
         )
     if plan.assessment is not None:
         single = max(
@@ -124,19 +137,22 @@ def _render_profile_summary(profile: QuickDeployProfile, plan: InferencePlan) ->
             else "estimated; verified during deploy"
         )
         if single > 0:
-            lines.append(f"[bold]Single[/bold]   ~{single:.0f} output tok/s")
-            lines.append(f"[bold]Batch[/bold]    ~{aggregate:.0f} aggregate tok/s")
-        lines.append(f"[bold]Evidence[/bold] {escape(evidence)}")
+            lines.append(_summary_row("Single", f"~{single:.0f} output tok/s"))
+            lines.append(_summary_row("Batch", f"~{aggregate:.0f} aggregate tok/s"))
+        lines.append(_summary_row("Evidence", escape(evidence)))
     if profile.speculative_decoding is not None:
         lines.append(
-            "[bold]Spec decode[/bold] Native MTP · up to "
-            f"{profile.speculative_decoding.num_speculative_tokens} draft tokens"
+            _summary_row(
+                "Spec decode",
+                "Native MTP · up to "
+                f"{profile.speculative_decoding.num_speculative_tokens} draft tokens",
+            )
         )
     lines.extend(
         [
-            f"[bold]Context[/bold]  Full {escape(format_context_length(profile.max_context_tokens))}",
-            f"[bold]Hourly[/bold]   {escape(_plan_hourly_cost(plan))}",
-            f"[bold]Monthly[/bold]  {escape(_plan_monthly_cost(plan))}",
+            _summary_row("Context", f"Full {escape(format_context_length(profile.max_context_tokens))}"),
+            _summary_row("Hourly", escape(_plan_hourly_cost(plan))),
+            _summary_row("Monthly", escape(_plan_monthly_cost(plan))),
         ]
     )
     # A provisioned rental keeps billing until it is stopped, which the
@@ -144,12 +160,12 @@ def _render_profile_summary(profile: QuickDeployProfile, plan: InferencePlan) ->
     # left the two contradicting each other, with the larger number missing.
     if plan.quote.billing_model != BillingModel.SCALE_TO_ZERO:
         lines.append(
-            f"[bold]If left up[/bold] {escape(_plan_continuous_monthly_cost(plan))}"
+            _summary_row("If left up", escape(_plan_continuous_monthly_cost(plan)))
         )
     lines.extend(
         [
-            f"[bold]Model[/bold]    {escape(plan.recipe.model_id)}",
-            f"[bold]Default slug[/bold]  {escape(instance_slug_for_plan(profile, plan))}",
+            _summary_row("Model", escape(plan.recipe.model_id)),
+            _summary_row("Default slug", escape(instance_slug_for_plan(profile, plan))),
             "",
             f"[dim]{escape(workload_basis_label())}[/dim]",
             "[dim]Availability is revalidated when deployment starts.[/dim]",
@@ -312,9 +328,12 @@ class QuickDeployScreen(CopyEnabledScreen):
         )
 
     def compose(self) -> ComposeResult:
+        # Steps 1 and 2 are the model and placement pickers this screen is
+        # reached from; naming the last one keeps the flow's count complete.
         yield Static(
-            "[bold #7bf168]Deploy endpoint[/]  "
-            f"[dim]Recommended plan for[/dim] {_render_profile_label(self.profile)}",
+            "[bold #7bf168]Deploy[/]  "
+            f"{_render_profile_label(self.profile)} "
+            "[dim]· Step 3: Confirm and deploy[/dim]",
             id="quick-deploy-title",
         )
         yield Static(
@@ -445,7 +464,7 @@ class QuickDeployScreen(CopyEnabledScreen):
         with Vertical(id="quick-deploy-actions"):
             yield Static("", id="quick-deploy-feedback")
             yield Button("Deploy", id="quick-deploy-btn", variant="primary")
-        yield Footer()
+        yield FittedFooter()
 
     def on_mount(self) -> None:
         for widget in self.query(".quick-advanced"):

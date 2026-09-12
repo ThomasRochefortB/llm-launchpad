@@ -314,7 +314,9 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             content = "\n".join(screen.log_viewer.log_widget.lines)
             self.assertIn("Operation failed (exit code 9).", content)
             self.assertIn("Detail: backend error", content)
-            self.assertIn("Press esc or q to return, or enter to retry.", content)
+            self.assertIn("Press esc, q or enter to return", content)
+            # Enter pops this screen like esc and q; there is no retry path.
+            self.assertNotIn("retry", content)
             self.assertIn("Error: worker failed", content)
             self.assertNotIn("[red", content)
             self.assertNotIn("[green", content)
@@ -564,7 +566,7 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("sk-test-key", body)
             self.assertTrue(screen.query_one("#copy-key-btn", Button).display)
             content = "\n".join(screen.log_viewer.log_widget.lines)
-            self.assertIn("Press enter or esc to return home.", content)
+            self.assertIn("Press esc, q or enter to return", content)
 
             screen.action_copy_base_url()
             self.assertEqual(app.clipboard, "https://example.modal.run/v1")
@@ -602,7 +604,7 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(app.home_calls, 0)
 
-    async def test_failed_operation_enter_pops_back_for_retry(self) -> None:
+    async def test_failed_operation_enter_returns_to_the_previous_screen(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:
             app.push_screen(Screen())

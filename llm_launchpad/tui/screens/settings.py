@@ -7,8 +7,8 @@ import time
 from rich.markup import escape
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical, VerticalScroll
-from textual.widgets import Button, Footer, Input, Select, Static, Switch
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.widgets import Button, Input, Select, Static, Switch
 
 from ...core.config import ConfigStore
 from ...protocol.models import LaunchpadSettings
@@ -19,6 +19,7 @@ from ..visual import (
     normalize_tui_theme,
 )
 from ..widgets.input_form import FormField, ToggleField
+from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
 
 
@@ -50,17 +51,15 @@ class SettingsScreen(CopyEnabledScreen):
 
         with VerticalScroll(id="settings-scroll", classes="screen-scroll"):
             with Vertical(id="settings-form"):
-                yield Static("[bold #7bf168]Settings[/]")
-                yield Button("Vast.ai rentals", id="vast-preview-btn")
-                yield Static("")
-                yield Static("[bold]Deployment[/bold]")
+                yield Static("[bold #7bf168]Settings[/]", id="settings-title")
+                yield Static("[bold]Deployment[/bold]", classes="settings-section")
                 yield FormField(
                     "Scaledown window (seconds)",
                     "scaledown-window",
                     default=str(settings.scaledown_window),
                     hint="Seconds before idle containers scale down",
                 )
-                yield Static("[bold]Appearance[/bold]")
+                yield Static("[bold]Appearance[/bold]", classes="settings-section")
                 yield Static("Theme", classes="form-label")
                 yield Select(
                     TUI_THEME_OPTIONS,
@@ -83,7 +82,7 @@ class SettingsScreen(CopyEnabledScreen):
                     "[dim]Compact density reduces spacing without hiding content.[/dim]",
                     classes="form-hint",
                 )
-                yield Static("[bold]Behavior[/bold]")
+                yield Static("[bold]Behavior[/bold]", classes="settings-section")
                 yield ToggleField(
                     "Enable mouse support",
                     "tui-mouse",
@@ -99,15 +98,16 @@ class SettingsScreen(CopyEnabledScreen):
                     "confirm-quit",
                     default=settings.confirm_quit,
                 )
-                yield Static("")
-                yield Button("Save", id="save-btn", variant="primary")
+                with Horizontal(id="settings-actions"):
+                    yield Button("Save", id="save-btn", variant="primary")
+                    yield Button("Vast.ai rentals", id="vast-preview-btn")
                 yield Static(
                     f"[yellow]{escape(self._load_error)} Using defaults.[/yellow]"
                     if self._load_error
                     else "",
                     id="save-feedback",
                 )
-        yield Footer()
+        yield FittedFooter()
 
     def on_mount(self) -> None:
         # Only edits that arrive after the initial values have settled count.
@@ -137,12 +137,40 @@ class SettingsScreen(CopyEnabledScreen):
         if not self._accepting_edits:
             return
         self._dirty = True
+        self._announce("[yellow]Unsaved changes — ctrl+s to save.[/yellow]")
+
+    def _announce(self, markup: str) -> None:
+        """Update the feedback line and make sure it is actually on screen.
+
+        The form is taller than a short terminal, and this line sits at the
+        very bottom of it. Writing to a widget below the fold reported a failed
+        save, an unsaved-changes warning, and the second-esc-to-discard prompt
+        to nobody; every one of them looked like the key had done nothing.
+        """
         try:
-            self.query_one("#save-feedback", Static).update(
-                "[yellow]Unsaved changes — ctrl+s to save.[/yellow]"
-            )
+            feedback = self.query_one("#save-feedback", Static)
         except Exception:
             return
+        feedback.update(markup)
+        # Until this message arrived the line was empty, so it had no height to
+        # scroll to. The reveal has to wait for the layout that the update it
+        # just made will trigger.
+        self.call_after_refresh(self._reveal_feedback)
+
+    def _reveal_feedback(self) -> None:
+        """Scroll the foot of the form into view, where the message lives.
+
+        Not ``scroll_to_widget``: this line sits in the scroll container's own
+        bottom padding, which counts as inside the window even though nothing
+        is drawn there, so that call treats an invisible line as visible and
+        can scroll away from it. The feedback is the last element of the form,
+        which makes the end of the form the right place to land.
+        """
+        try:
+            scroll = self.query_one("#settings-scroll", VerticalScroll)
+        except Exception:
+            return
+        scroll.scroll_end(animate=False, immediate=True)
 
     def action_save(self) -> None:
         self._save()
@@ -152,9 +180,7 @@ class SettingsScreen(CopyEnabledScreen):
         try:
             scaledown = int(scaledown_str)
         except ValueError:
-            self.query_one("#save-feedback", Static).update(
-                "[red]Scaledown must be an integer.[/red]"
-            )
+            self._announce("[red]Scaledown must be an integer.[/red]")
             return
 
         settings = LaunchpadSettings(
@@ -172,15 +198,13 @@ class SettingsScreen(CopyEnabledScreen):
         if result.success:
             self._dirty = False
             self._unsaved_warning_at = 0.0
-            self.query_one("#save-feedback", Static).update(
-                "[green]Settings saved.[/green]"
-            )
+            self._announce("[green]Settings saved.[/green]")
             apply_preferences = getattr(self.app, "apply_visual_preferences", None)
             if callable(apply_preferences):
                 apply_preferences(settings.tui_theme, settings.tui_density)
             self._apply_behavior_settings(settings)
         else:
-            self.query_one("#save-feedback", Static).update(
+            self._announce(
                 f"[red]{escape(result.error or 'Settings could not be saved.')}[/red]"
             )
 
@@ -206,7 +230,7 @@ class SettingsScreen(CopyEnabledScreen):
         if now - self._unsaved_warning_at <= self._UNSAVED_DISCARD_WINDOW_SECONDS:
             return True
         self._unsaved_warning_at = now
-        self.query_one("#save-feedback", Static).update(
+        self._announce(
             "[yellow]Unsaved changes. Press esc again to discard, or ctrl+s to save.[/yellow]"
         )
         return False

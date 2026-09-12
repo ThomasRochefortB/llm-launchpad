@@ -5,8 +5,9 @@ from __future__ import annotations
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Button, Footer, Static
+from textual.widgets import Button, Static
 
+from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
 
 _MODAL_COMMAND = "modal setup"
@@ -62,7 +63,7 @@ class SetupRequiredScreen(CopyEnabledScreen):
                     yield Button("Copy prime", id="setup-copy-prime-btn")
                     yield Button("Copy vast", id="setup-copy-vast-btn")
                     yield Button("Quit", id="setup-quit-btn", variant="error")
-        yield Footer()
+        yield FittedFooter()
 
     def on_mount(self) -> None:
         self.query_one("#setup-recheck-btn", Button).focus()
