@@ -85,7 +85,7 @@ def logout() -> None:
         raise typer.Exit(code=1) from None
     typer.echo("Removed Launchpad's Vast key." if removed else "No saved Launchpad Vast key to remove.")
     if credentials.api_key:
-        typer.echo(f"A key remains configured through {credentials.source}.")
+        typer.echo(f"A key remains configured ({credentials.source}).")
 
 
 def print_vast_offers(query: VastOfferQuery, *, output_json: bool) -> None:

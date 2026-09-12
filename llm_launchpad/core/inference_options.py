@@ -234,6 +234,35 @@ def resolve_inference_plans(
     return plans
 
 
+HOURS_PER_MONTH_CONTINUOUS: float = 24.0 * 30.0
+
+
+def workload_basis_label(workload: WorkloadProfile | None = None) -> str:
+    """State the assumptions a monthly estimate rests on, in one sentence.
+
+    Monthly figures are normalized through a workload profile, not wall-clock,
+    so a provisioned rental's "/mo" is a fraction of what leaving it running
+    costs. Printed unqualified next to "the rental bills continuously" the two
+    contradict each other, so every surface that shows the figure states this.
+    """
+
+    profile = workload or WorkloadProfile()
+    hours = profile.paid_hours_per_day
+    noun = "hour" if hours == 1 else "hours"
+    return (
+        f"Monthly estimates assume {hours:g} paid {noun} a day, scaled by "
+        f"{profile.utilization:.0%} utilization on scale-to-zero providers."
+    )
+
+
+def continuous_monthly_compute_cost(quote: ProviderQuote) -> float | None:
+    """Return the monthly cost of never stopping a provisioned resource."""
+
+    if quote.price_per_hour_usd is None:
+        return None
+    return quote.price_per_hour_usd * HOURS_PER_MONTH_CONTINUOUS
+
+
 def estimate_monthly_compute_cost(
     quote: ProviderQuote,
     workload: WorkloadProfile,

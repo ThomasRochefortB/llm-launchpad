@@ -10,12 +10,23 @@ from llm_launchpad.core.quick_deploy import (
     format_context_length,
     get_quick_deploy_catalog_info,
     get_quick_deploy_profile,
+    instance_slug_for_plan,
     list_quick_deploy_profiles,
     quick_deploy_model_label_parts,
+    quick_deploy_recipe,
     record_quick_deploy_catalog_failure,
 )
-from llm_launchpad.protocol.enums import BackendType, SpeculativeDecodingMethod
-from llm_launchpad.protocol.models import SpeculativeDecodingConfig
+from llm_launchpad.protocol.enums import (
+    BackendType,
+    BillingModel,
+    ComputeProvider,
+    SpeculativeDecodingMethod,
+)
+from llm_launchpad.protocol.models import (
+    InferencePlan,
+    ProviderQuote,
+    SpeculativeDecodingConfig,
+)
 
 from tests.catalog_fixtures import activate_static_like_catalog
 
@@ -176,6 +187,87 @@ class QuickDeployConfigTests(unittest.TestCase):
         config = build_quick_deploy_config(profile, app_name="llamacpp-custom-prod")
         self.assertEqual(config.app_name, "llamacpp-custom-prod")
         self.assertEqual(config.instance_name, "custom-prod")
+
+
+class InstanceSlugForPlanTests(unittest.TestCase):
+    """The default name must describe the hardware the user actually took.
+
+    ``instance_slug_hint`` ends in the catalog tier that chose the profile's
+    Modal shape, so picking any other placement in step two produced a name
+    like ``qwen3-27b-q2xl-b200`` for a pair of RTX 2060s -- and that name is
+    what the deployment is created with.
+    """
+
+    def _plan(self, profile, gpu_type: str, gpu_count: int) -> InferencePlan:
+        recipe = quick_deploy_recipe(profile)
+        return InferencePlan(
+            recipe=recipe,
+            quote=ProviderQuote(
+                id=f"vast:{gpu_type}",
+                recipe_id=recipe.id,
+                provider=ComputeProvider.VAST,
+                provider_reference="offer-1",
+                gpu_type=gpu_type,
+                gpu_count=gpu_count,
+                price_per_hour_usd=0.13,
+                billing_model=BillingModel.PROVISIONED,
+            ),
+        )
+
+    def test_the_tier_suffix_gives_way_to_the_chosen_placement(self) -> None:
+        profile = QuickDeployProfile(
+            id="demo",
+            display_name="Demo",
+            repo_id="acme/Demo-GGUF",
+            quant="UD-Q2_K_XL",
+            gpu_type="B200",
+            gpu_count=1,
+            profile_label="B200",
+            approx_cost_per_hour_usd=6.25,
+            max_context_tokens=262144,
+            instance_slug_hint="demo-q2xl-b200",
+            summary="",
+            server_args=(),
+            resource_tier="b200",
+        )
+        plan = self._plan(profile, "RTX 2060", 2)
+
+        self.assertEqual(
+            instance_slug_for_plan(profile, plan), "demo-q2xl-rtx-2060-x2"
+        )
+
+    def test_the_hint_stands_when_the_placement_is_the_one_it_describes(self) -> None:
+        profile = QuickDeployProfile(
+            id="demo",
+            display_name="Demo",
+            repo_id="acme/Demo-GGUF",
+            quant="UD-Q2_K_XL",
+            gpu_type="B200",
+            gpu_count=1,
+            profile_label="B200",
+            approx_cost_per_hour_usd=6.25,
+            max_context_tokens=262144,
+            instance_slug_hint="demo-q2xl-b200",
+            summary="",
+            server_args=(),
+            resource_tier="b200",
+        )
+
+        self.assertEqual(
+            instance_slug_for_plan(profile, self._plan(profile, "B200", 1)),
+            "demo-q2xl-b200",
+        )
+        self.assertEqual(instance_slug_for_plan(profile, None), "demo-q2xl-b200")
+
+    def test_the_deployment_config_carries_the_placement_name(self) -> None:
+        activate_static_like_catalog()
+        profile = get_quick_deploy_profile("qwen35-397b-rtxpro")
+        plan = self._plan(profile, "RTX 4090", 8)
+        config = build_quick_deploy_config(profile, plan=plan)
+
+        self.assertEqual(
+            config.instance_name, "qwen35-397b-rtxpro-rtx-4090-x8"
+        )
 
 
 if __name__ == "__main__":

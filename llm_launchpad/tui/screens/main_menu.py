@@ -469,10 +469,7 @@ _PROVIDER_RESOURCE_LABELS = {
 
 def _render_deployment_status(rows: list[EndpointInfo], username: str = "") -> str:
     if not rows:
-        return (
-            "[bold]Fleet Pulse[/bold]\n"
-            "[dim]No active launchpad apps.[/dim]"
-        )
+        return "[dim]No active launchpad apps.[/dim]"
 
     header_lines = _friendly_count_line(rows)
 
@@ -835,7 +832,7 @@ class MainMenuScreen(CopyEnabledScreen):
         Binding("t", "select_storage", "Storage", show=True),
         Binding("s", "select_settings", "Settings", show=True),
         Binding("i", "toggle_details", "Details", show=True),
-        Binding("escape", "close_details", show=False),
+        Binding("escape", "close_details", "Close details", show=False),
     ]
     _ENDPOINT_REFRESH_INTERVAL_SECONDS = 20.0
     _BILLING_REFRESH_INTERVAL_SECONDS = 300.0
@@ -1571,7 +1568,6 @@ class MainMenuScreen(CopyEnabledScreen):
     def on_deployments_load_failed(self, message: DeploymentsLoadFailed) -> None:
         self._status_refresh_inflight = False
         self.query_one("#deployment-status-body", Static).update(
-            "[bold]Fleet Pulse[/bold]\n"
             "[yellow]Status unavailable.[/yellow]\n"
             f"[dim]{clip(message.error, 80)}[/dim]"
         )

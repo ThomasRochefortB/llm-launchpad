@@ -13,12 +13,18 @@ from textual.containers import Vertical, VerticalScroll
 from textual.widgets import Button, Footer, Input, Select, Static, Switch
 
 from ...core.compute_availability import display_gpu_type
+from ...core.inference_options import (
+    continuous_monthly_compute_cost,
+    workload_basis_label,
+)
 from ...core.quick_deploy import (
     QuickDeployProfile,
     build_quick_deploy_config,
     format_context_length,
     get_quick_deploy_plan,
     get_quick_deploy_profile,
+    instance_slug_for_plan,
+    placement_matches_profile,
     quick_deploy_profile_for_plan,
     quick_deploy_model_label_parts,
     retune_quick_deploy_plan,
@@ -47,19 +53,6 @@ def _render_profile_label(profile: QuickDeployProfile, *, accent: str = "") -> s
     return f"{label_markup} [dim]{escape(quant_suffix)}[/dim]"
 
 
-def _placement_matches_profile(
-    profile: QuickDeployProfile,
-    plan: InferencePlan,
-) -> bool:
-    """Whether the chosen placement is the one this catalog tier describes."""
-
-    return (
-        (profile.gpu_type or "").strip().casefold()
-        == (plan.quote.gpu_type or "").strip().casefold()
-        and int(profile.gpu_count or 0) == int(plan.quote.gpu_count or 0)
-    )
-
-
 def _render_profile_summary(profile: QuickDeployProfile, plan: InferencePlan) -> str:
     lines = [
         _render_profile_label(profile, accent="bold #7bf168"),
@@ -72,7 +65,7 @@ def _render_profile_summary(profile: QuickDeployProfile, plan: InferencePlan) ->
     # on the B200 they deliberately selected -- so it is shown only when the
     # placement is the one the tier actually describes. Everything it conveyed
     # is stated exactly by the GPU, hourly and throughput rows below.
-    if profile.resource_tier_label and _placement_matches_profile(profile, plan):
+    if profile.resource_tier_label and placement_matches_profile(profile, plan):
         tier_detail = profile.resource_tier_label
         if profile.profile_label and profile.profile_label != profile.resource_tier_label:
             tier_detail = f"{tier_detail} {profile.profile_label}"
@@ -144,13 +137,21 @@ def _render_profile_summary(profile: QuickDeployProfile, plan: InferencePlan) ->
             f"[bold]Context[/bold]  Full {escape(format_context_length(profile.max_context_tokens))}",
             f"[bold]Hourly[/bold]   {escape(_plan_hourly_cost(plan))}",
             f"[bold]Monthly[/bold]  {escape(_plan_monthly_cost(plan))}",
+        ]
+    )
+    # A provisioned rental keeps billing until it is stopped, which the
+    # fulfillment note below says in words. Stating only the windowed estimate
+    # left the two contradicting each other, with the larger number missing.
+    if plan.quote.billing_model != BillingModel.SCALE_TO_ZERO:
+        lines.append(
+            f"[bold]If left up[/bold] {escape(_plan_continuous_monthly_cost(plan))}"
+        )
+    lines.extend(
+        [
             f"[bold]Model[/bold]    {escape(plan.recipe.model_id)}",
-            f"[bold]Default slug[/bold]  {escape(profile.instance_slug_hint)}",
+            f"[bold]Default slug[/bold]  {escape(instance_slug_for_plan(profile, plan))}",
             "",
-            (
-                "[dim]Monthly estimate assumes an 8-hour daily serving window at "
-                "25% utilization. Provisioned resources bill the full window.[/dim]"
-            ),
+            f"[dim]{escape(workload_basis_label())}[/dim]",
             "[dim]Availability is revalidated when deployment starts.[/dim]",
         ]
     )
@@ -202,6 +203,13 @@ def _plan_monthly_cost(plan: InferencePlan) -> str:
     return f"~${value:,.2f}/mo"
 
 
+def _plan_continuous_monthly_cost(plan: InferencePlan) -> str:
+    value = continuous_monthly_compute_cost(plan.quote)
+    if value is None:
+        return "Unavailable"
+    return f"~${value:,.2f}/mo at 24/7"
+
+
 def _fulfillment_option(plan: InferencePlan, *, recommended: bool = False) -> str:
     location = plan.quote.region or "provider-managed region"
     price = _plan_hourly_cost(plan)
@@ -210,6 +218,29 @@ def _fulfillment_option(plan: InferencePlan, *, recommended: bool = False) -> st
         f"{prefix}{plan.quote.provider.display_name} · "
         f"{plan.quote.gpu_count}x {display_gpu_type(plan.quote.gpu_type)} · {location} · {price}"
     )
+
+
+def _dedupe_fulfillment_options(
+    plans: tuple[InferencePlan, ...],
+    keep: InferencePlan,
+) -> tuple[InferencePlan, ...]:
+    """Drop placements this list cannot tell apart.
+
+    A provider can return several quotes for one shape -- Modal lists two B200
+    placements -- and the line above renders provider, GPU count, region and
+    price only, so they arrived as the same row twice with nothing to choose
+    between them. The selected plan is never dropped.
+    """
+
+    seen: set[str] = set()
+    unique: list[InferencePlan] = []
+    for plan in plans:
+        label = _fulfillment_option(plan)
+        if label in seen and plan.quote.id != keep.quote.id:
+            continue
+        seen.add(label)
+        unique.append(plan)
+    return tuple(unique)
 
 
 def _fulfillment_caution(plan: InferencePlan) -> str:
@@ -266,7 +297,9 @@ class QuickDeployScreen(CopyEnabledScreen):
             for plan in alternatives
             if plan.recipe.id == self.plan.recipe.id
         )
-        self._alternative_plans = matching or (self.plan,)
+        self._alternative_plans = _dedupe_fulfillment_options(
+            matching or (self.plan,), self.plan
+        )
         self._plan_by_id = {
             plan.quote.id: plan
             for plan in self._alternative_plans
@@ -418,7 +451,18 @@ class QuickDeployScreen(CopyEnabledScreen):
         for widget in self.query(".quick-advanced"):
             widget.add_class("hidden")
         self._sync_prime_option_visibility()
-        self.query_one("#quick-deploy-btn", Button).focus()
+        # This screen is reached by pressing enter, and Deploy spends money the
+        # moment it fires, so a second enter must not be able to rent a GPU.
+        # Start on the first thing worth reading; ctrl+d and tab still deploy.
+        target = next(iter(self.query("#quick-fulfillment")), None) or next(
+            iter(self.query("#toggle-advanced-quick")), None
+        )
+        if target is None:
+            target = self.query_one("#quick-deploy-btn", Button)
+        # Not scroll_visible: on a short terminal, scrolling the form control
+        # into view pushes the profile summary the user came here to read off
+        # the top of the screen.
+        target.focus(scroll_visible=False)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "toggle-advanced-quick":

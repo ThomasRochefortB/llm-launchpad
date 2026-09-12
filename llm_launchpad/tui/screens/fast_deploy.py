@@ -21,6 +21,7 @@ from ...core.compute_availability import (
     load_compute_availability,
     plans_for_compute_profile,
 )
+from ...core.inference_options import workload_basis_label
 from ...core.llamacpp_planner import assessment_score
 from ...core.serving_tiers import ServingTier, serving_tiers
 from ...core.runtime_support import load_llamacpp_support_manifest
@@ -226,6 +227,15 @@ def _model_option(
         return (
             f"  {escape(clip(model.display_name, 28)):<28} "
             f"[dim]{score} · {cost}[/dim]"
+        )
+    if width_mode == WidthMode.STANDARD:
+        # The size bucket is already the section heading this row sits under,
+        # so it is the first thing to drop. Carrying it at 80 columns pushed
+        # the line past the list and wrapped the price onto a second row,
+        # splitting "~$2.00/hr" across the box border.
+        return (
+            f"  {escape(clip(model.display_name, 34)):<34} "
+            f"[dim]{score} · from {cost}[/dim]"
         )
     return (
         f"  {escape(clip(model.display_name, 34)):<34} "
@@ -668,6 +678,33 @@ class FastDeployScreen(CopyEnabledScreen):
         Binding("x", "show_excluded_models", "Excluded models", show=True),
         Binding("r", "refresh_availability", "Refresh offers", show=True),
     ]
+    # Half of those keys belong to one step only. Leaving them live on the
+    # other one advertised a search box that step two does not have, and an
+    # "a" that quietly did nothing on step one.
+    _PHASE_ACTIONS = {
+        "focus_model_search": {"models"},
+        "show_excluded_models": {"models"},
+        "toggle_all_placements": {"infra"},
+    }
+
+    @property
+    def _phase(self) -> str:
+        return self._phase_name
+
+    @_phase.setter
+    def _phase(self, value: str) -> None:
+        if getattr(self, "_phase_name", None) == value:
+            return
+        self._phase_name = value
+        if self.is_mounted:
+            self.refresh_bindings()
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Hide and disable the keys that do not apply to the current step."""
+        phases = self._PHASE_ACTIONS.get(action)
+        if phases is not None and self._phase not in phases:
+            return False
+        return super().check_action(action, parameters)
 
     def __init__(self) -> None:
         super().__init__()
@@ -1107,6 +1144,8 @@ class FastDeployScreen(CopyEnabledScreen):
                 f"{'s' if len(rows) != 1 else ''}[/bold] "
                 "[dim]· best full-context throughput first · press a for tiers[/dim]"
             )
+        # Both views price rows by the month, and neither number is wall-clock.
+        status += f"\n[dim]{escape(workload_basis_label())}[/dim]"
         if self._gpu_filter not in {"", "any"}:
             status += f" [dim]· GPU {escape(self._gpu_filter)}[/dim]"
         if snapshot.vast_configured and not any(row.plan.quote.provider == ComputeProvider.VAST for row in rows):
@@ -1426,6 +1465,12 @@ class FastDeployScreen(CopyEnabledScreen):
 
     def action_focus_model_search(self) -> None:
         search = self.query_one("#fast-deploy-model-search", Input)
+        if self._phase != "models":
+            self.notify(
+                "Model search belongs to step 1; press esc to pick another model.",
+                timeout=3,
+            )
+            return
         if not search.display:
             self.notify(
                 "Model search is unavailable at this terminal size.", timeout=3

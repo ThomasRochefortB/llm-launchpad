@@ -203,6 +203,7 @@ class TuiApp(App):
         Binding(
             "ctrl+v,ctrl+shift+v,super+v,meta+v,cmd+v,command+v",
             "paste_from_clipboard",
+            "Paste",
             show=False,
             priority=True,
         ),
@@ -986,7 +987,7 @@ class TuiApp(App):
         if not url:
             self.notify("No endpoint URL is stored for this deployment.", severity="error", timeout=6)
             return
-        monitor = MonitorScreen(title="Status Check")
+        monitor = MonitorScreen(title="Status Check", deploy_backend=endpoint.backend)
         self.push_screen(monitor)
         self.run_worker(
             lambda: self._run_status(
@@ -1074,7 +1075,7 @@ class TuiApp(App):
             tokenizer=tokenizer,
             output_dir=output_dir,
         )
-        monitor = MonitorScreen(title="Benchmark")
+        monitor = MonitorScreen(title="Benchmark", deploy_backend=row.backend)
         self.push_screen(monitor)
         self.run_worker(
             lambda: self._run_benchmark(config, monitor),
@@ -1103,7 +1104,7 @@ class TuiApp(App):
         if endpoint.backend is None:
             self.notify("This endpoint has no recognized backend.", severity="error", timeout=6)
             return
-        monitor = MonitorScreen(title="Logs")
+        monitor = MonitorScreen(title="Logs", deploy_backend=endpoint.backend)
         self.push_screen(monitor)
         target_app_name = endpoint.name or legacy_app_name(endpoint.backend)
         target_ref = (endpoint.app_id or target_app_name).strip()
@@ -1157,7 +1158,7 @@ class TuiApp(App):
         if endpoint.backend is None:
             self.notify("This endpoint has no recognized backend.", severity="error", timeout=6)
             return
-        monitor = MonitorScreen(title="Stop")
+        monitor = MonitorScreen(title="Stop", deploy_backend=endpoint.backend)
         self.push_screen(monitor)
         target_app_name = endpoint.name or legacy_app_name(endpoint.backend)
         target_ref = (endpoint.app_id or target_app_name).strip()
@@ -1456,7 +1457,7 @@ class TuiApp(App):
         quant: str | None = None,
         revision: str | None = None,
     ) -> None:
-        monitor = MonitorScreen(title="Pre-download")
+        monitor = MonitorScreen(title="Pre-download", deploy_backend=backend)
         self.push_screen(monitor)
         self.run_worker(
             lambda: self._run_storage_predownload(
@@ -1489,7 +1490,7 @@ class TuiApp(App):
             _dispatch_event(monitor, event)
 
     def begin_storage_delete(self, model: StoredModelInfo) -> None:
-        monitor = MonitorScreen(title="Delete model")
+        monitor = MonitorScreen(title="Delete model", deploy_backend=model.backend)
         self.push_screen(monitor)
         self.run_worker(
             lambda: self._run_storage_delete(model=model, monitor=monitor),

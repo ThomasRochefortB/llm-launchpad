@@ -178,11 +178,32 @@ def aggregate_compute_availability(
     return ComputeAvailabilitySnapshot(configurations=tuple(configurations))
 
 
+def gpu_memory_label(memory_gb: float) -> str:
+    """Render VRAM the way vendors quote it: whole gigabytes.
+
+    Providers derive capacity from the device byte count, so Vast reports
+    5.99414 for a 6 GB card and 79.6475 for an 80 GB one. Printing that raw
+    filled the GPU filter with numbers like "RTX A2000 5.99414GB", and because
+    the identity below is built from this label it also split one card into
+    several entries whenever two hosts rounded differently.
+    """
+
+    if memory_gb <= 0:
+        return "0GB"
+    if memory_gb < 1:
+        return f"{memory_gb:.2g}GB"
+    return f"{round(memory_gb)}GB"
+
+
 def canonical_gpu_identity(value: str, memory_gb: float) -> tuple[str, str]:
     """Return a stable cross-provider ID and concise display label."""
 
     normalized = re.sub(r"[^A-Z0-9]+", "-", value.strip().upper()).strip("-")
-    memory_suffix = re.compile(rf"-{int(memory_gb)}GB$")
+    memory_label = gpu_memory_label(memory_gb)
+    # Strip the capacity the name already carries, using the same rounded label
+    # that is about to be appended; deriving it with int() truncation left
+    # "RTX A2000 6GB" reading "RTX A2000 6GB 6GB".
+    memory_suffix = re.compile(rf"-{re.escape(memory_label)}$")
     family = memory_suffix.sub("", normalized)
     aliases = {
         "A100-40GB": "A100",
@@ -197,7 +218,6 @@ def canonical_gpu_identity(value: str, memory_gb: float) -> tuple[str, str]:
         "RTXPRO6000": "RTX PRO 6000",
     }
     family = aliases.get(normalized, aliases.get(family, family.replace("-", " ")))
-    memory_label = f"{memory_gb:g}GB"
     display_name = f"{family} {memory_label}"
     config_id = re.sub(r"[^a-z0-9]+", "-", display_name.casefold()).strip("-")
     return config_id, display_name

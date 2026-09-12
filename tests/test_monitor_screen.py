@@ -74,6 +74,53 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(header.state, expected)
                     self.assertEqual(header.detail, "")
 
+    async def test_a_read_only_operation_also_leaves_the_running_state(self) -> None:
+        """Logs, status and benchmark were missing from the terminal-state map.
+
+        They fell through to None, so the bar still read "state: running" while
+        the pane below said "Operation complete (logs)".
+        """
+        from llm_launchpad.tui.widgets.status_header import StatusHeader
+
+        for operation in (
+            OperationType.LOGS,
+            OperationType.STATUS,
+            OperationType.BENCHMARK,
+            OperationType.STORAGE_PREDOWNLOAD,
+        ):
+            with self.subTest(operation=operation):
+                app = _TestApp()
+                async with app.run_test() as pilot:
+                    app.push_screen(MonitorScreen("Logs"))
+                    await pilot.pause()
+                    screen = app.screen
+                    assert isinstance(screen, MonitorScreen)
+                    header = screen.query_one("#monitor-status-header", StatusHeader)
+                    header.update_from_event(
+                        state=DeploymentState.RUNNING, operation=operation
+                    )
+                    screen.on_operation_done(
+                        OperationDone(operation=operation, success=True)
+                    )
+                    await pilot.pause()
+                    self.assertEqual(header.state, "idle")
+
+    async def test_the_context_bar_names_the_backend_it_was_given(self) -> None:
+        """Every caller knows the backend; only deploy used to say so."""
+        from llm_launchpad.tui.widgets.status_header import StatusHeader
+
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(
+                MonitorScreen("Logs", deploy_backend=BackendType.LLAMACPP)
+            )
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, MonitorScreen)
+            header = screen.query_one("#monitor-status-header", StatusHeader)
+            self.assertEqual(header.backend, "llamacpp")
+            self.assertIn("llamacpp", header.render())
+
     async def test_a_failed_operation_drops_the_stale_detail(self) -> None:
         # DeploymentState has no failed member, so the state it reached stands;
         # the detail must not keep advertising work that stopped.
@@ -766,3 +813,66 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MonitorLaunchBackendTests(unittest.IsolatedAsyncioTestCase):
+    """Every operation that opens a monitor knows which backend it runs on.
+
+    Only deploy used to pass it, so logs, status, benchmark, stop and the two
+    storage operations all opened with the context bar reading "backend: --".
+    """
+
+    async def test_every_operation_opens_its_monitor_with_a_named_backend(self) -> None:
+        from llm_launchpad.core.config import ConfigStore
+        from llm_launchpad.protocol.enums import ComputeProvider
+        from llm_launchpad.protocol.models import EndpointInfo, StoredModelInfo
+        from llm_launchpad.tui.app import TuiApp
+
+        endpoint = EndpointInfo(
+            name="llamacpp-alpha",
+            backend=BackendType.LLAMACPP,
+            provider=ComputeProvider.MODAL,
+            app_id="ap-alpha",
+            web_url="https://example.invalid/v1",
+            state="deployed",
+        )
+        stored = StoredModelInfo(
+            backend=BackendType.VLLM,
+            model_id="acme/model",
+            revision=None,
+            quant=None,
+            size_bytes=1,
+            file_count=1,
+            source_volume="huggingface-cache",
+            paths=[],
+            incomplete=False,
+        )
+
+        launchers = (
+            ("logs", lambda app: app.begin_logs(endpoint), BackendType.LLAMACPP),
+            ("status", lambda app: app.begin_status(endpoint), BackendType.LLAMACPP),
+            ("benchmark", lambda app: app.begin_benchmark(endpoint), BackendType.LLAMACPP),
+            ("stop", lambda app: app.begin_stop(endpoint), BackendType.LLAMACPP),
+            (
+                "predownload",
+                lambda app: app.begin_storage_predownload(BackendType.VLLM, "acme/model"),
+                BackendType.VLLM,
+            ),
+            ("delete", lambda app: app.begin_storage_delete(stored), BackendType.VLLM),
+        )
+
+        for label, launch, expected in launchers:
+            with self.subTest(operation=label):
+                with (
+                    patch.object(TuiApp, "_sync_opencode", return_value=None),
+                    patch.object(TuiApp, "run_worker", return_value=None),
+                    patch.object(ConfigStore, "save", return_value=None),
+                ):
+                    app = TuiApp()
+                    async with app.run_test() as pilot:
+                        await pilot.pause()
+                        launch(app)
+                        await pilot.pause()
+                        screen = app.screen
+                        assert isinstance(screen, MonitorScreen)
+                        self.assertEqual(screen._deploy_backend, expected)

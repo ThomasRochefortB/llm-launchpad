@@ -492,6 +492,49 @@ def quick_deploy_profile_for_plan(
     return match
 
 
+def placement_matches_profile(
+    profile: QuickDeployProfile,
+    plan: InferencePlan | None,
+) -> bool:
+    """Whether the chosen placement is the shape this catalog tier describes."""
+
+    if plan is None:
+        return True
+    return (
+        (profile.gpu_type or "").strip().casefold()
+        == (plan.quote.gpu_type or "").strip().casefold()
+        and int(profile.gpu_count or 0) == int(plan.quote.gpu_count or 0)
+    )
+
+
+def instance_slug_for_plan(
+    profile: QuickDeployProfile,
+    plan: InferencePlan | None,
+) -> str:
+    """Return the default instance slug, named after the hardware in use.
+
+    ``instance_slug_hint`` ends in the catalog tier -- "cheap", "rtx-pro",
+    "b200" -- that picked the profile's Modal shape. Step two lets the user
+    take any certified placement, and the tier then names hardware they did
+    not choose: deploying on two RTX 2060s produced
+    ``qwen3-8-27b-xhigh-q2xl-b200`` and carried that into the instance name.
+    """
+
+    hint = (profile.instance_slug_hint or "").strip()
+    if not hint or plan is None or placement_matches_profile(profile, plan):
+        return hint
+    tier = (profile.resource_tier or "").strip()
+    base = hint
+    if tier and hint.casefold().endswith(f"-{tier.casefold()}"):
+        base = hint[: -(len(tier) + 1)]
+    gpu = slugify_instance_name(plan.quote.gpu_type, default="")
+    count = int(plan.quote.gpu_count or 1)
+    suffix = gpu if count <= 1 else f"{gpu}-x{count}" if gpu else f"x{count}"
+    if not suffix:
+        return base or hint
+    return f"{base}-{suffix}" if base else suffix
+
+
 def build_quick_deploy_config(
     profile: QuickDeployProfile,
     *,
@@ -615,6 +658,6 @@ def build_quick_deploy_config(
         config.instance_name = slugify_instance_name(instance_override)
         config.app_name = build_deployment_name(provider, config.backend, config.instance_name)
     else:
-        config.instance_name = slugify_instance_name(profile.instance_slug_hint)
+        config.instance_name = slugify_instance_name(instance_slug_for_plan(profile, plan))
         config.app_name = build_deployment_name(provider, config.backend, config.instance_name)
     return config

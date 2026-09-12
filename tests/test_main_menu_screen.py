@@ -73,6 +73,21 @@ class MainMenuStatusRenderTests(unittest.TestCase):
     def test_render_deployment_status_empty_state(self) -> None:
         rendered = _render_deployment_status([])
         self.assertIn("No active launchpad apps", rendered)
+        # The panel is already titled "Deployment Status"; the second heading
+        # appeared only in the empty state, so the panel renamed itself when
+        # the fleet emptied.
+        self.assertNotIn("Fleet Pulse", rendered)
+        self.assertNotIn("Fleet Pulse", _render_deployment_status(
+            [
+                EndpointInfo(
+                    name="vllm-qwen",
+                    app_id="ap-1",
+                    state="running",
+                    backend=BackendType.VLLM,
+                    instance_name="qwen",
+                )
+            ]
+        ))
 
     def test_render_deployment_status_includes_counts_and_rows(self) -> None:
         rows = [

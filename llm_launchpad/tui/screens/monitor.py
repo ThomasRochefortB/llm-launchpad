@@ -107,8 +107,8 @@ class MonitorScreen(CopyEnabledScreen):
         Binding("pagedown", "page_down_log", "Page down", show=True, priority=True),
         Binding("end", "resume_follow", "Follow", show=True, priority=True),
         Binding("/", "search_logs", "Search", show=True, priority=True),
-        Binding("n", "next_search_match", show=False),
-        Binding("shift+n", "previous_search_match", show=False),
+        Binding("n", "next_search_match", "Next match", show=False),
+        Binding("shift+n", "previous_search_match", "Previous match", show=False),
         Binding("v", "toggle_log_view", "Raw/Summary", show=True),
         Binding("ctrl+l", "clear_log", "Clear log", show=True),
         Binding("enter", "submit_or_finish", "Done", show=False, priority=True),
@@ -234,6 +234,11 @@ class MonitorScreen(CopyEnabledScreen):
     # -- Message handlers --
 
     def on_mount(self) -> None:
+        # Every caller knows the backend it is operating on, so name it even
+        # when there is no deploy summary to drive. Leaving it unset showed
+        # "backend: --" for the whole of logs, status, benchmark and stop.
+        if self._deploy_backend is not None:
+            self.status_header.update_from_event(backend=self._deploy_backend)
         if self._summary_mode_enabled:
             self.status_header.update_from_event(
                 state=DeploymentState.QUEUED,
@@ -299,6 +304,12 @@ class MonitorScreen(CopyEnabledScreen):
     # Without this the context bar kept its last in-progress state forever, so a
     # finished deploy still read "state: publishing · Publishing verified
     # endpoint" while the log below said the operation was complete.
+    #
+    # Only the operations below leave the deployment somewhere new. Everything
+    # else -- logs, status, benchmark, the storage operations -- reads or edits
+    # a cache and ends at idle, because nothing is running any more. They are
+    # not listed individually: an unmapped operation falling through to None is
+    # what left a finished `logs` run still reading "state: running".
     _TERMINAL_STATES = {
         OperationType.DEPLOY: DeploymentState.HEALTHY,
         OperationType.WARMUP: DeploymentState.HEALTHY,
@@ -314,7 +325,9 @@ class MonitorScreen(CopyEnabledScreen):
         # that is no longer running.
         if message.success:
             self.status_header.update_from_event(
-                state=self._TERMINAL_STATES.get(message.operation)
+                state=self._TERMINAL_STATES.get(
+                    message.operation, DeploymentState.IDLE
+                )
             )
         # update_from_event keeps the old detail when given an empty one, so
         # clear it directly rather than loosening that for every caller.

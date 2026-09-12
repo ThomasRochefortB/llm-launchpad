@@ -6,6 +6,8 @@ import threading
 import unittest
 from unittest.mock import patch
 
+from rich.cells import cell_len
+from rich.markup import render as render_markup
 from textual.app import App
 from textual.widgets import Input, OptionList, Static
 
@@ -18,6 +20,7 @@ from llm_launchpad.core.quick_deploy import (
     QuickDeployProfile,
     list_quick_deploy_recipes,
 )
+from llm_launchpad.core.inference_options import workload_basis_label
 from llm_launchpad.core.prime_backend import preferred_prime_offer_image
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider
 from llm_launchpad.protocol.models import CatalogExclusion, ComputeAvailabilitySnapshot, ComputeOffer, InferencePlan
@@ -402,6 +405,71 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
         # ladder; Fast Deploy never retries above the user's selected price.
         self.assertEqual(len(alternatives), 2)
         self.assertEqual(alternatives[0].quote.id, selected.quote.id)
+
+    async def test_infra_status_states_what_the_monthly_column_measures(self) -> None:
+        """Every "/mo" here is a workload estimate, not wall-clock.
+
+        Unqualified, a provisioned rental's figure reads as the cost of
+        leaving it up, which is roughly three times larger.
+        """
+        model = _model((_profile("fits", required_vram_gb=100.0),))
+        snapshot = aggregate_compute_availability(
+            modal_catalog=[ModalGpuSpec("H100", price_per_hour_usd=4.0)]
+        )
+        app = _TestApp()
+        with patch(
+            "llm_launchpad.tui.screens.fast_deploy.list_quick_deploy_models",
+            return_value=(model,),
+        ):
+            async with app.run_test() as pilot:
+                app.push_screen(FastDeployScreen())
+                await pilot.pause()
+                screen = app.screen
+                assert isinstance(screen, FastDeployScreen)
+                screen._selected_model = model
+                screen.on_fast_deploy_availability_loaded(
+                    FastDeployAvailabilityLoaded(snapshot)
+                )
+                await pilot.pause()
+
+                status = str(screen.query_one("#fast-deploy-status", Static).content)
+                self.assertIn(workload_basis_label(), status)
+
+    async def test_step_one_and_step_two_advertise_only_their_own_keys(self) -> None:
+        """Search and the exclusions list belong to step one, compare-all to step two.
+
+        Leaving them all live told the reader step two had a model search --
+        and that "/" there was blocked by their terminal size.
+        """
+        model = _model((_profile("fits", required_vram_gb=100.0),))
+        snapshot = aggregate_compute_availability(
+            modal_catalog=[ModalGpuSpec("H100", price_per_hour_usd=4.0)]
+        )
+        app = _TestApp()
+        with patch(
+            "llm_launchpad.tui.screens.fast_deploy.list_quick_deploy_models",
+            return_value=(model,),
+        ):
+            async with app.run_test() as pilot:
+                app.push_screen(FastDeployScreen())
+                await pilot.pause()
+                screen = app.screen
+                assert isinstance(screen, FastDeployScreen)
+
+                self.assertTrue(screen.check_action("focus_model_search", ()))
+                self.assertTrue(screen.check_action("show_excluded_models", ()))
+                self.assertFalse(screen.check_action("toggle_all_placements", ()))
+
+                screen._selected_model = model
+                screen.on_fast_deploy_availability_loaded(
+                    FastDeployAvailabilityLoaded(snapshot)
+                )
+                await pilot.pause()
+
+                self.assertEqual(screen._phase, "infra")
+                self.assertFalse(screen.check_action("focus_model_search", ()))
+                self.assertFalse(screen.check_action("show_excluded_models", ()))
+                self.assertTrue(screen.check_action("toggle_all_placements", ()))
 
     async def test_availability_failure_renders_catalog_estimates(self) -> None:
         model = _model((_profile("too-large", required_vram_gb=200.0),))
@@ -895,6 +963,40 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 option_list = screen.query_one("#fast-deploy-list", OptionList)
                 self.assertGreaterEqual(option_list.size.height, 6)
 
+
+    async def test_model_rows_stay_inside_the_list_at_eighty_columns(self) -> None:
+        """The row carried the size bucket its own section heading states.
+
+        At 80 columns that pushed the line past the list, wrapping "~$4.00/hr"
+        onto a second row and splitting the price across the box border.
+        """
+        model = _model(
+            (
+                _profile(
+                    "fits",
+                    required_vram_gb=100.0,
+                    display_name="A Fairly Long Model Name Here",
+                ),
+            )
+        )
+        app = _StyledApp()
+        with patch(
+            "llm_launchpad.tui.screens.fast_deploy.list_quick_deploy_models",
+            return_value=(model,),
+        ):
+            async with app.run_test(size=(80, 24)) as pilot:
+                app.push_screen(FastDeployScreen())
+                await pilot.pause()
+
+                screen = app.screen
+                assert isinstance(screen, FastDeployScreen)
+                option_list = screen.query_one("#fast-deploy-list", OptionList)
+                width = option_list.content_size.width
+                for index in range(option_list.option_count):
+                    prompt = str(option_list.get_option_at_index(index).prompt)
+                    with self.subTest(row=prompt):
+                        plain = render_markup(prompt).plain
+                        self.assertLessEqual(cell_len(plain), width)
 
     async def test_pending_catalog_renders_building_state(self) -> None:
         app = _StyledApp()
