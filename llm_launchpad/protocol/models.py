@@ -757,3 +757,55 @@ class StorageSnapshot:
     @property
     def total_models(self) -> int:
         return len(self.llamacpp_models) + len(self.vllm_models)
+
+
+@dataclass(frozen=True)
+class ProviderListing:
+    """One provider's answer to a fleet discovery pass.
+
+    A provider that could not be reached still contributes the rows it last
+    returned. An empty fleet and an unreachable provider mean opposite things
+    to someone deciding whether to redeploy, so the two are never merged into
+    a shorter list.
+    """
+
+    provider: ComputeProvider
+    rows: tuple[EndpointInfo, ...] = ()
+    error: str | None = None
+    retrieved_at_epoch: float | None = None
+
+    @property
+    def available(self) -> bool:
+        """Whether this pass reached the provider."""
+        return self.error is None
+
+    @property
+    def is_retained(self) -> bool:
+        """Whether these rows survived a failed pass and may be out of date."""
+        return self.error is not None and bool(self.rows)
+
+    def age_seconds(self, now: float) -> float | None:
+        """Seconds since these rows were read, or None if they never were."""
+        if self.retrieved_at_epoch is None:
+            return None
+        return max(0.0, now - self.retrieved_at_epoch)
+
+
+@dataclass(frozen=True)
+class FleetDiscovery:
+    """Every configured provider's listing from a single discovery pass."""
+
+    listings: tuple[ProviderListing, ...] = ()
+
+    @property
+    def rows(self) -> list[EndpointInfo]:
+        return [row for listing in self.listings for row in listing.rows]
+
+    @property
+    def prune_providers(self) -> tuple[ComputeProvider, ...]:
+        """Providers that answered, and whose absences are therefore real."""
+        return tuple(listing.provider for listing in self.listings if listing.available)
+
+    @property
+    def unavailable(self) -> tuple[ProviderListing, ...]:
+        return tuple(listing for listing in self.listings if not listing.available)

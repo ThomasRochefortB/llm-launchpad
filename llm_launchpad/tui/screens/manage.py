@@ -15,6 +15,7 @@ from ...core.vision_probe import image_test_command
 from ...protocol.enums import ComputeProvider, VisionVerification
 from ...protocol.models import EndpointInfo, VisionCapabilities
 from ..connection import endpoint_connection_payload, resolve_openai_base_url
+from ..fleet_status import provider_outage_lines, retained_providers
 from ..navigation import move_focus_across_widgets
 from ..responsive import ViewportProfile, WidthMode
 from ..widgets.adaptive_table import AdaptiveColumn, AdaptiveDataTable
@@ -224,6 +225,7 @@ class ManageScreen(CopyEnabledScreen):
         self._rows: list[EndpointInfo] = []
         self._rows_by_key: dict[str, EndpointInfo] = {}
         self._selected_key: str | None = None
+        self._retained_providers: set[str] = set()
         self._was_suspended = False
         table = self.query_one("#manage-endpoint-table", AdaptiveDataTable)
         table.cursor_type = "row"
@@ -264,13 +266,22 @@ class ManageScreen(CopyEnabledScreen):
             key=lambda row: (_endpoint_name(row).casefold(), _endpoint_key(row)),
         )
         self._rows_by_key = {_endpoint_key(row): row for row in self._rows}
+        self._retained_providers = retained_providers(message.discovery)
+        outage_lines = provider_outage_lines(message.discovery)
         table = self.query_one("#manage-endpoint-table", AdaptiveDataTable)
         table.set_rows(self._rows)
 
         if not self._rows:
             self._selected_key = None
-            self.query_one("#manage-status", Static).update(
+            # An unreachable provider is not an empty fleet, and saying so would
+            # invite a second deployment of something that is already running.
+            summary = (
                 "[yellow]No managed endpoints found.[/yellow]  Press r to refresh."
+                if not outage_lines
+                else "[yellow]No endpoints could be listed.[/yellow]  Press r to retry."
+            )
+            self.query_one("#manage-status", Static).update(
+                "\n".join([summary, *outage_lines])
             )
             self._update_selection_detail()
             return
@@ -281,8 +292,13 @@ class ManageScreen(CopyEnabledScreen):
             else _endpoint_key(self._rows[0])
         )
         noun = "endpoint" if len(self._rows) == 1 else "endpoints"
-        self.query_one("#manage-status", Static).update(
+        summary = (
             f"[green]Fleet refreshed.[/green] {len(self._rows)} managed {noun}."
+            if not outage_lines
+            else f"[yellow]Fleet partly refreshed.[/yellow] {len(self._rows)} managed {noun}."
+        )
+        self.query_one("#manage-status", Static).update(
+            "\n".join([summary, *outage_lines])
         )
         self._move_cursor_to_selected()
         self._update_selection_detail()
@@ -427,10 +443,16 @@ class ManageScreen(CopyEnabledScreen):
         ]
         base_url, _derived = resolve_openai_base_url(row, username=self._modal_username())
         url_line = f"\n[dim]Base URL:[/dim] {escape(base_url)}" if base_url else ""
+        stale_line = (
+            f"\n[yellow]{escape(row.provider.display_name)} did not answer the last refresh;"
+            " this state may be out of date.[/yellow]"
+            if row.provider.value in self._retained_providers
+            else ""
+        )
         detail.update(
             f"[bold]{escape(_endpoint_name(row))}[/bold]  "
             f"[dim]{escape(_endpoint_host(row))} · {escape(_state_label(row.state))}[/dim]"
-            f"{url_line}\n"
+            f"{url_line}{stale_line}\n"
             f"Actions: {', '.join(action_labels) or 'none'}"
         )
 

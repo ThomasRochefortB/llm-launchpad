@@ -9,6 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import PropertyMock, patch
 
+from llm_launchpad.core.backend import ModalListAppsResult
 from llm_launchpad.core.hf_models import GgufQuantMetadata
 from llm_launchpad.core.prime_auth import PrimeAuthStatus
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider, OperationType
@@ -117,10 +118,10 @@ class TuiAppStorageCacheTests(unittest.TestCase):
         prime_started = threading.Event()
         modal_saw_prime = False
 
-        def modal_rows() -> list[EndpointInfo]:
+        def modal_rows() -> ModalListAppsResult:
             nonlocal modal_saw_prime
             modal_saw_prime = prime_started.wait(timeout=1.0)
-            return []
+            return ModalListAppsResult(rows=[])
 
         def prime_rows(_self: object) -> list[EndpointInfo]:
             prime_started.set()
@@ -130,7 +131,7 @@ class TuiAppStorageCacheTests(unittest.TestCase):
             "llm_launchpad.tui.app.get_prime_auth_status",
             return_value=PrimeAuthStatus(authenticated=True),
         ), patch(
-            "llm_launchpad.tui.app.ModalBackend.list_apps",
+            "llm_launchpad.tui.app.ModalBackend.list_apps_result",
             side_effect=modal_rows,
         ), patch(
             "llm_launchpad.tui.app.PrimeBackend.list_deployments",
@@ -630,7 +631,10 @@ class TuiAppStorageCacheTests(unittest.TestCase):
                 )
             ]
             with (
-                patch("llm_launchpad.tui.app.ModalBackend.list_apps", return_value=rows),
+                patch(
+                    "llm_launchpad.tui.app.ModalBackend.list_apps_result",
+                    return_value=ModalListAppsResult(rows=rows),
+                ),
                 patch(
                     "llm_launchpad.tui.app.get_prime_auth_status",
                     return_value=PrimeAuthStatus(authenticated=False),
@@ -666,7 +670,10 @@ class TuiAppStorageCacheTests(unittest.TestCase):
             )
         ]
         with (
-            patch("llm_launchpad.tui.app.ModalBackend.list_apps", return_value=rows),
+            patch(
+                "llm_launchpad.tui.app.ModalBackend.list_apps_result",
+                return_value=ModalListAppsResult(rows=rows),
+            ),
             patch(
                 "llm_launchpad.tui.app.get_prime_auth_status",
                 return_value=PrimeAuthStatus(authenticated=False),
