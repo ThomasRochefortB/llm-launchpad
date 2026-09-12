@@ -306,6 +306,9 @@ def representative_profiles_for_model(
     return tuple(unique)
 
 
+NO_PRICE_EXCLUSION = "publishes no hourly price"
+
+
 def infra_rows_for_model(
     model: QuickDeployModel,
     snapshot: ComputeAvailabilitySnapshot,
@@ -327,6 +330,18 @@ def infra_rows_for_model(
             for plan in plans_for_compute_profile(
                 configuration, profile, rejected=rejected
             ):
+                # Fast Deploy ranks by price and promises a fallback "at or
+                # below the approved hourly price". A placement whose cost the
+                # provider does not publish -- Modal lists no price for H100 or
+                # H200 -- can satisfy neither, so it is not offered here. The
+                # Advanced deploy form still reaches that hardware.
+                if plan.quote.price_per_hour_usd is None:
+                    if rejected is not None:
+                        rejected.append(
+                            f"{configuration.gpu_type}: "
+                            f"{plan.quote.provider.display_name} {NO_PRICE_EXCLUSION}"
+                        )
+                    continue
                 grouped.setdefault(plan.quote.provider.value, []).append(plan)
             for provider_plans in grouped.values():
                 best = provider_plans[0]
@@ -1095,11 +1110,20 @@ class FastDeployScreen(CopyEnabledScreen):
             )
         if excluded:
             # A shorter list with no explanation reads as missing hardware
-            # rather than as hardware that would not have worked.
+            # rather than as hardware that would not have worked. The reasons
+            # differ, so the summary counts them rather than asserting one.
+            unpriced = sum(1 for reason in excluded if NO_PRICE_EXCLUSION in reason)
+            reasons = []
+            if len(excluded) - unpriced:
+                reasons.append(
+                    f"{len(excluded) - unpriced} cannot hold the full context on GPU"
+                )
+            if unpriced:
+                reasons.append(f"{unpriced} have no published hourly price")
             status += (
                 f"\n[dim]{len(excluded)} placement"
                 f"{'s' if len(excluded) != 1 else ''} excluded: "
-                "cannot hold the full context on GPU.[/dim]"
+                f"{'; '.join(reasons)}.[/dim]"
             )
         if snapshot.errors:
             status += "\n[yellow]Partial results:[/yellow] " + escape(

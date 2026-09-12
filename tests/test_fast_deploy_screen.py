@@ -139,6 +139,38 @@ class _StyledApp(_TestApp):
     CSS_PATH = TuiApp.CSS_PATH
 
 
+class UnpricedPlacementTests(unittest.TestCase):
+    """Fast Deploy ranks by price and promises a priced fallback ceiling.
+
+    Modal publishes no hourly price for H100 or H200, and those placements were
+    offered anyway: they sorted last, showed "price n/a", and could still be
+    chosen or selected as a fallback whose ceiling nothing could check.
+    """
+
+    def test_a_placement_without_a_price_is_not_offered(self) -> None:
+        from llm_launchpad.core.compute_availability import aggregate_compute_availability
+        from llm_launchpad.core.modal_gpu import ModalGpuSpec
+        from llm_launchpad.tui.screens.fast_deploy import (
+            NO_PRICE_EXCLUSION,
+            infra_rows_for_model,
+        )
+        from tests.test_vast_fast_deploy import comparison_model
+
+        snapshot = aggregate_compute_availability(
+            modal_catalog=[
+                ModalGpuSpec("L4", price_per_hour_usd=0.8),
+                ModalGpuSpec("H200", price_per_hour_usd=None),
+            ]
+        )
+        excluded: list[str] = []
+        rows = infra_rows_for_model(comparison_model(), snapshot, rejected=excluded)
+
+        self.assertTrue(all(row.plan.quote.price_per_hour_usd is not None for row in rows))
+        self.assertFalse([row for row in rows if "H200" in row.plan.quote.gpu_type])
+        # Dropped silently, a short list reads as missing hardware.
+        self.assertTrue([reason for reason in excluded if NO_PRICE_EXCLUSION in reason])
+
+
 class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         from llm_launchpad.core import quick_deploy as _qd
