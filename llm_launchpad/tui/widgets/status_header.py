@@ -14,7 +14,8 @@ class StatusHeader(Static):
 
     DEFAULT_CSS = """
     StatusHeader {
-        height: 3;
+        /* One content row plus the bottom border; render() is a single line. */
+        height: 2;
         padding: 0 2;
         background: $surface;
         border-bottom: solid $border;
@@ -68,17 +69,27 @@ class StatusHeader(Static):
             self.detail = detail
 
 
+# Deliberately ASCII: these have to stay readable with colour stripped, which
+# is what the monochrome theme and low-colour terminals do. Every marker is
+# padded to the same width so `state:` does not shift sideways as the state
+# changes underneath it.
+_STATE_MARKER_WIDTH = 2
+
+# No marker may begin with "[": these are interpolated into Rich markup.
+_STATE_MARKERS: dict[str, tuple[str, str]] = {
+    "idle": ("..", "dim"),
+    "queued": ("~~", "yellow"),
+    "running": (">>", "green"),
+    "deploying": ("^^", "green"),
+    "warming_up": ("**", "yellow"),
+    "healthy": ("OK", "green"),
+    "unhealthy": ("!!", "red"),
+    "stopped": ("--", "dim"),
+    "error": ("XX", "red"),
+    "cancelled": ("//", "dim"),
+}
+
+
 def _state_icon(state: str) -> str:
-    icons = {
-        "idle": "[dim]o[/]",
-        "queued": "[yellow]~[/]",
-        "running": "[green]>[/]",
-        "deploying": "[green]>>[/]",
-        "warming_up": "[yellow]*[/]",
-        "healthy": "[green]OK[/]",
-        "unhealthy": "[red]X[/]",
-        "stopped": "[dim].[/]",
-        "error": "[red]![/]",
-        "cancelled": "[dim]-[/]",
-    }
-    return icons.get(state, "[dim]?[/]")
+    marker, style = _STATE_MARKERS.get(state, ("??", "dim"))
+    return f"[{style}]{marker:<{_STATE_MARKER_WIDTH}}[/]"

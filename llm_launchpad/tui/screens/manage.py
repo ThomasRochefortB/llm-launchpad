@@ -7,7 +7,7 @@ from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Button, DataTable, Footer, Input, OptionList, Static
+from textual.widgets import Button, DataTable, Input, OptionList, Static
 from textual.widgets.option_list import Option
 
 from ...core.benchmark import parse_concurrency_values
@@ -21,6 +21,7 @@ from ..responsive import ViewportProfile, WidthMode
 from ..widgets.adaptive_table import AdaptiveColumn, AdaptiveDataTable
 from ..widgets.input_form import FormField
 from ..workers import EndpointsFailed, EndpointsLoaded
+from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
 
 
@@ -214,12 +215,11 @@ class ManageScreen(CopyEnabledScreen):
             )
             yield Static("[dim]Loading managed endpoints...[/dim]", id="manage-status")
             yield AdaptiveDataTable(id="manage-endpoint-table")
+            # The footer already renders Back, Refresh and Actions with their
+            # keys; a second copy of the same list below the table was one more
+            # line to read and one more place to keep in step.
             yield Static("[dim]No endpoint selected.[/dim]", id="manage-selection-detail")
-            yield Static(
-                "[dim]↑/↓ choose · Enter actions · r refresh · Esc back[/dim]",
-                id="manage-help",
-            )
-        yield Footer()
+        yield FittedFooter()
 
     def on_mount(self) -> None:
         self._rows: list[EndpointInfo] = []
@@ -497,7 +497,7 @@ class EndpointActionsScreen(CopyEnabledScreen):
                 "[dim]↑/↓ choose · Enter open · Esc back[/dim]",
                 id="manage-action-help",
             )
-        yield Footer()
+        yield FittedFooter()
 
     def on_mount(self) -> None:
         actions = self.query_one("#manage-actions", OptionList)
@@ -563,7 +563,7 @@ class ConnectionInfoScreen(CopyEnabledScreen):
                 yield Button("Copy model ID", id="connection-copy-model")
                 yield Button("Copy API key", id="connection-copy-key")
                 yield Button("Copy image request", id="connection-copy-image")
-        yield Footer()
+        yield FittedFooter()
 
     def on_mount(self) -> None:
         self._payload = endpoint_connection_payload(
@@ -667,7 +667,7 @@ class StatusOptionsScreen(CopyEnabledScreen):
             yield FormField("Timeout (seconds)", "status-timeout", default="60")
             yield Static("", id="status-feedback")
             yield Button("Check status", id="status-submit", variant="primary")
-        yield Footer()
+        yield FittedFooter()
 
     def on_mount(self) -> None:
         self.query_one("#status-url", Input).focus()
@@ -750,7 +750,7 @@ class BenchmarkOptionsScreen(CopyEnabledScreen):
             )
             yield Static("", id="benchmark-feedback")
             yield Button("Benchmark", id="benchmark-submit", variant="primary")
-        yield Footer()
+        yield FittedFooter()
 
     def on_mount(self) -> None:
         self.query_one("#benchmark-concurrency", Input).focus()
@@ -862,7 +862,7 @@ class StopConfirmScreen(CopyEnabledScreen):
                     "Destroy rental and disk" if self.endpoint.provider == ComputeProvider.VAST else "Stop endpoint",
                     id="stop-confirm", variant="error",
                 )
-        yield Footer()
+        yield FittedFooter()
 
     def on_mount(self) -> None:
         self.query_one("#stop-cancel", Button).focus()

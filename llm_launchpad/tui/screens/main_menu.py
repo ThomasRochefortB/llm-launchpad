@@ -21,7 +21,7 @@ from textual.binding import Binding
 from textual.containers import Center, Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.timer import Timer
-from textual.widgets import Footer, OptionList, Static
+from textual.widgets import OptionList, Static
 from textual.widgets.option_list import Option
 
 from ...core.backend import ModalBackend
@@ -57,6 +57,7 @@ from ..connection import endpoint_model_summary, resolve_openai_base_url
 from ..fleet_status import provider_outage_lines
 from ..workers import EndpointsFailed, EndpointsLoaded, StorageFailed, StorageLoaded
 from ..responsive import ViewportProfile
+from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
 
 BANNER = r"""[bold #7bf168]
@@ -189,38 +190,52 @@ class QuickDeployCatalogLoadFailed(Message):
         self.error = error
 
 
+# Every provider marker must occupy exactly one terminal cell. The Hugging Face
+# emoji is East Asian Width "W" (two cells) and the diamonds that used to mark
+# Prime Intellect and Artificial Analysis are "Ambiguous" -- Rich measures them
+# as one cell while a CJK-configured terminal draws two. Either way the row
+# slips out of its column, and in the ambiguous case Rich and the terminal
+# disagree about where the rest of the line begins. These five are all width
+# "N": unambiguous, single-cell, and visually distinct from one another.
+MODAL_MARKER = "\u25b0"
+PRIME_MARKER = "\u2726"
+VAST_MARKER = "\u2756"
+HUGGINGFACE_MARKER = "\u25c9"
+ARTIFICIAL_ANALYSIS_MARKER = "\u2731"
+
+
 def _render_hf_auth_status(status: HuggingFaceAuthStatus | None = None) -> str:
     if status is None:
-        return "[dim]🤗 Checking Hugging Face auth...[/dim]"
+        return f"[dim]{HUGGINGFACE_MARKER} Checking Hugging Face auth...[/dim]"
     if status.authenticated:
-        return "[green]🤗 Hugging Face authenticated[/green]"
+        return f"[green]{HUGGINGFACE_MARKER} Hugging Face authenticated[/green]"
     if status.error:
         color = "red" if "invalid" in status.error.lower() else "yellow"
         detail = escape(clip(status.error, 72))
-        return f"[{color}]🤗 Hugging Face auth check failed: {detail}[/{color}]"
-    return "[yellow]🤗 Hugging Face not authenticated (run: hf auth login)[/yellow]"
+        return f"[{color}]{HUGGINGFACE_MARKER} Hugging Face auth check failed: {detail}[/{color}]"
+    return f"[yellow]{HUGGINGFACE_MARKER} Hugging Face not authenticated (run: hf auth login)[/yellow]"
 
 
 def _render_modal_auth_status(status: ModalAuthStatus | None = None) -> str:
     if status is None:
-        return "[dim]▰ Checking Modal auth...[/dim]"
+        return f"[dim]{MODAL_MARKER} Checking Modal auth...[/dim]"
     if status.authenticated:
-        return "[green]▰ Modal authenticated[/green]"
+        return f"[green]{MODAL_MARKER} Modal authenticated[/green]"
     if status.error:
         detail = escape(clip(status.error, 72))
-        return f"[yellow]▰ Modal auth check failed: {detail}[/yellow]"
-    return "[yellow]▰ Modal not authenticated (run: modal setup)[/yellow]"
+        return f"[yellow]{MODAL_MARKER} Modal auth check failed: {detail}[/yellow]"
+    return f"[yellow]{MODAL_MARKER} Modal not authenticated (run: modal setup)[/yellow]"
 
 
 def _render_prime_auth_status(status: PrimeAuthStatus | None = None) -> str:
     if status is None:
-        return "[dim]◆ Checking Prime Intellect auth...[/dim]"
+        return f"[dim]{PRIME_MARKER} Checking Prime Intellect auth...[/dim]"
     if status.authenticated:
-        return "[green]◆ Prime Intellect authenticated[/green]"
+        return f"[green]{PRIME_MARKER} Prime Intellect authenticated[/green]"
     if status.error:
         detail = escape(clip(status.error, 72))
-        return f"[yellow]◆ Prime Intellect auth check failed: {detail}[/yellow]"
-    return "[yellow]◆ Prime Intellect not authenticated (run: prime login)[/yellow]"
+        return f"[yellow]{PRIME_MARKER} Prime Intellect auth check failed: {detail}[/yellow]"
+    return f"[yellow]{PRIME_MARKER} Prime Intellect not authenticated (run: prime login)[/yellow]"
 
 
 def _render_vast_auth_status() -> str:
@@ -229,26 +244,26 @@ def _render_vast_auth_status() -> str:
         credentials = resolve_vast_credentials()
     except ValueError as exc:
         detail = escape(clip(str(exc), 72))
-        return f"[yellow]❖ Vast.ai key unreadable: {detail}[/yellow]"
+        return f"[yellow]{VAST_MARKER} Vast.ai key unreadable: {detail}[/yellow]"
     if credentials.api_key:
-        return f"[green]❖ Vast.ai key configured ({escape(credentials.source)})[/green]"
-    return "[yellow]❖ Vast.ai not configured (run: llm-launchpad vast-auth login)[/yellow]"
+        return f"[green]{VAST_MARKER} Vast.ai key configured ({escape(credentials.source)})[/green]"
+    return f"[yellow]{VAST_MARKER} Vast.ai not configured (run: llm-launchpad vast-auth login)[/yellow]"
 
 
 def _render_artificial_analysis_auth_status(
     status: ArtificialAnalysisAuthStatus | None = None,
 ) -> str:
     if status is None:
-        return "[dim]◈ Checking Artificial Analysis auth...[/dim]"
+        return f"[dim]{ARTIFICIAL_ANALYSIS_MARKER} Checking Artificial Analysis auth...[/dim]"
     if status.authenticated:
         tier = f" ({escape(status.tier)} tier)" if status.tier else ""
-        return f"[green]◈ Artificial Analysis authenticated{tier}[/green]"
+        return f"[green]{ARTIFICIAL_ANALYSIS_MARKER} Artificial Analysis authenticated{tier}[/green]"
     if status.error:
         color = "red" if "invalid" in status.error.casefold() else "yellow"
         detail = escape(clip(status.error, 72))
-        return f"[{color}]◈ Artificial Analysis auth check failed: {detail}[/{color}]"
+        return f"[{color}]{ARTIFICIAL_ANALYSIS_MARKER} Artificial Analysis auth check failed: {detail}[/{color}]"
     return (
-        "[yellow]◈ Artificial Analysis not authenticated "
+        f"[yellow]{ARTIFICIAL_ANALYSIS_MARKER} Artificial Analysis not authenticated "
         "(run: llm-launchpad aai-auth login)[/yellow]"
     )
 
@@ -899,6 +914,8 @@ class MainMenuScreen(CopyEnabledScreen):
                             f"[dim]{version_text}Deploy and manage inference endpoints[/dim]",
                             id="compact-menu-header",
                         )
+                        # Wraps rather than stopping mid-word: the narrow left
+                        # column used to cut this to "... Vast.ai LLM".
                         yield Static(
                             f"[bold]{version_text}[/bold][dim]Modal + Prime Intellect + Vast.ai LLM backends[/dim]",
                             classes="centered main-menu-version",
@@ -927,7 +944,7 @@ class MainMenuScreen(CopyEnabledScreen):
                 _render_auth_status_block(username=self.username),
                 id="auth-status-block",
             )
-        yield Footer()
+        yield FittedFooter()
 
     def on_mount(self) -> None:
         """Focus the option list so arrow-key navigation works immediately."""

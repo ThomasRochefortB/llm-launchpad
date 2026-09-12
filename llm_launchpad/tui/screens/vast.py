@@ -9,7 +9,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, VerticalScroll
 from textual.message import Message
-from textual.widgets import Button, DataTable, Footer, Input, Static, Switch
+from textual.widgets import Button, DataTable, Input, Static, Switch
 
 from ...core.vast_auth import (
     VastCredentials, clear_vast_api_key, resolve_vast_credentials, save_vast_api_key,
@@ -17,6 +17,7 @@ from ...core.vast_auth import (
 from ...core.vast_backend import VastApiError, VastBackend
 from ...protocol.models import VastOffer, VastOfferQuery
 from ..format import format_money
+from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
 
 
@@ -72,7 +73,7 @@ class VastPreviewScreen(CopyEnabledScreen):
                 "but exclude traffic. Downloads are charged; storage remains billable when stopped. "
                 "Unknown prices are not zero. Offers have not been checked against a model."
             )
-        yield Footer()
+        yield FittedFooter()
 
     def on_mount(self) -> None:
         self.query_one("#vast-offers", DataTable).add_columns(

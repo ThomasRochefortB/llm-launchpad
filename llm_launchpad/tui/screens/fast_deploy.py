@@ -13,7 +13,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
-from textual.widgets import Footer, Input, OptionList, Select, Static
+from textual.widgets import Input, OptionList, Select, Static
 from textual.widgets.option_list import Option
 
 from ...core.compute_availability import (
@@ -51,6 +51,7 @@ from ...protocol.models import (
     InferencePlan,
 )
 from ..responsive import ViewportProfile, WidthMode
+from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
 
 
@@ -651,7 +652,7 @@ class CatalogExclusionsScreen(CopyEnabledScreen):
                 id="fast-deploy-list",
             )
             yield Static("", id="fast-deploy-detail")
-        yield Footer()
+        yield FittedFooter()
 
     def on_mount(self) -> None:
         self.query_one(OptionList).focus()
@@ -755,7 +756,7 @@ class FastDeployScreen(CopyEnabledScreen):
             yield Static("[dim]Loading models...[/dim]", id="fast-deploy-status")
             yield OptionList(id="fast-deploy-list")
             yield Static("", id="fast-deploy-detail")
-        yield Footer()
+        yield FittedFooter()
 
     def on_mount(self) -> None:
         self._availability_inflight = False

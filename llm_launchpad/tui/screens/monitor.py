@@ -15,7 +15,7 @@ from textual.actions import SkipAction
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.widgets import Button, Footer, Input, Static
+from textual.widgets import Button, Input, Static
 
 from ...protocol.enums import BackendType, DeploymentState, OperationType
 from ..deploy_log_summary import (
@@ -25,6 +25,7 @@ from ..deploy_log_summary import (
     classify_summary_kind,
     summary_progress_parts,
 )
+from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
 from ..widgets.log_viewer import LogViewer, prune_retained_items
 from ..widgets.status_header import StatusHeader
@@ -37,22 +38,41 @@ def _strip_ansi(text: str) -> str:
     return _ANSI_ESCAPE_RE.sub("", text or "")
 
 
+# The same three keys leave this screen whatever finished on it. Three
+# different sentences describing them ("esc or q to return", "enter or esc to
+# return home") read as three different behaviours.
+_RETURN_HINT = "Press esc, q or enter to return"
+
+
+def _labelled_rows_markup(rows: list[tuple[str, str]]) -> str:
+    """Render label/value rows with the values in one column.
+
+    Hand-counted padding kept drifting: the connection card lined its values up
+    and the result card did not, so `Status  Healthy` and `Test command  curl`
+    began at different columns in the same style of panel. Measuring the widest
+    label keeps every card aligned and every future row aligned with it.
+    """
+    if not rows:
+        return ""
+    width = max(len(label) for label, _ in rows) + 2
+    return "\n".join(
+        f"[dim]{escape(label)}[/dim]{' ' * (width - len(label))}{escape(value)}"
+        for label, value in rows
+    )
+
+
 def _connection_card_markup(payload: dict[str, str]) -> str:
     """Render connection fields for the post-deploy card."""
-    base_url = escape((payload.get("base_url") or "").strip() or "(unavailable)")
-    model_id = escape((payload.get("model_id") or "").strip() or "(unavailable)")
-    display_name = escape((payload.get("display_name") or "").strip() or "(unavailable)")
-    api_key = (payload.get("api_key") or "").strip()
-    key_line = (
-        f"[dim]API key[/dim]     {escape(api_key)}"
-        if api_key
-        else "[dim]API key[/dim]     none"
-    )
-    return (
-        f"[dim]Base URL[/dim]    {base_url}\n"
-        f"[dim]Model ID[/dim]    {model_id}\n"
-        f"[dim]Display[/dim]     {display_name}\n"
-        f"{key_line}"
+    def _field(key: str) -> str:
+        return (payload.get(key) or "").strip() or "(unavailable)"
+
+    return _labelled_rows_markup(
+        [
+            ("Base URL", _field("base_url")),
+            ("Model ID", _field("model_id")),
+            ("Display", _field("display_name")),
+            ("API key", (payload.get("api_key") or "").strip() or "none"),
+        ]
     )
 
 
@@ -77,9 +97,7 @@ def _connection_copy_text(payload: dict[str, str]) -> str:
 
 def _result_card_markup(rows: list[tuple[str, str]]) -> str:
     """Render result-card fields for a finished status check or benchmark."""
-    return "\n".join(
-        f"[dim]{escape(label)}[/dim]  {escape(value)}" for label, value in rows
-    )
+    return _labelled_rows_markup(rows)
 
 
 class MonitorScreen(CopyEnabledScreen):
@@ -179,7 +197,7 @@ class MonitorScreen(CopyEnabledScreen):
                     yield Button("Copy result", id="result-copy-btn")
                     yield Button("Done", id="result-done-btn", variant="primary")
             yield LogViewer(id="monitor-log-viewer")
-        yield Footer()
+        yield FittedFooter()
 
     def _title_markup(self) -> str:
         """Render a compact operation title and input-mode badge."""
@@ -344,13 +362,15 @@ class MonitorScreen(CopyEnabledScreen):
                 self._append_log_line(
                     'Tip: re-run with "Show debug logs" enabled to see full backend logs.'
                 )
-            self._append_log_line("Press esc or q to return, or enter to retry.")
+            # Not "enter to retry": enter pops this screen like esc and q do,
+            # and no retry path exists to offer.
+            self._append_log_line(_RETURN_HINT)
             return
         if message.success and self._connection_payload:
-            self._append_log_line("Press enter or esc to return home.")
+            self._append_log_line(_RETURN_HINT)
             self._show_connection_card()
         else:
-            self._append_log_line("Press esc or q to return.")
+            self._append_log_line(_RETURN_HINT)
 
     def _capture_result_lines(self, cleaned_line: str) -> None:
         """Capture structured status-probe output while an operation runs."""

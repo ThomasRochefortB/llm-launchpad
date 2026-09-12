@@ -12,7 +12,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal, VerticalScroll
 from textual.css.query import NoMatches
 from textual.widget import Widget
-from textual.widgets import Button, DataTable, Footer, Input, OptionList, Select, Static
+from textual.widgets import Button, DataTable, Input, OptionList, Select, Static
 from textual.widgets.option_list import Option
 
 from ...core.storage_costs import (
@@ -31,6 +31,7 @@ from ..navigation import (
 from ..workers import StorageFailed, StorageLoaded
 from ..responsive import ViewportProfile, WidthMode
 from ..widgets.adaptive_table import AdaptiveColumn, AdaptiveDataTable
+from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
 
 
@@ -182,9 +183,14 @@ class StorageScreen(CopyEnabledScreen):
                 id="storage-filter",
             )
             yield AdaptiveDataTable(id="storage-table")
+            # A table showing only its header cannot say whether nothing is
+            # cached, the filter excluded everything, or the refresh failed.
+            yield Static("", id="storage-empty", classes="hidden")
+            # The footer names the p and x keys already; what it cannot say is
+            # that they act on whichever row is selected here.
             yield Static(
-                "[dim]Tip: select a row to prefill the pre-download form. "
-                "p pre-downloads; x deletes the selected model after confirmation.[/dim]",
+                "[dim]Selecting a row prefills the form below and targets it "
+                "for pre-download or delete.[/dim]",
                 id="storage-hint",
             )
             yield Static("")
@@ -209,7 +215,7 @@ class StorageScreen(CopyEnabledScreen):
                 id="storage-model-revision",
             )
             yield Static("[dim]Press p to pre-download using these values.[/dim]")
-        yield Footer()
+        yield FittedFooter()
 
     def on_mount(self) -> None:
         self._snapshot = StorageSnapshot(llamacpp_models=[], vllm_models=[])
@@ -291,13 +297,13 @@ class StorageScreen(CopyEnabledScreen):
         self._snapshot = message.snapshot
         self._render_table()
         estimate = estimate_monthly_storage_cost(self._snapshot)
+        # One line, and only the numbers: the instruction that used to trail it
+        # wrapped the status onto a second row and repeated the hint below.
         self.query_one("#storage-status", Static).update(
-            "[green]Storage refreshed.[/green] "
-            f"{_human_bytes(estimate.total_size_bytes)} cached; "
-            f"{format_gib(estimate.billable_gib_month)} billable after "
-            f"{format_free_tier(MODAL_VOLUME_FREE_TIER_GIB_MONTH)} free; "
-            f"est. {format_money(estimate.estimated_monthly_cost_usd)}/mo. "
-            "Use selected row or type a model to pre-download."
+            f"[green]{_human_bytes(estimate.total_size_bytes)} cached[/green] "
+            f"[dim]· {format_gib(estimate.billable_gib_month)} billable past "
+            f"{format_free_tier(MODAL_VOLUME_FREE_TIER_GIB_MONTH)} free "
+            f"· est. {format_money(estimate.estimated_monthly_cost_usd)}/mo[/dim]"
         )
         should_refocus = self._initial_focus_pending
         self._initial_focus_pending = False
@@ -325,6 +331,29 @@ class StorageScreen(CopyEnabledScreen):
         ):
             self._selected_model = None
         table.set_rows(rows)
+        self._render_empty_state(rows)
+
+    def _render_empty_state(self, rows: list[StoredModelInfo]) -> None:
+        """Say why the inventory is empty, distinguishing cause from failure."""
+        empty = self.query_one("#storage-empty", Static)
+        table = self.query_one("#storage-table", AdaptiveDataTable)
+        if rows:
+            empty.add_class("hidden")
+            table.remove_class("hidden")
+            return
+        cached_anything = bool(
+            self._snapshot.llamacpp_models or self._snapshot.vllm_models
+        )
+        if cached_anything:
+            message = "[dim]No cached model matches the current filter.[/dim]"
+        else:
+            message = (
+                "[dim]No models cached yet. Pre-download one below, or deploy "
+                "a model and it will be cached for you.[/dim]"
+            )
+        empty.update(message)
+        empty.remove_class("hidden")
+        table.add_class("hidden")
 
     def _apply_row_selection(self, row_key: str) -> None:
         selected = self._rows_by_key.get(row_key)
@@ -501,7 +530,7 @@ class StorageDeleteConfirmScreen(CopyEnabledScreen):
             with Horizontal(id="delete-confirm-actions"):
                 yield Button("Cancel", id="delete-cancel")
                 yield Button("Delete model", id="delete-confirm", variant="error")
-        yield Footer()
+        yield FittedFooter()
 
     def on_mount(self) -> None:
         self.query_one("#delete-cancel", Button).focus()
