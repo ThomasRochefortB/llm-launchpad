@@ -12,7 +12,7 @@ from ..core.vision_probe import is_vision_probe_failure
 
 import os
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, replace
 import json
 from typing import Annotated, Any
 
@@ -237,7 +237,10 @@ def _resolve_deploy_target(
 
 
 def _backend_instances(backend: BackendType) -> list[EndpointInfo]:
-    rows = ModalBackend.list_apps() or []
+    # Modal keeps a row per stopped revision, so the raw list reports one
+    # logical app many times and target resolution refused to pick a single
+    # instance. visible_launchpad_rows collapses them, preferring a live row.
+    rows = visible_launchpad_rows(ModalBackend.list_apps() or [])
     return [row for row in rows if row.backend == backend]
 
 
@@ -248,7 +251,7 @@ def _provider_instances(
     if provider == ComputeProvider.MODAL:
         return _backend_instances(backend)
     rows = VastDeploymentBackend().list_deployments() if provider == ComputeProvider.VAST else PrimeBackend().list_deployments()
-    return [row for row in rows if row.backend == backend]
+    return [row for row in visible_launchpad_rows(rows) if row.backend == backend]
 
 
 def _resolve_manage_app_name(
@@ -490,7 +493,10 @@ def _deploy_and_maybe_warmup(
             deployed_endpoint = event.endpoint
             deployed_web_url = event.endpoint.web_url or deployed_web_url
             if deployed_web_url and not do_warmup:
-                save_connection(config, event.endpoint)
+                # save_connection silently does nothing without a URL on the
+                # endpoint itself, which stranded the generated API key while
+                # OpenCode was synced from the accumulated URL regardless.
+                save_connection(config, replace(event.endpoint, web_url=deployed_web_url))
                 _sync_opencode_cli(
                     target_app_name=config.app_name,
                     target_url=deployed_web_url,
@@ -1529,6 +1535,21 @@ def _redeploy_modal_llamacpp(
             _print_event(event)
             _raise_on_failed_completion(event)
     if (do_warmup and warmup_succeeded) or not do_warmup:
+        # This path does not go through _deploy_and_maybe_warmup, so it has to
+        # persist the connection itself. Syncing OpenCode alone left the local
+        # cache describing the model the switch just replaced, which is what
+        # status/benchmark/logs hydrate from.
+        save_connection(
+            config,
+            EndpointInfo(
+                name=resolved_app_name,
+                backend=bt,
+                instance_name=resolved_instance,
+                provider=compute_provider,
+                web_url=final_sync_url,
+                endpoint_api_key=config.endpoint_api_key,
+            ),
+        )
         _sync_opencode_cli(
             target_app_name=resolved_app_name,
             target_url=final_sync_url,

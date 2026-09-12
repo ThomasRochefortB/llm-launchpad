@@ -164,7 +164,14 @@ class SelectableLog(Log):
         scroll_end: bool | None = None,
     ) -> SelectableLog:
         """Append logical lines and reflow them to the current viewport."""
-        source_values = list(lines)
+        # Log.write_lines expands every value with str.splitlines(), and
+        # "".splitlines() is empty, so a blank separator silently disappears and
+        # the retained line list drifts out of step with what is rendered. A
+        # trailing newline round-trips through splitlines() unchanged, which
+        # keeps blank lines while leaving every other line alone.
+        source_values = [
+            f"{part}\n" for line in lines for part in (line.splitlines() or [""])
+        ]
         was_following = self.is_vertical_scroll_end
         previous_line_count = len(self._lines)
         previous_wrap_width = self._wrap_width
@@ -379,7 +386,9 @@ class LogViewer(Vertical):
         log = self.log_widget
         was_following = log.is_vertical_scroll_end
         log.write_line(line)
-        new_plain_lines = line.splitlines()
+        # Match SelectableLog's expansion so a blank line occupies one retained
+        # row here too; search offsets are resolved through these indexes.
+        new_plain_lines = line.splitlines() or [""]
         self._plain_lines.extend(new_plain_lines)
         prune_retained_items(self._plain_lines)
         added_lines = len(new_plain_lines)

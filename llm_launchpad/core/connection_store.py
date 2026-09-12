@@ -26,8 +26,24 @@ CONNECTIONS_PATH = SETTINGS_DIR / "deployment_connection_summaries.json"
 STORAGE_SNAPSHOT_PATH = SETTINGS_DIR / "storage_snapshot.json"
 
 
-def load_connection_entries(path: Path = CONNECTIONS_PATH) -> dict[str, dict[str, Any]]:
+def _connections_path(path: Path | None) -> Path:
+    """Resolve the store path at call time.
+
+    A ``= CONNECTIONS_PATH`` default is bound at import, so redirecting the
+    module attribute -- which is how the test suite keeps itself out of the
+    user's real ~/.llm_launchpad -- never reached these callers.
+    """
+    return CONNECTIONS_PATH if path is None else path
+
+
+def _storage_path(path: Path | None) -> Path:
+    """Resolve the storage snapshot path at call time, for the same reason."""
+    return STORAGE_SNAPSHOT_PATH if path is None else path
+
+
+def load_connection_entries(path: Path | None = None) -> dict[str, dict[str, Any]]:
     """Load valid connection entries, returning an empty mapping on corruption."""
+    path = _connections_path(path)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
@@ -54,9 +70,10 @@ def _write(entries: dict[str, dict[str, Any]], path: Path) -> None:
 def save_connection(
     config: DeploymentConfig,
     endpoint: EndpointInfo,
-    path: Path = CONNECTIONS_PATH,
+    path: Path | None = None,
 ) -> None:
     """Persist endpoint URL/model/credential metadata for a deployment."""
+    path = _connections_path(path)
     app_name = (endpoint.name or config.app_name or "").strip()
     server_url = (endpoint.web_url or "").strip()
     if not app_name or not server_url:
@@ -93,12 +110,13 @@ def save_connection(
 
 def merge_connections(
     rows: list[EndpointInfo],
-    path: Path = CONNECTIONS_PATH,
-    storage_path: Path = STORAGE_SNAPSHOT_PATH,
+    path: Path | None = None,
+    storage_path: Path | None = None,
     *,
     persist_backfill: bool = True,
 ) -> list[EndpointInfo]:
     """Hydrate provider rows with locally persisted endpoint metadata."""
+    path, storage_path = _connections_path(path), _storage_path(storage_path)
     entries = load_connection_entries(path)
     _backfill_legacy_reasoning(
         entries,
@@ -155,12 +173,13 @@ def merge_connections(
 
 
 def rows_from_connection_cache(
-    path: Path = CONNECTIONS_PATH,
-    storage_path: Path = STORAGE_SNAPSHOT_PATH,
+    path: Path | None = None,
+    storage_path: Path | None = None,
     *,
     persist_backfill: bool = True,
 ) -> list[EndpointInfo]:
     """Build endpoint rows from locally persisted connection metadata."""
+    path, storage_path = _connections_path(path), _storage_path(storage_path)
     entries = load_connection_entries(path)
     _backfill_legacy_reasoning(
         entries,
@@ -367,15 +386,17 @@ def _unique_storage_revision(rows: list[dict[str, Any]]) -> dict[str, Any] | Non
     return rows[0]
 
 
-def remove_connection(app_name: str, path: Path = CONNECTIONS_PATH) -> None:
+def remove_connection(app_name: str, path: Path | None = None) -> None:
     """Remove local metadata for a terminated deployment."""
+    path = _connections_path(path)
     entries = load_connection_entries(path)
     if entries.pop(app_name, None) is not None:
         _write(entries, path)
 
 
-def update_vision_verification(app_name: str, url: str, vision: Any, path: Path = CONNECTIONS_PATH) -> None:
+def update_vision_verification(app_name: str, url: str, vision: Any, path: Path | None = None) -> None:
     """Update only image state for the endpoint actually tested."""
+    path = _connections_path(path)
     entries = load_connection_entries(path)
     entry = entries.get(app_name)
     if entry is None or str(entry.get("base_url") or "").removesuffix("/v1").rstrip("/") != url.removesuffix("/v1").rstrip("/"):

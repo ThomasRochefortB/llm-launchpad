@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime, UTC
+import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
+
+from llm_launchpad.core import benchmark as benchmark_module
 
 from llm_launchpad.core.benchmark import (
     aiperf_metrics_have_successful_requests,
@@ -16,7 +20,7 @@ from llm_launchpad.core.benchmark import (
     parse_concurrency_values,
     request_count_for_concurrency,
 )
-from llm_launchpad.protocol.enums import BackendType
+from llm_launchpad.protocol.enums import BackendType, ComputeProvider
 from llm_launchpad.protocol.models import BenchmarkConfig, EndpointInfo
 
 
@@ -218,6 +222,34 @@ class BenchmarkCoreTests(unittest.TestCase):
         self.assertEqual(row.web_url, "https://alice--vllm-qwen-serve.modal.run")
         self.assertEqual(row.served_model_name, "Qwen3-4B")
         self.assertEqual(row.display_name, "Qwen")
+
+
+class BenchmarkConnectionMergeTests(unittest.TestCase):
+    def test_a_disconnected_vast_tunnel_is_not_resurrected_from_cache(self) -> None:
+        """This merge was a second, weaker copy of the connection store's.
+
+        Without the Vast guard it handed the benchmark the loopback port of a
+        rental whose SSH tunnel had since closed -- a port the local machine may
+        well have reassigned to an unrelated process.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "deployment_connection_summaries.json").write_text(
+                json.dumps({"entries": {"llp-vast-llamacpp-demo": {
+                    "provider": "vast", "backend": "llamacpp",
+                    "base_url": "http://127.0.0.1:41233/v1",
+                    "model_id": "Qwen3-8B-GGUF-Q4_K_M",
+                }}})
+            )
+            row = EndpointInfo(
+                name="llp-vast-llamacpp-demo", backend=BackendType.LLAMACPP,
+                provider=ComputeProvider.VAST, state="running",
+            )
+            with patch.object(benchmark_module, "SETTINGS_DIR", Path(tmp)):
+                merge_cached_benchmark_connections([row])
+
+        self.assertIsNone(row.web_url)
+        # Metadata that does not assert a live tunnel is still merged.
+        self.assertEqual(row.served_model_name, "Qwen3-8B-GGUF-Q4_K_M")
 
 
 if __name__ == "__main__":

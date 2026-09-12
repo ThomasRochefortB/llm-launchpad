@@ -36,7 +36,9 @@ from .copy_enabled import CopyEnabledScreen
 
 def _human_bytes(size_bytes: int) -> str:
     size = float(size_bytes)
-    units = ["B", "KB", "MB", "GB", "TB"]
+    # Binary divisor, binary labels: the same screen reports GiB through
+    # format_gib, and calling 1024-based units "GB" understates a model by 7%.
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
     for unit in units:
         if size < 1024.0 or unit == units[-1]:
             return f"{size:.1f} {unit}"

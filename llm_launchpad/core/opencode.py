@@ -272,7 +272,15 @@ def build_connection_from_endpoint(
     # A fallback URL may come from deploy/warmup output and can point at a
     # transient or stale web endpoint after the app is redeployed.
     base_root = (row.web_url or server_url or "").strip().rstrip("/")
-    if not base_root and username.strip():
+    # Only Modal publishes a URL derivable from the app name. Deriving one for a
+    # Prime pod or a Vast rental invents a modal.run address that never existed
+    # and writes it into the user's OpenCode config; a Vast rental with no URL
+    # means its local SSH tunnel is down, which no cached address can fix.
+    if (
+        not base_root
+        and row.provider == ComputeProvider.MODAL
+        and username.strip()
+    ):
         from .backend import ModalBackend
 
         base_root = ModalBackend.default_server_url(username.strip(), app_name=app_name).rstrip("/")

@@ -795,5 +795,43 @@ class CorruptConfigRecoveryTests(unittest.TestCase):
             self.assertEqual(_load_opencode_config(path)["provider"], {"a": {}})
 
 
+class ProviderUrlDerivationTests(unittest.TestCase):
+    def test_only_modal_rows_derive_a_url_from_the_app_name(self) -> None:
+        """A URL was invented for providers that never publish one.
+
+        Deriving ``<user>--<app>.modal.run`` for a Prime pod or a Vast rental
+        wrote an address that never existed into the user's OpenCode config; a
+        Vast row without a URL means its SSH tunnel is down.
+        """
+        for provider in (ComputeProvider.VAST, ComputeProvider.PRIME):
+            with self.subTest(provider=provider):
+                row = EndpointInfo(
+                    name=f"llp-{provider.value}-llamacpp-demo",
+                    backend=BackendType.LLAMACPP,
+                    provider=provider,
+                    state="running",
+                    repo_id="unsloth/Qwen3-4B-GGUF",
+                    quant="Q4_K_M",
+                )
+                self.assertIsNone(
+                    opencode.build_connection_from_endpoint(row, username="alice")
+                )
+                self.assertEqual(
+                    opencode.resolve_connections_for_rows([row], username="alice"), []
+                )
+
+        modal_row = EndpointInfo(
+            name="llamacpp-demo",
+            backend=BackendType.LLAMACPP,
+            provider=ComputeProvider.MODAL,
+            state="deployed",
+            repo_id="unsloth/Qwen3-4B-GGUF",
+            quant="Q4_K_M",
+        )
+        connection = opencode.build_connection_from_endpoint(modal_row, username="alice")
+        self.assertIsNotNone(connection)
+        self.assertTrue(connection.base_url.startswith("https://alice--llamacpp-demo"))
+
+
 if __name__ == "__main__":
     unittest.main()

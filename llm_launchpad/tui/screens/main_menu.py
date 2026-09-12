@@ -457,6 +457,16 @@ def _wrap_url_for_panel(value: str, width: int = 44) -> list[str]:
     return lines or [text]
 
 
+# Each provider names its unit of compute differently, and a row that calls a
+# Vast rental a "Prime Intellect pod" sends the reader looking for it in the
+# wrong console.
+_PROVIDER_RESOURCE_LABELS = {
+    ComputeProvider.MODAL: "Modal app",
+    ComputeProvider.PRIME: "Prime Intellect pod",
+    ComputeProvider.VAST: "Vast.ai rental",
+}
+
+
 def _render_deployment_status(rows: list[EndpointInfo], username: str = "") -> str:
     if not rows:
         return (
@@ -486,8 +496,8 @@ def _render_deployment_status(rows: list[EndpointInfo], username: str = "") -> s
             f"[dim]{escape(backend_name)}[/dim]  {_style_runtime_bucket(_runtime_bucket(row))} "
             f"[dim]({row.provider.value}: {escape((row.state or 'unknown').strip().lower())})[/dim]"
         )
-        resource_label = (
-            "Modal app" if row.provider == ComputeProvider.MODAL else "Prime Intellect pod"
+        resource_label = _PROVIDER_RESOURCE_LABELS.get(
+            row.provider, f"{row.provider.display_name} deployment"
         )
         modal_app_line = f"[dim]{resource_label}:[/dim] {escape(row.name or '')}"
         if (row.app_id or "").strip():
@@ -761,7 +771,12 @@ def _render_provider_billing_body(
     """Compose the Modal, Prime and Vast billing sections of the shared panel."""
 
     if modal_error is not None:
-        modal_section = _render_billing_load_error(modal_error)
+        # The storage estimate comes from a local snapshot and owes nothing to
+        # Modal's billing CLI, so a failed billing call must not take the only
+        # standing warning about ongoing storage spend down with it.
+        modal_section = "\n".join(
+            [_render_billing_load_error(modal_error), *_storage_estimate_lines(storage_snapshot)]
+        )
     elif modal_payload is not None:
         modal_section = _render_billing_report(
             modal_payload,

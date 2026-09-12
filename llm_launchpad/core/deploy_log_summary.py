@@ -246,7 +246,10 @@ class DeployLogSummarizer:
         if text in {"GPU allocated; continuing readiness probe.", "GPU allocated; continuing readiness probe"}:
             return self._emit_once("GPU allocated")
         if text == "Server is ready!":
-            return [text]
+            # A sticky milestone, so deploy and the warmup that follows it do
+            # not each announce readiness. Emitting it directly kept it out of
+            # the seen set, which is what _STICKY_MILESTONES is checked against.
+            return self._emit_once(text)
         if text.startswith("Test command:"):
             return []
         if text.startswith("=== OpenAI-compatible") or text == "=========================":

@@ -13,6 +13,7 @@ from llm_launchpad.tui.deploy_log_summary import SUMMARY_SPINNER_FRAMES
 from llm_launchpad.tui.screens.monitor import MonitorScreen, _connection_copy_text
 from llm_launchpad.tui.widgets.log_viewer import (
     MAX_RETAINED_LOG_LINES,
+    LogViewer,
     SelectableLog,
     prune_retained_items,
 )
@@ -712,6 +713,45 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             preparing = [line for line in lines if "Preparing deployment" in line]
             self.assertEqual(preparing, ["✓ Preparing deployment"])
             self.assertIn("✓ Machine ready", lines)
+
+    async def test_blank_lines_survive_and_keep_search_offsets_aligned(self) -> None:
+        """Blank separators were dropped, silently shifting every search jump.
+
+        ``Log.write_lines`` expands each value with ``str.splitlines()``, and
+        ``"".splitlines()`` is empty, so the viewer retained blank lines the
+        widget never rendered and resolved match offsets against the wrong rows.
+        """
+        app = _TestApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            screen = Screen()
+            app.push_screen(screen)
+            await pilot.pause()
+            viewer = LogViewer()
+            await screen.mount(viewer)
+            await pilot.pause()
+
+            viewer.set_lines(["one", "", "two", "", "needle"], keep_follow=True)
+            await pilot.pause()
+            self.assertEqual(
+                list(viewer.log_widget.wrapped_lines),
+                ["one", "", "two", "", "needle"],
+            )
+
+            viewer.search("needle")
+            await pilot.pause()
+            self.assertEqual(
+                viewer.log_widget.visual_row_for_line(viewer._search_matches[0]),
+                viewer.log_widget.wrapped_lines.index("needle"),
+            )
+
+            viewer.write_line("")
+            viewer.write_line("tail")
+            await pilot.pause()
+            self.assertEqual(
+                list(viewer.log_widget.wrapped_lines),
+                ["one", "", "two", "", "needle", "", "tail"],
+            )
+            self.assertEqual(len(viewer._plain_lines), len(viewer.log_widget.wrapped_lines))
 
     def test_footer_includes_log_navigation_bindings(self) -> None:
         visible_bindings = {

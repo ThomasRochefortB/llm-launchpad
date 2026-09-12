@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import typer
 from typer.testing import CliRunner
 
 from llm_launchpad.cli import main as cli_main
@@ -1349,6 +1350,92 @@ class CliMainAaiAuthCommandTests(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 1)
         self.assertIn("No stored Artificial Analysis API key to remove.", result.output)
+
+
+class CliTargetResolutionTests(unittest.TestCase):
+    def test_stopped_modal_revisions_do_not_block_target_resolution(self) -> None:
+        """Modal keeps a row per stopped revision of the same logical app.
+
+        Counting the raw list made every management command refuse with
+        "Multiple instances found" when exactly one app was live.
+        """
+        rows = [
+            EndpointInfo(name="llamacpp-qwen", backend=BackendType.LLAMACPP,
+                         provider=ComputeProvider.MODAL, state="deployed"),
+            EndpointInfo(name="llamacpp-qwen", backend=BackendType.LLAMACPP,
+                         provider=ComputeProvider.MODAL, state="stopped"),
+            EndpointInfo(name="llamacpp-qwen", backend=BackendType.LLAMACPP,
+                         provider=ComputeProvider.MODAL, state="terminated"),
+        ]
+        with patch.object(cli_main.ModalBackend, "list_apps", staticmethod(lambda: rows)):
+            resolved = cli_main._resolve_manage_app_name(
+                BackendType.LLAMACPP, None, None, ComputeProvider.MODAL
+            )
+        self.assertEqual(resolved, "llamacpp-qwen")
+
+    def test_genuinely_distinct_instances_still_require_disambiguation(self) -> None:
+        rows = [
+            EndpointInfo(name="llamacpp-qwen", instance_name="qwen",
+                         backend=BackendType.LLAMACPP,
+                         provider=ComputeProvider.MODAL, state="deployed"),
+            EndpointInfo(name="llamacpp-gemma", instance_name="gemma",
+                         backend=BackendType.LLAMACPP,
+                         provider=ComputeProvider.MODAL, state="deployed"),
+        ]
+        with patch.object(cli_main.ModalBackend, "list_apps", staticmethod(lambda: rows)):
+            with self.assertRaises(typer.Exit):
+                cli_main._resolve_manage_app_name(
+                    BackendType.LLAMACPP, None, None, ComputeProvider.MODAL
+                )
+
+
+class CliConnectionPersistenceTests(unittest.TestCase):
+    def test_endpoint_without_its_own_url_still_persists_the_connection(self) -> None:
+        """save_connection silently does nothing without a URL on the endpoint.
+
+        The branch gated on the accumulated URL but passed the event's endpoint
+        through, so the generated API key was dropped while OpenCode was synced
+        from the accumulated URL regardless.
+        """
+        from llm_launchpad.core.connection_store import load_connection_entries
+        from llm_launchpad.protocol.models import DeploymentConfig
+
+        config = DeploymentConfig(
+            backend=BackendType.LLAMACPP, provider=ComputeProvider.MODAL,
+            app_name="llamacpp-demo", instance_name="demo",
+            repo_id="unsloth/Qwen3-4B-GGUF", quant="Q4_K_M",
+            endpoint_api_key="generated-at-deploy",
+        )
+        # The provider announced the endpoint before its URL was attached.
+        endpoint = EndpointInfo(name="llamacpp-demo", backend=BackendType.LLAMACPP)
+        events = [
+            LogEvent(line="https://alice--llamacpp-demo-serve.modal.run"),
+            EndpointAvailableEvent(endpoint=endpoint),
+            OperationCompleteEvent(operation=OperationType.DEPLOY, success=True),
+        ]
+
+        with TemporaryDirectory() as tmp:
+            cache = Path(tmp) / "conns.json"
+            with (
+                patch("llm_launchpad.core.connection_store.CONNECTIONS_PATH", cache),
+                patch.object(cli_main, "_sync_opencode_cli", lambda **kw: None),
+                patch.object(cli_main, "_load_visible_launchpad_rows", lambda p: []),
+                patch.object(
+                    cli_main.ModalBackend, "extract_modal_web_url",
+                    staticmethod(lambda line: line if line.startswith("https://") else None),
+                ),
+            ):
+                orch = Mock()
+                orch.deploy.return_value = iter(events)
+                cli_main._deploy_and_maybe_warmup(
+                    orch, username="alice", backend=BackendType.LLAMACPP,
+                    config=config, server_url=None, do_warmup=False,
+                    timeout=60, tail_logs=False,
+                )
+                entries = load_connection_entries(cache)
+
+        self.assertIn("llamacpp-demo", entries)
+        self.assertEqual(entries["llamacpp-demo"]["api_key"], "generated-at-deploy")
 
 
 if __name__ == "__main__":

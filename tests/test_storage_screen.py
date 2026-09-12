@@ -116,7 +116,7 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
 
             status = screen.query_one("#storage-status", Static)
             rendered_status = str(status.renderable)
-            self.assertIn("5.0 GB cached", rendered_status)
+            self.assertIn("5.0 GiB cached", rendered_status)
             self.assertIn("0.00 GiB billable", rendered_status)
             self.assertIn("1 TiB free", rendered_status)
             self.assertIn("$0.00/mo", rendered_status)
