@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from rich.markup import render as render_markup
 from textual.app import App
 from textual.coordinate import Coordinate
 from textual.screen import Screen
@@ -394,6 +395,51 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
             screen.action_refresh_storage()
             await pilot.pause()
             self.assertEqual(app.refresh_force_flags, [False, True])
+
+
+class StorageDeleteScopeTests(unittest.TestCase):
+    def test_confirmation_names_the_other_quants_it_will_remove(self) -> None:
+        """The dialog named one quant while deletion removed the repository.
+
+        Rows are listed per quant, but _storage_delete_targets removes
+        /hub/models--<repo> recursively, so confirming a 2.4 GiB row silently
+        took every other cached quant of that model with it.
+        """
+        q4 = StoredModelInfo(
+            backend=BackendType.LLAMACPP, model_id="unsloth/Qwen3-4B-GGUF",
+            revision="abc", quant="Q4_K_M", size_bytes=2_600_000_000,
+        )
+        q8 = StoredModelInfo(
+            backend=BackendType.LLAMACPP, model_id="unsloth/Qwen3-4B-GGUF",
+            revision="abc", quant="Q8_0", size_bytes=4_300_000_000,
+        )
+        warning = render_markup(
+            StorageDeleteConfirmScreen(q4, also_removed=(q8,))._warning()
+        ).plain
+        self.assertIn("whole cached repository", warning)
+        self.assertIn("Q8_0", warning)
+        self.assertIn("6.4 GiB total", warning)
+
+        only = render_markup(StorageDeleteConfirmScreen(q4)._warning()).plain
+        self.assertNotIn("whole cached repository", only)
+
+    def test_sibling_rows_are_collected_from_the_loaded_snapshot(self) -> None:
+        screen = StorageScreen()
+        q4 = StoredModelInfo(
+            backend=BackendType.LLAMACPP, model_id="unsloth/Qwen3-4B-GGUF",
+            revision="abc", quant="Q4_K_M", size_bytes=1,
+        )
+        q8 = StoredModelInfo(
+            backend=BackendType.LLAMACPP, model_id="unsloth/Qwen3-4B-GGUF",
+            revision="abc", quant="Q8_0", size_bytes=2,
+        )
+        other = StoredModelInfo(
+            backend=BackendType.LLAMACPP, model_id="unsloth/gemma-3-4b-it-GGUF",
+            revision="def", quant="Q4_K_M", size_bytes=3,
+        )
+        screen._snapshot = StorageSnapshot(llamacpp_models=[q4, q8, other], vllm_models=[])
+        self.assertEqual(screen._rows_removed_with(q4), (q8,))
+        self.assertEqual(screen._rows_removed_with(other), ())
 
 
 if __name__ == "__main__":
