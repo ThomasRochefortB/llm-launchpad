@@ -697,5 +697,87 @@ class FastDeployHeaderTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("AAI", _model_option(scored))
 
 
+class MainMenuFitTests(unittest.IsolatedAsyncioTestCase):
+    """The menu's breakpoints measured the terminal, not the list."""
+
+    async def _menu(self, pilot, app, size) -> MainMenuScreen:
+        screen = MainMenuScreen(username="review", version="1.1.1")
+        with patch.object(MainMenuScreen, "on_mount", lambda self: None):
+            app.push_screen(screen)
+            for _ in range(3):
+                await pilot.pause()
+        return screen
+
+    async def test_no_menu_row_wraps_at_any_supported_width(self) -> None:
+        for size in ((220, 60), (140, 45), (126, 40), (120, 30), (100, 30),
+                     (80, 24), (60, 20), (50, 35)):
+            with self.subTest(size=size):
+                app = _StyledApp()
+                async with app.run_test(size=size) as pilot:
+                    screen = await self._menu(pilot, app, size)
+                    action_list = screen.query_one("#action-list", OptionList)
+                    widest = max(
+                        cell_len(str(action_list.get_option_at_index(i).prompt))
+                        for i in range(action_list.option_count)
+                    )
+                    self.assertLessEqual(
+                        widest,
+                        action_list.content_size.width,
+                        f"a menu row wraps at {size}",
+                    )
+
+    async def test_a_wide_terminal_still_gets_the_descriptions(self) -> None:
+        app = _StyledApp()
+        async with app.run_test(size=(140, 45)) as pilot:
+            await self._menu(pilot, app, (140, 45))
+            rendered = "\n".join(_rendered_lines(app))
+            self.assertIn("pre-download", rendered)
+
+    async def test_a_compact_terminal_keeps_its_concise_names(self) -> None:
+        """Measurement may shorten labels; it must not re-expand them into a
+        padded grid the compact layout deliberately dropped."""
+        app = _StyledApp()
+        async with app.run_test(size=(50, 35)) as pilot:
+            screen = await self._menu(pilot, app, (50, 35))
+            action_list = screen.query_one("#action-list", OptionList)
+            prompts = {
+                str(action_list.get_option_at_index(i).id): str(
+                    action_list.get_option_at_index(i).prompt
+                )
+                for i in range(action_list.option_count)
+            }
+            self.assertIn("Manage endpoints", prompts["manage"])
+
+    async def test_the_status_panel_uses_the_column_instead_of_scrolling(self) -> None:
+        """It was capped at 14 rows and scrolled its own content while the
+        rows directly beneath it stayed blank."""
+        from llm_launchpad.protocol.enums import BackendType, ComputeProvider
+        from llm_launchpad.protocol.models import EndpointInfo
+        from llm_launchpad.tui.screens.main_menu import _render_deployment_status
+
+        rows = [
+            EndpointInfo(
+                name="llp-modal-a", app_id="ap-1", backend=BackendType.LLAMACPP,
+                instance_name="a", provider=ComputeProvider.MODAL, state="deployed",
+            ),
+            EndpointInfo(
+                name="llp-prime-b", app_id="pod-1", backend=BackendType.VLLM,
+                instance_name="b", provider=ComputeProvider.PRIME, state="running",
+            ),
+        ]
+        app = _StyledApp()
+        async with app.run_test(size=(140, 45)) as pilot:
+            screen = await self._menu(pilot, app, (140, 45))
+            screen.query_one("#deployment-status-body", Static).update(
+                _render_deployment_status(rows, username="review")
+            )
+            await pilot.pause()
+            panel = screen.query_one("#deployment-status-panel")
+            self.assertGreater(panel.region.height, 14)
+            rendered = "\n".join(_rendered_lines(app))
+            for instance in ("a", "b"):
+                self.assertIn(f"llp-{'modal' if instance == 'a' else 'prime'}-{instance}", rendered)
+
+
 if __name__ == "__main__":
     unittest.main()

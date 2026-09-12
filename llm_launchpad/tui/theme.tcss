@@ -129,10 +129,14 @@ LogViewer Log {
     overflow-y: auto;
 }
 
+/* Takes the column height that billing does not, rather than capping at 14
+   rows and scrolling its own content while the rows below it stay blank. Two
+   deployments were already enough to clip an entry mid-endpoint with ten
+   unused rows directly underneath. */
 #deployment-status-panel {
     width: 100%;
-    height: auto;
-    max-height: 14;
+    height: 1fr;
+    min-height: 6;
     overflow-y: auto;
     padding: 0 2;
     border: solid $border;
@@ -142,6 +146,8 @@ LogViewer Log {
 #billing-report-panel {
     width: 100%;
     height: auto;
+    max-height: 50%;
+    overflow-y: auto;
     margin: 1 0 0 0;
     padding: 0 2;
     border: solid $border;
