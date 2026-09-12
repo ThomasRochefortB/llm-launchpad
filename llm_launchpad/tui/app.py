@@ -70,6 +70,8 @@ from ..protocol.events import (
 )
 from ..protocol.models import BenchmarkConfig
 from ..protocol.models import EndpointInfo
+from ..protocol.models import FleetDiscovery
+from ..protocol.models import ProviderListing
 from ..protocol.models import DeploymentConfig
 from ..protocol.models import InferencePlan
 from ..protocol.models import StoredModelInfo
@@ -241,6 +243,9 @@ class TuiApp(App):
         self._endpoint_refresh_inflight = False
         self._endpoint_refresh_lock = threading.Lock()
         self._endpoint_refresh_receivers: list[object] = []
+        self._provider_listing_lock = threading.Lock()
+        self._provider_listings: dict[ComputeProvider, ProviderListing] = {}
+        self._last_fleet_discovery: FleetDiscovery = FleetDiscovery()
         self._storage_snapshot_cache: StorageSnapshot | None = None
         self._storage_snapshot_cached_at_epoch: float = 0.0
         self._storage_refresh_inflight = False
@@ -1248,7 +1253,13 @@ class TuiApp(App):
                     start_worker = True
 
         if cached_rows is not None:
-            poster(EndpointsLoaded(rows=cached_rows, is_stale=not cache_is_fresh))
+            poster(
+                EndpointsLoaded(
+                    rows=cached_rows,
+                    is_stale=not cache_is_fresh,
+                    discovery=self.last_fleet_discovery(),
+                )
+            )
         if cache_is_fresh:
             return
         if start_worker:
@@ -1266,13 +1277,14 @@ class TuiApp(App):
             return
 
         self._cache_endpoint_snapshot(rows)
-        self._finish_endpoint_refresh(rows=rows)
+        self._finish_endpoint_refresh(rows=rows, discovery=self.last_fleet_discovery())
 
     def _finish_endpoint_refresh(
         self,
         *,
         rows: list[EndpointInfo] | None = None,
         error: str | None = None,
+        discovery: FleetDiscovery | None = None,
     ) -> None:
         with self._endpoint_refresh_lock:
             receivers = self._endpoint_refresh_receivers
@@ -1286,57 +1298,141 @@ class TuiApp(App):
             if error is not None:
                 poster(EndpointsFailed(error=error))
             else:
-                poster(EndpointsLoaded(rows=[replace(row) for row in rows or []]))
+                poster(
+                    EndpointsLoaded(
+                        rows=[replace(row) for row in rows or []],
+                        discovery=discovery,
+                    )
+                )
 
     def list_instances(self, backend: BackendType | None = None) -> list[EndpointInfo]:
         """Synchronously discover endpoints without unrelated configuration writes."""
         rows, _prune_providers = self._visible_rows_and_prune_scope()
+        # Copies: a caller that annotates runtime status must not write through
+        # to the rows retained for a provider that may be unreachable next pass.
         if backend is None:
-            return list(rows)
-        return [row for row in rows if row.backend == backend]
+            return [replace(row) for row in rows]
+        return [replace(row) for row in rows if row.backend == backend]
 
     def _visible_rows_and_prune_scope(
         self,
     ) -> tuple[list[EndpointInfo], tuple[ComputeProvider, ...]]:
-        rows: list[EndpointInfo] = []
-        prune_providers: list[ComputeProvider] = []
+        discovery = self.discover_fleet()
+        return visible_launchpad_rows(discovery.rows), discovery.prune_providers
+
+    def last_fleet_discovery(self) -> FleetDiscovery:
+        """Return the most recent discovery pass, for screens showing a cache."""
+        with self._provider_listing_lock:
+            return self._last_fleet_discovery
+
+    def discover_fleet(self) -> FleetDiscovery:
+        """List every configured provider, reporting each one's own outcome.
+
+        A provider that cannot be reached keeps the rows it last returned and
+        carries its error instead of silently shortening the fleet: a user who
+        sees a running deployment disappear redeploys it, and pays twice.
+        """
+        rows_by_provider: dict[ComputeProvider, list[EndpointInfo] | None] = {}
+        errors: dict[ComputeProvider, str] = {}
+
+        # An unconfigured provider is not an unavailable one, so it reports
+        # nothing rather than an error the user has no reason to act on.
+        modal_enabled = ModalBackend.is_cli_available()
         prime_enabled = get_prime_auth_status().authenticated
         try:
             vast_enabled = bool(resolve_vast_credentials().api_key)
         except ValueError:
             vast_enabled = False
+        configured = (
+            *((ComputeProvider.MODAL,) if modal_enabled else ()),
+            *((ComputeProvider.PRIME,) if prime_enabled else ()),
+            *((ComputeProvider.VAST,) if vast_enabled else ()),
+        )
+
         with ThreadPoolExecutor(max_workers=3) as executor:
-            modal_future = executor.submit(ModalBackend.list_apps)
+            modal_future = (
+                executor.submit(ModalBackend.list_apps_result) if modal_enabled else None
+            )
             prime_future = (
                 executor.submit(PrimeBackend().list_deployments)
                 if prime_enabled
                 else None
             )
             vast_future = executor.submit(VastDeploymentBackend().list_deployments) if vast_enabled else None
-            try:
-                modal_rows = modal_future.result()
-            except Exception:
-                modal_rows = None
-            try:
-                prime_rows = prime_future.result() if prime_future is not None else None
-            except Exception:
-                prime_rows = None
-            try:
-                vast_rows = vast_future.result() if vast_future is not None else None
-            except Exception:
-                vast_rows = None
+            if modal_future is not None:
+                try:
+                    modal_result = modal_future.result()
+                except Exception as exc:
+                    rows_by_provider[ComputeProvider.MODAL] = None
+                    errors[ComputeProvider.MODAL] = self._listing_error_text(
+                        ComputeProvider.MODAL, exc
+                    )
+                else:
+                    rows_by_provider[ComputeProvider.MODAL] = modal_result.rows
+                    if modal_result.error is not None:
+                        errors[ComputeProvider.MODAL] = modal_result.error.message
+            for provider, future in (
+                (ComputeProvider.PRIME, prime_future),
+                (ComputeProvider.VAST, vast_future),
+            ):
+                if future is None:
+                    continue
+                try:
+                    rows_by_provider[provider] = future.result()
+                except Exception as exc:
+                    rows_by_provider[provider] = None
+                    errors[provider] = self._listing_error_text(provider, exc)
 
-        if modal_rows is not None:
-            rows.extend(modal_rows)
-            prune_providers.append(ComputeProvider.MODAL)
-        if prime_rows is not None:
-            rows.extend(prime_rows)
-            prune_providers.append(ComputeProvider.PRIME)
-        if vast_rows is not None:
-            rows.extend(vast_rows)
-            prune_providers.append(ComputeProvider.VAST)
+        discovery = self._record_provider_listings(configured, rows_by_provider, errors)
+        rows = discovery.rows
         self._merge_deploy_connection_cache(rows)
-        return visible_launchpad_rows(rows), tuple(prune_providers)
+        return discovery
+
+    @staticmethod
+    def _listing_error_text(provider: ComputeProvider, exc: Exception) -> str:
+        log_exception(f"Could not list {provider.display_name} deployments")
+        text = str(exc).strip()
+        return text or f"{type(exc).__name__} while listing {provider.display_name}."
+
+    def _record_provider_listings(
+        self,
+        configured: tuple[ComputeProvider, ...],
+        rows_by_provider: dict[ComputeProvider, list[EndpointInfo] | None],
+        errors: dict[ComputeProvider, str],
+    ) -> FleetDiscovery:
+        """Turn one pass into listings, retaining rows a failed provider had."""
+        now = time.time()
+        listings: list[ProviderListing] = []
+        with self._provider_listing_lock:
+            # A provider the user signed out of keeps no rows: those endpoints
+            # are no longer this account's to report on.
+            for provider in tuple(self._provider_listings):
+                if provider not in configured:
+                    self._provider_listings.pop(provider, None)
+
+            for provider in configured:
+                rows = rows_by_provider.get(provider)
+                if rows is not None:
+                    listing = ProviderListing(
+                        provider=provider,
+                        rows=tuple(visible_launchpad_rows(rows)),
+                        retrieved_at_epoch=now,
+                    )
+                    self._provider_listings[provider] = listing
+                else:
+                    retained = self._provider_listings.get(provider)
+                    listing = ProviderListing(
+                        provider=provider,
+                        rows=tuple(replace(row) for row in retained.rows) if retained else (),
+                        error=errors.get(provider)
+                        or f"Could not read the {provider.display_name} deployment list.",
+                        retrieved_at_epoch=retained.retrieved_at_epoch if retained else None,
+                    )
+                listings.append(listing)
+
+            discovery = FleetDiscovery(listings=tuple(listings))
+            self._last_fleet_discovery = discovery
+        return discovery
 
     def _sync_opencode(
         self,

@@ -17,7 +17,7 @@ from ..protocol.events import (
     OperationCompleteEvent,
     StateChangeEvent,
 )
-from ..protocol.models import EndpointInfo, StorageSnapshot
+from ..protocol.models import EndpointInfo, FleetDiscovery, StorageSnapshot
 
 
 # -----------------------------------------------------------------------
@@ -179,12 +179,23 @@ class StorageFailed(Message):
 
 
 class EndpointsLoaded(Message):
-    """Managed endpoint discovery completed successfully."""
+    """Managed endpoint discovery completed.
 
-    def __init__(self, rows: list[EndpointInfo], *, is_stale: bool = False) -> None:
+    ``discovery`` carries each provider's own outcome, so a screen can tell a
+    fleet that is empty from one whose provider could not be reached.
+    """
+
+    def __init__(
+        self,
+        rows: list[EndpointInfo],
+        *,
+        is_stale: bool = False,
+        discovery: FleetDiscovery | None = None,
+    ) -> None:
         super().__init__()
         self.rows = rows
         self.is_stale = is_stale
+        self.discovery = discovery
 
 
 class EndpointsFailed(Message):

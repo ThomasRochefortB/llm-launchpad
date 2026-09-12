@@ -52,8 +52,9 @@ from ...core.storage_costs import (
     estimate_monthly_storage_cost,
 )
 from ...protocol.enums import BackendType, ComputeProvider
-from ...protocol.models import EndpointInfo, StorageSnapshot
+from ...protocol.models import EndpointInfo, FleetDiscovery, StorageSnapshot
 from ..connection import endpoint_model_summary, resolve_openai_base_url
+from ..fleet_status import provider_outage_lines
 from ..workers import EndpointsFailed, EndpointsLoaded, StorageFailed, StorageLoaded
 from ..responsive import ViewportProfile
 from .copy_enabled import CopyEnabledScreen
@@ -467,8 +468,17 @@ _PROVIDER_RESOURCE_LABELS = {
 }
 
 
-def _render_deployment_status(rows: list[EndpointInfo], username: str = "") -> str:
+def _render_deployment_status(
+    rows: list[EndpointInfo],
+    username: str = "",
+    discovery: FleetDiscovery | None = None,
+) -> str:
+    # A provider that did not answer is reported before any count, because
+    # "no apps" and "we could not ask" lead to opposite decisions.
+    outage_lines = provider_outage_lines(discovery)
     if not rows:
+        if outage_lines:
+            return "\n".join(outage_lines)
         return "[dim]No active launchpad apps.[/dim]"
 
     header_lines = _friendly_count_line(rows)
@@ -534,7 +544,8 @@ def _render_deployment_status(rows: list[EndpointInfo], username: str = "") -> s
         if index != len(display_rows) - 1:
             app_lines.append("")
 
-    return "\n".join(header_lines + app_lines)
+    preface = [*outage_lines, ""] if outage_lines else []
+    return "\n".join(preface + header_lines + app_lines)
 
 
 def _storage_estimate_lines(snapshot: StorageSnapshot | None) -> list[str]:
@@ -874,6 +885,7 @@ class MainMenuScreen(CopyEnabledScreen):
         self._runtime_rows: list[EndpointInfo] = []
         self._runtime_rows_fingerprint: tuple[tuple[object, ...], ...] = ()
         self._runtime_rows_cached_at = 0.0
+        self._fleet_discovery: FleetDiscovery | None = None
 
     def compose(self) -> ComposeResult:
         with Vertical(id="main-menu-root"):
@@ -1384,6 +1396,9 @@ class MainMenuScreen(CopyEnabledScreen):
         except Exception as exc:
             poster(DeploymentsLoadFailed(error=str(exc)))
             return
+        last_discovery = getattr(self.app, "last_fleet_discovery", None)
+        if callable(last_discovery):
+            self._fleet_discovery = last_discovery()
         if rows is None:
             poster(DeploymentsLoadFailed(error="Could not read Modal app list."))
             return
@@ -1392,6 +1407,7 @@ class MainMenuScreen(CopyEnabledScreen):
 
     def on_endpoints_loaded(self, message: EndpointsLoaded) -> None:
         """Add runtime health details without mutating the shared endpoint cache."""
+        self._fleet_discovery = message.discovery
         rows = [replace(row) for row in message.rows if row.backend is not None]
         fingerprint = self._runtime_fingerprint(rows)
         cached_runtime_is_fresh = (
@@ -1545,7 +1561,11 @@ class MainMenuScreen(CopyEnabledScreen):
     def _show_deployments(self, rows: list[EndpointInfo]) -> None:
         visible_rows = [row for row in rows if _should_show_in_panel(row.state)]
         self.query_one("#deployment-status-body", Static).update(
-            _render_deployment_status(visible_rows, username=self.username)
+            _render_deployment_status(
+                visible_rows,
+                username=self.username,
+                discovery=self._fleet_discovery,
+            )
         )
 
     @staticmethod
