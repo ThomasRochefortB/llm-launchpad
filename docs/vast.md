@@ -254,7 +254,12 @@ UI, not live prices, performance, or serving certification.
 
 ### Recovery and billing
 
-Private recovery records live under `~/.llm_launchpad/vast/`. Launchpad writes a
+Private recovery records live under `~/.llm_launchpad/vast/`, one directory per
+rental, holding the record and the rental's own SSH key. Confirmed destruction
+removes both: the key authenticates a host that no longer exists, so keeping it
+stores a secret for nothing. The lock file stays, because removal happens while
+that lock is held and unlinking it would let a waiting process take a different
+inode and hold no lock at all. Launchpad writes a
 unique ownership label before creation and saves the returned instance ID before
 continuing. An ambiguous response is reconciled by label; creation is never
 blindly retried. Account and machine identity are checked before destruction.

@@ -75,5 +75,18 @@ class VastState:
         finally:
             temporary.unlink(missing_ok=True)
 
+    # Written by VastSsh for one rental and useless once it is destroyed. The
+    # lock file is deliberately absent: remove() runs inside locked(), and
+    # unlinking the file another process is waiting on lets it recreate the
+    # path and hold a different inode, which is no lock at all.
+    _RENTAL_FILES = ("record.json", "id_ed25519", "id_ed25519.pub", "known_hosts", "ssh")
+
     def remove(self, name: str) -> None:
-        (self.directory(name) / "record.json").unlink(missing_ok=True)
+        """Drop a destroyed rental's record and its private key material.
+
+        The per-rental SSH key authenticates one host that no longer exists, so
+        keeping it past confirmed destruction stores a secret for nothing.
+        """
+        directory = self.directory(name)
+        for filename in self._RENTAL_FILES:
+            (directory / filename).unlink(missing_ok=True)
