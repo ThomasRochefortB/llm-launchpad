@@ -7,7 +7,7 @@ from rich.markup import render as render_markup
 
 from llm_launchpad.core.modal_auth import ModalAuthStatus
 from llm_launchpad.core.artificial_analysis import ArtificialAnalysisAuthStatus
-from llm_launchpad.protocol.enums import BackendType
+from llm_launchpad.protocol.enums import BackendType, ComputeProvider
 from llm_launchpad.protocol.models import EndpointInfo, StorageSnapshot, StoredModelInfo
 from llm_launchpad.tui.screens.main_menu import (
     MainMenuScreen,
@@ -46,12 +46,48 @@ class MainMenuStatusRenderTests(unittest.TestCase):
         self.assertIsNone(screen._secondary_refresh_timer)
         refresh_secondary.assert_called_once_with()
 
+    def test_each_provider_row_names_its_own_kind_of_resource(self) -> None:
+        """A Vast rental was labelled a Prime pod by a two-way branch."""
+        rows = [
+            EndpointInfo(
+                name="llamacpp-modal", app_id="ap-1", backend=BackendType.LLAMACPP,
+                instance_name="on-modal", provider=ComputeProvider.MODAL, state="deployed",
+            ),
+            EndpointInfo(
+                name="llp-prime-vllm-pod", app_id="pod-1", backend=BackendType.VLLM,
+                instance_name="on-prime", provider=ComputeProvider.PRIME, state="running",
+            ),
+            EndpointInfo(
+                name="llp-vast-llamacpp-rental", app_id="284412", backend=BackendType.LLAMACPP,
+                instance_name="on-vast", provider=ComputeProvider.VAST, state="running",
+            ),
+        ]
+        rendered = _render_deployment_status(rows)
+        self.assertIn("Modal app:[/dim] llamacpp-modal", rendered)
+        self.assertIn("Prime Intellect pod:[/dim] llp-prime-vllm-pod", rendered)
+        self.assertIn("Vast.ai rental:[/dim] llp-vast-llamacpp-rental", rendered)
+
     def test_main_menu_bindings_do_not_include_q_quit(self) -> None:
         self.assertFalse(any(binding.key == "q" for binding in MainMenuScreen.BINDINGS))
 
     def test_render_deployment_status_empty_state(self) -> None:
         rendered = _render_deployment_status([])
         self.assertIn("No active launchpad apps", rendered)
+        # The panel is already titled "Deployment Status"; the second heading
+        # appeared only in the empty state, so the panel renamed itself when
+        # the fleet emptied.
+        self.assertNotIn("Fleet Pulse", rendered)
+        self.assertNotIn("Fleet Pulse", _render_deployment_status(
+            [
+                EndpointInfo(
+                    name="vllm-qwen",
+                    app_id="ap-1",
+                    state="running",
+                    backend=BackendType.VLLM,
+                    instance_name="qwen",
+                )
+            ]
+        ))
 
     def test_render_deployment_status_includes_counts_and_rows(self) -> None:
         rows = [
@@ -394,6 +430,34 @@ class MainMenuStatusRenderTests(unittest.TestCase):
         self.assertIn("Hugging Face authenticated", rendered)
         self.assertIn("Artificial Analysis authenticated", rendered)
         self.assertNotIn("alice", rendered)
+
+
+class BillingPanelStorageTests(unittest.TestCase):
+    def test_storage_estimate_survives_a_failed_modal_billing_call(self) -> None:
+        """The estimate is local data and does not depend on Modal billing.
+
+        Rendering only the billing error hid the sole standing warning that
+        cached models are still costing money.
+        """
+        snapshot = StorageSnapshot(
+            llamacpp_models=[
+                StoredModelInfo(
+                    backend=BackendType.LLAMACPP, model_id="m", size_bytes=1400 * _GIB
+                )
+            ],
+            vllm_models=[],
+        )
+        rendered = _render_provider_billing_body(
+            modal_payload=None,
+            modal_error="modal CLI not found",
+            prime_state="unavailable",
+            prime_payload=None,
+            prime_error=None,
+            storage_snapshot=snapshot,
+        )
+        self.assertIn("Billing unavailable.", rendered)
+        self.assertIn("Launchpad storage est.", rendered)
+        self.assertIn("1,400 GiB cached", rendered)
 
 
 if __name__ == "__main__":

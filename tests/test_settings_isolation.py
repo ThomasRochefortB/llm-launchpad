@@ -26,6 +26,39 @@ def _is_under(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
 
+def _settings_default_arguments() -> dict[str, Path]:
+    """Return every function default still pointing inside the real settings dir.
+
+    A ``path: Path = CONNECTIONS_PATH`` default is evaluated at import, so the
+    isolation fixture's monkeypatch of the module attribute never reaches it and
+    the call writes the developer's live state. That is not hypothetical: it put
+    a fabricated deployment, API key included, into a real connection store.
+    """
+
+    import inspect
+
+    found: dict[str, Path] = {}
+    for info in pkgutil.walk_packages(
+        llm_launchpad.__path__, prefix=f"{llm_launchpad.__name__}."
+    ):
+        try:
+            module = importlib.import_module(info.name)
+        except Exception:
+            continue
+        for attribute, value in vars(module).items():
+            if not inspect.isfunction(value) or value.__module__ != info.name:
+                continue
+            try:
+                signature = inspect.signature(value)
+            except (TypeError, ValueError):
+                continue
+            for parameter in signature.parameters.values():
+                default = parameter.default
+                if isinstance(default, Path) and _is_under(default, REAL_SETTINGS_DIR):
+                    found[f"{info.name}.{attribute}({parameter.name})"] = default
+    return found
+
+
 def _settings_paths() -> dict[str, Path]:
     """Return every module-level Path still pointing inside the real settings dir."""
 
@@ -54,6 +87,19 @@ class SettingsIsolationTests(unittest.TestCase):
             "These paths still resolve into the real ~/.llm_launchpad and would "
             "let the suite read or overwrite live user state. Add each one to "
             "_ISOLATED_SETTINGS_PATHS in tests/conftest.py:\n  "
+            + "\n  ".join(sorted(leaked)),
+        )
+
+    def test_no_function_default_resolves_into_the_real_settings_dir(self) -> None:
+        leaked = _settings_default_arguments()
+
+        self.assertEqual(
+            leaked,
+            {},
+            "These defaults are bound at import, so the isolation fixture cannot "
+            "redirect them and the suite would read or overwrite live user state. "
+            "Default the parameter to None and resolve the path inside the "
+            "function:\n  "
             + "\n  ".join(sorted(leaked)),
         )
 

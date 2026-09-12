@@ -38,7 +38,6 @@ class VastPreviewScreen(CopyEnabledScreen):
     VastPreviewScreen Input { margin-bottom: 1; }
     VastPreviewScreen .vast-actions { height: auto; }
     VastPreviewScreen Button { margin-right: 1; }
-    VastPreviewScreen #vast-offers { height: 14; margin-top: 1; }
     VastPreviewScreen #vast-feedback { height: auto; min-height: 2; }
     """
 
@@ -83,7 +82,7 @@ class VastPreviewScreen(CopyEnabledScreen):
         try:
             credentials = resolve_vast_credentials()
             text = (
-                f"Key configured through {credentials.source}; not verified."
+                f"Key configured ({credentials.source}); not verified."
                 if credentials.api_key else "Configure a Vast API key to browse offers."
             )
         except ValueError as exc:
@@ -128,7 +127,7 @@ class VastPreviewScreen(CopyEnabledScreen):
                 effective = resolve_vast_credentials()
                 detail = "Launchpad's saved Vast key has been removed."
                 if effective.api_key:
-                    detail += f" A key remains configured through {effective.source}."
+                    detail += f" A key remains configured ({effective.source})."
             elif action == "vast-connect":
                 credentials = VastCredentials(key, "provided") if key else resolve_vast_credentials()
                 status = VastBackend(credentials).auth_status()

@@ -457,12 +457,19 @@ def _wrap_url_for_panel(value: str, width: int = 44) -> list[str]:
     return lines or [text]
 
 
+# Each provider names its unit of compute differently, and a row that calls a
+# Vast rental a "Prime Intellect pod" sends the reader looking for it in the
+# wrong console.
+_PROVIDER_RESOURCE_LABELS = {
+    ComputeProvider.MODAL: "Modal app",
+    ComputeProvider.PRIME: "Prime Intellect pod",
+    ComputeProvider.VAST: "Vast.ai rental",
+}
+
+
 def _render_deployment_status(rows: list[EndpointInfo], username: str = "") -> str:
     if not rows:
-        return (
-            "[bold]Fleet Pulse[/bold]\n"
-            "[dim]No active launchpad apps.[/dim]"
-        )
+        return "[dim]No active launchpad apps.[/dim]"
 
     header_lines = _friendly_count_line(rows)
 
@@ -486,8 +493,8 @@ def _render_deployment_status(rows: list[EndpointInfo], username: str = "") -> s
             f"[dim]{escape(backend_name)}[/dim]  {_style_runtime_bucket(_runtime_bucket(row))} "
             f"[dim]({row.provider.value}: {escape((row.state or 'unknown').strip().lower())})[/dim]"
         )
-        resource_label = (
-            "Modal app" if row.provider == ComputeProvider.MODAL else "Prime Intellect pod"
+        resource_label = _PROVIDER_RESOURCE_LABELS.get(
+            row.provider, f"{row.provider.display_name} deployment"
         )
         modal_app_line = f"[dim]{resource_label}:[/dim] {escape(row.name or '')}"
         if (row.app_id or "").strip():
@@ -761,7 +768,12 @@ def _render_provider_billing_body(
     """Compose the Modal, Prime and Vast billing sections of the shared panel."""
 
     if modal_error is not None:
-        modal_section = _render_billing_load_error(modal_error)
+        # The storage estimate comes from a local snapshot and owes nothing to
+        # Modal's billing CLI, so a failed billing call must not take the only
+        # standing warning about ongoing storage spend down with it.
+        modal_section = "\n".join(
+            [_render_billing_load_error(modal_error), *_storage_estimate_lines(storage_snapshot)]
+        )
     elif modal_payload is not None:
         modal_section = _render_billing_report(
             modal_payload,
@@ -820,7 +832,7 @@ class MainMenuScreen(CopyEnabledScreen):
         Binding("t", "select_storage", "Storage", show=True),
         Binding("s", "select_settings", "Settings", show=True),
         Binding("i", "toggle_details", "Details", show=True),
-        Binding("escape", "close_details", show=False),
+        Binding("escape", "close_details", "Close details", show=False),
     ]
     _ENDPOINT_REFRESH_INTERVAL_SECONDS = 20.0
     _BILLING_REFRESH_INTERVAL_SECONDS = 300.0
@@ -1556,7 +1568,6 @@ class MainMenuScreen(CopyEnabledScreen):
     def on_deployments_load_failed(self, message: DeploymentsLoadFailed) -> None:
         self._status_refresh_inflight = False
         self.query_one("#deployment-status-body", Static).update(
-            "[bold]Fleet Pulse[/bold]\n"
             "[yellow]Status unavailable.[/yellow]\n"
             f"[dim]{clip(message.error, 80)}[/dim]"
         )

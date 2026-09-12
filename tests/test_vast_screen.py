@@ -9,10 +9,17 @@ from textual.widgets import Button, DataTable, Input, Static
 from llm_launchpad.core.vast_auth import VastCredentials
 from llm_launchpad.core.vast_backend import parse_vast_offer
 from llm_launchpad.protocol.models import VastAuthStatus, VastOfferQuery
+from llm_launchpad.tui.app import TuiApp
 from llm_launchpad.tui.screens.settings import SettingsScreen
 from llm_launchpad.tui.screens.setup import SetupRequiredScreen
 from llm_launchpad.tui.screens.vast import VastPreviewScreen
 from tests.test_vast_backend import offer_payload
+
+
+class _StyledApp(App[None]):
+    """Carries the product stylesheet, which screen DEFAULT_CSS must survive."""
+
+    CSS_PATH = TuiApp.CSS_PATH
 
 
 class VastScreenTests(unittest.IsolatedAsyncioTestCase):
@@ -68,6 +75,37 @@ class VastScreenTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("unknown", cells)
                 self.assertIn("$0.0020", cells)
                 self.assertFalse(screen.query_one("#vast-refresh", Button).disabled)
+
+    async def test_the_offer_table_is_tall_enough_to_browse(self) -> None:
+        """`DataTable { height: 1fr }` in the app stylesheet outranks a screen default.
+
+        It collapsed the offer browser to its 3-row minimum, so a lookup
+        reporting 100 eligible rentals showed exactly one of them.
+        """
+        app = _StyledApp()
+        async with app.run_test(size=(200, 50)) as pilot:
+            await app.push_screen(VastPreviewScreen())
+            await pilot.pause()
+            table = app.screen.query_one("#vast-offers", DataTable)
+            self.assertGreaterEqual(table.content_size.height, 10)
+
+    async def test_the_key_source_reads_as_a_sentence(self) -> None:
+        # "configured through stored" is not English; every source has to read
+        # in the line that reports it.
+        for source in ("environment", "stored", "Vast CLI"):
+            with self.subTest(source=source):
+                with patch(
+                    "llm_launchpad.tui.screens.vast.resolve_vast_credentials",
+                    return_value=VastCredentials("secret", source),
+                ):
+                    app = App()
+                    async with app.run_test() as pilot:
+                        await app.push_screen(VastPreviewScreen())
+                        await pilot.pause()
+                        feedback = str(
+                            app.screen.query_one("#vast-feedback", Static).content
+                        )
+                self.assertIn(f"Key configured ({source}); not verified.", feedback)
 
     async def test_failed_login_does_not_save_and_ui_recovers(self) -> None:
         with patch("llm_launchpad.tui.screens.vast.VastBackend.auth_status", return_value=VastAuthStatus(False, error="Denied")), patch(

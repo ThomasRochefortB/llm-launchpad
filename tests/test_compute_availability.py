@@ -339,6 +339,38 @@ class ComputeAvailabilityTests(unittest.TestCase):
             ("a100-80gb", "A100 80GB"),
         )
 
+    def test_reported_capacity_is_rounded_to_whole_gigabytes(self) -> None:
+        """Providers report VRAM from the device byte count, not the spec sheet.
+
+        Printing it raw filled the GPU filter with "RTX A2000 5.99414GB" and,
+        because the identity is built from the label, listed one card several
+        times when two hosts reported slightly different capacities.
+        """
+        for gpu, memory_gb, expected in (
+            ("RTX A2000", 5.99414, "RTX A2000 6GB"),
+            ("RTX 4060 TI", 15.9961, "RTX 4060 TI 16GB"),
+            ("RTX 5060 TI", 15.9287, "RTX 5060 TI 16GB"),
+            ("H100 SXM", 79.6475, "H100 SXM 80GB"),
+            ("RTX PRO 6000 MAX Q", 95.5928, "RTX PRO 6000 MAX Q 96GB"),
+        ):
+            with self.subTest(gpu=gpu):
+                self.assertEqual(canonical_gpu_identity(gpu, memory_gb)[1], expected)
+
+    def test_hosts_reporting_the_same_card_share_one_identity(self) -> None:
+        first = canonical_gpu_identity("RTX 5060 TI", 15.9287)
+        second = canonical_gpu_identity("RTX 5060 TI", 15.9961)
+        self.assertEqual(first, second)
+        # Genuinely different variants of one card still stay apart.
+        self.assertNotEqual(first, canonical_gpu_identity("RTX 5060 TI", 7.95996))
+
+    def test_a_name_that_already_carries_its_capacity_is_not_doubled(self) -> None:
+        # The suffix used to be stripped with int() truncation, so a 5.99414
+        # reading never matched the "-6GB" the name already ended with.
+        self.assertEqual(
+            canonical_gpu_identity("RTX-A2000-6GB", 5.99414)[1],
+            "RTX A2000 6GB",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

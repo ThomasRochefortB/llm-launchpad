@@ -43,6 +43,15 @@ Footer {
     background: $footer-background;
     color: $footer-foreground;
     border-top: solid $border;
+    /* Restore Textual's own footer scrollbar settings, which the global `*`
+       rule above overrides. The gutter is the damaging one: reserving it
+       collapses every auto grid column in the footer to zero width, so once
+       the hints no longer fit the terminal the whole row rendered blank --
+       the main menu lost every key at 80 columns, Fast Deploy at 100. The
+       size matters too: the border leaves exactly one content row, and a
+       horizontal scrollbar would spend it. */
+    scrollbar-gutter: auto;
+    scrollbar-size: 0 0;
 }
 
 /* ---- Status header widget ---- */
@@ -534,6 +543,15 @@ VisionOptions Select {
     height: auto;
     text-wrap: wrap;
     padding: 0 0 1 0;
+}
+
+/* The offer browser returns up to 100 rows, so it needs a real viewport. This
+   lives here rather than in VastPreviewScreen.DEFAULT_CSS because the
+   `DataTable { height: 1fr }` rule above comes from the app stylesheet and
+   outranks a screen default, which collapsed the table to its 3-row minimum. */
+#vast-offers {
+    height: 14;
+    margin-top: 1;
 }
 
 /* A provider offer dictates these, so they must read as reported values

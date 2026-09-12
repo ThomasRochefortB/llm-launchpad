@@ -10,7 +10,13 @@ from textual.widgets import Footer, Static
 
 
 def _iter_screen_bindings(obj: object) -> list[tuple[str, str]]:
-    """Collect (key, label) pairs from a widget's class BINDINGS across the MRO."""
+    """Collect (key, label) pairs from a widget's class BINDINGS across the MRO.
+
+    A binding with no description is internal plumbing -- arrow keys that hop
+    between option lists, the focus shuffle inside a confirm dialog -- and is
+    skipped. Falling back to the action name printed ``navigate_option_list_up``
+    and ``close_details`` at the reader, which names nothing they can use.
+    """
     bindings: list[tuple[str, str]] = []
     seen: set[tuple[str, str]] = set()
     for base in reversed(type(obj).__mro__):
@@ -23,7 +29,9 @@ def _iter_screen_bindings(obj: object) -> list[tuple[str, str]]:
             key_token = entry.key.split(",", 1)[0].strip()
             if not key_token:
                 continue
-            label = (entry.description or entry.action or "").strip()
+            label = (entry.description or "").strip()
+            if not label:
+                continue
             identity = (key_token, label)
             if identity in seen:
                 continue

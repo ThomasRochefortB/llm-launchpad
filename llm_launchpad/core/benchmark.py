@@ -199,38 +199,21 @@ def benchmark_config_from_endpoint(
 
 
 def merge_cached_benchmark_connections(rows: list[EndpointInfo]) -> None:
-    """Merge persisted deployment connection summaries into Modal rows."""
-    cache_path = SETTINGS_DIR / "deployment_connection_summaries.json"
-    try:
-        payload = json.loads(cache_path.read_text())
-    except Exception:
-        return
-    entries = payload.get("entries")
-    if not isinstance(entries, dict):
-        return
-    for row in rows:
-        cached = entries.get((row.name or "").strip())
-        if not isinstance(cached, dict):
-            continue
-        if not (row.web_url or "").strip():
-            base_url = str(cached.get("base_url", "") or "").strip()
-            if base_url:
-                row.web_url = normalize_aiperf_url(base_url)
-        if not (row.served_model_name or "").strip():
-            model_id = str(cached.get("model_id", "") or "").strip()
-            if model_id:
-                row.served_model_name = model_id
-        if not (row.display_name or "").strip():
-            display_name = str(cached.get("display_name", "") or "").strip()
-            if display_name:
-                row.display_name = display_name
-        if row.endpoint_api_key is None:
-            key = str(cached.get("api_key", "") or "").strip()
-            if key:
-                row.endpoint_api_key = key
-        provider = str(cached.get("provider", "") or "").strip()
-        if provider in {item.value for item in ComputeProvider}:
-            row.provider = ComputeProvider(provider)
+    """Hydrate benchmark rows from the shared connection store.
+
+    This used to be a second, weaker copy of that merge. It had no resource-id
+    or URL conflict checks, and no Vast guard, so it handed a benchmark the
+    loopback port of a rental whose SSH tunnel had since closed -- a port the
+    local machine may well have reassigned to something else.
+    """
+    from .connection_store import merge_connections
+
+    merge_connections(
+        rows,
+        SETTINGS_DIR / "deployment_connection_summaries.json",
+        SETTINGS_DIR / "storage_snapshot.json",
+        persist_backfill=False,
+    )
 
 
 def build_aiperf_command(

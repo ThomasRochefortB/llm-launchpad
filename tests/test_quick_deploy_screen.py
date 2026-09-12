@@ -7,6 +7,7 @@ from textual.app import App
 from textual.widgets import Button, Input, Select, Static, Switch
 
 from llm_launchpad.core import quick_deploy
+from llm_launchpad.core.inference_options import workload_basis_label
 from llm_launchpad.core.quick_deploy import (
     QuickDeployProfile,
     get_quick_deploy_profile,
@@ -213,7 +214,12 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(instance_input.parent is not None)
             assert instance_input.parent is not None
             self.assertTrue(instance_input.parent.has_class("hidden"))
-            self.assertTrue(screen.query_one("#quick-deploy-btn", Button).has_focus)
+            # Deploy spends money on the keypress that reaches this screen, so
+            # it must not be the thing a second enter lands on.
+            self.assertFalse(screen.query_one("#quick-deploy-btn", Button).has_focus)
+            self.assertTrue(
+                screen.query_one("#toggle-advanced-quick", Button).has_focus
+            )
 
     async def test_supported_profile_shows_default_on_mtp_toggle_and_can_disable_it(self) -> None:
         profile = replace(
@@ -253,7 +259,107 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             button = screen.query_one("#quick-deploy-btn", Button)
             self.assertGreaterEqual(card.region.y, 0)
             self.assertLessEqual(button.region.bottom, 24)
-            self.assertTrue(button.has_focus)
+            self.assertFalse(button.has_focus)
+
+    async def test_a_provisioned_plan_quantifies_what_leaving_it_up_costs(self) -> None:
+        """The windowed estimate and "bills continuously" contradicted each other.
+
+        A Vast rental at $1.45/hr showed ~$349/mo beside a note saying the
+        rental bills until it is stopped, which is ~$1,047/mo.
+        """
+        profile = get_quick_deploy_profile("qwen35-397b-rtxpro")
+        recipe = quick_deploy_recipe(profile)
+        plan = InferencePlan(
+            recipe=recipe,
+            quote=ProviderQuote(
+                id="vast:offer-1",
+                recipe_id=recipe.id,
+                provider=ComputeProvider.VAST,
+                provider_reference="offer-1",
+                gpu_type="RTX-PRO-6000",
+                gpu_count=3,
+                price_per_hour_usd=1.0,
+                billing_model=BillingModel.PROVISIONED,
+            ),
+            estimated_monthly_cost_usd=240.0,
+        )
+
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(QuickDeployScreen(profile_id=plan))
+            await pilot.pause()
+            summary = str(
+                app.screen.query_one("#quick-deploy-profile-body", Static).content
+            )
+
+        self.assertIn("[bold]Monthly[/bold]  ~$240.00/mo", summary)
+        self.assertIn("[bold]If left up[/bold] ~$720.00/mo at 24/7", summary)
+        self.assertIn(workload_basis_label(), summary)
+
+    async def test_a_scale_to_zero_plan_omits_the_continuous_figure(self) -> None:
+        profile = get_quick_deploy_profile("qwen35-397b-rtxpro")
+        recipe = quick_deploy_recipe(profile)
+        plan = InferencePlan(
+            recipe=recipe,
+            quote=ProviderQuote(
+                id="modal:compute:rtxpro",
+                recipe_id=recipe.id,
+                provider=ComputeProvider.MODAL,
+                provider_reference="RTX-PRO-6000",
+                gpu_type="RTX-PRO-6000",
+                gpu_count=3,
+                price_per_hour_usd=1.0,
+                billing_model=BillingModel.SCALE_TO_ZERO,
+            ),
+            estimated_monthly_cost_usd=60.0,
+        )
+
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(QuickDeployScreen(profile_id=plan))
+            await pilot.pause()
+            summary = str(
+                app.screen.query_one("#quick-deploy-profile-body", Static).content
+            )
+
+        self.assertNotIn("If left up", summary)
+
+    async def test_placements_the_list_cannot_tell_apart_are_collapsed(self) -> None:
+        """Modal returns several quotes for one shape; the row shows none of it.
+
+        Two identical "Modal · 1x B200 180GB · provider-managed region" lines
+        gave the reader a choice with nothing to choose between.
+        """
+        profile = get_quick_deploy_profile("qwen35-397b-rtxpro")
+        recipe = quick_deploy_recipe(profile)
+
+        def _quote(quote_id: str) -> ProviderQuote:
+            return ProviderQuote(
+                id=quote_id,
+                recipe_id=recipe.id,
+                provider=ComputeProvider.MODAL,
+                provider_reference="B200",
+                gpu_type="B200",
+                gpu_count=1,
+                price_per_hour_usd=6.25,
+                billing_model=BillingModel.SCALE_TO_ZERO,
+            )
+
+        first = InferencePlan(recipe=recipe, quote=_quote("modal:b200:a"))
+        second = InferencePlan(recipe=recipe, quote=_quote("modal:b200:b"))
+
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(
+                QuickDeployScreen(
+                    profile_id=first, alternative_plans=(first, second)
+                )
+            )
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, QuickDeployScreen)
+            self.assertEqual(len(screen._alternative_plans), 1)
+            self.assertEqual(len(screen.query("#quick-fulfillment")), 0)
 
     async def test_deploy_maps_override_fields_into_config(self) -> None:
         app = _TestApp()
@@ -319,7 +425,11 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(config)
         self.assertEqual(config.provider, ComputeProvider.PRIME)
         self.assertEqual(config.backend, BackendType.LLAMACPP)
-        self.assertEqual(config.app_name, "llp-prime-llamacpp-qwen35-397b-rtxpro")
+        # The catalog profile describes three RTX PRO 6000s; this plan is four
+        # H100s, so the default name has to follow the placement, not the tier.
+        self.assertEqual(
+            config.app_name, "llp-prime-llamacpp-qwen35-397b-rtxpro-h100-80gb-x4"
+        )
         self.assertEqual(
             config.provider_options,
             PrimeProviderOptions(

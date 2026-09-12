@@ -11,6 +11,7 @@ from textual.geometry import Size
 from textual.screen import Screen
 from textual.widget import Widget
 from textual.widgets import Footer, Input, OptionList, Static
+from textual.widgets._footer import FooterKey
 
 from llm_launchpad.core.compute_availability import aggregate_compute_availability
 from llm_launchpad.protocol.enums import BackendType, OperationType
@@ -111,6 +112,36 @@ class ResponsiveLayoutTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(overlay.display)
             self.assertIs(screen.focused, field)
             self.assertEqual(field.value, "777")
+
+    async def test_footer_keeps_its_hints_when_they_overflow_the_terminal(self) -> None:
+        """The footer is one content row; a scrollbar would spend all of it.
+
+        The global `*` rule gives every widget a 1-cell scrollbar, which
+        outranks Textual's `Footer { scrollbar-size: 0 0 }`. Once the hints
+        grew past the terminal, that row became a scrollbar and every key
+        vanished -- on the main menu at 80 columns, on Fast Deploy at 100.
+        """
+
+        for screen_factory, width in (
+            (MainMenuScreen, 80),
+            (FastDeployScreen, 100),
+        ):
+            with self.subTest(screen=screen_factory.__name__, width=width):
+                screen = screen_factory()
+                app = _ScreenApp(screen)
+                async with app.run_test(size=(width, 30)) as pilot:
+                    await pilot.pause()
+                    footer = screen.query_one(Footer)
+                    self.assertFalse(footer.show_horizontal_scrollbar)
+                    self.assertGreater(footer.content_size.height, 0)
+                    keys = [
+                        key
+                        for key in footer.query(FooterKey)
+                        if not key.has_class("-command-palette")
+                    ]
+                    self.assertTrue(keys)
+                    self.assertGreater(keys[0].region.width, 0)
+                    self.assertEqual(keys[0].region.y, footer.region.bottom - 1)
 
     async def test_main_menu_hides_secondary_content_when_space_is_constrained(self) -> None:
         screen = MainMenuScreen(username="alice", version="1.0")

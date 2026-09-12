@@ -407,5 +407,20 @@ class DeployLogSummarizerTests(unittest.TestCase):
         self.assertEqual(beautify_summary_line("✓ already formatted"), "✓ already formatted")
 
 
+class StickyMilestoneTests(unittest.TestCase):
+    def test_server_ready_is_announced_once_across_deploy_and_warmup(self) -> None:
+        """"Server is ready!" is sticky, but was emitted without being recorded.
+
+        It bypassed ``_emit_once``, so it never entered the seen set that
+        ``_STICKY_MILESTONES`` is filtered against, and the deploy summary
+        showed the milestone twice.
+        """
+        summarizer = DeployLogSummarizer(BackendType.LLAMACPP)
+        deploy = summarizer.transform("Server is ready!", OperationType.DEPLOY)
+        warmup = summarizer.transform("Server is ready!", OperationType.WARMUP)
+        self.assertEqual(deploy, ["Server is ready!"])
+        self.assertEqual(warmup, [])
+
+
 if __name__ == "__main__":
     unittest.main()

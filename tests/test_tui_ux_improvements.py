@@ -78,6 +78,7 @@ class _BindingProbeScreen(CopyEnabledScreen):
     BINDINGS = [
         Binding("escape", "pop", "Back", show=True),
         Binding("probe", "probe", "Probe action", show=False),
+        Binding("up", "navigate_option_list_up", show=False),
     ]
 
 
@@ -103,6 +104,28 @@ class HelpOverlayTests(unittest.IsolatedAsyncioTestCase):
         keys = [key for key, _label in bindings]
         self.assertIn("escape", keys)
         self.assertIn("probe", keys)
+
+    def test_undescribed_bindings_do_not_leak_their_action_names(self) -> None:
+        """A binding with no description is plumbing, not a shortcut.
+
+        Falling back to the action name printed "up navigate_option_list_up"
+        in the help of every screen that hops focus with the arrow keys.
+        """
+        bindings = _iter_screen_bindings(_BindingProbeScreen())
+        self.assertNotIn("up", [key for key, _label in bindings])
+        for _key, label in bindings:
+            self.assertTrue(label)
+            self.assertNotIn("_", label)
+
+    async def test_help_lists_only_described_bindings_on_a_real_screen(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(StorageScreen())
+            await pilot.pause()
+            labels = [label for _key, label in _iter_screen_bindings(app.screen)]
+            self.assertIn("Pre-download", labels)
+            self.assertNotIn("navigate_option_list_up", labels)
+            self.assertNotIn("navigate_option_list_down", labels)
 
 
 class LaunchpadSettingsFieldsTests(unittest.TestCase):

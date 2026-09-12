@@ -36,7 +36,9 @@ from .copy_enabled import CopyEnabledScreen
 
 def _human_bytes(size_bytes: int) -> str:
     size = float(size_bytes)
-    units = ["B", "KB", "MB", "GB", "TB"]
+    # Binary divisor, binary labels: the same screen reports GiB through
+    # format_gib, and calling 1024-based units "GB" understates a model by 7%.
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
     for unit in units:
         if size < 1024.0 or unit == units[-1]:
             return f"{size:.1f} {unit}"
@@ -366,7 +368,26 @@ class StorageScreen(CopyEnabledScreen):
         if self._selected_model is None:
             self.app.notify("Select a model row first to delete.", severity="warning", timeout=5)
             return
-        self.app.push_screen(StorageDeleteConfirmScreen(self._selected_model))
+        self.app.push_screen(
+            StorageDeleteConfirmScreen(
+                self._selected_model,
+                also_removed=self._rows_removed_with(self._selected_model),
+            )
+        )
+
+    def _rows_removed_with(self, model: StoredModelInfo) -> tuple[StoredModelInfo, ...]:
+        """Return the other cached rows this delete would take with it.
+
+        Deletion is scoped to the repository directory, while the table lists a
+        row per quant, so confirming one row can remove several.
+        """
+        return tuple(
+            row
+            for row in (self._snapshot.llamacpp_models + self._snapshot.vllm_models)
+            if row.backend == model.backend
+            and row.model_id == model.model_id
+            and _storage_row_key(row) != _storage_row_key(model)
+        )
 
     def action_pop_screen(self) -> None:
         self.app.pop_screen()
@@ -435,9 +456,34 @@ class StorageDeleteConfirmScreen(CopyEnabledScreen):
     ]
     ACTION_IDS = ("delete-cancel", "delete-confirm")
 
-    def __init__(self, model: StoredModelInfo) -> None:
+    def __init__(
+        self,
+        model: StoredModelInfo,
+        also_removed: tuple[StoredModelInfo, ...] = (),
+    ) -> None:
         super().__init__()
         self.model = model
+        self.also_removed = also_removed
+
+    def _warning(self) -> str:
+        """State the real blast radius, which is the whole repository cache.
+
+        The row names one quant and its size, but deletion removes the
+        repository directory, so confirming a 2.4 GiB row could silently take
+        every other cached quant of that model with it.
+        """
+        if not self.also_removed:
+            return "[yellow]This will remove the cached model files from provider storage.[/yellow]"
+        quants = ", ".join(
+            escape((row.quant or "unquantized").strip()) for row in self.also_removed
+        )
+        total = self.model.size_bytes + sum(row.size_bytes for row in self.also_removed)
+        noun = "quant" if len(self.also_removed) == 1 else "quants"
+        return (
+            f"[yellow]This removes the whole cached repository, including "
+            f"{len(self.also_removed)} other {noun} ({quants}). "
+            f"{_human_bytes(total)} total.[/yellow]"
+        )
 
     def compose(self) -> ComposeResult:
         detail = [escape(self.model.backend.value)]
@@ -451,10 +497,7 @@ class StorageDeleteConfirmScreen(CopyEnabledScreen):
                 f"Delete [bold]{escape(self.model.model_id)}[/bold]?\n"
                 f"[dim]{' · '.join(detail)}[/dim]"
             )
-            yield Static(
-                "[yellow]This will remove the cached model files from provider storage.[/yellow]",
-                id="delete-warning",
-            )
+            yield Static(self._warning(), id="delete-warning")
             with Horizontal(id="delete-confirm-actions"):
                 yield Button("Cancel", id="delete-cancel")
                 yield Button("Delete model", id="delete-confirm", variant="error")
