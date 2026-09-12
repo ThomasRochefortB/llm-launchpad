@@ -59,14 +59,21 @@ class SetupRequiredScreen(CopyEnabledScreen):
                 yield Button("Set up Vast.ai key", id="setup-vast-preview-btn")
                 with Horizontal(id="setup-required-actions"):
                     yield Button("Re-check", id="setup-recheck-btn", variant="primary")
-                    yield Button("Copy modal", id="setup-copy-modal-btn")
-                    yield Button("Copy prime", id="setup-copy-prime-btn")
-                    yield Button("Copy vast", id="setup-copy-vast-btn")
+                    yield Button("Copy Modal", id="setup-copy-modal-btn")
+                    yield Button("Copy Prime", id="setup-copy-prime-btn")
+                    yield Button("Copy Vast", id="setup-copy-vast-btn")
                     yield Button("Quit", id="setup-quit-btn", variant="error")
         yield FittedFooter()
 
     def on_mount(self) -> None:
-        self.query_one("#setup-recheck-btn", Button).focus()
+        # Focus without scrolling. This screen exists to explain how to
+        # authenticate, and letting Textual scroll the button into view opened
+        # it below its own title and all three options on a short terminal --
+        # the reader landed mid-document with no sign of what came above.
+        self.query_one("#setup-recheck-btn", Button).focus(scroll_visible=False)
+        self.query_one("#setup-required-scroll", VerticalScroll).scroll_home(
+            animate=False,
+        )
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "setup-recheck-btn":
