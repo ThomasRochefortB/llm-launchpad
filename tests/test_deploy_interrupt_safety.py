@@ -16,8 +16,8 @@ from llm_launchpad.protocol.enums import (
     OperationType,
 )
 from llm_launchpad.protocol.events import OperationCompleteEvent
-from llm_launchpad.protocol.models import DeploymentConfig
-from llm_launchpad.tui.app import TuiApp
+from llm_launchpad.protocol.models import DeploymentConfig, EndpointInfo
+from llm_launchpad.tui.app import AbandonedDeploymentsChecked, TuiApp
 
 
 def _config() -> DeploymentConfig:
@@ -115,27 +115,91 @@ class QuitStopsInFlightDeploymentTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AbandonedDeploymentRecoveryTests(unittest.TestCase):
-    def test_an_entry_from_a_previous_session_is_reported(self) -> None:
-        record_in_flight(
-            InFlightDeployment(
-                app_name="llamacpp-abandoned",
-                provider=ComputeProvider.MODAL.value,
-                backend=BackendType.LLAMACPP.value,
-                price_per_hour_usd=3.03,
-                started_at_epoch=1.0,
-            )
-        )
+    @staticmethod
+    def _entry(app_name: str, **changes: object) -> InFlightDeployment:
+        base = {
+            "app_name": app_name,
+            "provider": ComputeProvider.MODAL.value,
+            "backend": BackendType.LLAMACPP.value,
+            "price_per_hour_usd": 3.03,
+            "started_at_epoch": 1.0,
+        }
+        base.update(changes)
+        return InFlightDeployment(**base)  # type: ignore[arg-type]
+
+    def _check(self, app: TuiApp, rows: list[EndpointInfo], enumerated: tuple) -> list:
+        """Run the verification pass and return what it still reports."""
+        posted: list = []
+        with patch.object(app, "_visible_rows_and_prune_scope", return_value=(rows, enumerated)), patch.object(
+            app, "post_message", lambda message: posted.append(message)
+        ):
+            app._run_check_abandoned_deployments()
+        return posted
+
+    def test_an_entry_the_provider_still_lists_is_reported(self) -> None:
+        record_in_flight(self._entry("llamacpp-abandoned"))
         app = TuiApp()
+        rows = [EndpointInfo(name="llamacpp-abandoned", provider=ComputeProvider.MODAL)]
+
+        posted = self._check(app, rows, (ComputeProvider.MODAL,))
+
+        self.assertEqual(len(posted), 1)
+        self.assertEqual(len(load_in_flight()), 1)
         messages: list[str] = []
-
         with patch.object(app, "notify", lambda message, **kwargs: messages.append(str(message))):
-            app._warn_about_abandoned_deployments()
-
+            app.on_abandoned_deployments_checked(posted[0])
         self.assertEqual(len(messages), 1)
         self.assertIn("llamacpp-abandoned", messages[0])
         self.assertIn("may still be running", messages[0])
         # A months-old entry must not claim a five-figure bill.
         self.assertNotIn("$", messages[0])
+
+    def test_an_entry_the_provider_says_is_gone_is_resolved_silently(self) -> None:
+        """The journal records an interrupted deploy, not a live resource.
+
+        Warning about one the provider positively reports as absent sends the
+        user hunting for a rental that does not exist, on every launch.
+        """
+        record_in_flight(self._entry("llamacpp-finished"))
+        app = TuiApp()
+
+        posted = self._check(app, [], (ComputeProvider.MODAL,))
+
+        self.assertEqual(posted, [])
+        self.assertEqual(load_in_flight(), ())
+
+    def test_a_provider_that_could_not_be_listed_keeps_its_entry(self) -> None:
+        # Absence of evidence is not confirmation: an unreachable provider must
+        # not resolve an entry.
+        record_in_flight(self._entry("llamacpp-unknown"))
+        app = TuiApp()
+
+        posted = self._check(app, [], ())
+
+        self.assertEqual(len(posted), 1)
+        self.assertEqual(len(load_in_flight()), 1)
+
+    def test_a_failed_listing_keeps_every_entry(self) -> None:
+        record_in_flight(self._entry("llamacpp-unknown"))
+        app = TuiApp()
+        posted: list = []
+        with patch.object(
+            app, "_visible_rows_and_prune_scope", side_effect=RuntimeError("provider down")
+        ), patch.object(app, "post_message", lambda message: posted.append(message)):
+            app._run_check_abandoned_deployments()
+
+        self.assertEqual(len(posted), 1)
+        self.assertEqual(len(load_in_flight()), 1)
+
+    def test_many_unresolved_entries_do_not_bury_the_screen(self) -> None:
+        entries = tuple(self._entry(f"llamacpp-{index}") for index in range(5))
+        app = TuiApp()
+        messages: list[str] = []
+        with patch.object(app, "notify", lambda message, **kwargs: messages.append(str(message))):
+            app.on_abandoned_deployments_checked(AbandonedDeploymentsChecked(entries))
+
+        self.assertEqual(len(messages), app._ABANDONED_WARNING_LIMIT + 1)
+        self.assertIn("2 more unresolved deployments", messages[-1])
 
     def test_nothing_is_reported_when_the_journal_is_empty(self) -> None:
         app = TuiApp()
