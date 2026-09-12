@@ -899,6 +899,10 @@ StatusHeader.state-warming-up {
     border-bottom: solid $warning;
 }
 
+StatusHeader.state-error {
+    border-bottom: solid $error;
+}
+
 #monitor-search {
     width: 100%;
     margin: 0;

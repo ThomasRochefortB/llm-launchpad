@@ -10,6 +10,8 @@ from textual import events
 from textual.binding import Binding
 from textual.css.query import NoMatches
 from textual.geometry import Size
+from textual.containers import ScrollableContainer
+from textual.scroll_view import ScrollView
 from textual.selection import Selection
 from textual.screen import Screen
 from textual.widget import Widget
@@ -44,10 +46,34 @@ class CopyEnabledScreen(Screen):
         self._last_synced_selection: str | None = None
         self._viewport_profile: ViewportProfile | None = None
         self._focus_before_size_gate: Widget | None = None
+        self._scroll_focus_retired = False
 
     async def on_resize(self, event: events.Resize) -> None:
         """Apply responsive classes and gate terminals below the supported floor."""
+        self._retire_redundant_scroll_focus()
         await self._apply_viewport_size(event.size)
+
+    def _retire_redundant_scroll_focus(self) -> None:
+        """Keep form scroll regions out of the tab cycle.
+
+        Textual makes every ``VerticalScroll`` focusable so a keyboard user can
+        scroll a region that holds nothing to focus. When the region holds a
+        form, tabbing into the container itself is a stop where nothing appears
+        focused and no key does anything useful -- and on Settings it was where
+        focus started, so the screen opened on its scrollbar rather than its
+        first field. A region with no focusable descendant keeps its own focus,
+        because there scrolling is the only thing to do.
+        """
+        if self._scroll_focus_retired:
+            return
+        self._scroll_focus_retired = True
+        for container in self.query(ScrollableContainer):
+            # Input, OptionList and DataTable all reach ScrollableContainer
+            # through ScrollView, and their focusability is their own business.
+            if isinstance(container, ScrollView):
+                continue
+            if any(child.can_focus for child in container.query("*")):
+                container.can_focus = False
 
     async def _apply_viewport_size(self, size: Size) -> None:
         profile = ViewportProfile.from_size(size)

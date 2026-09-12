@@ -134,6 +134,20 @@ _STORAGE_COLUMNS = (
 )
 
 
+def _current_row_key(table: AdaptiveDataTable) -> str | None:
+    """The key under the table's cursor, or None when there are no rows."""
+    if table.row_count == 0 or not table.columns:
+        return None
+    try:
+        from textual.coordinate import Coordinate
+
+        return str(
+            table.coordinate_to_cell_key(Coordinate(table.cursor_row, 0)).row_key.value
+        )
+    except Exception:
+        return None
+
+
 def _is_focusable_for_arrow_navigation(widget: Widget) -> bool:
     return is_focusable_for_navigation(widget, check_size=True)
 
@@ -224,6 +238,8 @@ class StorageScreen(CopyEnabledScreen):
         self._selected_model: StoredModelInfo | None = None
         self._was_suspended = False
         self._initial_focus_pending = True
+        self._restored_highlight_key: str | None = None
+        self._prefilled_model_id: str | None = None
         table = self.query_one("#storage-table", AdaptiveDataTable)
         table.cursor_type = "row"
         table.zebra_stripes = True
@@ -290,8 +306,33 @@ class StorageScreen(CopyEnabledScreen):
         self._apply_row_selection(row_key)
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        # Repopulating the table moves its cursor, and Textual reports that as
+        # a highlight exactly like a keypress would -- asynchronously, so a
+        # flag held across set_rows is already clear by the time this arrives.
+        # Prefilling on it meant a background snapshot refresh, which lands on
+        # a timer, overwrote whatever the user was part-way through typing into
+        # the pre-download form: "Qwen" became the highlighted row's full id
+        # mid-word. The row the rebuild restored is named instead, and that one
+        # replay is skipped; moving to any other row still prefills.
         row_key = str(event.row_key.value) if getattr(event, "row_key", None) is not None else ""
+        if row_key and row_key == self._restored_highlight_key:
+            self._restored_highlight_key = None
+            if self._form_is_user_edited():
+                return
         self._apply_row_selection(row_key)
+
+    def _form_is_user_edited(self) -> bool:
+        """Whether the model id differs from whatever was last prefilled there.
+
+        The first population should prefill -- that is what establishes the
+        default target -- so this is about protecting typing, not about
+        refusing every repeat.
+        """
+        try:
+            current = self.query_one("#storage-model-id", Input).value
+        except Exception:
+            return False
+        return current != (self._prefilled_model_id or "")
 
     def on_storage_loaded(self, message: StorageLoaded) -> None:
         self._snapshot = message.snapshot
@@ -331,6 +372,7 @@ class StorageScreen(CopyEnabledScreen):
         ):
             self._selected_model = None
         table.set_rows(rows)
+        self._restored_highlight_key = _current_row_key(table)
         self._render_empty_state(rows)
 
     def _render_empty_state(self, rows: list[StoredModelInfo]) -> None:
@@ -360,6 +402,7 @@ class StorageScreen(CopyEnabledScreen):
         if selected is None:
             return
         self._selected_model = selected
+        self._prefilled_model_id = selected.model_id
         self.query_one("#storage-model-id", Input).value = selected.model_id
         self.query_one("#storage-model-backend", Select).value = selected.backend.value
         self.query_one("#storage-model-quant", Input).value = selected.quant or ""
