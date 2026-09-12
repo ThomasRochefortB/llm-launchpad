@@ -683,6 +683,33 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.deployed_config.model_revision, "main")
 
     async def test_deployment_gpu_shape_is_independent_from_tensor_parallel(self) -> None:
+        """The two fields stay separate; only impossible pairs are refused.
+
+        How many allocated GPUs a plan may leave idle is the provider's policy,
+        so a smaller tensor-parallel size still reaches the config unchanged.
+        """
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+            screen.query_one("#gpu-count-vllm", Input).value = "4"
+            screen.query_one("#n-gpu", Input).value = "2"
+            screen.query_one("#model-name", Input).value = "Qwen/Qwen3-0.6B"
+            screen._do_deploy()
+
+            self.assertIsNotNone(app.deployed_config)
+            self.assertEqual(app.deployed_config.gpu_count, 4)
+            self.assertEqual(app.deployed_config.n_gpu, 2)
+
+    async def test_sharding_across_more_gpus_than_allocated_is_refused(self) -> None:
+        """GPU_CONFIG sizes the container and N_GPU becomes the shard count.
+
+        Asking for more shards than allocated GPUs fails every time, after the
+        GPU has been allocated and billed. Only Vast used to refuse it.
+        """
         app = _TestApp()
         async with app.run_test() as pilot:
             app.push_screen(VllmDeployScreen())
@@ -695,9 +722,7 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             screen.query_one("#model-name", Input).value = "Qwen/Qwen3-0.6B"
             screen._do_deploy()
 
-            self.assertIsNotNone(app.deployed_config)
-            self.assertEqual(app.deployed_config.gpu_count, 2)
-            self.assertEqual(app.deployed_config.n_gpu, 4)
+            self.assertIsNone(app.deployed_config)
 
     async def test_predownload_uses_highlighted_model_from_rank_list(self) -> None:
         app = _TestApp()

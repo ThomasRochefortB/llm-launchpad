@@ -118,6 +118,20 @@ def refuse(config: DeploymentConfig) -> str | None:
         return f"{provider} has no preload-only operation; select Deploy to rent an instance."
     if config.run_smoke and not caps.supports_smoke_test_only:
         return f"{provider} does not support smoke-test-only mode."
+    # GPU_CONFIG sizes the container and N_GPU becomes --tensor-parallel-size,
+    # so a tensor-parallel size above the allocated count asks vLLM to shard
+    # across devices that do not exist. It fails every time, after the GPU is
+    # allocated and billed. Only Vast refused it; how many GPUs a valid plan may
+    # leave idle stays each provider's own policy.
+    if (
+        config.backend == BackendType.VLLM
+        and config.n_gpu is not None
+        and config.n_gpu > gpu_count
+    ):
+        return (
+            f"vLLM tensor parallelism needs one GPU per shard: {config.n_gpu} "
+            f"requested across {gpu_count} allocated."
+        )
     if caps.extra_refusal is not None:
         return caps.extra_refusal(config)
     return None
