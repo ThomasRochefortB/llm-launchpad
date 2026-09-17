@@ -11,6 +11,7 @@ from .events import (
     ErrorEvent,
     LogEvent,
     OperationCompleteEvent,
+    ResourceAllocatedEvent,
     StateChangeEvent,
 )
 from .models import (
@@ -36,6 +37,7 @@ __all__ = [
     "OperationCompleteEvent",
     "OperationType",
     "ReasoningCapabilities",
+    "ResourceAllocatedEvent",
     "SpeculativeDecodingConfig",
     "SpeculativeDecodingMethod",
     "StateChangeEvent",

@@ -170,7 +170,14 @@ class RuntimeTuning:
 
 @dataclass(frozen=True)
 class MemoryEstimate:
-    """Topology-aware memory requirement for one serving configuration."""
+    """Topology-aware memory requirement for one serving configuration.
+
+    Weights, KV cache and speculative buffers shard across the devices of a
+    placement. ``compute_gb`` and ``attention_scratch_gb`` do not: every device
+    builds its own graph, so each one pays them in full. ``total_gb`` already
+    counts them once per device, which keeps ``total_gb / gpu_count`` the
+    per-device requirement.
+    """
 
     weights_gb: float
     kv_cache_gb: float
@@ -182,6 +189,10 @@ class MemoryEstimate:
     confidence: float = 0.0
     source: str = "estimated"
     total_layer_count: int | None = None
+    # Scores and mask of a graph built without flash attention. Zero whenever
+    # flash attention is on, and linear in the advertised context when it is
+    # off, which is the term that decides whether a long context is servable.
+    attention_scratch_gb: float = 0.0
     # Recurrent state is included in kv_cache_gb; retain its contribution so
     # changing concurrency can resize state without scaling the token cache.
     recurrent_gb: float = 0.0
@@ -228,6 +239,10 @@ class PlacementAssessment:
     fits: bool = False
     gpu_resident: bool = False
     rejection_reason: str | None = None
+    # Identifies this plan's compute graph without the hardware under it, so
+    # one runtime measurement can size every topology that serves it.
+    calibration_key: str = ""
+    runtime_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -244,6 +259,72 @@ class RuntimeAttestation:
     performance: tuple[PerformancePoint, ...] = ()
     runtime_id: str | None = None
     verified_at: str | None = None
+
+
+@dataclass(frozen=True)
+class ServingStats:
+    """One reading of a serving runtime's own counters and gauges.
+
+    Token counts are whatever the runtime reports, which is always "since this
+    process started" -- see :class:`ServingSnapshot` for the totals that
+    survive a container restart.
+    """
+
+    captured_at: float = 0.0
+    prompt_tokens: float | None = None
+    generation_tokens: float | None = None
+    requests_running: float | None = None
+    requests_waiting: float | None = None
+    requests_finished: float | None = None
+    kv_cache_usage: float | None = None
+    avg_ttft_seconds: float | None = None
+    # llama.cpp publishes its own decode rate, but as the last request's
+    # speed rather than a windowed average, so it reads zero between
+    # requests. Kept as a secondary "right now" reading next to the rate
+    # derived from counter deltas, which is comparable across backends.
+    reported_tokens_per_second: float | None = None
+    runtime_started_at: float | None = None
+
+    @property
+    def has_readings(self) -> bool:
+        """Whether the endpoint answered with metrics this build understands."""
+        return any(
+            value is not None
+            for value in (
+                self.prompt_tokens,
+                self.generation_tokens,
+                self.requests_running,
+                self.requests_waiting,
+                self.requests_finished,
+                self.kv_cache_usage,
+            )
+        )
+
+
+@dataclass(frozen=True)
+class ServingSnapshot:
+    """Live gauges for an endpoint plus its traffic totals across restarts.
+
+    ``observed_at`` is wall-clock time for the reading that produced the live
+    gauges. Banked totals loaded without a new request carry the timestamp of
+    the reading that banked them (or None when unknown), so passive views can
+    present them as history rather than as a current measurement.
+    """
+
+    stats: ServingStats = field(default_factory=ServingStats)
+    total_prompt_tokens: float = 0.0
+    total_generation_tokens: float = 0.0
+    tokens_per_second: float | None = None
+    observed_at: float | None = None
+
+    @property
+    def total_tokens(self) -> float:
+        return self.total_prompt_tokens + self.total_generation_tokens
+
+    @property
+    def has_live_gauges(self) -> bool:
+        """Whether this snapshot carries a fresh runtime reading."""
+        return self.stats.has_readings or self.tokens_per_second is not None
 
 
 @dataclass
@@ -278,6 +359,12 @@ class DeploymentConfig:
     gguf_architecture: str | None = None
     llamacpp_runtime_id: str | None = None
     speculative_decoding: SpeculativeDecodingConfig | None = None
+    # Whether preflight may resolve speculative decoding from model evidence.
+    # ``speculative_decoding`` alone cannot express intent: None is what both a
+    # caller with no opinion and a caller that declined leave behind. Preflight
+    # treats None as "decide from the GGUF and the pinned runtime" so MTP is on
+    # wherever it is supported, and this flag is the only way to say no.
+    allow_speculative_decoding: bool = True
     serving_requirements: ServingRequirements | None = None
     runtime_tuning: RuntimeTuning | None = None
     placement_assessment: PlacementAssessment | None = None
@@ -362,6 +449,37 @@ class WorkloadProfile:
     paid_hours_per_day: float = 8.0
     utilization: float = 0.25
     output_tokens_per_month: int | None = None
+
+
+@dataclass(frozen=True)
+class CostScenario:
+    """Explicit usage assumptions for comparing unlike billing models.
+
+    Provisioned rentals bill for every hour they stay up; scale-to-zero
+    providers bill active compute plus idle time while the container stays
+    warm. A monthly figure without these assumptions invents a schedule, so
+    every scenario names its own.
+    """
+
+    id: str
+    display_name: str
+    provisioned_hours_per_day: float = 24.0
+    active_hours_per_day: float = 8.0
+    sessions_per_day: float = 4.0
+    idle_timeout_seconds: float = 1800.0
+    description: str = ""
+
+    def describe(self) -> str:
+        """One-line statement of what this scenario assumes."""
+        if self.id == "continuous":
+            return "Running 24/7 with no shutdown."
+        sessions = f"{self.sessions_per_day:g} session(s)/day"
+        idle_minutes = self.idle_timeout_seconds / 60.0
+        return (
+            f"{self.provisioned_hours_per_day:g}h up/day, "
+            f"{self.active_hours_per_day:g}h active, {sessions}, "
+            f"{idle_minutes:g}min idle timeout."
+        )
 
 
 @dataclass(frozen=True)
@@ -529,6 +647,11 @@ class EndpointInfo:
     quant: str | None = None
     runtime_status: str | None = None
     runtime_status_detail: str | None = None
+    # Wall-clock epoch of the last explicit (user-requested) runtime health
+    # observation. Passive fleet refreshes never touch the network for
+    # scale-to-zero providers, so they re-attach the stored verdict and show
+    # its age instead of claiming the deployment itself is healthy.
+    runtime_checked_at: float | None = None
     provider: ComputeProvider = ComputeProvider.MODAL
     endpoint_api_key: str | None = None
     max_context_tokens: int | None = None
@@ -536,6 +659,7 @@ class EndpointInfo:
     reasoning: ReasoningCapabilities | None = None
     vision: VisionCapabilities | None = None
     runtime_attestation: RuntimeAttestation | None = None
+    serving: ServingSnapshot | None = None
 
 
 @dataclass
@@ -757,6 +881,48 @@ class StorageSnapshot:
     @property
     def total_models(self) -> int:
         return len(self.llamacpp_models) + len(self.vllm_models)
+
+
+@dataclass(frozen=True)
+class StorageResource:
+    """One billable storage object, with its lifecycle and deletion path.
+
+    Compute and storage are separate bills: stopping compute never implies
+    deleting storage unless the provider's model says so (Vast destroys its
+    rental disk; Modal and Prime keep theirs).
+    """
+
+    provider: ComputeProvider
+    resource_id: str
+    kind: str = "cache"
+    display_name: str = ""
+    size_gb: float | None = None
+    location: str = ""
+    attached_to: str | None = None
+    survives_stop: bool = True
+    billable_after_stop: bool = False
+    price_per_hour_usd: float | None = None
+    deletable: bool = True
+    delete_hint: str = ""
+    managed: bool = True
+
+
+@dataclass(frozen=True)
+class StopEffect:
+    """What stopping one deployment's compute does to its storage and bill."""
+
+    provider: ComputeProvider
+    compute_action: str
+    storage_consequence: str
+    remains_billable: bool
+    destructive: bool
+    detail: str = ""
+    recovery_hint: str = ""
+
+    def summary(self) -> str:
+        """One-line consequence for confirmations and results."""
+        bill = "remains billable" if self.remains_billable else "stops billing"
+        return f"{self.compute_action}; {self.storage_consequence} ({bill})"
 
 
 @dataclass(frozen=True)

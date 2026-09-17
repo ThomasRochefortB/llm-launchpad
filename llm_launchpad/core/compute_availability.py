@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import replace
 import math
+import time
 import re
 from collections.abc import Sequence
+from typing import Any
 
 from ..protocol.enums import (
     BackendType,
@@ -31,7 +33,12 @@ from .inference_options import (
     estimate_cost_per_million_output_tokens,
     estimate_monthly_compute_cost,
 )
-from .llamacpp_planner import assess_memory_placement, assessment_score
+from .fit_calibration import MemoryCalibration, calibration_key, load_memory_calibration
+from .llamacpp_planner import (
+    assess_memory_placement,
+    assessment_score,
+    per_device_requirements,
+)
 from .modal_cli import resolve_modal_cli_path
 from .modal_gpu import ModalGpuSpec, fetch_modal_gpu_catalog
 from .prime_auth import get_prime_auth_status
@@ -63,6 +70,16 @@ _GPU_MEMORY_GB: dict[str, float] = {
     "B200": 180.0,
     "B200+": 180.0,
 }
+# How long every provider fetch together may hold the screen. Each of these
+# calls has its own request timeout, but they were awaited with none: one
+# catalog that never answered left Fast Deploy on "loading" with no deadline
+# and no way back, which is indistinguishable from a hung client. Availability
+# is a comparison across providers, so a slow one should cost its own row, not
+# the whole screen -- whatever has not arrived is reported unavailable and the
+# rest is still shown.
+COMPUTE_AVAILABILITY_TIMEOUT_SECONDS = 45.0
+
+
 def load_compute_availability() -> ComputeAvailabilitySnapshot:
     """Fetch connected providers concurrently and return one aggregated view."""
 
@@ -88,7 +105,27 @@ def load_compute_availability() -> ComputeAvailabilitySnapshot:
     prime_future: Future[list[ComputeOffer]] | None = None
     vast_future: Future[list[VastOffer]] | None = None
     vast_offers: Sequence[VastOffer] = ()
-    with ThreadPoolExecutor(max_workers=3) as executor:
+    deadline = time.monotonic() + COMPUTE_AVAILABILITY_TIMEOUT_SECONDS
+
+    def collect(future: Future[Any], label: str) -> Any:
+        """Wait for one provider inside the shared budget, never past it."""
+        try:
+            return future.result(timeout=max(0.0, deadline - time.monotonic()))
+        except FutureTimeout:
+            future.cancel()
+            errors.append(
+                f"{label} did not answer within "
+                f"{int(COMPUTE_AVAILABILITY_TIMEOUT_SECONDS)}s"
+            )
+        except Exception as exc:
+            errors.append(f"{label} unavailable: {exc}")
+        return None
+
+    # Not a context manager: its exit joins every worker, which would restore
+    # the unbounded wait this budget exists to remove. A fetch that outlives
+    # the deadline is abandoned, and its own request timeout ends it.
+    executor = ThreadPoolExecutor(max_workers=3)
+    try:
         if include_modal:
             modal_future = executor.submit(fetch_modal_gpu_catalog)
         if include_prime:
@@ -99,20 +136,13 @@ def load_compute_availability() -> ComputeAvailabilitySnapshot:
                 VastOfferQuery(gpu_count=None, limit=500),
             )
         if modal_future is not None:
-            try:
-                modal_catalog = modal_future.result()
-            except Exception as exc:
-                errors.append(f"Modal catalog unavailable: {exc}")
+            modal_catalog = collect(modal_future, "Modal catalog") or ()
         if prime_future is not None:
-            try:
-                prime_offers = prime_future.result()
-            except Exception as exc:
-                errors.append(f"Prime availability unavailable: {exc}")
+            prime_offers = collect(prime_future, "Prime availability") or ()
         if vast_future is not None:
-            try:
-                vast_offers = vast_future.result()
-            except Exception as exc:
-                errors.append(f"Vast availability unavailable: {exc}")
+            vast_offers = collect(vast_future, "Vast availability") or ()
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
     if not include_modal and not include_prime and not vast_credentials.api_key and not errors:
         errors.append("Connect a compute provider to load availability.")
@@ -255,6 +285,22 @@ def plans_for_compute_profile(
     required_vram_gb = profile_required_vram_gb(profile)
     if recipe.required_vram_gb is None and required_vram_gb > 0:
         recipe = replace(recipe, required_vram_gb=required_vram_gb)
+    # The topology picker and the assessment below have to agree on how much
+    # memory the plan needs. If the picker sized on the formula while the
+    # assessment used a runtime measurement, it would propose shapes the
+    # assessment then rejected and the model would end up with no plan at all.
+    measured = None
+    if recipe.serving_requirements is not None and recipe.runtime_tuning is not None:
+        measured = load_memory_calibration(
+            calibration_key(
+                model_id=recipe.model_id,
+                revision=None,
+                quant=recipe.quant,
+                runtime_id=profile.llamacpp_runtime_id,
+                requirements=recipe.serving_requirements,
+                tuning=recipe.runtime_tuning,
+            )
+        )
     plans: list[InferencePlan] = []
     for placement in configuration.placements:
         if placement.is_spot or recipe.backend not in placement.supported_backends:
@@ -263,6 +309,7 @@ def plans_for_compute_profile(
             placement,
             required_vram_gb,
             memory_estimate=profile.memory_estimate,
+            calibration=measured,
         )
         if gpu_count is None:
             if rejected is not None:
@@ -472,15 +519,45 @@ def _placement_gpu_count(
     required_vram_gb: float,
     *,
     memory_estimate: object | None = None,
+    calibration: MemoryCalibration | None = None,
 ) -> int | None:
     count = placement.gpu_count_min
     if memory_estimate is not None:
         total_gb = float(getattr(memory_estimate, "total_gb", 0.0)) - float(
             getattr(memory_estimate, "reserve_gb", 0.0)
         )
+        # Graph memory is replicated on every device, so it stays out of the
+        # division. Sharding it here proposed topologies that the placement
+        # assessment then rejected, leaving the model with no plan at all
+        # rather than the larger topology that does hold it.
+        base_count = max(1, len(getattr(memory_estimate, "per_device_required_gb", ()) or ()))
+        per_device_graph = float(getattr(memory_estimate, "compute_gb", 0.0)) + float(
+            getattr(memory_estimate, "attention_scratch_gb", 0.0)
+        )
+        shardable_gb = max(0.0, total_gb - per_device_graph * base_count)
+        layer_count = getattr(memory_estimate, "total_layer_count", None)
         for candidate in range(count, placement.gpu_count_max + 1):
             reserve_per_gpu = max(2.0, placement.gpu_memory_gb * 0.05)
-            if total_gb / candidate + reserve_per_gpu <= placement.gpu_memory_gb:
+            # Layers are indivisible: size on the device that ends up with the
+            # remainder, not on the average.
+            if calibration is not None:
+                busiest = max(
+                    calibration.per_device_gb(
+                        shardable_gb=shardable_gb,
+                        gpu_count=candidate,
+                        layer_count=layer_count,
+                    )
+                ) + reserve_per_gpu
+            else:
+                busiest = max(
+                    per_device_requirements(
+                        shardable_gb=shardable_gb,
+                        per_device_gb=per_device_graph + reserve_per_gpu,
+                        gpu_count=candidate,
+                        layer_count=layer_count,
+                    )
+                )
+            if busiest <= placement.gpu_memory_gb:
                 return candidate
         return None
     if required_vram_gb > 0:

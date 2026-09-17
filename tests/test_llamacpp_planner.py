@@ -183,6 +183,112 @@ class KvCacheTypeTests(unittest.TestCase):
             attention_value_length=128,
         )
 
+    def test_flash_attention_costs_a_mask_and_without_it_the_scores_too(self) -> None:
+        requirements = serving_requirements(262144)
+        metadata = self._metadata()
+        with_fa = estimate_memory(
+            metadata, weights_gb=9.83, requirements=requirements, tuning=self._tuning()
+        )
+        without_fa = estimate_memory(
+            metadata,
+            weights_gb=9.83,
+            requirements=requirements,
+            tuning=replace(self._tuning(), flash_attention=False),
+        )
+
+        # Flash attention still reserves one f16 mask over the whole context.
+        self.assertAlmostEqual(
+            with_fa.attention_scratch_gb, 262144 * 512 * 2 / 1e9, places=3
+        )
+        # Without it the scores are materialized too: one f32 plane per query
+        # head, and the mask widens to f32.
+        self.assertAlmostEqual(
+            without_fa.attention_scratch_gb,
+            262144 * 512 * (32 + 1) * 4 / 1e9,
+            places=3,
+        )
+        self.assertGreater(without_fa.total_gb, with_fa.total_gb)
+
+    def test_attention_scratch_grows_with_the_advertised_context(self) -> None:
+        tuning = replace(self._tuning(), flash_attention=False)
+        metadata = self._metadata()
+        short = estimate_memory(
+            metadata, weights_gb=9.83, requirements=serving_requirements(131072), tuning=tuning
+        )
+        long = estimate_memory(
+            metadata, weights_gb=9.83, requirements=serving_requirements(262144), tuning=tuning
+        )
+
+        # Linear in context: it is why a long window without flash attention
+        # needs a bigger device rather than more of them.
+        self.assertAlmostEqual(long.attention_scratch_gb, short.attention_scratch_gb * 2, places=2)
+
+    def test_graph_memory_is_not_divided_across_devices(self) -> None:
+        requirements = serving_requirements(262144)
+        metadata = self._metadata()
+        tuning = replace(self._tuning(), flash_attention=False)
+        one = estimate_memory(
+            metadata, weights_gb=200.0, requirements=requirements, tuning=tuning, gpu_count=1
+        )
+        four = estimate_memory(
+            metadata, weights_gb=200.0, requirements=requirements, tuning=tuning, gpu_count=4
+        )
+
+        per_device_graph = four.compute_gb + four.attention_scratch_gb
+        shardable = four.weights_gb + four.kv_cache_gb + four.speculative_gb
+        # 65 layers over 4 devices is 17/16/16/16, so the busiest carries 17
+        # of them -- and a whole graph of its own on top, which is the part
+        # adding GPUs never divides.
+        self.assertAlmostEqual(
+            four.per_device_required_gb[0],
+            shardable * 17 / 65 + per_device_graph,
+            places=1,
+        )
+        # Four devices cost four copies of the graph, not one shared between
+        # them, so the total grows rather than staying put.
+        self.assertAlmostEqual(
+            four.total_gb - one.total_gb, per_device_graph * 3, places=1
+        )
+
+    def test_an_uneven_layer_split_is_sized_on_the_busiest_device(self) -> None:
+        """llama.cpp assigns whole layers, so a remainder lands on one GPU.
+
+        A measured GLM-5.3-Flash plan put 78,810 MiB on CUDA0 against 74,738
+        on CUDA1 -- 23 layers against 22 -- and was refused for the difference
+        while the two together had room to spare.
+        """
+        metadata = replace(self._metadata(), block_count=45)
+        memory = estimate_memory(
+            metadata,
+            weights_gb=109.0,
+            requirements=serving_requirements(262144),
+            tuning=self._tuning(),
+            gpu_count=2,
+        )
+
+        busiest, quietest = memory.per_device_required_gb
+        self.assertGreater(busiest, quietest)
+        shardable = memory.weights_gb + memory.kv_cache_gb + memory.speculative_gb
+        graph = memory.compute_gb + memory.attention_scratch_gb
+        self.assertAlmostEqual(busiest, shardable * 23 / 45 + graph, places=1)
+        # The total is unchanged by how it is split.
+        self.assertAlmostEqual(memory.total_gb, shardable + graph * 2, places=1)
+
+    def test_a_head_count_is_required_to_size_a_plan_without_flash_attention(self) -> None:
+        metadata = replace(self._metadata(), attention_head_count=None)
+
+        unsized = estimate_memory(
+            metadata,
+            weights_gb=9.83,
+            requirements=serving_requirements(262144),
+            tuning=replace(self._tuning(), flash_attention=False),
+        )
+
+        # Guessing would understate the requirement by an order of magnitude,
+        # so the estimate is marked unverified instead.
+        self.assertEqual(unsized.source, "conservative-fallback")
+        self.assertLess(unsized.confidence, 0.8)
+
     def test_quantized_cache_halves_the_full_context_footprint(self) -> None:
         requirements = serving_requirements(262144)
         f16 = self._tuning()

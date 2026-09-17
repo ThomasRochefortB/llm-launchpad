@@ -9,6 +9,7 @@ from collections.abc import Iterable, Sequence
 from ..protocol.enums import BackendType, BillingModel, ComputeProvider, QuoteAvailability
 from ..protocol.models import (
     ComputeOffer,
+    CostScenario,
     InferencePlan,
     InferenceRecipe,
     ModalProviderOptions,
@@ -23,6 +24,7 @@ from .prime_backend import (
     is_compatible_prime_offer,
     preferred_prime_offer_image,
     prime_offer_gpu_memory_gb,
+    prime_offer_matches_location,
 )
 
 
@@ -159,6 +161,8 @@ class PrimeInferenceAdapter:
             self._cached_offers = tuple(self.backend.list_offers())
         required_image = preferred_prime_offer_image(recipe.backend)
         for offer in self._cached_offers:
+            if not prime_offer_matches_location(offer, self.provider_options.region):
+                continue
             if not is_compatible_prime_offer(
                 offer,
                 recipe.required_vram_gb,
@@ -236,6 +240,63 @@ def resolve_inference_plans(
 
 HOURS_PER_MONTH_CONTINUOUS: float = 24.0 * 30.0
 
+COST_SCENARIO_CONTINUOUS = CostScenario(
+    id="continuous",
+    display_name="Always on",
+    provisioned_hours_per_day=24.0,
+    active_hours_per_day=24.0,
+    sessions_per_day=1.0,
+    idle_timeout_seconds=1800.0,
+    description="Running 24/7 with no shutdown.",
+)
+
+COST_SCENARIO_WORKDAY = CostScenario(
+    id="workday-8h",
+    display_name="Workday 8h",
+    provisioned_hours_per_day=8.0,
+    active_hours_per_day=2.0,
+    sessions_per_day=4.0,
+    idle_timeout_seconds=1800.0,
+    description="Up 8h/day, 2h active across 4 sessions, 30min idle timeout.",
+)
+
+COST_SCENARIO_SPARSE = CostScenario(
+    id="sparse",
+    display_name="Sparse",
+    provisioned_hours_per_day=8.0,
+    active_hours_per_day=0.5,
+    sessions_per_day=10.0,
+    idle_timeout_seconds=1800.0,
+    description="Up 8h/day, 0.5h active spread over 10 sessions.",
+)
+
+COST_SCENARIO_CLUSTERED = CostScenario(
+    id="clustered",
+    display_name="Clustered",
+    provisioned_hours_per_day=8.0,
+    active_hours_per_day=0.5,
+    sessions_per_day=2.0,
+    idle_timeout_seconds=1800.0,
+    description="Up 8h/day, 0.5h active clustered into 2 sessions.",
+)
+
+COST_SCENARIOS: tuple[CostScenario, ...] = (
+    COST_SCENARIO_CONTINUOUS,
+    COST_SCENARIO_WORKDAY,
+    COST_SCENARIO_SPARSE,
+    COST_SCENARIO_CLUSTERED,
+)
+
+
+def get_cost_scenario(scenario_id: str | None) -> CostScenario:
+    """Return a named scenario, defaulting to the workday schedule."""
+    if not scenario_id:
+        return COST_SCENARIO_WORKDAY
+    for scenario in COST_SCENARIOS:
+        if scenario.id == scenario_id:
+            return scenario
+    raise ValueError(f"Unknown cost scenario: {scenario_id}")
+
 
 def workload_basis_label(workload: WorkloadProfile | None = None) -> str:
     """State the assumptions a monthly estimate rests on, in one sentence.
@@ -251,8 +312,25 @@ def workload_basis_label(workload: WorkloadProfile | None = None) -> str:
     noun = "hour" if hours == 1 else "hours"
     return (
         f"Monthly estimates assume {hours:g} paid {noun} a day, scaled by "
-        f"{profile.utilization:.0%} utilization on scale-to-zero providers."
+        f"{profile.utilization:.0%} utilization on scale-to-zero providers. "
+        f"Hourly and 24/7 figures are exact; monthly usage is a scenario."
     )
+
+
+def scenario_basis_label(scenario: CostScenario | None = None) -> str:
+    """State an explicit cost scenario's assumptions in one sentence."""
+    resolved = scenario or COST_SCENARIO_WORKDAY
+    return (
+        f"Cost scenario '{resolved.display_name}': {resolved.describe()} "
+        f"Provisioned bills {resolved.provisioned_hours_per_day:g}h/day; "
+        f"scale-to-zero bills active plus idle timeout."
+    )
+
+
+def cost_sort_basis_label(scenario: CostScenario | None = None) -> str:
+    """Name the cost basis placement ordering uses, so it matches the display."""
+    resolved = scenario or COST_SCENARIO_WORKDAY
+    return f"Sorted by '{resolved.display_name}' scenario cost ({resolved.describe()})"
 
 
 def continuous_monthly_compute_cost(quote: ProviderQuote) -> float | None:
@@ -261,6 +339,78 @@ def continuous_monthly_compute_cost(quote: ProviderQuote) -> float | None:
     if quote.price_per_hour_usd is None:
         return None
     return quote.price_per_hour_usd * HOURS_PER_MONTH_CONTINUOUS
+
+
+def estimate_modal_billed_hours_per_day(
+    active_hours_per_day: float,
+    sessions_per_day: float,
+    idle_timeout_seconds: float,
+    *,
+    window_hours_per_day: float = 24.0,
+) -> float:
+    """Billed hours for a scale-to-zero container, including warm idle time.
+
+    Each session keeps its container warm for the idle timeout after its last
+    request. Sparse sessions each pay the timeout; clustered sessions share
+    it, so identical active time bills differently. The result never exceeds
+    the usage window and never drops below active time.
+    """
+    active = min(max(0.0, active_hours_per_day), 24.0)
+    sessions = max(0.0, sessions_per_day)
+    idle_hours = max(0.0, idle_timeout_seconds) / 3600.0 * sessions
+    window = min(max(0.0, window_hours_per_day), 24.0)
+    return max(0.0, min(window, active + idle_hours))
+
+
+def estimate_cost_for_scenario(
+    quote: ProviderQuote,
+    scenario: CostScenario | None = None,
+    *,
+    idle_timeout_seconds: float | None = None,
+) -> float | None:
+    """Monthly cost under an explicit scenario; unknown storage is excluded.
+
+    Provisioned rentals bill scheduled uptime. Scale-to-zero bills active
+    compute plus one idle timeout per session, capped by the usage window.
+    Returns None when the hourly price is unknown; storage is reported
+    separately and never treated as zero.
+    """
+    if quote.price_per_hour_usd is None:
+        return None
+    resolved = scenario or COST_SCENARIO_WORKDAY
+    idle_timeout = idle_timeout_seconds if idle_timeout_seconds is not None else resolved.idle_timeout_seconds
+    if quote.billing_model == BillingModel.SCALE_TO_ZERO:
+        billed_per_day = estimate_modal_billed_hours_per_day(
+            resolved.active_hours_per_day,
+            resolved.sessions_per_day,
+            idle_timeout,
+            window_hours_per_day=resolved.provisioned_hours_per_day,
+        )
+    else:
+        billed_per_day = min(24.0, max(0.0, resolved.provisioned_hours_per_day))
+    return quote.price_per_hour_usd * billed_per_day * 30.0
+
+
+def format_cost_summary(
+    quote: ProviderQuote,
+    scenario: CostScenario | None = None,
+    *,
+    idle_timeout_seconds: float | None = None,
+) -> str:
+    """Hourly rate, 24/7 ceiling, and scenario cost in one comparable line."""
+    resolved = scenario or COST_SCENARIO_WORKDAY
+    if quote.price_per_hour_usd is None:
+        return "Hourly unavailable · monthly unavailable (storage excluded)"
+    hourly = f"${quote.price_per_hour_usd:.2f}/hr while billed"
+    continuous = continuous_monthly_compute_cost(quote)
+    continuous_text = f"${continuous:,.2f}/mo if left running 24/7" if continuous is not None else "24/7 unavailable"
+    scenario_cost = estimate_cost_for_scenario(quote, resolved, idle_timeout_seconds=idle_timeout_seconds)
+    scenario_text = (
+        f"${scenario_cost:,.2f}/mo '{resolved.display_name}' ({resolved.describe()})"
+        if scenario_cost is not None
+        else f"'{resolved.display_name}' unavailable"
+    )
+    return f"{hourly} · {continuous_text} · {scenario_text} · storage separate"
 
 
 def estimate_monthly_compute_cost(
@@ -330,5 +480,4 @@ def _plan_monthly_cost_sort_key(plan: InferencePlan) -> tuple[int, int, float, s
         monthly_cost if monthly_cost is not None else float("inf"),
         plan.quote.id,
     )
-
 

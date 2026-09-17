@@ -98,6 +98,10 @@ class QuickDeployConfigTests(unittest.TestCase):
         disabled = build_quick_deploy_config(profile, enable_speculative_decoding=False)
         self.assertIsNotNone(enabled.speculative_decoding)
         self.assertIsNone(disabled.speculative_decoding)
+        # Preflight resolves MTP from the model itself, so a cleared config is
+        # not enough to express a decline: it would be turned straight back on.
+        self.assertTrue(enabled.allow_speculative_decoding)
+        self.assertFalse(disabled.allow_speculative_decoding)
 
     def test_quick_deploy_model_label_parts_split_quant_suffix(self) -> None:
         activate_static_like_catalog()

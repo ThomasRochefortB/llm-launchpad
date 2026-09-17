@@ -19,10 +19,12 @@ import json
 import os
 from pathlib import Path
 import time
+import threading
 from typing import Any
 
 from ..protocol.enums import BackendType, ComputeProvider
 from .config import SETTINGS_DIR
+from .coerce import optional_float, positive_int
 from .diagnostics import log_exception
 
 DEPLOY_JOURNAL_PATH = SETTINGS_DIR / "in_flight_deployments.json"
@@ -30,6 +32,7 @@ JOURNAL_SCHEMA_VERSION = 1
 # Past this, an entry says more about a journal that was never cleaned up than
 # about a resource that is still running, so no spend figure is offered.
 _STALE_ENTRY_SECONDS = 24 * 60 * 60
+_JOURNAL_LOCK = threading.RLock()
 
 
 @dataclass(frozen=True)
@@ -85,20 +88,32 @@ def record_in_flight(
     """Note that a deployment is starting, before the provider is contacted."""
 
     target = path if path is not None else DEPLOY_JOURNAL_PATH
-    entries = {
-        row.app_name: row for row in load_in_flight(target) if row.app_name != entry.app_name
-    }
-    entries[entry.app_name] = entry
-    _write(target, entries.values())
+    with _JOURNAL_LOCK:
+        entries = {
+            (row.provider, row.backend, row.app_name): row for row in load_in_flight(target)
+        }
+        entries[(entry.provider, entry.backend, entry.app_name)] = entry
+        _write(target, entries.values())
 
 
-def clear_in_flight(app_name: str, path: Path | None = None) -> None:
+def clear_in_flight(
+    app_name: str, path: Path | None = None, *,
+    provider: str | None = None, backend: str | None = None,
+) -> None:
     """Note that a deployment reached a known outcome and needs no recovery."""
 
     target = path if path is not None else DEPLOY_JOURNAL_PATH
     name = (app_name or "").strip()
-    remaining = [row for row in load_in_flight(target) if row.app_name != name]
-    _write(target, remaining)
+    with _JOURNAL_LOCK:
+        remaining = [
+            row for row in load_in_flight(target)
+            if not (
+                row.app_name == name
+                and (provider is None or row.provider == provider)
+                and (backend is None or row.backend == backend)
+            )
+        ]
+        _write(target, remaining)
 
 
 def load_in_flight(path: Path | None = None) -> tuple[InFlightDeployment, ...]:
@@ -140,13 +155,9 @@ def _entry_from_dict(raw: Any) -> InFlightDeployment | None:
         app_id=(str(raw["app_id"]) if raw.get("app_id") else None),
         instance_name=(str(raw["instance_name"]) if raw.get("instance_name") else None),
         gpu_type=(str(raw["gpu_type"]) if raw.get("gpu_type") else None),
-        gpu_count=int(raw.get("gpu_count") or 1),
-        price_per_hour_usd=(
-            float(raw["price_per_hour_usd"])
-            if raw.get("price_per_hour_usd") is not None
-            else None
-        ),
-        started_at_epoch=float(raw.get("started_at_epoch") or 0.0),
+        gpu_count=positive_int(raw.get("gpu_count")) or 1,
+        price_per_hour_usd=optional_float(raw.get("price_per_hour_usd")),
+        started_at_epoch=optional_float(raw.get("started_at_epoch")) or 0.0,
     )
 
 

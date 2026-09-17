@@ -139,7 +139,7 @@ LogViewer Log {
     min-height: 6;
     overflow-y: auto;
     padding: 0 2;
-    border: solid $border;
+    border: solid $foreground-muted;
     background: $panel;
 }
 
@@ -150,7 +150,7 @@ LogViewer Log {
     overflow-y: auto;
     margin: 1 0 0 0;
     padding: 0 2;
-    border: solid $border;
+    border: solid $foreground-muted;
     background: $panel;
 }
 
@@ -186,7 +186,7 @@ LogViewer Log {
     min-height: 4;
     margin: 0 0 1 1;
     padding: 0 1;
-    border-left: tall $border;
+    border-left: tall $foreground-muted;
     color: $text-muted;
     background: transparent;
 }
@@ -195,7 +195,7 @@ LogViewer Log {
 
 OptionList {
     background: $surface;
-    border: solid $border;
+    border: solid $foreground-muted;
     padding: 0;
     height: auto;
     max-height: 20;
@@ -219,7 +219,7 @@ OptionList > .option-list--option-hover-highlighted {
 
 DataTable {
     background: $surface;
-    border: solid $border;
+    border: solid $foreground-muted;
     height: 1fr;
     /* Two rows go to the border, so a floor of 3 left a single content row for
        the header and none for the data. A table that shows no rows is worse
@@ -253,7 +253,7 @@ ListView > ListItem.--highlight {
 /* ---- Inputs ---- */
 
 Input {
-    border: tall $border;
+    border: tall $foreground-muted;
     background: $surface;
     color: $text;
     padding: 0 1;
@@ -274,7 +274,7 @@ Select {
 }
 
 Select > SelectCurrent {
-    border: tall $border;
+    border: tall $foreground-muted;
 }
 
 Select:focus > SelectCurrent {
@@ -301,7 +301,7 @@ Button {
     min-width: 16;
     background: $panel;
     color: $text;
-    border: solid $border;
+    border: solid $foreground-muted;
 }
 
 Button:hover {
@@ -434,7 +434,7 @@ Button:focus {
 #quick-deploy-form {
     height: auto;
     padding: 1 2;
-    border: solid $border;
+    border: solid $foreground-muted;
     background: $surface;
 }
 
@@ -452,6 +452,16 @@ Button:focus {
     width: 100%;
     height: auto;
     padding: 0 2 1 2;
+}
+
+#quick-deploy-decision-summary {
+    width: 100%;
+    height: auto;
+    padding: 0 1;
+    margin: 0 0 1 0;
+    border-left: tall $primary;
+    background: $surface-lighten-1;
+    text-wrap: wrap;
 }
 
 #quick-deploy-profile-title {
@@ -765,7 +775,7 @@ VllmDeployScreen Select:disabled > SelectCurrent {
 #storage-empty {
     height: auto;
     padding: 1 1;
-    border: solid $border;
+    border: solid $foreground-muted;
     background: $surface;
     text-wrap: wrap;
 }
@@ -778,7 +788,7 @@ VllmDeployScreen Select:disabled > SelectCurrent {
     max-width: 88;
     height: auto;
     padding: 1 2;
-    border: solid $border;
+    border: solid $foreground-muted;
     background: $surface;
 }
 
@@ -811,6 +821,34 @@ VllmDeployScreen Select:disabled > SelectCurrent {
 
 #settings-actions Button {
     margin-right: 2;
+}
+
+#settings-appearance-row {
+    width: 100%;
+    height: auto;
+}
+
+.settings-appearance-control {
+    width: 1fr;
+    height: auto;
+    margin-right: 2;
+}
+
+.settings-appearance-control:last-child {
+    margin-right: 0;
+}
+
+#storage-predownload-actions {
+    width: 100%;
+    height: auto;
+    margin-top: 1;
+}
+
+#storage-predownload-actions Static {
+    width: auto;
+    height: auto;
+    margin: 1 0 0 1;
+    color: $text-muted;
 }
 
 #save-feedback {
@@ -913,6 +951,31 @@ StatusHeader.state-error {
     display: none;
 }
 
+/* The large wordmark is pleasant on an empty wide terminal, but at 80×24 it
+   displaced four primary actions. The compact heading keeps the context while
+   leaving the menu's complete first level visible. */
+.viewport-narrow #banner-text,
+.viewport-narrow .main-menu-version,
+.viewport-narrow .decorative-spacer {
+    display: none;
+}
+
+.viewport-narrow #compact-menu-header,
+.viewport-narrow #compact-menu-help {
+    display: block;
+    width: 100%;
+    height: auto;
+    padding: 0 1;
+}
+
+.viewport-narrow #compact-menu-header {
+    margin: 1 0 0 0;
+}
+
+.viewport-narrow #compact-menu-help {
+    margin: 1 0 0 0;
+}
+
 .viewport-narrow.show-secondary-panel #main-menu-side-column,
 .viewport-short.show-secondary-panel #main-menu-side-column {
     display: block;
@@ -936,6 +999,12 @@ StatusHeader.state-error {
 
 .viewport-narrow #main-menu-primary {
     width: 100%;
+}
+
+.viewport-narrow #action-list {
+    height: 8;
+    min-height: 8;
+    max-height: 8;
 }
 
 .viewport-narrow #auth-status-block {
@@ -983,9 +1052,9 @@ StatusHeader.state-error {
 }
 
 .viewport-compact #action-list {
-    height: 7;
-    min-height: 7;
-    max-height: 7;
+    height: 8;
+    min-height: 8;
+    max-height: 8;
 }
 
 .viewport-compact.viewport-short #action-list {
@@ -1027,9 +1096,14 @@ StatusHeader.state-error {
 .viewport-compact #fast-deploy-subtitle,
 .viewport-compact #fast-deploy-gpu-label,
 .viewport-compact #fast-deploy-search-label,
-.viewport-minimal #fast-deploy-search-group,
 .viewport-short #fast-deploy-search-group {
     display: none;
+}
+
+/* Search is a temporary control on constrained terminals. It stays available
+   on `/`, without permanently taking the model list below a useful height. */
+.viewport-narrow.search-open #fast-deploy-search-group {
+    display: block;
 }
 
 .viewport-narrow #fast-deploy-gpu-group,
@@ -1044,6 +1118,24 @@ StatusHeader.state-error {
     height: 3;
     min-height: 3;
     margin: 0 0 1 0;
+}
+
+.viewport-narrow #fast-deploy-filter-row,
+.viewport-compact #fast-deploy-filter-row {
+    layout: vertical;
+}
+
+.viewport-narrow #fast-deploy-search-group,
+.viewport-compact #fast-deploy-search-group {
+    width: 100%;
+    max-width: 100%;
+    margin: 0 0 1 0;
+}
+
+.viewport-narrow #fast-deploy-model-search,
+.viewport-compact #fast-deploy-model-search {
+    height: 3;
+    min-height: 3;
 }
 
 .viewport-compact #quick-deploy-title,
@@ -1061,6 +1153,15 @@ StatusHeader.state-error {
 
 .viewport-compact .gpu-config-main-row {
     layout: vertical;
+}
+
+.viewport-compact #settings-appearance-row {
+    layout: vertical;
+}
+
+.viewport-compact .settings-appearance-control {
+    width: 100%;
+    margin-right: 0;
 }
 
 .viewport-compact #gpu-type-group-llama,
@@ -1121,6 +1222,15 @@ StatusHeader.state-error {
     overflow-y: auto;
 }
 
+.viewport-short #quick-deploy-profile-card {
+    max-height: 9;
+    overflow-y: auto;
+}
+
+.viewport-short #quick-deploy-decision-summary {
+    margin-bottom: 0;
+}
+
 .viewport-minimal Footer,
 .viewport-shallow Footer {
     display: none;
@@ -1143,6 +1253,15 @@ StatusHeader.state-error {
 .viewport-minimal OptionList {
     border-left: none;
     border-right: none;
+}
+
+.viewport-minimal #storage-predownload-actions {
+    layout: vertical;
+}
+
+.viewport-minimal #storage-predownload-actions Static {
+    width: 100%;
+    margin: 0;
 }
 
 .density-compact .screen-scroll,

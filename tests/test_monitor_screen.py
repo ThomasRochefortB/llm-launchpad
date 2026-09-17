@@ -322,6 +322,47 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("[green", content)
             self.assertNotIn("[dim]", content)
 
+    async def test_a_failure_states_its_reason_once(self) -> None:
+        """fail_operation sends the same sentence twice; the screen shows one.
+
+        Every operation reports an error and then repeats it verbatim as the
+        completion detail. A Vast stall message wrapped over two lines, so the
+        pair took four of the twelve lines the summary box has.
+        """
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(MonitorScreen(title="Deploy"))
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, MonitorScreen)
+            reason = "Vast instance stopped making progress while provisioning."
+            screen.on_operation_error(OperationError(reason))
+            screen.on_operation_done(
+                OperationDone(
+                    operation=OperationType.DEPLOY,
+                    success=False,
+                    exit_code=1,
+                    detail=reason,
+                )
+            )
+            await pilot.pause()
+
+            content = "\n".join(screen.log_viewer.log_widget.lines)
+            self.assertIn(f"Error: {reason}", content)
+            self.assertNotIn(f"Detail: {reason}", content)
+            # A detail that says something new is still worth the line.
+            screen.on_operation_done(
+                OperationDone(
+                    operation=OperationType.DEPLOY,
+                    success=False,
+                    exit_code=1,
+                    detail=f"{reason} Cleanup remains pending.",
+                )
+            )
+            await pilot.pause()
+            self.assertIn("Cleanup remains pending.", "\n".join(screen.log_viewer.log_widget.lines))
+
     async def test_summary_mode_normalizes_backend_log_lines(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:
@@ -762,6 +803,47 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             preparing = [line for line in lines if "Preparing deployment" in line]
             self.assertEqual(preparing, ["✓ Preparing deployment"])
             self.assertIn("✓ Machine ready", lines)
+
+    async def test_a_concurrent_done_milestone_does_not_freeze_the_spinner(self) -> None:
+        """A Prime deploy polls the tunnel and the runtime at the same time.
+
+        "Secure endpoint connected" therefore arrives while the container
+        image is still being built. The spinner was chosen by taking the last
+        step-or-done row and marking it only if it was a step, so that done
+        milestone removed the spinner entirely: every row took a tick and a
+        build with twenty minutes left to run looked like a finished deploy.
+        """
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(
+                MonitorScreen(
+                    title="Deploy",
+                    deploy_backend=BackendType.LLAMACPP,
+                    summarize_backend_logs=True,
+                    show_debug_logs=False,
+                )
+            )
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, MonitorScreen)
+            for line in (
+                "Prime pod state: ACTIVE/FINISHED",
+                "Prime runtime: building the runtime image from source",
+                "Prime Tunnel: connected",
+                "Prime runtime: building the runtime image from source (waiting 1m11s)",
+            ):
+                screen.on_log_message(LogMessage(line, is_milestone=True))
+            await pilot.pause()
+
+            lines = list(screen.log_viewer.log_widget.lines)
+            building = [line for line in lines if "Building container image" in line]
+            self.assertEqual(len(building), 1)
+            self.assertTrue(
+                building[0].startswith(tuple(f"{frame} " for frame in SUMMARY_SPINNER_FRAMES)),
+                building,
+            )
+            # The tunnel really is connected; only the build is still running.
+            self.assertIn("✓ Secure endpoint connected", lines)
 
     async def test_blank_lines_survive_and_keep_search_offsets_aligned(self) -> None:
         """Blank separators were dropped, silently shifting every search jump.

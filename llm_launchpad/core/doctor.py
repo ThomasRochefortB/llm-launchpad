@@ -5,14 +5,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from .backend import ModalBackend
 from .config import SETTINGS_DIR
 from .diagnostics import LOG_FILE, log_file_path
 from .hf_auth import get_huggingface_auth_status
-from .modal_auth import get_modal_auth_status
-from .prime_auth import get_prime_auth_status
 from .artificial_analysis import get_artificial_analysis_auth_status
-from .vast_auth import resolve_vast_credentials
+from .provider_readiness import (
+    ProviderReadinessStage,
+    check_modal_readiness,
+    check_prime_readiness,
+    check_vast_readiness,
+)
 
 
 @dataclass(frozen=True)
@@ -62,88 +64,69 @@ def run_doctor_checks(
     # Deploying needs one compute provider, not all of them: that is what the
     # TUI gates on. Each provider reports for itself and only warns, so an
     # unused one never fails the run; the aggregate below is the requirement.
-    modal_available = False
-    if ModalBackend.is_cli_available():
-        modal_status = get_modal_auth_status()
-        modal_available = modal_status.authenticated
-        if modal_status.authenticated:
-            profile = f" (profile: {modal_status.profile})" if modal_status.profile else ""
-            checks.append(
-                DoctorCheck(name="Modal auth", ok=True, required=False, detail=f"authenticated{profile}")
-            )
-        else:
-            checks.append(
-                DoctorCheck(
-                    name="Modal auth",
-                    ok=False,
-                    required=False,
-                    detail=modal_status.error or "not authenticated",
-                    hint="run: modal setup",
-                )
-            )
-    else:
-        checks.append(
-            DoctorCheck(
-                name="Modal CLI",
-                ok=False,
-                required=False,
-                detail="modal executable not found",
-                hint="reinstall llm-launchpad, then run: modal setup",
-            )
-        )
+    # Readiness distinguishes installation, stored credentials, verified
+    # access, rejected credentials, and unreachable providers.
+    def _readiness_check(name: str, readiness: object) -> tuple[bool, str, str | None]:
+        stage = getattr(readiness, "stage", None)
+        detail = str(getattr(readiness, "detail", "") or "")
+        hint = getattr(readiness, "hint", None)
+        if stage == ProviderReadinessStage.READY:
+            return True, detail or "authenticated", None
+        if stage == ProviderReadinessStage.UNREACHABLE:
+            return False, f"{detail or 'verification unavailable'} (credentials present; not proven invalid)", hint
+        if stage == ProviderReadinessStage.CREDENTIALS_PRESENT:
+            return False, detail or "credentials present; not verified", hint
+        return False, detail or "not configured", hint
 
-    prime_available = False
     try:
-        prime_status = get_prime_auth_status()
-        prime_available = prime_status.authenticated
-        if prime_status.authenticated:
-            checks.append(DoctorCheck(name="Prime Intellect auth", ok=True, required=False, detail="API key found"))
-        else:
-            checks.append(
-                DoctorCheck(
-                    name="Prime Intellect auth",
-                    ok=False,
-                    required=False,
-                    detail=prime_status.error or "no API key configured",
-                    hint="run: prime login (or set PRIME_API_KEY)",
-                )
-            )
+        modal_readiness = check_modal_readiness(verify=True)
+    except Exception as exc:  # pragma: no cover - defensive around auth probing
+        checks.append(DoctorCheck(name="Modal auth", ok=False, required=False, detail=str(exc), hint="run: modal setup"))
+        modal_available = False
+    else:
+        ok, detail, hint = _readiness_check("Modal auth", modal_readiness)
+        modal_available = modal_readiness.verified
+        label = "Modal auth" if modal_readiness.stage != ProviderReadinessStage.NOT_INSTALLED else "Modal CLI"
+        checks.append(DoctorCheck(name=label, ok=ok, required=False, detail=detail, hint=hint))
+
+    try:
+        prime_readiness = check_prime_readiness(verify=True)
     except Exception as exc:  # pragma: no cover - defensive around auth probing
         checks.append(
-            DoctorCheck(
-                name="Prime Intellect auth",
-                ok=False,
-                required=False,
-                detail=str(exc),
-                hint="run: prime login (or set PRIME_API_KEY)",
-            )
+            DoctorCheck(name="Prime Intellect auth", ok=False, required=False, detail=str(exc), hint="run: prime login (or set PRIME_API_KEY)")
         )
+        prime_available = False
+    else:
+        ok, detail, hint = _readiness_check("Prime Intellect auth", prime_readiness)
+        prime_available = prime_readiness.verified
+        # A stored key that could not be verified is still credentials the TUI
+        # can attempt to use; only verified access counts as available here so
+        # `doctor` does not promise what the network has not confirmed.
+        checks.append(DoctorCheck(name="Prime Intellect auth", ok=ok, required=False, detail=detail, hint=hint))
 
-    # Resolving the key is a local read, like the Modal and Prime probes: a
-    # missing key is reported without spending a request to authenticate it.
     try:
-        vast_credentials = resolve_vast_credentials()
-        vast_detail = (
-            f"API key found ({vast_credentials.source}); not verified over the network"
-            if vast_credentials.api_key else "no API key configured"
+        vast_readiness = check_vast_readiness(verify=True)
+    except Exception as exc:  # pragma: no cover - defensive around auth probing
+        checks.append(
+            DoctorCheck(name="Vast.ai auth", ok=False, required=False, detail=str(exc), hint="run: llm-launchpad vast-auth login (or set VAST_API_KEY)")
         )
-        vast_ok = bool(vast_credentials.api_key)
-    except ValueError as exc:
-        vast_detail, vast_ok = str(exc), False
-    checks.append(DoctorCheck(
-        name="Vast.ai auth", ok=vast_ok, required=False, detail=vast_detail,
-        hint="run: llm-launchpad vast-auth login (or set VAST_API_KEY)",
-    ))
+        vast_ok = False
+    else:
+        ok, detail, hint = _readiness_check("Vast.ai auth", vast_readiness)
+        vast_ok = vast_readiness.verified
+        checks.append(DoctorCheck(name="Vast.ai auth", ok=ok, required=False, detail=detail, hint=hint))
 
     configured = [
         name for name, available in (
             ("Modal", modal_available), ("Prime Intellect", prime_available), ("Vast.ai", vast_ok),
         ) if available
     ]
+    # Credentials that exist but are unverified still let the user into the TUI
+    # for an explicit retry; doctor only promises verified access.
     checks.append(DoctorCheck(
         name="Compute provider",
         ok=bool(configured),
-        detail=", ".join(configured) if configured else "none authenticated",
+        detail=", ".join(configured) if configured else "none verified",
         hint="authenticate one: modal setup | prime login | llm-launchpad vast-auth login",
     ))
 

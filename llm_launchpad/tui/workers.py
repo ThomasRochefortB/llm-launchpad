@@ -178,6 +178,22 @@ class StorageFailed(Message):
         self.error = error
 
 
+class PrimeDisksLoaded(Message):
+    """Prime persistent-disk inventory loaded."""
+
+    def __init__(self, disks: list[object]) -> None:
+        super().__init__()
+        self.disks = disks
+
+
+class PrimeDisksFailed(Message):
+    """Prime disk inventory failed; distinct from an empty disk list."""
+
+    def __init__(self, error: str) -> None:
+        super().__init__()
+        self.error = error
+
+
 class EndpointsLoaded(Message):
     """Managed endpoint discovery completed.
 
@@ -196,6 +212,14 @@ class EndpointsLoaded(Message):
         self.rows = rows
         self.is_stale = is_stale
         self.discovery = discovery
+
+
+class ServingStatsReady(Message):
+    """Live traffic was read for the rows a screen is already showing."""
+
+    def __init__(self, rows: list[EndpointInfo]) -> None:
+        super().__init__()
+        self.rows = rows
 
 
 class EndpointsFailed(Message):

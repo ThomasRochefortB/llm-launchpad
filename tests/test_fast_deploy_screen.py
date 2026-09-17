@@ -22,8 +22,17 @@ from llm_launchpad.core.quick_deploy import (
 )
 from llm_launchpad.core.inference_options import workload_basis_label
 from llm_launchpad.core.prime_backend import preferred_prime_offer_image
-from llm_launchpad.protocol.enums import BackendType, ComputeProvider
-from llm_launchpad.protocol.models import CatalogExclusion, ComputeAvailabilitySnapshot, ComputeOffer, InferencePlan
+from llm_launchpad.core.serving_tiers import BALANCED, ECONOMY, SAVER, ServingTier
+from llm_launchpad.protocol.enums import BackendType, BillingModel, ComputeProvider
+from llm_launchpad.protocol.models import (
+    CatalogExclusion,
+    ComputeAvailabilitySnapshot,
+    ComputeOffer,
+    InferencePlan,
+    InferenceRecipe,
+    ProviderQuote,
+)
+from llm_launchpad.tui.responsive import WidthMode
 from llm_launchpad.tui.app import TuiApp
 from llm_launchpad.tui.screens.fast_deploy import (
     FastDeployAvailabilityFailed,
@@ -31,6 +40,9 @@ from llm_launchpad.tui.screens.fast_deploy import (
     FastDeployScreen,
     CatalogExclusionsScreen,
     _gpu_filter_options,
+    _quant_markup,
+    _tier_option,
+    _tier_quality_width,
     infra_rows_for_model,
     representative_profiles_for_model,
 )
@@ -192,12 +204,13 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
         _qd._reset_quick_deploy_catalog_cache()
 
 
-    async def test_catalog_prices_are_marked_provisional_until_providers_answer(self) -> None:
-        """First paint prices from the cached catalog, which is Modal list rate.
+    async def test_no_price_is_quoted_until_live_placements_answer(self) -> None:
+        """The catalog estimate is Modal's list rate, priced at build time.
 
-        Live placements routinely come in several times cheaper, so the number
-        shown before the availability worker returns has to say it is an
-        estimate rather than read like the answer.
+        Live placements routinely come in several times cheaper, so painting
+        the estimate on first open moved every row's number under the reader
+        a second later. A number that is about to be replaced is worth less
+        than saying it is not known yet.
         """
         model = _model((_profile("available", required_vram_gb=8.0),))
         info = QuickDeployCatalogInfo(source_label="test")
@@ -206,6 +219,13 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
         def _slow_availability() -> ComputeAvailabilitySnapshot:
             released.wait(5)
             return aggregate_compute_availability()
+
+        def rows() -> list[str]:
+            option_list = screen.query_one("#fast-deploy-list", OptionList)
+            return [
+                render_markup(str(option_list.get_option_at_index(index).prompt)).plain
+                for index in range(option_list.option_count)
+            ]
 
         app = _StyledApp()
         with (
@@ -217,16 +237,60 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 screen = FastDeployScreen()
                 app.push_screen(screen)
                 await pilot.pause()
-                pending = str(screen.query_one("#fast-deploy-status", Static).content)
-                self.assertIn("Catalog estimates", pending)
+
+                pending_rows = rows()
+                self.assertTrue(any("pricing" in row for row in pending_rows))
+                for row in pending_rows:
+                    with self.subTest(row=row):
+                        self.assertNotIn("$", row)
+                self.assertIn(
+                    "Pricing live placements",
+                    str(screen.query_one("#fast-deploy-status", Static).content),
+                )
 
                 released.set()
                 for _ in range(80):
                     await pilot.pause()
                     if not screen._pricing_pending:
                         break
+
                 settled = str(screen.query_one("#fast-deploy-status", Static).content)
-                self.assertNotIn("Catalog estimates", settled)
+                self.assertNotIn("Pricing live placements", settled)
+                for row in rows():
+                    with self.subTest(row=row):
+                        self.assertNotIn("pricing", row)
+
+    async def test_a_failed_pricing_load_falls_back_to_the_catalog_estimate(self) -> None:
+        # An estimate beats a blank column once there is nothing better coming.
+        model = _model((_profile("available", required_vram_gb=8.0),))
+        info = QuickDeployCatalogInfo(source_label="test")
+
+        def _broken_availability() -> ComputeAvailabilitySnapshot:
+            raise RuntimeError("no providers reachable")
+
+        app = _StyledApp()
+        with (
+            patch("llm_launchpad.tui.screens.fast_deploy.list_quick_deploy_models", return_value=(model,)),
+            patch("llm_launchpad.tui.screens.fast_deploy.get_quick_deploy_catalog_info", return_value=info),
+            patch("llm_launchpad.tui.screens.fast_deploy.load_compute_availability", _broken_availability),
+        ):
+            async with app.run_test(size=(120, 30)) as pilot:
+                screen = FastDeployScreen()
+                app.push_screen(screen)
+                for _ in range(80):
+                    await pilot.pause()
+                    if not screen._pricing_pending:
+                        break
+
+                option_list = screen.query_one("#fast-deploy-list", OptionList)
+                rendered = [
+                    render_markup(str(option_list.get_option_at_index(index).prompt)).plain
+                    for index in range(option_list.option_count)
+                ]
+                self.assertTrue(any("$" in row for row in rendered))
+                for row in rendered:
+                    with self.subTest(row=row):
+                        self.assertNotIn("pricing", row)
 
     async def test_excluded_models_explain_missing_entries_and_return_to_selection(self) -> None:
         model = _model((_profile("available", required_vram_gb=8.0),))
@@ -304,6 +368,73 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 with patch.object(screen, "_choose") as choose:
                     await pilot.press("enter")
                     choose.assert_called_once_with("medium")
+
+    async def test_top_ten_view_ranks_across_sizes_and_preserves_selection(self) -> None:
+        models = tuple(
+            replace(
+                _model((replace(
+                    _profile(f"model-{index}", required_vram_gb=8.0),
+                    model_size_label="Large >150B" if index < 10 else "Compact ≤40B",
+                ),)),
+                quality_score=100.0 - index,
+            )
+            for index in range(12)
+        )
+        unranked = replace(models[-1], id="unranked", quality_score=None)
+        app = _StyledApp()
+        with patch(
+            "llm_launchpad.tui.screens.fast_deploy.list_quick_deploy_models",
+            return_value=(*models, unranked),
+        ):
+            async with app.run_test(size=(140, 42)) as pilot:
+                app.push_screen(FastDeployScreen())
+                await pilot.pause()
+                screen = app.screen
+                assert isinstance(screen, FastDeployScreen)
+                await pilot.press("v")
+                options = screen.query_one("#fast-deploy-list", OptionList)
+                self.assertEqual(
+                    [options.get_option_at_index(i).id for i in range(options.option_count)],
+                    [None, *(model.id for model in models[:10])],
+                )
+                self.assertIn("all sizes", str(options.get_option_at_index(0).prompt))
+                await pilot.press("down")
+                selected = screen._highlighted_model_id()
+                await pilot.resize_terminal(80, 24)
+                await pilot.pause()
+                self.assertEqual(screen._highlighted_model_id(), selected)
+                with patch.object(screen, "_open_model") as open_model:
+                    await pilot.press("enter")
+                    open_model.assert_called_once_with(selected)
+                await pilot.press("v")
+                self.assertFalse(screen._show_top_models)
+                self.assertEqual(screen._highlighted_model_id(), selected)
+
+    async def test_top_view_excludes_unranked_and_respects_search(self) -> None:
+        models = tuple(
+            replace(_model((_profile(name, required_vram_gb=8.0),)), quality_score=score)
+            for name, score in (("unranked", None), ("low", 2.0), ("high", 90.0))
+        )
+        app = _StyledApp()
+        with patch(
+            "llm_launchpad.tui.screens.fast_deploy.list_quick_deploy_models",
+            return_value=models,
+        ):
+            async with app.run_test(size=(140, 42)) as pilot:
+                app.push_screen(FastDeployScreen())
+                await pilot.pause()
+                screen = app.screen
+                assert isinstance(screen, FastDeployScreen)
+                await pilot.press("v")
+                self.assertEqual([model.id for model in screen._visible_models()], ["high", "low"])
+                search = screen.query_one("#fast-deploy-model-search", Input)
+                search.value = "unranked"
+                await pilot.pause()
+                self.assertEqual(screen._visible_models(), ())
+                self.assertIn("No AA-scored", str(screen.query_one(OptionList).get_option_at_index(0).prompt))
+                search.value = "low"
+                await pilot.pause()
+                self.assertEqual([model.id for model in screen._visible_models()], ["low"])
 
     async def test_search_removes_empty_sections_and_keeps_typing_focus(self) -> None:
         models = tuple(
@@ -965,6 +1096,11 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 option_list = screen.query_one("#fast-deploy-list", OptionList)
                 self.assertGreaterEqual(option_list.size.height, 6)
 
+                await pilot.press("/")
+                search = screen.query_one("#fast-deploy-model-search", Input)
+                self.assertTrue(search.display)
+                self.assertIs(screen.focused, search)
+
 
     async def test_model_rows_stay_inside_the_list_at_eighty_columns(self) -> None:
         """The row carried the size bucket its own section heading states.
@@ -1166,3 +1302,141 @@ class FastDeployMainMenuTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class QuantDisclosureRenderTests(unittest.TestCase):
+    """A bit width the user did not choose has to be legible at any width."""
+
+    def _tier(self, key: str, quant: str | None, price: float) -> ServingTier:
+        recipe = InferenceRecipe(
+            id=key,
+            model_key="model",
+            display_name="Model",
+            quant=quant,
+            backend=BackendType.LLAMACPP,
+            model_id="org/model",
+        )
+        quote = ProviderQuote(
+            id=key,
+            recipe_id=key,
+            provider=ComputeProvider.PRIME,
+            provider_reference=key,
+            gpu_type="B200",
+            gpu_count=1,
+            price_per_hour_usd=price,
+            billing_model=BillingModel.PROVISIONED,
+            gpu_memory_gb=180.0,
+        )
+        return ServingTier(
+            key=key,
+            label=key.title(),
+            plan=InferencePlan(recipe=recipe, quote=quote, assessment=None),
+            is_recommended=key == BALANCED,
+        )
+
+    def test_prices_stay_aligned_when_only_one_tier_is_reduced(self) -> None:
+        tiers = [
+            self._tier(ECONOMY, "UD-Q4_K_XL", 4.95),
+            self._tier(BALANCED, "UD-Q4_K_XL", 6.25),
+            self._tier(SAVER, "UD-Q2_K_XL", 2.50),
+        ]
+        width = _tier_quality_width(tiers)
+
+        for mode in (WidthMode.MINIMAL, WidthMode.COMPACT, WidthMode.WIDE):
+            with self.subTest(width_mode=mode):
+                columns = {
+                    render_markup(_tier_option(tier, mode, width)).plain.index("$")
+                    for tier in tiers
+                }
+                # One shared column, whether or not the row fills it.
+                self.assertEqual(len(columns), 1)
+
+    def test_no_column_is_reserved_when_every_tier_meets_the_floor(self) -> None:
+        tiers = [
+            self._tier(ECONOMY, "UD-Q4_K_XL", 3.03),
+            self._tier(BALANCED, "Q4_K_M", 6.25),
+        ]
+
+        # Otherwise every row of every model is indented to make room for a
+        # disclosure none of them carries.
+        self.assertEqual(_tier_quality_width(tiers), 0)
+        rendered = render_markup(_tier_option(tiers[0], WidthMode.WIDE, 0)).plain
+        self.assertNotIn("-bit", rendered)
+
+    def test_the_bit_width_survives_the_narrowest_terminal(self) -> None:
+        saver = self._tier(SAVER, "UD-Q2_K_XL", 2.50)
+        width = _tier_quality_width([saver])
+
+        # MINIMAL drops the tradeoff clause, which is the other place the
+        # disclosure lives. It must not be the only place.
+        rendered = render_markup(_tier_option(saver, WidthMode.MINIMAL, width)).plain
+        self.assertIn("2-bit", rendered)
+
+    def test_a_reduced_quant_is_flagged_rather_than_highlighted(self) -> None:
+        reduced = _quant_markup(
+            _profile("small", required_vram_gb=40.0, quant="UD-Q2_K_XL")
+        )
+        full = _quant_markup(
+            _profile("full", required_vram_gb=70.0, quant="UD-Q4_K_XL")
+        )
+
+        # Green read as a recommendation for the row costing the most quality.
+        self.assertIn("yellow", reduced)
+        self.assertNotIn("#7bf168", reduced)
+        self.assertIn("dim", full)
+
+
+class DeployKeyHintTests(unittest.TestCase):
+    """Step three is the one screen where enter does not do the obvious thing."""
+
+    def test_the_keyboard_route_is_stated_beside_the_button(self) -> None:
+        from llm_launchpad.tui.screens.quick_deploy import deploy_key_hint
+
+        # Enter is deliberately unbound here so a keystroke carried over from
+        # step two cannot rent a GPU. The footer says so, but the fulfillment
+        # dropdown paints over the footer while open, and a phone terminal
+        # hides the footer behind its on-screen keyboard for good.
+        wide = render_markup(deploy_key_hint(narrow=False, mouse_enabled=True)).plain
+        self.assertIn("ctrl+d", wide)
+        self.assertIn("Deploy", wide)
+
+    def test_the_hint_fits_a_phone_viewport(self) -> None:
+        from llm_launchpad.tui.screens.quick_deploy import deploy_key_hint
+
+        # The hint is one row high, so anything that does not fit is cut. The
+        # full sentence lost its final word on a real phone terminal.
+        for mouse_enabled in (True, False):
+            with self.subTest(mouse_enabled=mouse_enabled):
+                narrow = render_markup(
+                    deploy_key_hint(narrow=True, mouse_enabled=mouse_enabled)
+                ).plain
+                self.assertLessEqual(cell_len(narrow), 46)
+                self.assertIn("ctrl+d", narrow)
+
+    def test_it_says_how_to_turn_taps_on_when_they_are_off(self) -> None:
+        from llm_launchpad.tui.screens.quick_deploy import deploy_key_hint
+
+        # Mouse reporting off means taps never reach the app, so it cannot
+        # report one it never received. The remedy has to be on screen first.
+        for narrow in (True, False):
+            with self.subTest(narrow=narrow):
+                text = render_markup(
+                    deploy_key_hint(narrow=narrow, mouse_enabled=False)
+                ).plain
+                self.assertIn("ctrl+t", text)
+                self.assertNotIn(
+                    "ctrl+t",
+                    render_markup(deploy_key_hint(narrow=narrow, mouse_enabled=True)).plain,
+                )
+
+    def test_enter_is_not_bound_to_deploy(self) -> None:
+        from llm_launchpad.tui.screens.quick_deploy import QuickDeployScreen
+
+        bound = {
+            binding.key
+            for binding in QuickDeployScreen.BINDINGS
+            if getattr(binding, "action", "") == "deploy"
+        }
+
+        self.assertIn("ctrl+d", bound)
+        self.assertNotIn("enter", bound)

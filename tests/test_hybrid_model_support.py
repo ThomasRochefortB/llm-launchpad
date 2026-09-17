@@ -77,7 +77,7 @@ class HybridModelSupportTests(unittest.TestCase):
         self.assertAlmostEqual(memory.kv_cache_gb, token_cache + recurrent, places=3)
         self.assertEqual(memory.total_layer_count, 45)
         profiles = self.profiles("GLM-5.3-Flash")
-        self.assertEqual([p.gpu_count for p in profiles], [1, 2])
+        self.assertEqual(sorted(p.gpu_count for p in profiles), [1, 2])
         for profile in profiles:
             self.assertFalse(profile.runtime_tuning.flash_attention)
             self.assertIn("off", profile.server_args)
@@ -93,7 +93,7 @@ class HybridModelSupportTests(unittest.TestCase):
     def test_both_models_survive_real_shortlist_and_placement_pipeline(self) -> None:
         names = ("Kimi-K3", "GLM-5.3-Flash")
         with (
-            patch("llm_launchpad.core.quick_deploy_refresh._find_unsloth_gguf_match", side_effect=lambda c, api: f"unsloth/{c.name}-GGUF"),
+            patch("llm_launchpad.core.quick_deploy_refresh._find_unsloth_gguf_match", side_effect=lambda c, api, budget=None: f"unsloth/{c.name}-GGUF"),
             patch("llm_launchpad.core.quick_deploy_refresh._fetch_serving_metadata", side_effect=lambda repo: metadata_fixture(repo.split('/')[1].removesuffix('-GGUF'))),
         ):
             profiles = _profiles_from_aa_rankings(tuple(candidate(name, i + 1) for i, name in enumerate(names)), self.gpus, model_limit=3, candidate_limit=80)

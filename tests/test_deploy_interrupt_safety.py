@@ -40,8 +40,9 @@ class InFlightJournalTests(unittest.TestCase):
 
         recorded = load_in_flight()
         self.assertEqual([row.app_name for row in recorded], ["llamacpp-interrupted"])
-        self.assertEqual(app._in_flight_deploy.app_name, "llamacpp-interrupted")
-        self.assertGreater(app._in_flight_deploy.started_at_epoch, 0.0)
+        pending = app._in_flight_deploys[app._deployment_key(_config())]
+        self.assertEqual(pending.app_name, "llamacpp-interrupted")
+        self.assertGreater(pending.started_at_epoch, 0.0)
 
     def test_a_finished_deploy_clears_its_journal_entry(self) -> None:
         app = TuiApp()
@@ -51,7 +52,7 @@ class InFlightJournalTests(unittest.TestCase):
         app._finish_in_flight(config)
 
         self.assertEqual(load_in_flight(), ())
-        self.assertIsNone(app._in_flight_deploy)
+        self.assertEqual(app._in_flight_deploys, {})
 
 
 class QuitStopsInFlightDeploymentTests(unittest.IsolatedAsyncioTestCase):

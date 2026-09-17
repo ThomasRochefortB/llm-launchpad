@@ -21,9 +21,26 @@ from ...core.compute_availability import (
     load_compute_availability,
     plans_for_compute_profile,
 )
-from ...core.inference_options import workload_basis_label
+from ...core.inference_options import (
+    COST_SCENARIO_WORKDAY,
+    cost_sort_basis_label,
+    estimate_cost_for_scenario,
+    scenario_basis_label,
+    workload_basis_label,
+)
 from ...core.llamacpp_planner import assessment_score
-from ...core.serving_tiers import ServingTier, serving_tiers
+from ...core.quant_quality import is_reduced_quality, quant_quality_label
+from ...core.quick_deploy_refresh import (
+    DEFAULT_MODEL_LIMIT,
+    DEFAULT_OVERALL_MODEL_LIMIT,
+    UNCHECKED_BUDGET_REASON,
+)
+from ...core.serving_tiers import (
+    ServingTier,
+    reduced_quality_note,
+    reduced_quality_plan_note,
+    serving_tiers,
+)
 from ...core.runtime_support import load_llamacpp_support_manifest
 from ...core.vast_comparison import (
     deployable_vast_offers, vast_gpu_label, vast_offer_is_rentable,
@@ -113,6 +130,20 @@ def _monthly_label(value: float | None) -> str:
     return f"~${value:,.0f}/mo"
 
 
+def _scenario_monthly_label(plan: object) -> str:
+    """Explicit-scenario cost; unknown storage is never folded in."""
+    quote = getattr(plan, "quote", None)
+    if quote is None:
+        return "monthly est. n/a"
+    try:
+        value = estimate_cost_for_scenario(quote, COST_SCENARIO_WORKDAY)  # type: ignore[arg-type]
+    except Exception:
+        return "monthly est. n/a"
+    if value is None:
+        return "monthly est. n/a"
+    return f"~${value:,.0f}/mo {COST_SCENARIO_WORKDAY.display_name}"
+
+
 def _compact_quant_label(quant: str) -> str:
     cleaned = quant.strip().strip("()")
     if not cleaned:
@@ -131,9 +162,35 @@ def _quant_markup(profile: QuickDeployProfile) -> str:
     quant = _compact_quant_label(profile.quant)
     if not quant:
         return ""
-    if quant.casefold().startswith("q2"):
-        return f"[bold #7bf168]{escape(quant)}[/]"
+    if is_reduced_quality(profile.quant):
+        # Green here used to mark the smallest quantization, which read as a
+        # recommendation for the row that quietly costs the most quality.
+        return f"[yellow]{escape(quant)}[/yellow]"
     return f"[dim]{escape(quant)}[/dim]"
+
+
+# Marks a model whose GGUF carries native MTP heads the pinned runtime can
+# use. U+26A1 is East Asian Wide, so it measures two cells in every terminal
+# and fills exactly the two-column gutter each model row already reserves --
+# a width-1 glyph would pull the name a column left on marked rows only, and
+# a width-ambiguous one renders differently per locale.
+MTP_MARKER = "⚡"
+MODEL_ROW_GUTTER = "  "
+
+
+def _model_supports_mtp(model: QuickDeployModel) -> bool:
+    """Whether any recipe for this model resolved native MTP.
+
+    False also covers "not probed yet": the catalog attaches recommendations
+    on a trailing pass, so an unmarked row is never a claim that the model
+    cannot speculate, only that nothing has established that it can.
+    """
+
+    return any(profile.speculative_decoding is not None for profile in model.profiles)
+
+
+def _model_row_gutter(model: QuickDeployModel) -> str:
+    return MTP_MARKER if _model_supports_mtp(model) else MODEL_ROW_GUTTER
 
 
 def _format_aa_index(value: float) -> str:
@@ -193,15 +250,25 @@ def _model_cost_label(
     model: QuickDeployModel,
     snapshot: ComputeAvailabilitySnapshot | None = None,
     gpu_type: str = "any",
+    pricing_pending: bool = False,
 ) -> str:
     # Deployable Vast placements already reach this through infra_rows_for_model,
     # so there is no separate Vast price to fold in. The branch that used to sit
     # here quoted comparison-only offers, which is how an unrentable host became
     # a model's advertised price.
+    if snapshot is None and pricing_pending:
+        # The catalog estimate prices Modal's published rates at build time,
+        # which is rarely what the reader's own providers charge. Showing it
+        # for the second before the live snapshot lands means every row's
+        # number moves under them. A number that is about to be replaced is
+        # worth less than saying so.
+        return "pricing…"
     price, estimate = _model_cheapest_price(model, snapshot, gpu_type)
     if price is None:
         return "price n/a"
     if snapshot is None:
+        # Live pricing was attempted and did not arrive. The catalog estimate
+        # is then the best there is, and the status line carries the reason.
         return format_hourly_cost(price)
     return _format_price(price, estimate=estimate)
 
@@ -211,8 +278,9 @@ def _model_option(
     width_mode: WidthMode = WidthMode.WIDE,
     snapshot: ComputeAvailabilitySnapshot | None = None,
     gpu_type: str = "any",
+    pricing_pending: bool = False,
 ) -> str:
-    cost = _model_cost_label(model, snapshot, gpu_type)
+    cost = _model_cost_label(model, snapshot, gpu_type, pricing_pending)
     # Without an Artificial Analysis key nothing is ranked, and the word
     # "unranked" then repeats down every row of the list saying nothing. An
     # absent score reads as absent; the detail panel names it for the one
@@ -220,14 +288,15 @@ def _model_option(
     score = _model_score_segment(model)
     size = (model.profiles[0].model_size_label or "").strip()
     metrics = f"{size} · " if size else ""
+    gutter = _model_row_gutter(model)
     if width_mode == WidthMode.MINIMAL:
         return (
-            f"  {escape(clip(model.display_name, 25))}  "
+            f"{gutter}{escape(clip(model.display_name, 25))}  "
             f"[dim]{cost}[/dim]"
         )
     if width_mode == WidthMode.COMPACT:
         return (
-            f"  {escape(clip(model.display_name, 28)):<28} "
+            f"{gutter}{escape(clip(model.display_name, 28)):<28} "
             f"[dim]{score}{cost}[/dim]"
         )
     if width_mode == WidthMode.STANDARD:
@@ -236,11 +305,11 @@ def _model_option(
         # the line past the list and wrapped the price onto a second row,
         # splitting "~$2.00/hr" across the box border.
         return (
-            f"  {escape(clip(model.display_name, 34)):<34} "
+            f"{gutter}{escape(clip(model.display_name, 34)):<34} "
             f"[dim]{score}from {cost}[/dim]"
         )
     return (
-        f"  {escape(clip(model.display_name, 34)):<34} "
+        f"{gutter}{escape(clip(model.display_name, 34)):<34} "
         f"[dim]{metrics}{score}from {cost}[/dim]"
     )
 
@@ -301,11 +370,18 @@ def _model_detail(model: QuickDeployModel) -> str:
         "\n[dim]First launch builds a model-compatible runtime and may take longer.[/]"
         if load_llamacpp_support_manifest(model.profiles[0].gguf_architecture).build_recipe else ""
     )
+    # Names the bolt in the list for the one model the reader has selected,
+    # so the marker does not have to be guessed at from the rows alone.
+    mtp_note = (
+        f" · {MTP_MARKER} native MTP speculative decoding"
+        if _model_supports_mtp(model)
+        else ""
+    )
     return (
         f"[bold]{escape(model.display_name)}[/bold]  "
         f"{escape(format_context_length(model.max_context_tokens))}\n"
         f"[dim]{score} · {_quant_options_label(model)} · "
-        f"pick one to see live infrastructure[/dim]{runtime_note}"
+        f"pick one to see live infrastructure{mtp_note}[/dim]{runtime_note}"
     )
 
 
@@ -405,9 +481,27 @@ def _infra_gpu_label(row: _InfraRow) -> str:
     return row.configuration.gpu_type or display_gpu_type(row.plan.quote.gpu_type)
 
 
+def _tier_quality_width(tiers: Sequence[ServingTier]) -> int:
+    """Width of the bit-width column, or zero when no tier needs one.
+
+    Reserving the column unconditionally would indent every row of every
+    model to make room for a disclosure most of them do not carry.
+    """
+
+    return max(
+        (
+            len(quant_quality_label(tier.plan.recipe.quant))
+            for tier in tiers
+            if is_reduced_quality(tier.plan.recipe.quant)
+        ),
+        default=0,
+    )
+
+
 def _tier_option(
     tier: ServingTier,
     width_mode: WidthMode = WidthMode.WIDE,
+    quality_width: int = 0,
 ) -> str:
     """One tier line: what it costs, how fast it is, what it trades away.
 
@@ -419,16 +513,32 @@ def _tier_option(
     price = _format_price(tier.price_per_hour_usd, estimate=tier.plan.quote.is_estimate)
     speed = tier.output_tokens_per_second
     speed_text = f"~{speed:.0f} tok/s" if speed > 0 else "speed n/a"
-    note = tier.tradeoff or ("recommended" if tier.is_recommended else "")
+    # A merged role now occupies the tradeoff column on the recommended row,
+    # where the bare word "recommended" used to sit alone. Both belong there.
+    note = tier.tradeoff or ""
+    if tier.is_recommended:
+        note = f"{note} · recommended" if note else "recommended"
+    # The tradeoff clause is the first thing a narrow terminal drops, and it is
+    # what carries the quality disclosure. The bit width rides beside the label
+    # instead, in a column every row shares so the prices stay aligned.
+    quality = ""
+    if quality_width:
+        label = (
+            quant_quality_label(tier.plan.recipe.quant)
+            if is_reduced_quality(tier.plan.recipe.quant)
+            else ""
+        )
+        padded = f"{escape(label):<{quality_width}}"
+        quality = f" [yellow]{padded}[/yellow]" if label else f" {padded}"
     if width_mode == WidthMode.MINIMAL:
-        return f" {marker} {escape(tier.label):<9} [dim]{price}[/dim]"
+        return f" {marker} {escape(tier.label):<9}{quality} [dim]{price}[/dim]"
     if width_mode == WidthMode.COMPACT:
         return (
-            f" {marker} {escape(tier.label):<9} "
+            f" {marker} {escape(tier.label):<9}{quality} "
             f"[dim]{price} · {speed_text}[/dim]"
         )
     return (
-        f" {marker} {escape(tier.label):<10} "
+        f" {marker} {escape(tier.label):<10}{quality} "
         f"{price:<12} {speed_text:<14} "
         f"[dim]{escape(note)}[/dim]"
     )
@@ -438,7 +548,7 @@ def _infra_option(row: _InfraRow, width_mode: WidthMode = WidthMode.WIDE) -> str
     quote = row.plan.quote
     gpu = _infra_gpu_label(row)
     price = _format_price(quote.price_per_hour_usd, estimate=quote.is_estimate)
-    monthly = _monthly_label(row.plan.estimated_monthly_cost_usd)
+    monthly = _scenario_monthly_label(row.plan)
     extra = ""
     if len(row.alternative_plans) > 1:
         extra = f" · {len(row.alternative_plans)} placements"
@@ -466,7 +576,7 @@ def _infra_detail(row: _InfraRow) -> str:
     quote = row.plan.quote
     gpu = _infra_gpu_label(row)
     price = _format_price(quote.price_per_hour_usd, estimate=quote.is_estimate)
-    monthly = _monthly_label(row.plan.estimated_monthly_cost_usd)
+    monthly = _scenario_monthly_label(row.plan)
     region = (quote.region or "").strip() or "provider-managed regions"
     performance = ""
     if row.plan.assessment is not None:
@@ -652,7 +762,7 @@ class CatalogExclusionsScreen(CopyEnabledScreen):
         with Vertical(id="fast-deploy-container"):
             yield Static("[bold #7bf168]Excluded models[/]", id="fast-deploy-title")
             yield Static(
-                "Checked candidates only; discovery stops when each size category is full.",
+                "Candidates checked while building the overall and per-size shortlists.",
                 id="fast-deploy-subtitle",
             )
             yield OptionList(
@@ -682,6 +792,7 @@ class FastDeployScreen(CopyEnabledScreen):
         Binding("escape", "pop_screen", "Back", show=True),
         Binding("enter", "choose_selected", "Choose", show=True, priority=True),
         Binding("g", "focus_gpu_filter", "GPU filter", show=True),
+        Binding("v", "toggle_model_view", "Model view", show=True),
         Binding("/", "focus_model_search", "Search", show=True),
         Binding("a", "toggle_all_placements", "Compare all", show=True),
         Binding("x", "show_excluded_models", "Excluded models", show=True),
@@ -692,6 +803,7 @@ class FastDeployScreen(CopyEnabledScreen):
     # "a" that quietly did nothing on step one.
     _PHASE_ACTIONS = {
         "focus_model_search": {"models"},
+        "toggle_model_view": {"models"},
         "show_excluded_models": {"models"},
         "toggle_all_placements": {"infra"},
     }
@@ -738,6 +850,7 @@ class FastDeployScreen(CopyEnabledScreen):
         self._pricing_pending = False
         self._gpu_filter = "any"
         self._model_search = ""
+        self._show_top_models = False
         self._updating_gpu_filter = False
         self._catalog_building = False
         self._catalog_spinner_index = 0
@@ -813,6 +926,13 @@ class FastDeployScreen(CopyEnabledScreen):
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "fast-deploy-model-search":
             return
+        # Leaving the box with nothing in it means the search is done. On a
+        # constrained terminal the box is a temporary control that borrows rows
+        # from the model list, so it has to be able to give them back -- with
+        # nothing clearing "search-open", one press of "/" shortened the list
+        # for the rest of the step.
+        if not self._model_search.strip():
+            self.remove_class("search-open")
         option_list = self.query_one("#fast-deploy-list", OptionList)
         if option_list.option_count:
             option_list.focus()
@@ -1121,9 +1241,13 @@ class FastDeployScreen(CopyEnabledScreen):
         if tiers:
             # Tier option ids are the underlying quote ids, so selection and the
             # detail pane keep working unchanged whichever view is showing.
+            quality_width = _tier_quality_width(tiers)
             option_list.set_options(
                 [
-                    Option(_tier_option(tier, width_mode), id=tier.plan.quote.id)
+                    Option(
+                        _tier_option(tier, width_mode, quality_width),
+                        id=tier.plan.quote.id,
+                    )
                     for tier in tiers
                 ]
             )
@@ -1158,7 +1282,19 @@ class FastDeployScreen(CopyEnabledScreen):
                 f"{'s' if len(rows) != 1 else ''}[/bold] "
                 "[dim]· best full-context throughput first · press a for tiers[/dim]"
             )
-        # Both views price rows by the month, and neither number is wall-clock.
+        # Item four of the quality floor: a model that only fits below it is
+        # still worth offering, but never without saying why.
+        quality_note = (
+            reduced_quality_note(tiers)
+            if tiers
+            else reduced_quality_plan_note([row.plan for row in rows])
+        )
+        if quality_note:
+            status += f"\n[yellow]{escape(quality_note)}[/yellow]"
+        # Hourly and 24/7 are what a deployment bills; the monthly row is an
+        # explicit scenario, and sorting uses that same scenario.
+        status += f"\n[dim]{escape(scenario_basis_label(COST_SCENARIO_WORKDAY))}[/dim]"
+        status += f"\n[dim]{escape(cost_sort_basis_label(COST_SCENARIO_WORKDAY))} · storage separate[/dim]"
         status += f"\n[dim]{escape(workload_basis_label())}[/dim]"
         if self._gpu_filter not in {"", "any"}:
             status += f" [dim]· GPU {escape(self._gpu_filter)}[/dim]"
@@ -1288,7 +1424,30 @@ class FastDeployScreen(CopyEnabledScreen):
         query = self._model_search.strip().casefold()
         if query:
             visible = tuple(model for model in visible if _model_matches_query(model, query))
-        return visible
+        if self._show_top_models:
+            return tuple(sorted(
+                (model for model in visible if model.quality_score is not None),
+                key=lambda model: (
+                    -(model.quality_score or 0.0),
+                    model.quality_rank if model.quality_rank is not None else 10**9,
+                    model.display_name.casefold(),
+                ),
+            )[:DEFAULT_OVERALL_MODEL_LIMIT])
+        counts: dict[str, int] = {}
+        shortlist: list[QuickDeployModel] = []
+        for model in visible:
+            section = _model_size_section(model)
+            counts[section] = counts.get(section, 0) + 1
+            if section == "Size unknown" or counts[section] <= DEFAULT_MODEL_LIMIT:
+                shortlist.append(model)
+        return tuple(shortlist)
+
+    def action_toggle_model_view(self) -> None:
+        """Switch between size shortlists and the overall AA top ten."""
+        if self._phase != "models":
+            return
+        self._show_top_models = not self._show_top_models
+        self._render_model_list(preferred_id=self._highlighted_model_id())
 
     def viewport_profile_changed(
         self,
@@ -1320,7 +1479,7 @@ class FastDeployScreen(CopyEnabledScreen):
         self.query_one("#fast-deploy-model-search", Input).remove_class("hidden")
         self._catalog_building = False
         visible = self._visible_models()
-        if not visible and not self._catalog_info.ready:
+        if not self._models and not self._catalog_info.ready:
             self._render_catalog_unavailable(option_list)
             return
         sections: dict[str, list[QuickDeployModel]] = {
@@ -1329,8 +1488,11 @@ class FastDeployScreen(CopyEnabledScreen):
             "Large · >150B": [],
             "Size unknown": [],
         }
-        for model in visible:
-            sections[_model_size_section(model)].append(model)
+        if self._show_top_models:
+            sections = {"Top 10 by AA score · all sizes": list(visible)}
+        else:
+            for model in visible:
+                sections[_model_size_section(model)].append(model)
         options: list[Option] = []
         model_indices: dict[str, int] = {}
         # Legacy catalogs without size metadata retain a plain model list.
@@ -1350,15 +1512,31 @@ class FastDeployScreen(CopyEnabledScreen):
                             self.viewport_profile.width_mode,
                             snapshot=self._snapshot,
                             gpu_type=self._gpu_filter,
+                            pricing_pending=self._pricing_pending,
                         ),
                         id=model.id,
                     )
                 )
         if not options:
+            # Name whichever filter is hiding everything. Falling through to
+            # "no models in the catalog" told a reader whose search simply
+            # missed to go and rebuild a catalog that was never the problem.
+            # Ordered narrowest cause first: the view and the GPU filter each
+            # explain an absence a search term cannot.
+            search_query = self._model_search.strip()
             if self._gpu_filter != "any":
                 options = [
                     Option(
                         f"  No catalog models fit {escape(self._gpu_filter)}",
+                        disabled=True,
+                    )
+                ]
+            elif self._show_top_models:
+                options = [Option("  No AA-scored models match. Refresh the catalog or check AA settings.", disabled=True)]
+            elif search_query:
+                options = [
+                    Option(
+                        f"  No catalog model matches {escape(search_query)}",
                         disabled=True,
                     )
                 ]
@@ -1375,6 +1553,7 @@ class FastDeployScreen(CopyEnabledScreen):
         else:
             self.query_one("#fast-deploy-detail", Static).update("")
         self.query_one("#fast-deploy-subtitle", Static).update(_subtitle(self._catalog_info))
+        view_label = "Top 10 by AA score · all sizes" if self._show_top_models else "By size"
         plural = "s" if len(visible) != 1 else ""
         filter_note = ""
         if self._gpu_filter != "any":
@@ -1388,13 +1567,20 @@ class FastDeployScreen(CopyEnabledScreen):
         # The source label belongs to the subtitle; repeating it here put the
         # same sentence on screen twice, three lines apart.
         self.query_one("#fast-deploy-status", Static).update(
-            f"[dim]{len(visible)} model{plural}{filter_note}{search_note}{excluded_note}[/dim]"
+            f"[dim]{view_label} · v switches view · {len(visible)} model{plural}{filter_note}{search_note}{excluded_note}[/dim]"
             + (f"\n[dim]{len(self._snapshot.vast_offers)} Vast offers priced · r refreshes[/dim]"
                if self._snapshot is not None and self._snapshot.vast_configured else "")
             + ("\n[yellow]Partial results: " + escape("; ".join(self._snapshot.errors)) + "[/yellow]"
                if self._snapshot is not None and self._snapshot.errors else "")
-            + ("\n[yellow]Catalog estimates; pricing live placements…[/yellow]"
+            + ("\n[dim]Pricing live placements…[/dim]"
                if self._pricing_pending and self._snapshot is None else "")
+            # A build that stopped early still publishes what it found. Saying
+            # so is the difference between "nothing better exists" and "we ran
+            # out of requests before we could look".
+            + (f"\n[yellow]{unchecked} model{'s' if unchecked != 1 else ''} not yet checked; "
+               "reopen Deploy to carry on from here[/yellow]" if (unchecked := sum(
+                   1 for exclusion in self._catalog_info.exclusions
+                   if exclusion.reason == UNCHECKED_BUDGET_REASON)) else "")
         )
         if getattr(self.focused, "id", "") not in {
             "fast-deploy-gpu-filter", "fast-deploy-model-search",
@@ -1438,6 +1624,7 @@ class FastDeployScreen(CopyEnabledScreen):
         self._infra_rows = {}
         self._fallback_profiles = {}
         self._availability_inflight = False
+        self.remove_class("search-open")
         self._apply_model_catalog(force=True)
 
     def _cancel_availability_request(self) -> None:
@@ -1486,11 +1673,7 @@ class FastDeployScreen(CopyEnabledScreen):
                 timeout=3,
             )
             return
-        if not search.display:
-            self.notify(
-                "Model search is unavailable at this terminal size.", timeout=3
-            )
-            return
+        self.add_class("search-open")
         search.focus()
 
     def action_pop_screen(self) -> None:

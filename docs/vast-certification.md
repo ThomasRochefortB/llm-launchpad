@@ -88,11 +88,44 @@ steps fetching from `archive.ubuntu.com`. Neither scales with the image, and
 neither is measured by `inet_down`, which is a speedtest figure.
 
 So both runtimes now get the same 1800s (`VAST_READY_DEADLINE_SECONDS`), and a
-host that stops reporting progress for 360s before SSH is reachable is
-abandoned early (`VAST_PROVISION_STALL_SECONDS`) rather than billed to the
-deadline. Progress is read from `status_msg`, with BuildKit's `#step elapsed`
-prefix stripped first: that counter keeps ticking while a step is wedged, so
-the raw string is not a progress signal.
+host that stops reporting progress before SSH is reachable is abandoned early
+rather than billed to the deadline. Progress is read from `status_msg`, with
+BuildKit's `#step elapsed` prefix stripped first: that counter keeps ticking
+while a step is wedged, so the raw string is not a progress signal.
+
+### What "stopped reporting" is allowed to mean
+
+That rule was first written as one 360s window over everything before SSH, and
+on 2026-09-15 it destroyed a working rental. Three deploys that day recorded
+their own timings (`~/.llm_launchpad/vast/startup_history.json`):
+
+| Machine | Offer | Result |
+| --- | --- | --- |
+| 144700 | 50967991 | failed before SSH |
+| 57255 | 50735894 | **SSH at 386.6s**, healthy at 458.4s |
+| 113571 | 42492577 | abandoned at 361s of "loading" for $0.6537/hr |
+
+The successful one is the measurement that matters: 386.6s from creation to
+SSH is *inside* the window that was being used to call a host stuck. Whether a
+rental survived therefore came down to whether Vast happened to emit a new
+status line in some six-minute stretch, which is a coin flip rather than a
+diagnosis -- and this file already records a certified host that reported a
+docker pull line at 32s and **nothing** at 64s.
+
+The two waits before SSH are now watched separately, because only one of them
+is measured:
+
+- Running, addressable, refusing SSH (`VAST_SSH_STALL_SECONDS`, 360s). The
+  knock is its own progress signal, so silence here is the host. This is the
+  New Brunswick case above.
+- Still pulling, and reporting (`VAST_PULL_STALL_SECONDS`, 900s). The window
+  has to clear the normal spread rather than sit inside it: above 386.6s, and
+  below the ~20 minutes the live GTX 1650 rental held a single BuildKit line.
+- Still pulling, reporting nothing at all. Not stalled -- unobserved. No stall
+  window applies; `VAST_READY_DEADLINE_SECONDS` is the only backstop.
+
+A stall report now quotes the last line the host reported, so the next one can
+be classified without renting another GPU to guess at it.
 
 This does not make `inet_down` predictive. `disk_bw` is not either — both failed
 hosts had NVMe-class disks (2538 and 3679 MB/s). `cpu_cores_effective` remains

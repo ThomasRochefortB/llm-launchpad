@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -117,6 +118,48 @@ class ComputeAvailabilityTests(unittest.TestCase):
             snapshot = load_compute_availability()
 
         self.assertEqual(snapshot.providers, (ComputeProvider.MODAL,))
+        self.assertEqual(snapshot.configurations[0].gpu_type, "H100 80GB")
+
+    def test_a_provider_that_never_answers_cannot_hold_the_whole_screen(self) -> None:
+        """One stalled catalog used to leave Fast Deploy on "loading" forever.
+
+        The fetches were awaited with no timeout, so a provider that never
+        returned had no deadline and no way back -- a live run sat in the
+        loading phase for 300s and was killed rather than recovering. The
+        other providers' rows are still real, so they are still shown.
+        """
+        import threading
+
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def never_answers() -> list[ComputeOffer]:
+            release.wait(30)
+            raise AssertionError("cancelled fetch should not decide the snapshot")
+
+        with patch(
+            "llm_launchpad.core.compute_availability.COMPUTE_AVAILABILITY_TIMEOUT_SECONDS",
+            0.2,
+        ), patch(
+            "llm_launchpad.core.compute_availability.resolve_modal_cli_path",
+            return_value="/usr/bin/modal",
+        ), patch(
+            "llm_launchpad.core.compute_availability.get_prime_auth_status",
+            return_value=SimpleNamespace(authenticated=True),
+        ), patch(
+            "llm_launchpad.core.compute_availability.fetch_modal_gpu_catalog",
+            return_value=[ModalGpuSpec("H100", price_per_hour_usd=3.95)],
+        ), patch.object(PrimeBackend, "list_offers", side_effect=never_answers):
+            started = time.monotonic()
+            snapshot = load_compute_availability()
+            elapsed = time.monotonic() - started
+
+        # Returns on the budget, not on the stalled provider.
+        self.assertLess(elapsed, 15)
+        self.assertTrue(
+            any("did not answer" in error for error in snapshot.errors), snapshot.errors
+        )
+        # The provider that did answer is still usable.
         self.assertEqual(snapshot.configurations[0].gpu_type, "H100 80GB")
 
     def test_display_gpu_type_strips_provider_suffixes(self) -> None:

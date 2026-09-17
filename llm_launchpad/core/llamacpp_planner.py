@@ -26,6 +26,7 @@ from ..protocol.models import (
 )
 from .config import SETTINGS_DIR
 from .coerce import optional_float
+from .fit_calibration import calibration_key, load_memory_calibration
 from .hf_models import GgufQuantMetadata
 
 
@@ -142,6 +143,70 @@ def tuning_for_objective(
     )
 
 
+# A graph built without flash attention reserves its attention scores in full,
+# and that reservation is linear in the physical batch. Prompt processing is
+# faster with a larger batch, so the planner spends up to this much device
+# memory on it -- the same ceiling the compute-buffer heuristic uses -- and
+# then trades batch size for the context rather than buying GPUs to hold a
+# buffer none of them can share.
+ATTENTION_SCRATCH_BUDGET_GB = 16.0
+
+# Below 64 tokens per batch llama.cpp's prompt processing degrades sharply, so
+# that is the floor: a plan that still does not fit there is one the hardware
+# genuinely cannot serve, not one to shrink further.
+_UBATCH_LADDER: tuple[int, ...] = (512, 256, 128, 64)
+
+
+def ubatch_for_attention_scratch(
+    gb_per_ubatch_token: float,
+    *,
+    max_ubatch: int = _UBATCH_LADDER[0],
+) -> int:
+    """Return the largest physical batch whose attention scratch stays in budget.
+
+    The ladder is where a batch is stepped *down* to, never a ceiling to impose:
+    a caller asking for a batch above it that already fits the budget keeps the
+    batch it asked for. Clamping to the ladder's top rung silently shrank a
+    configured batch on the strength of a scratch cost of nearly nothing, while
+    a cost of exactly nothing was left alone -- the same request answered two
+    different ways either side of zero.
+    """
+
+    if gb_per_ubatch_token <= 0:
+        return max_ubatch
+    if gb_per_ubatch_token * max_ubatch <= ATTENTION_SCRATCH_BUDGET_GB:
+        return max_ubatch
+    for ubatch in _UBATCH_LADDER:
+        if ubatch <= max_ubatch and gb_per_ubatch_token * ubatch <= ATTENTION_SCRATCH_BUDGET_GB:
+            return ubatch
+    return min(max_ubatch, _UBATCH_LADDER[-1])
+
+
+def tuning_for_attention_scratch(
+    tuning: RuntimeTuning,
+    *,
+    context_tokens: int,
+    attention_head_count: int | None,
+) -> RuntimeTuning:
+    """Size the physical batch against a non-flash-attention graph's scores.
+
+    Flash attention keeps the scores out of memory, so the batch is free to
+    stay at its default. Without it the scores are reserved as
+    ``[n_ctx x n_ubatch x n_head]``, which at a long context is larger than any
+    device -- and since every device builds its own graph, adding GPUs does not
+    help. Trading the batch down is the lever that does.
+    """
+
+    if tuning.flash_attention or not attention_head_count or attention_head_count <= 0:
+        return tuning
+    # Only the scores matter for this trade: they are the plane count that
+    # makes a long context unservable, and they scale with the batch exactly
+    # as the masks do.
+    per_token_gb = context_tokens * (attention_head_count + 1) * 4 / 1_000_000_000.0
+    ubatch = ubatch_for_attention_scratch(per_token_gb, max_ubatch=tuning.ubatch_size)
+    return replace(tuning, ubatch_size=ubatch)
+
+
 def tuning_for_architecture(tuning: RuntimeTuning, architecture: str | None) -> RuntimeTuning:
     """Apply correctness requirements of the selected model implementation."""
     if architecture == "glm5next":
@@ -227,14 +292,14 @@ def memory_for_cache_type(
             "heuristic does not model cache precision."
         )
     kv_gb = memory.kv_cache_gb * (target_bytes / source_bytes)
+    count = max(1, len(memory.per_device_required_gb))
     total = (
         memory.weights_gb
         + kv_gb
-        + memory.compute_gb
         + memory.speculative_gb
+        + (memory.compute_gb + memory.attention_scratch_gb) * count
         + memory.reserve_gb
     )
-    count = max(1, len(memory.per_device_required_gb))
     return replace(
         memory,
         kv_cache_gb=round(kv_gb, 3),
@@ -302,6 +367,33 @@ def compile_server_args_string(
     return shlex.join(compile_server_args(requirements, tuning, extra_args=extra_args))
 
 
+def per_device_requirements(
+    *,
+    shardable_gb: float,
+    per_device_gb: float,
+    gpu_count: int,
+    layer_count: int | None,
+) -> tuple[float, ...]:
+    """Split a requirement the way llama.cpp actually assigns it.
+
+    Layers are indivisible, so a model that does not divide evenly leaves one
+    device carrying the remainder: 45 layers over two GPUs is 23 and 22, a
+    51/49 split rather than 50/50. Assuming an even one understates the
+    busiest device, which is the only one that has to fit -- a measured
+    GLM-5.3-Flash plan put 78,810 MiB on CUDA0 against 74,738 MiB on CUDA1
+    and was rejected for the difference while the total had room to spare.
+    """
+
+    count = max(1, gpu_count)
+    layers = layer_count if layer_count and layer_count > 0 else 0
+    if layers < count:
+        shares = [1.0 / count] * count
+    else:
+        base, remainder = divmod(layers, count)
+        shares = [(base + (1 if index < remainder else 0)) / layers for index in range(count)]
+    return tuple(shardable_gb * share + per_device_gb for share in shares)
+
+
 def estimate_memory(
     metadata: GgufQuantMetadata,
     *,
@@ -324,8 +416,11 @@ def estimate_memory(
 
     # Compute graphs, CUDA workspaces, and allocations outside the model/KV
     # tensors are deliberately conservative until an exact runtime certificate
-    # replaces this estimate.
+    # replaces this estimate. Every device builds the whole graph for the
+    # layers it holds, so this is a per-device cost that extra GPUs replicate
+    # rather than divide.
     compute_gb = max(1.5, min(16.0, weights * 0.08 + tuning.batch_size / 4096.0))
+    scratch_gb, scratch_known = _attention_scratch_gb(metadata, context, tuning)
     speculative_gb = (
         max(0.5, weights * 0.04)
         if tuning.speculative_decoding is not None
@@ -338,23 +433,31 @@ def estimate_memory(
         else 0.0
     )
     reserve_gb = reserve_per_device * count
-    total = weights + kv_gb + compute_gb + speculative_gb + reserve_gb
-    per_device = tuple(total / count for _ in range(count))
     hybrid = metadata.architecture in {"kimi-k3", "kimi-linear", "glm5next"}
     source = "gguf-hybrid-metadata" if hybrid else "gguf-metadata"
     nextn = metadata.serving_metadata.nextn_predict_layers if metadata.serving_metadata else 0
+    layer_count = (metadata.block_count - nextn) if metadata.block_count else None
+    per_device = per_device_requirements(
+        shardable_gb=weights + kv_gb + speculative_gb,
+        per_device_gb=compute_gb + scratch_gb + reserve_per_device,
+        gpu_count=count,
+        layer_count=layer_count,
+    )
+    total = sum(per_device)
     recurrent = _hybrid_recurrent_gb(metadata, tuning) if hybrid and metadata_complete else 0.0
+    complete = metadata_complete and scratch_known
     return MemoryEstimate(
         weights_gb=round(weights, 3),
         kv_cache_gb=round(kv_gb, 3),
         compute_gb=round(compute_gb, 3),
+        attention_scratch_gb=round(scratch_gb, 3),
         speculative_gb=round(speculative_gb, 3),
         reserve_gb=round(reserve_gb, 3),
         total_gb=round(total, 3),
         per_device_required_gb=tuple(round(value, 3) for value in per_device),
-        confidence=0.82 if metadata_complete else 0.55,
-        source=source if metadata_complete else "conservative-fallback",
-        total_layer_count=(metadata.block_count - nextn) if metadata.block_count else None,
+        confidence=0.82 if complete else 0.55,
+        source=source if complete else "conservative-fallback",
+        total_layer_count=layer_count,
         recurrent_gb=round(recurrent, 6),
         recurrent_state_copies=_recurrent_state_copies(tuning),
     )
@@ -413,9 +516,19 @@ def assess_placement(
         and cached.gpu_resident
         and cached.effective_context_tokens >= requirements.context_tokens
     )
+    measured_key = calibration_key(
+        model_id=model_id,
+        revision=revision,
+        quant=quant,
+        runtime_id=runtime_id,
+        requirements=requirements,
+        tuning=tuning,
+    )
     if cached is not None and not certified:
         return PlacementAssessment(
             fingerprint=fingerprint,
+            calibration_key=measured_key,
+            runtime_id=runtime_id,
             memory=memory,
             tuning=tuning,
             performance=performance,
@@ -426,6 +539,8 @@ def assess_placement(
         )
     return PlacementAssessment(
         fingerprint=fingerprint,
+        calibration_key=measured_key,
+        runtime_id=runtime_id,
         memory=cached.memory if certified and cached.memory is not None else memory,
         tuning=tuning,
         performance=performance,
@@ -466,17 +581,54 @@ def assess_memory_placement(
     recurrent = base_memory.recurrent_gb * state_copies / max(1, base_memory.recurrent_state_copies)
     state_delta = recurrent - base_memory.recurrent_gb
     reserve_per_device = max(2.0, float(gpu_memory_gb) * 0.05)
-    base_without_reserve = max(0.0, base_memory.total_gb - base_memory.reserve_gb)
+    # Rebase the estimate onto this topology: only the model, cache and
+    # speculative buffers shard, so the graph memory is re-multiplied by the
+    # device count this placement actually uses instead of being carried over
+    # from the count the catalog estimate was built at.
+    base_count = max(1, len(base_memory.per_device_required_gb))
+    per_device_graph = base_memory.compute_gb + base_memory.attention_scratch_gb
+    shardable = max(
+        0.0,
+        base_memory.total_gb - base_memory.reserve_gb - per_device_graph * base_count,
+    )
     reserve = reserve_per_device * count
-    total = base_without_reserve + reserve + state_delta
+    measured_key = calibration_key(
+        model_id=model_id,
+        revision=revision,
+        quant=quant,
+        runtime_id=runtime_id,
+        requirements=requirements,
+        tuning=tuning,
+    )
+    # A runtime measurement of this exact graph outranks the formula that
+    # predicted it. The formula reconstructs ggml's allocator from outside
+    # and has been wrong in both directions; llama.cpp reports the real
+    # figure before every serve, and one report sizes every topology.
+    measured = load_memory_calibration(measured_key)
+    if measured is not None:
+        per_device = tuple(
+            value + reserve_per_device
+            for value in measured.per_device_gb(
+                shardable_gb=shardable + state_delta,
+                gpu_count=count,
+                layer_count=base_memory.total_layer_count,
+            )
+        )
+    else:
+        per_device = per_device_requirements(
+            shardable_gb=shardable + state_delta,
+            per_device_gb=per_device_graph + reserve_per_device,
+            gpu_count=count,
+            layer_count=base_memory.total_layer_count,
+        )
     memory = replace(
         base_memory,
         kv_cache_gb=round(base_memory.kv_cache_gb + state_delta, 3),
         recurrent_gb=round(recurrent, 6),
         recurrent_state_copies=state_copies,
         reserve_gb=round(reserve, 3),
-        total_gb=round(total, 3),
-        per_device_required_gb=tuple(round(total / count, 3) for _ in range(count)),
+        total_gb=round(sum(per_device), 3),
+        per_device_required_gb=tuple(round(value, 3) for value in per_device),
     )
     fits = all(value <= gpu_memory_gb for value in memory.per_device_required_gb)
     fingerprint = serving_fingerprint(
@@ -508,6 +660,8 @@ def assess_memory_placement(
     )
     return PlacementAssessment(
         fingerprint=fingerprint,
+        calibration_key=measured_key,
+        runtime_id=runtime_id,
         memory=cached.memory if certified and cached.memory is not None else memory,
         tuning=tuning,
         performance=performance,
@@ -529,8 +683,8 @@ def assess_memory_placement(
                 "A previous runtime attestation rejected this configuration."
                 if cached is not None and not certified
                 else (
-                    f"Full-context plan needs {total / count:.1f} GB per GPU; "
-                    f"{gpu_type} provides {gpu_memory_gb:.1f} GB."
+                    f"Full-context plan needs {max(per_device):.1f} GB on its "
+                    f"busiest GPU; {gpu_type} provides {gpu_memory_gb:.1f} GB."
                 )
             )
         ),
@@ -740,6 +894,85 @@ def attestation_now(
     )
 
 
+def _attention_scratch_gb(
+    metadata: GgufQuantMetadata,
+    context_tokens: int,
+    tuning: RuntimeTuning,
+) -> tuple[float, bool]:
+    """Return the per-device attention scratch of a non-flash-attention graph.
+
+    Flash attention never materializes the scores, so its working set is small
+    and context-independent. Without it llama.cpp builds the full
+    ``kq = K @ Q`` tensor, shaped ``[n_ctx, n_ubatch, n_head]`` in f32, plus an
+    f32 mask of ``[n_ctx, n_ubatch]``; both are reserved at the worst case, so
+    the buffer grows linearly with the advertised context. See
+    ``llm_graph_context::build_attn_mha`` in the pinned runtime.
+
+    The graph is rebuilt on every device that holds an attention layer and the
+    allocator reuses one buffer across layers, so the cost is one copy per
+    device rather than one per layer, and adding GPUs does not divide it.
+
+    Returns the estimate and whether the architecture could be measured at all:
+    a runtime that forbids flash attention cannot be sized without a head
+    count, and guessing one would understate the requirement by an order of
+    magnitude.
+    """
+
+    heads = attention_head_count(metadata)
+    if heads is None and not tuning.flash_attention:
+        return 0.0, False
+    # llama.cpp reserves the graph one physical batch at a time.
+    tokens = max(1, min(context_tokens, tuning.ubatch_size))
+    planes = _attention_plane_bytes(metadata, tuning, heads)
+    return (context_tokens * tokens * planes / 1_000_000_000.0, True)
+
+
+def attention_head_count(metadata: GgufQuantMetadata) -> int | None:
+    """Return the query-head count GGUF headers report, if they report one."""
+
+    layout = metadata.serving_metadata
+    heads = metadata.attention_head_count or (layout.attention_head_count if layout else None)
+    return heads if heads and heads > 0 else None
+
+
+# Intermediates of the sparse-attention path, each shaped like the mask:
+# the duplicated selection mask, the top-k scatter, the candidate add, the
+# f16 cast, and the add of the base mask. Counted from build_attn_sparse in
+# the pinned runtime. Measured against a live 2x A100 GLM-5.3-Flash fit,
+# whose compute buffers came to 14.7 GiB per device where the plain
+# heuristic predicted 8.8 GiB.
+_SPARSE_ATTENTION_MASK_PLANES = 5
+
+
+def _attention_plane_bytes(
+    metadata: GgufQuantMetadata,
+    tuning: RuntimeTuning,
+    heads: int | None,
+) -> int:
+    """Bytes per context-token, per batch-token, of attention working memory.
+
+    Every attention implementation reserves at least one ``[n_ctx, n_ubatch]``
+    mask, f16 under flash attention and f32 without it. Without flash
+    attention the scores are materialized too, one f32 plane per query head,
+    which is what makes a long context impossible to serve that way.
+
+    A sparse-attention model adds more planes of the same shape whether or not
+    flash attention is on: its indexer builds the top-k mask by duplicating,
+    scattering into and adding masks, and those intermediates are the
+    difference between a compute-buffer guess and what the runtime allocates.
+    """
+
+    mask_bytes = 2 if tuning.flash_attention else 4
+    planes = 1
+    layout = metadata.serving_metadata
+    if layout is not None and layout.indexer_key_length and layout.indexer_kpool:
+        planes += _SPARSE_ATTENTION_MASK_PLANES
+    total = planes * mask_bytes
+    if not tuning.flash_attention and heads:
+        total += heads * 4
+    return total
+
+
 def _kv_cache_gb(
     metadata: GgufQuantMetadata,
     context_tokens: int,
@@ -926,6 +1159,7 @@ def _attestation_from_dict(raw: Any) -> RuntimeAttestation | None:
                 source=str(memory_raw.get("source") or "runtime"),
                 recurrent_gb=float(memory_raw.get("recurrent_gb", 0.0)),
                 recurrent_state_copies=int(memory_raw.get("recurrent_state_copies", 1)),
+                attention_scratch_gb=float(memory_raw.get("attention_scratch_gb", 0.0)),
                 total_layer_count=(
                     int(memory_raw["total_layer_count"])
                     if memory_raw.get("total_layer_count") is not None

@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import shlex
 import shutil
+import tempfile
 import threading
 from typing import Any
 from collections.abc import Iterable
@@ -16,6 +17,7 @@ from ..protocol.enums import BackendType, ComputeProvider
 from ..protocol.models import DeploymentConfig, EndpointInfo, ReasoningCapabilities, VisionCapabilities
 from .vision import image_input_verified, vision_to_dict, vision_from_dict
 from .config import SETTINGS_DIR
+from .deployment_states import is_terminal_deployment_state
 from .coerce import positive_int
 from .diagnostics import log_debug, log_exception
 from .naming import (
@@ -38,7 +40,6 @@ _PROVIDER_PREFIX = "llm-launchpad-"
 _PROVIDER_NAME = "llm-launchpad"
 _LEGACY_PROVIDER_NAME_PREFIX = "llm-launchpad: "
 _MANAGED_NPM = "@ai-sdk/openai-compatible"
-_REMOVABLE_STATES = {"stopped", "stopping", "terminated", "archived"}
 _DEFAULT_MODAL_LLAMACPP_CONTEXT_TOKENS = 32_768
 _DEFAULT_OPENCODE_OUTPUT_TOKENS = 32_768
 _SYNC_LOCK = threading.Lock()
@@ -227,6 +228,35 @@ def build_openai_connection_payload(
     return payload
 
 
+def format_connection_summary_lines(
+    config: DeploymentConfig,
+    server_url: str,
+) -> list[str]:
+    """Compact post-deploy connection summary for OpenAI-compatible clients.
+
+    Shared by the TUI monitor and background workers so reopened logs and
+    headless job output describe the endpoint the same way.
+    """
+    payload = build_openai_connection_payload(config, server_url)
+    base_url = str(payload["base_url"])
+    model_id = str(payload["model_id"])
+    display_name = str(payload["display_name"])
+
+    return [
+        "=== OpenAI-compatible ===",
+        f"Base URL: {base_url}",
+        f"Model ID: {model_id}",
+        f"Display name: {display_name}",
+        f"Vision: {config.vision_mode.value}; " + (f"{'enabled' if config.vision.enabled else 'disabled'}, {config.vision.verification.value}" if config.vision else "unknown"),
+        (
+            "API key: generated and stored locally"
+            if config.endpoint_api_key
+            else "API key: (leave blank; no auth by default)"
+        ),
+        "=========================",
+    ]
+
+
 def build_connection_from_config(
     config: DeploymentConfig,
     server_url: str,
@@ -398,7 +428,11 @@ def resolve_connection_for_app(
         if resolved is not None:
             return resolved
 
-    if fallback_config is not None and fallback_server_url:
+    if (
+        fallback_config is not None
+        and (fallback_config.app_name or "").strip() == target_app_name
+        and fallback_server_url
+    ):
         return build_connection_from_config(fallback_config, fallback_server_url)
     return None
 
@@ -773,13 +807,20 @@ def _atomic_write(path: Path, contents: str) -> None:
     caches are written.
     """
 
-    temporary_path = path.with_suffix(f"{path.suffix}.tmp")
-    temporary_path.write_text(contents, encoding="utf-8")
+    # Separate processes do not share _SYNC_LOCK. Each write needs its own
+    # sibling file, created privately before any credentials are written.
+    temporary_path: Path | None = None
     try:
-        os.chmod(temporary_path, 0o600)
-    except OSError:
-        pass
-    temporary_path.replace(path)
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent,
+            prefix=f".{path.name}.", suffix=".tmp", delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            handle.write(contents)
+        temporary_path.replace(path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
 
 
 def _write_opencode_config(path: Path, payload: dict[str, Any]) -> None:
@@ -788,13 +829,15 @@ def _write_opencode_config(path: Path, payload: dict[str, Any]) -> None:
         current = path.read_text(encoding="utf-8")
         if current == serialized:
             return
-        backup_path = path.with_suffix(path.suffix + ".bak")
-        backup_path.parent.mkdir(parents=True, exist_ok=True)
-        backup_path.write_text(current, encoding="utf-8")
+        # Recovery may have read the backup because the live file is corrupt.
+        # Do not destroy the last valid copy when persisting that recovery.
         try:
-            os.chmod(backup_path, 0o600)
-        except OSError:
-            pass
+            current_payload = _parse_jsonc(current)
+        except ValueError:
+            current_payload = None
+        if isinstance(current_payload, dict):
+            backup_path = path.with_suffix(path.suffix + ".bak")
+            _atomic_write(backup_path, current)
     path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write(path, serialized)
 
@@ -927,11 +970,13 @@ def _strip_json_comments(text: str) -> str:
             continue
 
         if ch == "/" and nxt == "/":
+            result.append(" ")
             in_line_comment = True
             i += 2
             continue
 
         if ch == "/" and nxt == "*":
+            result.append(" ")
             in_block_comment = True
             i += 2
             continue
@@ -939,6 +984,8 @@ def _strip_json_comments(text: str) -> str:
         result.append(ch)
         i += 1
 
+    if in_block_comment:
+        raise ValueError("Unterminated JSONC block comment.")
     return "".join(result)
 
 
@@ -981,4 +1028,4 @@ def _strip_trailing_commas(text: str) -> str:
 
 
 def _is_removable_modal_state(state: str) -> bool:
-    return (state or "").strip().lower() in _REMOVABLE_STATES
+    return is_terminal_deployment_state(state)

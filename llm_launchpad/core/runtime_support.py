@@ -17,6 +17,11 @@ from .coerce import positive_int
 DEFAULT_LLAMACPP_IMAGE_REF = "ghcr.io/ggml-org/llama.cpp:server-cuda-b10689"
 LLAMACPP_SUPPORT_MANIFEST_FILENAME = "llamacpp_runtime_support.json"
 
+# Draft length requested whenever MTP is resolved without an explicit ask. The
+# catalog and deploy-time preflight must agree on it, or a profile built with
+# one budget would deploy against another and invalidate its placement.
+DEFAULT_MTP_DRAFT_TOKENS = 3
+
 _ARCHITECTURE_ROW_RE = re.compile(
     r'\{\s*(LLM_ARCH_[A-Z0-9_]+)\s*,\s*"([^"]+)"\s*\}'
 )
@@ -327,13 +332,33 @@ def llamacpp_build_recipe(architecture: str | None) -> str | None:
 
 
 def llamacpp_cuda_architecture(gpu_type: str | None) -> str | None:
-    """Compile the source runtime for the selected catalog GPU family."""
+    """Map a GPU name to its CUDA compute capability for source builds.
+
+    Provider GPU names carry suffixes that do not change the architecture
+    ("A6000_48GB", "H100!", "RTX-4090-24GB"), so matching is on the
+    normalized family, not the raw string. Unknown families return None and
+    the Dockerfile default (all families) applies.
+    """
     gpu = (gpu_type or "").strip().upper().removesuffix("!")
-    return {
-        "T4": "75", "A100": "80", "A100-40GB": "80", "A100-80GB": "80",
-        "A10": "86", "L4": "89", "L40S": "89", "H100": "90", "H200": "90",
-        "B200": "100", "RTX-PRO-6000": "120",
-    }.get(gpu)
+    normalized = re.sub(r"[^A-Z0-9]+", "-", gpu).strip("-")
+    table = {
+        "T4": "75",
+        "A100": "80",
+        "A100-40GB": "80",
+        "A100-80GB": "80",
+        "A10": "86",
+        "A6000": "86",
+        "L4": "89",
+        "L40S": "89",
+        "H100": "90",
+        "H200": "90",
+        "B200": "100",
+        "RTX-PRO-6000": "120",
+    }
+    if normalized in table:
+        return table[normalized]
+    family = re.sub(r"-\d+GB$", "", normalized)
+    return table.get(family)
 
 
 def _required_string(payload: dict[str, Any], key: str) -> str:

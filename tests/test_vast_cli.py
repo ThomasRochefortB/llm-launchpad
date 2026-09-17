@@ -159,7 +159,7 @@ class VastCliTests(unittest.TestCase):
         ), patch("llm_launchpad.cli.main.remove_connection"), patch("llm_launchpad.cli.main._sync_opencode_cli"):
             result = self.runner.invoke(app, ["stop", "--provider", "vast"], input="y\n")
         self.assertEqual(result.exit_code, 0, result.output)
-        self.assertIn("permanently delete its disk", result.output)
+        self.assertIn("Rental disk and cached weights are deleted", result.output)
         self.assertEqual(orchestrator.stop_app.call_args.kwargs["provider"], ComputeProvider.VAST)
         self.assertEqual(orchestrator.stop_app.call_args.kwargs["app_id"], "900")
 

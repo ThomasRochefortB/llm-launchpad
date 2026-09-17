@@ -10,17 +10,40 @@ from typer.testing import CliRunner
 
 from llm_launchpad.cli.main import app
 from llm_launchpad.core import doctor as doctor_module
-from llm_launchpad.core.backend import ModalBackend
 from llm_launchpad.core.doctor import (
     DoctorCheck,
     doctor_exit_code,
     run_doctor_checks,
 )
 from llm_launchpad.core.hf_auth import HuggingFaceAuthStatus
-from llm_launchpad.core.modal_auth import ModalAuthStatus
-from llm_launchpad.core.prime_auth import PrimeAuthStatus
-from llm_launchpad.core.vast_auth import VastCredentials
+from llm_launchpad.core.provider_readiness import (
+    ProviderReadiness,
+    ProviderReadinessStage,
+)
+from llm_launchpad.protocol.enums import ComputeProvider
 from llm_launchpad.core.artificial_analysis import ArtificialAnalysisAuthStatus
+
+
+def _readiness(
+    provider: ComputeProvider,
+    stage: ProviderReadinessStage,
+    detail: str = "",
+    hint: str | None = None,
+) -> ProviderReadiness:
+    return ProviderReadiness(provider=provider, stage=stage, detail=detail, hint=hint)
+
+
+def _ready(provider: ComputeProvider, detail: str = "verified") -> ProviderReadiness:
+    return _readiness(provider, ProviderReadinessStage.READY, detail)
+
+
+def _missing(provider: ComputeProvider) -> ProviderReadiness:
+    return _readiness(
+        provider,
+        ProviderReadinessStage.MISSING_CREDENTIALS,
+        "no API key configured",
+        "authenticate to enable this provider",
+    )
 
 
 def _ok_checks() -> tuple[DoctorCheck, ...]:
@@ -66,19 +89,19 @@ class RunDoctorChecksTests(unittest.TestCase):
     def setUp(self) -> None:
         patchers = [
             mock.patch.object(
-                doctor_module, "resolve_vast_credentials",
-                return_value=VastCredentials("test-key", "stored"),
-            ),
-            mock.patch.object(ModalBackend, "is_cli_available", return_value=True),
-            mock.patch.object(
                 doctor_module,
-                "get_modal_auth_status",
-                return_value=ModalAuthStatus(authenticated=True, profile="default"),
+                "check_modal_readiness",
+                return_value=_ready(ComputeProvider.MODAL, "authenticated (profile: default)"),
             ),
             mock.patch.object(
                 doctor_module,
-                "get_prime_auth_status",
-                return_value=PrimeAuthStatus(authenticated=True),
+                "check_prime_readiness",
+                return_value=_ready(ComputeProvider.PRIME, "API key verified"),
+            ),
+            mock.patch.object(
+                doctor_module,
+                "check_vast_readiness",
+                return_value=_ready(ComputeProvider.VAST, "verified (stored)"),
             ),
             mock.patch.object(
                 doctor_module,
@@ -110,7 +133,16 @@ class RunDoctorChecksTests(unittest.TestCase):
         self.assertEqual(doctor_exit_code(checks), 0)
 
     def test_missing_vast_key_warns_without_contacting_the_api(self) -> None:
-        with mock.patch.object(doctor_module, "resolve_vast_credentials", return_value=VastCredentials()), mock.patch(
+        with mock.patch.object(
+            doctor_module,
+            "check_vast_readiness",
+            return_value=_readiness(
+                ComputeProvider.VAST,
+                ProviderReadinessStage.MISSING_CREDENTIALS,
+                "no API key configured",
+                "run: llm-launchpad vast-auth login (or set VAST_API_KEY)",
+            ),
+        ), mock.patch(
             "llm_launchpad.core.vast_backend.requests.request"
         ) as request:
             checks = run_doctor_checks(settings_dir=Path(tempfile.gettempdir()))
@@ -121,11 +153,20 @@ class RunDoctorChecksTests(unittest.TestCase):
         # Modal and Prime are authenticated here, so a provider nobody uses
         # must not fail the run.
         self.assertEqual(doctor_exit_code(checks), 0)
-        # Resolving a key is a local read, exactly like the Modal and Prime probes.
+        # A missing key is reported from local state without any API call.
         request.assert_not_called()
 
     def test_missing_modal_cli_reports_hint(self) -> None:
-        with mock.patch.object(ModalBackend, "is_cli_available", return_value=False):
+        with mock.patch.object(
+            doctor_module,
+            "check_modal_readiness",
+            return_value=_readiness(
+                ComputeProvider.MODAL,
+                ProviderReadinessStage.NOT_INSTALLED,
+                "Modal CLI not found",
+                "reinstall llm-launchpad, then run: modal setup",
+            ),
+        ):
             checks = run_doctor_checks(settings_dir=Path(tempfile.gettempdir()))
 
         modal_cli = next(check for check in checks if check.name == "Modal CLI")
@@ -136,8 +177,13 @@ class RunDoctorChecksTests(unittest.TestCase):
     def test_unauthenticated_modal_reports_hint(self) -> None:
         with mock.patch.object(
             doctor_module,
-            "get_modal_auth_status",
-            return_value=ModalAuthStatus(authenticated=False),
+            "check_modal_readiness",
+            return_value=_readiness(
+                ComputeProvider.MODAL,
+                ProviderReadinessStage.AUTH_FAILED,
+                "not authenticated",
+                "run: modal setup",
+            ),
         ):
             checks = run_doctor_checks(settings_dir=Path(tempfile.gettempdir()))
 
@@ -148,25 +194,44 @@ class RunDoctorChecksTests(unittest.TestCase):
 
     def test_one_authenticated_provider_is_enough_and_none_is_a_failure(self) -> None:
         """Deploying needs one provider, which is what the TUI gates on."""
-        for present in ("modal", "prime", "vast"):
-            with self.subTest(provider=present), mock.patch.object(
-                ModalBackend, "is_cli_available", return_value=present == "modal",
-            ), mock.patch.object(
-                doctor_module, "get_prime_auth_status",
-                return_value=PrimeAuthStatus(authenticated=present == "prime"),
-            ), mock.patch.object(
-                doctor_module, "resolve_vast_credentials",
-                return_value=VastCredentials("k", "stored") if present == "vast" else VastCredentials(),
-            ):
-                checks = run_doctor_checks(settings_dir=Path(tempfile.gettempdir()))
+        providers = (ComputeProvider.MODAL, ComputeProvider.PRIME, ComputeProvider.VAST)
+        check_names = {
+            ComputeProvider.MODAL: "check_modal_readiness",
+            ComputeProvider.PRIME: "check_prime_readiness",
+            ComputeProvider.VAST: "check_vast_readiness",
+        }
+        for present in providers:
+            with self.subTest(provider=present.value):
+                patchers = [
+                    mock.patch.object(
+                        doctor_module,
+                        name,
+                        return_value=(
+                            _ready(provider) if provider == present else _missing(provider)
+                        ),
+                    )
+                    for provider, name in check_names.items()
+                ]
+                for patcher in patchers:
+                    patcher.start()
+                try:
+                    checks = run_doctor_checks(settings_dir=Path(tempfile.gettempdir()))
+                finally:
+                    for patcher in patchers:
+                        patcher.stop()
             provider = next(check for check in checks if check.name == "Compute provider")
             self.assertTrue(provider.ok)
             self.assertEqual(doctor_exit_code(checks), 0)
 
-        with mock.patch.object(ModalBackend, "is_cli_available", return_value=False), mock.patch.object(
-            doctor_module, "get_prime_auth_status", return_value=PrimeAuthStatus(authenticated=False),
+        with mock.patch.object(
+            doctor_module, "check_modal_readiness",
+            return_value=_missing(ComputeProvider.MODAL),
         ), mock.patch.object(
-            doctor_module, "resolve_vast_credentials", return_value=VastCredentials(),
+            doctor_module, "check_prime_readiness",
+            return_value=_missing(ComputeProvider.PRIME),
+        ), mock.patch.object(
+            doctor_module, "check_vast_readiness",
+            return_value=_missing(ComputeProvider.VAST),
         ):
             checks = run_doctor_checks(settings_dir=Path(tempfile.gettempdir()))
         provider = next(check for check in checks if check.name == "Compute provider")

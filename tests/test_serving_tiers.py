@@ -9,6 +9,9 @@ from llm_launchpad.core.serving_tiers import (
     BALANCED,
     ECONOMY,
     FASTEST,
+    SAVER,
+    reduced_quality_note,
+    reduced_quality_plan_note,
     serving_tiers,
 )
 from llm_launchpad.protocol.enums import (
@@ -52,11 +55,13 @@ def _plan(
     fits: bool = True,
     gpu_resident: bool = True,
     measured: bool = False,
+    quant: str | None = None,
 ) -> InferencePlan:
     recipe = InferenceRecipe(
         id="recipe",
         model_key="model",
         display_name="Model",
+        quant=quant,
         backend=BackendType.LLAMACPP,
         model_id="org/model",
     )
@@ -297,3 +302,229 @@ class EstimatedTopologyTierTests(unittest.TestCase):
         for key in speed_roles:
             self.assertEqual(tiers[key].plan.quote.id, "modal-1x")
 
+
+
+class QuantQualityFloorTests(unittest.TestCase):
+    """Price and speed may not buy themselves a smaller quantization."""
+
+    def _pair(self, *, small_price: float) -> list[InferencePlan]:
+        """A 4-bit frontier plus a 2-bit build that is cheaper and faster.
+
+        Fewer bytes per weight is both cheaper to hold and faster to read, so
+        the small build wins every axis the tier picker ranks on. That is
+        precisely the sweep this floor exists to stop.
+        """
+
+        return [
+            _plan("q4-cheap", price=3.03, single_tps=60.0, aggregate_tps=70.0, quant="UD-Q4_K_XL"),
+            _plan("q4-fast", price=6.25, single_tps=115.0, aggregate_tps=130.0, quant="UD-Q4_K_XL"),
+            _plan("q2-cheap", price=small_price, single_tps=120.0, aggregate_tps=140.0, quant="UD-Q2_K_XL"),
+        ]
+
+    def test_every_serving_tier_stays_at_the_best_available_width(self) -> None:
+        tiers = serving_tiers(self._pair(small_price=1.00))
+
+        serving = [tier for tier in tiers if tier.key != SAVER]
+        self.assertTrue(serving)
+        for tier in serving:
+            self.assertEqual(tier.plan.recipe.quant, "UD-Q4_K_XL")
+
+    def test_a_materially_cheaper_small_build_is_offered_and_labelled(self) -> None:
+        # 1.00 against a 3.03 floor is a 67% discount: a real decision.
+        tiers = {tier.key: tier for tier in serving_tiers(self._pair(small_price=1.00))}
+
+        self.assertIn(SAVER, tiers)
+        saver = tiers[SAVER]
+        self.assertEqual(saver.plan.recipe.quant, "UD-Q2_K_XL")
+        self.assertIn("2-bit", saver.tradeoff or "")
+        self.assertFalse(saver.is_recommended)
+
+    def test_the_saver_goes_last_rather_than_leading_on_price(self) -> None:
+        tiers = serving_tiers(self._pair(small_price=1.00))
+
+        # It is an opt-out from the quality floor, not the way into the list,
+        # so it does not take the top row just for being cheapest.
+        self.assertEqual(tiers[-1].key, SAVER)
+
+    def test_a_small_build_on_the_same_hardware_is_not_offered(self) -> None:
+        # The compact models put both widths on one RTX-PRO-6000. Serving 2-bit
+        # weights to save nothing is pure loss, so the option should not exist.
+        tiers = serving_tiers(self._pair(small_price=3.03))
+
+        self.assertNotIn(SAVER, {tier.key for tier in tiers})
+
+    def test_a_small_discount_does_not_buy_a_smaller_quantization(self) -> None:
+        # 17% off, the real Qwen3-Next-80B gap. Under the bar, so no offer.
+        tiers = serving_tiers(self._pair(small_price=2.50))
+
+        self.assertNotIn(SAVER, {tier.key for tier in tiers})
+
+    def test_a_model_that_only_fits_small_is_served_and_disclosed(self) -> None:
+        # Kimi K3 is 2-bit or nothing. Offering it is right; offering it
+        # silently is the failure this note exists to prevent.
+        plans = [
+            _plan("q2-cheap", price=34.65, single_tps=3.8, aggregate_tps=10.4, quant="UD-Q2_K_XL"),
+            _plan("q2-fast", price=37.50, single_tps=5.6, aggregate_tps=15.3, quant="UD-Q2_K_XL"),
+        ]
+
+        tiers = serving_tiers(plans)
+        note = reduced_quality_note(tiers)
+
+        self.assertTrue(tiers)
+        self.assertIsNotNone(note)
+        self.assertIn("2-bit", note or "")
+        self.assertIn("4-bit baseline", note or "")
+
+    def test_no_note_when_the_floor_is_met(self) -> None:
+        self.assertIsNone(reduced_quality_note(serving_tiers(self._pair(small_price=1.00))))
+
+    def test_widths_spelled_differently_are_one_quality_level(self) -> None:
+        # Q4_K_M and UD-Q4_K_XL are the same floor with two spellings; reading
+        # them as rival quality levels would strand half the frontier.
+        plans = [
+            _plan("xl", price=6.25, single_tps=115.0, aggregate_tps=130.0, quant="UD-Q4_K_XL"),
+            _plan("km", price=3.03, single_tps=60.0, aggregate_tps=70.0, quant="Q4_K_M"),
+        ]
+
+        tiers = serving_tiers(plans)
+
+        self.assertNotIn(SAVER, {tier.key for tier in tiers})
+        self.assertEqual({tier.plan.quote.id for tier in tiers}, {"xl", "km"})
+
+    def test_an_unlabelled_frontier_is_unchanged(self) -> None:
+        # Curated recipes carry no quant. They must not be read as degraded.
+        plans = [
+            _plan("a", price=1.95, single_tps=55.0, aggregate_tps=60.0),
+            _plan("b", price=4.00, single_tps=110.0, aggregate_tps=130.0),
+        ]
+
+        tiers = serving_tiers(plans)
+
+        self.assertNotIn(SAVER, {tier.key for tier in tiers})
+        self.assertIsNone(reduced_quality_note(tiers))
+
+
+class MergedRoleTests(unittest.TestCase):
+    """A role whose placement another row already claimed is named, not lost."""
+
+    def test_a_placement_winning_value_and_speed_says_it_is_also_fastest(self) -> None:
+        # The common shape: one B200 is both the best tokens-per-dollar and
+        # the fastest thing available. Balanced claims the row first, and the
+        # Fastest label used to vanish without trace -- sending the reader to
+        # the full list after a faster placement that does not exist.
+        plans = [
+            _plan("cheap", price=4.95, single_tps=27.0, aggregate_tps=30.0),
+            _plan("big", price=6.25, single_tps=41.0, aggregate_tps=300.0),
+        ]
+
+        tiers = {tier.key: tier for tier in serving_tiers(plans)}
+
+        self.assertNotIn(FASTEST, tiers)
+        self.assertEqual(tiers[BALANCED].also, (FASTEST,))
+        self.assertIn("also the fastest", tiers[BALANCED].tradeoff or "")
+
+    def test_the_merged_role_composes_with_the_ratio_it_trades_on(self) -> None:
+        # Cheapest and fastest in one placement, with the value tier elsewhere:
+        # the row is not the baseline, so it carries both clauses.
+        plans = [
+            _plan("quick", price=1.0, single_tps=100.0, aggregate_tps=100.0),
+            _plan("value", price=2.0, single_tps=50.0, aggregate_tps=300.0),
+        ]
+
+        tiers = {tier.key: tier for tier in serving_tiers(plans)}
+
+        self.assertEqual(tiers[ECONOMY].also, (FASTEST,))
+        tradeoff = tiers[ECONOMY].tradeoff or ""
+        self.assertIn("also the fastest", tradeoff)
+        self.assertIn("cheaper", tradeoff)
+
+    def test_being_the_best_value_is_left_to_the_recommendation_marker(self) -> None:
+        # Cheapest and best value in one placement. "also the best value" and
+        # "recommended" are the same claim; the row should not make it twice.
+        plans = [
+            _plan("one", price=3.03, single_tps=72.0, aggregate_tps=400.0),
+            _plan("fast", price=6.25, single_tps=136.0, aggregate_tps=150.0),
+        ]
+
+        tiers = {tier.key: tier for tier in serving_tiers(plans)}
+
+        self.assertNotIn(BALANCED, tiers)
+        self.assertEqual(tiers[ECONOMY].also, (BALANCED,))
+        self.assertTrue(tiers[ECONOMY].is_recommended)
+        self.assertIsNone(tiers[ECONOMY].tradeoff)
+
+    def test_nothing_is_claimed_when_each_role_wins_its_own_placement(self) -> None:
+        tiers = serving_tiers(
+            [
+                _plan("cheap", price=1.0, single_tps=30.0, aggregate_tps=32.0),
+                _plan("value", price=2.0, single_tps=60.0, aggregate_tps=400.0),
+                _plan("fast", price=8.0, single_tps=200.0, aggregate_tps=210.0),
+            ]
+        )
+
+        self.assertEqual(len(tiers), 3)
+        for tier in tiers:
+            with self.subTest(tier=tier.key):
+                self.assertEqual(tier.also, ())
+
+    def test_one_placement_winning_everything_stays_one_row(self) -> None:
+        tiers = serving_tiers([_plan("only", price=2.0, single_tps=90.0, aggregate_tps=95.0)])
+
+        self.assertEqual(len(tiers), 1)
+        self.assertEqual(tiers[0].also, (BALANCED, FASTEST))
+        # Balanced stays unsaid, so the clause names the one role that is not
+        # already carried by the recommendation marker.
+        self.assertEqual(tiers[0].tradeoff, "also the fastest")
+
+    def test_a_saver_never_claims_a_frontier_role(self) -> None:
+        plans = [
+            _plan("q4", price=4.00, single_tps=40.0, aggregate_tps=300.0, quant="UD-Q4_K_XL"),
+            _plan("q2", price=1.00, single_tps=90.0, aggregate_tps=95.0, quant="UD-Q2_K_XL"),
+        ]
+
+        tiers = {tier.key: tier for tier in serving_tiers(plans)}
+
+        self.assertEqual(tiers[SAVER].also, ())
+
+
+class SinglePlacementDisclosureTests(unittest.TestCase):
+    """One live placement has no tiers, and is where the floor most often bites."""
+
+    def test_a_lone_reduced_placement_is_still_explained(self) -> None:
+        # Kimi K3 on this account resolves to exactly one placement, so the
+        # screen lists it directly instead of collapsing it into tiers. The
+        # note used to be read off tiers alone, which left the one model that
+        # needed the sentence without it.
+        plans = [_plan("only", price=37.5, single_tps=5.6, aggregate_tps=15.3, quant="UD-Q2_K_XL")]
+
+        note = reduced_quality_plan_note(plans)
+
+        self.assertIsNotNone(note)
+        self.assertIn("2-bit", note or "")
+
+    def test_a_lone_placement_that_meets_the_floor_says_nothing(self) -> None:
+        plans = [_plan("only", price=3.03, single_tps=72.0, aggregate_tps=80.0, quant="UD-Q4_K_XL")]
+
+        self.assertIsNone(reduced_quality_plan_note(plans))
+
+    def test_a_reachable_wider_build_is_not_a_floor(self) -> None:
+        # Both widths are placeable, so nothing was forced on the reader.
+        plans = [
+            _plan("q4", price=6.25, single_tps=41.0, aggregate_tps=50.0, quant="UD-Q4_K_XL"),
+            _plan("q2", price=2.50, single_tps=90.0, aggregate_tps=95.0, quant="UD-Q2_K_XL"),
+        ]
+
+        self.assertIsNone(reduced_quality_plan_note(plans))
+
+    def test_an_ineligible_placement_cannot_lift_the_floor(self) -> None:
+        # A 4-bit plan that cannot hold the context is not an option, so the
+        # reader is still on 2-bit whether or not the row exists.
+        plans = [
+            _plan("q4", price=6.25, single_tps=41.0, aggregate_tps=50.0, quant="UD-Q4_K_XL", fits=False),
+            _plan("q2", price=2.50, single_tps=90.0, aggregate_tps=95.0, quant="UD-Q2_K_XL"),
+        ]
+
+        self.assertIsNotNone(reduced_quality_plan_note(plans))
+
+    def test_nothing_placeable_yields_no_opinion(self) -> None:
+        self.assertIsNone(reduced_quality_plan_note([]))

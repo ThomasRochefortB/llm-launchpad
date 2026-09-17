@@ -203,12 +203,16 @@ class TuiAppStorageCacheTests(unittest.TestCase):
 
         with (
             patch("llm_launchpad.tui.app.ModalBackend.is_cli_available", return_value=True),
+            patch("llm_launchpad.core.modal_auth.get_modal_auth_status") as modal_auth,
             patch("llm_launchpad.tui.app.ModalBackend.get_username", return_value="default") as get_username,
             patch.object(app, "push_screen", return_value=None) as push_screen,
             patch.object(app, "run_worker", return_value=None) as run_worker,
             patch.object(app, "notify", return_value=None) as notify,
             patch.object(app, "exit", return_value=None) as exit_mock,
         ):
+            from llm_launchpad.core.modal_auth import ModalAuthStatus
+
+            modal_auth.return_value = ModalAuthStatus(authenticated=True, profile="default")
             app.on_mount()
 
         notify.assert_not_called()
@@ -216,7 +220,9 @@ class TuiAppStorageCacheTests(unittest.TestCase):
         push_screen.assert_called_once()
         self.assertEqual(push_screen.call_args.args[0].username, "")
         get_username.assert_not_called()
-        run_worker.assert_called_once_with(
+        # Readiness verification also runs without blocking first paint.
+        self.assertGreaterEqual(run_worker.call_count, 1)
+        run_worker.assert_any_call(
             app._run_load_modal_username,
             name="modal-username-worker",
             thread=True,
@@ -230,7 +236,7 @@ class TuiAppStorageCacheTests(unittest.TestCase):
             patch("llm_launchpad.tui.app.ModalBackend.is_cli_available", return_value=False),
             patch("llm_launchpad.tui.app.get_prime_auth_status", return_value=PrimeAuthStatus(authenticated=False)),
             patch.object(app, "push_screen") as push_screen,
-            patch.object(app, "run_worker", return_value=None) as run_worker,
+            patch.object(app, "refresh_provider_readiness", return_value=None),
             patch.object(app, "notify", return_value=None) as notify,
             patch.object(app, "exit", return_value=None) as exit_mock,
         ):
@@ -238,7 +244,6 @@ class TuiAppStorageCacheTests(unittest.TestCase):
 
         notify.assert_not_called()
         exit_mock.assert_not_called()
-        run_worker.assert_not_called()
         push_screen.assert_called_once()
         from llm_launchpad.tui.screens.setup import SetupRequiredScreen
 
@@ -253,6 +258,7 @@ class TuiAppStorageCacheTests(unittest.TestCase):
             patch("llm_launchpad.tui.app.get_prime_auth_status", return_value=PrimeAuthStatus(authenticated=False)),
             patch.object(app, "push_screen", return_value=None) as push_screen,
             patch.object(app, "run_worker", return_value=None),
+            patch.object(app, "refresh_provider_readiness", return_value=None),
         ):
             self.assertFalse(app.recheck_provider_setup())
 

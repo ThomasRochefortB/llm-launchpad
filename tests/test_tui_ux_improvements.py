@@ -71,7 +71,7 @@ class SetupRequiredScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(app.menu_entered)
             self.assertIsInstance(app.screen, SetupRequiredScreen)
             feedback = str(screen.query_one("#setup-required-feedback", Static).content)
-            self.assertIn("Still no authenticated provider", feedback)
+            self.assertIn("Still no provider with credentials", feedback)
 
 
 class _BindingProbeScreen(CopyEnabledScreen):

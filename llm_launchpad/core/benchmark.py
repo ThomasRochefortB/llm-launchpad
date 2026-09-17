@@ -21,6 +21,7 @@ from ..protocol.models import (
     EndpointInfo,
 )
 from .config import SETTINGS_DIR
+from .coerce import optional_float
 from .diagnostics import log_exception
 from .naming import default_llamacpp_served_model_name, default_served_model_name, slugify_instance_name
 
@@ -308,7 +309,9 @@ def build_run_summary(config: BenchmarkConfig, run_dir: Path, results: list[Benc
     best_result: BenchmarkConcurrencyResult | None = None
     best_value: float | None = None
     for result in results:
-        value = result.metrics.get("output_token_throughput")
+        if not result.success:
+            continue
+        value = optional_float(result.metrics.get("output_token_throughput"))
         if value is None:
             continue
         if best_value is None or value > best_value:
@@ -318,7 +321,7 @@ def build_run_summary(config: BenchmarkConfig, run_dir: Path, results: list[Benc
         config=config,
         run_dir=str(run_dir),
         results=results,
-        success=all(result.success for result in results),
+        success=bool(results) and all(result.success for result in results),
         best_concurrency=best_result.concurrency if best_result else None,
         best_output_token_throughput=best_value,
     )
@@ -505,14 +508,6 @@ def _first_present(mapping: dict[str, Any], keys: tuple[str, ...]) -> str:
 
 
 def _coerce_float(value: Any) -> float | None:
-    if isinstance(value, bool) or value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    text = str(value).strip().replace(",", "")
-    if not text or text.upper() == "N/A":
-        return None
-    try:
-        return float(text)
-    except ValueError:
-        return None
+    if isinstance(value, str):
+        value = value.strip().replace(",", "")
+    return optional_float(value)

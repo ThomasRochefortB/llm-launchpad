@@ -198,12 +198,24 @@ class TuiAuditStorageRefreshTests(unittest.TestCase):
         self.assertEqual(warmup.call_args.kwargs.get("api_key"), "audit-example-key")
 
     def test_modal_status_forwards_stored_endpoint_api_key(self) -> None:
+        from llm_launchpad.protocol.models import EndpointInfo
+
         app = TuiApp()
+        endpoint = EndpointInfo(
+            name="llamacpp-test",
+            app_id="ap-test",
+            backend=BackendType.LLAMACPP,
+            provider=ComputeProvider.MODAL,
+            served_model_name="test",
+            endpoint_api_key="audit-example-key",
+        )
         with patch.object(app._orchestrator, "check_status", return_value=[]) as check:
             app._run_status(
-                BackendType.LLAMACPP, "https://example.test", 60,
-                "llamacpp-test", "test", ComputeProvider.MODAL,
-                "audit-example-key", "ap-test", _MessageReceiver(),
+                endpoint,
+                "https://example.test",
+                60,
+                "llamacpp-test",
+                _MessageReceiver(),
             )
         self.assertEqual(check.call_args.kwargs.get("api_key"), "audit-example-key")
 

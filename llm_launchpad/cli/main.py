@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from ..protocol.enums import VisionMode
 from ..core.vision_probe import is_vision_probe_failure
+from ..core.warmup import StartupPhaseTimer
 
 import os
 import sys
@@ -74,6 +75,8 @@ from ..protocol.events import (
     StateChangeEvent,
 )
 from ..protocol.models import DeploymentConfig, EndpointInfo, PrimeProviderOptions, VastProviderOptions
+from .jobs import jobs_app
+from .prime import prime_disks_app
 from .vast import vast_app, vast_auth_app, print_vast_offers
 
 app = typer.Typer(
@@ -86,6 +89,8 @@ aai_auth_app = typer.Typer(help="Manage the stored Artificial Analysis API key."
 app.add_typer(aai_auth_app, name="aai-auth")
 app.add_typer(vast_auth_app, name="vast-auth")
 app.add_typer(vast_app, name="vast")
+app.add_typer(prime_disks_app, name="prime-disks")
+app.add_typer(jobs_app, name="jobs")
 
 
 def _version_callback(value: bool) -> None:
@@ -484,6 +489,11 @@ def _deploy_and_maybe_warmup(
     deploy_succeeded = False
     opencode_synced = False
     summarizer = None if debug_logs else DeployLogSummarizer(backend)
+    # Same startup-time phases as the TUI: deploy start here, warmup start +
+    # end below, so ``startup-phase <name> <seconds>`` milestone lines are
+    # available for before/after comparisons in both paths.
+    phase_timer = StartupPhaseTimer()
+    phase_timer.deploy_started()
     for event in orch.deploy(config):
         if isinstance(event, LogEvent):
             maybe_url = ModalBackend.extract_modal_web_url(event.line)
@@ -508,6 +518,9 @@ def _deploy_and_maybe_warmup(
                 opencode_synced = True
         elif isinstance(event, OperationCompleteEvent) and event.operation == OperationType.DEPLOY:
             deploy_succeeded = event.success
+            deploy_phase = phase_timer.deploy_event(event.operation)
+            if deploy_phase is not None:
+                _print_event(deploy_phase, summarizer=summarizer)
             if event.success and isinstance(event.data, EndpointInfo):
                 deployed_endpoint = event.data
                 deployed_web_url = event.data.web_url or deployed_web_url
@@ -552,6 +565,7 @@ def _deploy_and_maybe_warmup(
         )
         if config.vision is not None:
             certification_kwargs["vision"] = config.vision
+        phase_timer.warmup_started()
         warmup_events = (
             orch.warmup(
                 backend,
@@ -560,6 +574,7 @@ def _deploy_and_maybe_warmup(
                 tail_logs,
                 app_name=config.app_name,
                 served_model_name=config.served_model_name,
+                phase_timer=phase_timer,
                 **certification_kwargs,
             )
             if config.provider == ComputeProvider.MODAL
@@ -573,6 +588,7 @@ def _deploy_and_maybe_warmup(
                 provider=config.provider,
                 api_key=config.endpoint_api_key,
                 pod_id=deployed_endpoint.app_id if deployed_endpoint else None,
+                phase_timer=phase_timer,
                 **certification_kwargs,
             )
         )
@@ -900,6 +916,14 @@ def deploy(
     revision: str | None = typer.Option(None, help="llama.cpp HF revision (Modal only)"),
     server_args: str | None = typer.Option(None, help="Additional llama-server arguments"),
     n_gpu_layers: int | None = typer.Option(None, help="llama.cpp GPU layers (default: auto)"),
+    mtp: bool = typer.Option(
+        True,
+        "--mtp/--no-mtp",
+        help=(
+            "Use native MTP speculative decoding when the GGUF carries NextN "
+            "heads and the pinned llama.cpp runtime supports the architecture"
+        ),
+    ),
     model_name: str | None = typer.Option(None, help="vLLM MODEL_NAME"),
     model_revision: str | None = typer.Option(None, help="vLLM MODEL_REVISION"),
     served_model_name: str | None = typer.Option(None, help="vLLM SERVED_MODEL_NAME"),
@@ -990,6 +1014,7 @@ def deploy(
         revision=revision,
         server_args=server_args,
         n_gpu_layers=n_gpu_layers,
+        allow_speculative_decoding=mtp,
         model_name=model_name,
         model_revision=model_revision,
         served_model_name=served_model_name,
@@ -1401,7 +1426,9 @@ def stop(
     instance_name: str | None = typer.Option(None, help="Target instance name"),
     app_name: str | None = typer.Option(None, help="Target deployment name"),
 ) -> None:
-    """Stop a deployed backend app. Vast destroys the rental and its disk."""
+    """Stop a deployed backend app. Storage consequences differ by provider."""
+    from ..core.storage_resources import format_stop_preview
+
     compute_provider = ComputeProvider(provider)
     orch, username = _preflight(compute_provider)
     _print_banner()
@@ -1409,12 +1436,8 @@ def stop(
     target = _resolve_manage_target(bt, compute_provider, app_name, instance_name)
     target_app_name = target.name
     if not yes:
-        question = (
-            f"Destroy Vast rental '{target_app_name}' and permanently delete its disk?"
-            if compute_provider == ComputeProvider.VAST
-            else f"Stop deployed app '{target_app_name}'?"
-        )
-        confirmed = typer.confirm(question)
+        typer.echo(format_stop_preview(compute_provider, target_app_name))
+        confirmed = typer.confirm("Proceed?")
         if not confirmed:
             typer.echo("Aborted.")
             raise typer.Exit(code=1)
@@ -1580,6 +1603,14 @@ def switch(
     repo_id: str | None = typer.Option(None, help="HF repo id"),
     quant: str | None = typer.Option(None, help="Quant pattern"),
     revision: str | None = typer.Option(None, help="HF revision"),
+    mtp: bool = typer.Option(
+        True,
+        "--mtp/--no-mtp",
+        help=(
+            "Use native MTP speculative decoding when the GGUF carries NextN "
+            "heads and the pinned llama.cpp runtime supports the architecture"
+        ),
+    ),
     model_name: str | None = typer.Option(None, help="vLLM MODEL_NAME"),
     model_revision: str | None = typer.Option(None, help="vLLM MODEL_REVISION"),
     served_model_name: str | None = typer.Option(None, help="vLLM SERVED_MODEL_NAME"),
@@ -1652,6 +1683,7 @@ def switch(
         revision=revision,
         preload=preload,
         do_deploy=False,  # first run just switches model
+        allow_speculative_decoding=mtp,
         model_name=model_name,
         model_revision=model_revision,
         served_model_name=served_model_name,

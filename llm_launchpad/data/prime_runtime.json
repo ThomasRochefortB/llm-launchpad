@@ -20,5 +20,5 @@
     "frpc_linux_amd64_sha256": "317a17a7adac2e6bed2d7a83dc077da91ced0d110e1636373ece8ae5ac8b578b",
     "frpc_linux_arm64_sha256": "196ddaa51b716c2e99aeb2916b0a2bf55bb317494c4acdcefab36c383de950ba"
   },
-  "notes": "Launchpad bootstraps the configured upstream runtime container on Prime's default CUDA image and exposes it through Prime Tunnel. Direct HTTP remains an explicit fallback."
+  "notes": "Launchpad bootstraps the configured upstream runtime container on Prime's default CUDA image and exposes it through Prime Tunnel. Direct HTTP remains an explicit fallback. To publish an owned base image with the serving runtime preloaded (skipping the billed-time registry pull), set LLM_LAUNCHPAD_PRIME_OFFER_IMAGE (or the per-backend LLM_LAUNCHPAD_PRIME_<BACKEND>_OFFER_IMAGE); bootstrap.sh runs the tag already present in the pod's Docker store without pulling."
 }

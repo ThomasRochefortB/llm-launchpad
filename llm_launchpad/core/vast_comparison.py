@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 from functools import lru_cache
 import math
+from typing import Any
 
 from ..protocol.enums import BackendType, BillingModel, ComputeProvider, QuoteAvailability
 from ..protocol.models import InferencePlan, OfferCostBreakdown, ProviderQuote, VastModelOffer, VastOffer, VastProviderOptions, WorkloadProfile
@@ -14,6 +15,10 @@ from .quick_deploy import QuickDeployModel, QuickDeployProfile, quick_deploy_rec
 from .inference_options import estimate_monthly_compute_cost
 from .runtime_support import load_llamacpp_support_manifest
 from .vast_runtime import VAST_MAX_GPU_COUNT, VAST_MIN_COMPUTE_CAPABILITY, VAST_MIN_CUDA_VERSION
+from .vast_startup_history import (
+    load_vast_startup_history,
+    machine_startup_stats,
+)
 
 
 def vast_gpu_label(offer: VastOffer) -> str:
@@ -159,8 +164,35 @@ def vast_offers_for_model(
                 offer=offer, gpu_label=vast_gpu_label(offer), disk_gb=disk,
                 costs=costs, assessment=assessment,
             ))
-    return tuple(sorted(result, key=lambda row: (
-        row.costs.total_per_hour_usd is None,
-        row.costs.total_per_hour_usd if row.costs.total_per_hour_usd is not None else math.inf,
+    return tuple(
+        sorted(result, key=lambda row: _vast_row_sort_key(row, _cached_startup_history()))
+    )
+
+
+def _cached_startup_history() -> dict[str, Any] | None:
+    """Best-effort measured history; a corrupt file means no evidence."""
+    try:
+        return load_vast_startup_history()
+    except Exception:
+        return None
+
+
+def _vast_row_sort_key(
+    row: VastModelOffer, history: dict[str, Any] | None
+) -> tuple[int, float, int, float, str]:
+    """Price first, measured startup second: keep the cheapest-host default.
+
+    A machine with a recent successful observation sorts ahead of an
+    unmeasured one at the *same* price, so evidence moves the needle without
+    ever spending more than the cheapest tier. ``inet_down`` stays out of the
+    ranking entirely: advertised bandwidth predicts startup poorly.
+    """
+    price = row.costs.total_per_hour_usd
+    stats = machine_startup_stats(history, row.offer.machine_id or "")
+    return (
+        price is None,
+        price if price is not None else math.inf,
+        0 if stats is not None else 1,
+        stats["healthy_seconds"] if stats is not None else 0.0,
         row.id,
-    )))
+    )

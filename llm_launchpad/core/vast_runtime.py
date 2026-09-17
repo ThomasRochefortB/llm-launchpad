@@ -38,6 +38,35 @@ GPU_INVENTORY_COMMAND = (
     "--format=csv,noheader,nounits"
 )
 
+# What a starting runtime is doing, in one round trip. Weights land as partial
+# files -- llama.cpp writes ``.downloadInProgress`` and the Hugging Face hub
+# writes ``.incomplete`` -- so their combined size is the download's own
+# progress meter, and it is readable while the server log stays empty. Both
+# runtimes keep every cache under VAST_RUNTIME_DIR, so one scan covers them.
+VAST_STARTUP_PROBE_COMMAND = rf"""
+cd {VAST_RUNTIME_DIR} 2>/dev/null || exit 0
+find . \( -name '*.downloadInProgress' -o -name '*.incomplete' \) -printf '%s\n' 2>/dev/null | awk '{{ total += $1 }} END {{ printf "BYTES %d\n", total }}'
+tail -c 4000 server.log 2>/dev/null | tr '\r' '\n' | grep -v '^[[:space:]]*$' | tail -n 1 | cut -c1-140 | sed 's|^|LOG |'
+"""
+
+
+def parse_startup_probe(output: str) -> tuple[int, str]:
+    """Return partial-download bytes and the last server log line.
+
+    Never raises: this reports on a rental that is already billing, and a
+    probe that cannot be read is a reason to say less, not to end the deploy.
+    """
+    downloaded, last = 0, ""
+    for line in output.splitlines():
+        if line.startswith("BYTES "):
+            try:
+                downloaded = max(0, int(line[6:].strip()))
+            except ValueError:
+                downloaded = 0
+        elif line.startswith("LOG "):
+            last = "".join(char for char in line[4:] if char.isprintable()).strip()
+    return downloaded, last
+
 
 @dataclass(frozen=True)
 class GpuDevice:
@@ -218,6 +247,9 @@ def vast_runtime_script(config: DeploymentConfig) -> str:
     arguments = [
         "/app/llama-server", "--hf-repo", f"{config.repo_id}:{config.quant}",
         *shlex.split(config.server_args or ""),
+        # Serve /metrics so the fleet can read tokens and throughput off the
+        # runtime itself, as Modal already does.
+        "--metrics",
         "--host", "127.0.0.1", "--port", "8000",
         "--alias", config.served_model_name or "model",
     ]

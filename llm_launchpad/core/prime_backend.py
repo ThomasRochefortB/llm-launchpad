@@ -12,12 +12,13 @@ import re
 import shlex
 import subprocess
 from typing import Any
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 
 import requests
 
 from ..protocol.enums import BackendType, ComputeProvider, QuoteAvailability
 from ..protocol.models import ComputeOffer, DeploymentConfig, EndpointInfo
+from .deploy_log_summary import is_error_like
 from .config import SETTINGS_DIR
 from .coerce import optional_float
 from .diagnostics import log_exception
@@ -83,8 +84,11 @@ def default_prime_container_image(backend: BackendType) -> str:
 def preferred_prime_offer_image(backend: BackendType) -> str:
     """Return the Prime base image required by the portable runtime."""
 
+    backend_env = f"LLM_LAUNCHPAD_PRIME_{backend.value.upper()}_OFFER_IMAGE"
     return (
-        str(prime_runtime(backend).get("bootstrap_base_image") or "").strip()
+        os.getenv(backend_env, "").strip()
+        or os.getenv("LLM_LAUNCHPAD_PRIME_OFFER_IMAGE", "").strip()
+        or str(prime_runtime(backend).get("bootstrap_base_image") or "").strip()
         or PRIME_DEFAULT_BOOTSTRAP_IMAGE
     )
 
@@ -121,6 +125,20 @@ PRIME_TUNNEL_LABEL = "llm-launchpad"
 PRIME_TUNNEL_PID_PATH = f"{PRIME_RUNTIME_ROOT}/tunnel.pid"
 PRIME_TUNNEL_LOG_PATH = f"{PRIME_RUNTIME_ROOT}/tunnel.log"
 PRIME_BOOTSTRAP_SSH_KEY_NAME = "llm-launchpad-bootstrap"
+
+
+LLAMACPP_FIT_LOG_VERBOSITY = 4
+
+
+# cmake prints "[ 45%] Building CXX object ..." as it compiles; docker build
+# prefixes each line with its step number, so the marker is matched anywhere.
+_CMAKE_PERCENT_RE = re.compile(r"\[\s*(\d{1,3})%\]")
+
+
+def _gigabytes(byte_count: int) -> str:
+    """Format a byte count in decimal GB, the unit model weights are quoted in."""
+
+    return f"{byte_count / 1000**3:.1f}"
 
 
 def _llamacpp_fit_relevant_args(arguments: list[str]) -> list[str]:
@@ -539,6 +557,12 @@ def select_prime_offer(
         match = next((row for row in rows if row.id.casefold() == offer_id.strip().casefold()), None)
         if match is None:
             raise ValueError(f"Prime offer not found: {offer_id}")
+        if gpu_type and match.gpu_type.casefold() != gpu_type.casefold():
+            raise ValueError(f"Prime offer {offer_id} does not match the requested GPU type.")
+        if gpu_count is not None and match.gpu_count != gpu_count:
+            raise ValueError(f"Prime offer {offer_id} does not match the requested GPU count.")
+        if region and not prime_offer_matches_location(match, region):
+            raise ValueError(f"Prime offer {offer_id} does not match the requested region.")
         if not is_prime_gpu_offer(match):
             raise ValueError(f"Prime offer {offer_id} is not a GPU instance.")
         if not prime_offer_satisfies_vram(match, required_vram_gb):
@@ -593,6 +617,37 @@ def select_prime_offer(
     )
 
 
+# llama.cpp prefixes its own warnings with a W level and a "warn:" note, and
+# both carry words an error match would accept.
+_RUNTIME_WARNING_RE = re.compile(r"^\s*(warn(ing)?[: ]|\S+\s+W\s)", re.IGNORECASE)
+
+
+def runtime_failure_detail(logs: Sequence[str], fallback: str) -> str:
+    """Pick the line that explains a dead runtime, not the one printed last.
+
+    A restarting container's tail ends with the *next* attempt's opening
+    lines, so taking the last line reports whatever the runtime happens to
+    say first. llama.cpp opens with a harmless note that LLAMA_ARG_HOST will
+    be overwritten by --host, and that is exactly what a live H200 deploy
+    reported as its cause of death -- while the real one, "failed to resolve
+    commit for unsloth/Qwen3.8-27B-GGUF" after the container could not reach
+    huggingface.co, sat a few lines above it and never reached the user.
+    Prefer the first line that reads like a failure, and never a warning: the
+    first error is the cause and the ones after it are its consequences. In
+    that same deploy the tail ended with "failed to load model", which is only
+    what happens once the download it depended on has already failed.
+    """
+    candidates = [line.strip() for line in logs if line and line.strip()]
+    if not candidates:
+        return fallback
+    for line in candidates:
+        if _RUNTIME_WARNING_RE.search(line):
+            continue
+        if is_error_like(line):
+            return line
+    return candidates[-1]
+
+
 class PrimeBackend:
     """Small requests-based client compatible with Prime CLI authentication state."""
 
@@ -607,6 +662,9 @@ class PrimeBackend:
         self.session = session or requests.Session()
         self.timeout = timeout
         self.ssh_private_key_path = ssh_private_key_path or PRIME_BOOTSTRAP_SSH_KEY_PATH
+        # Last byte count seen per pod, so a poll can tell a download that is
+        # still moving from one that has finished.
+        self._runtime_byte_samples: dict[str, int] = {}
 
     def preflight(self) -> tuple[bool, str]:
         if not self.config.api_key:
@@ -882,6 +940,39 @@ class PrimeBackend:
         if not isinstance(payload, dict):
             raise PrimeApiError("Prime disk response was not an object.")
         return payload
+
+    def list_disks(self) -> list[dict[str, Any]]:
+        """Return every persistent disk on the account, across pages.
+
+        The account is the authority on what is billing. Local state records
+        only the disks Launchpad created and still remembers, and it is
+        dropped on several paths -- a create that never became ready, a
+        forgotten entry after a failed attach -- so a disk can outlive the
+        record of it and keep costing money with nothing naming it.
+        """
+        rows: list[dict[str, Any]] = []
+        offset = 0
+        limit = 100
+        while True:
+            payload = self._request("GET", "/disks", params={"offset": offset, "limit": limit})
+            page_rows = payload.get("data", []) if isinstance(payload, dict) else []
+            rows.extend(row for row in page_rows if isinstance(row, dict))
+            # A missing or unreadable total is not "one page and done": callers
+            # forget local records for disks this list omits, so stopping early
+            # drops the record of a disk that is still billing. Keep paging
+            # until a short page proves the end, and treat a null count the
+            # same way rather than crashing on int(None).
+            total = (
+                optional_float(
+                    payload.get("total_count", payload.get("totalCount"))
+                )
+                if isinstance(payload, dict)
+                else None
+            )
+            offset += len(page_rows)
+            if len(page_rows) < limit or (total is not None and offset >= total):
+                break
+        return rows
 
     def delete_disk(self, disk_id: str) -> None:
         """Permanently terminate one persistent disk."""
@@ -1354,6 +1445,9 @@ class PrimeBackend:
             llama_args.extend(
                 [
                     *shlex.split(config.server_args or ""),
+                    # Serve /metrics so the fleet can read tokens and
+                    # throughput off the runtime itself, as Modal already does.
+                    "--metrics",
                     "--host",
                     "0.0.0.0",
                     "--port",
@@ -1367,6 +1461,12 @@ class PrimeBackend:
                 "/app/llama-fit-params",
                 "--hf-repo",
                 hf_repo,
+                # Trace level: llama.cpp logs the projected-versus-free
+                # arithmetic there, and without it a rejected plan leaves only
+                # the guard it aborted at, which says nothing about how much
+                # memory was missing.
+                "--verbosity",
+                str(LLAMACPP_FIT_LOG_VERBOSITY),
                 *_llamacpp_fit_relevant_args(server_extra_args),
             ]
             attestation_marker = (
@@ -1419,10 +1519,23 @@ class PrimeBackend:
     @staticmethod
     def _bootstrap_script(config: DeploymentConfig, launch: PrimeLaunchSpec) -> str:
         docker_command = PrimeBackend._bootstrap_docker_command(config, launch)
-        prepare_image = f"docker pull {shlex.quote(launch.container_image)}"
+        # An owned base image (or any pod whose Docker store already carries
+        # the serving tag) skips the registry pull entirely: the pull is the
+        # dominant billed-time cost on Prime, and on branded base images the
+        # Docker daemon arrives with the image rather than being installed
+        # during boot (the 180s wait loop below still covers stock images).
+        prepare_image = (
+            f"if docker image inspect {shlex.quote(launch.container_image)} "
+            f">/dev/null 2>&1; then echo 'Serving image already present; "
+            f"skipping pull'; else docker pull {shlex.quote(launch.container_image)}; fi"
+        )
         if launch.build_recipe:
+            # Source builds compile on billed GPU time, so use every CPU the
+            # pod has rather than a fixed small job count.
+            jobs = os.cpu_count() or 4
             cuda_arch = llamacpp_cuda_architecture(config.gpu_type)
             build_flags = f"--build-arg CUDA_ARCHITECTURES={cuda_arch} " if cuda_arch else ""
+            build_flags += f"--build-arg BUILD_JOBS={jobs} "
             prepare_image = (
                 f"docker build -t {shlex.quote(launch.container_image)} "
                 f"{build_flags}- < {PRIME_RUNTIME_ROOT}/runtime.dockerfile"
@@ -1710,11 +1823,27 @@ class PrimeBackend:
 
     @staticmethod
     def _expected_model_bytes(config: DeploymentConfig) -> int:
-        """Best-effort download size used for Prime model-load percentages."""
-        gb = config.required_vram_gb
-        if gb is None or gb <= 0:
+        """Bytes the pod will actually download, for model-load percentages.
+
+        This used to be ``required_vram_gb``, which is the whole serving plan:
+        weights plus KV cache plus compute buffers plus reserve. The pod only
+        ever downloads the weights, so the percentage was scaled against a
+        number a third larger than the thing being measured -- a finished
+        download read as about 75%, and since completion is detected at 98%
+        of expected, it never read as finished at all. It sat at three
+        quarters for the whole of the model load.
+
+        The planner already knows the weight size; use that, and when it is
+        unavailable report nothing rather than a percentage that cannot reach
+        its own end. A wait with no percentage still reports elapsed time.
+        """
+
+        assessment = config.placement_assessment
+        memory = getattr(assessment, "memory", None)
+        weights_gb = getattr(memory, "weights_gb", None)
+        if not weights_gb or weights_gb <= 0:
             return 0
-        return int(float(gb) * (1000**3))
+        return int(float(weights_gb) * (1000**3))
 
     @staticmethod
     def _parse_docker_byte_count(value: str) -> int | None:
@@ -1783,6 +1912,7 @@ class PrimeBackend:
         network: str,
         cache_bytes: int,
         expected_bytes: int,
+        growing: bool | None = None,
     ) -> str:
         """Describe model download/load using cache bytes when a size is known."""
         downloaded = max(0, cache_bytes)
@@ -1791,9 +1921,26 @@ class PrimeBackend:
         if downloaded <= 0 and rx_bytes:
             downloaded = rx_bytes
         download_complete = expected_bytes > 0 and downloaded >= int(expected_bytes * 0.98)
-        if expected_bytes > 0 and downloaded > 0 and not download_complete:
-            percent = max(0, min(99, int(downloaded * 100 / expected_bytes)))
-            return f"runtime container is downloading the model ({percent}%)"
+        if downloaded > 0 and not download_complete:
+            # The percentage keeps its own parentheses: the summary reads it
+            # back with a "(N%)" pattern and would miss one followed by a
+            # comma.
+            if expected_bytes > 0:
+                percent = max(0, min(99, int(downloaded * 100 / expected_bytes)))
+                return (
+                    f"runtime container is downloading the model ({percent}%), "
+                    f"{_gigabytes(downloaded)} of {_gigabytes(expected_bytes)} GB"
+                )
+            # Without a planner estimate there is no percentage to give. A
+            # byte count still beats a bare "loading the model", but only
+            # once the count is known to be moving: the network counter holds
+            # its final value while the weights load into VRAM, and calling
+            # that a download would leave the step stuck there.
+            if growing:
+                return (
+                    "runtime container is downloading the model, "
+                    f"{_gigabytes(downloaded)} GB so far"
+                )
         if network.strip():
             return f"runtime container is loading the model (network {network.strip()})"
         return "runtime container is loading the model"
@@ -1833,7 +1980,7 @@ class PrimeBackend:
             restart_count = 0
         if container_state == "restarting" or restart_count > 0:
             logs = self.bootstrap_runtime_logs(pod, tail=30)
-            detail = logs[-1] if logs else f"last exit code {exit_code}"
+            detail = runtime_failure_detail(logs, f"last exit code {exit_code}")
             return (
                 False,
                 True,
@@ -1841,8 +1988,9 @@ class PrimeBackend:
             )
         if container_state in {"exited", "dead", "removing"}:
             logs = self.bootstrap_runtime_logs(pod, tail=30)
-            detail = logs[-1] if logs else (
-                f"runtime container is {container_state} (exit code {exit_code})"
+            detail = runtime_failure_detail(
+                logs,
+                f"runtime container is {container_state} (exit code {exit_code})",
             )
             return False, True, detail
         if container_state == "running":
@@ -1851,10 +1999,17 @@ class PrimeBackend:
                 (
                     "docker stats --no-stream --format='{{.NetIO}}' "
                     f"{PRIME_RUNTIME_CONTAINER_NAME}; "
+                    # No awk here on purpose. The program has to survive two
+                    # shells -- this one and the container's -- and an
+                    # unescaped "$1" inside the inner double quotes was being
+                    # expanded to nothing, so awk saw "{s+=}" and exited on a
+                    # syntax error. The cache size came back empty on every
+                    # poll, leaving docker's network counter as the only
+                    # measure of a download. "du -c" totals the paths itself.
                     f"echo CACHE:$(docker exec {PRIME_RUNTIME_CONTAINER_NAME} sh -lc "
-                    "'du -sb /root/.cache/huggingface /root/.cache/llama.cpp "
-                    "/data/huggingface /data/llama.cpp 2>/dev/null | "
-                    "awk \"{s+=$1} END {print s+0}\"'); "
+                    "'du -scb /root/.cache/huggingface /root/.cache/llama.cpp "
+                    "/data/huggingface /data/llama.cpp 2>/dev/null "
+                    "| tail -n1 | cut -f1' 2>/dev/null || echo 0); "
                     f"echo EXPECTED:$(cat {PRIME_RUNTIME_ROOT}/expected-bytes "
                     "2>/dev/null || echo 0)"
                 ),
@@ -1871,18 +2026,91 @@ class PrimeBackend:
                 network=network,
                 cache_bytes=cache_bytes,
                 expected_bytes=expected_bytes,
+                growing=self._runtime_bytes_growing(pod, cache_bytes, network),
             )
 
-        bootstrap_exit = self._run_privileged_ssh(
+        # One round trip for the exit status, the image kind and the build
+        # log: this runs every five seconds against a pod that may be busy
+        # compiling, so the image progress rides along with the status read
+        # rather than opening a connection of its own.
+        bootstrap = self._run_privileged_ssh(
             pod,
-            f"cat {PRIME_RUNTIME_ROOT}/bootstrap.exit",
+            (
+                f"echo EXIT:$(cat {PRIME_RUNTIME_ROOT}/bootstrap.exit 2>/dev/null); "
+                f"test -f {PRIME_RUNTIME_ROOT}/runtime.dockerfile "
+                "&& echo KIND:build || echo KIND:pull; "
+                f"tail -n 40 {PRIME_RUNTIME_ROOT}/bootstrap.log 2>/dev/null"
+            ),
             timeout=20,
         )
-        if bootstrap_exit.returncode == 0 and bootstrap_exit.stdout.strip() not in {"", "0"}:
+        if bootstrap.returncode != 0:
+            return False, False, "pulling the runtime image"
+        exit_status, building, percent = self._parse_runtime_image_progress(
+            bootstrap.stdout or ""
+        )
+        if exit_status not in {"", "0"}:
             logs = self.bootstrap_runtime_logs(pod, tail=30)
             detail = logs[-1] if logs else "runtime bootstrap failed"
             return False, True, detail
-        return False, False, "pulling the runtime image"
+        if not building:
+            return False, False, "pulling the runtime image"
+        if percent is None:
+            return False, False, "building the runtime image from source"
+        return False, False, f"building the runtime image from source ({percent}%)"
+
+    @staticmethod
+    def _parse_runtime_image_progress(stdout: str) -> tuple[str, bool, int | None]:
+        """Return the bootstrap exit status, whether it builds, and its percent.
+
+        An architecture served by a source build compiles llama.cpp with CUDA
+        on the pod, which takes far longer than a pull. Reporting both as
+        "pulling the runtime image" left a long compile looking like a stalled
+        download. The dockerfile staged beside the bootstrap script is what
+        distinguishes them, and cmake's own percentage is in the build log.
+        """
+
+        exit_status = ""
+        building = False
+        percent: int | None = None
+        for raw_line in (stdout or "").splitlines():
+            line = raw_line.strip()
+            if line.startswith("EXIT:"):
+                exit_status = line.split(":", 1)[1].strip()
+                continue
+            if line.startswith("KIND:"):
+                building = line.split(":", 1)[1].strip() == "build"
+                continue
+            match = _CMAKE_PERCENT_RE.search(line)
+            if match:
+                try:
+                    percent = max(0, min(99, int(match.group(1))))
+                except ValueError:
+                    percent = None
+        return exit_status, building, percent
+
+    def _runtime_bytes_growing(
+        self,
+        pod: dict[str, Any],
+        cache_bytes: int,
+        network: str,
+    ) -> bool | None:
+        """Return whether the pod has pulled more bytes since the last poll.
+
+        ``None`` on the first sample, when there is nothing to compare against.
+        """
+
+        observed = max(0, cache_bytes)
+        if observed <= 0:
+            rx = PrimeBackend._parse_docker_byte_count(
+                (network or "").split("/", 1)[0].strip()
+            )
+            observed = rx or 0
+        key = str(pod.get("id") or pod.get("name") or "")
+        previous = self._runtime_byte_samples.get(key)
+        self._runtime_byte_samples[key] = observed
+        if previous is None:
+            return None
+        return observed > previous
 
     def bootstrap_runtime_logs(self, pod: dict[str, Any], tail: int = 200) -> list[str]:
         """Read portable runtime logs over SSH without exposing env files."""
