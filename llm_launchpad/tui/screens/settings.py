@@ -20,6 +20,8 @@ from ..visual import (
 )
 from ..widgets.input_form import FormField, ToggleField
 from ..widgets.fitted_footer import FittedFooter
+from ..mouse import default_tui_mouse_enabled
+from ..navigation import move_focus_with_arrows
 from .copy_enabled import CopyEnabledScreen
 
 
@@ -31,6 +33,13 @@ class SettingsScreen(CopyEnabledScreen):
     BINDINGS = [
         Binding("escape", "pop_screen", "Back", show=True),
         Binding("ctrl+s", "save", "Save", show=True),
+        # This form had no arrow navigation at all: focus started in an input
+        # and the arrows moved nothing, so every control below it was reachable
+        # only by tab. That is a modifier-bar item on a phone keyboard, which
+        # is where this screen matters most -- it is where mouse support is
+        # turned on when taps are being ignored.
+        Binding("up", "focus_previous_control", "Previous", show=False, priority=True),
+        Binding("down", "focus_next_control", "Next", show=False, priority=True),
     ]
     _UNSAVED_DISCARD_WINDOW_SECONDS = 6.0
 
@@ -62,33 +71,38 @@ class SettingsScreen(CopyEnabledScreen):
                     hint="Seconds before idle containers scale down",
                 )
                 yield Static("[bold]Appearance[/bold]", classes="settings-section")
-                yield Static("Theme", classes="form-label")
-                yield Select(
-                    TUI_THEME_OPTIONS,
-                    value=normalize_tui_theme(settings.tui_theme),
-                    allow_blank=False,
-                    id="tui-theme",
-                )
-                yield Static(
-                    "[dim]Dark, high-contrast, and low-color terminal palettes.[/dim]",
-                    classes="form-hint",
-                )
-                yield Static("Density", classes="form-label")
-                yield Select(
-                    TUI_DENSITY_OPTIONS,
-                    value=normalize_tui_density(settings.tui_density),
-                    allow_blank=False,
-                    id="tui-density",
-                )
-                yield Static(
-                    "[dim]Compact density reduces spacing without hiding content.[/dim]",
-                    classes="form-hint",
-                )
+                with Horizontal(id="settings-appearance-row"):
+                    with Vertical(classes="settings-appearance-control"):
+                        yield Static("Theme", classes="form-label")
+                        yield Select(
+                            TUI_THEME_OPTIONS,
+                            value=normalize_tui_theme(settings.tui_theme),
+                            allow_blank=False,
+                            id="tui-theme",
+                        )
+                        yield Static("[dim]Color palette[/dim]", classes="form-hint")
+                    with Vertical(classes="settings-appearance-control"):
+                        yield Static("Density", classes="form-label")
+                        yield Select(
+                            TUI_DENSITY_OPTIONS,
+                            value=normalize_tui_density(settings.tui_density),
+                            allow_blank=False,
+                            id="tui-density",
+                        )
+                        yield Static("[dim]Spacing[/dim]", classes="form-hint")
                 yield Static("[bold]Behavior[/bold]", classes="settings-section")
                 yield ToggleField(
                     "Enable mouse support",
                     "tui-mouse",
-                    default=True if settings.tui_mouse is None else settings.tui_mouse,
+                    # Unset does not mean on: over SSH the default resolves to
+                    # off so the terminal keeps its own selection. Showing a
+                    # flat True told an SSH user that clicks were enabled while
+                    # the app was ignoring every one of them.
+                    default=(
+                        settings.tui_mouse
+                        if settings.tui_mouse is not None
+                        else default_tui_mouse_enabled()
+                    ),
                 )
                 yield Static(
                     "[dim]Off enables native terminal text selection and copy shortcuts; "
@@ -224,6 +238,12 @@ class SettingsScreen(CopyEnabledScreen):
         ):
             set_mouse_mode(settings.tui_mouse)
         self.app._confirm_quit = settings.confirm_quit
+
+    def action_focus_next_control(self) -> None:
+        move_focus_with_arrows(self, 1)
+
+    def action_focus_previous_control(self) -> None:
+        move_focus_with_arrows(self, -1)
 
     def action_pop_screen(self) -> None:
         if self._dirty and not self._discard_confirmed():

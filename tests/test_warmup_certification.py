@@ -7,8 +7,11 @@ from unittest.mock import patch
 
 from llm_launchpad.core.orchestrator import Orchestrator
 from llm_launchpad.core.warmup import (
+    StartupPhaseTimer,
     _calibration_is_acceptable,
     extract_effective_context,
+    parse_startup_phase_line,
+    startup_phase_summary_line,
 )
 from llm_launchpad.protocol.enums import (
     BackendType,
@@ -17,7 +20,11 @@ from llm_launchpad.protocol.enums import (
     OperationType,
     ServingObjective,
 )
-from llm_launchpad.protocol.events import OperationCompleteEvent, StateChangeEvent
+from llm_launchpad.protocol.events import (
+    LogEvent,
+    OperationCompleteEvent,
+    StateChangeEvent,
+)
 from llm_launchpad.protocol.models import (
     MemoryEstimate,
     PerformancePoint,
@@ -218,6 +225,88 @@ class WarmupCertificationTests(unittest.TestCase):
 
         self.assertFalse(accepted)
         self.assertIn("no stable requests", detail)
+
+
+class StartupPhaseLineTests(unittest.TestCase):
+    def test_phase_line_round_trips(self) -> None:
+        line = startup_phase_summary_line("deploy", 12.34)
+        self.assertEqual(line, "startup-phase deploy 12.3s")
+        self.assertEqual(parse_startup_phase_line(line), ("deploy", 12.3))
+
+    def test_phase_line_rejects_unknown_names_and_noise(self) -> None:
+        self.assertIsNone(parse_startup_phase_line("Server is ready!"))
+        self.assertIsNone(parse_startup_phase_line("startup-phase frobnicate 1.0s"))
+        self.assertIsNone(parse_startup_phase_line("startup-phase deploy nope"))
+
+
+class StartupPhaseTimerTests(unittest.TestCase):
+    def _events(self, **kwargs: object) -> list:
+        requirements = ServingRequirements(context_tokens=131_072)
+        fake_requests = types.SimpleNamespace(
+            post=lambda *_args, **_kwargs: _Response(
+                200,
+                {"choices": [{"text": "ok"}]},
+            ),
+            get=lambda *_args, **_kwargs: _Response(
+                200,
+                {"default_generation_settings": {"n_ctx": 131_072}},
+            ),
+        )
+        with (
+            patch.dict("sys.modules", {"requests": fake_requests}),
+            patch(
+                "llm_launchpad.core.warmup.shutdown_event",
+                return_value=types.SimpleNamespace(wait=lambda **_kwargs: False),
+            ),
+            patch(
+                "llm_launchpad.core.warmup._calibrate_endpoint",
+                return_value=_performance(),
+            ),
+            patch("llm_launchpad.core.warmup.save_runtime_attestation"),
+            patch(
+                "llm_launchpad.core.warmup.ModalBackend.test_curl_command",
+                return_value="curl ok",
+            ),
+        ):
+            return list(
+                Orchestrator().warmup(
+                    backend=BackendType.LLAMACPP,
+                    server_url="https://example.modal.run",
+                    timeout=10,
+                    tail_logs=False,
+                    serving_requirements=requirements,
+                    placement_assessment=_assessment(),
+                    runtime_id="llama.cpp-b10689-cuda12",
+                    **kwargs,  # type: ignore[arg-type]
+                )
+            )
+
+    def test_warmup_emits_phase_lines_with_timer(self) -> None:
+        timer = StartupPhaseTimer()
+        timer.deploy_started()
+        timer.warmup_started()
+        events = self._events(phase_timer=timer)
+        completion = next(
+            event
+            for event in events
+            if isinstance(event, OperationCompleteEvent)
+            and event.operation == OperationType.WARMUP
+        )
+        self.assertTrue(completion.success)
+        parsed = [
+            parse_startup_phase_line(event.line)
+            for event in events
+            if isinstance(event, LogEvent)
+        ]
+        names = {row[0] for row in parsed if row is not None}
+        self.assertEqual(names, {"warmup-wait", "calibration", "total"})
+
+    def test_warmup_without_timer_emits_no_phase_lines(self) -> None:
+        events = self._events()
+        lines = [
+            event.line for event in events if isinstance(event, LogEvent)
+        ]
+        self.assertFalse(any("startup-phase" in line for line in lines))
 
 
 if __name__ == "__main__":

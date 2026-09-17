@@ -407,6 +407,43 @@ class CliMainCommandTests(unittest.TestCase):
             ),
         )
 
+    def test_deploy_llamacpp_allows_mtp_by_default_and_honours_no_mtp(self) -> None:
+        """MTP is resolved in preflight, so the CLI only has to not forbid it."""
+
+        captured = {}
+
+        def _deploy(config):  # type: ignore[no-untyped-def]
+            captured.setdefault("configs", []).append(config)
+            return [
+                OperationCompleteEvent(
+                    operation=OperationType.DEPLOY,
+                    success=True,
+                    exit_code=0,
+                )
+            ]
+
+        orch = SimpleNamespace(deploy=_deploy)
+        base = [
+            "deploy",
+            "--backend",
+            "llamacpp",
+            "--repo-id",
+            "org/Model-GGUF",
+            "--quant",
+            "Q4_K_M",
+        ]
+        with (
+            patch("llm_launchpad.cli.main._preflight", return_value=(orch, "alice")),
+            patch("llm_launchpad.cli.main._print_banner", return_value=None),
+        ):
+            default = self.runner.invoke(cli_main.app, base)
+            declined = self.runner.invoke(cli_main.app, [*base, "--no-mtp"])
+
+        self.assertEqual(default.exit_code, 0, default.output)
+        self.assertEqual(declined.exit_code, 0, declined.output)
+        self.assertTrue(captured["configs"][0].allow_speculative_decoding)
+        self.assertFalse(captured["configs"][1].allow_speculative_decoding)
+
     def test_deploy_prime_llamacpp_requires_repo_id(self) -> None:
         orch = SimpleNamespace(deploy=lambda _config: [])
         with (
@@ -442,6 +479,7 @@ class CliMainCommandTests(unittest.TestCase):
             _tail_logs: bool,
             app_name: str | None = None,
             served_model_name: str | None = None,
+            phase_timer: object = None,
         ):
             warmup_calls.append(url)
             return []
@@ -587,6 +625,7 @@ class CliMainCommandTests(unittest.TestCase):
             _tail_logs: bool,
             app_name: str | None = None,
             served_model_name: str | None = None,
+            phase_timer: object = None,
         ):
             warmup_calls.append(url)
             return []
@@ -660,6 +699,7 @@ class CliMainCommandTests(unittest.TestCase):
             tail_logs: bool,
             app_name: str | None = None,
             served_model_name: str | None = None,
+            phase_timer: object = None,
         ):
             calls.append((backend, url, timeout, tail_logs, app_name))
             return []

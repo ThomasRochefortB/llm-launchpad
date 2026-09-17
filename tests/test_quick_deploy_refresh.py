@@ -16,6 +16,7 @@ from llm_launchpad.core.gguf_metadata import GgufMtpCapability, GgufMtpStatus
 from llm_launchpad.core.hf_models import GgufQuantMetadata, ModelCandidate
 from llm_launchpad.core.modal_gpu import ModalGpuSpec
 from llm_launchpad.core.quick_deploy import QuickDeployProfile
+from llm_launchpad.protocol.enums import SpeculativeDecodingMethod
 from llm_launchpad.core.artificial_analysis import (
     AAModelCandidate,
     _AARankings,
@@ -132,7 +133,11 @@ class QuickDeployRefreshTests(unittest.TestCase):
             ModalGpuSpec("B200", 5.0),
         ]
 
-        def matched_repo(candidate: AAModelCandidate, _api: object) -> str | None:
+        def matched_repo(
+            candidate: AAModelCandidate,
+            _api: object,
+            _budget: object = None,
+        ) -> str | None:
             if candidate.name.startswith("Closed"):
                 return None
             return f"unsloth/{candidate.name.replace(' ', '-')}-GGUF"
@@ -201,7 +206,11 @@ class QuickDeployRefreshTests(unittest.TestCase):
         )
         gpu_catalog = [ModalGpuSpec("L4", 0.5)]
 
-        def matched_repo(candidate: AAModelCandidate, _api: object) -> str:
+        def matched_repo(
+            candidate: AAModelCandidate,
+            _api: object,
+            _budget: object = None,
+        ) -> str:
             return f"unsloth/{candidate.name.replace(' ', '-')}-GGUF"
 
         with patch(
@@ -217,14 +226,14 @@ class QuickDeployRefreshTests(unittest.TestCase):
             "llm_launchpad.core.quick_deploy_refresh.fetch_gguf_quant_metadata",
             return_value=metadata,
         ):
-            _info, profiles = build_live_quick_deploy_catalog(model_limit=2)
+            _info, profiles = build_live_quick_deploy_catalog(model_limit=2, overall_model_limit=0)
 
         self.assertEqual(
             _ordered_unique_names(profiles),
             ["Open Model 1 8B", "Open Model 2 8B"],
         )
 
-    def test_live_catalog_selects_top_models_in_each_size_bucket(self) -> None:
+    def test_live_catalog_includes_overall_top_ten_and_each_size_shortlist(self) -> None:
         candidates: list[AAModelCandidate] = []
         rank = 1
         for parameter_count_b, prefix in (
@@ -250,7 +259,11 @@ class QuickDeployRefreshTests(unittest.TestCase):
         )
         gpu_catalog = [ModalGpuSpec("L4", 0.5)]
 
-        def matched_repo(candidate: AAModelCandidate, _api: object) -> str:
+        def matched_repo(
+            candidate: AAModelCandidate,
+            _api: object,
+            _budget: object = None,
+        ) -> str:
             return f"unsloth/{candidate.name.replace(' ', '-')}-GGUF"
 
         with patch(
@@ -280,6 +293,8 @@ class QuickDeployRefreshTests(unittest.TestCase):
                 "Large Model 1 300B",
                 "Large Model 2 300B",
                 "Large Model 3 300B",
+                "Compact Model 4 8B",
+                "Medium Model 4 70B",
             ],
         )
 
@@ -309,7 +324,11 @@ class QuickDeployRefreshTests(unittest.TestCase):
         )
         gpu_catalog = [ModalGpuSpec("L4", 0.5)]
 
-        def matched_repo(candidate: AAModelCandidate, _api: object) -> str:
+        def matched_repo(
+            candidate: AAModelCandidate,
+            _api: object,
+            _budget: object = None,
+        ) -> str:
             return f"unsloth/{candidate.name.replace(' ', '-')}-GGUF"
 
         with patch(
@@ -328,10 +347,11 @@ class QuickDeployRefreshTests(unittest.TestCase):
             _info, profiles = build_live_quick_deploy_catalog()
 
         names = _ordered_unique_names(profiles)
-        self.assertEqual(len(names), 9)
+        self.assertEqual(len(names), 16)
         self.assertEqual(names[:3], [f"Compact Model {index} 8B" for index in range(1, 4)])
         self.assertEqual(names[3:6], [f"Medium Model {index} 70B" for index in range(1, 4)])
-        self.assertEqual(names[6:], [f"Large Model {index} 300B" for index in range(1, 4)])
+        self.assertEqual(names[6:9], [f"Large Model {index} 300B" for index in range(1, 4)])
+        self.assertEqual(names[9:], [f"Compact Model {index} 8B" for index in range(4, 11)])
 
     def test_live_catalog_deduplicates_variants_sharing_a_gguf_repo(self) -> None:
         candidates = (
@@ -347,7 +367,11 @@ class QuickDeployRefreshTests(unittest.TestCase):
         )
         gpu_catalog = [ModalGpuSpec("L4", 0.5)]
 
-        def matched_repo(candidate: AAModelCandidate, _api: object) -> str:
+        def matched_repo(
+            candidate: AAModelCandidate,
+            _api: object,
+            _budget: object = None,
+        ) -> str:
             if "One" in candidate.name:
                 return "unsloth/Open-Model-One-GGUF"
             return f"unsloth/{candidate.name.replace(' ', '-')}-GGUF"
@@ -395,7 +419,7 @@ class QuickDeployRefreshTests(unittest.TestCase):
         with (
             patch("llm_launchpad.core.quick_deploy_refresh._AA_RESOLUTION_WORKERS", 2),
             patch("llm_launchpad.core.quick_deploy_refresh._find_unsloth_gguf_match",
-                  side_effect=lambda candidate, api: f"unsloth/{candidate.slug}-GGUF") as match,
+                  side_effect=lambda candidate, api, budget=None: f"unsloth/{candidate.slug}-GGUF") as match,
             patch("llm_launchpad.core.quick_deploy_refresh._fetch_serving_metadata", return_value=metadata),
         ):
             profiles = _profiles_from_aa_rankings(
@@ -432,7 +456,7 @@ class QuickDeployRefreshTests(unittest.TestCase):
         with (
             patch("llm_launchpad.core.quick_deploy_refresh._AA_RESOLUTION_WORKERS", 4),
             patch("llm_launchpad.core.quick_deploy_refresh._find_unsloth_gguf_match",
-                  side_effect=lambda candidate, api: f"unsloth/{candidate.slug}-GGUF"),
+                  side_effect=lambda candidate, api, budget=None: f"unsloth/{candidate.slug}-GGUF"),
             patch("llm_launchpad.core.quick_deploy_refresh._fetch_serving_metadata", side_effect=metadata),
         ):
             profiles = _profiles_from_aa_rankings(
@@ -473,7 +497,7 @@ class QuickDeployRefreshTests(unittest.TestCase):
             with (
                 patch("llm_launchpad.core.quick_deploy_refresh.ThreadPoolExecutor", return_value=resolver),
                 patch("llm_launchpad.core.quick_deploy_refresh._find_unsloth_gguf_match",
-                      side_effect=lambda candidate, api: f"unsloth/{candidate.slug}-GGUF"),
+                      side_effect=lambda candidate, api, budget=None: f"unsloth/{candidate.slug}-GGUF"),
                 patch("llm_launchpad.core.quick_deploy_refresh._fetch_serving_metadata", side_effect=fetch),
             ):
                 result = caller.submit(
@@ -851,7 +875,11 @@ class QuickDeployRefreshTests(unittest.TestCase):
         )
         gpu_catalog = [ModalGpuSpec("L4", 0.5)]
 
-        def matched_repo(candidate: AAModelCandidate, _api: object) -> str:
+        def matched_repo(
+            candidate: AAModelCandidate,
+            _api: object,
+            _budget: object = None,
+        ) -> str:
             return f"unsloth/{candidate.name.replace(' ', '-')}-GGUF"
 
         with patch(
@@ -917,6 +945,75 @@ class QuickDeployRefreshTests(unittest.TestCase):
         )
         self.assertIsNone(profile.speculative_decoding)
         self.assertIsNotNone(upgraded[0].speculative_decoding)
+
+    def test_attach_mtp_recommendations_persists_to_the_catalog_snapshot(self) -> None:
+        """The snapshot the build wrote predates this pass, so it must be rewritten.
+
+        Without it every launch reprobes every repository and the confirm
+        screen opens with no MTP toggle until those probes land.
+        """
+
+        from llm_launchpad.core.quick_deploy import (
+            QuickDeployCatalogInfo,
+            QuickDeployProfile,
+        )
+
+        profile = QuickDeployProfile(
+            id="model-cheap-l4",
+            display_name="Open Model One 8B",
+            repo_id="unsloth/Open-Model-One-8B-GGUF",
+            quant="UD-Q2_K_XL",
+            gpu_type="L4",
+            gpu_count=2,
+            profile_label="Slow but cheap",
+            approx_cost_per_hour_usd=1.0,
+            max_context_tokens=131_072,
+            instance_slug_hint="open-model-one",
+            summary="Test profile.",
+            server_args=("--ctx-size", "131072"),
+        )
+        info = QuickDeployCatalogInfo(
+            source_label="Test catalog",
+            generated_at="2026-09-03T00:00:00Z",
+            is_live=True,
+        )
+        metadata = GgufQuantMetadata(
+            quantizations=["UD-Q2_K_XL"],
+            vram_gb_by_quant={"UD-Q2_K_XL": 20.0},
+            architecture="qwen35",
+            mtp=GgufMtpCapability(
+                status=GgufMtpStatus.SUPPORTED,
+                nextn_predict_layers=1,
+            ),
+        )
+        with TemporaryDirectory() as temporary_directory:
+            cache_path = Path(temporary_directory) / "catalog.json"
+            _write_quick_deploy_catalog_cache(info, (profile,), cache_path=cache_path)
+            before = _read_quick_deploy_catalog_cache(cache_path)
+            assert before is not None
+            self.assertIsNone(before[1][0].speculative_decoding)
+
+            with patch(
+                "llm_launchpad.core.quick_deploy_refresh.fetch_gguf_quant_metadata",
+                return_value=metadata,
+            ):
+                attach_quick_deploy_mtp_recommendations(
+                    (profile,),
+                    info=info,
+                    cache_path=cache_path,
+                )
+
+            after = _read_quick_deploy_catalog_cache(cache_path)
+            assert after is not None
+            restored = after[1][0].speculative_decoding
+            self.assertIsNotNone(restored)
+            self.assertEqual(restored.method, SpeculativeDecodingMethod.MTP)
+            self.assertEqual(restored.nextn_predict_layers, 1)
+            # A reopened snapshot must need no further probing.
+            self.assertEqual(
+                attach_quick_deploy_mtp_recommendations(after[1]),
+                after[1],
+            )
 
     def test_cached_catalog_round_trip_marks_stale_snapshots(self) -> None:
         from llm_launchpad.core.quick_deploy import QuickDeployProfile

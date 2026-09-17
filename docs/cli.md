@@ -15,11 +15,17 @@ Run `uv run python scripts/generate_cli_reference.py` after changing a command.
 - [`llm-launchpad deploy`](#llm-launchpad-deploy)
 - [`llm-launchpad doctor`](#llm-launchpad-doctor)
 - [`llm-launchpad gpu-types`](#llm-launchpad-gpu-types)
+- [`llm-launchpad jobs cancel`](#llm-launchpad-jobs-cancel)
+- [`llm-launchpad jobs follow`](#llm-launchpad-jobs-follow)
+- [`llm-launchpad jobs list`](#llm-launchpad-jobs-list)
+- [`llm-launchpad jobs show`](#llm-launchpad-jobs-show)
 - [`llm-launchpad list`](#llm-launchpad-list)
 - [`llm-launchpad llamacpp-support`](#llm-launchpad-llamacpp-support)
 - [`llm-launchpad logs`](#llm-launchpad-logs)
 - [`llm-launchpad offers`](#llm-launchpad-offers)
 - [`llm-launchpad opencode sync`](#llm-launchpad-opencode-sync)
+- [`llm-launchpad prime-disks delete`](#llm-launchpad-prime-disks-delete)
+- [`llm-launchpad prime-disks list`](#llm-launchpad-prime-disks-list)
 - [`llm-launchpad status`](#llm-launchpad-status)
 - [`llm-launchpad stop`](#llm-launchpad-stop)
 - [`llm-launchpad switch`](#llm-launchpad-switch)
@@ -57,12 +63,14 @@ Run `uv run python scripts/generate_cli_reference.py` after changing a command.
 │ status             Check endpoint readiness.                                                     │
 │ benchmark          Benchmark a deployed OpenAI-compatible backend with AIPerf.                   │
 │ logs               Show logs for a deployed backend.                                             │
-│ stop               Stop a deployed backend app. Vast destroys the rental and its disk.           │
+│ stop               Stop a deployed backend app. Storage consequences differ by provider.         │
 │ switch             Switch model and optionally redeploy.                                         │
 │ opencode           OpenCode integration commands.                                                │
 │ aai-auth           Manage the stored Artificial Analysis API key.                                │
 │ vast-auth          Manage Vast.ai credentials for offer discovery.                               │
 │ vast               Manage local SSH connections to Vast rentals.                                 │
+│ prime-disks        Inspect and remove persistent Prime cache disks.                              │
+│ jobs               Inspect and control background deployment jobs.                               │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -155,8 +163,7 @@ Run `uv run python scripts/generate_cli_reference.py` after changing a command.
 
 ╭─ Options ────────────────────────────────────────────────────────────────────────────────────────╮
 │ --vast-offer-id                                    <str>                  Exact Vast offer to    │
-│                                                                           rent (single-GPU       │
-│                                                                           llama.cpp).            │
+│                                                                           rent.                  │
 │ --vast-disk-gb                                     <int range> [x>=1]     Vast disk allocation   │
 │                                                                           in GB.                 │
 │                                                                           [default: 100]         │
@@ -198,6 +205,14 @@ Run `uv run python scripts/generate_cli_reference.py` after changing a command.
 │                                                                           llama-server arguments │
 │ --n-gpu-layers                                     <int>                  llama.cpp GPU layers   │
 │                                                                           (default: auto)        │
+│ --mtp                     --no-mtp                                        Use native MTP         │
+│                                                                           speculative decoding   │
+│                                                                           when the GGUF carries  │
+│                                                                           NextN heads and the    │
+│                                                                           pinned llama.cpp       │
+│                                                                           runtime supports the   │
+│                                                                           architecture           │
+│                                                                           [default: mtp]         │
 │ --model-name                                       <str>                  vLLM MODEL_NAME        │
 │ --model-revision                                   <str>                  vLLM MODEL_REVISION    │
 │ --served-model-name                                <str>                  vLLM SERVED_MODEL_NAME │
@@ -289,6 +304,68 @@ Run `uv run python scripts/generate_cli_reference.py` after changing a command.
 ╭─ Options ────────────────────────────────────────────────────────────────────────────────────────╮
 │ --timeout        <int range> [x>=1]  Modal docs request timeout in seconds [default: 10]         │
 │ --help                               Show this message and exit.                                 │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+```
+
+## `llm-launchpad jobs cancel`
+
+```text
+
+ Usage: llm-launchpad jobs cancel [OPTIONS] {job_id}
+
+ Request cooperative cancellation; the worker stops its resource after the current provider call.
+
+╭─ Arguments ──────────────────────────────────────────────────────────────────────────────────────╮
+│ *    job_id      <str>  Job id from 'jobs list'. [required]                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭─ Options ────────────────────────────────────────────────────────────────────────────────────────╮
+│ --help          Show this message and exit.                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+```
+
+## `llm-launchpad jobs follow`
+
+```text
+
+ Usage: llm-launchpad jobs follow [OPTIONS] {job_id}
+
+ Stream a job's retained log until it reaches a terminal state.
+
+╭─ Arguments ──────────────────────────────────────────────────────────────────────────────────────╮
+│ *    job_id      <str>  Job id from 'jobs list'. [required]                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭─ Options ────────────────────────────────────────────────────────────────────────────────────────╮
+│ --help          Show this message and exit.                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+```
+
+## `llm-launchpad jobs list`
+
+```text
+
+ Usage: llm-launchpad jobs list [OPTIONS]
+
+ Show durable deployment jobs across TUI sessions.
+
+╭─ Options ────────────────────────────────────────────────────────────────────────────────────────╮
+│ --all     --active      Include finished jobs. [default: all]                                    │
+│ --help                  Show this message and exit.                                              │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+```
+
+## `llm-launchpad jobs show`
+
+```text
+
+ Usage: llm-launchpad jobs show [OPTIONS] {job_id}
+
+ Show one job with its retained result and recent log tail.
+
+╭─ Arguments ──────────────────────────────────────────────────────────────────────────────────────╮
+│ *    job_id      <str>  Job id from 'jobs list'. [required]                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭─ Options ────────────────────────────────────────────────────────────────────────────────────────╮
+│ --help          Show this message and exit.                                                      │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -398,6 +475,37 @@ Run `uv run python scripts/generate_cli_reference.py` after changing a command.
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
+## `llm-launchpad prime-disks delete`
+
+```text
+
+ Usage: llm-launchpad prime-disks delete
+            [OPTIONS] {disk_id}
+
+ Permanently terminate one Prime disk and its cached model weights.
+
+╭─ Arguments ──────────────────────────────────────────────────────────────────────────────────────╮
+│ *    disk_id      <str>  Disk id from 'prime-disks list'. [required]                             │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+╭─ Options ────────────────────────────────────────────────────────────────────────────────────────╮
+│ --yes   -y        Skip the confirmation prompt.                                                  │
+│ --help            Show this message and exit.                                                    │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+```
+
+## `llm-launchpad prime-disks list`
+
+```text
+
+ Usage: llm-launchpad prime-disks list [OPTIONS]
+
+ Show every persistent disk on the Prime account that is still billing.
+
+╭─ Options ────────────────────────────────────────────────────────────────────────────────────────╮
+│ --help          Show this message and exit.                                                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
+```
+
 ## `llm-launchpad status`
 
 ```text
@@ -426,7 +534,7 @@ Run `uv run python scripts/generate_cli_reference.py` after changing a command.
 
  Usage: llm-launchpad stop [OPTIONS]
 
- Stop a deployed backend app. Vast destroys the rental and its disk.
+ Stop a deployed backend app. Storage consequences differ by provider.
 
 ╭─ Options ────────────────────────────────────────────────────────────────────────────────────────╮
 │ --provider             <modal|prime|vast>  Compute provider: modal, prime, or vast               │
@@ -471,6 +579,14 @@ Run `uv run python scripts/generate_cli_reference.py` after changing a command.
 │ --repo-id                                            <str>               HF repo id              │
 │ --quant                                              <str>               Quant pattern           │
 │ --revision                                           <str>               HF revision             │
+│ --mtp                      --no-mtp                                      Use native MTP          │
+│                                                                          speculative decoding    │
+│                                                                          when the GGUF carries   │
+│                                                                          NextN heads and the     │
+│                                                                          pinned llama.cpp        │
+│                                                                          runtime supports the    │
+│                                                                          architecture            │
+│                                                                          [default: mtp]          │
 │ --model-name                                         <str>               vLLM MODEL_NAME         │
 │ --model-revision                                     <str>               vLLM MODEL_REVISION     │
 │ --served-model-name                                  <str>               vLLM SERVED_MODEL_NAME  │

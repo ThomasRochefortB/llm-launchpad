@@ -26,6 +26,10 @@ CONNECTIONS_PATH = SETTINGS_DIR / "deployment_connection_summaries.json"
 STORAGE_SNAPSHOT_PATH = SETTINGS_DIR / "storage_snapshot.json"
 
 
+def _endpoint_root(url: str) -> str:
+    return url.strip().rstrip("/").removesuffix("/v1").rstrip("/")
+
+
 def _connections_path(path: Path | None) -> Path:
     """Resolve the store path at call time.
 
@@ -128,21 +132,22 @@ def merge_connections(
         cached = entries.get((row.name or "").strip())
         if not cached:
             continue
-        cached_url = str(cached.get("base_url") or "").removesuffix("/v1").rstrip("/")
+        cached_url = _endpoint_root(str(cached.get("base_url") or ""))
         cached_resource = str(cached.get("resource_id") or "")
         # Only a genuine contradiction means this record describes a different
         # deployment. An identifier missing on either side is unknown, not
         # mismatched -- records saved before the provider reported a resource id
         # would otherwise never hand back their verification.
         resource_conflict = bool(row.app_id and cached_resource and row.app_id != cached_resource)
-        row_url = (row.web_url or "").removesuffix("/v1").rstrip("/")
+        row_url = _endpoint_root(row.web_url or "")
         url_conflict = bool(row_url and cached_url and row_url != cached_url)
-        if not resource_conflict and not url_conflict:
-            row.vision = row.vision or vision_from_dict(cached.get("vision"))
+        if resource_conflict or url_conflict:
+            continue
+        row.vision = row.vision or vision_from_dict(cached.get("vision"))
         # A missing Vast URL means its local SSH tunnel is disconnected. A
         # cached listener address cannot establish that the tunnel is alive.
         if row.provider != ComputeProvider.VAST:
-            row.web_url = row.web_url or str(cached.get("base_url") or "").removesuffix("/v1")
+            row.web_url = row.web_url or cached_url
         row.served_model_name = row.served_model_name or str(cached.get("model_id") or "") or None
         row.display_name = row.display_name or str(cached.get("display_name") or "") or None
         row.model_name = row.model_name or str(cached.get("model_name") or "") or None
@@ -189,7 +194,7 @@ def rows_from_connection_cache(
     )
     rows: list[EndpointInfo] = []
     for app_name, entry in entries.items():
-        base_url = str(entry.get("base_url") or "").removesuffix("/v1")
+        base_url = _endpoint_root(str(entry.get("base_url") or ""))
         if not base_url:
             continue
         provider_value = str(entry.get("provider") or "")
@@ -399,7 +404,7 @@ def update_vision_verification(app_name: str, url: str, vision: Any, path: Path 
     path = _connections_path(path)
     entries = load_connection_entries(path)
     entry = entries.get(app_name)
-    if entry is None or str(entry.get("base_url") or "").removesuffix("/v1").rstrip("/") != url.removesuffix("/v1").rstrip("/"):
+    if entry is None or _endpoint_root(str(entry.get("base_url") or "")) != _endpoint_root(url):
         return
     entry["vision"] = vision_to_dict(vision)
     _write(entries, path)

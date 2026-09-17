@@ -28,6 +28,71 @@ def ssh_key_startup(public_key: str, *, root: str = "/root") -> str:
     )
 
 
+# Why a connection failed, told apart without ever echoing the transport's
+# words. A rental that refuses the port is still installing its SSH server; a
+# rental that denies the key has finished and will refuse forever. Those two
+# need opposite decisions, and until now both arrived as one message.
+SSH_REFUSED, SSH_REJECTED = "refused", "rejected"
+SSH_HOST_KEY, SSH_UNREACHABLE = "host-key", "unreachable"
+SSH_THROTTLED = "throttled"
+
+_SSH_REASONS = (
+    # Host key first, because a changed key also prints a denial line and the
+    # two mean different things here. A Vast rental is reached through a
+    # shared proxy that answers before the container's own sshd does, so the
+    # key seen in the first seconds is not always the key the rental ends up
+    # presenting. That is provisioning churn on a host we have not trusted
+    # yet, not evidence about the deployment key.
+    (SSH_HOST_KEY, re.compile(
+        r"host key verification failed|remote host identification has changed"
+        r"|key for .* has changed",
+        re.I,
+    )),
+    # Before a denial: an authentication-attempt limit is a verdict on how
+    # often we knocked, not on the key we offered. This loop polls a rental
+    # for as long as it takes to come up, and the deploy path already notes
+    # that hundreds of failed authentications look like an attack to Vast's
+    # shared SSH proxy -- so reading the proxy's own rate limit as a rejected
+    # key blames the rental for our polling and ends it while it still works.
+    (SSH_THROTTLED, re.compile(
+        r"too many authentication|max(imum)? authentication attempts",
+        re.I,
+    )),
+    (SSH_REJECTED, re.compile(
+        r"permission denied|no supported authentication",
+        re.I,
+    )),
+    (SSH_REFUSED, re.compile(
+        r"connection refused|connection closed|connection reset"
+        r"|kex_exchange_identification|banner exchange|broken pipe",
+        re.I,
+    )),
+)
+
+
+def ssh_failure_reason(stderr: str) -> str:
+    """Classify an OpenSSH failure by what it says about the host.
+
+    Callers poll a rental that is already billing, so the distinction decides
+    money: waiting out a refusal costs a few more minutes, while waiting out a
+    denied key costs the whole deadline and then a second rental. Only an
+    authentication denial is read as a decision; a refused port and a changed
+    host key are both things a provisioning rental does on its way up.
+    """
+    for reason, pattern in _SSH_REASONS:
+        if pattern.search(stderr or ""):
+            return reason
+    return SSH_UNREACHABLE
+
+
+class VastSshError(RuntimeError):
+    """An SSH failure that still says which kind it was, with no stderr in it."""
+
+    def __init__(self, message: str, reason: str = SSH_UNREACHABLE) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
 class VastSsh:
     """Use OpenSSH control sockets so endpoints survive the launching process."""
 
@@ -61,7 +126,9 @@ class VastSsh:
         try:
             result = subprocess.run(args, input=input_text, capture_output=True, text=True, timeout=timeout)
         except (OSError, subprocess.TimeoutExpired):
-            raise RuntimeError("Vast SSH command could not complete. Check OpenSSH and connectivity.") from None
+            raise VastSshError(
+                "Vast SSH command could not complete. Check OpenSSH and connectivity."
+            ) from None
         if result.returncode:
             # Never echo command arguments, stderr, or a credential-bearing
             # script: a runtime script carries the endpoint key, and arguments
@@ -70,13 +137,28 @@ class VastSsh:
             detail = ""
             if os.environ.get("LLM_LAUNCHPAD_SSH_DEBUG") == "1":
                 detail = " " + " ".join((result.stderr or "").split())[:400]
-            raise RuntimeError(
-                "Vast SSH command failed. Check connectivity and the saved host key." + detail
+            raise VastSshError(
+                "Vast SSH command failed. Check connectivity and the saved host key." + detail,
+                ssh_failure_reason(result.stderr or ""),
             )
         return result
 
-    def run(self, instance: VastInstance, command: str, *, input_text: str | None = None) -> str:
-        return self._run([*self.args(instance), f"root@{instance.ssh_host}", command], input_text=input_text).stdout
+    def run(
+        self, instance: VastInstance, command: str, *, input_text: str | None = None,
+        multiplex: bool = False,
+    ) -> str:
+        """Run one command. ``multiplex`` rides the tunnel instead of dialling.
+
+        A polling caller runs this every few seconds for as long as a model
+        takes to download, and each fresh dial is a new authentication against
+        Vast's shared SSH proxy. Where the tunnel is already open the poll is a
+        channel on it, so the proxy sees one connection for the whole deploy.
+        """
+        session = ["-S", str(self.control)] if multiplex and self.control.exists() else []
+        return self._run(
+            [*self.args(instance), *session, f"root@{instance.ssh_host}", command],
+            input_text=input_text,
+        ).stdout
 
     def connected(self, instance: VastInstance) -> bool:
         if not self.control.exists():

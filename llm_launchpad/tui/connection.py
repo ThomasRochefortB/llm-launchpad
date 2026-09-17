@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from ..core.backend import ModalBackend
+from ..core.deployment_states import is_terminal_deployment_state
 from ..core.naming import default_llamacpp_served_model_name, default_served_model_name
 from ..protocol.enums import BackendType, ComputeProvider
 from ..protocol.models import EndpointInfo
@@ -15,6 +16,11 @@ def resolve_openai_base_url(row: EndpointInfo, username: str = "") -> tuple[str 
         base_root = raw_url.rstrip("/")
         return (base_root if base_root.endswith("/v1") else f"{base_root}/v1"), False
     if row.provider != ComputeProvider.MODAL or not username.strip() or not row.name.strip():
+        return None, False
+    # Deriving a URL for an app that is over invents a copyable endpoint that
+    # only ever hangs. A row still starting has no URL yet but will get one, so
+    # it keeps the derived address.
+    if is_terminal_deployment_state(row.state):
         return None, False
     derived = ModalBackend.default_server_url(username.strip(), app_name=row.name.strip()).rstrip("/")
     return (derived if derived.endswith("/v1") else f"{derived}/v1"), True

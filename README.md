@@ -56,7 +56,15 @@ From the TUI you can:
 - Deploy a popular model by picking it, choosing live GPU placement, and confirming
 - Use Custom deploy for arbitrary Hugging Face llama.cpp or vLLM setups
 - Manage multiple deployed instances and inspect their status
+- Reopen deployment logs and results from Operations (Ctrl+O), or cancel a deployment
 - Copy the OpenAI-compatible base URL, model ID, and API key after a successful deploy
+
+Back leaves a deployment running. Operations keeps its monitor available across
+sessions: deployments run in detached background workers, so closing the TUI
+detaches without interrupting them. Reopen logs and results from Operations
+(Ctrl+O) or `llm-launchpad jobs`. Cancellation is separate and stops that
+deployment's resource after the current provider call returns. Failed cleanup
+stays visible for recovery on the next launch.
 
 Deploy is model-first: each model can have multiple runtime recipes and each
 recipe can receive quotes from any compatible provider adapter. For details on

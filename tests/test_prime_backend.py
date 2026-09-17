@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
+import shlex
 import stat
 import subprocess
 import tempfile
@@ -18,6 +20,7 @@ from llm_launchpad.core.connection_store import (
 from llm_launchpad.core.orchestrator import Orchestrator
 from llm_launchpad.core.prime_auth import PrimeConfig, load_prime_config
 from llm_launchpad.core.prime_backend import (
+    runtime_failure_detail,
     PRIME_DEFAULT_BOOTSTRAP_IMAGE,
     PrimeApiError,
     PrimeBackend,
@@ -31,7 +34,12 @@ from llm_launchpad.core.prime_backend import (
     resolve_prime_launch_spec,
     select_prime_offer,
 )
-from llm_launchpad.protocol.enums import BackendType, ComputeProvider, OperationType
+from llm_launchpad.protocol.enums import (
+    BackendType,
+    CertificationState,
+    ComputeProvider,
+    OperationType,
+)
 from llm_launchpad.core.prime_disks import remember_prime_disk, StoredPrimeDisk
 from llm_launchpad.core.provider_options import prime_provider_options
 from llm_launchpad.protocol.events import EndpointAvailableEvent, LogEvent, OperationCompleteEvent
@@ -39,8 +47,11 @@ from llm_launchpad.protocol.models import (
     ComputeOffer,
     DeploymentConfig,
     EndpointInfo,
+    MemoryEstimate,
+    PlacementAssessment,
     PrimeProviderOptions,
     ReasoningCapabilities,
+    RuntimeTuning,
 )
 
 
@@ -845,6 +856,46 @@ class PrimeBackendTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "require an endpoint API key"):
             PrimeBackend._docker_env_file(config)
 
+    def test_bootstrap_skips_pull_when_serving_image_is_present(self) -> None:
+        config = DeploymentConfig(
+            backend=BackendType.VLLM,
+            provider=ComputeProvider.PRIME,
+            model_name="Qwen/Qwen3-4B",
+            endpoint_api_key="endpoint-secret",
+            provider_options=PrimeProviderOptions(),
+        )
+        launch = resolve_prime_launch_spec(config)
+        script = PrimeBackend._bootstrap_script(config, launch)
+
+        self.assertIn("docker image inspect", script)
+        self.assertIn("skipping pull", script)
+        self.assertIn(f"docker pull {shlex.quote(launch.container_image)}", script)
+        self.assertLess(
+            script.index("docker image inspect"), script.index("docker pull")
+        )
+
+    def test_owned_offer_image_is_configurable_per_backend(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"LLM_LAUNCHPAD_PRIME_LLAMACPP_OFFER_IMAGE": "registry.example/llp-base:1"},
+        ):
+            self.assertEqual(
+                preferred_prime_offer_image(BackendType.LLAMACPP),
+                "registry.example/llp-base:1",
+            )
+            self.assertEqual(
+                preferred_prime_offer_image(BackendType.VLLM),
+                "ubuntu_22_cuda_12",
+            )
+        with patch.dict(
+            os.environ,
+            {"LLM_LAUNCHPAD_PRIME_OFFER_IMAGE": "registry.example/llp-base:2"},
+        ):
+            self.assertEqual(
+                preferred_prime_offer_image(BackendType.VLLM),
+                "registry.example/llp-base:2",
+            )
+
     def test_portable_runtime_status_detects_restart_loop(self) -> None:
         backend = PrimeBackend(PrimeConfig(api_key="secret"))
         probe = subprocess.CompletedProcess([], 22, "", "not ready")
@@ -897,12 +948,36 @@ class PrimeBackendTests(unittest.TestCase):
 
         self.assertFalse(ready)
         self.assertFalse(failed)
-        self.assertEqual(detail, "runtime container is downloading the model (74%)")
+        self.assertEqual(
+            detail,
+            "runtime container is downloading the model (74%), "
+            "59.0 of 78.9 GB",
+        )
 
     def test_runtime_load_detail_helpers_parse_progress(self) -> None:
-        self.assertEqual(PrimeBackend._expected_model_bytes(
-            DeploymentConfig(required_vram_gb=78.9)
-        ), 78_900_000_000)
+        assessment = PlacementAssessment(
+            fingerprint="fingerprint",
+            memory=MemoryEstimate(
+                weights_gb=78.9,
+                kv_cache_gb=0.0,
+                compute_gb=0.0,
+                speculative_gb=0.0,
+                reserve_gb=0.0,
+                total_gb=78.9,
+                per_device_required_gb=(78.9,),
+                total_layer_count=0,
+            ),
+            tuning=RuntimeTuning(parallel_slots=1),
+            certification=CertificationState.ESTIMATED,
+            fits=True,
+            gpu_resident=True,
+        )
+        self.assertEqual(
+            PrimeBackend._expected_model_bytes(
+                DeploymentConfig(placement_assessment=assessment)
+            ),
+            78_900_000_000,
+        )
         self.assertEqual(PrimeBackend._parse_docker_byte_count("61.7GB"), 61_700_000_000)
         network, cache_bytes, expected_bytes = PrimeBackend._parse_runtime_progress_output(
             "61.7GB / 551MB\nCACHE:59000000000\nEXPECTED:78900000000\n"
@@ -916,7 +991,8 @@ class PrimeBackendTests(unittest.TestCase):
                 cache_bytes=cache_bytes,
                 expected_bytes=expected_bytes,
             ),
-            "runtime container is downloading the model (74%)",
+            "runtime container is downloading the model (74%), "
+            "59.0 of 78.9 GB",
         )
 
     def test_portable_runtime_status_reports_exit_code_without_logs(self) -> None:
@@ -1650,3 +1726,45 @@ class ConnectionStoreTests(unittest.TestCase):
             self.assertIsNotNone(rows[0].reasoning)
             assert rows[0].reasoning is not None
             self.assertEqual(rows[0].reasoning.default_effort, "xhigh")
+
+
+class RuntimeFailureDetailTests(unittest.TestCase):
+    """A dead runtime must report why it died, not what it said last."""
+
+    LIVE_TAIL = [
+        "warn: LLAMA_ARG_HOST environment variable is set, but will be"
+        " overwritten by command line argument --host",
+        "0.20.246.546 E get_repo_commit: error: HTTPLIB failed: Could not"
+        " establish connection",
+        "0.20.246.555 W get_repo_files: failed to resolve commit for"
+        " unsloth/Qwen3.8-27B-GGUF",
+        "0.20.248.400 E cmn  common_init_: failed to load model ''",
+        "warn: LLAMA_ARG_HOST environment variable is set, but will be"
+        " overwritten by command line argument --host",
+    ]
+
+    def test_a_restarting_container_does_not_report_its_opening_warning(self) -> None:
+        """The live H200 failure, which blamed a harmless note about --host.
+
+        A restarting container's tail ends with the next attempt's first
+        lines, so the last line is whatever the runtime happens to say first.
+        """
+        detail = runtime_failure_detail(self.LIVE_TAIL, "last exit code 1")
+        self.assertNotIn("LLAMA_ARG_HOST", detail)
+        self.assertIn("Could not establish connection", detail)
+
+    def test_the_first_failure_wins_over_the_ones_it_causes(self) -> None:
+        # "failed to load model" is only what happens once the download it
+        # depended on has already failed.
+        detail = runtime_failure_detail(self.LIVE_TAIL, "fallback")
+        self.assertNotIn("failed to load model", detail)
+
+    def test_an_empty_tail_keeps_the_caller_s_fallback(self) -> None:
+        self.assertEqual(runtime_failure_detail([], "last exit code 137"), "last exit code 137")
+        self.assertEqual(runtime_failure_detail(["", "   "], "exited"), "exited")
+
+    def test_logs_without_an_error_report_the_last_line(self) -> None:
+        self.assertEqual(
+            runtime_failure_detail(["starting server", "listening on 8000"], "fb"),
+            "listening on 8000",
+        )

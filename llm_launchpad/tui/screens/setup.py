@@ -1,7 +1,8 @@
-"""Setup-required screen shown when no compute provider is authenticated."""
+"""Setup-required screen shown when no compute provider has credentials."""
 
 from __future__ import annotations
 
+from rich.markup import escape
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -29,9 +30,10 @@ class SetupRequiredScreen(CopyEnabledScreen):
                 yield Static("[bold #7bf168]Compute provider required[/]")
                 yield Static(
                     "llm-launchpad deploys inference endpoints through at least one "
-                    "compute provider. None is currently authenticated.\n",
+                    "compute provider. None currently has credentials.\n",
                     id="setup-required-intro",
                 )
+                yield Static("[dim]Checking provider credentials…[/dim]", id="setup-readiness-status")
                 yield Static(
                     "[bold]Option 1 · Modal[/bold]\n"
                     "[dim]Install the CLI, then authenticate:[/dim]\n"
@@ -74,6 +76,46 @@ class SetupRequiredScreen(CopyEnabledScreen):
         self.query_one("#setup-required-scroll", VerticalScroll).scroll_home(
             animate=False,
         )
+        self._render_readiness(self._local_readiness())
+
+    def _local_readiness(self) -> tuple[object, ...]:
+        snapshot = getattr(self.app, "provider_readiness_snapshot", None)
+        if callable(snapshot):
+            try:
+                return tuple(snapshot())
+            except Exception:
+                return ()
+        return ()
+
+    def on_provider_readiness(self, readiness: tuple[object, ...]) -> None:
+        """Update installed/checking/authenticated/failed without re-mounting."""
+        self._render_readiness(readiness)
+
+    def _render_readiness(self, readiness: tuple[object, ...]) -> None:
+        try:
+            status = self.query_one("#setup-readiness-status", Static)
+        except Exception:
+            return
+        if not readiness:
+            status.update("[dim]Checking provider credentials…[/dim]")
+            return
+        lines = []
+        for row in readiness:
+            provider = getattr(row, "provider", None)
+            name = getattr(provider, "display_name", str(provider))
+            stage = getattr(getattr(row, "stage", None), "display_name", str(getattr(row, "stage", "")))
+            detail = str(getattr(row, "detail", "") or "")
+            color = {
+                "Authenticated": "green",
+                "Checking": "yellow",
+                "Not configured": "dim",
+                "Not installed": "dim",
+                "Authentication failed": "red",
+                "Verification unavailable": "yellow",
+            }.get(stage, "")
+            label = f"[{color}]{escape(stage)}[/]" if color else escape(stage)
+            lines.append(f"• {escape(str(name))}: {label}" + (f" — {escape(detail)}" if detail else ""))
+        status.update("\n".join(lines))
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "setup-recheck-btn":
@@ -103,8 +145,15 @@ class SetupRequiredScreen(CopyEnabledScreen):
         entered = bool(callable(rechecker) and rechecker())
         if entered:
             return
+        refresher = getattr(self.app, "refresh_provider_readiness", None)
+        if callable(refresher):
+            try:
+                refresher()
+            except Exception:
+                pass
+        self._render_readiness(self._local_readiness())
         self.query_one("#setup-required-feedback", Static).update(
-            "[yellow]Still no authenticated provider.[/yellow] "
+            "[yellow]Still no provider with credentials.[/yellow] "
             f"Run {_MODAL_COMMAND}, {_PRIME_COMMAND}, or {_VAST_COMMAND}, "
             "then re-check."
         )

@@ -149,6 +149,7 @@ class MonitorScreen(CopyEnabledScreen):
         self._show_debug_logs = show_debug_logs
         self._current_operation: OperationType | None = None
         self._last_summary_state_detail = ""
+        self._last_error_message = ""
         self._following = True
         self._unseen_lines = 0
         self._line_count = 0
@@ -355,8 +356,13 @@ class MonitorScreen(CopyEnabledScreen):
             self._show_result_card(message)
         else:
             self._append_log_line(f"Operation failed (exit code {message.exit_code}).")
-            if message.detail:
-                self._append_log_line(f"Detail: {message.detail}")
+            # The operation has already reported the error under its own line,
+            # and fail_operation repeats it verbatim as the completion detail.
+            # Restating it here printed the same sentence twice, which on a
+            # summarized deploy took four of the dozen lines the box has.
+            detail = _strip_ansi(message.detail or "").strip()
+            if detail and detail != self._last_error_message:
+                self._append_log_line(f"Detail: {detail}")
             if self._summary_mode_enabled:
                 self._append_log_line(
                     'Tip: re-run with "Show debug logs" enabled to see full backend logs.'
@@ -411,6 +417,9 @@ class MonitorScreen(CopyEnabledScreen):
         self._result_rows = rows
         card = self.query_one("#result-card", VerticalScroll)
         card.remove_class("hidden")
+        self.query_one("#result-card-title", Static).update(
+            "[bold #7bf168]Check complete[/]"
+        )
         self.query_one("#result-card-body", Static).update(_result_card_markup(rows))
         self.query_one("#result-done-btn", Button).focus()
 
@@ -423,6 +432,7 @@ class MonitorScreen(CopyEnabledScreen):
         self.notify("Copied result", timeout=2)
 
     def on_operation_error(self, message: OperationError) -> None:
+        self._last_error_message = _strip_ansi(message.message).strip()
         self._append_log_line(f"Error: {message.message}")
 
     def on_log_viewer_status_changed(self, message: LogViewer.StatusChanged) -> None:
@@ -474,6 +484,9 @@ class MonitorScreen(CopyEnabledScreen):
             return
         card = self.query_one("#connection-card", VerticalScroll)
         card.remove_class("hidden")
+        self.query_one("#connection-card-title", Static).update(
+            "[bold #7bf168]Endpoint ready[/]"
+        )
         self.query_one("#connection-card-body", Static).update(
             _connection_card_markup(payload)
         )
@@ -563,6 +576,9 @@ class MonitorScreen(CopyEnabledScreen):
         self.app.pop_screen()
 
     def action_go_back(self) -> None:
+        jobs = getattr(self.app, "deployment_jobs", {})
+        if any(job.monitor is self and not job.finished.is_set() for job in jobs.values()):
+            self.notify("Deployment continues. Reopen or cancel it in Operations (Ctrl+O).", timeout=5)
         if self._success and self._connection_payload:
             self._pop_after_success()
             return
@@ -655,15 +671,23 @@ class MonitorScreen(CopyEnabledScreen):
         return None
 
     def _active_in_progress_index(self) -> int | None:
+        """Return the step still running, so something on screen is moving.
+
+        This used to take the last step-or-done row and spin it only if it was
+        a step, which assumes the two alternate. They do not: a Prime deploy
+        polls the tunnel and the runtime together, so "Secure endpoint
+        connected" lands while the container image is still being built. The
+        spinner then vanished and every row took a tick, leaving a build that
+        had twenty minutes to run looking like a finished deploy.
+
+        The last step is the one to mark. It can briefly sit on a step that
+        has just finished, in the gap before the next one starts -- that reads
+        as "still working", which is true, where a static screen does not.
+        """
+
         if self._done:
             return None
-        active: int | None = None
-        for index, item in enumerate(self._summary_items):
-            if item.kind in {"step", "done"}:
-                active = index
-        if active is not None and self._summary_items[active].kind == "step":
-            return active
-        return None
+        return self._last_summary_step_index()
 
     def _rendered_summary_lines(self) -> list[str]:
         active_index = self._active_in_progress_index()

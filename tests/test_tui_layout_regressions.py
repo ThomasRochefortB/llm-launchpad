@@ -19,8 +19,12 @@ from textual.geometry import Region
 from textual.widgets import Button, Input, OptionList, Static
 from textual.widgets._footer import FooterKey
 
-from llm_launchpad.protocol.models import StorageSnapshot
+from llm_launchpad.core.quick_deploy import QuickDeployModel, QuickDeployProfile
+from llm_launchpad.protocol.enums import SpeculativeDecodingMethod
+from llm_launchpad.protocol.models import SpeculativeDecodingConfig, StorageSnapshot
+from llm_launchpad.tui.responsive import WidthMode
 from llm_launchpad.tui.app import TuiApp
+from llm_launchpad.tui.screens import fast_deploy as fast_deploy_module
 from llm_launchpad.tui.screens import main_menu as main_menu_module
 from llm_launchpad.tui.screens.main_menu import MainMenuScreen
 from llm_launchpad.tui.screens.monitor import _connection_card_markup, _result_card_markup
@@ -266,6 +270,86 @@ class FooterFitTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             await pilot.pause()
             self.assertIn("i Details", "\n".join(_rendered_lines(app)))
+
+
+def _quick_deploy_model(*, mtp: bool) -> "QuickDeployModel":
+    """One catalog model, with or without a resolved MTP recommendation."""
+
+    profile = QuickDeployProfile(
+        id="acme-model-l4",
+        display_name="Acme Model 27B",
+        repo_id="acme/Acme-Model-27B-GGUF",
+        quant="UD-Q4_K_XL",
+        gpu_type="L4",
+        gpu_count=1,
+        profile_label="Balanced",
+        approx_cost_per_hour_usd=1.5,
+        max_context_tokens=131_072,
+        instance_slug_hint="acme-model",
+        summary="Test profile.",
+        server_args=("--ctx-size", "131072"),
+        model_size_label="Medium",
+        speculative_decoding=(
+            SpeculativeDecodingConfig(
+                method=SpeculativeDecodingMethod.MTP,
+                num_speculative_tokens=3,
+                nextn_predict_layers=1,
+            )
+            if mtp
+            else None
+        ),
+    )
+    return QuickDeployModel(
+        id=profile.id,
+        display_name=profile.display_name,
+        recipes=(),
+        profiles=(profile,),
+        max_context_tokens=profile.max_context_tokens,
+        quality_score=12.5,
+    )
+
+
+class MtpMarkerTests(unittest.TestCase):
+    """The MTP bolt shares the gutter every model row already reserves."""
+
+    def test_the_marker_fills_the_gutter_exactly(self) -> None:
+        self.assertEqual(
+            cell_len(fast_deploy_module.MTP_MARKER),
+            cell_len(fast_deploy_module.MODEL_ROW_GUTTER),
+        )
+        # "W" is rendered as two cells everywhere; "A" (ambiguous) is two in a
+        # CJK locale and one elsewhere while Rich measures one either way,
+        # which is what knocks a row out of column.
+        self.assertEqual(
+            unicodedata.east_asian_width(fast_deploy_module.MTP_MARKER),
+            "W",
+        )
+
+    def test_a_marked_row_starts_its_name_in_the_same_column(self) -> None:
+        from rich.markup import render as render_markup
+
+        marked = _quick_deploy_model(mtp=True)
+        plain = _quick_deploy_model(mtp=False)
+        for width_mode in WidthMode:
+            with self.subTest(width_mode=width_mode):
+                rendered = [
+                    render_markup(
+                        fast_deploy_module._model_option(model, width_mode)
+                    ).plain
+                    for model in (marked, plain)
+                ]
+                self.assertTrue(rendered[0].startswith(fast_deploy_module.MTP_MARKER))
+                self.assertEqual(
+                    *(cell_len(text) - cell_len(text.lstrip(" ⚡")) for text in rendered)
+                )
+
+    def test_an_unprobed_model_is_left_unmarked(self) -> None:
+        self.assertFalse(
+            fast_deploy_module._model_supports_mtp(_quick_deploy_model(mtp=False))
+        )
+        self.assertTrue(
+            fast_deploy_module._model_supports_mtp(_quick_deploy_model(mtp=True))
+        )
 
 
 class ProviderMarkerTests(unittest.TestCase):
@@ -781,3 +865,50 @@ class MainMenuFitTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class MouseModeVisibilityTests(unittest.IsolatedAsyncioTestCase):
+    """A toggle has to say which way it is currently set.
+
+    Mouse reporting defaults off over SSH so the terminal keeps its own text
+    selection. Taps then do nothing, and a footer hint reading only "Mouse"
+    cannot tell anyone why -- on a phone client, where tapping a button is the
+    obvious thing to try, the button reads as unreachable rather than as a
+    mode being off.
+    """
+
+    def _footer_descriptions(self, app: App[None]) -> list[str]:
+        return [
+            str(key.description) for key in app.screen.query(FooterKey)
+        ]
+
+    async def test_the_footer_names_the_current_mouse_state(self) -> None:
+        app = TuiApp(mouse_enabled=False)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+
+            self.assertIn("Mouse off", self._footer_descriptions(app))
+            self.assertNotIn("Mouse", self._footer_descriptions(app))
+
+    async def test_toggling_updates_the_hint(self) -> None:
+        app = TuiApp(mouse_enabled=False)
+        async with app.run_test(size=(140, 40)) as pilot:
+            await pilot.pause()
+            await pilot.press("ctrl+t")
+            await pilot.pause()
+
+            self.assertIn("Mouse on", self._footer_descriptions(app))
+
+    async def test_an_ssh_session_starts_with_taps_disabled(self) -> None:
+        # The condition the report came from: Termius over SSH, no terminal
+        # marker the clipboard heuristic recognises.
+        from llm_launchpad.tui.mouse import default_tui_mouse_enabled
+
+        with patch.dict(
+            "os.environ",
+            {"SSH_CONNECTION": "1.2.3.4 1 5.6.7.8 22", "TERM": "xterm-256color"},
+            clear=False,
+        ):
+            for name in ("ITERM_SESSION_ID", "TERM_PROGRAM", "LC_TERMINAL", "LLM_LAUNCHPAD_TUI_MOUSE"):
+                __import__("os").environ.pop(name, None)
+            self.assertFalse(default_tui_mouse_enabled())

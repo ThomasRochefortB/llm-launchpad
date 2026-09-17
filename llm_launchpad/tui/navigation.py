@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
+from textual.actions import SkipAction
 from textual.screen import Screen
 from textual.widget import Widget
-from textual.widgets import OptionList
+from textual.widgets import OptionList, Select
 
 
 def first_enabled_option_index(option_list: OptionList) -> int | None:
@@ -155,3 +156,27 @@ def move_focus_across_widgets(
             neighbor
         )
     return True
+
+
+def move_focus_with_arrows(screen: Screen, direction: int) -> None:
+    """Walk focus between the controls of a form with the arrow keys.
+
+    Textual moves focus with tab, which is fine on a desktop keyboard and
+    close to unusable on a phone, where tab is an item in a modifier bar and
+    the arrows are what people reach for. Worse than unusable on a form built
+    from selects: a closed ``Select`` binds "down" to opening its own overlay,
+    so arrowing down landed inside the dropdown and every further press moved
+    within it, leaving the buttons below unreachable.
+
+    An open overlay keeps the arrows, because that is how one of its options
+    gets chosen; the caller is expected to let ``SkipAction`` propagate.
+    """
+
+    if direction not in (-1, 1):
+        raise ValueError("direction must be -1 or 1")
+    if any(select.expanded for select in screen.query(Select)):
+        raise SkipAction()
+    if direction == 1:
+        screen.focus_next()
+    else:
+        screen.focus_previous()

@@ -3,6 +3,13 @@
 from __future__ import annotations
 
 from ..protocol.models import VisionCapabilities
+# The startup-phase line format lives beside the other milestone line parsers
+# in deploy_log_summary, which is also what preserves the lines through
+# summarization. Re-exported here because the phase timer is what emits them.
+from .deploy_log_summary import (
+    parse_startup_phase_line as parse_startup_phase_line,
+    startup_phase_summary_line,
+)
 from .vision_probe import VISION_PROBE_FAILED, verify_image_request
 
 from .shutdown import is_shutting_down, shutdown_event
@@ -40,6 +47,7 @@ from ..protocol.models import (
     ServingRequirements,
 )
 from .backend import ModalBackend
+from .fit_calibration import FitCalibrationRecorder
 from .operation_events import fail_operation
 from .diagnostics import log_exception
 from .llamacpp_planner import attestation_now, save_runtime_attestation
@@ -53,6 +61,103 @@ _MODAL_GPU_WAIT_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _MODAL_RELAX_RE = re.compile(r"Relaxing requirements \((?P<requirements>[^)]+)\)", flags=re.IGNORECASE)
+
+# A serving plan the placement cannot hold is rejected identically on every
+# container restart, so waiting out the readiness timeout only replays the same
+# crash for half an hour. Matched on the runner's own sentence rather than
+# llama.cpp's, which names the guard it aborted at rather than the cause.
+_TERMINAL_STARTUP_MARKERS = (
+    "llama.cpp rejected the full-context GPU-only serving plan",
+)
+
+
+def terminal_startup_failure(line: str) -> str | None:
+    """Return the message when a log line reports a crash that will repeat."""
+
+    text = (line or "").strip()
+    for marker in _TERMINAL_STARTUP_MARKERS:
+        index = text.find(marker)
+        if index >= 0:
+            # The marker can arrive wrapped in a traceback or a repr, so the
+            # message is cut out of whichever framing carried it.
+            return text[index:].strip().rstrip("')\"") or marker
+    return None
+
+
+class StartupPhaseTimer:
+    """Emit milestone lines that break one deploy+warmup run into phases.
+
+    The four phases are emitted separately so callers can reconstruct which
+    part of the run dominated wall-clock time:
+
+    - ``deploy``: deploy start until the deploy operation completes.
+    - ``warmup-wait``: warmup start until first successful readiness probe
+      (i.e. provider scheduling, binding, and model load).
+    - ``calibration``: certification start until calibration returns.
+    - ``total``: deploy start until warmup completion.
+    """
+
+    def __init__(self) -> None:
+        self._deploy_started: float | None = None
+        self._warmup_started: float | None = None
+        self._ready_at: float | None = None
+        self._calibration_started: float | None = None
+
+    def deploy_started(self, *, at: float | None = None) -> None:
+        self._deploy_started = at if at is not None else time.monotonic()
+
+    def warmup_started(self, *, at: float | None = None) -> None:
+        self._warmup_started = at if at is not None else time.monotonic()
+
+    def ready(self, *, at: float | None = None) -> None:
+        now = at if at is not None else time.monotonic()
+        if self._ready_at is None:
+            self._ready_at = now
+
+    def calibration_started(self, *, at: float | None = None) -> None:
+        now = at if at is not None else time.monotonic()
+        if self._calibration_started is None:
+            self._calibration_started = now
+
+    def deploy_event(self, operation: OperationType) -> LogEvent | None:
+        """Return the ``deploy`` phase line when deploy completes, else None."""
+        if self._deploy_started is None:
+            return None
+        seconds = time.monotonic() - self._deploy_started
+        line = startup_phase_summary_line("deploy", seconds)
+        return LogEvent(line=line, operation=operation, is_milestone=True)
+
+    def calibration_event(self) -> LogEvent | None:
+        """Return the ``calibration`` phase line for a finished calibration."""
+        if self._calibration_started is None:
+            return None
+        seconds = time.monotonic() - self._calibration_started
+        line = startup_phase_summary_line("calibration", seconds)
+        return LogEvent(
+            line=line, operation=OperationType.WARMUP, is_milestone=True
+        )
+
+    def finish_events(self) -> list[LogEvent]:
+        """Return warmup-wait/total lines when warmup completes."""
+        if self._warmup_started is None or self._deploy_started is None:
+            return []
+        now = time.monotonic()
+        ready_at = self._ready_at if self._ready_at is not None else now
+        return [
+            LogEvent(
+                line=startup_phase_summary_line(
+                    "warmup-wait", ready_at - self._warmup_started
+                ),
+                operation=OperationType.WARMUP,
+                is_milestone=True,
+            ),
+            LogEvent(
+                line=startup_phase_summary_line("total", now - self._deploy_started),
+                operation=OperationType.WARMUP,
+                is_milestone=True,
+            ),
+        ]
+
 
 _CALIBRATION_BUDGET_SECONDS = 90.0
 _GENERAL_PURPOSE_MIN_OUTPUT_TPS = 8.0
@@ -278,6 +383,7 @@ def _certify_serving_requirements(
     serving_requirements: ServingRequirements,
     placement_assessment: PlacementAssessment | None,
     runtime_id: str | None,
+    phase_timer: StartupPhaseTimer | None = None,
 ) -> Generator[BaseEvent, None, RuntimeAttestation | None]:
     """Verify full-context GPU residency and throughput for a ready endpoint.
 
@@ -360,7 +466,15 @@ def _certify_serving_requirements(
         ),
         price_per_hour_usd=serving_requirements.max_hourly_cost_usd,
         budget_seconds=_CALIBRATION_BUDGET_SECONDS,
+        phase_timer=phase_timer,
     )
+    if phase_timer is not None:
+        # A test double or future reimplementation may not report the start;
+        # the calibration phase still ended here.
+        phase_timer.calibration_started()
+        calibration_line = phase_timer.calibration_event()
+        if calibration_line is not None:
+            yield calibration_line
     accepted, calibration_detail = _calibration_is_acceptable(
         performance,
         serving_requirements.objective,
@@ -446,6 +560,7 @@ class WarmupRunner:
         placement_assessment: PlacementAssessment | None = None,
         runtime_id: str | None = None,
         vision: VisionCapabilities | None = None,
+        phase_timer: StartupPhaseTimer | None = None,
     ) -> EventStream:
         """Probe endpoint readiness and optionally tail logs."""
         yield StateChangeEvent(
@@ -467,6 +582,12 @@ class WarmupRunner:
                 detail="",
             )
             return
+
+        # llama.cpp states what it will allocate before every serve, whether
+        # or not it accepts the plan. The rejected runs are the valuable ones:
+        # they are exactly where the planner's formula was wrong. Recording
+        # both turns each deploy into evidence the next one plans from.
+        calibration = FitCalibrationRecorder(placement_assessment)
 
         target_app_name = app_name or legacy_app_name(backend)
         log_tail = _ModalLogTail(target_app_name)
@@ -513,8 +634,33 @@ class WarmupRunner:
                 yield from fetch_historical_logs(target_app_name, log_tail.seen_lines)
                 yield from log_tail.attach()
 
-            # Drain log lines delivered by the reader thread.
-            yield from log_tail.drain()
+            # Drain log lines delivered by the reader thread, watching for a
+            # startup failure that every restart will reproduce.
+            unrecoverable: str | None = None
+            for event in log_tail.drain():
+                yield event
+                line = getattr(event, "line", "")
+                measured = calibration.observe(line)
+                if measured is not None:
+                    yield LogEvent(
+                        line=(
+                            "Recorded llama.cpp's own measurement: "
+                            f"{measured.graph_gb:.1f} GB of graph memory per GPU"
+                            f" (measured on {measured.gpu_count}x {measured.gpu_type})."
+                        ),
+                        operation=OperationType.WARMUP,
+                    )
+                if unrecoverable is None:
+                    unrecoverable = terminal_startup_failure(line)
+            if unrecoverable is not None:
+                log_tail.stop("on unrecoverable startup failure")
+                yield from fail_operation(
+                    OperationType.WARMUP,
+                    unrecoverable,
+                    recoverable=False,
+                    detail="",
+                )
+                return
 
             elapsed = time.time() - start
             if elapsed > timeout:
@@ -539,6 +685,8 @@ class WarmupRunner:
                 )
                 if ready_ok:
                     log_tail.stop("after readiness")
+                    if phase_timer is not None:
+                        phase_timer.ready()
                     attestation = None
                     if serving_requirements is not None:
                         attestation = yield from _certify_serving_requirements(
@@ -550,6 +698,7 @@ class WarmupRunner:
                             serving_requirements=serving_requirements,
                             placement_assessment=placement_assessment,
                             runtime_id=runtime_id,
+                            phase_timer=phase_timer,
                         )
                         if attestation is None:
                             return
@@ -570,6 +719,8 @@ class WarmupRunner:
                             return
                         yield LogEvent(line="Image request verified (not a visual accuracy benchmark).", operation=OperationType.WARMUP)
                     yield LogEvent(line="Server is ready!")
+                    if phase_timer is not None:
+                        yield from phase_timer.finish_events()
                     curl_cmd = ModalBackend.test_curl_command(
                         backend,
                         server_url,
@@ -652,11 +803,14 @@ def _calibrate_endpoint(
     parallel_slots: int,
     price_per_hour_usd: float | None,
     budget_seconds: float,
+    phase_timer: StartupPhaseTimer | None = None,
 ) -> tuple[PerformancePoint, ...]:
     """Measure a bounded performance curve without requiring aiperf."""
 
     root = endpoint_root_url(server_url)
     endpoint = root + "/v1/completions"
+    if phase_timer is not None:
+        phase_timer.calibration_started()
     started = time.monotonic()
     scenarios = [(512, 1), (4096, 1)] + [
         (512, concurrency)

@@ -6,7 +6,7 @@ from rich.markup import render as render_markup
 from textual.app import App
 from textual.coordinate import Coordinate
 from textual.screen import Screen
-from textual.widgets import DataTable, Input, OptionList, Select, Static
+from textual.widgets import Button, DataTable, Input, OptionList, Select, Static
 
 from llm_launchpad.protocol.enums import BackendType
 from llm_launchpad.protocol.models import StorageSnapshot, StoredModelInfo
@@ -153,14 +153,18 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             screen = app.screen
             assert isinstance(screen, StorageScreen)
+            provider_filter = screen.query_one("#storage-provider-filter", Select)
             backend_filter = screen.query_one("#storage-backend-filter", OptionList)
-            self.assertTrue(backend_filter.has_focus)
+            # Provider scope comes first; backend filter retains its selection.
+            self.assertTrue(provider_filter.has_focus)
 
             highlighted = backend_filter.highlighted_option
             self.assertIsNotNone(highlighted)
             assert highlighted is not None
             self.assertEqual(highlighted.id, "filter-vllm")
 
+            backend_filter.focus()
+            await pilot.pause()
             await pilot.press("up")
             await pilot.pause()
             highlighted = backend_filter.highlighted_option
@@ -269,9 +273,13 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             screen = app.screen
             assert isinstance(screen, StorageScreen)
+            provider_filter = screen.query_one("#storage-provider-filter", Select)
             backend_filter = screen.query_one("#storage-backend-filter", OptionList)
 
             self.assertGreater(backend_filter.size.height, 0)
+            self.assertTrue(provider_filter.has_focus)
+            backend_filter.focus()
+            await pilot.pause()
             self.assertTrue(backend_filter.has_focus)
 
     async def test_small_viewport_table_boundary_moves_to_model_id(self) -> None:
@@ -305,14 +313,14 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
             screen = app.screen
             assert isinstance(screen, StorageScreen)
             table = screen.query_one("#storage-table", DataTable)
-            backend_filter = screen.query_one("#storage-backend-filter", OptionList)
+            provider_filter = screen.query_one("#storage-provider-filter", Select)
 
             app.deliver_snapshot()
             await pilot.pause()
             await pilot.pause()
 
             self.assertEqual(table.row_count, 2)
-            self.assertTrue(backend_filter.has_focus)
+            self.assertTrue(provider_filter.has_focus)
 
     async def test_predownload_uses_form_values(self) -> None:
         app = _TestApp()
@@ -332,6 +340,19 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(model_id, "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF")
             self.assertEqual(quant, "Q4_K_M")
             self.assertEqual(revision, "main")
+
+    async def test_predownload_button_uses_form_values(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(StorageScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, StorageScreen)
+            screen.query_one("#storage-model-id", Input).value = "acme/model"
+            screen.query_one("#storage-predownload-btn", Button).press()
+            await pilot.pause()
+
+        self.assertEqual(app.predownload_calls[0][1], "acme/model")
 
     async def test_delete_requires_confirmation_before_calling_backend(self) -> None:
         app = _TestApp()

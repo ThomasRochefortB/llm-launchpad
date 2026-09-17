@@ -21,10 +21,27 @@ _BACKEND_PREFIX = {
     BackendType.VLLM: "vllm",
 }
 
+# Short-lived `modal run` helpers (storage listing, predownload) still create a
+# Modal app. Left unnamed they inherit the backend script's default, which is
+# the legacy app name, and the fleet then lists a phantom endpoint called
+# "default" that nobody deployed. This prefix keeps those runs outside every
+# pattern `infer_backend_from_app_name` claims.
+_UTILITY_APP_PREFIX = "llp-util-"
+
 
 def legacy_app_name(backend: BackendType) -> str:
     """Return the historical single-instance app name for *backend*."""
     return _LEGACY_APP_NAMES[backend]
+
+
+def utility_app_name(backend: BackendType) -> str:
+    """Return the app name for a throwaway `modal run` helper entrypoint."""
+    return f"{_UTILITY_APP_PREFIX}{_BACKEND_PREFIX[backend]}"
+
+
+def is_utility_app_name(app_name: str) -> bool:
+    """Return whether *app_name* belongs to a helper run, not a deployment."""
+    return (app_name or "").strip().startswith(_UTILITY_APP_PREFIX)
 
 
 def slugify_instance_name(raw: str, default: str = "default") -> str:
@@ -103,6 +120,10 @@ def infer_provider_from_app_name(app_name: str) -> ComputeProvider | None:
 
 def infer_backend_from_app_name(app_name: str) -> BackendType | None:
     """Infer backend type from legacy or prefixed app names."""
+    # A helper run is not a deployment, so it must never enter the fleet even
+    # though its name carries a backend prefix.
+    if is_utility_app_name(app_name):
+        return None
     if (
         app_name == _LEGACY_APP_NAMES[BackendType.VLLM]
         or app_name.startswith("vllm-")

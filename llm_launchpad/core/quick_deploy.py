@@ -418,6 +418,12 @@ def retune_quick_deploy_plan(
     )
     tuning = tuning_for_gpu_memory(tuning, plan.quote.gpu_memory_gb)
     tuning = tuning_for_architecture(tuning, profile.gguf_architecture)
+    if profile.runtime_tuning is not None and not tuning.flash_attention:
+        # The physical batch was sized against this model's attention scratch,
+        # which depends on the context and the head count. Changing the
+        # workload objective changes neither, so rebuilding tuning from the
+        # objective must not hand the batch back to its default.
+        tuning = replace(tuning, ubatch_size=profile.runtime_tuning.ubatch_size)
     recipe = replace(
         plan.recipe,
         serving_requirements=requirements,
@@ -591,8 +597,17 @@ def build_quick_deploy_config(
             )
         )
         config.placement_assessment = plan.assessment if plan is not None else None
+        # Declining the toggle has to survive into preflight, which otherwise
+        # resolves MTP from the model itself and would turn it straight back on.
+        config.allow_speculative_decoding = enable_speculative_decoding
         if enable_speculative_decoding:
-            config.speculative_decoding = profile.speculative_decoding
+            # A retuned plan carries the configuration its placement was
+            # assessed with, so it wins over the catalog profile it came from.
+            config.speculative_decoding = (
+                plan.recipe.speculative_decoding
+                if plan is not None
+                else profile.speculative_decoding
+            )
         elif config.runtime_tuning is not None:
             config.runtime_tuning = RuntimeTuning(
                 parallel_slots=config.runtime_tuning.parallel_slots,

@@ -455,7 +455,7 @@ class ImageProbeTests(unittest.TestCase):
                 verify_image_request("https://host/v1", "Qwen3-VL", None, state)
         self.assertEqual(state.verification, VisionVerification.FAILED)
 
-    def test_cancellation_leaves_verification_untested(self) -> None:
+    def test_cancellation_preserves_previous_verification(self) -> None:
         # Shutting down teaches nothing about the model, so a cancelled probe
         # must not be recorded as a failure.
         state = VisionCapabilities(
@@ -468,7 +468,7 @@ class ImageProbeTests(unittest.TestCase):
             with self.assertRaises(ImageProbeCancelled):
                 verify_image_request("https://host/v1", "Qwen3-VL", None, state)
         post.assert_not_called()
-        self.assertEqual(state.verification, VisionVerification.UNTESTED)
+        self.assertEqual(state.verification, VisionVerification.PASSED)
 
     def test_reasoning_only_response_counts_as_a_pass(self) -> None:
         # A thinking model can leave content empty; the server still accepted

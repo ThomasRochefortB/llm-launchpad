@@ -31,7 +31,8 @@ def load_saved_artificial_analysis_api_key(path: Path | None = None) -> str:
         return ""
     if not isinstance(raw, dict):
         return ""
-    return str(raw.get("api_key", "")).strip()
+    api_key = raw.get("api_key")
+    return api_key.strip() if isinstance(api_key, str) else ""
 
 
 def save_artificial_analysis_api_key(api_key: str, path: Path | None = None) -> Path:

@@ -247,6 +247,8 @@ class ModalBackend:
                 cuda_arch = llamacpp_cuda_architecture(config.gpu_type)
                 if cuda_arch:
                     env["LLAMA_CPP_CUDA_ARCHITECTURES"] = cuda_arch
+                build_jobs = os.cpu_count() or 4
+                env["LLAMA_CPP_BUILD_JOBS"] = str(build_jobs)
             if config.llamacpp_image_no_cache is not None:
                 env["LLAMA_CPP_IMAGE_NO_CACHE"] = "true" if config.llamacpp_image_no_cache else "false"
             return env
@@ -652,7 +654,20 @@ class ModalBackend:
                     detail=f"Process exited with code {proc.returncode}",
                 )
         finally:
-            ModalBackend.unregister_proc(proc)
+            # Closing a deployment stream cancels only its own client. Leaving
+            # it alive could publish a resource after cancellation stopped it.
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=5)
+            finally:
+                if proc.stdout is not None:
+                    proc.stdout.close()
+                ModalBackend.unregister_proc(proc)
 
     @staticmethod
     def run_modal_script_entrypoint(

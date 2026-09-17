@@ -1,4 +1,4 @@
-"""Storage management screen for cached models across backends."""
+"""Storage management screen for cached models and provider disks."""
 
 from __future__ import annotations
 
@@ -20,7 +20,8 @@ from ...core.storage_costs import (
     estimate_monthly_storage_cost,
     gross_monthly_storage_cost_usd,
 )
-from ...protocol.enums import BackendType
+from ...core.storage_resources import storage_scope_label
+from ...protocol.enums import BackendType, ComputeProvider
 from ...protocol.models import StorageSnapshot, StoredModelInfo
 from ..navigation import (
     first_enabled_option_index,
@@ -28,7 +29,7 @@ from ..navigation import (
     move_focus_across_option_lists,
     move_focus_across_widgets,
 )
-from ..workers import StorageFailed, StorageLoaded
+from ..workers import PrimeDisksFailed, PrimeDisksLoaded, StorageFailed, StorageLoaded
 from ..responsive import ViewportProfile, WidthMode
 from ..widgets.adaptive_table import AdaptiveColumn, AdaptiveDataTable
 from ..widgets.fitted_footer import FittedFooter
@@ -153,7 +154,7 @@ def _is_focusable_for_arrow_navigation(widget: Widget) -> bool:
 
 
 class StorageScreen(CopyEnabledScreen):
-    """View and pre-download backend model caches."""
+    """View provider storage: Modal cache, Prime disks, and Vast rentals."""
 
     BINDINGS = [
         Binding("up", "navigate_option_list_up", show=False, priority=True),
@@ -165,24 +166,43 @@ class StorageScreen(CopyEnabledScreen):
         Binding("/", "focus_model_filter", "Filter", show=True),
     ]
     NAVIGATION_ORDER = (
+        "storage-provider-filter",
         "storage-backend-filter",
         "storage-table",
         "storage-model-id",
         "storage-model-backend",
         "storage-model-quant",
         "storage-model-revision",
+        "storage-predownload-btn",
     )
 
     def __init__(self, initial_backend: BackendType | None = None) -> None:
         super().__init__()
         self._initial_backend = initial_backend
         self._table_filter = ""
+        self._selected_provider = ComputeProvider.MODAL
+        self._prime_disks: list[object] = []
+        self._prime_error: str | None = None
+        self._selected_prime_disk_id: str | None = None
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(classes="screen-scroll"):
             yield Static("[bold #7bf168]Storage[/]  [dim]Cached models, pre-download, delete[/dim]")
             yield Static("[dim]Storage status appears here.[/dim]", id="storage-status")
-            yield Static("")
+            # Scope rides on the provider label row, and the selector is a
+            # dropdown rather than a list: each extra row here is a table row
+            # lost on an 80x24 terminal, where the inventory must stay visible.
+            yield Static("", id="storage-provider-label")
+            yield Select(
+                options=[
+                    ("Modal · shared volume cache", "modal"),
+                    ("Prime · persistent cache disks", "prime"),
+                    ("Vast · rental-local disks", "vast"),
+                ],
+                value="modal",
+                allow_blank=False,
+                id="storage-provider-filter",
+            )
             yield Static("[bold]Backend filter[/bold]")
             yield OptionList(
                 Option("  All backends", id="filter-all"),
@@ -228,7 +248,9 @@ class StorageScreen(CopyEnabledScreen):
                 placeholder="Revision (optional)",
                 id="storage-model-revision",
             )
-            yield Static("[dim]Press p to pre-download using these values.[/dim]")
+            with Horizontal(id="storage-predownload-actions"):
+                yield Button("Pre-download", id="storage-predownload-btn", variant="primary")
+                yield Static("[dim]Downloads using the values above.[/dim]")
         yield FittedFooter()
 
     def on_mount(self) -> None:
@@ -257,8 +279,17 @@ class StorageScreen(CopyEnabledScreen):
             backend_filter.highlighted = 2
         elif backend_filter.option_count > 0:
             backend_filter.highlighted = 0
+        self._render_scope()
         self.call_after_refresh(self._focus_first_visible_navigation_target)
         self._refresh_storage_snapshot()
+
+    def _render_scope(self) -> None:
+        try:
+            self.query_one("#storage-provider-label", Static).update(
+                f"[bold]Provider[/bold]  [dim]{escape(storage_scope_label(self._selected_provider))}[/dim]"
+            )
+        except Exception:
+            pass
 
     def on_screen_suspend(self, _: events.ScreenSuspend) -> None:
         self._was_suspended = True
@@ -292,6 +323,24 @@ class StorageScreen(CopyEnabledScreen):
                 self._selected_filter = None
             self._render_table()
             return
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id != "storage-provider-filter":
+            return
+        value = str(event.value or "").strip().lower()
+        if value == "prime":
+            provider = ComputeProvider.PRIME
+        elif value == "vast":
+            provider = ComputeProvider.VAST
+        else:
+            provider = ComputeProvider.MODAL
+        if provider == self._selected_provider:
+            return
+        self._selected_provider = provider
+        self._selected_model = None
+        self._selected_prime_disk_id = None
+        self._render_scope()
+        self._refresh_storage_snapshot()
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "storage-filter":
@@ -336,6 +385,9 @@ class StorageScreen(CopyEnabledScreen):
 
     def on_storage_loaded(self, message: StorageLoaded) -> None:
         self._snapshot = message.snapshot
+        if self._selected_provider != ComputeProvider.MODAL:
+            self._render_table()
+            return
         self._render_table()
         estimate = estimate_monthly_storage_cost(self._snapshot)
         # One line, and only the numbers: the instruction that used to trail it
@@ -353,12 +405,89 @@ class StorageScreen(CopyEnabledScreen):
             self.call_after_refresh(self._focus_first_visible_navigation_target)
 
     def on_storage_failed(self, message: StorageFailed) -> None:
+        if self._selected_provider != ComputeProvider.MODAL:
+            return
         self.query_one("#storage-status", Static).update(
             f"[yellow]Storage refresh failed:[/yellow] {escape(message.error)}"
         )
 
+    def on_prime_disks_loaded(self, message: PrimeDisksLoaded) -> None:
+        from ...core.prime_disks import RetainedPrimeDisk
+
+        self._prime_disks = list(message.disks)
+        self._prime_error = None
+        total = sum(
+            (disk.size_gb if isinstance(disk, RetainedPrimeDisk) else int(getattr(disk, "size_gb", 0) or 0))
+            for disk in self._prime_disks
+        )
+        self.query_one("#storage-status", Static).update(
+            f"[green]{len(self._prime_disks)} Prime disk(s)[/green] "
+            f"[dim]· {total} GB retained · stop keeps disks billing; "
+            f"delete unneeded ones[/dim]"
+        )
+        self._render_table()
+
+    def on_prime_disks_failed(self, message: PrimeDisksFailed) -> None:
+        self._prime_disks = []
+        self._prime_error = message.error
+        self.query_one("#storage-status", Static).update(
+            f"[yellow]Prime disk refresh failed:[/yellow] {escape(message.error)}"
+        )
+        self._render_table()
+
+    def _prime_rows(self) -> list[StoredModelInfo]:
+        rows: list[StoredModelInfo] = []
+        for disk in self._prime_disks:
+            disk_id = str(getattr(disk, "id", "") or "").strip()
+            if not disk_id:
+                continue
+            size_gb = getattr(disk, "size_gb", 0) or 0
+            try:
+                size_bytes = int(float(size_gb) * (1024.0**3))
+            except (TypeError, ValueError):
+                size_bytes = 0
+            location = str(getattr(disk, "location", "") or "")
+            status = str(getattr(disk, "status", "") or "")
+            price = getattr(disk, "price_per_hour_usd", 0.0) or 0.0
+            managed = bool(getattr(disk, "managed", True))
+            quant = f"{size_gb} GB" + ("" if managed else " · other")
+            rows.append(
+                StoredModelInfo(
+                    backend=BackendType.LLAMACPP,
+                    model_id=f"prime:{disk_id}",
+                    revision=location or status or "-",
+                    quant=quant,
+                    size_bytes=size_bytes,
+                    file_count=0,
+                    source_volume=f"${float(price):.4f}/hr" if price else "prime-disk",
+                )
+            )
+        query = self._table_filter.strip().casefold()
+        if query:
+            rows = [row for row in rows if query in row.model_id.casefold()]
+        return rows
+
     def _render_table(self) -> None:
         table = self.query_one("#storage-table", AdaptiveDataTable)
+        if self._selected_provider == ComputeProvider.VAST:
+            self._rows_by_key = {}
+            self._selected_model = None
+            table.set_rows([])
+            self._render_empty_state([])
+            return
+        if self._selected_provider == ComputeProvider.PRIME:
+            rows = self._prime_rows()
+            self._rows_by_key = {_storage_row_key(row): row for row in rows}
+            if (
+                self._selected_model is not None
+                and _storage_row_key(self._selected_model) not in self._rows_by_key
+            ):
+                self._selected_model = None
+                self._selected_prime_disk_id = None
+            table.set_rows(rows)
+            self._restored_highlight_key = _current_row_key(table)
+            self._render_empty_state(rows)
+            return
         rows = self._snapshot.llamacpp_models + self._snapshot.vllm_models
         if self._selected_filter is not None:
             rows = [row for row in rows if row.backend == self._selected_filter]
@@ -383,6 +512,28 @@ class StorageScreen(CopyEnabledScreen):
             empty.add_class("hidden")
             table.remove_class("hidden")
             return
+        if self._selected_provider == ComputeProvider.VAST:
+            empty.update(
+                "[dim]Vast rentals use rental-local disks that are destroyed with "
+                "the rental. There is no separate cache to inventory or delete; "
+                "`stop` deletes the disk along with cached models.[/dim]"
+            )
+            empty.remove_class("hidden")
+            table.add_class("hidden")
+            return
+        if self._selected_provider == ComputeProvider.PRIME:
+            if self._prime_error:
+                empty.update(
+                    f"[yellow]Prime disk inventory unavailable:[/yellow] {escape(self._prime_error)}"
+                )
+            else:
+                empty.update(
+                    "[dim]No Prime disks billing. Disks remain billable after a pod "
+                    "stops; delete unneeded ones with prime-disks delete.[/dim]"
+                )
+            empty.remove_class("hidden")
+            table.add_class("hidden")
+            return
         cached_anything = bool(
             self._snapshot.llamacpp_models or self._snapshot.vllm_models
         )
@@ -402,6 +553,11 @@ class StorageScreen(CopyEnabledScreen):
         if selected is None:
             return
         self._selected_model = selected
+        if self._selected_provider == ComputeProvider.PRIME:
+            disk_id = selected.model_id.removeprefix("prime:")
+            self._selected_prime_disk_id = disk_id
+            return
+        self._selected_prime_disk_id = None
         self._prefilled_model_id = selected.model_id
         self.query_one("#storage-model-id", Input).value = selected.model_id
         self.query_one("#storage-model-backend", Select).value = selected.backend.value
@@ -413,9 +569,31 @@ class StorageScreen(CopyEnabledScreen):
 
     def _refresh_storage_snapshot(self, force: bool = False) -> None:
         self.query_one("#storage-status", Static).update("[dim]Refreshing storage snapshot...[/dim]")
+        if self._selected_provider == ComputeProvider.PRIME:
+            refresher = getattr(self.app, "begin_prime_disks_refresh", None)
+            if callable(refresher):
+                refresher(self)
+                return
+            self.query_one("#storage-status", Static).update(
+                "[yellow]Prime disk refresh is unavailable in this session.[/yellow]"
+            )
+            return
+        if self._selected_provider == ComputeProvider.VAST:
+            self._render_table()
+            self.query_one("#storage-status", Static).update(
+                "[dim]Vast has no separate storage inventory; rental disks are destroyed with the rental.[/dim]"
+            )
+            return
         self.app.begin_storage_refresh(self, force=force)  # type: ignore[attr-defined]
 
     def action_predownload_selected(self) -> None:
+        if self._selected_provider != ComputeProvider.MODAL:
+            self.app.notify(
+                "Pre-download targets the Modal shared cache; switch provider to Modal.",
+                severity="warning",
+                timeout=5,
+            )
+            return
         model_id = self.query_one("#storage-model-id", Input).value.strip()
         backend_raw = str(self.query_one("#storage-model-backend", Select).value).strip().lower()
         quant = self.query_one("#storage-model-quant", Input).value.strip() or None
@@ -436,7 +614,25 @@ class StorageScreen(CopyEnabledScreen):
             revision=revision,
         )
 
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "storage-predownload-btn":
+            self.action_predownload_selected()
+
     def action_delete_selected_model(self) -> None:
+        if self._selected_provider == ComputeProvider.VAST:
+            self.app.notify(
+                "Vast rental disks are destroyed with the rental; there is no separate delete.",
+                severity="warning",
+                timeout=5,
+            )
+            return
+        if self._selected_provider == ComputeProvider.PRIME:
+            disk_id = (self._selected_prime_disk_id or "").strip()
+            if not disk_id or self._selected_model is None:
+                self.app.notify("Select a Prime disk row first to delete.", severity="warning", timeout=5)
+                return
+            self.app.push_screen(PrimeDiskDeleteConfirmScreen(disk_id))
+            return
         if self._selected_model is None:
             self.app.notify("Select a model row first to delete.", severity="warning", timeout=5)
             return
@@ -596,3 +792,63 @@ class StorageDeleteConfirmScreen(CopyEnabledScreen):
     def action_confirm_delete(self) -> None:
         self.app.pop_screen()
         self.app.begin_storage_delete(self.model)  # type: ignore[attr-defined]
+
+
+class PrimeDiskDeleteConfirmScreen(CopyEnabledScreen):
+    """Confirm terminating a billable Prime persistent disk."""
+
+    BINDINGS = [
+        Binding("escape", "cancel", "Cancel", show=True),
+        Binding("x", "confirm_delete", "Confirm delete", show=True),
+    ]
+
+    def __init__(self, disk_id: str) -> None:
+        super().__init__()
+        self.disk_id = disk_id
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(classes="screen-scroll"):
+            yield Static("[bold #7bf168]Delete Prime Disk[/]")
+            yield Static("")
+            yield Static(
+                f"Permanently delete Prime disk [bold]{escape(self.disk_id)}[/bold] "
+                "and its cached weights?"
+            )
+            yield Static(
+                "[yellow]The disk keeps billing until deleted. Deleting it means "
+                "the next deploy re-downloads the weights.[/yellow]"
+            )
+            with Horizontal(id="delete-confirm-actions"):
+                yield Button("Cancel", id="delete-cancel")
+                yield Button("Delete disk", id="delete-confirm", variant="error")
+        yield FittedFooter()
+
+    def on_mount(self) -> None:
+        self.query_one("#delete-cancel", Button).focus()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "delete-cancel":
+            self.app.pop_screen()
+        elif event.button.id == "delete-confirm":
+            self.action_confirm_delete()
+
+    def action_cancel(self) -> None:
+        self.app.pop_screen()
+
+    def action_confirm_delete(self) -> None:
+        disk_id = self.disk_id
+        self.app.pop_screen()
+        deleter = getattr(self.app, "begin_prime_disk_delete", None)
+        if callable(deleter):
+            try:
+                screens = list(getattr(self.app, "screen_stack", []))
+                receiver = next(
+                    (screen for screen in reversed(screens) if type(screen).__name__ == "StorageScreen"),
+                    None,
+                )
+                if receiver is not None:
+                    deleter(disk_id, receiver)
+                    return
+            except Exception:
+                pass
+        self.app.notify("Prime disk deletion is unavailable in this session.", severity="error")

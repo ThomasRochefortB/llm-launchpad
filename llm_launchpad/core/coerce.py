@@ -33,9 +33,9 @@ def optional_float(value: Any) -> float | None:
         return None
     try:
         parsed = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
-    return None if math.isnan(parsed) else parsed
+    return parsed if math.isfinite(parsed) else None
 
 
 def positive_int(value: Any) -> int | None:

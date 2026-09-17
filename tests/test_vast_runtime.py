@@ -8,6 +8,7 @@ from llm_launchpad.core.vast_runtime import (
     VAST_RUNTIME_DIR,
     GpuDevice,
     parse_gpu_inventory,
+    parse_startup_probe,
     vast_refusal,
     vast_runtime,
     vast_runtime_image,
@@ -152,6 +153,26 @@ class GpuInventoryTests(unittest.TestCase):
 
 def device(index: int, name: str = "NVIDIA RTX 4090", total: int = 24564, used: int = 0) -> GpuDevice:
     return GpuDevice(index=index, name=name, memory_total_mib=total, memory_used_mib=used)
+
+
+class StartupProbeTests(unittest.TestCase):
+    """The probe reports on a rental that is already billing, so it never raises."""
+
+    def test_reads_partial_download_bytes_and_the_last_log_line(self) -> None:
+        self.assertEqual(
+            parse_startup_probe("BYTES 6614223467\nLOG load_tensors: offloading 63 layers\n"),
+            (6614223467, "load_tensors: offloading 63 layers"),
+        )
+
+    def test_a_download_that_has_not_started_reads_as_zero_not_as_missing(self) -> None:
+        self.assertEqual(parse_startup_probe("BYTES 0\n"), (0, ""))
+
+    def test_unreadable_output_yields_no_progress_rather_than_an_error(self) -> None:
+        self.assertEqual(parse_startup_probe(""), (0, ""))
+        self.assertEqual(parse_startup_probe("BYTES nonsense\nnoise\n"), (0, ""))
+
+    def test_control_characters_are_stripped_from_the_reported_log_line(self) -> None:
+        self.assertEqual(parse_startup_probe("LOG \x1b[32mready\x07")[1], "[32mready")
 
 
 class TopologyVerificationTests(unittest.TestCase):

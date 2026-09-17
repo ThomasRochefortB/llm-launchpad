@@ -4,6 +4,7 @@ from typing import Any
 from collections.abc import Callable, Iterator, Sequence
 import json
 import os
+import threading
 import time
 import fnmatch
 import hashlib
@@ -585,10 +586,114 @@ def _gguf_weight_paths(entrypoint: Path | str) -> list[Path]:
     return [found[index] for index in sorted(found)]
 
 
+# --- Volume hydration caching
+# The first GPU mmap after a large volume write can exceed 30 minutes on a
+# cold Modal volume (GLM-5.3-Flash ~109GiB); sequential hydration covers that
+# first read, and later starts stay fast because pages remain hot. A hydration
+# marker per snapshot makes "already hydrated" cheap: an empty string means
+# skip the cache entirely, "marker" trusts the marker (default), "always"
+# preserves the old behaviour of hydrating on every start.
+HYDRATION_MARKER_DIRNAME = ".llm-launchpad-hydrated"
+# ``or "marker"`` here would fold an explicit empty value back into the default,
+# making the documented skip mode unreachable while the error below went on
+# advertising it. Only an unset variable takes the default.
+LLAMACPP_HYDRATION_MODE = os.environ.get(
+    "LLAMACPP_HYDRATION_MODE", "marker"
+).strip().casefold()
+if LLAMACPP_HYDRATION_MODE not in {"", "marker", "always"}:
+    raise RuntimeError(
+        f"Environment variable LLAMACPP_HYDRATION_MODE must be one of "
+        f"'marker', 'always', or empty (skip), got: {LLAMACPP_HYDRATION_MODE!r}"
+    )
+
+
+def _hub_snapshot_name(model_path: Path | str) -> str | None:
+    """Return the HF snapshot directory name containing a weight file."""
+    try:
+        parts = Path(model_path).resolve().parts
+    except OSError:
+        parts = Path(model_path).parts
+    if "snapshots" in parts:
+        index = len(parts) - 1 - parts[::-1].index("snapshots")
+        if index + 1 < len(parts):
+            return parts[index + 1]
+    return None
+
+
+def _hydration_marker_path(repo_id: str | None, snapshot: str | None) -> Path:
+    """Location of the marker proving one snapshot's weights were hydrated."""
+    repo_slug = _hub_repo_slug((repo_id or "").strip() or "unknown")
+    snap = (snapshot or "").strip() or "unknown"
+    safe_snap = "".join(
+        ch if ch.isalnum() or ch in {"-", "_", "."} else "-" for ch in snap
+    ).strip("-.") or "unknown"
+    return (
+        Path(HF_CACHE_DIR) / HYDRATION_MARKER_DIRNAME / repo_slug / f"{safe_snap}.json"
+    )
+
+
+def _hydration_fingerprint(paths: Sequence[Path | str]) -> list[dict[str, Any]]:
+    """Describe weight files so a later start can confirm nothing changed."""
+    entries: list[dict[str, Any]] = []
+    for raw in paths:
+        path = Path(raw)
+        try:
+            resolved = str(path.resolve())
+        except OSError:
+            resolved = str(path)
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = -1
+        entries.append({"path": resolved, "size": size})
+    return entries
+
+
+def _hydration_marker_matches(
+    marker_path: Path, paths: Sequence[Path | str]
+) -> bool:
+    """Check whether the marker proves these exact weight files were hydrated."""
+    try:
+        payload = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    recorded = payload.get("files")
+    if not isinstance(recorded, list):
+        return False
+    return recorded == _hydration_fingerprint(paths)
+
+
+def _write_hydration_marker(
+    marker_path: Path, paths: Sequence[Path | str]
+) -> None:
+    """Record that these exact weight files were read end to end."""
+    try:
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "files": _hydration_fingerprint(paths),
+                    "hydrated_at_epoch": time.time(),
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        # A missing marker only means the next start hydrates again; never
+        # fail a serve for bookkeeping.
+        print(f"🦙 hydration marker write skipped: {exc}")
+
+
 def _warm_volume_paths(
     paths: Sequence[Path | str],
     *,
     chunk_bytes: int | None = None,
+    record_marker: Path | None = None,
 ) -> None:
     """Read weight files sequentially so the first GPU mmap is not a cold volume fault."""
     chunk = VOLUME_WARM_CHUNK_BYTES if chunk_bytes is None else chunk_bytes
@@ -648,6 +753,24 @@ def _warm_volume_paths(
         f"🦙 volume warm complete: {done / (1024 ** 3):.2f}GiB in {elapsed:.1f}s "
         f"({rate:.2f}MiB/s)"
     )
+    if record_marker is not None:
+        _write_hydration_marker(record_marker, files)
+
+
+def _should_hydrate_volume(
+    marker_path: Path | None, warm_paths: list[Path | str]
+) -> bool:
+    """Decide whether the expensive pre-bind sequential read can be skipped."""
+    if LLAMACPP_HYDRATION_MODE == "":
+        return False
+    if LLAMACPP_HYDRATION_MODE == "always" or marker_path is None:
+        return WARM_VOLUME
+    if not WARM_VOLUME:
+        return False
+    if _hydration_marker_matches(marker_path, warm_paths):
+        print("🦙 volume already hydrated for this snapshot; skipping warm read")
+        return False
+    return True
 
 
 def _download_lease_key(repo_id: str, revision: str | None) -> str:
@@ -776,10 +899,14 @@ def _serving_image() -> modal.Image:
         cuda_arch = os.environ.get("LLAMA_CPP_CUDA_ARCHITECTURES", "").strip()
         if cuda_arch and cuda_arch not in {"75", "80", "86", "89", "90", "100", "120"}:
             raise ValueError(f"Unknown CUDA architecture: {cuda_arch}")
+        build_jobs = os.environ.get("LLAMA_CPP_BUILD_JOBS", "").strip() or "4"
         runtime_image = modal.Image.from_dockerfile(
             Path(__file__).resolve().parents[1] / "data" / recipe,
             add_python="3.12", force_build=LLAMA_CPP_IMAGE_FORCE_BUILD,
-            build_args={"CUDA_ARCHITECTURES": cuda_arch} if cuda_arch else {},
+            build_args={
+                **({"CUDA_ARCHITECTURES": cuda_arch} if cuda_arch else {}),
+                "BUILD_JOBS": build_jobs,
+            },
         )
     else:
         runtime_image = modal.Image.from_registry(
@@ -1172,6 +1299,51 @@ def _resolve_fit_binary() -> str | None:
     return None
 
 
+# Trace, not debug: enough for the memory planner's own arithmetic without
+# turning on every backend's device chatter.
+FIT_LOG_VERBOSITY = 4
+
+# Lines the planner logs while deciding, ordered as it prints them.
+_FIT_EVIDENCE_MARKERS = (
+    "projected to use",
+    "need to reduce device memory by",
+    "MiB less in total",
+    "free vs. target of",
+)
+
+
+def fit_evidence_lines(output: str) -> list[str]:
+    """Return llama.cpp's own memory arithmetic from a fit run's output."""
+
+    return [
+        line.strip()
+        for line in output.splitlines()
+        if any(marker in line for marker in _FIT_EVIDENCE_MARKERS)
+    ]
+
+
+def _fit_rejection_message(output: str, *, returncode: int) -> str:
+    """Explain a rejected plan in terms of the memory it was short of.
+
+    llama.cpp reports the guard it stopped at, which for a GPU-only plan is
+    always the explicit ``--n-gpu-layers``: the planner only reaches that guard
+    after finding it cannot meet the free-memory margin and cannot shrink a
+    context the caller pinned. Quoting that message alone reads like a bad
+    argument rather than a placement that is too small, so lead with the cause
+    and carry the planner's numbers.
+    """
+
+    message = (
+        "llama.cpp rejected the full-context GPU-only serving plan: the model, "
+        "its full-context cache and the compute graph do not fit this "
+        f"placement's GPUs with the requested margin (fit exit {returncode})."
+    )
+    evidence = fit_evidence_lines(output)
+    if evidence:
+        return message + " llama.cpp measured: " + "; ".join(evidence)
+    return message
+
+
 def _fit_relevant_args(server_args: list[str]) -> list[str]:
     """Keep common memory-affecting flags understood by llama-fit-params."""
 
@@ -1342,8 +1514,19 @@ def serve():
         warm_paths: list[Path | str] = [*_gguf_weight_paths(model_path)]
         if projector_path:
             warm_paths.append(projector_path)
-        _warm_volume_paths(warm_paths)
+        marker_path: Path | None = None
+        if _hub_snapshot_name(model_path) is not None or model_repo_id:
+            marker_path = _hydration_marker_path(
+                model_repo_id, _hub_snapshot_name(model_path)
+            )
+        hydrate = _should_hydrate_volume(marker_path, warm_paths)
+    else:
+        warm_paths = []
+        marker_path = None
+        hydrate = False
 
+    fit_binary: str | None = None
+    fit_command: list[str] | None = None
     if serving_fingerprint:
         fit_binary = _resolve_fit_binary()
         if fit_binary:
@@ -1351,32 +1534,75 @@ def serve():
                 fit_binary,
                 "--model",
                 str(model_path),
+                # The planner's measurements are logged at trace level. Without
+                # this the only thing a rejected plan leaves behind is the
+                # abort message, which names whichever guard the planner
+                # reached rather than the memory it was short of.
+                "--verbosity",
+                str(FIT_LOG_VERBOSITY),
                 *_fit_relevant_args(server_args),
             ]
-            print("🧭 verifying full-context device fit:")
-            print(" ", " ".join(fit_command))
-            fit_result = subprocess.run(
-                fit_command,
-                env=server_env,
-                cwd=server_cwd,
-                capture_output=True,
-                text=True,
-                timeout=15 * 60,
-            )
-            if fit_result.stdout:
-                print(fit_result.stdout.rstrip())
-            if fit_result.stderr:
-                print(fit_result.stderr.rstrip())
-            if fit_result.returncode != 0:
-                raise RuntimeError(
-                    "llama.cpp rejected the full-context GPU-only serving plan "
-                    f"(fit exit {fit_result.returncode})."
+
+    def _print_fit_output(stdout: str, stderr: str, returncode: int) -> None:
+        if stdout:
+            print(stdout.rstrip())
+        if stderr:
+            print(stderr.rstrip())
+        if returncode != 0:
+            raise RuntimeError(
+                _fit_rejection_message(
+                    f"{stdout}\n{stderr}",
+                    returncode=returncode,
                 )
-        else:
-            print(
-                "⚠️ llama-fit-params is unavailable; startup success with explicit "
-                "all-GPU layers will be used as the residency guard."
             )
+
+    def _run_fit_command(command: list[str]) -> None:
+        result = subprocess.run(
+            command,
+            env=server_env,
+            cwd=server_cwd,
+            capture_output=True,
+            text=True,
+            timeout=15 * 60,
+        )
+        _print_fit_output(result.stdout or "", result.stderr or "", result.returncode)
+
+    if hydrate and fit_command is not None:
+        # Both steps are read-only on the volume (sequential warm read plus the
+        # planner's header/sizing pass), so run them together instead of paying
+        # both latencies back to back before the server can bind.
+        print("🧭 verifying full-context device fit (in parallel with volume warm):")
+        print(" ", " ".join(fit_command))
+        fit_error: list[BaseException | None] = [None]
+
+        def _run_fit_check() -> None:
+            try:
+                _run_fit_command(fit_command)
+            except BaseException as exc:  # keep the warm read from masking it
+                fit_error[0] = exc
+
+        fit_thread = threading.Thread(target=_run_fit_check, daemon=True)
+        fit_thread.start()
+        try:
+            _warm_volume_paths(warm_paths, record_marker=marker_path)
+        finally:
+            fit_thread.join()
+        if fit_error[0] is not None:
+            raise fit_error[0]
+        fit_command = None
+    elif hydrate:
+        _warm_volume_paths(warm_paths, record_marker=marker_path)
+
+    if serving_fingerprint and fit_command is not None:
+        assert fit_binary is not None
+        print("🧭 verifying full-context device fit:")
+        print(" ", " ".join(fit_command))
+        _run_fit_command(fit_command)
+    elif serving_fingerprint and not fit_binary:
+        print(
+            "⚠️ llama-fit-params is unavailable; startup success with explicit "
+            "all-GPU layers will be used as the residency guard."
+        )
     command = [
         server_bin,
         "--model",

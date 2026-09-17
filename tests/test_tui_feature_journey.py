@@ -37,6 +37,16 @@ class _JourneyApp(TuiApp):
         self.push_screen(MainMenuScreen(username="audit"))
 
 
+def _inline_job_worker(self: TuiApp, persistent_id: str) -> None:
+    """Run a durable job in-process for hermetic journey tests."""
+    import threading
+
+    from llm_launchpad.core.job_runner import run_job
+
+    store = self._get_job_store()
+    threading.Thread(target=run_job, args=(persistent_id, store), daemon=True).start()
+
+
 class TuiFeatureJourneyTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.patches = ExitStack()
@@ -63,6 +73,13 @@ class TuiFeatureJourneyTests(unittest.IsolatedAsyncioTestCase):
             return_value=aggregate_compute_availability(),
         ))
         activate_static_like_catalog()
+        # Durable deploys run in detached worker processes in production,
+        # which would escape these parent-process mocks (and the network
+        # isolation). Run the worker inline so the mocked orchestrator below
+        # still answers, exactly like production's worker loop does.
+        self.patches.enter_context(
+            patch.object(TuiApp, "_spawn_job_worker", _inline_job_worker)
+        )
         self.app = _JourneyApp()
         self.row = _endpoint("vllm-audit", "ap-audit")
         self.row.model_name = "org/audit-model"
@@ -72,6 +89,10 @@ class TuiFeatureJourneyTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.orchestrator = Mock()
         self.app._orchestrator = self.orchestrator
+        self.patches.enter_context(patch(
+            "llm_launchpad.core.job_runner._orchestrator",
+            return_value=self.orchestrator,
+        ))
         snapshot = _sample_snapshot()
         snapshot.llamacpp_models = [replace(snapshot.llamacpp_models[0], incomplete=False)]
         for method, operation, data in (

@@ -156,7 +156,9 @@ def prepare_vision(config: DeploymentConfig) -> VisionCapabilities:
         projector_repo = config.projector_repo or repo
         if not projector_repo:
             raise ValueError("Vision requires a model repository and a projector.")
-        projector_revision = config.projector_revision or (vision.model_revision if projector_repo == repo else None)
+        projector_revision = config.projector_revision or (
+            (vision.model_revision or revision) if projector_repo == repo else None
+        )
         if projector_repo != repo or config.projector_revision or not vision.model_revision:
             info = HfApi().model_info(projector_repo, revision=projector_revision, files_metadata=True, timeout=10)
             projector_revision, files = info.sha, _siblings(info)

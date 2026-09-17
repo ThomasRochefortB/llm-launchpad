@@ -44,9 +44,9 @@ def assistant_text(message: dict) -> str:
         return content
     if isinstance(content, list):
         parts = " ".join(
-            str(part.get("text", ""))
+            part["text"]
             for part in content
-            if isinstance(part, dict)
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
         )
         if parts.strip():
             return parts
@@ -82,6 +82,7 @@ def verify_image_request(url: str, model: str | None, api_key: str | None, visio
     headers = {"Content-Type": "application/json"}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
+    previous_verification = vision.verification
     vision.verification = VisionVerification.UNTESTED
     try:
         if is_shutting_down():
@@ -97,6 +98,7 @@ def verify_image_request(url: str, model: str | None, api_key: str | None, visio
             raise ValueError("Image request returned no assistant text.")
     except ImageProbeCancelled:
         # Nothing was learned, so the previous verification stands.
+        vision.verification = previous_verification
         vision.message = "Image verification cancelled before it finished."
         raise
     except Exception:

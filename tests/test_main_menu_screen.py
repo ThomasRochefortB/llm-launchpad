@@ -3,25 +3,24 @@ from __future__ import annotations
 import unittest
 from unittest.mock import Mock, patch
 
-from rich.markup import render as render_markup
 
 from llm_launchpad.core.modal_auth import ModalAuthStatus
 from llm_launchpad.core.artificial_analysis import ArtificialAnalysisAuthStatus
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider
-from llm_launchpad.protocol.models import EndpointInfo, StorageSnapshot, StoredModelInfo
+from llm_launchpad.protocol.models import EndpointInfo
+from llm_launchpad.core.provider_billing import (
+    BalanceKind,
+    BillingStatus,
+    ProviderBilling,
+)
 from llm_launchpad.tui.screens.main_menu import (
     MainMenuScreen,
+    ProviderBillingLoaded,
     _render_auth_status_block,
     _render_artificial_analysis_auth_status,
-    _render_billing_load_error,
-    _render_billing_report,
     _render_deployment_status,
     _render_hf_auth_status,
     _render_modal_auth_status,
-    _render_prime_billing_load_error,
-    _render_prime_billing_report,
-    _render_provider_billing_body,
-    _render_vast_billing_report,
     _should_show_in_panel,
 )
 from llm_launchpad.core.hf_auth import HuggingFaceAuthStatus
@@ -122,7 +121,12 @@ class MainMenuStatusRenderTests(unittest.TestCase):
 
         rendered = _render_deployment_status(rows, username="alice")
         self.assertIn("3 active launchpad apps", rendered)
-        self.assertIn("1 healthy", rendered)
+        # A deployed Modal app without an explicit check is "not checked",
+        # never "healthy": background refreshes must not wake the container
+        # to learn whether it is warm.
+        self.assertIn("0 healthy", rendered)
+        self.assertIn("1 not checked", rendered)
+        self.assertIn("health not checked", rendered)
         self.assertIn("1 in progress", rendered)
         self.assertIn("1 error", rendered)
         self.assertIn("qwen", rendered)
@@ -162,200 +166,6 @@ class MainMenuStatusRenderTests(unittest.TestCase):
         self.assertTrue(_should_show_in_panel("running"))
         self.assertTrue(_should_show_in_panel("deploying"))
         self.assertTrue(_should_show_in_panel("failed"))
-
-    def test_render_billing_report_includes_total_and_current_month_label(self) -> None:
-        payload = {
-            "summary": {
-                "total_usd": 12.5,
-                "gpu_cost_usd": 8.1,
-                "period_start": "2026-02-01",
-                "period_end": "2026-02-18",
-            }
-        }
-
-        rendered = _render_billing_report(payload)
-        self.assertIn("Workspace Spend", rendered)
-        self.assertIn("Current month spend", rendered)
-        self.assertIn("$12.50", rendered)
-        self.assertIn("$8.10", rendered)
-
-    def test_render_billing_report_includes_storage_estimate_separately(self) -> None:
-        payload = {"summary": {"total_usd": 12.5, "gpu_cost_usd": 8.1}}
-        snapshot = StorageSnapshot(
-            llamacpp_models=[
-                StoredModelInfo(
-                    backend=BackendType.LLAMACPP,
-                    model_id="Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
-                    size_bytes=1024 * _GIB,
-                    file_count=1,
-                    source_volume="huggingface-cache",
-                )
-            ],
-            vllm_models=[
-                StoredModelInfo(
-                    backend=BackendType.VLLM,
-                    model_id="Qwen/Qwen3-4B",
-                    size_bytes=2 * _GIB,
-                    file_count=2,
-                    source_volume="huggingface-cache",
-                )
-            ],
-        )
-
-        rendered = _render_billing_report(payload, storage_snapshot=snapshot)
-
-        self.assertIn("[dim]total[/dim] [bold]$12.50[/bold]", rendered)
-        self.assertIn("[dim]gpu[/dim] $8.10", rendered)
-        self.assertIn("Launchpad storage est.", rendered)
-        self.assertIn("$0.18/mo", rendered)
-        self.assertIn("1,026 GiB cached", rendered)
-        self.assertIn("2.00 GiB billable after 1 TiB free", rendered)
-
-    def test_render_billing_report_handles_unrecognized_payload(self) -> None:
-        rendered = _render_billing_report("not-json")
-        self.assertIn("Billing data unavailable", rendered)
-
-    def test_render_billing_report_aggregates_list_payload(self) -> None:
-        payload = [
-            {"Description": "app-a", "Interval Start": "2026-02-13T00:00:00", "Cost": "1.25"},
-            {"Description": "app-b", "Interval Start": "2026-02-18T00:00:00", "Cost": "2.75"},
-        ]
-        rendered = _render_billing_report(payload)
-        self.assertIn("Workspace Spend", rendered)
-        self.assertIn("Current month spend", rendered)
-        self.assertIn("$4.00", rendered)
-
-    def test_render_billing_report_empty_list_shows_zero_total(self) -> None:
-        rendered = _render_billing_report([])
-        self.assertIn("Workspace Spend", rendered)
-        self.assertIn("Current month spend", rendered)
-        self.assertIn("$0.00", rendered)
-        self.assertNotIn("No billed usage", rendered)
-
-    def test_render_billing_load_error_escapes_rich_markup_chars(self) -> None:
-        rendered = _render_billing_load_error("Usage: modal [red]COMMAND[/red]")
-        self.assertEqual(
-            str(render_markup(rendered)).splitlines()[-1],
-            "Usage: modal [red]COMMAND[/red]",
-        )
-
-    def test_render_prime_billing_report_shows_balance_and_resource_totals(self) -> None:
-        payload = {
-            "wallet_id": "wallet-1",
-            "balance_usd": 41.25,
-            "currency": "USD",
-            "recent_billings": [
-                {"amount_usd": 1.25, "resource_type": "compute"},
-                {"amount_usd": 0.75, "resource_type": "compute"},
-                {"amount_usd": "0.50", "resource_type": "disks"},
-                {"amount_usd": None, "resource_type": "inference"},
-            ],
-        }
-
-        rendered = _render_prime_billing_report(payload)
-        self.assertIn("Prime Intellect Wallet", rendered)
-        self.assertIn("[dim]balance[/dim] [bold]$41.25[/bold]", rendered)
-        self.assertIn("[dim]recent charges[/dim]", rendered)
-        self.assertIn("compute $2.00", rendered)
-        self.assertIn("disks $0.50", rendered)
-        self.assertNotIn("inference", rendered)
-
-    def test_render_prime_billing_report_handles_unrecognized_payload(self) -> None:
-        rendered = _render_prime_billing_report("not-json")
-        self.assertIn("Prime Intellect Wallet", rendered)
-        self.assertIn("Wallet data unavailable", rendered)
-        self.assertIn("prime wallet", rendered)
-
-    def test_render_prime_billing_report_without_rows_shows_placeholder(self) -> None:
-        rendered = _render_prime_billing_report({"balance_usd": 5, "recent_billings": []})
-        self.assertIn("$5.00", rendered)
-        self.assertIn("No recent billing rows.", rendered)
-
-    def test_render_prime_billing_load_error_escapes_rich_markup_chars(self) -> None:
-        rendered = _render_prime_billing_load_error("denied [bold]401[/bold]")
-        self.assertEqual(
-            str(render_markup(rendered)).splitlines()[-1],
-            "denied [bold]401[/bold]",
-        )
-
-    def test_vast_credit_is_reported_beside_modal_and_prime(self) -> None:
-        """Vast bills against credit, so the panel that names every provider's
-        spend had no business omitting the one that runs out."""
-        body = _render_provider_billing_body(
-            modal_payload={"summary": {"total_usd": 12.5}},
-            modal_error=None,
-            prime_state="loaded",
-            prime_payload={"balance_usd": 3},
-            prime_error=None,
-            vast_state="loaded",
-            vast_payload={"credit_usd": 8.13, "balance_usd": 0.0, "available_usd": 8.13},
-        )
-        self.assertIn("Workspace Spend", body)
-        self.assertIn("Prime Intellect Wallet", body)
-        self.assertIn("Vast.ai Credit", body)
-        self.assertIn("[bold]$8.13[/bold]", body)
-
-    def test_an_unconfigured_vast_key_names_the_command(self) -> None:
-        body = _render_provider_billing_body(
-            modal_payload=None, modal_error=None,
-            prime_state="loading", prime_payload=None, prime_error=None,
-            vast_state="unavailable",
-        )
-        self.assertIn("llm-launchpad vast-auth login", body)
-
-    def test_a_failed_vast_read_shows_its_reason(self) -> None:
-        body = _render_provider_billing_body(
-            modal_payload=None, modal_error=None,
-            prime_state="loading", prime_payload=None, prime_error=None,
-            vast_state="failed", vast_error="Vast request failed (HTTP 429).",
-        )
-        self.assertIn("Credit unavailable.", body)
-        self.assertIn("HTTP 429", body)
-
-    def test_an_owed_balance_is_called_out(self) -> None:
-        rendered = _render_vast_billing_report(
-            {"credit_usd": 0.0, "balance_usd": -4.25, "available_usd": -4.25}
-        )
-        self.assertIn("owed $4.25", rendered)
-
-    def test_a_malformed_credit_payload_does_not_raise(self) -> None:
-        for payload in (None, {}, {"available_usd": None}, "nonsense"):
-            with self.subTest(payload=payload):
-                self.assertIn("Vast.ai Credit", _render_vast_billing_report(payload))
-
-    def test_provider_billing_body_combines_modal_and_prime_sections(self) -> None:
-        body = _render_provider_billing_body(
-            modal_payload={"summary": {"total_usd": 12.5}},
-            modal_error=None,
-            prime_state="loaded",
-            prime_payload={"balance_usd": 3},
-            prime_error=None,
-        )
-        self.assertIn("Workspace Spend", body)
-        self.assertIn("$12.50", body)
-        self.assertIn("Prime Intellect Wallet", body)
-        self.assertIn("[bold]$3.00[/bold]", body)
-
-    def test_provider_billing_body_reports_unauthenticated_prime(self) -> None:
-        body = _render_provider_billing_body(
-            modal_payload=None,
-            modal_error=None,
-            prime_state="unavailable",
-            prime_payload=None,
-            prime_error=None,
-        )
-        self.assertIn("Not authenticated (run: prime login)", body)
-
-    def test_provider_billing_body_keeps_modal_error_while_prime_loads(self) -> None:
-        body = _render_provider_billing_body(
-            modal_payload=None,
-            modal_error="Modal timed out",
-            prime_state="loading",
-            prime_payload=None,
-            prime_error=None,
-        )
-        self.assertIn("Modal timed out", body)
-        self.assertIn("Refreshing wallet...", body)
 
     def test_render_hf_auth_status_hides_authenticated_username(self) -> None:
         rendered = _render_hf_auth_status(
@@ -432,32 +242,116 @@ class MainMenuStatusRenderTests(unittest.TestCase):
         self.assertNotIn("alice", rendered)
 
 
-class BillingPanelStorageTests(unittest.TestCase):
-    def test_storage_estimate_survives_a_failed_modal_billing_call(self) -> None:
-        """The estimate is local data and does not depend on Modal billing.
+class ProviderBillingWiringTests(unittest.TestCase):
+    """The panel's three workers and eleven attributes became one of each."""
 
-        Rendering only the billing error hid the sole standing warning that
-        cached models are still costing money.
-        """
-        snapshot = StorageSnapshot(
-            llamacpp_models=[
-                StoredModelInfo(
-                    backend=BackendType.LLAMACPP, model_id="m", size_bytes=1400 * _GIB
-                )
-            ],
-            vllm_models=[],
+    def _screen(self) -> MainMenuScreen:
+        screen = MainMenuScreen(username="alice")
+        screen._secondary_refresh_started = True
+        return screen
+
+    def test_every_provider_starts_out_checking(self) -> None:
+        screen = self._screen()
+        self.assertEqual(
+            {row.status for row in screen._provider_billing.values()},
+            {BillingStatus.LOADING},
         )
-        rendered = _render_provider_billing_body(
-            modal_payload=None,
-            modal_error="modal CLI not found",
-            prime_state="unavailable",
-            prime_payload=None,
-            prime_error=None,
-            storage_snapshot=snapshot,
+
+    def test_one_pass_reads_every_provider(self) -> None:
+        """Three independent workers with three in-flight flags became one
+        fan-out, so a slow provider no longer holds up the two beside it."""
+        screen = self._screen()
+        posted: list[ProviderBillingLoaded] = []
+        rows = {
+            ComputeProvider.MODAL: ProviderBilling.ready(
+                ComputeProvider.MODAL, BalanceKind.SPEND_MTD, 1.0
+            ),
+            ComputeProvider.PRIME: ProviderBilling.ready(
+                ComputeProvider.PRIME, BalanceKind.BALANCE, 2.0
+            ),
+            ComputeProvider.VAST: ProviderBilling.ready(
+                ComputeProvider.VAST, BalanceKind.CREDIT, 3.0
+            ),
+        }
+        with patch.object(screen, "post_message", posted.append), patch(
+            "llm_launchpad.tui.screens.main_menu.load_modal_billing",
+            return_value=rows[ComputeProvider.MODAL],
+        ), patch(
+            "llm_launchpad.tui.screens.main_menu.load_prime_billing",
+            return_value=rows[ComputeProvider.PRIME],
+        ), patch(
+            "llm_launchpad.tui.screens.main_menu.load_vast_billing",
+            return_value=rows[ComputeProvider.VAST],
+        ):
+            screen._run_load_provider_billing(
+                modal_authenticated=True, prime_authenticated=True
+            )
+
+        loaded = [m.row for m in posted if isinstance(m, ProviderBillingLoaded)]
+        self.assertEqual({row.provider for row in loaded}, set(rows))
+
+    def test_a_loader_that_raises_becomes_that_provider_s_failure(self) -> None:
+        screen = self._screen()
+        posted: list[object] = []
+        with patch.object(screen, "post_message", posted.append), patch(
+            "llm_launchpad.tui.screens.main_menu.load_modal_billing",
+            side_effect=RuntimeError("boom"),
+        ), patch(
+            "llm_launchpad.tui.screens.main_menu.load_prime_billing",
+            return_value=ProviderBilling.loading(ComputeProvider.PRIME),
+        ), patch(
+            "llm_launchpad.tui.screens.main_menu.load_vast_billing",
+            return_value=ProviderBilling.loading(ComputeProvider.VAST),
+        ):
+            screen._run_load_provider_billing(
+                modal_authenticated=True, prime_authenticated=True
+            )
+
+        modal = next(
+            m.row
+            for m in posted
+            if isinstance(m, ProviderBillingLoaded)
+            and m.row.provider is ComputeProvider.MODAL
         )
-        self.assertIn("Billing unavailable.", rendered)
-        self.assertIn("Launchpad storage est.", rendered)
-        self.assertIn("1,400 GiB cached", rendered)
+        self.assertIs(modal.status, BillingStatus.FAILED)
+        self.assertIn("boom", modal.error or "")
+
+    def test_an_unauthenticated_provider_names_its_setup_command(self) -> None:
+        """Modal had no unconfigured state and leaked a CLI error instead."""
+        screen = self._screen()
+        with patch.object(screen, "_update_billing_panel"):
+            screen._apply_auth_to_billing(ComputeProvider.MODAL, False)
+        row = screen._provider_billing[ComputeProvider.MODAL]
+        self.assertIs(row.status, BillingStatus.UNCONFIGURED)
+        self.assertEqual(row.setup_command, "modal setup")
+
+    def test_an_auth_wobble_does_not_discard_a_reading_in_hand(self) -> None:
+        screen = self._screen()
+        screen._provider_billing[ComputeProvider.PRIME] = ProviderBilling.ready(
+            ComputeProvider.PRIME, BalanceKind.BALANCE, 12.0
+        )
+        with patch.object(screen, "_update_billing_panel"):
+            screen._apply_auth_to_billing(ComputeProvider.PRIME, False)
+        self.assertEqual(screen._provider_billing[ComputeProvider.PRIME].amount_usd, 12.0)
+
+    def test_authenticating_starts_a_read_once_the_deferred_pass_has_begun(self) -> None:
+        screen = self._screen()
+        with patch.object(screen, "_refresh_provider_billing") as refresh:
+            screen._apply_auth_to_billing(ComputeProvider.PRIME, True)
+        refresh.assert_called_once_with()
+
+    def test_auth_before_first_paint_does_not_jump_the_deferred_pass(self) -> None:
+        """Billing stays deferred so the first paint is not held up by it."""
+        screen = MainMenuScreen(username="alice")
+        with patch.object(screen, "_refresh_provider_billing") as refresh:
+            screen._apply_auth_to_billing(ComputeProvider.PRIME, True)
+        refresh.assert_not_called()
+
+    def test_a_settled_pass_lets_the_next_one_start(self) -> None:
+        screen = self._screen()
+        screen._billing_refresh_inflight = True
+        screen.on_provider_billing_finished(Mock())
+        self.assertFalse(screen._billing_refresh_inflight)
 
 
 if __name__ == "__main__":
