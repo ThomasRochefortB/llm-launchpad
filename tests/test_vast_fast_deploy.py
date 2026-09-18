@@ -117,6 +117,19 @@ class VastModelComparisonTests(unittest.TestCase):
         self.assertEqual(vast_offer().gpu_memory_gib, 24)
         self.assertEqual(vast_offers_for_model(comparison_model(total=24.2), (vast_offer(),)), ())
 
+    def test_cheaper_incompatible_host_does_not_shadow_eligible_host(self) -> None:
+        # An incompatible host must be filtered before cheapest-per-topology
+        # selection, not after: otherwise the cheap host wins the grouping
+        # and the model loses a topology it could actually rent.
+        rows = vast_offers_for_model(comparison_model(), (
+            vast_offer(id=1001, dph_base=0.1, dph_total=0.12, cuda_max_good=11.4),
+            vast_offer(id=1002, dph_base=0.4, dph_total=0.42),
+        ))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].offer.id, "1002")
+        self.assertEqual(rows[0].costs.total_per_hour_usd, 0.42)
+        self.assertTrue(rows[0].assessment.fits)
+
     def test_multi_gpu_offer_keeps_whole_machine_price(self) -> None:
         rows = vast_offers_for_model(comparison_model(total=40), (
             vast_offer(), vast_offer(id=1002, num_gpus=2, dph_base=0.7, dph_total=0.72),

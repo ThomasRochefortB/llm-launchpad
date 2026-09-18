@@ -186,9 +186,9 @@ class SettingsFeedbackTests(unittest.IsolatedAsyncioTestCase):
                     await pilot.pause()
 
                     feedback = screen.query_one("#save-feedback", Static)
-                    self.assertIn("must be an integer", str(feedback.render()))
+                    self.assertIn("must be seconds", str(feedback.render()))
                     self.assertIn(
-                        "Scaledown must be an integer",
+                        "Idle timeout",
                         "\n".join(_rendered_lines(app)),
                         f"save feedback never reached the terminal at {size}",
                     )
@@ -251,6 +251,39 @@ class FooterFitTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("more (?)", rendered)
             # The shortcut that opens the full list must itself survive.
             self.assertIn("? Help", rendered)
+
+    async def test_narrow_terminal_prioritizes_help_back_and_choose(self) -> None:
+        """Presentation order, not binding order, decides the footer at 80 cols."""
+        app = _ReviewApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            screen = await self._menu(pilot, app)
+            footer = screen.query_one(FittedFooter)
+            shown = [
+                key.description
+                for key in footer.query(FooterKey)
+                if not key.has_class("-command-palette")
+                and not key.has_class("-overflow")
+            ]
+            self.assertIn("Help", shown)
+            self.assertNotIn("Operations", shown)
+
+    async def test_show_help_is_never_dropped_for_the_overflow_marker(self) -> None:
+        """Even a one-hint budget keeps the way back to the hidden hints."""
+        from textual.binding import Binding
+
+        from llm_launchpad.tui.widgets.fitted_footer import _hint_width
+
+        app = _ReviewApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            screen = await self._menu(pilot, app)
+            footer = screen.query_one(FittedFooter)
+            groups = [
+                [(Binding("a", "first_action", "First hint"), True, "")],
+                [(Binding("?", "show_help", "Help"), True, "")],
+            ]
+            shown, hidden = footer._fit(footer._prioritize(groups), _hint_width("?", "Help") + 1)
+            self.assertEqual([binding.action for (binding, _, _) in shown], ["show_help"])
+            self.assertEqual(hidden, 1)
 
     async def test_every_hint_is_shown_when_they_all_fit(self) -> None:
         app = _ReviewApp()

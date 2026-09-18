@@ -79,11 +79,33 @@ def _summarize(report: dict[str, Any]) -> dict[str, Any]:
         ]
         return max(values) if values else None
 
+    def scenario_of(key: str, only_single: bool = False) -> str | None:
+        matches = [
+            point for point in points
+            if point.get(key) is not None
+            and (not only_single or point.get("concurrency") == 1)
+        ]
+        if not matches:
+            return None
+        winner = max(matches, key=lambda point: point[key])
+        prompt = winner.get("prompt_tokens")
+        concurrency = winner.get("concurrency")
+        return f"prompt={prompt} c={concurrency}"
+
+    single_scenario = scenario_of("output_tokens_per_second", only_single=True)
+    aggregate_scenario = scenario_of("aggregate_output_tokens_per_second")
+    if single_scenario != aggregate_scenario:
+        # The two speeds come from different workloads; comparing either
+        # across arms without naming the scenario compares unlike runs.
+        single_scenario = f"{single_scenario} (single-prompt run)"
+        aggregate_scenario = f"{aggregate_scenario} (batch run)"
     return {
         "kv_cache_gb": memory.get("kv_cache_gb"),
         "total_gb": memory.get("total_gb"),
         "single_tps": best("output_tokens_per_second", only_single=True),
+        "single_scenario": single_scenario,
         "aggregate_tps": best("aggregate_output_tokens_per_second"),
+        "aggregate_scenario": aggregate_scenario,
         "prompt_tps": best("prompt_tokens_per_second"),
         "ttft_s": min(
             (p["time_to_first_token_seconds"] for p in points

@@ -31,7 +31,13 @@ _EXPLICIT_BITS = {
     "F32": 32,
     "FP32": 32,
 }
-_QUANT_BITS_RE = re.compile(r"(?i)(?:^|[-_])I?Q(\d)")
+# ``I`` is llama.cpp's importance-matrix prefix and ``T`` its ternary one, and
+# both leave the bit width in the same place. Reading only ``IQ``/``Q`` left the
+# ternary builds unrecognised, and an unrecognised label is scored at the
+# quality floor -- so TQ1_0, at about 1.69 bits per weight, ranked level with
+# Q4_K_M and disclosed nothing. That is precisely the silent degradation this
+# module exists to stop.
+_QUANT_BITS_RE = re.compile(r"(?i)(?:^|[-_])[IT]?Q(\d)")
 
 
 def quant_bits(quant: str | None) -> int | None:

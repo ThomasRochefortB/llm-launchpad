@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 
 from rich.markup import escape
@@ -25,10 +26,26 @@ from ..navigation import move_focus_with_arrows
 from .copy_enabled import CopyEnabledScreen
 
 
+_DURATION_PATTERN = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([smh]?)\s*$", re.IGNORECASE)
+
+
+def parse_scaledown_window(value: str) -> int:
+    """Parse a human duration into whole seconds for idle scale-down.
+
+    Accepts plain seconds (``1800``), or suffixed ``90s`` / ``30m`` / ``2h``.
+    Fractional values round to the nearest second.
+    """
+    match = _DURATION_PATTERN.match(value or "")
+    if match is None:
+        raise ValueError(f"Cannot parse duration: {value!r}")
+    amount = float(match.group(1))
+    unit = (match.group(2) or "s").lower()
+    multiplier = {"s": 1, "m": 60, "h": 3600}[unit]
+    return max(0, int(round(amount * multiplier)))
+
+
 class SettingsScreen(CopyEnabledScreen):
     """Edit and persist scaledown, appearance, and TUI behavior settings."""
-
-    AUTO_FOCUS = "#scaledown-window"
 
     BINDINGS = [
         Binding("escape", "pop_screen", "Back", show=True),
@@ -60,63 +77,69 @@ class SettingsScreen(CopyEnabledScreen):
         settings = loaded.settings
         self._load_error = loaded.error
 
-        with VerticalScroll(id="settings-scroll", classes="screen-scroll"):
-            with Vertical(id="settings-form"):
-                yield Static("[bold #7bf168]Settings[/]", id="settings-title")
-                yield Static("[bold]Deployment[/bold]", classes="settings-section")
-                yield FormField(
-                    "Scaledown window (seconds)",
-                    "scaledown-window",
-                    default=str(settings.scaledown_window),
-                    hint="Seconds before idle containers scale down",
-                )
-                yield Static("[bold]Appearance[/bold]", classes="settings-section")
-                with Horizontal(id="settings-appearance-row"):
-                    with Vertical(classes="settings-appearance-control"):
-                        yield Static("Theme", classes="form-label")
-                        yield Select(
-                            TUI_THEME_OPTIONS,
-                            value=normalize_tui_theme(settings.tui_theme),
-                            allow_blank=False,
-                            id="tui-theme",
-                        )
-                        yield Static("[dim]Color palette[/dim]", classes="form-hint")
-                    with Vertical(classes="settings-appearance-control"):
-                        yield Static("Density", classes="form-label")
-                        yield Select(
-                            TUI_DENSITY_OPTIONS,
-                            value=normalize_tui_density(settings.tui_density),
-                            allow_blank=False,
-                            id="tui-density",
-                        )
-                        yield Static("[dim]Spacing[/dim]", classes="form-hint")
-                yield Static("[bold]Behavior[/bold]", classes="settings-section")
-                yield ToggleField(
-                    "Enable mouse support",
-                    "tui-mouse",
-                    # Unset does not mean on: over SSH the default resolves to
-                    # off so the terminal keeps its own selection. Showing a
-                    # flat True told an SSH user that clicks were enabled while
-                    # the app was ignoring every one of them.
-                    default=(
-                        settings.tui_mouse
-                        if settings.tui_mouse is not None
-                        else default_tui_mouse_enabled()
-                    ),
-                )
-                yield Static(
-                    "[dim]Off enables native terminal text selection and copy shortcuts; "
-                    "ctrl+t toggles this at runtime.[/dim]",
-                    classes="form-hint",
-                )
-                yield ToggleField(
-                    "Require a second Ctrl+C to quit",
-                    "confirm-quit",
-                    default=settings.confirm_quit,
-                )
-                with Horizontal(id="settings-actions"):
-                    yield Button("Save", id="save-btn", variant="primary")
+        with Vertical(id="settings-layout"):
+            with VerticalScroll(id="settings-scroll", classes="screen-scroll"):
+                with Vertical(id="settings-form"):
+                    yield Static("[bold #7bf168]Settings[/]", id="settings-title")
+                    yield Static("[bold]Deployment[/bold]", classes="settings-section")
+                    yield FormField(
+                        "Idle timeout before scale-down",
+                        "scaledown-window",
+                        default=str(settings.scaledown_window),
+                        hint="e.g. 30m, 90s, or 1800 · idle containers scale to zero after this",
+                    )
+                    yield Static("[bold]Appearance[/bold]", classes="settings-section")
+                    with Horizontal(id="settings-appearance-row"):
+                        with Vertical(classes="settings-appearance-control"):
+                            yield Static("Theme", classes="form-label")
+                            yield Select(
+                                TUI_THEME_OPTIONS,
+                                value=normalize_tui_theme(settings.tui_theme),
+                                allow_blank=False,
+                                id="tui-theme",
+                            )
+                            yield Static("[dim]Color palette[/dim]", classes="form-hint")
+                        with Vertical(classes="settings-appearance-control"):
+                            yield Static("Density", classes="form-label")
+                            yield Select(
+                                TUI_DENSITY_OPTIONS,
+                                value=normalize_tui_density(settings.tui_density),
+                                allow_blank=False,
+                                id="tui-density",
+                            )
+                            yield Static("[dim]Spacing[/dim]", classes="form-hint")
+                    yield Static("[bold]Behavior[/bold]", classes="settings-section")
+                    yield ToggleField(
+                        "Enable mouse support",
+                        "tui-mouse",
+                        # Unset does not mean on: over SSH the default resolves to
+                        # off so the terminal keeps its own selection. Showing a
+                        # flat True told an SSH user that clicks were enabled while
+                        # the app was ignoring every one of them.
+                        default=(
+                            settings.tui_mouse
+                            if settings.tui_mouse is not None
+                            else default_tui_mouse_enabled()
+                        ),
+                    )
+                    yield Static(
+                        "[dim]Off enables native terminal text selection and copy shortcuts; "
+                        "ctrl+t toggles this at runtime.[/dim]",
+                        classes="form-hint",
+                    )
+                    yield ToggleField(
+                        "Require a second Ctrl+C to quit",
+                        "confirm-quit",
+                        default=settings.confirm_quit,
+                    )
+                    yield Static("[bold]Providers[/bold]", classes="settings-section")
+                    yield Static(
+                        "[dim]Vast.ai marketplace rentals and saved keys.[/dim]",
+                        classes="form-hint",
+                    )
                     yield Button("Vast.ai rentals", id="vast-preview-btn")
+            with Horizontal(id="settings-actions"):
+                yield Button("Save", id="save-btn", variant="primary")
                 yield Static(
                     f"[yellow]{escape(self._load_error)} Using defaults.[/yellow]"
                     if self._load_error
@@ -145,6 +168,11 @@ class SettingsScreen(CopyEnabledScreen):
             self.app.push_screen(VastPreviewScreen())
 
     def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "scaledown-window":
+            try:
+                event.input.remove_class("-invalid")
+            except Exception:
+                pass
         self._mark_dirty()
 
     def on_select_changed(self, event: Select.Changed) -> None:
@@ -160,48 +188,43 @@ class SettingsScreen(CopyEnabledScreen):
         self._announce("[yellow]Unsaved changes — ctrl+s to save.[/yellow]")
 
     def _announce(self, markup: str) -> None:
-        """Update the feedback line and make sure it is actually on screen.
+        """Update the feedback line in the persistent action bar.
 
-        The form is taller than a short terminal, and this line sits at the
-        very bottom of it. Writing to a widget below the fold reported a failed
-        save, an unsaved-changes warning, and the second-esc-to-discard prompt
-        to nobody; every one of them looked like the key had done nothing.
+        Save lives outside the scrolling form now, so feedback is always
+        visible: no scrolling to the bottom, and the viewport never jumps away
+        from the field being edited.
         """
         try:
             feedback = self.query_one("#save-feedback", Static)
         except Exception:
             return
         feedback.update(markup)
-        # Until this message arrived the line was empty, so it had no height to
-        # scroll to. The reveal has to wait for the layout that the update it
-        # just made will trigger.
-        self.call_after_refresh(self._reveal_feedback)
-
-    def _reveal_feedback(self) -> None:
-        """Scroll the foot of the form into view, where the message lives.
-
-        Not ``scroll_to_widget``: this line sits in the scroll container's own
-        bottom padding, which counts as inside the window even though nothing
-        is drawn there, so that call treats an invisible line as visible and
-        can scroll away from it. The feedback is the last element of the form,
-        which makes the end of the form the right place to land.
-        """
-        try:
-            scroll = self.query_one("#settings-scroll", VerticalScroll)
-        except Exception:
-            return
-        scroll.scroll_end(animate=False, immediate=True)
 
     def action_save(self) -> None:
         self._save()
 
+    def _reject_scaledown(self) -> None:
+        """Flag the timeout field in place so the error cannot scroll away."""
+        try:
+            field = self.query_one("#scaledown-window", Input)
+        except Exception:
+            self._announce("[red]Idle timeout must be seconds or a duration like 30m.[/red]")
+            return
+        field.add_class("-invalid")
+        field.focus()
+        self._announce("[red]Idle timeout must be seconds or a duration like 30m.[/red]")
+
     def _save(self) -> None:
         scaledown_str = self.query_one("#scaledown-window", Input).value.strip()
         try:
-            scaledown = int(scaledown_str)
+            scaledown = parse_scaledown_window(scaledown_str)
         except ValueError:
-            self._announce("[red]Scaledown must be an integer.[/red]")
+            self._reject_scaledown()
             return
+        try:
+            self.query_one("#scaledown-window", Input).remove_class("-invalid")
+        except Exception:
+            pass
 
         settings = LaunchpadSettings(
             scaledown_window=scaledown,

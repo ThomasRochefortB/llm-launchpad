@@ -149,13 +149,33 @@ def check_modal_readiness(*, verify: bool = True, refresh: bool = False) -> Prov
             ),
         )
     if not verify:
+        # An executable on PATH is not a credential. Reporting the install as
+        # "credentials present" collapsed the two states this module exists to
+        # keep apart, and it opened the setup gate on a Modal CLI that had
+        # never been authenticated. Prime and Vast read their stored key here;
+        # Modal's equivalent is its own local auth state, so it is read too.
+        try:
+            local = get_modal_auth_status()
+        except Exception:
+            local = None
+        if local is not None and not local.authenticated:
+            return _store(
+                ComputeProvider.MODAL,
+                verify,
+                ProviderReadiness(
+                    provider=ComputeProvider.MODAL,
+                    stage=ProviderReadinessStage.MISSING_CREDENTIALS,
+                    detail=local.error or "not authenticated",
+                    hint="run: modal setup",
+                ),
+            )
         return _store(
             ComputeProvider.MODAL,
             verify,
             ProviderReadiness(
                 provider=ComputeProvider.MODAL,
                 stage=ProviderReadinessStage.CREDENTIALS_PRESENT,
-                detail="Modal CLI installed; authentication not verified",
+                detail="Modal CLI authenticated locally; not verified over the network",
                 hint="run: modal setup",
             ),
         )
@@ -430,12 +450,4 @@ def has_provider_credentials(*, refresh: bool = False) -> bool:
             check_prime_readiness(verify=False, refresh=refresh),
             check_vast_readiness(verify=False, refresh=refresh),
         )
-    )
-
-
-def any_provider_verified(*, refresh: bool = False) -> bool:
-    """Whether any provider has passed a live authentication check."""
-    return any(
-        readiness.verified
-        for readiness in check_all_provider_readiness(verify=True, refresh=refresh)
     )

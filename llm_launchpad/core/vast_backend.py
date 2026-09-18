@@ -9,7 +9,10 @@ from typing import Any
 
 import requests
 
-from ..protocol.models import OfferCostBreakdown, VastAuthStatus, VastInstance, VastOffer, VastOfferQuery
+from ..protocol.models import (
+    OfferCostBreakdown, VastAuthStatus, VastInstance, VastOffer, VastOfferQuery,
+    vast_raw_mib_to_display_gb,
+)
 from .coerce import optional_float, positive_int
 from .vast_auth import VastCredentials, normalize_vast_api_key, resolve_vast_credentials
 
@@ -148,9 +151,8 @@ def parse_vast_offer(raw: Any, query: VastOfferQuery) -> VastOffer | None:
         return None
     return VastOffer(
         id=str(offer_id), machine_id=str(machine_id), gpu_type=gpu_type,
-        gpu_count=count, gpu_memory_gb=memory / 1000,
-        reliability=reliability, disk_gb=query.disk_gb,
-        disk_capacity_gb=disk,
+        gpu_count=count, gpu_memory_gb=vast_raw_mib_to_display_gb(memory),
+        reliability=reliability, disk_gb=query.disk_gb,        disk_capacity_gb=disk,
         cuda_max_good=_nonnegative(raw.get("cuda_max_good")),
         compute_capability=_compute_capability(raw.get("compute_cap")),
         inet_down_mbps=_nonnegative(raw.get("inet_down")),

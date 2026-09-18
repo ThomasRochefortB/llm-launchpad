@@ -134,24 +134,6 @@ class ProviderBilling:
             owed_usd=owed_usd,
         )
 
-    def with_notes(self, *notes: str) -> ProviderBilling:
-        """Return a copy carrying extra notes, whatever the status."""
-        extra = tuple(note for note in notes if note)
-        if not extra:
-            return self
-        return ProviderBilling(
-            provider=self.provider,
-            status=self.status,
-            kind=self.kind,
-            amount_usd=self.amount_usd,
-            charges=self.charges,
-            notes=self.notes + extra,
-            owed_usd=self.owed_usd,
-            setup_command=self.setup_command,
-            error=self.error,
-        )
-
-
 def money_float(value: Any) -> float | None:
     """Coerce a billing figure that may arrive as ``"$1,234.50"`` text."""
     if isinstance(value, str):

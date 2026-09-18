@@ -252,7 +252,7 @@ class TuiFeatureJourneyTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(self.app.screen, StorageScreen)
             self._capture("storage")
             self.app.screen.query_one("#storage-table").focus()
-            await pilot.press("p")
+            await pilot.press("p", "enter")
             await self._settle(pilot)
             self.orchestrator.predownload_model.assert_called_once()
             await pilot.press("enter")

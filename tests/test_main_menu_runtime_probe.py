@@ -17,7 +17,6 @@ from llm_launchpad.tui.screens.main_menu import (
     _probe_row_runtime_status,
     _runtime_bucket,
     _runtime_bucket_from_modal_state,
-    _runtime_display,
 )
 
 _VLLM_METRICS = """vllm:prompt_tokens_total{model_name="qwen"} 1200.0
@@ -422,21 +421,6 @@ class RuntimeBucketTests(unittest.TestCase):
             _runtime_bucket(_row(state="deployed", runtime_status="healthy")),
             "healthy",
         )
-
-    def test_health_display_names_the_last_check_age(self) -> None:
-        import time
-
-        row = _row(state="deployed", runtime_status="healthy")
-        row.runtime_checked_at = time.time() - 300
-        rendered = _runtime_display(row, now=time.time())
-        self.assertIn("healthy", rendered)
-        self.assertIn("checked", rendered)
-        self.assertIn("ago", rendered)
-
-    def test_unchecked_display_does_not_claim_health(self) -> None:
-        rendered = _runtime_display(_row(state="deployed"))
-        self.assertIn("health not checked", rendered)
-        self.assertNotIn("healthy", rendered.replace("health not checked", ""))
 
 
 if __name__ == "__main__":

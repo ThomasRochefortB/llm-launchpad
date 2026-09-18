@@ -16,7 +16,6 @@ from rich.markup import escape
 
 from ..format import (
     clip,
-    format_age,
     format_token_count,
     format_token_rate,
 )
@@ -248,6 +247,53 @@ def _render_artificial_analysis_auth_status(
     )
 
 
+def _connection_summary(
+    modal_status: ModalAuthStatus | None = None,
+    prime_status: PrimeAuthStatus | None = None,
+) -> str:
+    """One-line provider connection state for the compact home header.
+
+    Optional providers (unconfigured, no key) read neutrally; only failed
+    checks and explicit errors use warning styling. Full per-provider detail
+    lives in the Details view.
+    """
+    connected: list[str] = []
+    pending: list[str] = []
+    failed: list[str] = []
+    if modal_status is not None:
+        if modal_status.authenticated:
+            connected.append("Modal")
+        elif modal_status.error:
+            failed.append("Modal")
+        else:
+            pending.append("Modal")
+    if prime_status is not None:
+        if prime_status.authenticated:
+            connected.append("Prime")
+        elif prime_status.error:
+            failed.append("Prime")
+        else:
+            pending.append("Prime")
+    try:
+        credentials = resolve_vast_credentials()
+        if credentials.api_key:
+            connected.append("Vast.ai")
+    except ValueError:
+        failed.append("Vast.ai")
+    parts: list[str] = []
+    if connected:
+        parts.append(f"[green]{len(connected)} connected[/green]")
+    if pending:
+        parts.append(f"[dim]{len(pending)} pending[/dim]")
+    elif modal_status is None and prime_status is None and not connected:
+        parts.append("[dim]checking...[/dim]")
+    if failed:
+        parts.append(f"[yellow]{len(failed)} needs attention[/yellow]")
+    if not parts:
+        return "[dim]Providers: not configured[/dim]"
+    return f"[dim]Providers:[/dim] {' · '.join(parts)}"
+
+
 def _render_auth_status_block(
     username: str = "",
     modal_status: ModalAuthStatus | None = None,
@@ -305,59 +351,6 @@ def _runtime_bucket(row: EndpointInfo) -> str:
     if row.provider in SCALE_TO_ZERO_PROVIDERS and _state_bucket(row.state) == "healthy":
         return "unchecked"
     return _runtime_bucket_from_modal_state(row.state)
-
-
-def _style_runtime_bucket(bucket: str) -> str:
-    normalized = (bucket or "").strip().lower()
-    if normalized == "healthy":
-        return "[green]healthy[/green]"
-    if normalized == "in_progress":
-        return "[yellow]in progress[/yellow]"
-    if normalized == "error":
-        return "[red]error[/red]"
-    if normalized == "unchecked":
-        return "[dim]health not checked[/dim]"
-    return f"[dim]{escape(normalized or 'unknown')}[/dim]"
-
-
-def _runtime_display(row: EndpointInfo, *, now: float | None = None) -> str:
-    """Styled health plus the age of the last explicit check, when known.
-
-    Passive Modal rows never claim "healthy" from provider state alone: they
-    show either "health not checked" or the last user-requested verdict with
-    its age, so a green label always means a container answered, not that an
-    app row exists.
-    """
-    bucket = _runtime_bucket(row)
-    styled = _style_runtime_bucket(bucket)
-    if row.provider not in SCALE_TO_ZERO_PROVIDERS:
-        return styled
-    checked_at = row.runtime_checked_at
-    if checked_at is None:
-        try:
-            from ...core.runtime_health import get_health as _get_health
-
-            stored = _get_health(row)
-            if stored is not None:
-                checked_at = stored.checked_at_epoch
-                # The row predates the observation (fresh fleet listing); show
-                # the stored verdict's age without mutating the shared cache.
-                if (row.runtime_status or "").strip().lower() != stored.status:
-                    styled = _style_runtime_bucket(stored.status)
-                    bucket = stored.status
-        except Exception:
-            stored = None
-    if checked_at is None:
-        return styled
-    try:
-        moment = time.time() if now is None else now
-        age = max(0.0, moment - float(checked_at))
-        # format_age already ends in "ago" (or reads "just now"), so the
-        # sentence supplies only the verb: appending another one produced
-        # "checked 12m ago ago" and "checked just now ago".
-        return f"{styled} [dim](checked {format_age(age)})[/dim]"
-    except Exception:
-        return styled
 
 
 @dataclass(frozen=True)
@@ -540,27 +533,12 @@ def _backend_display_name(backend: BackendType | None) -> str:
 
 
 def _friendly_count_line(rows: list[EndpointInfo]) -> list[str]:
-    runtime_counts = Counter(_runtime_bucket(row) for row in rows)
+    from ..fleet_status import fleet_summary_line
+
     backend_counts = Counter(
         row.backend.value if row.backend is not None else "unknown"
         for row in rows
     )
-    healthy = runtime_counts.get("healthy", 0)
-    in_progress = runtime_counts.get("in_progress", 0)
-    errors = runtime_counts.get("error", 0)
-    unchecked = runtime_counts.get("unchecked", 0)
-
-    noun = "launchpad app" if len(rows) == 1 else "launchpad apps"
-    chips = [f"[green]{healthy} healthy[/green]"]
-    if unchecked:
-        chips.append(f"[dim]{unchecked} not checked[/dim]")
-    if in_progress:
-        chips.append(f"[yellow]{in_progress} in progress[/yellow]")
-    if errors:
-        chips.append(f"[red]{errors} error[/red]")
-    summary = f"[bold]{len(rows)} active {noun}[/bold]"
-    if chips:
-        summary += "  " + "  ".join(chips)
 
     backend_parts = []
     if backend_counts.get("vllm", 0):
@@ -569,7 +547,7 @@ def _friendly_count_line(rows: list[EndpointInfo]) -> list[str]:
         backend_parts.append(f"{backend_counts['llamacpp']} llama.cpp")
     if not backend_parts:
         backend_parts.append(f"{len(rows)} launchpad")
-    return [summary, f"[dim]{' | '.join(backend_parts)}[/dim]", ""]
+    return [fleet_summary_line(rows), f"[dim]{' | '.join(backend_parts)}[/dim]", ""]
 
 
 def _wrap_url_for_panel(value: str, width: int = 44) -> list[str]:
@@ -680,12 +658,14 @@ def _render_deployment_status(
 
     app_lines = []
     for index, row in enumerate(display_rows):
+        from ..fleet_status import deployment_and_health_line
+
         instance = (row.instance_name or "").strip() or "default"
         backend_name = _backend_display_name(row.backend)
         app_lines.append(
             f"[bold]{escape(instance)}[/bold]  "
-            f"[dim]{escape(backend_name)}[/dim]  {_runtime_display(row)} "
-            f"[dim]({row.provider.value}: {escape((row.state or 'unknown').strip().lower())})[/dim]"
+            f"[dim]{escape(backend_name)} · {row.provider.value}[/dim]\n"
+            f"  {deployment_and_health_line(row)}"
         )
         traffic_line = _serving_panel_line(row)
         if traffic_line:
@@ -853,6 +833,7 @@ class MainMenuScreen(CopyEnabledScreen):
                             "[dim]↑/↓ select · enter open · i details[/dim]",
                             id="compact-menu-help",
                         )
+                        yield Static("", id="fleet-summary-line")
                     with Vertical(id="main-menu-side-column"):
                         with Vertical(id="deployment-status-panel"):
                             yield Static("[bold #7bf168]Deployment Status[/]", id="deployment-status-title")
@@ -1032,15 +1013,8 @@ class MainMenuScreen(CopyEnabledScreen):
                 break
 
     def action_toggle_details(self) -> None:
-        """Expose secondary fleet and billing panels as a narrow drawer."""
-        if not self.viewport_profile.narrow and not self.viewport_profile.short:
-            self.notify(
-                "Fleet and billing panels are already visible on this screen size.",
-                title="Details",
-                timeout=3,
-            )
-            return
-        self.toggle_class("show-secondary-panel")
+        """Open fleet, billing and connection detail as a full-width view."""
+        self.app.push_screen(HomeDetailsScreen(self))  # type: ignore[attr-defined]
 
     def action_close_details(self) -> None:
         """Close the narrow details drawer without changing screens."""
@@ -1143,19 +1117,35 @@ class MainMenuScreen(CopyEnabledScreen):
             if callable(notifier):
                 notifier()
 
+    def _render_connection_widgets(self) -> None:
+        """Refresh both the full auth block and the compact summary line."""
+        try:
+            self.query_one("#auth-status-block", Static).update(
+                _render_auth_status_block(
+                    username=self.username,
+                    modal_status=self._modal_auth_status,
+                    hf_status=self._hf_auth_status,
+                    prime_status=self._prime_auth_status,
+                    aai_status=self._aai_auth_status,
+                )
+            )
+        except Exception:
+            pass
+        # The compact line is fleet-first once rows arrive; connection state
+        # until then. _update_fleet_summary owns it afterwards.
+        if not self._runtime_rows:
+            try:
+                self.query_one("#fleet-summary-line", Static).update(
+                    _connection_summary(self._modal_auth_status, self._prime_auth_status)
+                )
+            except Exception:
+                pass
+
     def _refresh_modal_auth_status(self) -> None:
         if self._modal_auth_refresh_inflight:
             return
         self._modal_auth_refresh_inflight = True
-        self.query_one("#auth-status-block", Static).update(
-            _render_auth_status_block(
-                username=self.username,
-                modal_status=self._modal_auth_status,
-                hf_status=self._hf_auth_status,
-                prime_status=self._prime_auth_status,
-                aai_status=self._aai_auth_status,
-            )
-        )
+        self._render_connection_widgets()
         self.run_worker(
             self._run_load_modal_auth_status,
             name="main-menu-modal-auth-worker",
@@ -1175,15 +1165,7 @@ class MainMenuScreen(CopyEnabledScreen):
     def on_modal_auth_loaded(self, message: ModalAuthLoaded) -> None:
         self._modal_auth_refresh_inflight = False
         self._modal_auth_status = message.status
-        self.query_one("#auth-status-block", Static).update(
-            _render_auth_status_block(
-                username=self.username,
-                modal_status=self._modal_auth_status,
-                hf_status=self._hf_auth_status,
-                prime_status=self._prime_auth_status,
-                aai_status=self._aai_auth_status,
-            )
-        )
+        self._render_connection_widgets()
         self._apply_auth_to_billing(
             ComputeProvider.MODAL, message.status.authenticated
         )
@@ -1204,30 +1186,14 @@ class MainMenuScreen(CopyEnabledScreen):
     def on_prime_auth_loaded(self, message: PrimeAuthLoaded) -> None:
         self._prime_auth_refresh_inflight = False
         self._prime_auth_status = message.status
-        self.query_one("#auth-status-block", Static).update(
-            _render_auth_status_block(
-                username=self.username,
-                modal_status=self._modal_auth_status,
-                hf_status=self._hf_auth_status,
-                prime_status=self._prime_auth_status,
-                aai_status=self._aai_auth_status,
-            )
-        )
+        self._render_connection_widgets()
         self._apply_auth_to_billing(ComputeProvider.PRIME, message.status.authenticated)
 
     def _refresh_hf_auth_status(self) -> None:
         if self._hf_auth_refresh_inflight:
             return
         self._hf_auth_refresh_inflight = True
-        self.query_one("#auth-status-block", Static).update(
-            _render_auth_status_block(
-                username=self.username,
-                modal_status=self._modal_auth_status,
-                hf_status=self._hf_auth_status,
-                prime_status=self._prime_auth_status,
-                aai_status=self._aai_auth_status,
-            )
-        )
+        self._render_connection_widgets()
         self.run_worker(
             self._run_load_hf_auth_status,
             name="main-menu-hf-auth-worker",
@@ -1247,15 +1213,7 @@ class MainMenuScreen(CopyEnabledScreen):
     def on_hugging_face_auth_loaded(self, message: HuggingFaceAuthLoaded) -> None:
         self._hf_auth_refresh_inflight = False
         self._hf_auth_status = message.status
-        self.query_one("#auth-status-block", Static).update(
-            _render_auth_status_block(
-                username=self.username,
-                modal_status=self._modal_auth_status,
-                hf_status=self._hf_auth_status,
-                prime_status=self._prime_auth_status,
-                aai_status=self._aai_auth_status,
-            )
-        )
+        self._render_connection_widgets()
 
     def _refresh_aai_auth_status(self) -> None:
         if self._aai_auth_refresh_inflight:
@@ -1286,15 +1244,7 @@ class MainMenuScreen(CopyEnabledScreen):
     ) -> None:
         self._aai_auth_refresh_inflight = False
         self._aai_auth_status = message.status
-        self.query_one("#auth-status-block", Static).update(
-            _render_auth_status_block(
-                username=self.username,
-                modal_status=self._modal_auth_status,
-                hf_status=self._hf_auth_status,
-                prime_status=self._prime_auth_status,
-                aai_status=self._aai_auth_status,
-            )
-        )
+        self._render_connection_widgets()
 
     def _refresh_panels(self) -> None:
         if not self._is_active_screen():
@@ -1508,6 +1458,26 @@ class MainMenuScreen(CopyEnabledScreen):
                 discovery=self._fleet_discovery,
             )
         )
+        self._update_fleet_summary(visible_rows)
+
+    def _update_fleet_summary(self, rows: list[EndpointInfo] | None = None) -> None:
+        """Keep the compact always-visible fleet line in step with the panel."""
+        from ..fleet_status import fleet_summary_line
+
+        try:
+            summary = self.query_one("#fleet-summary-line", Static)
+        except Exception:
+            return
+        current = rows if rows is not None else [
+            row for row in self._runtime_rows if _should_show_in_panel(row.state)
+        ]
+        if not current and self._status_refresh_inflight:
+            summary.update("[dim]Checking fleet...[/dim]")
+            return
+        if not current:
+            summary.update("[dim]No active endpoints · Deploy to start[/dim]")
+            return
+        summary.update(fleet_summary_line(current))
 
     @staticmethod
     def _runtime_fingerprint(rows: list[EndpointInfo]) -> tuple[tuple[object, ...], ...]:
@@ -1532,6 +1502,7 @@ class MainMenuScreen(CopyEnabledScreen):
             "[yellow]Status unavailable.[/yellow]\n"
             f"[dim]{clip(message.error, 80)}[/dim]"
         )
+        self._update_fleet_summary([])
 
     def on_provider_billing_loaded(self, message: ProviderBillingLoaded) -> None:
         self._provider_billing[message.row.provider] = message.row
@@ -1576,3 +1547,61 @@ class MainMenuScreen(CopyEnabledScreen):
 
     def action_select_settings(self) -> None:
         self.app.action_push_settings()  # type: ignore[attr-defined]
+
+
+class HomeDetailsScreen(CopyEnabledScreen):
+    """Full-width Fleet / Billing / Connections view for compact terminals.
+
+    Replaces the narrow overlay drawer, which covered the menu it was meant
+    to accompany and left the fleet panel too short to read. Escape returns
+    to the menu with its selection intact.
+    """
+
+    BINDINGS = [
+        Binding("escape", "pop_screen", "Back", show=True),
+        Binding("m", "open_manage", "Manage", show=True),
+    ]
+
+    def __init__(self, menu: MainMenuScreen) -> None:
+        super().__init__()
+        self._menu = menu
+
+    def compose(self) -> ComposeResult:
+        from textual.containers import VerticalScroll
+
+        from ..widgets.fitted_footer import FittedFooter
+
+        with VerticalScroll(classes="screen-scroll"):
+            yield Static("[bold #7bf168]Details[/]  [dim]Fleet, billing, connections[/dim]")
+            yield Static("[bold]Fleet[/bold]", classes="settings-section")
+            yield Static("[dim]Loading fleet...[/dim]", id="home-details-fleet")
+            yield Static("[bold]Billing[/bold]", classes="settings-section")
+            yield Static("[dim]Loading billing...[/dim]", id="home-details-billing")
+            yield Static("[bold]Connections[/bold]", classes="settings-section")
+            yield Static("[dim]Loading connections...[/dim]", id="home-details-connections")
+        yield FittedFooter()
+
+    def on_mount(self) -> None:
+        menu = self._menu
+        try:
+            fleet = menu.query_one("#deployment-status-body", Static).content
+            self.query_one("#home-details-fleet", Static).update(fleet)
+        except Exception:
+            pass
+        try:
+            billing = menu.query_one("#billing-report-body", Static).content
+            self.query_one("#home-details-billing", Static).update(billing)
+        except Exception:
+            pass
+        try:
+            connections = menu.query_one("#auth-status-block", Static).content
+            self.query_one("#home-details-connections", Static).update(connections)
+        except Exception:
+            pass
+
+    def action_pop_screen(self) -> None:
+        self.app.pop_screen()
+
+    def action_open_manage(self) -> None:
+        self.app.pop_screen()
+        self.app.action_push_manage()  # type: ignore[attr-defined]

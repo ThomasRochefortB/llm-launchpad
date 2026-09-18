@@ -13,14 +13,6 @@ class DeploymentCancelled(Exception):
     """Stop advancing a deployment after the current provider call returns."""
 
 
-class DeploymentFallback(Exception):
-    """Continue the same job with another approved placement."""
-
-    def __init__(self, config: DeploymentConfig) -> None:
-        super().__init__("Trying the next approved placement")
-        self.config = config
-
-
 @dataclass
 class DeploymentJob:
     """Retain a deployment's monitor and cancellation state for this session."""

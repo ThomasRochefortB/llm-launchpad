@@ -52,7 +52,18 @@ class SettingsScreenTests(unittest.IsolatedAsyncioTestCase):
             screen._save()
 
             feedback = str(screen.query_one("#save-feedback", Static).content)
-            self.assertIn("Scaledown must be an integer", feedback)
+            self.assertIn("Idle timeout", feedback)
+            self.assertTrue(screen.query_one("#scaledown-window", Input).has_class("-invalid"))
+
+    async def test_scaledown_accepts_human_durations(self) -> None:
+        from llm_launchpad.tui.screens.settings import parse_scaledown_window
+
+        self.assertEqual(parse_scaledown_window("900"), 900)
+        self.assertEqual(parse_scaledown_window("90s"), 90)
+        self.assertEqual(parse_scaledown_window("30m"), 1800)
+        self.assertEqual(parse_scaledown_window("2h"), 7200)
+        with self.assertRaises(ValueError):
+            parse_scaledown_window("nope")
 
 
 if __name__ == "__main__":

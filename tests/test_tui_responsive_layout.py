@@ -144,6 +144,8 @@ class ResponsiveLayoutTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(keys[0].region.y, footer.region.bottom - 1)
 
     async def test_main_menu_hides_secondary_content_when_space_is_constrained(self) -> None:
+        from llm_launchpad.tui.screens.main_menu import HomeDetailsScreen
+
         screen = MainMenuScreen(username="alice", version="1.0")
         app = _ScreenApp(screen)
 
@@ -160,13 +162,15 @@ class ResponsiveLayoutTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(side_column.display)
                 self.assertTrue(screen.query_one("#auth-status-block").display)
                 self.assertTrue(screen.query_one("#action-list").display)
+                # The compact summary stays visible when panels hide.
+                self.assertTrue(screen.query_one("#fleet-summary-line").display)
 
                 screen.action_toggle_details()
                 await pilot.pause()
-                self.assertTrue(side_column.display)
-                screen.action_close_details()
+                self.assertIsInstance(app.screen, HomeDetailsScreen)
+                await pilot.press("escape")
                 await pilot.pause()
-                self.assertFalse(side_column.display)
+                self.assertIs(app.screen, screen)
 
                 await pilot.resize_terminal(50, 35)
                 await pilot.pause()
@@ -400,13 +404,16 @@ class ResponsiveLayoutTests(unittest.IsolatedAsyncioTestCase):
 
                 header = screen.query_one("#compact-menu-header", Static)
                 help_text = screen.query_one("#compact-menu-help", Static)
+                summary = screen.query_one("#fleet-summary-line", Static)
                 auth = screen.query_one("#auth-status-block", Static)
                 footer = screen.query_one(Footer)
 
                 self.assertTrue(header.display)
                 self.assertTrue(help_text.display)
+                self.assertTrue(summary.display)
                 self.assertFalse(footer.display)
-                self.assertLessEqual(auth.region.y - help_text.region.bottom, 2)
+                self.assertLessEqual(summary.region.y - help_text.region.bottom, 2)
+                self.assertLessEqual(auth.region.y - summary.region.bottom, 2)
                 self.assertLess(auth.region.y, screen.region.height // 2)
 
 

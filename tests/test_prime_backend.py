@@ -641,6 +641,42 @@ class PrimeBackendTests(unittest.TestCase):
             },
         )
 
+    def test_portable_vllm_env_enables_xet_high_performance_downloads(self) -> None:
+        config = DeploymentConfig(
+            backend=BackendType.VLLM,
+            provider=ComputeProvider.PRIME,
+            model_name="Qwen/Qwen3-4B",
+            endpoint_api_key="endpoint-secret",
+            provider_options=PrimeProviderOptions(),
+        )
+        env = PrimeBackend.runtime_env(config)
+        env_file = PrimeBackend._docker_env_file(config)
+
+        self.assertEqual(env["HF_XET_HIGH_PERFORMANCE"], "1")
+        self.assertNotIn("HF_HUB_DISABLE_XET", env)
+        self.assertIn("HF_XET_HIGH_PERFORMANCE=1", env_file)
+
+    def test_portable_llamacpp_command_stages_weights_with_hf_xet(self) -> None:
+        config = DeploymentConfig(
+            backend=BackendType.LLAMACPP,
+            provider=ComputeProvider.PRIME,
+            repo_id="unsloth/Qwen3.8-27B-GGUF",
+            quant="UD-Q2_K_XL",
+            served_model_name="qwen38-27b",
+            endpoint_api_key="endpoint-secret",
+            provider_options=PrimeProviderOptions(),
+        )
+        launch = resolve_prime_launch_spec(config)
+        command = PrimeBackend._bootstrap_docker_command(config, launch)
+        inner = command[-1]
+
+        self.assertIn("--hf-repo", inner)
+        self.assertIn("--hf-file", inner)
+        self.assertIn("weights.args", inner)
+        self.assertIn("snapshot_download", inner)
+        self.assertIn("HF_XET_HIGH_PERFORMANCE", inner)
+        self.assertIn("LLAMA_CACHE=/root/.cache/llama.cpp/staged/hf-hub", command)
+
     def test_portable_bootstrap_keeps_secrets_out_of_uploaded_script(self) -> None:
         config = DeploymentConfig(
             backend=BackendType.VLLM,

@@ -38,14 +38,15 @@ GPU_INVENTORY_COMMAND = (
     "--format=csv,noheader,nounits"
 )
 
-# What a starting runtime is doing, in one round trip. Weights land as partial
-# files -- llama.cpp writes ``.downloadInProgress`` and the Hugging Face hub
-# writes ``.incomplete`` -- so their combined size is the download's own
-# progress meter, and it is readable while the server log stays empty. Both
-# runtimes keep every cache under VAST_RUNTIME_DIR, so one scan covers them.
+# What a starting runtime is doing, in one SSH round trip. Inventory regular
+# cache files as well as partial downloads so completed shards stay counted.
+# Snapshot symlinks are excluded; allocated blocks let the reader distinguish
+# sparse preallocation from bytes written. BYTES is the fallback for partials
+# outside the known cache roots.
 VAST_STARTUP_PROBE_COMMAND = rf"""
 cd {VAST_RUNTIME_DIR} 2>/dev/null || exit 0
 find . \( -name '*.downloadInProgress' -o -name '*.incomplete' \) -printf '%s\n' 2>/dev/null | awk '{{ total += $1 }} END {{ printf "BYTES %d\n", total }}'
+find models hf/hub -type f \( -path '*/blobs/*' -o -name '*.gguf' -o -name '*.downloadInProgress' -o -name '*.incomplete' \) -printf 'FILE %s %b %p\n' 2>/dev/null
 tail -c 4000 server.log 2>/dev/null | tr '\r' '\n' | grep -v '^[[:space:]]*$' | tail -n 1 | cut -c1-140 | sed 's|^|LOG |'
 """
 
@@ -239,13 +240,31 @@ def vast_runtime_image(config: DeploymentConfig) -> str:
 
 def vast_runtime_script(config: DeploymentConfig) -> str:
     """Build a private startup script; callers transfer it only over SSH stdin."""
+    from .serving_runtime import gguf_stage_command
+
     vast_runtime_image(config)
     if not config.endpoint_api_key:
         raise ValueError("Vast endpoints require an API key.")
     if config.backend == BackendType.VLLM:
         return _vllm_script(config)
+    repo = (config.repo_id or "").strip()
+    quant = (config.quant or "").strip()
+    if not repo or not quant:
+        raise ValueError("Vast llama.cpp rentals require a GGUF repository and quant.")
+    stage_setup, hf_file_flag = gguf_stage_command(
+        repo_id=repo,
+        revision=None,
+        quant=quant,
+        # llama.cpp resolves LLAMA_CACHE first; keep the Hub cache inside the
+        # staged dir rather than fighting its layout.
+        dest_dir=f"{VAST_RUNTIME_DIR}/gguf",
+        cache_dir=f"{VAST_RUNTIME_DIR}/gguf/hf-hub",
+    )
     arguments = [
-        "/app/llama-server", "--hf-repo", f"{config.repo_id}:{config.quant}",
+        "/app/llama-server", "--hf-repo", f"{repo}:{quant}",
+        # Pin the exact staged shard: same repo listing, no quant guessing.
+        hf_file_flag[0],
+        f"$(cat {hf_file_flag[1]})",
         *shlex.split(config.server_args or ""),
         # Serve /metrics so the fleet can read tokens and throughput off the
         # runtime itself, as Modal already does.
@@ -254,9 +273,10 @@ def vast_runtime_script(config: DeploymentConfig) -> str:
         "--alias", config.served_model_name or "model",
     ]
     # The same pinned image Prime uses, so the projector stages identically.
-    setup = ""
+    setup = stage_setup
     if config.vision is not None and config.vision.enabled:
-        setup, projector_path = projector_setup(config, root=VAST_RUNTIME_DIR)
+        projector_setup_text, projector_path = projector_setup(config, root=VAST_RUNTIME_DIR)
+        setup += projector_setup_text
         arguments.extend(["--mmproj", projector_path])
     else:
         arguments.append("--no-mmproj")
@@ -264,7 +284,9 @@ def vast_runtime_script(config: DeploymentConfig) -> str:
         arguments.extend(["--n-gpu-layers", str(config.n_gpu_layers)])
     env = {
         "LLAMA_API_KEY": config.endpoint_api_key,
-        "LLAMA_CACHE": f"{VAST_RUNTIME_DIR}/models",
+        # Staging uses HF_HUB_CACHE explicitly, but the server resolves
+        # LLAMA_CACHE first for its own listing; point both at the staged dir.
+        "LLAMA_CACHE": f"{VAST_RUNTIME_DIR}/gguf/hf-hub",
         # SSH sessions do not preserve the image's library search environment.
         "LD_LIBRARY_PATH": "/app:/usr/local/nvidia/lib:/usr/local/nvidia/lib64",
     }
@@ -281,6 +303,8 @@ def vast_runtime_script(config: DeploymentConfig) -> str:
 
 def _vllm_script(config: DeploymentConfig) -> str:
     """Serve vLLM on the rental's loopback interface, keyed by environment."""
+    from .hf_download import hf_download_env
+
     arguments = list(vllm_serve_args(config, host="127.0.0.1", port=8000))
     env = {
         # vLLM reads this natively, so the key never reaches argv where anything
@@ -292,6 +316,15 @@ def _vllm_script(config: DeploymentConfig) -> str:
         # interaction with CUDA that hangs multi-GPU startup.
         "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
     }
+    # vLLM downloads through huggingface_hub: same accelerated-transfer policy
+    # as Modal, with explicit user overrides still winning.
+    env.update(
+        {
+            key: value
+            for key, value in hf_download_env().items()
+            if key.startswith(("HF_HUB_", "HF_XET_"))
+        }
+    )
     token = get_token()
     if token:
         env["HF_TOKEN"] = token

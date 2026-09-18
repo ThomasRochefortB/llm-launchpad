@@ -17,16 +17,14 @@ from textual.widgets import Input, OptionList, Select, Static
 from textual.widgets.option_list import Option
 
 from ...core.compute_availability import (
+    assessed_plans_for_compute_profile,
     display_gpu_type,
     load_compute_availability,
     plans_for_compute_profile,
 )
 from ...core.inference_options import (
     COST_SCENARIO_WORKDAY,
-    cost_sort_basis_label,
-    estimate_cost_for_scenario,
-    scenario_basis_label,
-    workload_basis_label,
+    evaluate_quote_cost,
 )
 from ...core.llamacpp_planner import assessment_score
 from ...core.quant_quality import is_reduced_quality, quant_quality_label
@@ -124,24 +122,27 @@ def _format_price(value: float | None, *, estimate: bool = False) -> str:
     return f"{prefix}${value:.2f}/hr"
 
 
-def _monthly_label(value: float | None) -> str:
-    if value is None:
-        return "monthly est. n/a"
-    return f"~${value:,.0f}/mo"
+def _plan_cost_evaluation(plan: object):
+    """Canonical scenario cost; legacy plans without one recompute it."""
+    evaluation = getattr(plan, "cost", None)
+    if evaluation is not None:
+        return evaluation
+    quote = getattr(plan, "quote", None)
+    if quote is None:
+        raise ValueError("Plan has no quote for cost evaluation.")
+    return evaluate_quote_cost(quote, COST_SCENARIO_WORKDAY)
 
 
 def _scenario_monthly_label(plan: object) -> str:
-    """Explicit-scenario cost; unknown storage is never folded in."""
-    quote = getattr(plan, "quote", None)
-    if quote is None:
-        return "monthly est. n/a"
+    """Explicit-scenario cost from the plan's canonical evaluation."""
     try:
-        value = estimate_cost_for_scenario(quote, COST_SCENARIO_WORKDAY)  # type: ignore[arg-type]
+        evaluation = _plan_cost_evaluation(plan)
     except Exception:
         return "monthly est. n/a"
+    value = evaluation.estimated_monthly_cost_usd
     if value is None:
         return "monthly est. n/a"
-    return f"~${value:,.0f}/mo {COST_SCENARIO_WORKDAY.display_name}"
+    return f"~${value:,.0f}/mo {evaluation.scenario.display_name}"
 
 
 def _compact_quant_label(quant: str) -> str:
@@ -422,9 +423,10 @@ def infra_rows_for_model(
     for configuration in snapshot.configurations:
         for profile in representative_profiles_for_model(model):
             grouped: dict[str, list[InferencePlan]] = {}
-            for plan in plans_for_compute_profile(
+            plans, _ = assessed_plans_for_compute_profile(
                 configuration, profile, rejected=rejected
-            ):
+            )
+            for plan in plans:
                 # Fast Deploy ranks by price and promises a fallback "at or
                 # below the approved hourly price". A placement whose cost the
                 # provider does not publish -- Modal lists no price for H100 or
@@ -722,6 +724,8 @@ def _tier_markup(profile: QuickDeployProfile) -> str:
 
 def _compact_gpu_shape(profile: QuickDeployProfile) -> str:
     gpu = profile.gpu_type.strip()
+    if not gpu or profile.gpu_count <= 0:
+        return "recipe only"
     compact = {
         "A100-80GB": "A100",
         "A100-40GB": "A100-40",
@@ -743,6 +747,12 @@ def _fallback_option(profile: QuickDeployProfile) -> str:
 def _fallback_detail(profile: QuickDeployProfile) -> str:
     shape = _compact_gpu_shape(profile)
     cost = format_hourly_cost(profile.approx_cost_per_hour_usd)
+    if profile.gpu_count <= 0:
+        return (
+            f"[bold]{escape(profile.display_name)}[/bold]  {_quant_markup(profile)}\n"
+            "[dim]recipe only · no priced Modal placement in this catalog; "
+            "Prime or Vast may still serve it[/dim]"
+        )
     return (
         f"[bold]{escape(profile.display_name)}[/bold]  {_quant_markup(profile)}\n"
         f"[dim]{shape} · {cost} · catalog estimate (availability unavailable)[/dim]"
@@ -790,10 +800,13 @@ class FastDeployScreen(CopyEnabledScreen):
 
     BINDINGS = [
         Binding("escape", "pop_screen", "Back", show=True),
+        # Footer order is by FittedFooter's presentation priority: Choose,
+        # Search and Back must survive narrow terminals ahead of view and
+        # refresh keys, which remain reachable from help and their shortcuts.
         Binding("enter", "choose_selected", "Choose", show=True, priority=True),
+        Binding("/", "focus_model_search", "Search", show=True, priority=True),
         Binding("g", "focus_gpu_filter", "GPU filter", show=True),
-        Binding("v", "toggle_model_view", "Model view", show=True),
-        Binding("/", "focus_model_search", "Search", show=True),
+        Binding("v", "toggle_model_view", "Sort view", show=True),
         Binding("a", "toggle_all_placements", "Compare all", show=True),
         Binding("x", "show_excluded_models", "Excluded models", show=True),
         Binding("r", "refresh_availability", "Refresh offers", show=True),
@@ -862,9 +875,17 @@ class FastDeployScreen(CopyEnabledScreen):
                 id="fast-deploy-title",
             )
             yield Static(_subtitle(self._catalog_info), id="fast-deploy-subtitle")
-            # Each control carries its own label. A single label above the row
-            # sat over the Select and left the search box beside it unnamed.
+            # Search stays visible at every supported size: it is the primary
+            # way to reach a model, while the GPU filter narrows what is
+            # already listed. Both ride one row where they fit; the filter
+            # drops to its own line on constrained terminals.
             with Horizontal(id="fast-deploy-filter-row"):
+                with Vertical(id="fast-deploy-search-group"):
+                    yield Static("[dim]Search[/dim]", id="fast-deploy-search-label")
+                    yield Input(
+                        placeholder="Search models (type to filter)",
+                        id="fast-deploy-model-search",
+                    )
                 with Vertical(id="fast-deploy-gpu-group"):
                     yield Static("[dim]GPU filter[/dim]", id="fast-deploy-gpu-label")
                     yield Select(
@@ -872,12 +893,6 @@ class FastDeployScreen(CopyEnabledScreen):
                         value="any",
                         allow_blank=False,
                         id="fast-deploy-gpu-filter",
-                    )
-                with Vertical(id="fast-deploy-search-group"):
-                    yield Static("[dim]Search[/dim]", id="fast-deploy-search-label")
-                    yield Input(
-                        placeholder="Search models (type to filter)",
-                        id="fast-deploy-model-search",
                     )
             yield Static("[dim]Loading models...[/dim]", id="fast-deploy-status")
             yield OptionList(id="fast-deploy-list")
@@ -926,13 +941,6 @@ class FastDeployScreen(CopyEnabledScreen):
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id != "fast-deploy-model-search":
             return
-        # Leaving the box with nothing in it means the search is done. On a
-        # constrained terminal the box is a temporary control that borrows rows
-        # from the model list, so it has to be able to give them back -- with
-        # nothing clearing "search-open", one press of "/" shortened the list
-        # for the rest of the step.
-        if not self._model_search.strip():
-            self.remove_class("search-open")
         option_list = self.query_one("#fast-deploy-list", OptionList)
         if option_list.option_count:
             option_list.focus()
@@ -1238,6 +1246,7 @@ class FastDeployScreen(CopyEnabledScreen):
         width_mode = self.viewport_profile.width_mode
         option_list = self.query_one("#fast-deploy-list", OptionList)
         tiers = () if self._show_all_placements else self._tiers_for(rows)
+        basis_plan = tiers[0].plan if tiers else rows[0].plan
         if tiers:
             # Tier option ids are the underlying quote ids, so selection and the
             # detail pane keep working unchanged whichever view is showing.
@@ -1291,11 +1300,17 @@ class FastDeployScreen(CopyEnabledScreen):
         )
         if quality_note:
             status += f"\n[yellow]{escape(quality_note)}[/yellow]"
-        # Hourly and 24/7 are what a deployment bills; the monthly row is an
-        # explicit scenario, and sorting uses that same scenario.
-        status += f"\n[dim]{escape(scenario_basis_label(COST_SCENARIO_WORKDAY))}[/dim]"
-        status += f"\n[dim]{escape(cost_sort_basis_label(COST_SCENARIO_WORKDAY))} · storage separate[/dim]"
-        status += f"\n[dim]{escape(workload_basis_label())}[/dim]"
+        # Hourly and 24/7 are what a deployment bills; the monthly figure on
+        # each row is an explicit scenario. It is not what the list is ordered
+        # by -- placements sort on their assessment, which the line above
+        # already calls "best full-context throughput first" -- so claiming a
+        # cost ordering here put two contradictory statements about the same
+        # list three lines apart, and the rows visibly disagreed with the one
+        # that named a price.
+        status += (
+            f"\n[dim]{escape(_plan_cost_evaluation(basis_plan).basis_label())}"
+            " · storage separate[/dim]"
+        )
         if self._gpu_filter not in {"", "any"}:
             status += f" [dim]· GPU {escape(self._gpu_filter)}[/dim]"
         if snapshot.vast_configured and not any(row.plan.quote.provider == ComputeProvider.VAST for row in rows):
@@ -1311,13 +1326,20 @@ class FastDeployScreen(CopyEnabledScreen):
             # rather than as hardware that would not have worked. The reasons
             # differ, so the summary counts them rather than asserting one.
             unpriced = sum(1 for reason in excluded if NO_PRICE_EXCLUSION in reason)
+            policy = sum(
+                1
+                for reason in excluded
+                if "spot-only" in reason or "does not support" in reason
+            )
             reasons = []
-            if len(excluded) - unpriced:
+            if len(excluded) - unpriced - policy:
                 reasons.append(
-                    f"{len(excluded) - unpriced} cannot hold the full context on GPU"
+                    f"{len(excluded) - unpriced - policy} cannot hold the full context on GPU"
                 )
             if unpriced:
                 reasons.append(f"{unpriced} have no published hourly price")
+            if policy:
+                reasons.append(f"{policy} excluded by provider policy")
             status += (
                 f"\n[dim]{len(excluded)} placement"
                 f"{'s' if len(excluded) != 1 else ''} excluded: "
@@ -1553,7 +1575,7 @@ class FastDeployScreen(CopyEnabledScreen):
         else:
             self.query_one("#fast-deploy-detail", Static).update("")
         self.query_one("#fast-deploy-subtitle", Static).update(_subtitle(self._catalog_info))
-        view_label = "Top 10 by AA score · all sizes" if self._show_top_models else "By size"
+        view_label = "Sort: Size" if not self._show_top_models else "Sort: AA score"
         plural = "s" if len(visible) != 1 else ""
         filter_note = ""
         if self._gpu_filter != "any":
@@ -1567,7 +1589,7 @@ class FastDeployScreen(CopyEnabledScreen):
         # The source label belongs to the subtitle; repeating it here put the
         # same sentence on screen twice, three lines apart.
         self.query_one("#fast-deploy-status", Static).update(
-            f"[dim]{view_label} · v switches view · {len(visible)} model{plural}{filter_note}{search_note}{excluded_note}[/dim]"
+            f"[dim]{view_label} · press v for {'size groups' if self._show_top_models else 'AA top 10'} · {len(visible)} model{plural}{filter_note}{search_note}{excluded_note}[/dim]"
             + (f"\n[dim]{len(self._snapshot.vast_offers)} Vast offers priced · r refreshes[/dim]"
                if self._snapshot is not None and self._snapshot.vast_configured else "")
             + ("\n[yellow]Partial results: " + escape("; ".join(self._snapshot.errors)) + "[/yellow]"
@@ -1624,7 +1646,6 @@ class FastDeployScreen(CopyEnabledScreen):
         self._infra_rows = {}
         self._fallback_profiles = {}
         self._availability_inflight = False
-        self.remove_class("search-open")
         self._apply_model_catalog(force=True)
 
     def _cancel_availability_request(self) -> None:
@@ -1673,7 +1694,6 @@ class FastDeployScreen(CopyEnabledScreen):
                 timeout=3,
             )
             return
-        self.add_class("search-open")
         search.focus()
 
     def action_pop_screen(self) -> None:

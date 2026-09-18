@@ -8,11 +8,11 @@ import math
 from typing import Any
 
 from ..protocol.enums import BackendType, BillingModel, ComputeProvider, QuoteAvailability
-from ..protocol.models import InferencePlan, OfferCostBreakdown, ProviderQuote, VastModelOffer, VastOffer, VastProviderOptions, WorkloadProfile
+from ..protocol.models import InferencePlan, OfferCostBreakdown, ProviderQuote, VastModelOffer, VastOffer, VastProviderOptions
 from .compute_availability import canonical_gpu_identity
 from .llamacpp_planner import assess_memory_placement
 from .quick_deploy import QuickDeployModel, QuickDeployProfile, quick_deploy_recipe
-from .inference_options import estimate_monthly_compute_cost
+from .inference_options import COST_SCENARIO_WORKDAY, evaluate_quote_cost
 from .runtime_support import load_llamacpp_support_manifest
 from .vast_runtime import VAST_MAX_GPU_COUNT, VAST_MIN_COMPUTE_CAPABILITY, VAST_MIN_CUDA_VERSION
 from .vast_startup_history import (
@@ -35,8 +35,22 @@ def vast_offer_is_rentable(offer: VastOffer) -> bool:
     """
     price = offer.costs.total_per_hour_usd
     return (
-        1 <= offer.gpu_count <= VAST_MAX_GPU_COUNT
+        _vast_offer_meets_runtime_floors(offer)
         and price is not None and price > 0
+    )
+
+
+def _vast_offer_meets_runtime_floors(offer: VastOffer) -> bool:
+    """Whether a host clears the model-independent runtime floors.
+
+    This is the eligibility subset of ``vast_offer_is_rentable`` that does not
+    depend on pricing. It must run *before* cheapest-offer selection: picking
+    the cheapest host per topology first and checking rentability afterward
+    lets a cheaper incompatible host shadow a slightly more expensive host
+    that could actually serve the model.
+    """
+    return (
+        1 <= offer.gpu_count <= VAST_MAX_GPU_COUNT
         and offer.cuda_max_good is not None and offer.cuda_max_good >= VAST_MIN_CUDA_VERSION
         and offer.compute_capability is not None
         and offer.compute_capability >= VAST_MIN_COMPUTE_CAPABILITY
@@ -68,9 +82,13 @@ def vast_plan_for_offer(row: VastModelOffer, profile: QuickDeployProfile) -> Inf
         ),
         is_estimate=True,
     )
+    evaluation = evaluate_quote_cost(
+        quote, COST_SCENARIO_WORKDAY, includes_storage=True
+    )
     return InferencePlan(
         recipe=row.recipe, quote=quote, assessment=row.assessment,
-        estimated_monthly_cost_usd=estimate_monthly_compute_cost(quote, WorkloadProfile()),
+        estimated_monthly_cost_usd=evaluation.estimated_monthly_cost_usd,
+        cost=evaluation,
     )
 
 
@@ -137,6 +155,11 @@ def vast_offers_for_model(
         required_disk = max(100, math.ceil(memory.weights_gb * 1.1 + 10))
         grouped: dict[tuple[str, int, float], tuple[VastOffer, int, OfferCostBreakdown]] = {}
         for offer in offers:
+            if not _vast_offer_meets_runtime_floors(offer):
+                # Skip hosts that can never run the pinned runtime before
+                # price selection: an incompatible host must not shadow the
+                # cheapest eligible host of the same topology.
+                continue
             disk = max(required_disk, offer.disk_gb)
             capacity = offer.disk_capacity_gb if offer.disk_capacity_gb is not None else offer.disk_gb
             if capacity < disk:

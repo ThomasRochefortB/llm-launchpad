@@ -673,7 +673,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         Binding("p", "predownload_highlighted", "Pre-download", show=True),
     ]
     _MODEL_LIST_ID = "llama-model-list"
-    OPTION_LIST_IDS = ("llama-rank-mode", "llama-model-list", "llama-quant-list")
+    OPTION_LIST_IDS = ("llama-model-list", "llama-quant-list")
     NAVIGATION_ORDER = (
         "llama-rank-mode",
         "llama-model-list",
@@ -711,95 +711,100 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
     def compose(self) -> ComposeResult:
         with VerticalScroll(classes="screen-scroll"):
             yield Static("[bold #7bf168]Advanced deploy llama.cpp[/]  [dim]Step 2: Model & options[/dim]")
-            yield Static("")
+            yield Static("", classes="deploy-spacer")
 
-            yield Static(
-                "[bold]Model[/bold]  [dim](cached models in your storage volumes)[/dim]",
-                id="llama-model-ranking-title",
-            )
-            yield OptionList(
-                Option("  Cached in storage", id="rank-cached"),
-                Option("  Most downloaded", id="rank-downloads"),
-                Option("  Trending", id="rank-trending"),
-                id="llama-rank-mode",
-            )
-            yield Static("[dim]Loading model suggestions...[/dim]", id="llama-model-status")
-            yield OptionList(id="llama-model-list")
-
-            yield FormField(
-                "Hugging Face repo-id",
-                "repo-id",
-                hint="e.g., Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
-            )
-            yield FormField("Quant pattern", "quant", default="Q4_K_M")
-            yield Static("[dim]Quantizations: enter repo-id to detect GGUF variants[/dim]", id="llama-quant-status")
-            yield OptionList(id="llama-quant-list")
-            yield Static("")
-
-            yield Static("Compute provider", classes="form-label")
-            yield Select(
-                options=[
-                    ("Modal", "modal"),
-                    ("Prime Intellect", "prime"),
-                    ("Vast.ai", "vast"),
-                ],
-                value="modal",
-                allow_blank=False,
-                id="provider-llama",
-            )
-            yield Static("Prime GPU offer", classes="form-label prime-only")
-            yield Select(
-                options=[],
-                prompt="Select an exact live Prime offer",
-                id="prime-offer-llama",
-                classes="prime-only",
-            )
-            yield Static(
-                "[dim]Prime offers are secure, on-demand availability sorted by price.[/dim]",
-                id="prime-offer-status-llama",
-                classes="prime-only",
-            )
-            yield Static("Vast.ai rental", classes="form-label vast-only")
-            yield Select(
-                options=[],
-                prompt="Select a live Vast.ai rental",
-                id="vast-offer-llama",
-                classes="vast-only",
-            )
-            yield Static(
-                "[dim]Vast.ai rentals are priced including disk.[/dim]",
-                id="vast-offer-status-llama",
-                classes="vast-only",
-            )
-
-            # Options
-            with Vertical(classes="gpu-config-panel"):
-                yield Static("GPU configuration", classes="form-section-title")
+            with Vertical(classes="deploy-group"):
+                yield Static("Model", classes="deploy-group-title")
                 yield Static(
-                    "Select a Modal GPU shape.",
-                    id="gpu-config-subtitle-llama",
-                    classes="form-section-subtitle",
+                    "[dim]Cached models in your storage volumes[/dim]",
+                    id="llama-model-ranking-title",
                 )
-                with Horizontal(id="gpu-config-row-llama", classes="gpu-config-main-row"):
-                    with Vertical(id="gpu-type-group-llama"):
-                        yield Static("GPU type", classes="form-label")
-                        yield Select(
-                            options=[(DEFAULT_GPU_TYPE, DEFAULT_GPU_TYPE)],
-                            prompt="Select GPU type",
-                            value=DEFAULT_GPU_TYPE,
-                            id="gpu-type-llama",
-                        )
-                    with Vertical(id="gpu-count-group-llama"):
-                        yield Static("GPU count", classes="form-label")
-                        yield Input(
-                            value=str(DEFAULT_GPU_COUNT),
-                            placeholder="1",
-                            id="gpu-count-llama",
-                            type="integer",
-                        )
-                yield Static("", id="llama-cost-preview")
+                yield Select(
+                    options=[
+                        ("Cached in storage", "cached"),
+                        ("Most downloaded", "downloads"),
+                        ("Trending", "trending"),
+                    ],
+                    value="cached",
+                    allow_blank=False,
+                    id="llama-rank-mode",
+                )
+                yield Static("[dim]Loading model suggestions...[/dim]", id="llama-model-status")
+                yield OptionList(id="llama-model-list")
 
-            yield Static("")
+                yield FormField(
+                    "Hugging Face repo-id",
+                    "repo-id",
+                    hint="e.g., Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+                )
+                yield FormField("Quant pattern", "quant", default="Q4_K_M")
+                yield Static("[dim]Quantizations: enter repo-id to detect GGUF variants[/dim]", id="llama-quant-status")
+                yield OptionList(id="llama-quant-list")
+
+            with Vertical(classes="deploy-group"):
+                yield Static("Compute", classes="deploy-group-title")
+                yield Static("Compute provider", classes="form-label")
+                yield Select(
+                    options=[
+                        ("Modal", "modal"),
+                        ("Prime Intellect", "prime"),
+                        ("Vast.ai", "vast"),
+                    ],
+                    value="modal",
+                    allow_blank=False,
+                    id="provider-llama",
+                )
+                yield Static("Prime GPU offer", classes="form-label prime-only")
+                yield Select(
+                    options=[],
+                    prompt="Select an exact live Prime offer",
+                    id="prime-offer-llama",
+                    classes="prime-only",
+                )
+                yield Static(
+                    "[dim]Prime offers are secure, on-demand availability sorted by price.[/dim]",
+                    id="prime-offer-status-llama",
+                    classes="prime-only",
+                )
+                yield Static("Vast.ai rental", classes="form-label vast-only")
+                yield Select(
+                    options=[],
+                    prompt="Select a live Vast.ai rental",
+                    id="vast-offer-llama",
+                    classes="vast-only",
+                )
+                yield Static(
+                    "[dim]Vast.ai rentals are priced including disk.[/dim]",
+                    id="vast-offer-status-llama",
+                    classes="vast-only",
+                )
+
+                # Options
+                with Vertical(classes="gpu-config-panel"):
+                    yield Static("GPU configuration", classes="form-section-title")
+                    yield Static(
+                        "Select a Modal GPU shape.",
+                        id="gpu-config-subtitle-llama",
+                        classes="form-section-subtitle",
+                    )
+                    with Horizontal(id="gpu-config-row-llama", classes="gpu-config-main-row"):
+                        with Vertical(id="gpu-type-group-llama"):
+                            yield Static("GPU type", classes="form-label")
+                            yield Select(
+                                options=[(DEFAULT_GPU_TYPE, DEFAULT_GPU_TYPE)],
+                                prompt="Select GPU type",
+                                value=DEFAULT_GPU_TYPE,
+                                id="gpu-type-llama",
+                            )
+                        with Vertical(id="gpu-count-group-llama"):
+                            yield Static("GPU count", classes="form-label")
+                            yield Input(
+                                value=str(DEFAULT_GPU_COUNT),
+                                placeholder="1",
+                                id="gpu-count-llama",
+                                type="integer",
+                            )
+                    yield Static("", id="llama-cost-preview")
 
             yield VisionOptions(BackendType.LLAMACPP)
 
@@ -885,8 +890,9 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
                 id="llama-app-preview",
                 classes="llama-advanced",
             )
-            yield Static("")
-            yield Button("Deploy", id="deploy-btn", variant="primary")
+            with Horizontal(id="llama-deploy-actions"):
+                yield Button("Deploy", id="deploy-btn", variant="primary")
+                yield Static("", id="llama-deploy-feedback")
         yield FittedFooter()
 
     def on_mount(self) -> None:
@@ -918,6 +924,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         self._selected_vast_offer_id: str | None = None
         self._gpu_price_by_value: dict[str, float] = {}
         self._rank_mode_touched = False
+        self._updating_rank_mode = False
         self._focus_model_list_when_loaded = False
         for list_id in ("#llama-model-list", "#llama-quant-list"):
             self.query_one(list_id, OptionList).add_class("hidden")
@@ -927,10 +934,8 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
             widget.add_class("hidden")
         for widget in self.query(".vast-only"):
             widget.add_class("hidden")
-        rank_mode_list = self.query_one("#llama-rank-mode", OptionList)
-        if rank_mode_list.option_count > 0:
-            rank_mode_list.highlighted = 0
-        rank_mode_list.focus()
+        self.query_one("#llama-rank-mode", Select).value = "cached"
+        self.query_one("#llama-rank-mode", Select).focus()
         self._set_ranking_title()
         self._refresh_gpu_types()
         self._set_model_status("[dim]Loading cached models from storage...[/dim]")
@@ -938,32 +943,31 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         self._refresh_app_preview()
         self._update_cost_preview("llama-cost-preview")
 
-    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
-        if event.option_list.id == "llama-rank-mode":
-            selected_mode = self._resolve_rank_mode(event.option.id or "")
-            if selected_mode is None:
-                return
-            self._rank_mode_touched = True
-            if selected_mode != self._rank_mode:
-                self._rank_mode = selected_mode
-                self._set_ranking_title()
-                self._ranked_models = []
-                self._set_model_status("[dim]Loading model suggestions...[/dim]")
-                _set_option_list(self.query_one("#llama-model-list", OptionList), [])
-                if self._rank_mode == "cached":
-                    self._set_model_status("[dim]Loading cached models from storage...[/dim]")
-                    if self._has_cached_snapshot:
-                        self._show_cached_models()
-                    self._refresh_cached_models_from_storage()
-                else:
-                    self.app.begin_fetch_llamacpp_models(self._rank_mode, self)  # type: ignore[attr-defined]
-            model_list = self.query_one("#llama-model-list", OptionList)
-            # The picker is hidden until it has rows, so a still-loading list
-            # cannot take focus yet. Hand it over once the rows land.
-            self._focus_model_list_when_loaded = model_list.option_count == 0
-            _advance_deploy_focus(self, self.NAVIGATION_ORDER)
+    def _set_rank_mode(self, selected_mode: str | None) -> None:
+        """Switch the model-suggestion source, reloading when it changes."""
+        if selected_mode is None:
             return
+        self._rank_mode_touched = True
+        if selected_mode != self._rank_mode:
+            self._rank_mode = selected_mode
+            self._set_ranking_title()
+            self._ranked_models = []
+            self._set_model_status("[dim]Loading model suggestions...[/dim]")
+            _set_option_list(self.query_one("#llama-model-list", OptionList), [])
+            if self._rank_mode == "cached":
+                self._set_model_status("[dim]Loading cached models from storage...[/dim]")
+                if self._has_cached_snapshot:
+                    self._show_cached_models()
+                self._refresh_cached_models_from_storage()
+            else:
+                self.app.begin_fetch_llamacpp_models(self._rank_mode, self)  # type: ignore[attr-defined]
+        model_list = self.query_one("#llama-model-list", OptionList)
+        # The picker is hidden until it has rows, so a still-loading list
+        # cannot take focus yet. Hand it over once the rows land.
+        self._focus_model_list_when_loaded = model_list.option_count == 0
+        _advance_deploy_focus(self, self.NAVIGATION_ORDER)
 
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option_list.id == "llama-model-list":
             self._apply_ranked_model_selection(event.option.id or "")
             self._refresh_app_preview()
@@ -1003,6 +1007,23 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
             self._update_cost_preview("llama-cost-preview")
 
     def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "llama-rank-mode":
+            if not isinstance(event.value, str):
+                return
+            if getattr(self, "_updating_rank_mode", False):
+                return
+            # Select fires Changed for its initial value during mount, which
+            # is not a user choice and must not opt out of the empty-cache
+            # fallback. Mount-time delivery carries the same value on_mount
+            # is about to assign, so a no-op change is the mount echo.
+            if event.value == getattr(self, "_rank_mode", None) and not getattr(
+                self, "_rank_mode_initialized", False
+            ):
+                self._rank_mode_initialized = True
+                return
+            self._rank_mode_initialized = True
+            self._set_rank_mode(self._resolve_rank_mode(event.value))
+            return
         if event.select.id == "provider-llama":
             if not isinstance(event.value, str):
                 return
@@ -1517,12 +1538,9 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         self.query_one("#llama-quant-status", Static).update(text)
 
     def _resolve_rank_mode(self, option_id: str) -> str | None:
-        if option_id == "rank-cached":
-            return "cached"
-        if option_id == "rank-downloads":
-            return "downloads"
-        if option_id == "rank-trending":
-            return "trending"
+        cleaned = (option_id or "").strip().lower()
+        if cleaned in {"cached", "downloads", "trending"}:
+            return cleaned
         return None
 
     def _refresh_cached_models_from_storage(self, force: bool = False) -> None:
@@ -1560,8 +1578,14 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         if self._rank_mode_touched or self._rank_mode != "cached" or not self._has_cached_snapshot:
             return False
         self._rank_mode = "downloads"
-        rank_mode_list = self.query_one("#llama-rank-mode", OptionList)
-        rank_mode_list.highlighted = 1
+        self._updating_rank_mode = True
+        try:
+            try:
+                self.query_one("#llama-rank-mode", Select).value = "downloads"
+            except Exception:
+                pass
+        finally:
+            self._updating_rank_mode = False
         self._set_ranking_title()
         self._set_model_status("[dim]Nothing cached yet. Loading popular models...[/dim]")
         self.app.begin_fetch_llamacpp_models("downloads", self)  # type: ignore[attr-defined]
@@ -1762,7 +1786,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
         Binding("p", "predownload_highlighted", "Pre-download", show=True),
     ]
     _MODEL_LIST_ID = "vllm-model-list"
-    OPTION_LIST_IDS = ("vllm-rank-mode", "vllm-model-list")
+    OPTION_LIST_IDS = ("vllm-model-list",)
     NAVIGATION_ORDER = (
         "vllm-rank-mode",
         "vllm-model-list",
@@ -1800,38 +1824,45 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
     def compose(self) -> ComposeResult:
         with VerticalScroll(classes="screen-scroll"):
             yield Static("[bold #7bf168]Advanced deploy vLLM[/]  [dim]Step 2: Model & options[/dim]")
-            yield Static("")
+            yield Static("", classes="deploy-spacer")
 
-            yield Static(
-                "[bold]Model[/bold]  [dim](cached models in your storage volumes)[/dim]",
-                id="vllm-model-ranking-title",
-            )
-            yield OptionList(
-                Option("  Cached in storage", id="rank-cached"),
-                Option("  Most downloaded", id="rank-downloads"),
-                Option("  Trending", id="rank-trending"),
-                id="vllm-rank-mode",
-            )
-            yield Static("[dim]Loading model suggestions...[/dim]", id="vllm-model-status")
-            yield OptionList(id="vllm-model-list")
-            yield Static("")
+            with Vertical(classes="deploy-group"):
+                yield Static("Model", classes="deploy-group-title")
+                yield Static(
+                    "[dim]Cached models in your storage volumes[/dim]",
+                    id="vllm-model-ranking-title",
+                )
+                yield Select(
+                    options=[
+                        ("Cached in storage", "cached"),
+                        ("Most downloaded", "downloads"),
+                        ("Trending", "trending"),
+                    ],
+                    value="cached",
+                    allow_blank=False,
+                    id="vllm-rank-mode",
+                )
+                yield Static("[dim]Loading model suggestions...[/dim]", id="vllm-model-status")
+                yield OptionList(id="vllm-model-list")
 
-            yield FormField(
-                "Model name",
-                "model-name",
-            )
-            yield Static("[dim]Estimated VRAM: enter model name to compute[/dim]", id="vllm-vram-status")
-            yield Static("Compute provider", classes="form-label")
-            yield Select(
-                options=[
-                    ("Modal", "modal"),
-                    ("Prime Intellect", "prime"),
-                    ("Vast.ai", "vast"),
-                ],
-                value="modal",
-                allow_blank=False,
-                id="provider-vllm",
-            )
+                yield FormField(
+                    "Model name",
+                    "model-name",
+                )
+                yield Static("[dim]Estimated VRAM: enter model name to compute[/dim]", id="vllm-vram-status")
+            with Vertical(classes="deploy-group"):
+                yield Static("Compute", classes="deploy-group-title")
+                yield Static("Compute provider", classes="form-label")
+                yield Select(
+                    options=[
+                        ("Modal", "modal"),
+                        ("Prime Intellect", "prime"),
+                        ("Vast.ai", "vast"),
+                    ],
+                    value="modal",
+                    allow_blank=False,
+                    id="provider-vllm",
+                )
             yield Static("Prime GPU offer", classes="form-label prime-only")
             yield Select(
                 options=[],
@@ -2005,8 +2036,9 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
                 classes="vllm-advanced",
             )
 
-            yield Static("")
-            yield Button("Deploy", id="deploy-vllm-btn", variant="primary")
+            with Horizontal(id="vllm-deploy-actions"):
+                yield Button("Deploy", id="deploy-vllm-btn", variant="primary")
+                yield Static("", id="vllm-deploy-feedback")
         yield FittedFooter()
 
     def on_mount(self) -> None:
@@ -2036,6 +2068,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
         self._memory_lookup_timer: Timer | None = None
         self._gpu_price_by_value: dict[str, float] = {}
         self._rank_mode_touched = False
+        self._updating_rank_mode = False
         self._focus_model_list_when_loaded = False
         self.query_one("#vllm-model-list", OptionList).add_class("hidden")
         for widget in self.query(".vllm-advanced"):
@@ -2044,10 +2077,8 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
             widget.add_class("hidden")
         for widget in self.query(".vast-only"):
             widget.add_class("hidden")
-        rank_mode_list = self.query_one("#vllm-rank-mode", OptionList)
-        if rank_mode_list.option_count > 0:
-            rank_mode_list.highlighted = 0
-        rank_mode_list.focus()
+        self.query_one("#vllm-rank-mode", Select).value = "cached"
+        self.query_one("#vllm-rank-mode", Select).focus()
         self._set_ranking_title()
         self._refresh_gpu_types()
         self._set_model_status("[dim]Loading cached models from storage...[/dim]")
@@ -2058,32 +2089,31 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
         self._update_cost_preview("vllm-cost-preview")
         self._refresh_vllm_memory_status()
 
-    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
-        if event.option_list.id == "vllm-rank-mode":
-            selected_mode = self._resolve_rank_mode(event.option.id or "")
-            if selected_mode is None:
-                return
-            self._rank_mode_touched = True
-            if selected_mode != self._rank_mode:
-                self._rank_mode = selected_mode
-                self._set_ranking_title()
-                self._ranked_models = []
-                self._set_model_status("[dim]Loading model suggestions...[/dim]")
-                _set_option_list(self.query_one("#vllm-model-list", OptionList), [])
-                if self._rank_mode == "cached":
-                    self._set_model_status("[dim]Loading cached models from storage...[/dim]")
-                    if self._has_cached_snapshot:
-                        self._show_cached_models()
-                    self._refresh_cached_models_from_storage()
-                else:
-                    self.app.begin_fetch_vllm_models(self._rank_mode, self)  # type: ignore[attr-defined]
-            model_list = self.query_one("#vllm-model-list", OptionList)
-            # The picker is hidden until it has rows, so a still-loading list
-            # cannot take focus yet. Hand it over once the rows land.
-            self._focus_model_list_when_loaded = model_list.option_count == 0
-            _advance_deploy_focus(self, self.NAVIGATION_ORDER)
+    def _set_vllm_rank_mode(self, selected_mode: str | None) -> None:
+        """Switch the vLLM suggestion source, reloading when it changes."""
+        if selected_mode is None:
             return
+        self._rank_mode_touched = True
+        if selected_mode != self._rank_mode:
+            self._rank_mode = selected_mode
+            self._set_ranking_title()
+            self._ranked_models = []
+            self._set_model_status("[dim]Loading model suggestions...[/dim]")
+            _set_option_list(self.query_one("#vllm-model-list", OptionList), [])
+            if self._rank_mode == "cached":
+                self._set_model_status("[dim]Loading cached models from storage...[/dim]")
+                if self._has_cached_snapshot:
+                    self._show_cached_models()
+                self._refresh_cached_models_from_storage()
+            else:
+                self.app.begin_fetch_vllm_models(self._rank_mode, self)  # type: ignore[attr-defined]
+        model_list = self.query_one("#vllm-model-list", OptionList)
+        # The picker is hidden until it has rows, so a still-loading list
+        # cannot take focus yet. Hand it over once the rows land.
+        self._focus_model_list_when_loaded = model_list.option_count == 0
+        _advance_deploy_focus(self, self.NAVIGATION_ORDER)
 
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option_list.id == "vllm-model-list":
             self._apply_ranked_model_selection(event.option.id or "")
             self._refresh_app_preview()
@@ -2128,6 +2158,19 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
             self._update_cost_preview("vllm-cost-preview")
 
     def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "vllm-rank-mode":
+            if not isinstance(event.value, str):
+                return
+            if getattr(self, "_updating_rank_mode", False):
+                return
+            if event.value == getattr(self, "_rank_mode", None) and not getattr(
+                self, "_rank_mode_initialized", False
+            ):
+                self._rank_mode_initialized = True
+                return
+            self._rank_mode_initialized = True
+            self._set_vllm_rank_mode(self._resolve_rank_mode(event.value))
+            return
         if event.select.id == "provider-vllm":
             if not isinstance(event.value, str):
                 return
@@ -2492,12 +2535,9 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
             return
 
     def _resolve_rank_mode(self, option_id: str) -> str | None:
-        if option_id == "rank-cached":
-            return "cached"
-        if option_id == "rank-downloads":
-            return "downloads"
-        if option_id == "rank-trending":
-            return "trending"
+        cleaned = (option_id or "").strip().lower()
+        if cleaned in {"cached", "downloads", "trending"}:
+            return cleaned
         return None
 
     def _refresh_cached_models_from_storage(self, force: bool = False) -> None:
@@ -2528,8 +2568,14 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
         if self._rank_mode_touched or self._rank_mode != "cached" or not self._has_cached_snapshot:
             return False
         self._rank_mode = "downloads"
-        rank_mode_list = self.query_one("#vllm-rank-mode", OptionList)
-        rank_mode_list.highlighted = 1
+        self._updating_rank_mode = True
+        try:
+            try:
+                self.query_one("#vllm-rank-mode", Select).value = "downloads"
+            except Exception:
+                pass
+        finally:
+            self._updating_rank_mode = False
         self._set_ranking_title()
         self._set_model_status("[dim]Nothing cached yet. Loading popular models...[/dim]")
         self.app.begin_fetch_vllm_models("downloads", self)  # type: ignore[attr-defined]

@@ -120,23 +120,26 @@ class MainMenuStatusRenderTests(unittest.TestCase):
         ]
 
         rendered = _render_deployment_status(rows, username="alice")
-        self.assertIn("3 active launchpad apps", rendered)
-        # A deployed Modal app without an explicit check is "not checked",
-        # never "healthy": background refreshes must not wake the container
-        # to learn whether it is warm.
-        self.assertIn("0 healthy", rendered)
-        self.assertIn("1 not checked", rendered)
-        self.assertIn("health not checked", rendered)
-        self.assertIn("1 in progress", rendered)
-        self.assertIn("1 error", rendered)
+        self.assertIn("3 endpoints", rendered)
+        self.assertIn("1 running", rendered)
+        self.assertIn("1 starting", rendered)
+        self.assertIn("1 failed", rendered)
+        # A deployed Modal app without an explicit check is "Not checked",
+        # never "Healthy": background refreshes must not wake the container
+        # to learn whether it is warm. The header counts deployments, not
+        # health observations, so no "0 healthy" failure count appears.
+        self.assertNotIn("0 healthy", rendered)
+        self.assertIn("Not checked", rendered)
+        self.assertIn("Deployment:", rendered)
+        self.assertIn("Health:", rendered)
         self.assertIn("qwen", rendered)
         self.assertIn("phi", rendered)
         self.assertIn("broken", rendered)
         self.assertIn("Modal app:", rendered)
         self.assertIn("ap-1", rendered)
-        self.assertIn("modal: running", rendered)
-        self.assertIn("modal: deploying", rendered)
-        self.assertIn("modal: failed", rendered)
+        self.assertIn("Deployment:[/dim] Running", rendered)
+        self.assertIn("Deployment:[/dim] Starting", rendered)
+        self.assertIn("Deployment:[/dim] Failed", rendered)
         self.assertIn("Base URL:", rendered)
         self.assertIn("Display name:", rendered)
         self.assertIn("Model ID:", rendered)

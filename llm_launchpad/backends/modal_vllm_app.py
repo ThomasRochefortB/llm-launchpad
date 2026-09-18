@@ -90,6 +90,9 @@ DEPLOY_TOOL_CALL_PARSER = os.environ.get("TOOL_CALL_PARSER", "").strip() or None
 DEPLOY_ENABLE_AUTO_TOOL_CHOICE = _read_optional_bool_env("ENABLE_AUTO_TOOL_CHOICE")
 PREDOWNLOAD_TIMEOUT_MINUTES = _read_int_env("PREDOWNLOAD_TIMEOUT_MINUTES", 6 * 60)
 SNAPSHOT_MAX_WORKERS = _read_int_env("HF_SNAPSHOT_MAX_WORKERS", 16)
+DOWNLOAD_CPU = _read_int_env("HF_DOWNLOAD_CPU", 4)
+HF_HUB_DISABLE_XET = _read_bool_env("HF_HUB_DISABLE_XET", False)
+HF_XET_HIGH_PERFORMANCE = _read_bool_env("HF_XET_HIGH_PERFORMANCE", True)
 
 RUNTIME_ENV = {
     "LIMIT_MM_PER_PROMPT": os.environ.get("LIMIT_MM_PER_PROMPT", '{"image":1,"video":0,"audio":0}'),
@@ -115,6 +118,23 @@ if DEPLOY_ENABLE_AUTO_TOOL_CHOICE is not None:
 hf_cache_vol = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
 vllm_cache_vol = modal.Volume.from_name("vllm-cache", create_if_missing=True)
 
+def _download_image_env() -> dict[str, str]:
+    """Download env matching the shared policy (Xet high-performance default).
+
+    Kept inline so the remote module stays self-contained; tests pin it to
+    ``core.hf_download``.
+    """
+    env = {
+        "HF_HUB_ETAG_TIMEOUT": "30",
+        "HF_HUB_DOWNLOAD_TIMEOUT": "120",
+    }
+    if HF_HUB_DISABLE_XET:
+        env["HF_HUB_DISABLE_XET"] = "1"
+    elif HF_XET_HIGH_PERFORMANCE:
+        env["HF_XET_HIGH_PERFORMANCE"] = "1"
+    return env
+
+
 # The official image already ships a CUDA-built vLLM, and ``serve`` execs that
 # image's own ``vllm`` binary, so vLLM is deliberately not reinstalled here.
 # Modal still needs its own interpreter (the image exposes ``python3`` but not
@@ -124,19 +144,14 @@ vllm_image = (
     modal.Image.from_registry("vllm/vllm-openai:v0.19.1", add_python="3.12")
     .entrypoint([])
     .uv_pip_install("huggingface-hub")
-    .env(
-        {
-            "HF_XET_HIGH_PERFORMANCE": "1",
-            "HF_HUB_ETAG_TIMEOUT": "30",
-            "HF_HUB_DOWNLOAD_TIMEOUT": "120",
-        }
-    )
+    .env(_download_image_env())
 )
 
 
 @app.function(
     image=vllm_image,
     timeout=PREDOWNLOAD_TIMEOUT_MINUTES * MINUTES,
+    cpu=DOWNLOAD_CPU,
     volumes={
         "/root/.cache/huggingface": hf_cache_vol,
         "/root/.cache/vllm": vllm_cache_vol,
@@ -146,18 +161,104 @@ def predownload_model(
     repo_id: str,
     revision: str | None = None,
 ) -> dict[str, Any]:
-    """Download model weights into the shared HF cache volume."""
-    from huggingface_hub import snapshot_download  # type: ignore
+    """Download model weights into the shared HF cache volume.
 
-    path = snapshot_download(
-        repo_id=repo_id,
-        revision=revision,
-        cache_dir=HF_HUB_DIR,
-        allow_patterns=None,
-        max_workers=SNAPSHOT_MAX_WORKERS,
+    Runs each attempt in a subprocess so the Xet transport flags, which the
+    library reads at import time, apply reliably. Retryable transport errors
+    fall back once to plain HTTP; auth/missing-repo/disk errors fail fast.
+    """
+    import subprocess
+    import sys
+
+    payload = {
+        "repo_id": repo_id,
+        "revision": revision,
+        "cache_dir": str(HF_HUB_DIR),
+        "max_workers": SNAPSHOT_MAX_WORKERS,
+    }
+    worker_code = (
+        "import json, os, sys\n"
+        "from huggingface_hub import snapshot_download\n"
+        "cfg = json.loads(os.environ['LLM_LAUNCHPAD_SNAPSHOT_CFG'])\n"
+        "try:\n"
+        "    path = snapshot_download("
+        "repo_id=cfg['repo_id'],"
+        "revision=cfg.get('revision'),"
+        "cache_dir=cfg['cache_dir'],"
+        "allow_patterns=None,"
+        "max_workers=cfg.get('max_workers', 16)"
+        ")\n"
+        "except Exception as exc:\n"
+        "    print(f'LLM_LAUNCHPAD_DOWNLOAD_ERROR: {exc}', file=sys.stderr)\n"
+        "    raise\n"
+        "print(path)\n"
     )
-    hf_cache_vol.commit()
-    return {"repo_id": repo_id, "revision": revision, "path": path}
+
+    def _attempt_env(*, disable_xet: bool) -> dict[str, str]:
+        env = {**os.environ, "LLM_LAUNCHPAD_SNAPSHOT_CFG": json.dumps(payload)}
+        if disable_xet:
+            env["HF_HUB_DISABLE_XET"] = "1"
+            env.pop("HF_XET_HIGH_PERFORMANCE", None)
+            return env
+        enabled = _read_bool_env("HF_HUB_DISABLE_XET", HF_HUB_DISABLE_XET)
+        if enabled:
+            env["HF_HUB_DISABLE_XET"] = "1"
+            env.pop("HF_XET_HIGH_PERFORMANCE", None)
+            return env
+        env.pop("HF_HUB_DISABLE_XET", None)
+        perf = _read_bool_env("HF_XET_HIGH_PERFORMANCE", HF_XET_HIGH_PERFORMANCE)
+        current = (env.get("HF_XET_HIGH_PERFORMANCE") or "").strip().lower()
+        if perf and current not in {"1", "true", "yes", "on"}:
+            env["HF_XET_HIGH_PERFORMANCE"] = "1"
+        elif not perf:
+            env.pop("HF_XET_HIGH_PERFORMANCE", None)
+        return env
+
+    def _failure_kind(stderr: str) -> str | None:
+        text = (stderr or "").lower()
+        if not text.strip():
+            return None
+        if any(m in text for m in ("401", "403", "unauthorized", "forbidden", "invalid token", "gated repo", "access denied")):
+            return "auth"
+        if any(m in text for m in ("404", "repository not found", "repo not found", "revision not found", "no such revision", "entry not found", "does not exist")):
+            return "not_found"
+        if any(m in text for m in ("no space left", "disk quota", "enospc", "no space on device", "volume out of space")):
+            return "no_space"
+        return None
+
+    def _run(env: dict[str, str]) -> tuple[int, str, str]:
+        transport = "http" if (env.get("HF_HUB_DISABLE_XET") or "").strip().lower() in {"1", "true", "yes", "on"} else (
+            "xet-high-performance" if (env.get("HF_XET_HIGH_PERFORMANCE") or "").strip().lower() in {"1", "true", "yes", "on"} else "xet"
+        )
+        print(f"⬇️ downloading {repo_id} with transport={transport}")
+        completed = subprocess.run(
+            [sys.executable, "-c", worker_code], env=env, capture_output=True, text=True
+        )
+        return completed.returncode, (completed.stdout or "").strip(), completed.stderr or ""
+
+    env = _attempt_env(disable_xet=False)
+    returncode, stdout, stderr = _run(env)
+    if returncode == 0 and stdout.splitlines():
+        path = stdout.splitlines()[-1].strip()
+        hf_cache_vol.commit()
+        return {"repo_id": repo_id, "revision": revision, "path": path}
+    kind = _failure_kind(stderr)
+    last_line = stderr.strip().splitlines()[-1] if stderr.strip() else "unknown"
+    if kind is not None:
+        raise RuntimeError(f"snapshot_download failed ({kind}): {last_line}")
+    if not _read_bool_env("HF_HUB_DISABLE_XET", HF_HUB_DISABLE_XET):
+        print("⬇️ snapshot_download failed over Xet; retrying once with HF_HUB_DISABLE_XET=1")
+        fallback_code, fallback_out, fallback_err = _run(_attempt_env(disable_xet=True))
+        if fallback_code == 0 and fallback_out.splitlines():
+            path = fallback_out.splitlines()[-1].strip()
+            hf_cache_vol.commit()
+            return {"repo_id": repo_id, "revision": revision, "path": path}
+        fallback_last = fallback_err.strip().splitlines()[-1] if fallback_err.strip() else "unknown"
+        raise RuntimeError(
+            f"snapshot_download failed with exit code {fallback_code} "
+            f"after retrying with HF_HUB_DISABLE_XET=1. Last error: {fallback_last}"
+        )
+    raise RuntimeError(f"snapshot_download failed with exit code {returncode}. Last error: {last_line}")
 
 
 try:

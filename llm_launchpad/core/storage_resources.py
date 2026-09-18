@@ -9,11 +9,7 @@ surface the same vocabulary.
 from __future__ import annotations
 
 from ..protocol.enums import ComputeProvider
-from ..protocol.models import (
-    StorageResource,
-    StorageSnapshot,
-    StopEffect,
-)
+from ..protocol.models import StopEffect
 
 
 def stop_effect_for_provider(provider: ComputeProvider) -> StopEffect:
@@ -72,102 +68,6 @@ def format_stop_preview(provider: ComputeProvider, app_name: str) -> str:
     if effect.recovery_hint:
         lines.append(effect.recovery_hint)
     return "\n".join(lines)
-
-
-def modal_storage_resources(snapshot: StorageSnapshot) -> list[StorageResource]:
-    """Convert a Modal snapshot into provider-scoped storage resources."""
-    resources: list[StorageResource] = []
-    for row in (*snapshot.llamacpp_models, *snapshot.vllm_models):
-        size_gb = row.size_bytes / (1024.0**3) if row.size_bytes else 0.0
-        resources.append(
-            StorageResource(
-                provider=ComputeProvider.MODAL,
-                resource_id=f"{row.backend.value}:{row.model_id}:{row.revision or ''}:{row.quant or ''}",
-                kind="model-cache",
-                display_name=row.model_id,
-                size_gb=size_gb,
-                location=row.source_volume or "huggingface-cache",
-                attached_to=None,
-                survives_stop=True,
-                billable_after_stop=False,
-                price_per_hour_usd=None,
-                deletable=True,
-                delete_hint="Delete from the Storage screen; stopping an app never deletes cache.",
-                managed=True,
-            )
-        )
-    return resources
-
-
-def prime_storage_resources(
-    retained: list[object],
-    *,
-    attached_disk_id: str | None = None,
-) -> list[StorageResource]:
-    """Convert retained Prime disks into storage resources.
-
-    `retained` accepts RetainedPrimeDisk rows without importing prime_disks
-    here (which would couple storage display to disk provisioning).
-    """
-    resources: list[StorageResource] = []
-    wanted = (attached_disk_id or "").strip()
-    for row in retained:
-        disk_id = str(getattr(row, "id", "") or "").strip()
-        if not disk_id:
-            continue
-        size = getattr(row, "size_gb", 0) or 0
-        try:
-            size_gb = float(size)
-        except (TypeError, ValueError):
-            size_gb = 0.0
-        price = getattr(row, "price_per_hour_usd", 0.0) or 0.0
-        try:
-            price_per_hour = float(price) or None
-        except (TypeError, ValueError):
-            price_per_hour = None
-        resources.append(
-            StorageResource(
-                provider=ComputeProvider.PRIME,
-                resource_id=disk_id,
-                kind="persistent-disk",
-                display_name=str(getattr(row, "name", "") or disk_id),
-                size_gb=size_gb,
-                location=str(getattr(row, "location", "") or ""),
-                attached_to="this deployment" if wanted and disk_id == wanted else None,
-                survives_stop=True,
-                billable_after_stop=True,
-                price_per_hour_usd=price_per_hour,
-                deletable=True,
-                delete_hint="llm-launchpad prime-disks delete <id>",
-                managed=bool(getattr(row, "managed", True)),
-            )
-        )
-    # The deployment's disk sorts first so stop results name it, not a sibling.
-    resources.sort(key=lambda row: (row.resource_id != wanted, row.resource_id))
-    return resources
-
-
-def vast_storage_resources(*, disk_gb: int = 0, instance_label: str = "") -> list[StorageResource]:
-    """Describe a Vast rental-local disk, which has no file-level inventory."""
-    if disk_gb <= 0 and not instance_label:
-        return []
-    return [
-        StorageResource(
-            provider=ComputeProvider.VAST,
-            resource_id=instance_label or f"{disk_gb}GB-rental-disk",
-            kind="rental-disk",
-            display_name=instance_label or f"{disk_gb} GB rental disk",
-            size_gb=float(disk_gb) if disk_gb > 0 else None,
-            location="rental-local",
-            attached_to=instance_label or None,
-            survives_stop=False,
-            billable_after_stop=False,
-            price_per_hour_usd=None,
-            deletable=False,
-            delete_hint="Destroying the rental deletes this disk; there is no separate delete.",
-            managed=False,
-        )
-    ]
 
 
 def storage_scope_label(provider: ComputeProvider) -> str:

@@ -237,7 +237,10 @@ class SelectableLog(Log):
         """Reflow existing output whenever the terminal changes width."""
         _ = event
         following = bool(getattr(self.parent, "_following", self.is_vertical_scroll_end))
-        self._reflow(follow=following)
+        if self._wrap_width != self._available_wrap_width():
+            self._reflow(follow=following)
+        elif following:
+            self.scroll_end(animate=False, immediate=True, x_axis=False)
 
     def render_line(self, y: int) -> Strip:
         """Render a row from the reflowed visual-line buffer."""

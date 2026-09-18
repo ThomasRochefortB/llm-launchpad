@@ -105,14 +105,29 @@ class ServingTier:
         return any(point.measured for point in assessment.performance)
 
 
-def _single_stream_tps(plan: InferencePlan) -> float:
+def _performance_points(plan: InferencePlan) -> tuple:
+    """Return comparable performance points for tier ranking.
+
+    Measured and estimated points carry different workloads and metric
+    semantics, so mixing them lets a short-prompt measurement outrank an
+    estimate on speed alone. Rank within one evidence class: measured when the
+    plan has any, estimated otherwise.
+    """
+
     assessment = plan.assessment
     if assessment is None:
-        return 0.0
+        return ()
+    measured = tuple(point for point in assessment.performance if point.measured)
+    if measured:
+        return measured
+    return tuple(point for point in assessment.performance if not point.measured)
+
+
+def _single_stream_tps(plan: InferencePlan) -> float:
     return max(
         (
             point.output_tokens_per_second or 0.0
-            for point in assessment.performance
+            for point in _performance_points(plan)
             if point.concurrency == 1
         ),
         default=0.0,
@@ -120,13 +135,10 @@ def _single_stream_tps(plan: InferencePlan) -> float:
 
 
 def _aggregate_tps(plan: InferencePlan) -> float:
-    assessment = plan.assessment
-    if assessment is None:
-        return 0.0
     return max(
         (
             point.aggregate_output_tokens_per_second or 0.0
-            for point in assessment.performance
+            for point in _performance_points(plan)
         ),
         default=0.0,
     )
@@ -147,17 +159,15 @@ def _efficiency(plan: InferencePlan) -> float:
     ranking one recommendation but pulls the middle tier onto the largest
     machine -- leaving nothing between cheapest and fastest. Value is the knee
     of the curve, so it is measured directly.
+
+    Efficiency is always recomputed from the plan's current price: a cached
+    tokens-per-dollar figure from an earlier quote must not survive a price
+    change.
     """
 
     assessment = plan.assessment
     if assessment is None:
         return 0.0
-    measured = max(
-        (point.output_tokens_per_dollar or 0.0 for point in assessment.performance),
-        default=0.0,
-    )
-    if measured > 0:
-        return measured
     price = plan.quote.price_per_hour_usd
     if not price:
         return 0.0
@@ -172,7 +182,9 @@ def _describe_tradeoff(
     """Compare a tier to the recommended one in one clause.
 
     A ratio is easier to act on than two absolute numbers the reader has to
-    divide themselves.
+    divide themselves. Speed ratios are only stated when both sides share an
+    evidence class: a measured number and a heuristic estimate have different
+    workloads behind them, so their ratio is not a speedup the reader can buy.
     """
 
     if tier_plan.quote.id == baseline.quote.id:
@@ -182,7 +194,7 @@ def _describe_tradeoff(
     price = tier_plan.quote.price_per_hour_usd
     baseline_price = baseline.quote.price_per_hour_usd
     speed_text = ""
-    if speed > 0 and baseline_speed > 0:
+    if _evidence_classes_match(tier_plan, baseline) and speed > 0 and baseline_speed > 0:
         ratio = speed / baseline_speed
         if ratio >= 1.0 + _MEANINGFUL_MARGIN:
             speed_text = f"{ratio:.1f}x faster"
@@ -204,6 +216,18 @@ def _describe_tradeoff(
             price_text = "no cheaper"
     parts = [text for text in (speed_text, price_text) if text]
     return ", ".join(parts) if parts else None
+
+
+def _evidence_classes_match(left: InferencePlan, right: InferencePlan) -> bool:
+    """Whether two plans carry the same kind of speed evidence."""
+
+    def _evidence(plan: InferencePlan) -> bool:
+        assessment = plan.assessment
+        if assessment is None:
+            return False
+        return any(point.measured for point in assessment.performance)
+
+    return _evidence(left) == _evidence(right)
 
 
 def _quality_partition(

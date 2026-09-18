@@ -44,9 +44,18 @@ def _llamacpp_config(provider: ComputeProvider, **overrides: object) -> Deployme
 
 
 class LlamaCppMetricsFlagTests(unittest.TestCase):
+    def _server_line(self, script: str) -> str:
+        # The staging python program mentions llama-server in a comment; the
+        # actual server invocation is the exec line.
+        candidates = [
+            line for line in script.splitlines() if line.startswith("exec /app/llama-server")
+        ]
+        self.assertTrue(candidates, "expected an exec llama-server line in the startup script")
+        return candidates[0]
+
     def test_vast_starts_llama_server_with_metrics(self) -> None:
         script = vast_runtime_script(_llamacpp_config(ComputeProvider.VAST))
-        server_line = next(line for line in script.splitlines() if "llama-server" in line)
+        server_line = self._server_line(script)
         self.assertIn("--metrics", server_line)
 
     def test_prime_starts_llama_server_with_metrics(self) -> None:
@@ -57,7 +66,7 @@ class LlamaCppMetricsFlagTests(unittest.TestCase):
     def test_user_server_args_do_not_displace_the_flag(self) -> None:
         config = _llamacpp_config(ComputeProvider.VAST, server_args="--ctx-size 65536")
         script = vast_runtime_script(config)
-        server_line = next(line for line in script.splitlines() if "llama-server" in line)
+        server_line = self._server_line(script)
         self.assertIn("--ctx-size 65536", server_line)
         self.assertIn("--metrics", server_line)
 

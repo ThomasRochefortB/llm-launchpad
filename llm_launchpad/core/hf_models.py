@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 from .coerce import optional_str
+from .diagnostics import log_debug
 from .gguf_metadata import (
     GgufMtpCapability,
     GgufServingMetadata,
@@ -21,6 +22,19 @@ from .shutdown import is_shutting_down
 
 ModelRankMode = Literal["downloads", "trending"]
 ModelDiscoveryTarget = Literal["vllm", "llamacpp"]
+
+
+class HubModelPageUnavailable(RuntimeError):
+    """The model page could not be read, so its weight sizes are unknown.
+
+    Carries the response where there was one, so callers can tell a rate limit
+    apart from a page that is simply gone and retry accordingly.
+    """
+
+    def __init__(self, repo_id: str, message: str, *, response: Any = None) -> None:
+        super().__init__(f"Could not read the model page for {repo_id}: {message}")
+        self.repo_id = repo_id
+        self.response = response
 
 
 @dataclass(frozen=True)
@@ -50,6 +64,9 @@ class GgufQuantMetadata:
     attention_key_length: int | None = None
     attention_value_length: int | None = None
     serving_metadata: GgufServingMetadata | None = None
+    # Set when the weight-size table could not be read. Its presence means the
+    # sizes are unknown, never that the model publishes none.
+    weight_size_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -104,6 +121,15 @@ _MODEL_TENSORS_PROPS_RE = re.compile(r'data-target="ModelTensorsParams"[^>]*data
 _HTML_BLOCK_BREAK_RE = re.compile(r"(?i)<\s*(?:br|/p|/div|/li|/tr|/td|/th|/h[1-6])\b[^>]*>")
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _PARAMS_PATTERN = re.compile(r"(?i)(\d+(?:\.\d+)?)\s*([bm])(?=$|[^a-z0-9])")
+# A mixture-of-experts repository states its size as experts-by-size:
+# "Mixtral-8x7B" is not a 7B model. Reading only the second number sized
+# the best-known MoE family at a sixth of its weights, which is the unsafe
+# direction for a VRAM estimate. The product slightly overshoots the true
+# total (experts share attention and embeddings), and overshooting is the
+# direction that still fits.
+_EXPERT_PARAMS_PATTERN = re.compile(
+    r"(?i)(\d+)\s*x\s*(\d+(?:\.\d+)?)\s*([bm])(?=$|[^a-z0-9])"
+)
 _HF_PAGE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -457,8 +483,16 @@ def fetch_gguf_quant_metadata(
     inspect_serving: bool = False,
     mtp_quant: str | None = None,
     force_refresh: bool = False,
+    require_weight_sizes: bool = False,
 ) -> GgufQuantMetadata:
-    """Return detected GGUF quantizations and per-quant VRAM estimates in GB."""
+    """Return detected GGUF quantizations and per-quant VRAM estimates in GB.
+
+    Weight sizes come from the model page, which can be throttled or
+    unreachable while the Hub API answers normally. Callers that only want the
+    architecture get the metadata anyway, with ``weight_size_error`` set;
+    ``require_weight_sizes=True`` raises ``HubModelPageUnavailable`` instead,
+    for callers whose whole answer depends on the sizes.
+    """
     if is_shutting_down():
         return GgufQuantMetadata(quantizations=[], vram_gb_by_quant={})
     normalized_repo = repo_id.strip()
@@ -484,6 +518,7 @@ def fetch_gguf_quant_metadata(
             attention_key_length=cached_metadata.attention_key_length,
             attention_value_length=cached_metadata.attention_value_length,
             serving_metadata=cached_metadata.serving_metadata,
+            weight_size_error=cached_metadata.weight_size_error,
         )
 
     try:
@@ -572,7 +607,12 @@ def fetch_gguf_quant_metadata(
                 serving_metadata.attention_value_length or attention_value_length
             )
     vram_gb_by_quant = _extract_gguf_vram_by_quant(gguf_payload)
-    page_quant_data = _fetch_gguf_quantization_data_from_model_page(normalized_repo)
+    page_failure: HubModelPageUnavailable | None = None
+    page_quant_data: Any = None
+    try:
+        page_quant_data = _fetch_gguf_quantization_data_from_model_page(normalized_repo)
+    except HubModelPageUnavailable as exc:
+        page_failure = exc
     page_quantizations, page_vram_gb_by_quant = _extract_quantizations_and_vram_from_quantization_data(page_quant_data)
     if page_quantizations:
         quantizations = page_quantizations
@@ -581,6 +621,14 @@ def fetch_gguf_quant_metadata(
     if quantizations:
         allowed = {quant.upper() for quant in quantizations}
         vram_gb_by_quant = {quant: value for quant, value in vram_gb_by_quant.items() if quant in allowed}
+
+    # A page failure only matters where it cost us the sizes: the API payload
+    # carries them for some repositories, and there the page is optional.
+    weight_size_error: str | None = None
+    if page_failure is not None and not vram_gb_by_quant:
+        if require_weight_sizes:
+            raise page_failure
+        weight_size_error = str(page_failure)
 
     mtp = (
         fetch_gguf_mtp_capability(
@@ -606,8 +654,13 @@ def fetch_gguf_quant_metadata(
         attention_key_length=attention_key_length,
         attention_value_length=attention_value_length,
         serving_metadata=serving_metadata,
+        weight_size_error=weight_size_error,
     )
-    _GGUF_QUANT_METADATA_CACHE[cache_key] = (now, metadata)
+    if weight_size_error is None:
+        # Never cache a reading the page failed to supply: one throttled
+        # request would otherwise answer for this repository for the whole
+        # cache window, including the retries meant to recover from it.
+        _GGUF_QUANT_METADATA_CACHE[cache_key] = (now, metadata)
     return GgufQuantMetadata(
         quantizations=list(metadata.quantizations),
         vram_gb_by_quant=dict(metadata.vram_gb_by_quant),
@@ -621,6 +674,7 @@ def fetch_gguf_quant_metadata(
         attention_key_length=metadata.attention_key_length,
         attention_value_length=metadata.attention_value_length,
         serving_metadata=metadata.serving_metadata,
+        weight_size_error=metadata.weight_size_error,
     )
 
 
@@ -922,20 +976,41 @@ def _extract_quantizations_and_vram_from_quantization_data(quantization_data: An
 
 
 def _fetch_gguf_quantization_data_from_model_page(repo_id: str, timeout: float = 10.0) -> Any:
+    """Read the model page's quantization table, or say why it could not be read.
+
+    "We could not look" and "there is nothing there" are different facts, and
+    only the second is a reason to drop a model. This is the only source of
+    per-quant weight sizes -- the Hub API lists the GGUF files but not their
+    sizes -- so a swallowed failure here surfaced downstream as "no GGUF
+    quantization has a usable weight-size estimate", a claim about the model
+    rather than about the request that failed. One throttled page took a
+    top-ranked model out of Fast Deploy with no trace in the log.
+    """
+
     try:
         import requests
-    except Exception:
-        return None
+    except Exception as exc:  # pragma: no cover - requests is a hard dependency
+        raise HubModelPageUnavailable(
+            repo_id, "requests is required to read model weight sizes"
+        ) from exc
 
     url = f"https://huggingface.co/{repo_id}"
     try:
         response = requests.get(url, timeout=min(timeout, _HF_REQUEST_TIMEOUT_SECONDS), headers=_HF_PAGE_HEADERS)
-    except Exception:
+    except Exception as exc:
         if is_shutting_down():
             return None
-        return None
+        log_debug(f"Could not read the model page for {repo_id}: {exc}")
+        raise HubModelPageUnavailable(repo_id, str(exc)) from exc
     if response.status_code >= 400:
-        return None
+        log_debug(
+            f"Could not read the model page for {repo_id}: HTTP {response.status_code}"
+        )
+        raise HubModelPageUnavailable(
+            repo_id,
+            f"HTTP {response.status_code} from huggingface.co",
+            response=response,
+        )
     hardware_data = _extract_hardware_compatibility_quantization_data_from_model_page_html(response.text)
     if hardware_data is not None:
         return hardware_data
@@ -1368,7 +1443,17 @@ def _parse_parameter_count_from_repo_id(repo_id: str) -> float | None:
     text = repo_id.strip()
     if not text:
         return None
-    matches = _PARAMS_PATTERN.findall(text)
+    matches: list[tuple[str, str]] = [
+        (str(float(experts) * float(size)), unit)
+        for experts, size, unit in _EXPERT_PARAMS_PATTERN.findall(text)
+    ]
+    # The plain pattern also matches the second half of "8x7B", so its reading
+    # of that span is dropped in favour of the product above.
+    consumed = [span.span() for span in _EXPERT_PARAMS_PATTERN.finditer(text)]
+    for match in _PARAMS_PATTERN.finditer(text):
+        if any(start <= match.start() < end for start, end in consumed):
+            continue
+        matches.append((match.group(1), match.group(2)))
     if not matches:
         return None
     largest = 0.0

@@ -1099,6 +1099,8 @@ class PrimeBackend:
 
     @staticmethod
     def runtime_env(config: DeploymentConfig) -> dict[str, str]:
+        from .hf_download import hf_download_env
+
         options = prime_provider_options(config)
         if config.backend == BackendType.VLLM:
             env: dict[str, str] = {
@@ -1120,6 +1122,16 @@ class PrimeBackend:
                     key: value.strip()
                     for key, value in optional.items()
                     if value and value.strip()
+                }
+            )
+            # vLLM downloads through huggingface_hub, so propagate the same
+            # accelerated-transfer policy Modal uses. Explicit user overrides
+            # still win via the process environment.
+            env.update(
+                {
+                    key: value
+                    for key, value in hf_download_env().items()
+                    if key.startswith(("HF_HUB_", "HF_XET_"))
                 }
             )
             if options.disk_id:
@@ -1381,6 +1393,14 @@ class PrimeBackend:
                 values["LLAMA_CACHE"] = "/data/llama.cpp"
         else:
             values["VLLM_API_KEY"] = endpoint_api_key
+            for key in (
+                "HF_HUB_ETAG_TIMEOUT",
+                "HF_HUB_DOWNLOAD_TIMEOUT",
+                "HF_HUB_DISABLE_XET",
+                "HF_XET_HIGH_PERFORMANCE",
+            ):
+                if runtime_env.get(key):
+                    values[key] = runtime_env[key]
             if prime_provider_options(config).disk_id:
                 values["HF_HOME"] = "/data/huggingface"
                 values["VLLM_CACHE_ROOT"] = "/data/vllm"
@@ -1429,13 +1449,30 @@ class PrimeBackend:
             command.extend(["-v", "/data:/data"])
 
         if config.backend == BackendType.LLAMACPP:
+            from .serving_runtime import gguf_stage_command
+
             repo = str(config.repo_id or "").strip()
             quant = str(config.quant or "").strip()
+            if not repo or not quant:
+                raise ValueError("Prime llama.cpp runtimes require a GGUF repository and quant.")
             hf_repo = f"{repo}:{quant}" if quant else repo
+            # llama.cpp resolves LLAMA_CACHE first; stage through hf-xet into
+            # the same cache the server lists so --hf-file pins the download.
+            stage_root = "/data/llama.cpp" if options.disk_id else "/root/.cache/llama.cpp"
+            stage_setup, hf_file_flag = gguf_stage_command(
+                repo_id=repo,
+                revision=None,
+                quant=quant,
+                dest_dir=f"{stage_root}/staged",
+                cache_dir=f"{stage_root}/staged/hf-hub",
+            )
             llama_args = [
                 "/app/llama-server",
                 "--hf-repo",
                 hf_repo,
+                # Pin the exact staged shard: same repo listing, no quant guessing.
+                hf_file_flag[0],
+                f"$(cat {hf_file_flag[1]})",
             ]
             # Leave GPU placement unset by default so llama.cpp can reserve
             # enough device memory for the context and compute buffers. An
@@ -1461,6 +1498,8 @@ class PrimeBackend:
                 "/app/llama-fit-params",
                 "--hf-repo",
                 hf_repo,
+                hf_file_flag[0],
+                f"$(cat {hf_file_flag[1]})",
                 # Trace level: llama.cpp logs the projected-versus-free
                 # arithmetic there, and without it a rejected plan leaves only
                 # the guard it aborted at, which says nothing about how much
@@ -1483,10 +1522,11 @@ class PrimeBackend:
                     "|| exit $?; fi; "
                     f"{attestation_marker}"
                 )
-            projector_setup = ""
+            projector_setup = stage_setup
             if config.vision is not None:
                 if config.vision.enabled:
-                    projector_setup, projector_path = _prime_projector_setup(config)
+                    vision_setup, projector_path = _prime_projector_setup(config)
+                    projector_setup += vision_setup
                     llama_args.extend(["--mmproj", projector_path])
                 else:
                     llama_args.append("--no-mmproj")
@@ -1498,6 +1538,11 @@ class PrimeBackend:
                 command.extend(
                     ["-v", "llm-launchpad-llama-cache:/root/.cache/llama.cpp"]
                 )
+            command.extend(
+                ["--env", "LLAMA_CACHE=/root/.cache/llama.cpp/staged/hf-hub"]
+                if not options.disk_id
+                else ["--env", "LLAMA_CACHE=/data/llama.cpp/staged/hf-hub"]
+            )
             command.extend(
                 ["--entrypoint", "/bin/sh", launch.container_image, "-lc", inner]
             )

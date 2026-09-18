@@ -71,6 +71,8 @@ class OrchestratorMultiInstanceTests(unittest.TestCase):
         config = DeploymentConfig(
             backend=BackendType.LLAMACPP,
             app_name="llamacpp-qwen3",
+            repo_id="org/model-GGUF",
+            quant="Q4_K_M",
             do_deploy=True,
         )
         with patch("llm_launchpad.core.orchestrator.random_function_slug", return_value="alpha-bravo"):
@@ -91,6 +93,7 @@ class OrchestratorMultiInstanceTests(unittest.TestCase):
         config = DeploymentConfig(
             backend=BackendType.VLLM,
             app_name="vllm-qwen3",
+            model_name="Qwen/Qwen3-8B",
             do_deploy=True,
         )
         with patch("llm_launchpad.core.orchestrator.random_function_slug", return_value="alpha-bravo"):

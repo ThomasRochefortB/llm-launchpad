@@ -368,6 +368,15 @@ class Orchestrator:
 
     def deploy(self, config: DeploymentConfig) -> EventStream:
         """Run a full deploy workflow (optional preload + deploy + warmup)."""
+        from .deployment_preflight import preflight_config
+
+        preflight = preflight_config(config)
+        blocking = [finding for finding in preflight.findings if finding.blocking]
+        if blocking:
+            yield from fail_operation(
+                OperationType.DEPLOY, blocking[0].message, exit_code=2, recoverable=False
+            )
+            return
         try:
             config.reasoning = discover_selected_model_reasoning(config)
         except Exception as exc:
@@ -496,12 +505,21 @@ class Orchestrator:
                 "Use manual Deploy, or select text-only mode.", exit_code=2,
             )
             return
+        # Provider-specific execution lives behind ProviderAdapter; this
+        # method owns only shared preparation (preflight, reasoning, tuning,
+        # vision) that applies before any provider allocates compute.
         if config.provider == ComputeProvider.PRIME:
-            yield from self._deploy_prime(config)
+            yield from self.deploy_prime_only(config)
             return
         if config.provider == ComputeProvider.VAST:
-            yield from self.vast_backend.deploy(config)
+            from .provider_adapters import provider_adapter
+
+            yield from provider_adapter(ComputeProvider.VAST).deploy(config)
             return
+        yield from self.deploy_modal_only(config)
+
+    def deploy_modal_only(self, config: DeploymentConfig) -> EventStream:
+        """Execute the Modal-specific deploy step (adapter entrypoint)."""
         if config.do_deploy and config.backend != BackendType.VLLM and not config.function_slug:
             config.function_slug = random_function_slug()
         settings = self.config_store.load()
@@ -511,6 +529,10 @@ class Orchestrator:
             yield from self._deploy_vllm(config, env)
         else:
             yield from self._deploy_llamacpp(config, env)
+
+    def deploy_prime_only(self, config: DeploymentConfig) -> EventStream:
+        """Execute the Prime-specific deploy step (adapter entrypoint)."""
+        yield from self._deploy_prime(config)
 
     def _llamacpp_compatibility(
         self,
@@ -891,8 +913,15 @@ class Orchestrator:
 
     def _cleanup_failed_prime_pod(
         self, pod_id: str, options: Any, message: str
-    ) -> Generator[BaseEvent, None, str]:
-        """Drain the failed pod's logs and release it, returning the final message."""
+    ) -> Generator[BaseEvent, None, tuple[str, dict[str, object] | None]]:
+        """Drain the failed pod's logs and release it.
+
+        Returns (final message, rollback report). The rollback report lets the
+        lifecycle decide retry eligibility without mutating caller state: a
+        confirmed rollback allows the next approved placement, anything else
+        blocks it to avoid double-billing.
+        """
+        rollback: dict[str, object] | None = None
         if pod_id:
             try:
                 for line in self.prime_backend.get_pod_logs(pod_id):
@@ -905,6 +934,7 @@ class Orchestrator:
                     operation=OperationType.DEPLOY,
                     is_milestone=True,
                 )
+                rollback = {"attempted": False, "confirmed": False, "detail": "kept for inspection"}
             else:
                 try:
                     self.prime_backend.delete_pod(pod_id)
@@ -913,14 +943,26 @@ class Orchestrator:
                         operation=OperationType.DEPLOY,
                         is_milestone=True,
                     )
+                    rollback = {"attempted": True, "confirmed": True, "detail": ""}
                 except Exception as cleanup_exc:
                     message = f"{message} Cleanup also failed: {cleanup_exc}"
-        return message
+                    rollback = {"attempted": True, "confirmed": False, "detail": str(cleanup_exc)}
+        return message, rollback
 
     def _deploy_prime(self, config: DeploymentConfig) -> EventStream:
         """Provision a Prime pod and resolve its public inference endpoint."""
         options = prime_provider_options(config)
         requirement_error = _prime_launch_requirement_error(config)
+        if requirement_error is None:
+            # The authoritative preflight owns these messages; the local check
+            # stays as a backstop so direct orchestrator callers keep the same
+            # wording when they bypass the gate.
+            from .deployment_preflight import preflight_config
+
+            findings = preflight_config(config).findings
+            blocking = [finding for finding in findings if finding.blocking]
+            if blocking:
+                requirement_error = blocking[0].message
         if requirement_error:
             yield from fail_operation(
                 OperationType.DEPLOY, requirement_error, exit_code=2, recoverable=False
@@ -1016,10 +1058,13 @@ class Orchestrator:
                 data=info,
             )
         except Exception as exc:
-            message = yield from self._cleanup_failed_prime_pod(
+            message, rollback = yield from self._cleanup_failed_prime_pod(
                 pod_id, options, str(exc)
             )
-            yield from fail_operation(OperationType.DEPLOY, message)
+            yield from fail_operation(
+                OperationType.DEPLOY, message,
+                data={"rollback": rollback} if rollback is not None else None,
+            )
 
     def _deploy_vllm(
         self, config: DeploymentConfig, env: dict[str, str]
@@ -1168,6 +1213,7 @@ class Orchestrator:
         runtime_id: str | None = None,
         vision: VisionCapabilities | None = None,
         phase_timer: StartupPhaseTimer | None = None,
+        price_per_hour_usd: float | None = None,
     ) -> EventStream:
         """Probe endpoint readiness and optionally tail logs."""
         if vision is None and app_name:
@@ -1192,6 +1238,7 @@ class Orchestrator:
             placement_assessment=placement_assessment,
             runtime_id=runtime_id,
             phase_timer=phase_timer,
+            price_per_hour_usd=price_per_hour_usd,
         ):
             if (
                 isinstance(event, OperationCompleteEvent)
@@ -1576,8 +1623,6 @@ class Orchestrator:
                     exit_code=exit_code,
                     success=success,
                     detail=detail,
-                    json_export_path=str(json_path) if json_path.exists() else None,
-                    csv_export_path=str(csv_path) if csv_path.exists() else None,
                     metrics=metrics,
                 )
             )
@@ -2230,18 +2275,20 @@ class Orchestrator:
         app_id: str | None = None,
         provider: ComputeProvider = ComputeProvider.MODAL,
     ) -> EventStream:
-        """Stop a deployed app, stating what storage survives.
+        """Stop a deployed app via its provider adapter.
 
         Compute and storage are separate: Modal keeps its shared cache, Prime
         keeps its persistent disk (still billable), and Vast destroys its
         rental disk. The result names the consequence so `stop` never reads
-        as "spend has stopped" when a disk keeps billing.
+        as "spend has stopped" when a disk keeps billing. Provider-specific
+        teardown lives in :mod:`provider_adapters`; this is a facade that
+        preserves the public event stream.
         """
         if provider == ComputeProvider.VAST:
             try:
                 self.vast_backend.destroy(name=app_name, instance_id=app_id)
             except Exception as exc:
-                yield from fail_operation(OperationType.STOP, str(exc))
+                yield from fail_operation(OperationType.STOP, str(exc) or "Stop did not confirm.")
                 return
             yield LogEvent(
                 line="Vast rental and disk destroyed. Rental disk and cached models are deleted; nothing remains billable.",
@@ -2270,7 +2317,7 @@ class Orchestrator:
             try:
                 self.prime_backend.delete_pod(pod_id)
             except Exception as exc:
-                yield from fail_operation(OperationType.STOP, str(exc))
+                yield from fail_operation(OperationType.STOP, str(exc) or "Stop did not confirm.")
                 return
             yield LogEvent(
                 line=f"Terminated Prime pod: {pod_id}",
@@ -2304,6 +2351,9 @@ class Orchestrator:
             line="Shared Modal volume/cache remains for faster redeploys; delete cached weights from the Storage screen when unneeded.",
             operation=OperationType.STOP,
         )
+        # Modal teardown streams here so CLI/TUI keep live CLI output; the
+        # Modal adapter interprets the same command for non-streaming
+        # callers (see provider_adapters._ModalAdapter.stop).
         yield from _tag_operation(
             ModalBackend.run_streaming(cmd),
             OperationType.STOP,

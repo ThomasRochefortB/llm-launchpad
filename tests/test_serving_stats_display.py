@@ -261,7 +261,7 @@ class FleetPanelTrafficTests(unittest.TestCase):
         self.assertNotIn("47 tok/s", rendered)
         self.assertIn("302K served", rendered)
         self.assertIn("Live metrics paused", rendered)
-        self.assertIn("health not checked", rendered)
+        self.assertIn("Not checked", rendered)
 
 
 class ManageScreenReadsItsOwnTrafficTests(unittest.IsolatedAsyncioTestCase):
