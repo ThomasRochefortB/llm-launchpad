@@ -62,8 +62,9 @@ is an explicit scenario, never an invented schedule:
 Modal scale-to-zero bills active compute plus one idle timeout per session, so
 sparse requests bill more than clustered ones with the same active time.
 Modal deployments default the scaledown window to 1800 seconds; change it in
-Settings or with `SCALEDOWN_WINDOW` before deploying. Storage is always
-reported separately; unknown storage cost is not $0.
+Settings or with `SCALEDOWN_WINDOW` before deploying. Vast hourly totals
+already include disk rent; other providers report storage separately, and
+unknown storage cost is not $0.
 
 Modal Volume storage costs use Modal's `$0.09 / GiB / month` list price with a
 `1 TiB / month` free tier; the TUI billing panel and Storage screen show the

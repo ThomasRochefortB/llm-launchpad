@@ -61,6 +61,116 @@ SCALE_TO_ZERO_PROVIDERS = frozenset({ComputeProvider.MODAL})
 PASSIVE_METRICS_NOTE = "Live metrics paused to allow scale-to-zero."
 
 
+def _state_bucket(state: str) -> str:
+    """Deployment state bucket: running vs starting vs stopped vs failed."""
+    normalized = (state or "").strip().lower()
+    if normalized in {"running", "deployed"}:
+        return "running"
+    if normalized in {"deploying", "starting", "initializing", "building", "ephemeral"}:
+        return "starting"
+    if normalized in {"queued", "pending"}:
+        return "queued"
+    if normalized in {"failed", "error", "crashed"}:
+        return "failed"
+    if normalized in {"stopped", "stopping"}:
+        return "stopped"
+    return "other"
+
+
+def _health_bucket(row: EndpointInfo) -> str:
+    """Observed runtime health: healthy / starting / failed / not checked.
+
+    A deployed scale-to-zero app is not evidence its container answered, so
+    without an explicit observation it is "not checked", never "healthy".
+    Other providers keep live probing, so their provider state still implies
+    health until a probe says otherwise.
+    """
+    status = (row.runtime_status or "").strip().lower()
+    if status in {"healthy", "in_progress", "error", "unchecked"}:
+        return status
+    if row.provider in SCALE_TO_ZERO_PROVIDERS and _state_bucket(row.state) == "running":
+        try:
+            from ...core.runtime_health import get_health as _get_health
+
+            stored = _get_health(row)
+        except Exception:
+            stored = None
+        if stored is not None:
+            return stored.status
+        return "unchecked"
+    return _health_bucket_from_state(row.state)
+
+
+def _health_bucket_from_state(state: str) -> str:
+    bucket = _state_bucket(state)
+    if bucket == "running":
+        return "healthy"
+    if bucket in {"starting", "queued"}:
+        return "in_progress"
+    if bucket == "failed":
+        return "error"
+    return "in_progress"
+
+
+def style_health_bucket(bucket: str) -> str:
+    """One shared health label for Home and Manage.
+
+    Deployment state ("Running") and observed health ("Healthy") are separate
+    clauses everywhere, so a Modal row that exists but was never probed reads
+    "Deployment: Running · Health: Not checked" on both screens.
+    """
+    normalized = (bucket or "").strip().lower()
+    if normalized == "healthy":
+        return "[green]Healthy[/green]"
+    if normalized == "in_progress":
+        return "[yellow]Starting[/yellow]"
+    if normalized == "error":
+        return "[red]Failed[/red]"
+    if normalized == "unchecked":
+        return "[dim]Not checked[/dim]"
+    return f"[dim]{escape(normalized or 'unknown')}[/dim]"
+
+
+def deployment_and_health_line(row: EndpointInfo) -> str:
+    """Compact `Deployment: X · Health: Y` summary shared by fleet screens."""
+    bucket = _state_bucket(row.state)
+    state_label = {
+        "running": "Running",
+        "starting": "Starting",
+        "queued": "Queued",
+        "failed": "Failed",
+        "stopped": "Stopped",
+    }.get(bucket, (row.state or "unknown").strip().capitalize() or "Unknown")
+    return (
+        f"[dim]Deployment:[/dim] {escape(state_label)} · "
+        f"[dim]Health:[/dim] {style_health_bucket(_health_bucket(row))}"
+    )
+
+
+def fleet_summary_line(rows: list[EndpointInfo]) -> str:
+    """One-line fleet state for the compact home header.
+
+    Counts deployments (running/starting/failed), never health observations:
+    "0 healthy" on an unchecked fleet reads as a failure count.
+    """
+    from collections import Counter
+
+    counts = Counter(_state_bucket(row.state) for row in rows)
+    running = counts.get("running", 0)
+    starting = counts.get("starting", 0) + counts.get("queued", 0)
+    failed = counts.get("failed", 0)
+    total = len(rows)
+    noun = "endpoint" if total == 1 else "endpoints"
+    parts = [f"[bold]{total} {noun}[/bold]"]
+    if running:
+        parts.append(f"[green]{running} running[/green]")
+    if starting:
+        parts.append(f"[yellow]{starting} starting[/yellow]")
+    if failed:
+        parts.append(f"[red]{failed} failed[/red]")
+    return " · ".join(parts)
+
+
 def provider_outage_lines(
     discovery: FleetDiscovery | None,
     *,

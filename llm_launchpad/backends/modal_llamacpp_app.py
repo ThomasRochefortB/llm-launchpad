@@ -130,8 +130,8 @@ SERVE_STARTUP_TIMEOUT_MINUTES = _read_int_env("LLAMACPP_SERVE_STARTUP_TIMEOUT_MI
 WARM_VOLUME = _read_bool_env("LLAMACPP_WARM_VOLUME", True)
 VOLUME_WARM_CHUNK_BYTES = _read_int_env("LLAMACPP_VOLUME_WARM_CHUNK_BYTES", 16 * 1024 * 1024)
 VOLUME_WARM_LOG_INTERVAL_SECONDS = _read_int_env("LLAMACPP_VOLUME_WARM_LOG_INTERVAL_SECONDS", 10)
-HF_HUB_DISABLE_XET_DEFAULT = _read_bool_env("HF_HUB_DISABLE_XET", True)
-HF_XET_HIGH_PERFORMANCE_DEFAULT = _read_optional_bool_env("HF_XET_HIGH_PERFORMANCE")
+HF_HUB_DISABLE_XET_DEFAULT = _read_bool_env("HF_HUB_DISABLE_XET", False)
+HF_XET_HIGH_PERFORMANCE_DEFAULT = _read_bool_env("HF_XET_HIGH_PERFORMANCE", True)
 LLAMA_CPP_IMAGE_REF = (
     os.environ.get(
         "LLAMA_CPP_IMAGE_REF",
@@ -178,6 +178,12 @@ _GGUF_SPLIT_RE = re.compile(r"-(\d+)-of-(\d+)\.gguf$", flags=re.IGNORECASE)
 
 
 def _download_image_env() -> dict[str, str]:
+    """Download env shared by the Modal image and fresh worker subprocesses.
+
+    Mirrors ``core.hf_download.hf_download_env`` defaults: Xet enabled with
+    high-performance mode unless explicitly disabled. Kept inline so the
+    remote module stays self-contained.
+    """
     env = {
         "HF_HUB_ETAG_TIMEOUT": "30",
         "HF_HUB_DOWNLOAD_TIMEOUT": "120",
@@ -187,6 +193,61 @@ def _download_image_env() -> dict[str, str]:
     elif HF_XET_HIGH_PERFORMANCE_DEFAULT:
         env["HF_XET_HIGH_PERFORMANCE"] = "1"
     return env
+
+
+def _describe_transport_env(env: dict[str, str]) -> str:
+    """Short transport label for download logs (mirrors core.hf_download)."""
+    if _env_value_is_true(env.get("HF_HUB_DISABLE_XET")):
+        return "http"
+    if _env_value_is_true(env.get("HF_XET_HIGH_PERFORMANCE")):
+        return "xet-high-performance"
+    return "xet"
+
+
+def _classify_download_failure(output: str) -> str | None:
+    """Classify a failure as non-retryable (mirrors core.hf_download)."""
+    text = (output or "").lower()
+    if not text.strip():
+        return None
+    if any(
+        marker in text
+        for marker in (
+            "401",
+            "403",
+            "unauthorized",
+            "forbidden",
+            "invalid token",
+            "invalid hf_token",
+            "gated repo",
+            "access denied",
+        )
+    ):
+        return "auth"
+    if any(
+        marker in text
+        for marker in (
+            "404",
+            "repository not found",
+            "repo not found",
+            "revision not found",
+            "no such revision",
+            "entry not found",
+            "does not exist",
+        )
+    ):
+        return "not_found"
+    if any(
+        marker in text
+        for marker in (
+            "no space left",
+            "disk quota",
+            "enospc",
+            "no space on device",
+            "volume out of space",
+        )
+    ):
+        return "no_space"
+    return None
 
 
 def _load_config() -> dict[str, Any]:
@@ -1011,7 +1072,11 @@ def _snapshot_download_with_keepalive(
     force_download: bool = False,
     heartbeat: Callable[[], None] | None = None,
 ) -> None:
-    """Run snapshot_download in a subprocess and print periodic keepalives."""
+    """Run snapshot_download in a subprocess and print periodic keepalives.
+
+    The first attempt uses Xet high-performance transfers by default; failures
+    that are not auth/missing-repo/disk errors retry once over plain HTTP.
+    """
     try:
         expected_sizes = _fetch_expected_gguf_sizes(repo_id, revision, allow_patterns)
     except Exception:
@@ -1026,10 +1091,11 @@ def _snapshot_download_with_keepalive(
         "force_download": force_download,
     }
     worker_code = (
-        "import json, os\n"
+        "import json, os, sys\n"
         "from huggingface_hub import snapshot_download\n"
         "cfg = json.loads(os.environ['LLM_LAUNCHPAD_SNAPSHOT_CFG'])\n"
-        "snapshot_download("
+        "try:\n"
+        "    snapshot_download("
         "repo_id=cfg['repo_id'],"
         "revision=cfg.get('revision'),"
         "cache_dir=cfg['cache_dir'],"
@@ -1037,6 +1103,9 @@ def _snapshot_download_with_keepalive(
         "max_workers=cfg.get('max_workers', 8),"
         "force_download=cfg.get('force_download', False)"
         ")\n"
+        "except Exception as exc:\n"
+        "    print(f'LLM_LAUNCHPAD_DOWNLOAD_ERROR: {exc}', file=sys.stderr)\n"
+        "    raise\n"
     )
 
     def _attempt_env(*, disable_xet: bool) -> dict[str, str]:
@@ -1047,80 +1116,167 @@ def _snapshot_download_with_keepalive(
         if disable_xet:
             env["HF_HUB_DISABLE_XET"] = "1"
             env.pop("HF_XET_HIGH_PERFORMANCE", None)
+            return env
+        if _env_value_is_true(env.get("HF_HUB_DISABLE_XET")):
+            env.pop("HF_XET_HIGH_PERFORMANCE", None)
+            return env
+        env.pop("HF_HUB_DISABLE_XET", None)
+        if not _env_value_is_true(env.get("HF_XET_HIGH_PERFORMANCE")) and HF_XET_HIGH_PERFORMANCE_DEFAULT:
+            env["HF_XET_HIGH_PERFORMANCE"] = "1"
         return env
 
-    def _run_attempt(env: dict[str, str]) -> int:
+    def _run_attempt(env: dict[str, str]) -> tuple[int, str]:
         process = subprocess.Popen(
             [sys.executable, "-c", worker_code],
             env=env,
+            stderr=subprocess.PIPE,
+            text=True,
         )
         keepalive_interval_seconds = 20
         started = time.time()
+        try:
+            baseline_bytes, _ = _estimate_completed_expected_gguf_size_fallback(
+                repo_id=repo_id,
+                revision=revision,
+                expected_sizes=expected_sizes,
+                allow_patterns=allow_patterns,
+            )
+        except OSError:
+            baseline_bytes = 0
         last_bytes = -1
         stalled_intervals = 0
-        while process.poll() is None:
-            elapsed = int(time.time() - started)
-            if expected_sizes:
-                complete_bytes, complete_files = _estimate_completed_expected_gguf_size(
-                    repo_id=repo_id,
-                    revision=revision,
-                    expected_sizes=expected_sizes,
+        stderr_text = ""
+        try:
+            while process.poll() is None:
+                elapsed = int(time.time() - started)
+                try:
+                    if expected_sizes:
+                        complete_bytes, complete_files = _estimate_completed_expected_gguf_size(
+                            repo_id=repo_id,
+                            revision=revision,
+                            expected_sizes=expected_sizes,
+                        )
+                    else:
+                        complete_bytes, complete_files = _estimate_matched_snapshot_size(
+                            repo_id=repo_id,
+                            revision=revision,
+                            allow_patterns=allow_patterns,
+                        )
+                    inflight_bytes, inflight_files = _estimate_incomplete_blob_size(repo_id=repo_id)
+                except OSError:
+                    complete_bytes, complete_files = 0, 0
+                    inflight_bytes, inflight_files = 0, 0
+                observed_bytes = complete_bytes + inflight_bytes
+                observed_files = complete_files + inflight_files
+                if total_expected_bytes > 0:
+                    observed_bytes = min(observed_bytes, total_expected_bytes)
+                size_gib = observed_bytes / (1024**3)
+                transferred_bytes = max(0, observed_bytes - baseline_bytes)
+                rate_mib_s = (transferred_bytes / (1024**2)) / elapsed if elapsed > 0 else 0.0
+                if observed_bytes > last_bytes:
+                    stalled_intervals = 0
+                else:
+                    stalled_intervals += 1
+                last_bytes = observed_bytes
+                stall_note = " (no growth detected)" if stalled_intervals >= 3 else ""
+                progress_text = ""
+                if total_expected_bytes > 0:
+                    total_gib = total_expected_bytes / (1024**3)
+                    pct = int((observed_bytes * 100) / total_expected_bytes) if total_expected_bytes else 0
+                    pct = max(0, min(100, pct))
+                    progress_text = f"/{total_gib:.2f}GiB pct={pct}%"
+                print(
+                    "🦙 download in progress... "
+                    f"transport={_describe_transport_env(env)} "
+                    f"elapsed={elapsed}s files={observed_files} size={size_gib:.2f}GiB{progress_text} "
+                    f"complete={complete_files} inflight={inflight_files} "
+                    f"avg_rate={rate_mib_s:.2f}MiB/s{stall_note}"
                 )
-            else:
-                complete_bytes, complete_files = _estimate_matched_snapshot_size(
-                    repo_id=repo_id,
-                    revision=revision,
-                    allow_patterns=allow_patterns,
-                )
-            inflight_bytes, inflight_files = _estimate_incomplete_blob_size(repo_id=repo_id)
-            observed_bytes = complete_bytes + inflight_bytes
-            observed_files = complete_files + inflight_files
-            if total_expected_bytes > 0:
-                observed_bytes = min(observed_bytes, total_expected_bytes)
-            size_gib = observed_bytes / (1024**3)
-            rate_mib_s = (observed_bytes / (1024**2)) / elapsed if elapsed > 0 else 0.0
-            if observed_bytes > last_bytes:
-                stalled_intervals = 0
-            else:
-                stalled_intervals += 1
-            last_bytes = observed_bytes
-            stall_note = " (no growth detected)" if stalled_intervals >= 3 else ""
-            progress_text = ""
-            if total_expected_bytes > 0:
-                total_gib = total_expected_bytes / (1024**3)
-                pct = int((observed_bytes * 100) / total_expected_bytes) if total_expected_bytes else 0
-                pct = max(0, min(100, pct))
-                progress_text = f"/{total_gib:.2f}GiB pct={pct}%"
-            print(
-                "🦙 download in progress... "
-                f"elapsed={elapsed}s files={observed_files} size={size_gib:.2f}GiB{progress_text} "
-                f"complete={complete_files} inflight={inflight_files} "
-                f"avg_rate={rate_mib_s:.2f}MiB/s{stall_note}"
-            )
-            if heartbeat is not None:
-                heartbeat()
-            time.sleep(keepalive_interval_seconds)
-        return process.returncode
+                if heartbeat is not None:
+                    heartbeat()
+                time.sleep(keepalive_interval_seconds)
+            try:
+                _, stderr_text = process.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                _, stderr_text = process.communicate()
+        finally:
+            if process.poll() is None:
+                process.kill()
+        return process.returncode, stderr_text or ""
 
     env = _attempt_env(disable_xet=False)
-    returncode = _run_attempt(env)
+    returncode, stderr_text = _run_attempt(env)
     xet_was_enabled = not _env_value_is_true(env.get("HF_HUB_DISABLE_XET"))
     if returncode == 0:
         return
+    failure_kind = _classify_download_failure(stderr_text)
+    if failure_kind is not None:
+        raise RuntimeError(
+            f"snapshot_download failed with exit code {returncode} ({failure_kind}); "
+            "not retrying across transports because the error is not transport-specific. "
+            f"Last error: {stderr_text.strip().splitlines()[-1] if stderr_text.strip() else 'unknown'}"
+        )
     if xet_was_enabled:
         print(
-            f"🦙 snapshot_download failed with exit code {returncode}; "
+            f"🦙 snapshot_download failed with exit code {returncode} "
+            f"(transport={_describe_transport_env(env)}); "
             "retrying once with HF_HUB_DISABLE_XET=1"
         )
-        fallback_returncode = _run_attempt(_attempt_env(disable_xet=True))
+        fallback_returncode, fallback_stderr = _run_attempt(_attempt_env(disable_xet=True))
         if fallback_returncode == 0:
             return
         raise RuntimeError(
             "snapshot_download failed with exit code "
-            f"{fallback_returncode} after retrying with HF_HUB_DISABLE_XET=1"
+            f"{fallback_returncode} after retrying with HF_HUB_DISABLE_XET=1. "
+            f"Last error: {fallback_stderr.strip().splitlines()[-1] if fallback_stderr.strip() else 'unknown'}"
         )
 
-    raise RuntimeError(f"snapshot_download failed with exit code {returncode}")
+    raise RuntimeError(
+        f"snapshot_download failed with exit code {returncode}. "
+        f"Last error: {stderr_text.strip().splitlines()[-1] if stderr_text.strip() else 'unknown'}"
+    )
+
+
+def _estimate_completed_expected_gguf_size_fallback(
+    *,
+    repo_id: str,
+    revision: str | None,
+    expected_sizes: dict[str, int],
+    allow_patterns: list[str],
+) -> tuple[int, int]:
+    if expected_sizes:
+        return _estimate_completed_expected_gguf_size(
+            repo_id=repo_id,
+            revision=revision,
+            expected_sizes=expected_sizes,
+        )
+    return _estimate_matched_snapshot_size(
+        repo_id=repo_id,
+        revision=revision,
+        allow_patterns=allow_patterns,
+    )
+
+
+def _allocated_file_size(path: Path) -> int:
+    """Bytes actually allocated for a file, capped at its logical size.
+
+    Xet preallocates sparse files whose logical length is not progress, so
+    progress accounting uses allocated blocks (matches core.hf_download).
+    """
+    try:
+        stat = path.stat()
+    except OSError:
+        return 0
+    logical = max(0, int(stat.st_size))
+    blocks = getattr(stat, "st_blocks", None)
+    if not isinstance(blocks, int) or blocks < 0:
+        return logical
+    try:
+        allocated = int(blocks) * 512
+    except (OverflowError, ValueError):
+        return logical
+    return max(0, min(logical, allocated))
 
 
 def _estimate_matched_snapshot_size(
@@ -1149,7 +1305,11 @@ def _estimate_matched_snapshot_size(
 
 
 def _estimate_incomplete_blob_size(repo_id: str) -> tuple[int, int]:
-    """Estimate active download size from .incomplete blob files."""
+    """Estimate active download size from .incomplete blob files.
+
+    Uses allocated blocks rather than logical size: Xet preallocates sparse
+    files whose logical length is not progress.
+    """
     blobs_dir = _hub_model_dir(repo_id) / "blobs"
     if not blobs_dir.exists() or not blobs_dir.is_dir():
         return 0, 0
@@ -1160,24 +1320,107 @@ def _estimate_incomplete_blob_size(repo_id: str) -> tuple[int, int]:
         if not path.is_file():
             continue
         file_count += 1
-        try:
-            total_bytes += path.stat().st_size
-        except OSError:
-            continue
+        total_bytes += _allocated_file_size(path)
     return total_bytes, file_count
+
+
+def _download_projector_file(
+    *,
+    repo_id: str,
+    revision: str | None,
+    filename: str,
+    force_download: bool = False,
+) -> str:
+    """Download one file in a fresh process so transport env applies.
+
+    ``huggingface_hub`` reads transport flags at import time, so the parent
+    process env is not enough: each attempt runs isolated with Xet enabled
+    first and plain HTTP as the bounded fallback.
+    """
+    payload = {
+        "repo_id": repo_id,
+        "revision": revision,
+        "filename": filename,
+        "cache_dir": str(HF_HUB_DIR),
+        "force_download": force_download,
+    }
+    worker_code = (
+        "import json, os, sys\n"
+        "from huggingface_hub import hf_hub_download\n"
+        "cfg = json.loads(os.environ['LLM_LAUNCHPAD_PROJECTOR_CFG'])\n"
+        "try:\n"
+        "    path = hf_hub_download("
+        "repo_id=cfg['repo_id'],"
+        "revision=cfg.get('revision'),"
+        "filename=cfg['filename'],"
+        "cache_dir=cfg['cache_dir'],"
+        "force_download=cfg.get('force_download', False)"
+        ")\n"
+        "except Exception as exc:\n"
+        "    print(f'LLM_LAUNCHPAD_DOWNLOAD_ERROR: {exc}', file=sys.stderr)\n"
+        "    raise\n"
+        "print(path)\n"
+    )
+
+    def _attempt_env(*, disable_xet: bool) -> dict[str, str]:
+        env = {
+            **os.environ,
+            "LLM_LAUNCHPAD_PROJECTOR_CFG": json.dumps(payload),
+        }
+        if disable_xet:
+            env["HF_HUB_DISABLE_XET"] = "1"
+            env.pop("HF_XET_HIGH_PERFORMANCE", None)
+            return env
+        if _env_value_is_true(env.get("HF_HUB_DISABLE_XET")):
+            env.pop("HF_XET_HIGH_PERFORMANCE", None)
+            return env
+        env.pop("HF_HUB_DISABLE_XET", None)
+        if not _env_value_is_true(env.get("HF_XET_HIGH_PERFORMANCE")) and HF_XET_HIGH_PERFORMANCE_DEFAULT:
+            env["HF_XET_HIGH_PERFORMANCE"] = "1"
+        return env
+
+    def _run(env: dict[str, str]) -> tuple[int, str, str]:
+        completed = subprocess.run(
+            [sys.executable, "-c", worker_code],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        return completed.returncode, (completed.stdout or "").strip(), completed.stderr or ""
+
+    env = _attempt_env(disable_xet=False)
+    print(f"🦙 downloading projector with transport={_describe_transport_env(env)}")
+    returncode, stdout, stderr = _run(env)
+    if returncode == 0 and stdout.splitlines():
+        return stdout.splitlines()[-1].strip()
+    failure_kind = _classify_download_failure(stderr)
+    last_line = stderr.strip().splitlines()[-1] if stderr.strip() else "unknown"
+    if failure_kind is not None:
+        raise RuntimeError(
+            f"Projector download failed ({failure_kind}): {last_line}"
+        )
+    if not _env_value_is_true(env.get("HF_HUB_DISABLE_XET")):
+        print("🦙 projector download failed over Xet; retrying once with HF_HUB_DISABLE_XET=1")
+        fallback_code, fallback_out, fallback_err = _run(_attempt_env(disable_xet=True))
+        if fallback_code == 0 and fallback_out.splitlines():
+            return fallback_out.splitlines()[-1].strip()
+        fallback_last = fallback_err.strip().splitlines()[-1] if fallback_err.strip() else "unknown"
+        raise RuntimeError(
+            f"Projector download failed with exit code {fallback_code} "
+            f"after retrying with HF_HUB_DISABLE_XET=1. Last error: {fallback_last}"
+        )
+    raise RuntimeError(f"Projector download failed with exit code {returncode}. Last error: {last_line}")
 
 
 @app.function(image=download_image, volumes={cache_dir: model_cache}, timeout=PREDOWNLOAD_TIMEOUT_MINUTES * MINUTES)
 def download_projector(artifact: dict[str, Any]) -> str:
     """Cache an exact projector revision independently of the model quant."""
-    from huggingface_hub import hf_hub_download
-
     repo, revision, filename = artifact["repo_id"], artifact["revision"], artifact["filename"]
     with _acquire_download_lease(repo, revision, [filename]):
-        path = Path(hf_hub_download(repo_id=repo, revision=revision, filename=filename, cache_dir=str(HF_HUB_DIR)))
+        path = Path(_download_projector_file(repo_id=repo, revision=revision, filename=filename))
         expected = artifact.get("size_bytes")
         if expected and path.stat().st_size != expected:
-            path = Path(hf_hub_download(repo_id=repo, revision=revision, filename=filename, cache_dir=str(HF_HUB_DIR), force_download=True))
+            path = Path(_download_projector_file(repo_id=repo, revision=revision, filename=filename, force_download=True))
         if path.stat().st_size == 0 or (expected and path.stat().st_size != expected):
             raise RuntimeError("Projector download has an unexpected size.")
         with path.open("rb") as handle:

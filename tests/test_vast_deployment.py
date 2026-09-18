@@ -117,6 +117,19 @@ class SshFailureReasonTests(unittest.TestCase):
 class StartupDetailTests(unittest.TestCase):
     """What the startup heartbeat says, given what the host could be asked."""
 
+    def test_known_total_reports_percentage_rate_and_eta(self) -> None:
+        self.assertEqual(
+            vast_startup_detail(9_000_000_000, 3_000_000_000, 30, "", total=15_000_000_000),
+            "downloading weights (60%), 9.0 / 15.0 GB at 200 MB/s, ~30s remaining",
+        )
+
+    def test_active_download_cannot_claim_completion(self) -> None:
+        self.assertIn("(99%)", vast_startup_detail(1000, 500, 30, "", total=1000))
+        self.assertIn("(100%)", vast_startup_detail(1000, 500, 30, "", total=1000, active=False))
+
+    def test_known_total_starts_at_zero(self) -> None:
+        self.assertIn("(0%)", vast_startup_detail(0, 0, 30, "stale", total=1000))
+
     def test_the_first_sample_reports_size_without_inventing_a_rate(self) -> None:
         self.assertEqual(
             vast_startup_detail(3_000_000_000, 0, 31.0, "stale log line"),
@@ -164,6 +177,7 @@ class VastLifecycleTests(unittest.TestCase):
         for patcher in (
             patch.object(self.backend, "preflight", return_value=(True, "12", "")),
             patch("llm_launchpad.core.vast_runtime.get_token", return_value=None),
+            patch("llm_launchpad.core.vast_deployment.fetch_download_files", return_value=()),
             patch("llm_launchpad.core.vast_deployment.endpoint_healthy", return_value=True),
             patch("llm_launchpad.core.vast_deployment.verify_endpoint_auth"),
             patch("llm_launchpad.core.vast_deployment.is_shutting_down", return_value=False),
@@ -683,6 +697,45 @@ class VastLifecycleTests(unittest.TestCase):
             [getattr(event, "line", "") for event in events],
         )
 
+    def test_shard_progress_completes_once_then_reports_loading(self) -> None:
+        from llm_launchpad.core.vast_download import DownloadFile
+
+        clock = {"now": 0.0}
+        samples = iter([
+            "FILE 500 8 models/blobs/a.downloadInProgress",
+            "FILE 1000 8 models/blobs/a\nFILE 500 8 models/blobs/b.downloadInProgress",
+            "FILE 1000 8 models/blobs/a\nFILE 1000 8 models/blobs/b",
+            "FILE 1000 8 models/blobs/a\nFILE 1000 8 models/blobs/b",
+        ])
+
+        def healthy(*_: object) -> bool:
+            clock["now"] += 31
+            return clock["now"] > 124
+
+        def remote(instance: object, command: str, **kwargs: object) -> str:
+            if "nvidia-smi" in command:
+                return self.gpu_inventory
+            if "downloadInProgress" in command:
+                return next(samples) + "\nLOG load_tensors: loading model tensors\n"
+            return ""
+
+        self.ssh.run.side_effect = remote
+        with (
+            patch("llm_launchpad.core.vast_deployment.fetch_download_files", return_value=(
+                DownloadFile("models/blobs/a", 1000, "q4"),
+                DownloadFile("models/blobs/b", 1000, "q4"),
+            )),
+            patch("llm_launchpad.core.vast_deployment.endpoint_healthy", healthy),
+            patch("llm_launchpad.core.vast_deployment.time.monotonic", lambda: clock["now"]),
+        ):
+            events = list(self.backend.deploy(self.config))
+        lines = [event.line for event in events if getattr(event, "line", "").startswith("Vast model starting:")]
+        self.assertEqual(len(lines), 4)
+        for line, pct in zip(lines[:3], (25, 75, 100), strict=True):
+            self.assertIn(f"({pct}%)", line)
+        self.assertIn("load_tensors: loading model tensors", lines[3])
+        self.assertTrue(next(event for event in reversed(events) if isinstance(event, OperationCompleteEvent)).success)
+
     def test_incompatible_or_unknown_cuda_driver_cannot_rent(self) -> None:
         for version in (None, 12.6):
             self.api.get_offer.return_value = vast_offer(cuda_max_good=version)
@@ -774,10 +827,20 @@ class VastLifecycleTests(unittest.TestCase):
         self.assertEqual(self.state.records(), [])
 
     def test_uncertain_create_blocks_repeat_and_disables_fallback(self) -> None:
+        from llm_launchpad.core.provider_adapters import rollback_from_event
+
         self.api.create_instance.side_effect = VastApiError("timeout")
         self.config.fallback_configs = (config(),)
-        self.assertFalse(self.deploy().success)
-        self.assertEqual(self.config.fallback_configs, ())
+        events = list(self.backend.deploy(self.config))
+        failure = next(event for event in reversed(events) if isinstance(event, OperationCompleteEvent))
+        self.assertFalse(failure.success)
+        # Provider no longer mutates the approved ladder; it reports an
+        # unconfirmed rollback so the lifecycle blocks the next rental.
+        self.assertEqual(len(self.config.fallback_configs), 1)
+        rollback = rollback_from_event(failure)
+        self.assertIsNotNone(rollback)
+        assert rollback is not None
+        self.assertFalse(rollback.confirmed)
         self.assertEqual(len(self.state.records()), 1)
         self.assertFalse(self.deploy().success)
         self.api.create_instance.assert_called_once()
@@ -804,10 +867,20 @@ class VastLifecycleTests(unittest.TestCase):
         self.api.create_instance.assert_not_called()
 
     def test_existing_rental_blocks_fallback_and_external_destruction_is_visible(self) -> None:
+        from llm_launchpad.core.provider_adapters import rollback_from_event
+
         self.assertTrue(self.deploy().success)
         self.config.fallback_configs = (config(),)
-        self.assertFalse(self.deploy().success)
-        self.assertEqual(self.config.fallback_configs, ())
+        events = list(self.backend.deploy(self.config))
+        failure = next(event for event in reversed(events) if isinstance(event, OperationCompleteEvent))
+        self.assertFalse(failure.success)
+        # The provider reports the conflict; the lifecycle (not a mutation of
+        # the approved ladder) owns blocking the retry.
+        self.assertEqual(len(self.config.fallback_configs), 1)
+        rollback = rollback_from_event(failure)
+        self.assertIsNotNone(rollback)
+        assert rollback is not None
+        self.assertFalse(rollback.confirmed)
         self.remote = None
         row = self.backend.list_deployments()[0]
         self.assertEqual(row.state, "destroyed")

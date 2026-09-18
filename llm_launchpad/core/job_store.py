@@ -71,8 +71,6 @@ class JobRecord:
     id: str
     status: str
     config: DeploymentConfig
-    created_at: float = 0.0
-    updated_at: float = 0.0
     worker_pid: int | None = None
     heartbeat: float = 0.0
     cancel_requested: bool = False
@@ -83,6 +81,7 @@ class JobRecord:
     resource_app_id: str | None = None
     cleanup_error: str | None = None
     event_count: int = 0
+    undecodable: str | None = None
 
     @property
     def active(self) -> bool:
@@ -101,6 +100,48 @@ class StoredEvent:
     timestamp: float
     type: str
     event: BaseEvent = field(repr=False)
+
+
+def _undecodable_job_record(row: sqlite3.Row, event_count: int) -> JobRecord:
+    """Keep an unreadable job visible for recovery instead of dropping it.
+
+    Returned records carry a placeholder config pointing at the stored target
+    identity; ``undecodable`` marks them so interfaces show the recovery
+    message rather than pretending the job is healthy.
+    """
+    provider = row["provider"] or ""
+    backend = row["backend"] or ""
+    try:
+        provider_enum = ComputeProvider(provider)
+    except ValueError:
+        provider_enum = ComputeProvider.MODAL
+    try:
+        backend_enum = BackendType(backend)
+    except ValueError:
+        backend_enum = BackendType.LLAMACPP
+    return JobRecord(
+        id=row["id"],
+        status=row["status"],
+        config=DeploymentConfig(
+            backend=backend_enum,
+            provider=provider_enum,
+            app_name=row["app_name"] or "",
+            do_deploy=False,
+            do_warmup=False,
+            preload=False,
+        ),
+        worker_pid=row["worker_pid"],
+        heartbeat=row["heartbeat"] or 0.0,
+        cancel_requested=bool(row["cancel_requested"]),
+        outcome=row["outcome"] or "Unreadable job record; check provider for a billing resource.",
+        app_name=row["app_name"] or "",
+        provider=provider,
+        backend=backend,
+        resource_app_id=row["resource_app_id"],
+        cleanup_error=row["cleanup_error"],
+        event_count=event_count,
+        undecodable="Job payload could not be decoded; kept for recovery.",
+    )
 
 
 def _deployment_key(provider: str, backend: str, app_name: str) -> tuple[str, str, str]:
@@ -217,15 +258,13 @@ class JobStore:
             config = _decode(row["config_b64"])
         except Exception:
             log_exception(f"Could not decode job config for {job_id}")
-            return None
+            return _undecodable_job_record(row, int((count["n"] if count else 0) or 0))
         if not isinstance(config, DeploymentConfig):
-            return None
+            return _undecodable_job_record(row, int((count["n"] if count else 0) or 0))
         return JobRecord(
             id=row["id"],
             status=row["status"],
             config=config,
-            created_at=row["created_at"] or 0.0,
-            updated_at=row["updated_at"] or 0.0,
             worker_pid=row["worker_pid"],
             heartbeat=row["heartbeat"] or 0.0,
             cancel_requested=bool(row["cancel_requested"]),

@@ -634,6 +634,23 @@ class VastProvisioningSummaryTests(unittest.TestCase):
             line, OperationType.DEPLOY
         )
 
+    def test_percentage_and_transfer_details_share_a_stable_row(self) -> None:
+        result = self._transform(
+            "Vast model starting: downloading weights (60%), 9.0 / 15.0 GB at 200 MB/s, ~30s remaining (waiting 1m00s)"
+        )
+        self.assertEqual(result, [
+            "Downloading model (60%) — 9.0 / 15.0 GB at 200 MB/s, ~30s remaining",
+        ])
+        self.assertEqual(summary_progress_parts(result[0]), ("Downloading model", 60))
+
+    def test_ssh_readiness_is_only_reported_after_a_successful_connection(self) -> None:
+        self.assertEqual(self._transform("Vast waiting for SSH: success, running image (waiting 3m00s)"), ["Waiting for SSH (3m00s)"])
+        self.assertEqual(self._transform("Vast SSH ready"), ["Machine ready"])
+        self.assertEqual(self._transform("Vast opening secure endpoint"), ["Opening secure endpoint"])
+
+    def test_image_pull_is_distinguished_when_reported(self) -> None:
+        self.assertEqual(self._transform("Vast rental preparing: pulling image layers (waiting 30s)"), ["Pulling runtime image (30s)"])
+
     def test_the_provisioning_wait_reaches_the_summary(self) -> None:
         self.assertEqual(
             self._transform("Vast instance state: loading"), ["Provisioning machine"]
@@ -651,13 +668,13 @@ class VastProvisioningSummaryTests(unittest.TestCase):
                 "Vast model starting: downloading weights, 6.6 GB fetched at 35 MB/s"
                 " (waiting 4m10s)"
             ),
-            ["Downloading model (4m10s)"],
+            ["Downloading model — 6.6 GB fetched at 35 MB/s (4m10s)"],
         )
         self.assertEqual(
             self._transform(
                 "Vast model starting: load_tensors: offloaded 63/63 layers (waiting 9m00s)"
             ),
-            ["Starting server (9m00s)"],
+            ["Loading weights on GPU (9m00s)"],
         )
 
     def test_the_download_row_replaces_itself_rather_than_stacking(self) -> None:
@@ -688,14 +705,14 @@ class VastProvisioningSummaryTests(unittest.TestCase):
         self.assertEqual(labels, {"Provisioning machine"})
 
     def test_the_rest_of_the_rental_reads_as_milestones(self) -> None:
-        self.assertEqual(self._transform("Vast instance state: running"), ["Machine ready"])
+        self.assertEqual(self._transform("Vast instance state: running"), ["Waiting for SSH"])
         self.assertEqual(
             self._transform("Rented GPUs: 0:NVIDIA GeForce RTX 4090 23.5 GiB free"),
             ["GPU ready: 0:NVIDIA GeForce RTX 4090 23.5 GiB free"],
         )
         self.assertEqual(
             self._transform("Vast host is running but not accepting SSH yet: refused"),
-            ["Opening secure endpoint"],
+            ["Waiting for SSH"],
         )
         self.assertEqual(
             self._transform(

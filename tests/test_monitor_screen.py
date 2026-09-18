@@ -688,6 +688,23 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             body = str(screen.query_one("#result-card-body", Static).content)
             self.assertIn("Healthy", body)
             self.assertIn("curl https://x.test/v1/chat", body)
+            title = str(screen.query_one("#result-card-title", Static).content)
+            self.assertIn("Status check complete", title)
+
+    async def test_completed_operation_prioritizes_done_and_copy_over_log_keys(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(MonitorScreen(title="Status Check"))
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, MonitorScreen)
+            self.assertFalse(screen.check_action("submit_or_finish", ()))
+            screen.on_operation_done(
+                OperationDone(operation=OperationType.STATUS, success=True)
+            )
+            await pilot.pause()
+            self.assertTrue(screen.check_action("submit_or_finish", ()))
+            self.assertFalse(screen.check_action("page_up_log", ()))
 
     async def test_connection_card_manage_button_routes_to_manage(self) -> None:
         class _RouteApp(App[None]):

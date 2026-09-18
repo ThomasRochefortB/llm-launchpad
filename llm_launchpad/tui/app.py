@@ -12,10 +12,8 @@ import json
 import os
 import threading
 import time
-from collections.abc import Iterator
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
 from uuid import uuid4
 
 from textual.app import App
@@ -54,9 +52,6 @@ from ..core.provider_readiness import (
 )
 from ..core.vast_auth import resolve_vast_credentials
 from ..core.vast_deployment import VastDeploymentBackend
-from ..core.provider_options import prime_provider_options
-from ..core.vision_probe import is_vision_probe_failure
-from ..core.warmup import StartupPhaseTimer
 from ..core.quick_deploy import QuickDeployProfile
 from ..core.reasoning_profiles import discover_reasoning_capabilities
 from ..core.runtime_support import evaluate_llamacpp_architecture
@@ -68,7 +63,7 @@ from ..core.opencode import (
     visible_launchpad_rows,
 )
 from ..core.orchestrator import Orchestrator
-from ..protocol.enums import BackendType, ComputeProvider, DeploymentState, OperationType
+from ..protocol.enums import AttemptDisposition, BackendType, CleanupDisposition, ComputeProvider, OperationType
 from ..protocol.events import (
     BaseEvent,
     EndpointAvailableEvent,
@@ -76,7 +71,6 @@ from ..protocol.events import (
     LogEvent,
     OperationCompleteEvent,
     ResourceAllocatedEvent,
-    StateChangeEvent,
 )
 from ..protocol.models import BenchmarkConfig
 from ..protocol.models import EndpointInfo
@@ -93,7 +87,7 @@ from .screens.fast_deploy import FastDeployScreen
 from .screens.manage import ManageScreen
 from .screens.monitor import MonitorScreen
 from .screens.operations import OperationsScreen
-from .deployment_jobs import DeploymentCancelled, DeploymentFallback, DeploymentJob
+from .deployment_jobs import DeploymentCancelled, DeploymentJob
 from .screens.quick_deploy import QuickDeployScreen
 from .screens.setup import SetupRequiredScreen
 from .screens.storage import StorageScreen
@@ -1145,7 +1139,6 @@ class TuiApp(App):
         with self._deployment_lock:
             if job is None or not job.accepting_cancellation:
                 return
-            job.outcome = "Cancelling; waiting for provider"
             job.cancel_requested.set()
             if job.persistent_id:
                 try:
@@ -1159,8 +1152,6 @@ class TuiApp(App):
     def _run_deployment_job(self, job: DeploymentJob) -> None:
         try:
             self._run_deploy(job.config, job.monitor)
-            if not job.cancel_requested.is_set():
-                job.outcome = "Finished — open result"
         except Exception as exc:
             log_exception("Deployment worker failed")
             job.outcome = "Failed — check resource in Manage"
@@ -1173,87 +1164,63 @@ class TuiApp(App):
                 job.accepting_cancellation = False
                 job.finished.set()
 
-    def _deployment_events(
-        self, config: DeploymentConfig, monitor: MonitorScreen, events: Iterator[BaseEvent],
-    ) -> Iterator[BaseEvent]:
-        """Observe cancellation between provider calls and retain resource IDs."""
-        job = self._job_for_monitor(monitor)
-        try:
-            if job is not None and job.cancel_requested.is_set():
-                raise DeploymentCancelled
-            for event in events:
-                endpoint = (
-                    event.endpoint if isinstance(event, EndpointAvailableEvent)
-                    else event.data if isinstance(event, OperationCompleteEvent) and isinstance(event.data, EndpointInfo)
-                    else None
-                )
-                app_id = event.app_id if isinstance(event, ResourceAllocatedEvent) else endpoint.app_id if endpoint else None
-                if app_id:
-                    with self._deployment_lock:
-                        key = self._deployment_key(config)
-                        pending = self._in_flight_deploys.get(key)
-                        if pending is not None:
-                            pending = replace(pending, app_id=app_id)
-                            self._in_flight_deploys[key] = pending
-                            record_in_flight(pending)
-                if job is not None and job.cancel_requested.is_set():
-                    raise DeploymentCancelled
-                yield event
-            if job is not None and job.cancel_requested.is_set():
-                raise DeploymentCancelled
-        finally:
-            close = getattr(events, "close", None)
-            if close is not None:
-                close()
-
     def _run_deploy(self, config: DeploymentConfig, monitor: MonitorScreen) -> None:
         """Run one deployment to completion, journalling it for recovery."""
         # The provider creates the app before its command returns, so this is
         # journalled first: an entry that outlives the process is the only
         # evidence that a deployment was abandoned mid-flight.
         job = self._job_for_monitor(monitor)
-        while True:
-            if job is not None and job.cancel_requested.is_set():
-                job.outcome = "Cancelled before starting placement."
-                _dispatch_event(monitor, OperationCompleteEvent(
-                    operation=OperationType.DEPLOY, success=False, detail=job.outcome,
-                ))
-                return
+        if job is not None and job.cancel_requested.is_set():
+            job.outcome = "Cancelled before starting placement."
+            _dispatch_event(monitor, OperationCompleteEvent(
+                operation=OperationType.DEPLOY, success=False, detail=job.outcome,
+            ))
+            return
+        try:
             self._begin_in_flight(config)
+        except RuntimeError as exc:
+            # Another job owns this target (e.g. a fallback pointing at an
+            # occupied app): fail without touching the owner's journal entry.
             if job is not None:
-                job.config = config
-            resolved = False
-            fallback = None
-            try:
-                self._run_deploy_inner(config, monitor)
-                with self._deployment_lock:
-                    if job is not None:
-                        if job.cancel_requested.is_set():
-                            raise DeploymentCancelled
-                        job.accepting_cancellation = False
-                resolved = True
-            except DeploymentFallback as exc:
-                fallback = exc.config
-                resolved = True
-            except DeploymentCancelled:
-                with self._deployment_lock:
-                    pending = self._in_flight_deploys.get(self._deployment_key(config))
-                resolved = not config.do_deploy or (pending is not None and self._stop_in_flight(pending))
-                detail = (
-                    "Cancelled." if resolved and not config.do_deploy else
-                    "Cancelled; resource stopped." if resolved else
-                    "Cancellation cleanup failed; check Manage. Recovery record retained."
-                )
+                job.outcome = f"Failed — {exc}"
+            _dispatch_event(monitor, OperationCompleteEvent(
+                operation=OperationType.DEPLOY, success=False, detail=str(exc),
+            ))
+            return
+        if job is not None:
+            job.config = config
+        inner_outcome: str | None = None
+        resolved = False
+        try:
+            inner_outcome = self._run_deploy_inner(config, monitor)
+            # The lifecycle owns cancellation cleanup: it already stopped (or
+            # retained) the resource and recorded the outcome on the result.
+            # Checking the flag here would run a second stop and overwrite a
+            # lifecycle-computed "cleanup failed" verdict with success.
+            with self._deployment_lock:
                 if job is not None:
-                    job.outcome = detail
-                _dispatch_event(monitor, OperationCompleteEvent(
-                    operation=OperationType.DEPLOY, success=False, detail=detail,
-                ))
-            finally:
+                    job.accepting_cancellation = False
+            resolved = True
+        except DeploymentCancelled:
+            with self._deployment_lock:
+                pending = self._in_flight_deploys.get(self._deployment_key(config))
+            resolved = not config.do_deploy or (pending is not None and self._stop_in_flight(pending))
+            detail = (
+                "Cancelled." if resolved and not config.do_deploy else
+                "Cancelled; resource stopped." if resolved else
+                "Cancellation cleanup failed; check Manage. Recovery record retained."
+            )
+            if job is not None:
+                job.outcome = detail
+            _dispatch_event(monitor, OperationCompleteEvent(
+                operation=OperationType.DEPLOY, success=False, detail=detail,
+            ))
+        finally:
+            # The inner run reports lifecycle-computed resolution (cleanup
+            # failures keep the recovery record); the legacy boolean path is
+            # only for DeploymentCancelled raised outside the lifecycle.
+            if inner_outcome is None:
                 self._finish_in_flight(config, resolved=resolved)
-            if fallback is None:
-                return
-            config = fallback
 
     @staticmethod
     def _deployment_key(config: DeploymentConfig) -> tuple[str, str, str]:
@@ -1286,52 +1253,26 @@ class TuiApp(App):
     def _finish_in_flight(self, config: DeploymentConfig, *, resolved: bool = True) -> None:
         app_name = (config.app_name or legacy_app_name(config.backend)).strip()
         with self._deployment_lock:
-            if resolved:
+            if resolved is True:
                 self._in_flight_deploys.pop(self._deployment_key(config), None)
                 if app_name:
                     clear_in_flight(app_name, provider=config.provider.value, backend=config.backend.value)
+            elif resolved is False:
+                # Cleanup failed or was skipped: keep both the in-memory entry
+                # and the journal row for recovery from Manage.
+                pass
 
-    def _deploy_endpoint_url(
-        self, config: DeploymentConfig, observed_url: str | None
-    ) -> str | None:
-        """Return the endpoint URL to publish, falling back to Modal's default."""
-        if observed_url:
-            return observed_url
-        if config.provider != ComputeProvider.MODAL:
-            return observed_url
-        return ModalBackend.default_server_url(
-            self._username,
-            app_name=config.app_name or legacy_app_name(config.backend),
-            function_slug=config.function_slug,
+    def _run_deploy_inner(self, config: DeploymentConfig, monitor: MonitorScreen) -> str | None:  # type: ignore[return]
+        """Consumed by run_worker in a thread; delegates to the shared lifecycle."""
+        from ..core.deployment_lifecycle import (
+            LifecycleAttempt,
+            LifecycleCallbacks,
+            LifecycleOptions,
+            run_lifecycle,
         )
 
-    def _advance_to_fallback(
-        self, config: DeploymentConfig, monitor: MonitorScreen, reason: str
-    ) -> bool:
-        """Start the next approved placement, if this config still has one."""
-        job = self._job_for_monitor(monitor)
-        if job is not None and job.cancel_requested.is_set():
-            raise DeploymentCancelled
-        fallbacks = list(config.fallback_configs)
-        if not fallbacks:
-            return False
-        next_config = fallbacks.pop(0)
-        next_config.fallback_configs = tuple(fallbacks)
-        _dispatch_event(
-            monitor,
-            LogEvent(line=reason, operation=OperationType.DEPLOY, is_milestone=True),
-        )
-        raise DeploymentFallback(next_config)
-
-    def _run_deploy_inner(self, config: DeploymentConfig, monitor: MonitorScreen):  # type: ignore[return]
-        """Consumed by run_worker in a thread."""
-        deployed_web_url: str | None = None
         deployed_endpoint: EndpointInfo | None = None
-        # Endpoint URL precedence lives in core.deploy_events so headless
-        # callers get the same answer this screen does.
         url_resolver = EndpointUrlResolver()
-        deploy_succeeded = False
-        opencode_synced = False
         will_run_warmup = bool(config.do_warmup and config.do_deploy)
 
         def _emit_connection_summary(url: str) -> None:
@@ -1343,7 +1284,6 @@ class TuiApp(App):
                 poster(ConnectionSummaryReady(_deploy_connection_card_payload(config, url)))
 
         def _sync_now(url: str) -> None:
-            nonlocal opencode_synced
             target_app_name = config.app_name or legacy_app_name(config.backend)
             live_rows, prune_providers = self._visible_rows_and_prune_scope()
             self._sync_opencode(
@@ -1355,198 +1295,202 @@ class TuiApp(App):
                 monitor=monitor,
                 emit_skipped=True,
             )
-            opencode_synced = True
 
-        # Startup-time phases: deploy start is marked here, warmup start + end
-        # in the warmup block below, so the emitted milestone lines
-        # (``startup-phase <name> <seconds>``) carry deploy / warmup-wait /
-        # calibration / total timings for before/after comparisons.
-        phase_timer = StartupPhaseTimer()
-        phase_timer.deploy_started()
-        for event in self._deployment_events(config, monitor, self._orchestrator.deploy(config)):
+        def _on_event(event: BaseEvent) -> None:
+            nonlocal deployed_endpoint
             if isinstance(event, LogEvent):
                 url_resolver.observe(event)
-                deployed_web_url = url_resolver.url or deployed_web_url
             elif isinstance(event, EndpointAvailableEvent):
                 deployed_endpoint = event.endpoint
                 self._invalidate_endpoint_snapshot()
                 url_resolver.observe(event)
-                if event.endpoint.web_url:
-                    deployed_web_url = url_resolver.url or event.endpoint.web_url
-                    if not will_run_warmup:
-                        _emit_connection_summary(event.endpoint.web_url)
-                        _sync_now(event.endpoint.web_url)
             elif isinstance(event, OperationCompleteEvent):
-                deploy_succeeded = event.success
-                if event.operation == OperationType.DEPLOY:
-                    deploy_phase = phase_timer.deploy_event(event.operation)
-                    if deploy_phase is not None:
-                        _dispatch_event(monitor, deploy_phase)
                 if event.operation == OperationType.DEPLOY:
                     self._invalidate_endpoint_snapshot()
                 if event.success and isinstance(event.data, EndpointInfo):
                     deployed_endpoint = event.data
-                    deployed_web_url = event.data.web_url or deployed_web_url
-                    if event.data.web_url and not will_run_warmup:
-                        self._cache_deploy_connection_summary(
-                            config, event.data.web_url, event.data
-                        )
-                elif (
-                    not event.success
-                    and event.operation == OperationType.DEPLOY
-                    and opencode_synced
-                ):
-                    target_app_name = config.app_name or legacy_app_name(config.backend)
-                    live_rows, prune_providers = self._visible_rows_and_prune_scope()
-                    self._sync_opencode(
-                        current_rows=live_rows,
-                        remove_app_names=[target_app_name],
-                        prune_providers=prune_providers,
-                        monitor=monitor,
-                    )
-                    opencode_synced = False
-                # When warmup immediately follows a successful deploy in the same
-                # monitor session, suppress the intermediate completion footer
-                # ("Operation complete... Press esc") to keep the summary cleaner.
                 if _defers_completion_footer(
                     event, config=config, will_run_warmup=will_run_warmup
                 ):
-                    continue
-                if (
-                    event.success
-                    and event.operation == OperationType.DEPLOY
-                    and config.do_deploy
-                    and not opencode_synced
-                ):
-                    url = self._deploy_endpoint_url(config, deployed_web_url)
-                    if url:
-                        _emit_connection_summary(url)
-                        _sync_now(url)
+                    return
             _dispatch_event(monitor, event)
 
-        if not deploy_succeeded and self._advance_to_fallback(
-            config,
-            monitor,
-            "Deployment could not start; trying an equivalent placement "
-            "at or below the approved hourly price.",
-        ):
-            return
+        def _on_credentials(
+            saved: DeploymentConfig, url: str | None, endpoint: EndpointInfo | None
+        ) -> None:
+            # Pre-certification save: persist the bearer key so a later warmup
+            # failure cannot strand a live resource, without publishing the
+            # unverified URL as a verified endpoint.
+            nonlocal deployed_endpoint
+            if endpoint is not None:
+                deployed_endpoint = endpoint
+                self._invalidate_endpoint_snapshot()
+            if url:
+                try:
+                    self._cache_deploy_connection_summary(saved, url, endpoint)
+                except Exception:
+                    pass
 
-        # Warmup if requested and deploy was successful
-        if config.do_warmup and config.do_deploy and deploy_succeeded:
-            target_app_name = config.app_name or legacy_app_name(config.backend)
-            url = self._deploy_endpoint_url(config, deployed_web_url)
-            if not url:
-                _dispatch_event(monitor, ErrorEvent(message="Provider returned no endpoint URL."))
-                return
-            certification_kwargs: dict[str, Any] = (
-                {
-                    "serving_requirements": config.serving_requirements,
-                    "placement_assessment": config.placement_assessment,
-                    "runtime_id": config.llamacpp_runtime_id,
-                }
-                if config.serving_requirements is not None
-                else {}
-            )
-            if config.provider != ComputeProvider.MODAL or config.endpoint_api_key:
-                certification_kwargs.update(
-                    provider=config.provider,
-                    api_key=config.endpoint_api_key,
-                    pod_id=deployed_endpoint.app_id if deployed_endpoint else None,
-                )
-            if config.vision is not None:
-                certification_kwargs["vision"] = config.vision
-            phase_timer.warmup_started()
-            warmup_events = self._orchestrator.warmup(
-                backend=config.backend,
-                server_url=url,
-                timeout=1800,
-                tail_logs=True,
-                app_name=target_app_name,
-                served_model_name=config.served_model_name,
-                phase_timer=phase_timer,
-                **certification_kwargs,
-            )
-            for event in self._deployment_events(config, monitor, warmup_events):
+        def _on_connection(
+            saved: DeploymentConfig, url: str | None, endpoint: EndpointInfo | None
+        ) -> None:
+            nonlocal deployed_endpoint
+            if endpoint is not None:
+                deployed_endpoint = endpoint
+                self._invalidate_endpoint_snapshot()
+            if url:
                 if (
-                    isinstance(event, OperationCompleteEvent)
-                    and event.success
-                    and event.operation == OperationType.WARMUP
+                    endpoint is not None
+                    and endpoint.web_url
+                    and config.provider == ComputeProvider.MODAL
                 ):
-                    completed_url = url
-                    if isinstance(event.data, dict):
-                        maybe_url = event.data.get("url")
-                        if isinstance(maybe_url, str) and maybe_url.strip():
-                            completed_url = maybe_url.strip()
-                        attestation = event.data.get("attestation")
-                        if attestation is not None:
-                            config.runtime_attestation = attestation
-                            if deployed_endpoint is not None:
-                                deployed_endpoint.runtime_attestation = attestation
-                    # A certified warmup answered the runtime, so it counts as
-                    # the explicit health observation passive refreshes show.
-                    if config.provider == ComputeProvider.MODAL and deployed_endpoint is not None:
-                        try:
-                            from ..core.runtime_health import record_explicit_health
+                    try:
+                        from ..core.runtime_health import record_explicit_health
 
-                            record_explicit_health(deployed_endpoint, "healthy", None)
-                        except Exception:
-                            pass
-                    _dispatch_event(
-                        monitor,
-                        StateChangeEvent(
-                            current=DeploymentState.PUBLISHING,
-                            operation=OperationType.WARMUP,
-                            detail="Publishing verified endpoint",
+                        record_explicit_health(endpoint, "healthy", None)
+                    except Exception:
+                        pass
+                # Publication is single-sourced here: after deploy when no
+                # warmup follows, and after warmup with the verified URL.
+                # Pre-certification credentials persist via on_credentials.
+                _emit_connection_summary(url)
+                _sync_now(url)
+
+        from ..core.deployment_preflight import lifecycle_attempts_for_configs
+
+        def _attempt_with_plan(target: DeploymentConfig) -> LifecycleAttempt:
+            specs = lifecycle_attempts_for_configs([target])
+            spec = specs[0]
+            return LifecycleAttempt(
+                config=target,
+                retry_allowed=target.retry_allowed,
+                plan=spec.plan,
+            )
+
+        attempts = [_attempt_with_plan(config)]
+        for fallback in config.fallback_configs:
+            if self._deployment_key(fallback) == self._deployment_key(config):
+                # Same target as the attempt that just ran (the Fast Deploy
+                # ladder reuses one app name across placements): allowed.
+                attempts.append(_attempt_with_plan(fallback))
+                continue
+            try:
+                self._begin_in_flight(fallback)
+            except RuntimeError:
+                # A fallback targeting another job's app must not run: it
+                # would overwrite the owner's journal entry and deploy into
+                # its target. Skip it instead of failing the whole ladder.
+                _dispatch_event(
+                    monitor,
+                    LogEvent(
+                        line=(
+                            f"Skipping fallback placement {fallback.app_name}: "
+                            "another deployment owns that target."
                         ),
-                    )
-                    _emit_connection_summary(completed_url)
-                    if not opencode_synced or completed_url != url:
-                        _sync_now(completed_url)
-                elif (
-                    isinstance(event, OperationCompleteEvent)
-                    and not event.success
-                    and event.operation == OperationType.WARMUP
-                ):
-                    self._cache_deploy_connection_summary(config, url, deployed_endpoint)
-                    keep_failed_prime = (
-                        config.provider == ComputeProvider.PRIME
-                        and prime_provider_options(config).keep_failed_resource
-                    )
-                    # A server that answered readiness and then failed only the
-                    # image probe stays up so it can be inspected.
-                    if not keep_failed_prime and not is_vision_probe_failure(event):
-                        resource_label = (
-                            f"Prime pod {deployed_endpoint.app_id}"
-                            if config.provider == ComputeProvider.PRIME
-                            and deployed_endpoint is not None
-                            else f"failed {config.provider.display_name} deployment"
-                        )
-                        _dispatch_event(
-                            monitor,
-                            LogEvent(line=f"Certification failed; cleaning up {resource_label}."),
-                        )
-                        for cleanup_event in self._orchestrator.stop_app(
-                            config.backend,
-                            app_name=target_app_name,
-                            app_id=(deployed_endpoint.app_id if deployed_endpoint else None),
-                            provider=config.provider,
-                        ):
-                            _dispatch_event(monitor, cleanup_event)
-                            if (
-                                config.provider == ComputeProvider.VAST
-                                and isinstance(cleanup_event, OperationCompleteEvent)
-                                and not cleanup_event.success
-                            ):
-                                config.fallback_configs = ()
-                    if self._advance_to_fallback(
-                        config,
-                        monitor,
-                        "Trying an equivalent certified placement at or below "
+                        operation=OperationType.DEPLOY,
+                    ),
+                )
+                continue
+            self._finish_in_flight(fallback, resolved=True)
+            attempts.append(_attempt_with_plan(fallback))
+        result = run_lifecycle(
+            self._orchestrator,
+            attempts,
+            options=LifecycleOptions(
+                warmup_timeout_seconds=1800,
+                tail_logs=True,
+                warmup_enabled=will_run_warmup,
+                modal_username=self._username,
+            ),
+            callbacks=LifecycleCallbacks(
+                on_event=lambda event: (
+                    self._observe_lifecycle_event(config, monitor, event),
+                    _on_event(event),
+                ),
+                is_cancelled=lambda: self._is_deploy_cancelled(monitor),
+                on_resource=lambda resource_id: self._record_lifecycle_resource(
+                    config, monitor, resource_id
+                ),
+                on_connection=_on_connection,
+                on_credentials=_on_credentials,
+            ),
+        )
+        if not result.succeeded and result.attempts:
+            last = result.attempts[-1]
+            if last.retry_allowed and len(result.attempts) < len(attempts):
+                _dispatch_event(
+                    monitor,
+                    LogEvent(
+                        line="Trying an equivalent certified placement at or below "
                         "the approved hourly price.",
-                    ):
-                        return
-                _dispatch_event(monitor, event)
+                        operation=OperationType.DEPLOY,
+                        is_milestone=True,
+                    ),
+                )
+        job = self._job_for_monitor(monitor)
+        if job is not None:
+            job.outcome = result.outcome or (
+                "Finished — open result" if result.succeeded
+                else "Failed — check resource in Manage"
+            )
+            # Cancellation cleanup that did not confirm keeps its recovery
+            # record; a confirmed stop clears it like any other resolution.
+            if result.succeeded:
+                self._finish_in_flight(config, resolved=True)
+            elif result.attempts and all(
+                attempt.cleanup == CleanupDisposition.FAILED
+                or attempt.cleanup_error
+                for attempt in result.attempts
+                if attempt.disposition == AttemptDisposition.CANCELLED
+            ):
+                self._finish_in_flight(config, resolved=False)
+            elif result.attempts and any(
+                attempt.disposition == AttemptDisposition.CANCELLED
+                for attempt in result.attempts
+            ):
+                self._finish_in_flight(config, resolved=True)
+            elif not result.succeeded:
+                # A plain failure clears only this job's own entry: a skipped
+                # fallback never began, so its target's owner keeps theirs.
+                self._finish_in_flight(config, resolved=True)
+            return result.outcome
+        return result.outcome
+
+    def _observe_lifecycle_event(
+        self, config: DeploymentConfig, monitor: MonitorScreen, event: BaseEvent
+    ) -> None:
+        """Record resource IDs; cancellation is observed by the lifecycle."""
+        endpoint = (
+            event.endpoint if isinstance(event, EndpointAvailableEvent)
+            else event.data if isinstance(event, OperationCompleteEvent) and isinstance(event.data, EndpointInfo)
+            else None
+        )
+        app_id = event.app_id if isinstance(event, ResourceAllocatedEvent) else endpoint.app_id if endpoint else None
+        if app_id:
+            with self._deployment_lock:
+                key = self._deployment_key(config)
+                pending = self._in_flight_deploys.get(key)
+                if pending is not None:
+                    pending = replace(pending, app_id=app_id)
+                    self._in_flight_deploys[key] = pending
+                    record_in_flight(pending)
+
+    def _is_deploy_cancelled(self, monitor: MonitorScreen) -> bool:
+        job = self._job_for_monitor(monitor)
+        return bool(job is not None and job.cancel_requested.is_set())
+
+    def _record_lifecycle_resource(
+        self, config: DeploymentConfig, monitor: MonitorScreen, resource_id: str | None
+    ) -> None:
+        if not resource_id:
+            return
+        with self._deployment_lock:
+            key = self._deployment_key(config)
+            pending = self._in_flight_deploys.get(key)
+            if pending is not None:
+                pending = replace(pending, app_id=resource_id)
+                self._in_flight_deploys[key] = pending
+                record_in_flight(pending)
 
     # ------------------------------------------------------------------
     # Manage: status

@@ -14,7 +14,6 @@ import os
 import sys
 import threading
 import time
-from pathlib import Path
 
 from typing import TYPE_CHECKING, Any
 
@@ -24,20 +23,14 @@ from ..protocol.events import (
     EndpointAvailableEvent,
     LogEvent,
     OperationCompleteEvent,
-    ResourceAllocatedEvent,
 )
 from ..protocol.models import DeploymentConfig, EndpointInfo
 from .diagnostics import log_exception
+from .resource_targeting import NAME_ADDRESSABLE_PROVIDERS as _NAME_ADDRESSABLE_PROVIDERS_UNUSED  # noqa: F401  (compat re-export)
 
 if TYPE_CHECKING:
     from .job_store import JobStore
     from .orchestrator import Orchestrator
-
-
-def _store_for(path: str | None) -> JobStore:
-    from .job_store import JobStore
-
-    return JobStore(Path(path) if path else None)
 
 
 def spawn_job_worker(job_id: str, store_path: str | None = None) -> int:
@@ -136,46 +129,121 @@ def _run_claimed_job(job_id: str, store: JobStore, pid: int) -> int:
         )
     except Exception:
         pass
-    resource_app_id: str | None = record.resource_app_id
+    initial_resource: str | None = record.resource_app_id
+    # The approved ladder is snapshotted once; the lifecycle owns progression
+    # through explicit retry_allowed outcomes. Resource identity resets per
+    # attempt: the next placement must allocate before it can be cancelled.
     attempt_configs: list[DeploymentConfig] = [config, *list(config.fallback_configs)]
-    attempt_index = 0
-    try:
-        while attempt_index < len(attempt_configs):
-            current = attempt_configs[attempt_index]
-            if store.is_cancel_requested(job_id):
-                _cancel_with_cleanup(job_id, store, current, resource_app_id, "Cancelled before starting placement.")
-                _clear_journal(current)
-                return 0
-            if attempt_index > 0:
-                store.update_config(job_id, current)
+    from .deployment_lifecycle import (
+        LifecycleAttempt,
+        LifecycleCallbacks,
+        LifecycleOptions,
+        run_lifecycle,
+    )
+    from ..protocol.enums import AttemptDisposition
+
+    worker_resource: str | None = initial_resource
+    worker_url: str | None = None
+    worker_endpoint: EndpointInfo | None = None
+    worker_index: int = 0
+
+    def _on_event(event: BaseEvent) -> None:
+        try:
+            store.append_event(job_id, event)
+        except Exception:
+            pass
+
+    def _on_resource(new_resource: str | None) -> None:
+        nonlocal worker_resource
+        if new_resource:
+            worker_resource = new_resource
+            try:
+                store.set_resource(job_id, new_resource)
+            except Exception:
+                pass
+
+    def _on_connection(
+        saved_config: DeploymentConfig,
+        url: str | None,
+        endpoint: EndpointInfo | None,
+    ) -> None:
+        nonlocal worker_url, worker_endpoint
+        if endpoint is not None:
+            worker_endpoint = endpoint
+            if endpoint.web_url:
+                worker_url = endpoint.web_url
+        elif url:
+            worker_url = url
+        try:
+            _save_connection(saved_config, worker_url, worker_endpoint)
+        except Exception:
+            pass
+
+    def _on_attempt_start(index: int, attempt_config: DeploymentConfig) -> None:
+        nonlocal worker_index, worker_resource, worker_url, worker_endpoint
+        worker_index = index
+        # A previous attempt's resource must not leak into the next one.
+        if index > 0:
+            worker_resource = None
+            worker_url = None
+            worker_endpoint = None
+            try:
+                store.update_config(job_id, attempt_config)
                 store.append_event(
                     job_id,
                     LogEvent(
-                        line=f"Trying the next approved placement ({attempt_index + 1}/{len(attempt_configs)}).",
+                        line=f"Trying the next approved placement ({index + 1}/{len(attempt_configs)}).",
                         operation=OperationType.DEPLOY,
                         is_milestone=True,
                     ),
                 )
-            try:
-                resource_app_id, failure_detail = _run_attempt_phases(
-                    job_id, store, orchestrator, current, resource_app_id
-                )
-            except _WorkerCancelled:
-                _clear_journal(current)
-                return 0
-            if failure_detail is None:
-                _clear_journal(current)
-                return 0
-            attempt_index += 1
-            if attempt_index >= len(attempt_configs):
-                store.finish_job(
-                    job_id, JobStatus.FAILED, f"Failed — check resource in Manage. {failure_detail}".strip(),
-                )
-                # Failed deploys keep their journal entry when a resource may exist;
-                # a clean failure with no resource clears it.
-                if not resource_app_id:
-                    _clear_journal(current)
-                return 0
+            except Exception:
+                pass
+
+    def _on_attempt_finish(index: int, outcome: object) -> None:
+        from ..protocol.models import DeploymentAttemptOutcome
+
+        nonlocal worker_resource, worker_url, worker_endpoint
+        if isinstance(outcome, DeploymentAttemptOutcome):
+            if outcome.resource_app_id:
+                worker_resource = outcome.resource_app_id
+            if outcome.endpoint_url:
+                worker_url = outcome.endpoint_url
+            if outcome.endpoint is not None:
+                worker_endpoint = outcome.endpoint
+
+    from .deployment_preflight import lifecycle_attempts_for_configs
+
+    attempts = [
+        LifecycleAttempt(
+            config=spec.config,
+            retry_allowed=spec.retry_allowed,
+            plan=spec.plan,
+        )
+        for spec in lifecycle_attempts_for_configs(attempt_configs)
+    ]
+    try:
+        if store.is_cancel_requested(job_id):
+            _cancel_with_cleanup(
+                job_id, store, attempt_configs[0], initial_resource,
+                "Cancelled before starting placement.", allocated=False,
+            )
+            _clear_journal(attempt_configs[0])
+            return 0
+        result = run_lifecycle(
+            orchestrator,
+            attempts,
+            options=LifecycleOptions(warmup_timeout_seconds=1800, tail_logs=True),
+            callbacks=LifecycleCallbacks(
+                on_event=_on_event,
+                is_cancelled=lambda: store.is_cancel_requested(job_id),
+                on_resource=_on_resource,
+                on_connection=_on_connection,
+                on_credentials=_on_connection,
+                on_attempt_start=_on_attempt_start,
+                on_attempt_finish=_on_attempt_finish,
+            ),
+        )
     except Exception as exc:
         log_exception("Deployment worker failed")
         try:
@@ -187,6 +255,56 @@ def _run_claimed_job(job_id: str, store: JobStore, pid: int) -> int:
             pass
         store.finish_job(job_id, JobStatus.FAILED, f"Failed — check resource in Manage. {exc}".strip())
         return 0
+    resource_app_id: str | None = worker_resource
+    observed_url: str | None = worker_url
+    current_index: int = worker_index
+    current = attempt_configs[min(current_index, len(attempt_configs) - 1)]
+    outcome = result.attempts[-1] if result.attempts else None
+    if outcome is not None and outcome.disposition == AttemptDisposition.CANCELLED:
+        _finish_cancelled_from_lifecycle(job_id, store, current, outcome)
+        _clear_journal(current)
+        return 0
+    if result.succeeded:
+        try:
+            store.update_config(job_id, current)
+        except Exception:
+            pass
+        if observed_url:
+            try:
+                _emit_connection_summary(store, job_id, current, observed_url)  # type: ignore[arg-type]
+            except Exception:
+                pass
+        store.finish_job(
+            job_id, JobStatus.SUCCEEDED, "Finished — open result",
+            result={"url": observed_url, "app_name": current.app_name},
+        )
+        _clear_journal(current)
+        return 0
+    failure_detail = (
+        outcome.failure_detail if outcome and outcome.failure_detail
+        else "Deployment failed."
+    )
+    if outcome is not None and outcome.disposition == AttemptDisposition.RETAINED:
+        current.retry_allowed = False
+        try:
+            store.update_config(job_id, current)
+        except Exception:
+            pass
+        store.finish_job(
+            job_id, JobStatus.FAILED, f"Failed — check resource in Manage. {failure_detail}".strip(),
+        )
+        return 0
+    if outcome is not None and not outcome.retry_allowed:
+        current.retry_allowed = False
+        try:
+            store.update_config(job_id, current)
+        except Exception:
+            pass
+    store.finish_job(
+        job_id, JobStatus.FAILED, f"Failed — check resource in Manage. {failure_detail}".strip(),
+    )
+    if not resource_app_id:
+        _clear_journal(current)
     return 0
 
 
@@ -197,242 +315,159 @@ def _run_attempt_phases(
     config: DeploymentConfig,
     resource_app_id: str | None,
 ) -> tuple[str | None, str | None]:
-    """Run deploy (+warmup) for one placement.
+    """Run deploy (+warmup) for one placement through the shared lifecycle.
 
     Returns (resource_app_id, failure_detail); failure None means the job
     finished SUCCEEDED. Raises _WorkerCancelled after persisting cleanup.
     """
 
+    from .deployment_lifecycle import (
+        LifecycleAttempt,
+        LifecycleCallbacks,
+        LifecycleOptions,
+        run_lifecycle,
+    )
     from .job_store import JobStatus
+    from ..protocol.enums import AttemptDisposition
 
     observed_url: str | None = None
     observed_endpoint: EndpointInfo | None = None
-    deploy_succeeded = False
-    failure_detail = ""
-    for event in orchestrator.deploy(config):
-        endpoint = _endpoint_from_event(event)
+
+    def _on_event(event: BaseEvent) -> None:
+        store.append_event(job_id, event)
+
+    def _on_resource(new_resource: str | None) -> None:
+        nonlocal resource_app_id
+        if new_resource:
+            resource_app_id = new_resource
+            store.set_resource(job_id, new_resource)
+
+    def _on_connection(
+        saved_config: DeploymentConfig,
+        url: str | None,
+        endpoint: EndpointInfo | None,
+    ) -> None:
+        nonlocal observed_url, observed_endpoint
+        # The authoritative endpoint wins over incidental URLs: prefer the
+        # last endpoint object with a URL, and persist warmup replacements.
         if endpoint is not None:
+            observed_endpoint = endpoint
             if endpoint.web_url:
                 observed_url = endpoint.web_url
-            observed_endpoint = endpoint
-            if endpoint.app_id:
-                resource_app_id = endpoint.app_id
-                store.set_resource(job_id, resource_app_id)
-        if isinstance(event, ResourceAllocatedEvent) and event.app_id:
-            resource_app_id = event.app_id
-            store.set_resource(job_id, resource_app_id)
-        store.append_event(job_id, event)
-        if store.is_cancel_requested(job_id):
-            _cancel_with_cleanup(job_id, store, config, resource_app_id, "Cancelled; cleaning up allocated resource.")
-            raise _WorkerCancelled
-        if isinstance(event, OperationCompleteEvent) and event.operation == OperationType.DEPLOY:
-            if event.success:
-                deploy_succeeded = True
-            else:
-                failure_detail = event.detail or "Deployment failed."
-    if not deploy_succeeded:
-        return resource_app_id, failure_detail
-    # Persist credentials immediately: a later warmup failure must not strand
-    # a live, billable resource without its generated bearer key.
-    _save_connection(config, observed_url, observed_endpoint)
-    if config.do_warmup and config.do_deploy:
-        completed_url = _run_warmup_phase(job_id, store, orchestrator, config, observed_url, observed_endpoint)
-        if completed_url is None:
-            # Warmup failed or was cancelled; _run_warmup_phase already
-            # recorded the outcome (or raised _WorkerCancelled).
-            if store.is_cancel_requested(job_id):
-                raise _WorkerCancelled
-            return resource_app_id, "Certification failed."
-        observed_url = completed_url
-        _save_connection(config, observed_url, observed_endpoint)
-    try:
-        store.update_config(job_id, config)
-    except Exception:
-        pass
-    if observed_url:
-        _emit_connection_summary(store, job_id, config, observed_url)
-    store.finish_job(
-        job_id, JobStatus.SUCCEEDED, "Finished — open result",
-        result={"url": observed_url, "app_name": config.app_name},
+        elif url:
+            observed_url = url
+        _save_connection(saved_config, observed_url, observed_endpoint)
+
+    result = run_lifecycle(
+        orchestrator,
+        [LifecycleAttempt(config=config, retry_allowed=config.retry_allowed)],
+        options=LifecycleOptions(warmup_timeout_seconds=1800, tail_logs=True),
+        callbacks=LifecycleCallbacks(
+            on_event=_on_event,
+            is_cancelled=lambda: store.is_cancel_requested(job_id),
+            on_resource=_on_resource,
+            on_connection=_on_connection,
+            # Pre-certification credential save uses the same persistence;
+            # publication (summaries, OpenCode sync) happens once in the job
+            # finalization below from the verified outcome.
+            on_credentials=_on_connection,
+        ),
     )
-    return resource_app_id, None
-
-
-def _run_warmup_phase(
-    job_id: str,
-    store: JobStore,
-    orchestrator: Orchestrator,
-    config: DeploymentConfig,
-    observed_url: str | None,
-    observed_endpoint: EndpointInfo | None,
-) -> str | None:
-    """Warm one deployed placement; returns the verified URL or None.
-
-    None covers warmup failure (after best-effort cleanup of the failed
-    resource, mirroring the TUI) and cancellation (via _WorkerCancelled).
-    """
-
-    from ..protocol.enums import ComputeProvider
-    from ..protocol.events import ErrorEvent, StateChangeEvent
-    from ..protocol.enums import DeploymentState
-
-    url = observed_url
-    if not url and config.provider == ComputeProvider.MODAL:
+    outcome = result.attempts[0] if result.attempts else None
+    if outcome is not None and outcome.resource_app_id:
+        resource_app_id = outcome.resource_app_id
+    if outcome is not None and outcome.endpoint_url:
+        observed_url = outcome.endpoint_url
+    if outcome is not None and outcome.endpoint is not None:
+        observed_endpoint = outcome.endpoint
+    if outcome is not None and outcome.disposition == AttemptDisposition.CANCELLED:
+        _finish_cancelled_from_lifecycle(job_id, store, config, outcome)
+        raise _WorkerCancelled
+    if store.is_cancel_requested(job_id):
+        raise _WorkerCancelled
+    if result.succeeded:
         try:
-            from .backend import ModalBackend
-
-            username = ModalBackend.get_username()
+            store.update_config(job_id, config)
         except Exception:
-            username = None
-        if username:
-            try:
-                from .backend import ModalBackend as _ModalBackend
-
-                url = _ModalBackend.default_server_url(
-                    username,
-                    app_name=config.app_name,
-                    function_slug=config.function_slug,
-                )
-            except Exception:
-                url = None
-    if not url:
-        detail = "Provider returned no endpoint URL."
-        store.append_event(job_id, ErrorEvent(message=detail, operation=OperationType.WARMUP))
-        return None
-    certification_kwargs: dict[str, Any] = {}
-    if config.serving_requirements is not None:
-        certification_kwargs = {
-            "serving_requirements": config.serving_requirements,
-            "placement_assessment": config.placement_assessment,
-            "runtime_id": config.llamacpp_runtime_id,
-        }
-    if config.provider != ComputeProvider.MODAL or config.endpoint_api_key:
-        certification_kwargs.update(
-            provider=config.provider,
-            api_key=config.endpoint_api_key,
-            pod_id=observed_endpoint.app_id if observed_endpoint else None,
+            pass
+        if observed_url:
+            _emit_connection_summary(store, job_id, config, observed_url)
+        store.finish_job(
+            job_id, JobStatus.SUCCEEDED, "Finished — open result",
+            result={"url": observed_url, "app_name": config.app_name},
         )
-    if config.vision is not None:
-        certification_kwargs["vision"] = config.vision
-    completed_url = url
-    warmup_ok = False
-    for event in orchestrator.warmup(
-        config.backend,
-        url,
-        1800,
-        True,
-        app_name=config.app_name,
-        served_model_name=config.served_model_name,
-        **certification_kwargs,  # type: ignore[arg-type]
-    ):
-        if (
-            isinstance(event, OperationCompleteEvent)
-            and event.success
-            and event.operation == OperationType.WARMUP
-        ):
-            warmup_ok = True
-            if isinstance(event.data, dict):
-                maybe_url = event.data.get("url")
-                if isinstance(maybe_url, str) and maybe_url.strip():
-                    completed_url = maybe_url.strip()
-                attestation = event.data.get("attestation")
-                if attestation is not None:
-                    config.runtime_attestation = attestation
-                    if observed_endpoint is not None:
-                        observed_endpoint.runtime_attestation = attestation
-        store.append_event(job_id, event)
-        if store.is_cancel_requested(job_id):
-            _cancel_with_cleanup(job_id, store, config, observed_endpoint.app_id if observed_endpoint else None, "Cancelled during warmup.")
-            raise _WorkerCancelled
-    if warmup_ok:
-        store.append_event(
-            job_id,
-            StateChangeEvent(
-                current=DeploymentState.PUBLISHING,
-                operation=OperationType.WARMUP,
-                detail="Publishing verified endpoint",
-            ),
-        )
-        return completed_url
-    _cleanup_failed_certification(job_id, store, orchestrator, config, observed_endpoint)
-    return None
+        return resource_app_id, None
+    if outcome is not None and outcome.disposition == AttemptDisposition.RETAINED:
+        # Kept for inspection: no retry, but the resource stays reachable.
+        config.retry_allowed = False
+        try:
+            store.update_config(job_id, config)
+        except Exception:
+            pass
+        return resource_app_id, outcome.failure_detail or "Certification failed."
+    if outcome is not None and not outcome.retry_allowed:
+        config.retry_allowed = False
+        try:
+            store.update_config(job_id, config)
+        except Exception:
+            pass
+    return resource_app_id, (
+        outcome.failure_detail if outcome and outcome.failure_detail
+        else "Deployment failed."
+    )
 
 
-def _cleanup_failed_certification(
+# Providers whose teardown is addressed by name. `modal app stop` takes the app
+# name, and a Vast destroy resolves its rental from the record it persisted
+# under that name -- so for these the name is the handle and no allocation
+# event has to arrive first. Prime is the exception: termination genuinely
+# needs a pod id, and it emits one the moment the pod exists.
+# Canonical addressing lives in core.resource_targeting; the name below stays
+# importable for backwards compatibility while callers migrate.
+_NAME_ADDRESSABLE_PROVIDERS = _NAME_ADDRESSABLE_PROVIDERS_UNUSED
+
+
+def _stop_target(
+    store: JobStore | Any,
     job_id: str,
-    store: JobStore,
-    orchestrator: Orchestrator,
     config: DeploymentConfig,
-    observed_endpoint: EndpointInfo | None,
-) -> None:
-    """Stop a placement that failed certification, mirroring the TUI.
+    resource_app_id: str | None,
+    *,
+    allocated: bool,
+) -> tuple[str | None, bool]:
+    """Resolve what a cancellation can stop: (resource id, anything to stop).
 
-    A server that answered readiness but failed only the image probe stays up
-    for inspection; an explicitly kept Prime resource does too.
+    The id is re-read from the job when the caller does not have one to hand:
+    the warmup path only sees whatever endpoint it was given, while the deploy
+    phase already banked the id, and throwing that away would strand a live
+    pod. Addressing policy lives in :mod:`core.resource_targeting`.
     """
+    from .resource_targeting import resolve_stop_target
 
-    from ..protocol.enums import ComputeProvider
-    from .provider_options import prime_provider_options
-    from .vision_probe import is_vision_probe_failure
-
-    keep_failed = (
-        config.provider == ComputeProvider.PRIME
-        and prime_provider_options(config).keep_failed_resource
+    identifier = (resource_app_id or "").strip()
+    if not identifier:
+        try:
+            record = store.get_job(job_id)
+        except Exception:
+            record = None
+        identifier = ((record.resource_app_id if record else "") or "").strip()
+    target = resolve_stop_target(
+        provider=config.provider,
+        app_name=config.app_name,
+        resource_id=identifier or None,
+        allocated=allocated,
     )
-    # The triggering event is the failed WARMUP completion already stored;
-    # vision-probe-only failures keep the endpoint for inspection.
-    probe_only = False
-    try:
-        for stored in reversed(store.get_events(job_id)):
-            if isinstance(stored.event, OperationCompleteEvent) and stored.event.operation == OperationType.WARMUP:
-                probe_only = is_vision_probe_failure(stored.event)
-                break
-    except Exception:
-        probe_only = False
-    if keep_failed or probe_only:
-        store.append_event(
-            job_id,
-            LogEvent(line="Certification failed; keeping the endpoint for inspection.", operation=OperationType.WARMUP),
-        )
-        return
-    resource_label = (
-        f"Prime pod {observed_endpoint.app_id}"
-        if config.provider == ComputeProvider.PRIME and observed_endpoint is not None
-        else f"failed {config.provider.display_name} deployment"
-    )
-    store.append_event(
-        job_id,
-        LogEvent(line=f"Certification failed; cleaning up {resource_label}.", operation=OperationType.WARMUP),
-    )
-    try:
-        for cleanup_event in orchestrator.stop_app(
-            config.backend,
-            app_name=config.app_name,
-            app_id=(observed_endpoint.app_id if observed_endpoint else None),
-            provider=config.provider,
-        ):
-            store.append_event(job_id, cleanup_event)
-            if (
-                config.provider == ComputeProvider.VAST
-                and isinstance(cleanup_event, OperationCompleteEvent)
-                and not cleanup_event.success
-            ):
-                # A rental whose destruction failed must not be followed by
-                # another rental: stop retrying the ladder.
-                config.fallback_configs = ()
-                try:
-                    store.update_config(job_id, config)
-                except Exception:
-                    pass
-    except Exception as exc:
-        store.append_event(
-            job_id,
-            LogEvent(line=f"Cleanup after failed certification failed: {exc}", operation=OperationType.WARMUP),
-        )
+    return target.resource_id, target.stoppable
 
 
 def _cancel_with_cleanup(
-    job_id: str, store: JobStore, config: DeploymentConfig, resource_app_id: str | None, prefix: str
+    job_id: str,
+    store: JobStore,
+    config: DeploymentConfig,
+    resource_app_id: str | None,
+    prefix: str,
+    *,
+    allocated: bool = True,
 ) -> None:
     from .job_store import JobStatus
 
@@ -445,11 +480,24 @@ def _cancel_with_cleanup(
         except Exception:
             pass
 
-    if not config.do_deploy or not resource_app_id:
+    resource_app_id, stoppable = _stop_target(
+        store, job_id, config, resource_app_id, allocated=allocated
+    )
+    # A Modal deploy never emits an allocation event -- its app is addressed by
+    # name -- so requiring an id here skipped teardown entirely and told the
+    # reader nothing had been allocated while the app stayed published.
+    if not config.do_deploy or not stoppable:
         detail = "Cancelled before allocating a resource."
         _terminal(detail)
         store.finish_job(job_id, JobStatus.CANCELLED, detail)
         return
+    # The caller says which wait was interrupted; saying so is the difference
+    # between a log that shows the cleanup happening and one that jumps
+    # straight to its verdict.
+    try:
+        store.append_event(job_id, LogEvent(line=prefix, operation=OperationType.STOP))
+    except Exception:
+        pass
     try:
         orchestrator = _orchestrator()
         confirmed = False
@@ -483,6 +531,64 @@ def _cancel_with_cleanup(
             "Cancellation cleanup failed; check Manage. Recovery record retained.",
             cleanup_error=str(exc),
         )
+
+
+def _finish_cancelled_from_lifecycle(
+    job_id: str,
+    store: JobStore,
+    config: DeploymentConfig,
+    outcome: object,
+) -> None:
+    """Persist a lifecycle-observed cancellation with its cleanup outcome."""
+    from .job_store import JobStatus
+    from ..protocol.enums import CleanupDisposition
+
+    cleanup = getattr(outcome, "cleanup", CleanupDisposition.UNKNOWN)
+    cleanup_error = getattr(outcome, "cleanup_error", None)
+    failure_detail = getattr(outcome, "failure_detail", None) or "Cancelled."
+    if cleanup == CleanupDisposition.CONFIRMED or (
+        isinstance(cleanup, str) and cleanup == CleanupDisposition.CONFIRMED.value
+    ):
+        try:
+            store.append_event(
+                job_id,
+                OperationCompleteEvent(
+                    operation=OperationType.DEPLOY, success=False,
+                    detail="Cancelled; resource stopped.",
+                ),
+            )
+        except Exception:
+            pass
+        store.finish_job(job_id, JobStatus.CANCELLED, "Cancelled; resource stopped.")
+        return
+    if not config.do_deploy:
+        detail = "Cancelled before allocating a resource."
+        try:
+            store.append_event(
+                job_id,
+                OperationCompleteEvent(
+                    operation=OperationType.DEPLOY, success=False, detail=detail
+                ),
+            )
+        except Exception:
+            pass
+        store.finish_job(job_id, JobStatus.CANCELLED, detail)
+        return
+    try:
+        store.append_event(
+            job_id,
+            OperationCompleteEvent(
+                operation=OperationType.DEPLOY, success=False,
+                detail="Cancellation cleanup failed; check Manage. Recovery record retained.",
+            ),
+        )
+    except Exception:
+        pass
+    store.finish_job(
+        job_id, JobStatus.CANCELLED,
+        "Cancellation cleanup failed; check Manage. Recovery record retained.",
+        cleanup_error=cleanup_error or failure_detail,
+    )
 
 
 def _save_connection(config: DeploymentConfig, url: str | None, endpoint: EndpointInfo | None) -> None:

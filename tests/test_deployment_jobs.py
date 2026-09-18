@@ -77,7 +77,9 @@ class DeploymentTrackingTests(unittest.TestCase):
         ])) as deploy:
             app._run_deployment_job(job)
         self.assertEqual(deploy.call_count, 1)
-        self.assertEqual(load_in_flight(), (original,))
+        # The skipped fallback never began, so the owner's entry survives
+        # untouched; this job's own entry resolves like any plain failure.
+        self.assertIn(original, load_in_flight())
         self.assertIn("Failed", job.outcome)
 
     def test_concurrent_journal_writers_do_not_lose_entries(self) -> None:
@@ -141,7 +143,7 @@ class DeploymentTrackingTests(unittest.TestCase):
         job = DeploymentJob("job", current, MonitorScreen())
         app.deployment_jobs[job.id] = job
 
-        def warmup(**kwargs):
+        def warmup(*args, **kwargs):
             app.cancel_deployment(job.id)
             yield LogEvent(line="Loading weights")
 
@@ -290,8 +292,12 @@ class DeploymentJobInteractionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(second.cancel_requested.is_set())
                     releases["second"].set()
                     await wait_until(second.finished.is_set)
-                    # Cancelled without an allocated resource stops nothing.
-                    self.assertEqual(stopped, [])
+                    # Only the cancelled deployment is torn down, and it *is*
+                    # torn down: a Modal app is addressed by its name, so the
+                    # worker stops the app the deploy may already have
+                    # published. It used to skip this because Modal emits no
+                    # allocation event, which the TUI path never relied on.
+                    self.assertEqual(stopped, ["second"])
                     app.reopen_deployment(second.id)
                     await pilot.pause()
                     self.assertIs(app.screen, second.monitor)
@@ -333,3 +339,26 @@ class DeploymentJobInteractionTests(unittest.IsolatedAsyncioTestCase):
                     self.assertFalse(records[0].terminal)
                 finally:
                     release.set()
+
+
+class OperationsEmptyStateTests(unittest.IsolatedAsyncioTestCase):
+    async def test_empty_operations_offers_a_direct_deploy_action(self) -> None:
+        from textual.widgets import Button, OptionList, Static
+
+        from llm_launchpad.tui.screens.operations import OperationsScreen
+
+        app = TuiApp()
+        async with app.run_test(size=(100, 30)) as pilot:
+            app.push_screen(OperationsScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, OperationsScreen)
+            deploy = screen.query_one("#operations-deploy-btn", Button)
+            self.assertTrue(deploy.display)
+            self.assertIn(
+                "No deployments yet",
+                str(screen.query_one("#operations-empty", Static).content),
+            )
+            options = screen.query_one("#deployment-jobs", OptionList)
+            self.assertEqual(options.option_count, 1)
+            self.assertTrue(options.get_option_at_index(0).disabled)

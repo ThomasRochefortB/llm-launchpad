@@ -31,6 +31,7 @@ from .diagnostics import log_debug
 from .gguf_metadata import GgufMtpStatus
 from .hf_models import (
     GgufQuantMetadata,
+    HubModelPageUnavailable,
     ModelCandidate,
     fetch_gguf_quant_metadata,
     fetch_model_max_context,
@@ -51,6 +52,8 @@ from .quant_quality import quant_bits
 from .quick_deploy import QuickDeployCatalogInfo, QuickDeployProfile
 from .llamacpp_planner import (
     attention_head_count,
+    device_capacity_bytes,
+    gib_to_bytes,
     per_device_requirements,
     tuning_for_architecture,
     tuning_for_attention_scratch,
@@ -124,12 +127,20 @@ def _is_transient_hub_error(exc: BaseException) -> bool:
 
 
 def _fetch_serving_metadata(repo_id: str) -> GgufQuantMetadata:
-    """Fetch GGUF serving metadata, retrying transient Hub failures."""
+    """Fetch GGUF serving metadata, retrying transient Hub failures.
+
+    The catalog cannot size a model without its weight-size table, so an
+    unreadable one is a failed lookup here rather than a model that publishes
+    no weights -- otherwise a throttled page is written down as a fact about
+    the model and drops it from Fast Deploy until the next rebuild.
+    """
 
     delay = _HUB_RETRY_BASE_SECONDS
     for attempt in range(1, _HUB_FETCH_ATTEMPTS + 1):
         try:
-            return fetch_gguf_quant_metadata(repo_id, inspect_serving=True)
+            return fetch_gguf_quant_metadata(
+                repo_id, inspect_serving=True, require_weight_sizes=True
+            )
         except Exception as exc:
             if attempt >= _HUB_FETCH_ATTEMPTS or not _is_transient_hub_error(exc):
                 raise
@@ -1073,6 +1084,14 @@ def _hf_failure_reason(exc: BaseException, action: str) -> str:
             "Hugging Face rate limit reached; this model was not checked. "
             "Wait a few minutes and refresh the catalog."
         )
+    if isinstance(exc, HubModelPageUnavailable):
+        # The weight sizes have one source, and naming it keeps the reader
+        # from reading this as a model that publishes no weights.
+        detail = f" (HTTP {status})" if isinstance(status, int) else ""
+        return (
+            f"Hugging Face did not serve this model's weight-size table{detail}; "
+            "the model was not measured. Refresh the catalog to retry."
+        )
     return f"Could not {action} on Hugging Face. Refresh the catalog to retry."
 
 
@@ -1495,7 +1514,9 @@ def _safe_fetch_gguf_metadata(repo_id: str) -> GgufQuantMetadata | None:
     """Fetch GGUF metadata without MTP inspection or context lookups."""
 
     try:
-        return fetch_gguf_quant_metadata(repo_id, inspect_serving=True)
+        return fetch_gguf_quant_metadata(
+            repo_id, inspect_serving=True, require_weight_sizes=True
+        )
     except Exception:
         return None
 
@@ -1699,7 +1720,13 @@ def _verified_mtp_variant(
         if not request_budget.spend(METADATA_REQUEST_COST):
             return None
         variant = fetch_gguf_quant_metadata(
-            variant_repo, inspect_serving=True, inspect_mtp=True,
+            variant_repo,
+            inspect_serving=True,
+            inspect_mtp=True,
+            # The variant is only usable if its own quantizations can be
+            # sized, so an unreadable weight table is a failed probe to log
+            # rather than a variant that offers nothing.
+            require_weight_sizes=True,
         )
         if (
             variant.architecture != metadata.architecture
@@ -1757,8 +1784,9 @@ def _profiles_for_model(
             budget=budget,
             prefer_mtp=False,
         )
-        if accelerated:
-            return accelerated
+        placed = [profile for profile in accelerated if profile.gpu_count > 0]
+        if placed:
+            return placed
     compatibility = evaluate_llamacpp_architecture(metadata.architecture)
     if not compatibility.is_supported:
         return []
@@ -1780,23 +1808,34 @@ def _profiles_for_model(
     display_name = aa_candidate.name if aa_candidate else _display_name(model.repo_id)
     slug_hint = slugify_instance_name(display_name)
     profiles: list[QuickDeployProfile] = []
+    unplaced: list[QuickDeployProfile] = []
     for quant in quants:
-        profiles.extend(
-            _profiles_for_quant(
-                repo_id=model.repo_id,
-                display_name=display_name,
-                slug_hint=slug_hint,
-                context_tokens=context_tokens,
-                quant=quant,
-                metadata=metadata,
-                modal_gpu_catalog=modal_gpu_catalog,
-                aa_candidate=aa_candidate,
-                size_bucket=size_bucket,
-                llamacpp_runtime_id=compatibility.runtime_id,
-                speculative_decoding=_mtp_recommendation(metadata),
-                rejected=rejected,
-            )
+        built = _profiles_for_quant(
+            repo_id=model.repo_id,
+            display_name=display_name,
+            slug_hint=slug_hint,
+            context_tokens=context_tokens,
+            quant=quant,
+            metadata=metadata,
+            modal_gpu_catalog=modal_gpu_catalog,
+            aa_candidate=aa_candidate,
+            size_bucket=size_bucket,
+            llamacpp_runtime_id=compatibility.runtime_id,
+            speculative_decoding=_mtp_recommendation(metadata),
+            rejected=rejected,
+            include_unplaced=True,
         )
+        for profile in built:
+            (profiles if profile.gpu_count > 0 else unplaced).append(profile)
+    # An unplaced recipe is still a recipe: keep at most one per quant so Prime
+    # and Vast matching can evaluate it, without duplicating placed profiles.
+    seen_unplaced: set[str] = set()
+    for profile in unplaced:
+        key = _quant_key(profile.quant)
+        if key in seen_unplaced:
+            continue
+        seen_unplaced.add(key)
+        profiles.append(profile)
     return profiles
 
 
@@ -1809,18 +1848,22 @@ def _selected_quants(metadata: GgufQuantMetadata) -> list[str]:
     if not available:
         return []
     selected: list[str] = []
-    # Quality leads. Both quantizations are still built -- the low-VRAM one is
-    # what makes an economy option possible at all, and is the only build that
-    # fits for the largest models -- but the preferred width comes first, so
-    # every consumer that reads ``profiles[0]`` gets the better weights.
+    # Quality leads. Candidates are chosen in preference order so an
+    # intermediate quantization that fits its own hardware can still be
+    # offered: previously only the first preference and the low-VRAM fallback
+    # were built, and a Q5 or Q6 that fit a GPU exactly was never considered.
+    # The preferred width still comes first, so every consumer that reads
+    # ``profiles[0]`` gets the better weights.
     for preferred in _PREFERRED_QUANT_ORDER:
         quant = available.get(_quant_key(preferred))
-        if quant:
+        if quant and quant not in selected:
             selected.append(quant)
-            break
     low_vram = available.get(_quant_key(LOW_VRAM_QUANT))
     if low_vram and low_vram not in selected:
         selected.append(low_vram)
+    for quant in sorted(available.values()):
+        if quant not in selected and len(selected) < 4:
+            selected.append(quant)
     if not selected:
         selected.append(next(iter(available.values())))
     return selected
@@ -1863,6 +1906,7 @@ def _profiles_for_quant(
     llamacpp_runtime_id: str,
     speculative_decoding: SpeculativeDecodingConfig | None = None,
     rejected: list[str] | None = None,
+    include_unplaced: bool = False,
 ) -> list[QuickDeployProfile]:
     weights_gb = _required_vram_for_quant(metadata, quant)
     if weights_gb is None:
@@ -1895,6 +1939,10 @@ def _profiles_for_quant(
     per_device_overhead_gb = (
         memory_estimate.compute_gb + memory_estimate.attention_scratch_gb
     )
+    # An unplaced recipe must reflect genuinely missing capacity, not a
+    # fallback GPU list invented for display: without this, an empty catalog
+    # could never produce one because the static fallback always fits.
+    allow_fallback_gpus = not include_unplaced
     selections = (
         (
             "cheap",
@@ -1904,6 +1952,7 @@ def _profiles_for_quant(
                 modal_gpu_catalog,
                 per_device_overhead_gb=per_device_overhead_gb,
                 layer_count=memory_estimate.total_layer_count,
+                allow_fallback_gpus=allow_fallback_gpus,
             ),
         ),
         (
@@ -1915,6 +1964,7 @@ def _profiles_for_quant(
                 gpu_type="RTX-PRO-6000",
                 per_device_overhead_gb=per_device_overhead_gb,
                 layer_count=memory_estimate.total_layer_count,
+                allow_fallback_gpus=allow_fallback_gpus,
             ),
         ),
         (
@@ -1926,6 +1976,7 @@ def _profiles_for_quant(
                 gpu_type="B200",
                 per_device_overhead_gb=per_device_overhead_gb,
                 layer_count=memory_estimate.total_layer_count,
+                allow_fallback_gpus=allow_fallback_gpus,
             ),
         ),
     )
@@ -2001,22 +2052,120 @@ def _profiles_for_quant(
                 memory_estimate=memory_estimate,
             )
         )
-    if not profiles and rejected is not None:
-        reason = (
-            f"{quant}: estimated {required_vram_gb:,.0f} GB at {context_tokens:,} tokens "
-            "does not fit any priced catalog topology (maximum 8 GPUs)."
-        )
-        if memory_estimate.attention_scratch_gb > 0:
-            # Naming the term matters here: it is the one requirement extra
-            # GPUs cannot share, so the shortfall does not look like one more
-            # card would close it.
-            reason += (
-                f" {memory_estimate.attention_scratch_gb:,.0f} GB of that is attention"
-                " scratch every GPU needs in full, because this architecture's"
-                " runtime requires flash attention off."
+    if not profiles:
+        if include_unplaced:
+            # Keep the recipe discoverable even when the current Modal catalog
+            # has no priced topology for it: other providers may still serve
+            # it, and dropping it here would hide that. The zeroed shape marks
+            # it as unplaced rather than deployable.
+            quant_slug = _quant_slug(quant)
+            profiles.append(
+                _unplaced_profile(
+                    repo_id=repo_id,
+                    display_name=display_name,
+                    slug_hint=slug_hint,
+                    context_tokens=context_tokens,
+                    quant=quant,
+                    quant_slug=quant_slug,
+                    metadata=metadata,
+                    requirements=requirements,
+                    runtime_tuning=runtime_tuning,
+                    memory_estimate=memory_estimate,
+                    aa_candidate=aa_candidate,
+                    size_bucket=size_bucket,
+                    llamacpp_runtime_id=llamacpp_runtime_id,
+                    speculative_decoding=speculative_decoding,
+                )
             )
-        rejected.append(reason)
+        elif rejected is not None:
+            reason = (
+                f"{quant}: estimated {required_vram_gb:,.0f} GB at {context_tokens:,} tokens "
+                "does not fit any priced catalog topology (maximum 8 GPUs)."
+            )
+            if memory_estimate.attention_scratch_gb > 0:
+                # Naming the term matters here: it is the one requirement extra
+                # GPUs cannot share, so the shortfall does not look like one more
+                # card would close it.
+                reason += (
+                    f" {memory_estimate.attention_scratch_gb:,.0f} GB of that is attention"
+                    " scratch every GPU needs in full, because this architecture's"
+                    " runtime requires flash attention off."
+                )
+            rejected.append(reason)
     return profiles
+
+
+def _unplaced_profile(
+    *,
+    repo_id: str,
+    display_name: str,
+    slug_hint: str,
+    context_tokens: int,
+    quant: str,
+    quant_slug: str,
+    metadata: GgufQuantMetadata,
+    requirements: ServingRequirements,
+    runtime_tuning: RuntimeTuning,
+    memory_estimate: MemoryEstimate,
+    aa_candidate: AAModelCandidate | None,
+    size_bucket: ModelSizeBucket | None,
+    llamacpp_runtime_id: str,
+    speculative_decoding: SpeculativeDecodingConfig | None,
+) -> QuickDeployProfile:
+    """Build a provider-independent recipe with no current Modal placement.
+
+    The catalog used to drop a quantization entirely when the Modal price list
+    had no topology for it, so Prime and Vast never saw the recipe even when
+    they could serve it. An unplaced profile carries the same serving evidence
+    with a zeroed shape; matching treats it as a recipe to evaluate, never as
+    a deployable placement.
+    """
+    return QuickDeployProfile(
+        id=_stable_profile_id(repo_id, quant_slug, "unplaced"),
+        display_name=display_name,
+        repo_id=repo_id,
+        quant=quant,
+        gpu_type="",
+        gpu_count=0,
+        profile_label="No priced Modal placement",
+        approx_cost_per_hour_usd=0.0,
+        max_context_tokens=context_tokens,
+        instance_slug_hint=f"{slug_hint}-{quant_slug}-unplaced",
+        summary=(
+            f"Artificial Analysis-ranked {_MODEL_SIZE_LABELS[size_bucket]} "
+            "open-weight model matched to verified Hugging Face GGUF weights."
+            if aa_candidate is not None and size_bucket is not None
+            else "Live Hugging Face trending GGUF model matched to current "
+            "Modal GPU pricing."
+        ),
+        server_args=compile_server_args(requirements, runtime_tuning),
+        required_vram_gb=round(memory_estimate.total_gb, 1),
+        gpu_memory_gb=None,
+        resource_tier="unplaced",
+        resource_tier_label=None,
+        source_label=(
+            "Artificial Analysis"
+            if aa_candidate is not None
+            else "Hugging Face trending"
+        ),
+        aa_model_id=(aa_candidate.aa_model_id or None) if aa_candidate else None,
+        aa_model_name=aa_candidate.name if aa_candidate else None,
+        aa_model_slug=aa_candidate.slug or None if aa_candidate else None,
+        aa_coding_score=aa_candidate.coding_score if aa_candidate else None,
+        aa_intelligence_score=(
+            aa_candidate.intelligence_score if aa_candidate else None
+        ),
+        aa_rank=aa_candidate.rank if aa_candidate else None,
+        model_size_label=(
+            _MODEL_SIZE_LABELS[size_bucket] if size_bucket is not None else None
+        ),
+        gguf_architecture=metadata.architecture,
+        llamacpp_runtime_id=llamacpp_runtime_id,
+        speculative_decoding=speculative_decoding,
+        serving_requirements=requirements,
+        runtime_tuning=runtime_tuning,
+        memory_estimate=memory_estimate,
+    )
 
 
 def _mtp_recommendation(
@@ -2044,9 +2193,12 @@ def _select_gpu_shape(
     gpu_type: str | None = None,
     per_device_overhead_gb: float = 0.0,
     layer_count: int | None = None,
+    allow_fallback_gpus: bool = True,
 ) -> _GpuSelection | None:
     prices = _price_by_gpu(modal_gpu_catalog)
-    available = _available_gpu_types(modal_gpu_catalog)
+    available = _available_gpu_types(
+        modal_gpu_catalog, allow_fallback=allow_fallback_gpus
+    )
     # Graph memory is replicated on every device, so only the remainder of the
     # requirement gets smaller as GPUs are added. Dividing the whole figure
     # would keep offering a placement that llama.cpp then refuses at startup.
@@ -2062,6 +2214,8 @@ def _select_gpu_shape(
             reserve_per_gpu = max(2.0, memory_gb * 0.05)
             # The busiest device is the one that has to fit, and layers are
             # indivisible, so an uneven split is sized on its larger half.
+            # The comparison runs in whole bytes so a GB/GiB rounding boundary
+            # cannot admit a shape the byte-exact assessment then rejects.
             busiest = max(
                 per_device_requirements(
                     shardable_gb=shardable_gb,
@@ -2070,7 +2224,7 @@ def _select_gpu_shape(
                     layer_count=layer_count,
                 )
             )
-            if busiest > memory_gb:
+            if gib_to_bytes(busiest) > device_capacity_bytes(memory_gb):
                 continue
             cost = prices.get(
                 candidate_gpu,
@@ -2090,7 +2244,11 @@ def _select_gpu_shape(
     )
 
 
-def _available_gpu_types(modal_gpu_catalog: Sequence[ModalGpuSpec]) -> list[str]:
+def _available_gpu_types(
+    modal_gpu_catalog: Sequence[ModalGpuSpec],
+    *,
+    allow_fallback: bool = True,
+) -> list[str]:
     """Return catalog GPU shapes that can actually back a priced profile.
 
     Entries without a known VRAM size (e.g. future ``B300`` shapes) or
@@ -2109,6 +2267,8 @@ def _available_gpu_types(modal_gpu_catalog: Sequence[ModalGpuSpec]) -> list[str]
     ]
     if values:
         return values
+    if not allow_fallback:
+        return []
     return [
         value
         for value in _GPU_MEMORY_GB

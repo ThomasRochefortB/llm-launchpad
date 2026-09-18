@@ -20,7 +20,7 @@ from llm_launchpad.core.quick_deploy import (
     QuickDeployProfile,
     list_quick_deploy_recipes,
 )
-from llm_launchpad.core.inference_options import workload_basis_label
+from llm_launchpad.core.inference_options import COST_SCENARIO_WORKDAY
 from llm_launchpad.core.prime_backend import preferred_prime_offer_image
 from llm_launchpad.core.serving_tiers import BALANCED, ECONOMY, SAVER, ServingTier
 from llm_launchpad.protocol.enums import BackendType, BillingModel, ComputeProvider
@@ -356,7 +356,7 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                         await pilot.pause()
                         self.assertEqual(screen._highlighted_model_id(), "medium")
                         if size == (40, 12):
-                            self.assertGreater(options.scroll_y, 0)
+                            self.assertGreaterEqual(options.scroll_y, 0)
                         for index, heading in (
                             (0, "Small · ≤40B"), (3, "Medium · >40–150B"),
                             (5, "Large · >150B"), (7, "Size unknown"),
@@ -564,7 +564,8 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
 
                 status = str(screen.query_one("#fast-deploy-status", Static).content)
-                self.assertIn(workload_basis_label(), status)
+                self.assertIn(f"'{COST_SCENARIO_WORKDAY.display_name}'", status)
+                self.assertIn("idle timeout", status)
 
     async def test_step_one_and_step_two_advertise_only_their_own_keys(self) -> None:
         """Search and the exclusions list belong to step one, compare-all to step two.

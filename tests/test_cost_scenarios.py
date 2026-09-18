@@ -9,10 +9,12 @@ from llm_launchpad.core.inference_options import (
     COST_SCENARIO_WORKDAY,
     estimate_cost_for_scenario,
     estimate_modal_billed_hours_per_day,
+    evaluate_quote_cost,
     format_cost_summary,
+    workload_profile_cost_evaluation,
 )
 from llm_launchpad.protocol.enums import BillingModel, ComputeProvider
-from llm_launchpad.protocol.models import ProviderQuote
+from llm_launchpad.protocol.models import ProviderQuote, WorkloadProfile
 
 
 def _quote(billing: BillingModel, price: float = 1.0) -> ProviderQuote:
@@ -78,3 +80,37 @@ class CostScenarioTests(unittest.TestCase):
             billing_model=quote.billing_model,
         )
         self.assertIsNone(estimate_cost_for_scenario(quote, COST_SCENARIO_WORKDAY))
+
+    def test_canonical_workday_modal_cost_includes_idle_tails(self) -> None:
+        quote = _quote(BillingModel.SCALE_TO_ZERO, 1.0)
+        evaluation = evaluate_quote_cost(quote, COST_SCENARIO_WORKDAY)
+        self.assertEqual(evaluation.billed_hours_per_day, 4.0)
+        self.assertEqual(evaluation.estimated_monthly_cost_usd, 120.0)
+        self.assertEqual(evaluation.continuous_monthly_cost_usd, 720.0)
+        self.assertEqual(evaluation.scenario.id, COST_SCENARIO_WORKDAY.id)
+
+    def test_idle_timeout_override_changes_calculation_and_label(self) -> None:
+        quote = _quote(BillingModel.SCALE_TO_ZERO, 1.0)
+        evaluation = evaluate_quote_cost(
+            quote, COST_SCENARIO_WORKDAY, idle_timeout_seconds=0.0
+        )
+        self.assertEqual(evaluation.billed_hours_per_day, 2.0)
+        self.assertEqual(evaluation.estimated_monthly_cost_usd, 60.0)
+        self.assertIn("0min idle timeout", evaluation.basis_label())
+
+    def test_legacy_workload_keeps_zero_idle_tails(self) -> None:
+        quote = _quote(BillingModel.SCALE_TO_ZERO, 1.0)
+        evaluation = workload_profile_cost_evaluation(
+            quote, WorkloadProfile(paid_hours_per_day=8, utilization=0.25)
+        )
+        self.assertEqual(evaluation.billed_hours_per_day, 2.0)
+        self.assertEqual(evaluation.estimated_monthly_cost_usd, 60.0)
+
+    def test_active_time_beyond_window_is_capped_by_window(self) -> None:
+        billed = estimate_modal_billed_hours_per_day(
+            active_hours_per_day=24.0,
+            sessions_per_day=1.0,
+            idle_timeout_seconds=3600.0,
+            window_hours_per_day=8.0,
+        )
+        self.assertEqual(billed, 8.0)

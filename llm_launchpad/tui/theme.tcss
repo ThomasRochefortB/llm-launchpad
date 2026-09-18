@@ -179,6 +179,16 @@ LogViewer Log {
     padding: 0 0 1 0;
 }
 
+/* Compact fleet + connection line under the menu: always visible, even when
+   the side panels are hidden on constrained terminals. */
+#fleet-summary-line {
+    width: 100%;
+    height: auto;
+    padding: 1 1 0 1;
+    text-wrap: wrap;
+    color: $text;
+}
+
 #auth-status-block {
     width: auto;
     max-width: 92;
@@ -259,6 +269,10 @@ Input {
     padding: 0 1;
 }
 
+Input.-invalid {
+    border: tall $error;
+}
+
 Input:focus {
     border: tall $primary;
     background: $surface-lighten-1;
@@ -273,6 +287,13 @@ Select {
     color: $text;
 }
 
+/* Neutral chrome for unfocused controls; only the focused control earns the
+   primary border, so keyboard input always has exactly one bright target. */
+Button:focus,
+Select:focus > SelectCurrent {
+    background: $primary-background;
+}
+
 Select > SelectCurrent {
     border: tall $foreground-muted;
 }
@@ -280,6 +301,72 @@ Select > SelectCurrent {
 Select:focus > SelectCurrent {
     border: tall $primary;
     background: $surface-lighten-1;
+}
+
+OptionList > .option-list--option-highlighted {
+    background: $primary-background;
+    color: $text;
+    text-style: bold;
+}
+
+OptionList:focus > .option-list--option-highlighted {
+    background: $primary;
+    color: $button-color-foreground;
+    text-style: bold;
+}
+
+DataTable:focus > .datatable--header {
+    color: $primary;
+    text-style: bold;
+}
+
+DataTable:focus > .datatable--cursor {
+    background: $primary;
+    color: $button-color-foreground;
+    text-style: bold;
+}
+
+Button.-danger {
+    border: solid $error;
+    color: $error;
+    text-style: bold;
+}
+
+Button.-danger:hover,
+Button.-danger:focus {
+    background: $error;
+    color: $background;
+    border: solid $error;
+}
+
+.dialog-panel {
+    width: 100%;
+    max-width: 76;
+    height: auto;
+    padding: 1 2;
+    border: solid $foreground-muted;
+    background: $surface;
+}
+
+.dialog-title {
+    color: $primary;
+    text-style: bold;
+}
+
+.dialog-warning {
+    color: $warning;
+    text-wrap: wrap;
+}
+
+.dialog-actions {
+    width: 100%;
+    height: auto;
+    margin-top: 1;
+    align: left middle;
+}
+
+.dialog-actions Button {
+    margin: 0 1 0 0;
 }
 
 Switch {
@@ -355,18 +442,18 @@ Button:focus {
 
 /* The group owns the width so the Select can simply fill it; the narrow
    override below then stretches both together. */
-#fast-deploy-gpu-group {
-    width: 36;
+#fast-deploy-search-group {
+    width: 1fr;
+    max-width: 72;
     height: auto;
     margin: 0 2 1 0;
 }
 
-/* The search box takes what the GPU filter does not. Capping both at 36 left
-   the row more than half empty on a wide terminal while long model names in
-   the box below still had to be truncated. */
-#fast-deploy-search-group {
-    width: 1fr;
-    max-width: 72;
+/* The GPU filter narrows the list; search finds the model. Search takes what
+   the filter does not, and the filter keeps a readable floor. */
+#fast-deploy-gpu-group {
+    width: 30;
+    min-width: 24;
     height: auto;
     margin: 0 0 1 0;
 }
@@ -419,9 +506,12 @@ Button:focus {
     padding: 1 2 0 2;
 }
 
-#quick-deploy-subtitle {
-    padding: 0 2 0 2;
-    color: $text-muted;
+/* The five decision facts sit above the scroll container so they cannot
+   scroll away on a short terminal; technical evidence lives behind a toggle. */
+#quick-deploy-facts {
+    padding: 0 2 1 2;
+    color: $text;
+    text-wrap: wrap;
 }
 
 #quick-deploy-layout {
@@ -472,6 +562,17 @@ Button:focus {
 #quick-deploy-profile-body {
     color: $text;
     text-wrap: wrap;
+    padding-top: 1;
+}
+
+#toggle-quick-details {
+    width: auto;
+}
+
+.viewport-compact #quick-deploy-title,
+.viewport-compact #quick-deploy-facts {
+    padding-left: 1;
+    padding-right: 1;
 }
 
 #quick-deploy-feedback {
@@ -667,10 +768,36 @@ VllmDeployScreen Select:disabled > SelectCurrent {
     margin: 0 1 0 0;
 }
 
+#connection-info-actions {
+    width: 100%;
+    height: auto;
+    layout: grid;
+    grid-size: 3;
+}
+
+#connection-info-actions Button {
+    margin: 0 1 1 0;
+}
+
+.viewport-narrow #connection-info-actions {
+    layout: grid;
+    grid-size: 2;
+    grid-rows: 3;
+}
+
+.viewport-compact #connection-info-actions {
+    layout: grid;
+    grid-size: 2;
+}
+
 .viewport-narrow #connection-card-actions {
     layout: grid;
     grid-size: 2;
     grid-rows: 3;
+}
+
+.viewport-minimal #connection-info-actions {
+    layout: vertical;
 }
 
 .viewport-minimal #connection-card-actions {
@@ -742,6 +869,37 @@ VllmDeployScreen Select:disabled > SelectCurrent {
     height: auto;
 }
 
+/* Save and feedback live in a persistent action bar below the scrolling form,
+   so neither can end up below the fold on a short terminal. */
+#settings-layout {
+    width: 100%;
+    height: 1fr;
+}
+
+#settings-scroll {
+    height: 1fr;
+}
+
+#settings-actions {
+    width: 100%;
+    height: auto;
+    padding: 0 2 1 2;
+    background: $footer-background;
+    border-top: solid $border;
+    align: left middle;
+}
+
+#settings-actions Button {
+    margin-right: 2;
+}
+
+#save-feedback {
+    width: 1fr;
+    height: auto;
+    content-align: left middle;
+    text-wrap: wrap;
+}
+
 .viewport-compact #setup-required-actions,
 .viewport-minimal #connection-info-actions {
     layout: vertical;
@@ -761,15 +919,93 @@ VllmDeployScreen Select:disabled > SelectCurrent {
     align: center top;
 }
 
-#storage-controls {
+#storage-layout,
+#storage-scroll {
+    width: 100%;
+    height: 1fr;
+    padding: 1 2;
+}
+
+/* VerticalScroll owns the screen scroll, so the table sizes itself against
+   the viewport rather than the full content height; the responsive fit test
+   holds non-scrolling widgets to the viewport. */
+#storage-layout {
+    min-height: 100%;
+}
+
+#storage-title,
+#storage-status,
+#storage-hint {
     height: auto;
+    text-wrap: wrap;
+}
+
+#storage-status {
+    margin: 0 0 1 0;
+}
+
+#storage-filter-row {
+    width: 100%;
+    height: auto;
+    margin: 0 0 1 0;
+}
+
+#storage-provider-group {
+    width: 3fr;
+    height: auto;
+    margin: 0 2 0 0;
+}
+
+#storage-backend-group {
+    width: 2fr;
+    height: auto;
+}
+
+#storage-provider-label {
+    height: 1;
+}
+
+#storage-filter {
+    height: 3;
+    min-height: 3;
+    margin: 0 0 1 0;
 }
 
 /* The inventory is the reason this screen exists, so it gets a real viewport
    rather than whatever `1fr` has left over once the filters above it have
-   taken their share. The screen itself scrolls. */
+   taken their share. */
 #storage-table {
+    height: 1fr;
     min-height: 9;
+    max-height: 100%;
+}
+
+#storage-hint {
+    margin: 1 0 0 0;
+}
+
+#storage-predownload-toggle {
+    width: auto;
+    margin: 1 0 0 0;
+}
+
+#storage-predownload-form {
+    width: 100%;
+    height: auto;
+    margin: 1 0 0 0;
+    padding: 1 2;
+    border: solid $foreground-muted;
+    background: $surface;
+}
+
+.viewport-compact #storage-filter-row {
+    layout: vertical;
+}
+
+.viewport-compact #storage-provider-group,
+.viewport-compact #storage-backend-group {
+    width: 100%;
+    margin-right: 0;
 }
 
 #storage-empty {
@@ -814,15 +1050,6 @@ VllmDeployScreen Select:disabled > SelectCurrent {
     margin-bottom: 1;
 }
 
-#settings-actions {
-    height: auto;
-    margin-top: 1;
-}
-
-#settings-actions Button {
-    margin-right: 2;
-}
-
 #settings-appearance-row {
     width: 100%;
     height: auto;
@@ -854,6 +1081,53 @@ VllmDeployScreen Select:disabled > SelectCurrent {
 #save-feedback {
     height: auto;
     text-wrap: wrap;
+}
+
+/* Advanced deploy: model source and compute sit in labelled groups so the
+   compute configuration is visible without scrolling past a tall picker. */
+.deploy-group {
+    width: 100%;
+    height: auto;
+    margin: 0 0 1 0;
+    padding: 0 1 1 1;
+    border: solid $foreground-muted;
+    background: $surface;
+}
+
+.deploy-group-title {
+    color: $primary;
+    text-style: bold;
+    height: auto;
+    padding: 1 0 0 0;
+}
+
+#llama-deploy-actions,
+#vllm-deploy-actions {
+    width: 100%;
+    height: auto;
+    margin-top: 1;
+    align: left middle;
+}
+
+#llama-deploy-actions Button,
+#vllm-deploy-actions Button {
+    margin-right: 2;
+}
+
+#llama-deploy-feedback,
+#vllm-deploy-feedback {
+    width: 1fr;
+    height: auto;
+    content-align: left middle;
+    text-wrap: wrap;
+}
+
+.viewport-constrained .deploy-spacer {
+    display: none;
+}
+
+.viewport-constrained .deploy-group {
+    margin-bottom: 0;
 }
 
 /* ---- Deploy screen GPU row ---- */
@@ -910,6 +1184,91 @@ VllmDeployScreen Select:disabled > SelectCurrent {
 
 .centered {
     text-align: center;
+}
+
+/* Height-constrained terminals (up to 24 rows): vertical economy without the
+   aggressive hiding that .viewport-short applies. Decorative padding shrinks;
+   search, tables and action bars keep their rows. */
+.viewport-constrained #main-menu-primary,
+.viewport-constrained .screen-scroll,
+.viewport-constrained #fast-deploy-container,
+.viewport-constrained #quick-deploy-layout,
+.viewport-constrained #quick-deploy-actions {
+    padding-top: 0;
+    padding-bottom: 0;
+}
+
+.viewport-constrained .decorative-spacer {
+    display: none;
+}
+
+.viewport-constrained #main-menu-primary {
+    padding-top: 1;
+    padding-bottom: 1;
+}
+
+/* The wordmark is pleasant on a tall terminal but displaces the menu at
+   80x24; constrain its height rather than hiding it outright. */
+.viewport-constrained #banner-text {
+    padding-bottom: 0;
+    max-height: 5;
+    overflow-y: hidden;
+}
+
+/* The 80x24 home screen displaced its menu with the wordmark plus the
+   four-line subtitle. Constrain both so navigation stays on screen. */
+.viewport-constrained #main-menu-primary Static {
+    margin-top: 0;
+}
+
+.viewport-constrained #fast-deploy-subtitle,
+.viewport-constrained #fast-deploy-status,
+.viewport-constrained #quick-deploy-subtitle {
+    padding-bottom: 0;
+}
+
+.viewport-constrained #manage-status {
+    margin-bottom: 0;
+}
+
+.viewport-constrained #manage-endpoint-table {
+    min-height: 5;
+    max-height: 100%;
+}
+
+.viewport-constrained #storage-table {
+    min-height: 8;
+    max-height: 100%;
+}
+
+.viewport-constrained #fast-deploy-list {
+    max-height: 100%;
+}
+
+.viewport-constrained .form-group-heading {
+    padding: 0;
+}
+
+.viewport-constrained #settings-form FormField,
+.viewport-constrained #settings-form ToggleField {
+    padding-bottom: 0;
+}
+
+.viewport-constrained #settings-form > .form-hint {
+    margin-bottom: 0;
+}
+
+.viewport-constrained .settings-section {
+    margin-top: 1;
+}
+
+.viewport-constrained #settings-appearance-row {
+    margin-bottom: 0;
+}
+
+.viewport-constrained #fast-deploy-detail {
+    min-height: 2;
+    margin-top: 0;
 }
 
 /* ---- Responsive viewport profiles ---- */
@@ -1091,35 +1450,15 @@ StatusHeader.state-error {
 }
 
 .viewport-narrow #fast-deploy-subtitle,
-.viewport-narrow #fast-deploy-gpu-label,
-.viewport-narrow #fast-deploy-search-group,
 .viewport-compact #fast-deploy-subtitle,
-.viewport-compact #fast-deploy-gpu-label,
-.viewport-compact #fast-deploy-search-label,
-.viewport-short #fast-deploy-search-group {
+.viewport-short #fast-deploy-subtitle {
     display: none;
 }
 
-/* Search is a temporary control on constrained terminals. It stays available
-   on `/`, without permanently taking the model list below a useful height. */
-.viewport-narrow.search-open #fast-deploy-search-group {
-    display: block;
-}
-
-.viewport-narrow #fast-deploy-gpu-group,
-.viewport-minimal #fast-deploy-gpu-group {
-    width: 100%;
-    margin-right: 0;
-    margin-right: 0;
-}
-
-.viewport-compact #fast-deploy-gpu-filter {
-    max-width: 100%;
-    height: 3;
-    min-height: 3;
-    margin: 0 0 1 0;
-}
-
+/* Search is the primary model control and stays visible at every supported
+   size. The GPU filter keeps its label; only its surrounding chrome shrinks.
+   The temporary search-open drawer is gone: hiding the box behind `/` also
+   hid the `/` hint in the footer overflow, leaving no discoverable route. */
 .viewport-narrow #fast-deploy-filter-row,
 .viewport-compact #fast-deploy-filter-row {
     layout: vertical;
@@ -1132,23 +1471,39 @@ StatusHeader.state-error {
     margin: 0 0 1 0;
 }
 
+.viewport-narrow #fast-deploy-gpu-group,
+.viewport-minimal #fast-deploy-gpu-group,
+.viewport-compact #fast-deploy-gpu-group {
+    width: 100%;
+    min-width: 0;
+    margin: 0 0 1 0;
+}
+
+.viewport-compact #fast-deploy-gpu-filter {
+    max-width: 100%;
+    height: 3;
+    min-height: 3;
+    margin: 0 0 1 0;
+}
+
 .viewport-narrow #fast-deploy-model-search,
 .viewport-compact #fast-deploy-model-search {
     height: 3;
     min-height: 3;
 }
 
-.viewport-compact #quick-deploy-title,
-.viewport-compact #quick-deploy-subtitle {
-    padding-left: 1;
-    padding-right: 1;
-}
 
 .viewport-compact #quick-deploy-profile-card,
 .viewport-compact #quick-deploy-form,
 .viewport-compact #quick-deploy-actions,
 .viewport-compact #settings-form {
     padding: 0 1;
+}
+
+/* At 52 columns the fulfillment select collapses to zero width; keep it in
+   the focus chain but let the layout stack it below the details toggle. */
+.viewport-compact #quick-deploy-form {
+    layout: vertical;
 }
 
 .viewport-compact .gpu-config-main-row {
@@ -1253,6 +1608,47 @@ StatusHeader.state-error {
 .viewport-minimal OptionList {
     border-left: none;
     border-right: none;
+}
+
+/* At the 40x12 floor the chrome (title, filters, status, footer) already
+   spends the viewport; the scrolling list and detail shrink to their minimum
+   rather than overflowing it. */
+.viewport-minimal #fast-deploy-filter-row {
+    margin: 0;
+}
+
+.viewport-minimal #fast-deploy-search-group,
+.viewport-minimal #fast-deploy-gpu-group {
+    margin-bottom: 0;
+}
+
+.viewport-minimal #fast-deploy-status {
+    display: none;
+}
+
+.viewport-minimal #fast-deploy-detail {
+    display: none;
+}
+
+.viewport-minimal #fast-deploy-list {
+    min-height: 3;
+    max-height: 3;
+}
+
+.viewport-minimal #quick-deploy-facts {
+    max-height: 3;
+    overflow-y: hidden;
+}
+
+/* At the 40x12 floor only the facts and Deploy survive: the key hint hides
+   rather than overflowing the viewport. The scrollable card keeps its place
+   in the focus chain -- hiding it would strand arrow-key users on Deploy. */
+.viewport-minimal #quick-deploy-feedback {
+    display: none;
+}
+
+.viewport-minimal #quick-deploy-actions {
+    padding: 0 1;
 }
 
 .viewport-minimal #storage-predownload-actions {

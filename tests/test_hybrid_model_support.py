@@ -65,9 +65,10 @@ class HybridModelSupportTests(unittest.TestCase):
         self.assertLess(memory.total_gb, 1000)
         self.assertEqual(memory.total_layer_count, 93)
         profiles = self.profiles("Kimi-K3")
-        self.assertEqual(len(profiles), 1)
-        self.assertEqual(profiles[0].quant, "UD-Q2_K_XL")
-        self.assertEqual(profiles[0].gpu_count, 6)
+        placed = [profile for profile in profiles if profile.gpu_count > 0]
+        self.assertEqual(len(placed), 1)
+        self.assertEqual(placed[0].quant, "UD-Q2_K_XL")
+        self.assertEqual(placed[0].gpu_count, 6)
 
     def test_glm_cache_excludes_nextn_and_includes_pooling_indexer(self) -> None:
         metadata = metadata_fixture("GLM-5.3-Flash")
@@ -99,7 +100,9 @@ class HybridModelSupportTests(unittest.TestCase):
             profiles = _profiles_from_aa_rankings(tuple(candidate(name, i + 1) for i, name in enumerate(names)), self.gpus, model_limit=3, candidate_limit=80)
         self.assertEqual({p.display_name for p in profiles}, set(names))
         snapshot = aggregate_compute_availability(modal_catalog=self.gpus)
-        for profile in profiles:
+        placed = [profile for profile in profiles if profile.gpu_count > 0]
+        self.assertTrue(placed)
+        for profile in placed:
             with self.subTest(model=profile.display_name, quant=profile.quant):
                 plans = plans_for_compute_profile(snapshot.configurations[0], profile)
                 self.assertTrue(plans)

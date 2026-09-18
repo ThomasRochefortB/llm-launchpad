@@ -15,7 +15,6 @@ from .vision_probe import VISION_PROBE_FAILED, verify_image_request
 from .shutdown import is_shutting_down, shutdown_event
 
 import json
-import math
 import os
 import queue
 import re
@@ -23,7 +22,7 @@ import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from collections.abc import Generator
 from urllib.parse import urlsplit
 
@@ -31,6 +30,7 @@ from ..protocol.enums import (
     BackendType,
     ComputeProvider,
     DeploymentState,
+    EvidenceLevel,
     OperationType,
     ServingObjective,
 )
@@ -50,7 +50,14 @@ from .backend import ModalBackend
 from .fit_calibration import FitCalibrationRecorder
 from .operation_events import fail_operation
 from .diagnostics import log_exception
-from .llamacpp_planner import attestation_now, save_runtime_attestation
+if TYPE_CHECKING:
+    from .runtime_evidence import LlamacppRuntimeEvidence
+
+from .llamacpp_planner import (
+    attestation_now,
+    load_runtime_attestation,
+    save_runtime_attestation,
+)
 from .naming import legacy_app_name
 from .prime_backend import PrimeBackend
 
@@ -384,19 +391,45 @@ def _certify_serving_requirements(
     placement_assessment: PlacementAssessment | None,
     runtime_id: str | None,
     phase_timer: StartupPhaseTimer | None = None,
+    price_per_hour_usd: float | None = None,
+    runtime_log_text: str = "",
+    app_name: str = "",
 ) -> Generator[BaseEvent, None, RuntimeAttestation | None]:
     """Verify full-context GPU residency and throughput for a ready endpoint.
 
     Yields certification progress and, on failure, the events that end the
     warmup. Returns the attestation, or ``None`` when certification failed and
     the caller should stop.
+
+    Residency is read off the runtime, never off the plan: the effective
+    context comes from ``/props`` and the offload report from the server logs.
+    Evidence that *contradicts* residency fails the endpoint. Evidence that is
+    merely missing does not: the log stream is lossy -- Modal coalesced a
+    70-second burst covering the whole tensor-load phase, which is exactly
+    where llama.cpp prints its offload report -- and tearing down a server
+    that has loaded, answered ``/props`` and served a completion punishes the
+    user for a gap in someone else's telemetry. The retained logs are re-read
+    and an earlier certificate for this same placement is consulted before
+    residency is called unknown, and a certificate written without observation
+    is graded ``PREDICTED`` so it never passes for a measurement.
+    ``price_per_hour_usd`` is the placement's current quote price; the
+    requirements' ``max_hourly_cost_usd`` is a budget cap and must not stand
+    in for it.
     """
     yield StateChangeEvent(
         current=DeploymentState.VERIFYING,
         operation=OperationType.WARMUP,
         detail="Verifying full-context GPU residency",
     )
-    effective_context = serving_requirements.context_tokens
+    from .runtime_evidence import (
+        combine_runtime_evidence,
+        remembered_attestation_evidence,
+        runtime_log_evidence,
+        runtime_props_evidence,
+    )
+
+    runtime_evidence = combine_runtime_evidence()
+    effective_context = 0
     if backend == BackendType.LLAMACPP:
         props_url = endpoint_root_url(server_url) + "/props"
         try:
@@ -406,9 +439,11 @@ def _certify_serving_requirements(
                 timeout=15,
             )
             props_response.raise_for_status()
-            effective_context = extract_effective_context(
-                props_response.json()
-            ) or 0
+            runtime_evidence = combine_runtime_evidence(
+                runtime_evidence,
+                runtime_props_evidence(props_response.json()),
+            )
+            effective_context = runtime_evidence.effective_context_tokens or 0
         except Exception as exc:
             last_err = f"runtime property verification failed: {exc}"
             yield from fail_operation(
@@ -418,6 +453,8 @@ def _certify_serving_requirements(
                 detail=last_err,
             )
             return None
+    else:
+        effective_context = serving_requirements.context_tokens
     if placement_assessment is None:
         detail = "No placement assessment was supplied for runtime certification."
         yield from fail_operation(
@@ -427,10 +464,71 @@ def _certify_serving_requirements(
             detail=detail,
         )
         return None
-    gpu_resident = bool(
-        placement_assessment.gpu_resident
-        and placement_assessment.tuning.gpu_layers.casefold() == "all"
+    if backend == BackendType.LLAMACPP and runtime_log_text.strip():
+        runtime_evidence = combine_runtime_evidence(
+            runtime_evidence,
+            runtime_log_evidence(runtime_log_text),
+        )
+    observed_residency = runtime_evidence.gpu_resident
+    residency_evidence: EvidenceLevel | None = (
+        runtime_evidence.offload_evidence if observed_residency is not None else None
     )
+    if backend == BackendType.LLAMACPP and serving_requirements.gpu_only:
+        if observed_residency is None:
+            # The live tail can lose the offload report to a burst upstream, so
+            # look again before concluding the runtime never said anything.
+            recovered = _refetched_log_evidence(app_name)
+            if recovered.gpu_resident is None:
+                recovered = remembered_attestation_evidence(
+                    load_runtime_attestation(placement_assessment.fingerprint)
+                )
+            if recovered.gpu_resident is not None:
+                runtime_evidence = combine_runtime_evidence(runtime_evidence, recovered)
+                observed_residency = runtime_evidence.gpu_resident
+                residency_evidence = runtime_evidence.offload_evidence
+                yield LogEvent(
+                    line=f"GPU residency: {recovered.detail}.",
+                    operation=OperationType.WARMUP,
+                )
+        if observed_residency is False:
+            # This is the case worth failing on: the runtime said where the
+            # layers went, and some of them are not on the GPU.
+            detail = (
+                f"Requested {serving_requirements.context_tokens:,} context with "
+                f"GPU-only placement; the runtime reported "
+                f"{runtime_evidence.gpu_layers}/{runtime_evidence.total_layers} "
+                "layers on GPU."
+            )
+            yield from fail_operation(
+                OperationType.WARMUP,
+                f'Runtime attestation failed: {detail}',
+                recoverable=False,
+                detail=detail,
+            )
+            return None
+        if observed_residency is None:
+            residency_evidence = EvidenceLevel.PREDICTED
+            yield LogEvent(
+                line=(
+                    "GPU residency could not be verified: the runtime published no "
+                    "offload report in the captured logs. The endpoint is serving and "
+                    "its certificate records residency as predicted, not observed."
+                ),
+                operation=OperationType.WARMUP,
+            )
+        gpu_resident = (
+            bool(observed_residency)
+            if observed_residency is not None
+            else bool(
+                placement_assessment.gpu_resident
+                and placement_assessment.tuning.gpu_layers.casefold() == "all"
+            )
+        )
+    else:
+        gpu_resident = bool(
+            placement_assessment.gpu_resident
+            and placement_assessment.tuning.gpu_layers.casefold() == "all"
+        )
     if (
         effective_context < serving_requirements.context_tokens
         or (serving_requirements.gpu_only and not gpu_resident)
@@ -464,7 +562,7 @@ def _certify_serving_requirements(
             if placement_assessment is not None
             else 1
         ),
-        price_per_hour_usd=serving_requirements.max_hourly_cost_usd,
+        price_per_hour_usd=price_per_hour_usd,
         budget_seconds=_CALIBRATION_BUDGET_SECONDS,
         phase_timer=phase_timer,
     )
@@ -491,16 +589,24 @@ def _certify_serving_requirements(
         1,
         placement_assessment.memory.total_layer_count or 0,
     )
+    observed_gpu_layers = runtime_evidence.gpu_layers
+    observed_total_layers = runtime_evidence.total_layers
+    if backend == BackendType.LLAMACPP and observed_gpu_layers is not None:
+        gpu_layers = observed_gpu_layers
+        total_layers = observed_total_layers or total_layers
+    else:
+        gpu_layers = total_layers
     attestation = attestation_now(
         fingerprint=placement_assessment.fingerprint,
         requested_context_tokens=serving_requirements.context_tokens,
         effective_context_tokens=effective_context,
-        gpu_layers=total_layers,
+        gpu_layers=gpu_layers,
         total_layers=total_layers,
-        gpu_resident=True,
+        gpu_resident=gpu_resident,
         memory=placement_assessment.memory,
         performance=performance,
         runtime_id=runtime_id,
+        residency_evidence=residency_evidence,
     )
     try:
         save_runtime_attestation(attestation)
@@ -532,7 +638,8 @@ def _certify_serving_requirements(
         )
     yield LogEvent(
         line=(
-            f"Full {effective_context:,}-token context verified on GPU"
+            f"Configured {effective_context:,}-token context with "
+            f"{gpu_layers}/{total_layers} layers observed on GPU"
             f"{metric}."
         ),
         operation=OperationType.WARMUP,
@@ -561,6 +668,7 @@ class WarmupRunner:
         runtime_id: str | None = None,
         vision: VisionCapabilities | None = None,
         phase_timer: StartupPhaseTimer | None = None,
+        price_per_hour_usd: float | None = None,
     ) -> EventStream:
         """Probe endpoint readiness and optionally tail logs."""
         yield StateChangeEvent(
@@ -699,6 +807,9 @@ class WarmupRunner:
                             placement_assessment=placement_assessment,
                             runtime_id=runtime_id,
                             phase_timer=phase_timer,
+                            price_per_hour_usd=price_per_hour_usd,
+                            runtime_log_text="\n".join(sorted(log_tail.seen_lines)),
+                            app_name=target_app_name or "",
                         )
                         if attestation is None:
                             return
@@ -805,7 +916,15 @@ def _calibrate_endpoint(
     budget_seconds: float,
     phase_timer: StartupPhaseTimer | None = None,
 ) -> tuple[PerformancePoint, ...]:
-    """Measure a bounded performance curve without requiring aiperf."""
+    """Measure a bounded performance curve without requiring aiperf.
+
+    This is a short deployment calibration, not a sustained benchmark: one
+    request per worker per scenario, distinct prompts to avoid cache reuse,
+    and usage-counted tokens only. Points carry actual token counts and
+    sample sizes so callers can tell a calibration curve from a benchmark.
+    """
+
+    from ..protocol.enums import CachePolicy, EvidenceLevel
 
     root = endpoint_root_url(server_url)
     endpoint = root + "/v1/completions"
@@ -819,7 +938,7 @@ def _calibrate_endpoint(
     ]
     points: list[PerformancePoint] = []
     previous_aggregate = 0.0
-    for prompt_tokens, concurrency in scenarios:
+    for scenario_index, (prompt_tokens, concurrency) in enumerate(scenarios):
         remaining = budget_seconds - (time.monotonic() - started)
         if remaining <= 1.0:
             break
@@ -838,8 +957,9 @@ def _calibrate_endpoint(
                     prompt_tokens=prompt_tokens,
                     output_tokens=128,
                     timeout=timeout,
+                    prompt_seed=scenario_index * 16 + worker,
                 )
-                for _ in range(concurrency)
+                for worker in range(concurrency)
             ]
             for future in as_completed(futures):
                 try:
@@ -849,13 +969,19 @@ def _calibrate_endpoint(
         elapsed = max(0.001, time.monotonic() - scenario_started)
         successful = len(results)
         completion_tokens = sum(row["completion_tokens"] for row in results)
-        latencies = sorted(row["latency"] for row in results)
+        actual_prompt = (
+            int(sum(row["actual_prompt_tokens"] for row in results))
+            if results
+            else 0
+        )
+        actual_output = int(completion_tokens)
         output_rates = [row["output_tps"] for row in results]
         prompt_rates = [row["prompt_tps"] for row in results]
         ttfts = [row["ttft"] for row in results]
         aggregate = completion_tokens / elapsed if successful else 0.0
         error_rate = errors / max(1, concurrency)
-        p95_index = max(0, math.ceil(len(latencies) * 0.95) - 1) if latencies else 0
+        # One request per worker per scenario is a calibration curve, not a
+        # benchmark: tail percentiles from 1-8 samples are not evidence.
         point = PerformancePoint(
             prompt_tokens=prompt_tokens,
             output_tokens=128,
@@ -870,7 +996,7 @@ def _calibrate_endpoint(
             time_to_first_token_seconds=(
                 sum(ttfts) / len(ttfts) if ttfts else None
             ),
-            p95_latency_seconds=(latencies[p95_index] if latencies else None),
+            p95_latency_seconds=None,
             error_rate=error_rate,
             output_tokens_per_dollar=(
                 aggregate * 3600.0 / price_per_hour_usd
@@ -878,6 +1004,12 @@ def _calibrate_endpoint(
                 else None
             ),
             measured=True,
+            actual_prompt_tokens=actual_prompt or None,
+            actual_output_tokens=actual_output or None,
+            sample_count=successful,
+            completion_reason="calibration-curve",
+            cache_policy=CachePolicy.UNCACHED,
+            evidence=EvidenceLevel.OBSERVED,
         )
         points.append(point)
         if concurrency > 1:
@@ -900,10 +1032,18 @@ def _streaming_calibration_request(
     prompt_tokens: int,
     output_tokens: int,
     timeout: float,
+    prompt_seed: int = 0,
 ) -> dict[str, float]:
-    """Run one streaming completion and return timing primitives."""
+    """Run one streaming completion and return timing primitives.
 
-    prompt = " calibration" * max(1, prompt_tokens)
+    Prompts are distinct per worker: repeating one identical prompt across
+    concurrent requests lets prefix caching subsidize the measurement.
+    Token counts come from usage when the runtime reports it; streaming
+    chunks are transport events and never stand in for tokens. A response
+    without a usable completion count is an error, not a one-token success.
+    """
+
+    prompt = _calibration_prompt(prompt_tokens, seed=prompt_seed)
     payload = {
         "model": model,
         "prompt": prompt,
@@ -925,8 +1065,8 @@ def _streaming_calibration_request(
         raise RuntimeError(f"calibration returned HTTP {status_code}")
 
     first_token_at: float | None = None
-    observed_chunks = 0
     usage_completion_tokens = 0
+    usage_prompt_tokens = 0
     iterator = getattr(response, "iter_lines", None)
     if callable(iterator):
         for raw_line in iterator(decode_unicode=True):
@@ -947,6 +1087,10 @@ def _streaming_calibration_request(
                         usage_completion_tokens,
                         int(usage.get("completion_tokens") or 0),
                     )
+                    usage_prompt_tokens = max(
+                        usage_prompt_tokens,
+                        int(usage.get("prompt_tokens") or 0),
+                    )
                 except (TypeError, ValueError):
                     pass
             choices = chunk.get("choices") if isinstance(chunk, dict) else None
@@ -956,23 +1100,31 @@ def _streaming_calibration_request(
             raw_delta = choice.get("delta")
             delta = raw_delta if isinstance(raw_delta, dict) else {}
             text = str(choice.get("text") or delta.get("content") or "")
-            if text:
-                if first_token_at is None:
-                    first_token_at = time.monotonic()
-                observed_chunks += 1
+            if text and first_token_at is None:
+                first_token_at = time.monotonic()
     else:
         # Test doubles and non-streaming compatibility proxies may only expose
-        # a final JSON body. This still supplies conservative end-to-end rates.
+        # a final JSON body. Usage counts still decide; without them the
+        # request is unmeasurable rather than a one-token success.
         body = response.json()
-        first_token_at = time.monotonic()
         usage = body.get("usage") if isinstance(body, dict) else None
         if isinstance(usage, dict):
-            usage_completion_tokens = int(usage.get("completion_tokens") or 0)
-        observed_chunks = usage_completion_tokens
+            try:
+                usage_completion_tokens = int(usage.get("completion_tokens") or 0)
+                usage_prompt_tokens = int(usage.get("prompt_tokens") or 0)
+            except (TypeError, ValueError):
+                pass
+        choices = body.get("choices") if isinstance(body, dict) else None
+        if usage_completion_tokens > 0:
+            first_token_at = time.monotonic()
 
     finished = time.monotonic()
+    if usage_completion_tokens <= 0:
+        raise RuntimeError(
+            "calibration response carried no usable completion-token count"
+        )
     first = first_token_at or finished
-    completion_tokens = float(max(1, usage_completion_tokens or observed_chunks))
+    completion_tokens = float(usage_completion_tokens)
     latency = max(0.001, finished - started)
     ttft = max(0.001, first - started)
     decode_seconds = max(0.001, finished - first)
@@ -980,11 +1132,28 @@ def _streaming_calibration_request(
         decode_seconds = latency
     return {
         "completion_tokens": completion_tokens,
+        "actual_prompt_tokens": float(usage_prompt_tokens or prompt_tokens),
         "latency": latency,
         "ttft": ttft,
-        "prompt_tps": float(prompt_tokens) / ttft,
+        "prompt_tps": float(usage_prompt_tokens or prompt_tokens) / ttft,
         "output_tps": completion_tokens / decode_seconds,
     }
+
+
+def _calibration_prompt(prompt_tokens: int, *, seed: int = 0) -> str:
+    """Build a distinct uncached prompt of roughly the requested length.
+
+    Identical prompts across workers share a cacheable prefix, so each worker
+    gets its own filler sentence. Length is approximate -- the usage counts
+    decide the recorded token numbers, never this filler arithmetic.
+    """
+
+    filler = (
+        f"Calibration sentence {seed}: the deployment pipeline records "
+        "throughput, latency, and error rate for every serving configuration. "
+    )
+    repetitions = max(1, (max(1, prompt_tokens) * 4) // max(1, len(filler)))
+    return filler * repetitions
 
 
 def _calibration_is_acceptable(
@@ -996,6 +1165,11 @@ def _calibration_is_acceptable(
     healthy = [point for point in performance if point.error_rate <= 0.05]
     if not healthy:
         return False, "the bounded calibration produced no stable requests"
+    if any(
+        (point.actual_output_tokens or 0) <= 0 or (point.sample_count or 0) <= 0
+        for point in healthy
+    ):
+        return False, "the bounded calibration produced no counted completions"
     if objective in {ServingObjective.GENERAL_PURPOSE, ServingObjective.INTERACTIVE}:
         single = max(
             (
@@ -1012,6 +1186,34 @@ def _calibration_is_acceptable(
                 f"Fast Deploy requires {_GENERAL_PURPOSE_MIN_OUTPUT_TPS:.1f} tok/s",
             )
     return True, "performance policy satisfied"
+
+
+def _refetched_log_evidence(app_name: str) -> LlamacppRuntimeEvidence:
+    """Re-read the app's retained logs and grade whatever offload report is there.
+
+    The live tail is a stream, and a stream can lose a burst: llama.cpp emits
+    hundreds of tensor warnings in a millisecond just before it reports the
+    offload, and that whole window has been seen to vanish. Asking again costs
+    one CLI call against logs the provider already stored.
+    """
+
+    from .runtime_evidence import LlamacppRuntimeEvidence, runtime_log_evidence
+
+    if not app_name.strip():
+        return LlamacppRuntimeEvidence()
+    try:
+        result = subprocess.run(
+            ModalBackend._resolve_command(["modal", "app", "logs", app_name]),
+            capture_output=True,
+            text=True,
+            timeout=20,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        )
+        text = result.stdout or ""
+    except Exception:
+        log_exception(f"Failed to re-read retained logs for {app_name}")
+        return LlamacppRuntimeEvidence()
+    return runtime_log_evidence(text)
 
 
 def fetch_historical_logs(

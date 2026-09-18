@@ -20,6 +20,7 @@ from .naming import infer_instance_from_app_name
 from .operation_events import fail_operation
 from .shutdown import is_shutting_down
 from .vast_backend import VastApiError, VastBackend
+from .vast_download import fetch_download_files, measure_download
 from .vast_runtime import (
     GPU_INVENTORY_COMMAND,
     VAST_RUNTIME_DIR,
@@ -91,7 +92,10 @@ VAST_STARTUP_HEARTBEAT_SECONDS = 30
 _BUILDKIT_STEP_PREFIX = re.compile(r"^#\d+\s+\d+(?:\.\d+)?\s+")
 
 
-def vast_startup_detail(downloaded: int, previous: int, interval: float, last_log: str) -> str:
+def vast_startup_detail(
+    downloaded: int, previous: int, interval: float, last_log: str,
+    *, total: int | None = None, active: bool = True,
+) -> str:
     """Say what a starting runtime is doing, in the order the user can use.
 
     Measured bytes beat the server log while weights are arriving: llama.cpp
@@ -100,13 +104,19 @@ def vast_startup_detail(downloaded: int, previous: int, interval: float, last_lo
     partial file on disk grows. Once nothing is downloading the log is the
     only thing left that knows about loading and warmup.
     """
-    if downloaded > 0:
+    if downloaded > 0 or total:
         gained = downloaded - previous
         rate = (
             f" at {gained / interval / 1e6:.0f} MB/s"
             if previous > 0 and gained > 0 and interval > 0
             else ""
         )
+        if total is not None and total > 0:
+            pct = min(99 if active else 100, downloaded * 100 // total)
+            eta = ""
+            if rate and downloaded < total:
+                eta = f", ~{format_elapsed((total - downloaded) * interval / gained)} remaining"
+            return f"downloading weights ({pct}%), {downloaded / 1e9:.1f} / {total / 1e9:.1f} GB{rate}{eta}"
         return f"downloading weights, {downloaded / 1e9:.1f} GB fetched{rate}"
     return last_log or "no progress reported yet"
 
@@ -198,8 +208,11 @@ class VastDeploymentBackend:
             if not already_running:
                 _CANCELLATIONS[name] = cancellation
         if already_running:
-            config.fallback_configs = ()
-            yield from fail_operation(OperationType.DEPLOY, "This Vast deployment is already in progress.", recoverable=False)
+            yield from fail_operation(
+                OperationType.DEPLOY, "This Vast deployment is already in progress.",
+                recoverable=False,
+                data={"rollback": {"attempted": False, "confirmed": False, "detail": "already in progress"}},
+            )
             return
         try:
             with self.state.locked(name):
@@ -223,7 +236,6 @@ class VastDeploymentBackend:
                 raise ValueError(error)
             name = config.app_name or ""
             if self.state.load(name) is not None:
-                config.fallback_configs = ()
                 raise ValueError("A Vast rental is already recorded for this name. Connect to or destroy it before deploying again.")
             ssh = VastSsh(self.state.directory(name))
             public_key = ssh.public_key()
@@ -259,6 +271,7 @@ class VastDeploymentBackend:
             source = config.model_name if config.backend == BackendType.VLLM else config.repo_id
             config.served_model_name = config.served_model_name or (source or "model").rsplit("/", 1)[-1]
             script = vast_runtime_script(config)
+            download_files = fetch_download_files(config)
             yield StateChangeEvent(current=DeploymentState.DEPLOYING, operation=OperationType.DEPLOY, detail=f"Renting Vast offer {offer.id} at ${price:.4f}/hr including disk")
             if cancellation.is_set() or is_shutting_down():
                 raise RuntimeError("Vast deployment cancelled before rental.")
@@ -365,11 +378,13 @@ class VastDeploymentBackend:
                     reported_at = time.monotonic()
                     detail = instance.status_msg[:120] or "no progress reported yet"
                     elapsed = format_elapsed(time.monotonic() - started)
-                    yield LogEvent(line=f"Vast rental preparing: {detail} (waiting {elapsed})")
+                    phase = "waiting for SSH" if instance.state == "running" else "rental preparing"
+                    yield LogEvent(line=f"Vast {phase}: {detail} (waiting {elapsed})")
                 if knocking:
                     try:
                         ssh.run(instance, "true")
                         ssh_ready_at = time.monotonic()
+                        yield LogEvent(line="Vast SSH ready")
                         break
                     except RuntimeError as exc:
                         # A refused port and a denied key arrive at the same
@@ -434,6 +449,7 @@ class VastDeploymentBackend:
                 listener.bind(("127.0.0.1", 0))
                 record.local_port = listener.getsockname()[1]
             self.state.save(record)
+            yield LogEvent(line="Vast opening secure endpoint")
             ssh.connect(instance, record.local_port)
             url = f"http://127.0.0.1:{record.local_port}"
             yield StateChangeEvent(current=DeploymentState.DEPLOYING, operation=OperationType.DEPLOY, detail="Waiting for the Vast model through the local SSH tunnel")
@@ -447,6 +463,7 @@ class VastDeploymentBackend:
             startup_started = time.monotonic()
             startup_reported = startup_started
             downloaded = 0
+            download_complete = False
             while not endpoint_healthy(url, record.endpoint_api_key):
                 if cancellation.is_set() or is_shutting_down():
                     raise RuntimeError("Vast deployment cancelled.")
@@ -457,10 +474,21 @@ class VastDeploymentBackend:
                     startup_reported = time.monotonic()
                     previous, downloaded = downloaded, 0
                     try:
-                        downloaded, last_log = parse_startup_probe(
-                            ssh.run(instance, VAST_STARTUP_PROBE_COMMAND, multiplex=True)
-                        )
-                        detail = vast_startup_detail(downloaded, previous, interval, last_log)
+                        output = ssh.run(instance, VAST_STARTUP_PROBE_COMMAND, multiplex=True)
+                        downloaded, last_log = parse_startup_probe(output)
+                        progress = measure_download(output, download_files)
+                        if progress is not None:
+                            downloaded = progress.downloaded
+                            if progress.active or (progress.total and not download_complete):
+                                detail = vast_startup_detail(
+                                    downloaded, previous, interval, last_log,
+                                    total=progress.total, active=progress.active,
+                                )
+                            else:
+                                detail = last_log or "loading model"
+                            download_complete = not progress.active
+                        else:
+                            detail = vast_startup_detail(downloaded, previous, interval, last_log)
                     except (RuntimeError, ValueError):
                         # The probe is commentary on a rental that is already
                         # billing and already watched by the deadline above.
@@ -496,6 +524,14 @@ class VastDeploymentBackend:
             yield OperationCompleteEvent(operation=OperationType.DEPLOY, success=True, data=self._endpoint(record, "running", url))
         except Exception as exc:
             detail = str(exc)
+            rollback: dict[str, object] | None = None
+            if record is None and (
+                "already recorded" in detail or "already in progress" in detail
+            ):
+                # Pre-allocation refusal for a name that may still bill: block
+                # the next rental via an explicit unconfirmed rollback rather
+                # than mutating the caller's approved ladder.
+                rollback = {"attempted": False, "confirmed": False, "detail": detail}
             if record is not None:
                 try:
                     machine_id = getattr(record, "machine_id", "") or ""
@@ -514,19 +550,24 @@ class VastDeploymentBackend:
                 try:
                     self._destroy(record)
                     record = None
+                    rollback = {"attempted": True, "confirmed": True, "detail": ""}
                 except Exception as cleanup:
-                    # Prevent the TUI recovery ladder from renting another GPU
-                    # while the first rental may still be billing.
-                    config.fallback_configs = ()
+                    # The rental may still be billing: report the unconfirmed
+                    # rollback so the lifecycle blocks the next rental instead
+                    # of mutating the approved ladder in place.
                     detail += f" Cleanup remains pending: {cleanup}"
-            yield from fail_operation(OperationType.DEPLOY, detail, recoverable=False)
+                    rollback = {"attempted": True, "confirmed": False, "detail": str(cleanup)}
+            yield from fail_operation(
+                OperationType.DEPLOY, detail, recoverable=False,
+                data={"rollback": rollback} if rollback is not None else None,
+            )
         finally:
             if record is not None and not completed:
                 # Also runs on GeneratorExit / KeyboardInterrupt, with no yields.
                 try:
                     self._destroy(record)
                 except Exception:
-                    config.fallback_configs = ()
+                    pass
 
     @staticmethod
     def _endpoint(record: VastDeploymentRecord, state: str, url: str | None) -> EndpointInfo:

@@ -37,7 +37,7 @@ from typing import Any
 from ..protocol.models import RuntimeTuning, ServingRequirements
 from .config import SETTINGS_DIR
 
-CALIBRATION_SCHEMA_VERSION = 1
+CALIBRATION_SCHEMA_VERSION = 2
 CALIBRATION_CACHE_PATH = SETTINGS_DIR / "memory_calibrations.json"
 
 _MIB = 1024**2
@@ -225,8 +225,12 @@ def calibration_key(
     Everything here changes what ggml allocates. The GPU type and count do
     not: compute buffers are sized from tensor shapes, so one measurement is
     evidence for every topology and every provider serving the same plan.
+    Speculative decoding changes the recurrent-state copies, so its method and
+    token count are part of the key: a calibration solved without them must
+    not size a plan that enables them.
     """
 
+    speculative = tuning.speculative_decoding
     payload = {
         "schema": CALIBRATION_SCHEMA_VERSION,
         "model_id": model_id.strip(),
@@ -241,6 +245,10 @@ def calibration_key(
             "cache_type_v": tuning.cache_type_v,
             "flash_attention": tuning.flash_attention,
             "parallel_slots": tuning.parallel_slots,
+            "speculative_method": speculative.method.value if speculative else None,
+            "speculative_tokens": (
+                speculative.num_speculative_tokens if speculative else 0
+            ),
         },
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))

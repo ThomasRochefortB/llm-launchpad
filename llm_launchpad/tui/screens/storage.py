@@ -9,11 +9,10 @@ from textual import events
 from textual.actions import SkipAction
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.widget import Widget
 from textual.widgets import Button, DataTable, Input, OptionList, Select, Static
-from textual.widgets.option_list import Option
 
 from ...core.storage_costs import (
     MODAL_VOLUME_FREE_TIER_GIB_MONTH,
@@ -169,6 +168,8 @@ class StorageScreen(CopyEnabledScreen):
         "storage-provider-filter",
         "storage-backend-filter",
         "storage-table",
+        "storage-filter",
+        "storage-predownload-toggle",
         "storage-model-id",
         "storage-model-backend",
         "storage-model-quant",
@@ -184,34 +185,40 @@ class StorageScreen(CopyEnabledScreen):
         self._prime_disks: list[object] = []
         self._prime_error: str | None = None
         self._selected_prime_disk_id: str | None = None
+        self._predownload_expanded = False
 
     def compose(self) -> ComposeResult:
-        with VerticalScroll(classes="screen-scroll"):
-            yield Static("[bold #7bf168]Storage[/]  [dim]Cached models, pre-download, delete[/dim]")
+        with VerticalScroll(id="storage-scroll", classes="screen-scroll"):
+            yield Static("[bold #7bf168]Storage[/]  [dim]Cached models, pre-download, delete[/dim]", id="storage-title")
             yield Static("[dim]Storage status appears here.[/dim]", id="storage-status")
-            # Scope rides on the provider label row, and the selector is a
-            # dropdown rather than a list: each extra row here is a table row
-            # lost on an 80x24 terminal, where the inventory must stay visible.
-            yield Static("", id="storage-provider-label")
-            yield Select(
-                options=[
-                    ("Modal · shared volume cache", "modal"),
-                    ("Prime · persistent cache disks", "prime"),
-                    ("Vast · rental-local disks", "vast"),
-                ],
-                value="modal",
-                allow_blank=False,
-                id="storage-provider-filter",
-            )
-            yield Static("[bold]Backend filter[/bold]")
-            yield OptionList(
-                Option("  All backends", id="filter-all"),
-                Option("  llama.cpp", id="filter-llamacpp"),
-                Option("  vLLM", id="filter-vllm"),
-                id="storage-backend-filter",
-            )
-            yield Static("")
-            yield Static("[bold]Model inventory[/bold]")
+            # Provider and backend ride side by side: each extra vertical filter
+            # row is a table row lost on an 80x24 terminal, where the inventory
+            # must stay visible.
+            with Horizontal(id="storage-filter-row"):
+                with Vertical(id="storage-provider-group"):
+                    yield Static("", id="storage-provider-label")
+                    yield Select(
+                        options=[
+                            ("Modal · shared volume cache", "modal"),
+                            ("Prime · persistent cache disks", "prime"),
+                            ("Vast · rental-local disks", "vast"),
+                        ],
+                        value="modal",
+                        allow_blank=False,
+                        id="storage-provider-filter",
+                    )
+                with Vertical(id="storage-backend-group"):
+                    yield Static("[bold]Backend[/bold]")
+                    yield Select(
+                        options=[
+                            ("All backends", "all"),
+                            ("llama.cpp", "llamacpp"),
+                            ("vLLM", "vllm"),
+                        ],
+                        value="all",
+                        allow_blank=False,
+                        id="storage-backend-filter",
+                    )
             yield Input(
                 placeholder="Filter models (type to filter)",
                 id="storage-filter",
@@ -227,30 +234,31 @@ class StorageScreen(CopyEnabledScreen):
                 "for pre-download or delete.[/dim]",
                 id="storage-hint",
             )
-            yield Static("")
-            yield Static("[bold]Pre-download a model[/bold]")
-            yield Input(
-                placeholder="Model id (e.g. Qwen/Qwen3-4B-Thinking-2507-FP8)",
-                id="storage-model-id",
-            )
-            yield Static("Backend for pre-download", classes="form-label")
-            yield Select(
-                options=[("llama.cpp", "llamacpp"), ("vLLM", "vllm")],
-                value=(self._initial_backend.value if self._initial_backend else "llamacpp"),
-                allow_blank=False,
-                id="storage-model-backend",
-            )
-            yield Input(
-                placeholder="Quant pattern (llama.cpp only, optional)",
-                id="storage-model-quant",
-            )
-            yield Input(
-                placeholder="Revision (optional)",
-                id="storage-model-revision",
-            )
-            with Horizontal(id="storage-predownload-actions"):
-                yield Button("Pre-download", id="storage-predownload-btn", variant="primary")
-                yield Static("[dim]Downloads using the values above.[/dim]")
+            yield Button("Pre-download a model...", id="storage-predownload-toggle")
+            with Vertical(id="storage-predownload-form"):
+                yield Static("[bold]Pre-download a model[/bold]")
+                yield Input(
+                    placeholder="Model id (e.g. Qwen/Qwen3-4B-Thinking-2507-FP8)",
+                    id="storage-model-id",
+                )
+                yield Static("Backend for pre-download", classes="form-label")
+                yield Select(
+                    options=[("llama.cpp", "llamacpp"), ("vLLM", "vllm")],
+                    value=(self._initial_backend.value if self._initial_backend else "llamacpp"),
+                    allow_blank=False,
+                    id="storage-model-backend",
+                )
+                yield Input(
+                    placeholder="Quant pattern (llama.cpp only, optional)",
+                    id="storage-model-quant",
+                )
+                yield Input(
+                    placeholder="Revision (optional)",
+                    id="storage-model-revision",
+                )
+                with Horizontal(id="storage-predownload-actions"):
+                    yield Button("Pre-download", id="storage-predownload-btn", variant="primary")
+                    yield Static("[dim]Downloads using the values above.[/dim]")
         yield FittedFooter()
 
     def on_mount(self) -> None:
@@ -272,13 +280,9 @@ class StorageScreen(CopyEnabledScreen):
         )
         if self._initial_backend is not None:
             self.query_one("#storage-model-backend", Select).value = self._initial_backend.value
-        backend_filter = self.query_one("#storage-backend-filter", OptionList)
-        if self._selected_filter == BackendType.LLAMACPP:
-            backend_filter.highlighted = 1
-        elif self._selected_filter == BackendType.VLLM:
-            backend_filter.highlighted = 2
-        elif backend_filter.option_count > 0:
-            backend_filter.highlighted = 0
+            backend_filter = self.query_one("#storage-backend-filter", Select)
+            backend_filter.value = self._initial_backend.value
+        self._sync_predownload_visibility()
         self._render_scope()
         self.call_after_refresh(self._focus_first_visible_navigation_target)
         self._refresh_storage_snapshot()
@@ -313,18 +317,17 @@ class StorageScreen(CopyEnabledScreen):
             return
         table.set_viewport_profile(profile)
 
-    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
-        if event.option_list.id == "storage-backend-filter":
-            if event.option.id == "filter-llamacpp":
+    def on_select_changed(self, event: Select.Changed) -> None:
+        if event.select.id == "storage-backend-filter":
+            value = str(event.value or "").strip().lower()
+            if value == "llamacpp":
                 self._selected_filter = BackendType.LLAMACPP
-            elif event.option.id == "filter-vllm":
+            elif value == "vllm":
                 self._selected_filter = BackendType.VLLM
             else:
                 self._selected_filter = None
             self._render_table()
             return
-
-    def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id != "storage-provider-filter":
             return
         value = str(event.value or "").strip().lower()
@@ -615,8 +618,39 @@ class StorageScreen(CopyEnabledScreen):
         )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "storage-predownload-toggle":
+            self._predownload_expanded = not self._predownload_expanded
+            self._sync_predownload_visibility()
+            if self._predownload_expanded:
+                self.query_one("#storage-model-id", Input).focus()
+            return
         if event.button.id == "storage-predownload-btn":
             self.action_predownload_selected()
+
+    def _sync_predownload_visibility(self) -> None:
+        """Collapse the pre-download form until it is needed.
+
+        The form is four fields plus a button; showing it always leaves a
+        single inventory row on an 80x24 terminal. The toggle and the "p" key
+        both expand it; collapsing never clears the values.
+        """
+        try:
+            form = self.query_one("#storage-predownload-form")
+            toggle = self.query_one("#storage-predownload-toggle", Button)
+        except NoMatches:
+            return
+        form.display = self._predownload_expanded
+        toggle.label = (
+            "Hide pre-download form" if self._predownload_expanded
+            else "Pre-download a model..."
+        )
+
+    def action_toggle_predownload_form(self) -> None:
+        """Expand the pre-download form; pre-download acts on typed values."""
+        if not self._predownload_expanded:
+            self._predownload_expanded = True
+            self._sync_predownload_visibility()
+        self.query_one("#storage-model-id", Input).focus()
 
     def action_delete_selected_model(self) -> None:
         if self._selected_provider == ComputeProvider.VAST:
@@ -759,16 +793,16 @@ class StorageDeleteConfirmScreen(CopyEnabledScreen):
             detail.append(escape(self.model.quant.strip()))
         detail.append(_human_bytes(self.model.size_bytes))
         with VerticalScroll(classes="screen-scroll"):
-            yield Static("[bold #7bf168]Delete Cached Model[/]")
-            yield Static("")
-            yield Static(
-                f"Delete [bold]{escape(self.model.model_id)}[/bold]?\n"
-                f"[dim]{' · '.join(detail)}[/dim]"
-            )
-            yield Static(self._warning(), id="delete-warning")
-            with Horizontal(id="delete-confirm-actions"):
-                yield Button("Cancel", id="delete-cancel")
-                yield Button("Delete model", id="delete-confirm", variant="error")
+            with Vertical(id="delete-confirm-dialog", classes="dialog-panel"):
+                yield Static("[bold #7bf168]Delete Cached Model[/]", classes="dialog-title")
+                yield Static(
+                    f"Delete [bold]{escape(self.model.model_id)}[/bold]?\n"
+                    f"[dim]{' · '.join(detail)}[/dim]"
+                )
+                yield Static(self._warning(), id="delete-warning")
+                with Horizontal(id="delete-confirm-actions", classes="dialog-actions"):
+                    yield Button("Cancel", id="delete-cancel")
+                    yield Button("Delete model", id="delete-confirm", variant="error")
         yield FittedFooter()
 
     def on_mount(self) -> None:
@@ -808,19 +842,19 @@ class PrimeDiskDeleteConfirmScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(classes="screen-scroll"):
-            yield Static("[bold #7bf168]Delete Prime Disk[/]")
-            yield Static("")
-            yield Static(
-                f"Permanently delete Prime disk [bold]{escape(self.disk_id)}[/bold] "
-                "and its cached weights?"
-            )
-            yield Static(
-                "[yellow]The disk keeps billing until deleted. Deleting it means "
-                "the next deploy re-downloads the weights.[/yellow]"
-            )
-            with Horizontal(id="delete-confirm-actions"):
-                yield Button("Cancel", id="delete-cancel")
-                yield Button("Delete disk", id="delete-confirm", variant="error")
+            with Vertical(id="prime-delete-confirm-dialog", classes="dialog-panel"):
+                yield Static("[bold #7bf168]Delete Prime Disk[/]", classes="dialog-title")
+                yield Static(
+                    f"Permanently delete Prime disk [bold]{escape(self.disk_id)}[/bold] "
+                    "and its cached weights?"
+                )
+                yield Static(
+                    "[yellow]The disk keeps billing until deleted. Deleting it means "
+                    "the next deploy re-downloads the weights.[/yellow]"
+                )
+                with Horizontal(id="delete-confirm-actions", classes="dialog-actions"):
+                    yield Button("Cancel", id="delete-cancel")
+                    yield Button("Delete disk", id="delete-confirm", variant="error")
         yield FittedFooter()
 
     def on_mount(self) -> None:

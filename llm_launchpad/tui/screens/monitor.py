@@ -107,7 +107,7 @@ class MonitorScreen(CopyEnabledScreen):
 
     BINDINGS = [
         Binding("escape", "go_back", "Back", show=True),
-        Binding("q", "go_back", "Back"),
+        Binding("q", "go_back", "Back", show=False),
         Binding(
             "y",
             "copy_text",
@@ -129,10 +129,39 @@ class MonitorScreen(CopyEnabledScreen):
         Binding("shift+n", "previous_search_match", "Previous match", show=False),
         Binding("v", "toggle_log_view", "Raw/Summary", show=True),
         Binding("ctrl+l", "clear_log", "Clear log", show=True),
-        Binding("enter", "submit_or_finish", "Done", show=False, priority=True),
-        Binding("u", "copy_base_url", "Copy URL", show=False),
+        Binding("enter", "submit_or_finish", "Done", show=True, priority=True),
+        Binding("u", "copy_base_url", "Copy URL", show=True),
         Binding("k", "copy_api_key", "Copy key", show=False),
     ]
+
+    _RESULT_TITLES = {
+        OperationType.STATUS: "Status check complete",
+        OperationType.BENCHMARK: "Benchmark complete",
+        OperationType.DEPLOY: "Deploy complete",
+        OperationType.WARMUP: "Warmup complete",
+        OperationType.LOGS: "Logs complete",
+        OperationType.STOP: "Stop complete",
+    }
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Prioritize result actions once the operation finishes.
+
+        While running, the footer is about following and searching logs; once
+        done, Done/Copy URL/Copy take precedence over log navigation, which
+        remains reachable by shortcut and help.
+        """
+        if self._done and action in {
+            "page_up_log", "page_down_log", "resume_follow", "clear_log",
+        }:
+            return False
+        if not self._done and action in {"submit_or_finish", "copy_base_url"}:
+            # The result card is hidden until completion; advertising Done and
+            # Copy URL beforehand promises buttons that do not exist yet.
+            if action == "copy_base_url" and self._connection_payload is None:
+                return False
+            if action == "submit_or_finish":
+                return False
+        return super().check_action(action, parameters)
 
     def __init__(
         self,
@@ -339,6 +368,7 @@ class MonitorScreen(CopyEnabledScreen):
     def on_operation_done(self, message: OperationDone) -> None:
         self._done = True
         self._success = message.success
+        self.refresh_bindings()
         if message.success:
             self.status_header.update_from_event(
                 state=self._TERMINAL_STATES.get(
@@ -417,8 +447,9 @@ class MonitorScreen(CopyEnabledScreen):
         self._result_rows = rows
         card = self.query_one("#result-card", VerticalScroll)
         card.remove_class("hidden")
+        title = self._RESULT_TITLES.get(message.operation, "Check complete")
         self.query_one("#result-card-title", Static).update(
-            "[bold #7bf168]Check complete[/]"
+            f"[bold #7bf168]{title}[/]"
         )
         self.query_one("#result-card-body", Static).update(_result_card_markup(rows))
         self.query_one("#result-done-btn", Button).focus()

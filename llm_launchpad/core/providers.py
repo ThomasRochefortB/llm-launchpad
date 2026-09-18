@@ -63,6 +63,9 @@ _CAPABILITIES: dict[ComputeProvider, DeploymentCapabilities] = {
         max_gpu_count=8,
         supports_vision=True,
         pinned_revision_backends=frozenset({BackendType.VLLM}),
+        # Prime provisions a serving pod for every request; there is no
+        # preload-only or smoke-only execution behind these flags.
+        supports_preload_only=False,
         supports_smoke_test_only=False,
         gpu_shape_from_offer=True,
     ),
@@ -93,48 +96,15 @@ def capabilities(provider: ComputeProvider) -> DeploymentCapabilities:
 def refuse(config: DeploymentConfig) -> str | None:
     """Explain why this configuration cannot be deployed, or return None.
 
-    Callers must treat a returned string as final and user-facing: it is the
-    same sentence whether it surfaces in a form, the CLI, or a backend.
+    Compatibility wrapper over the authoritative preflight: new callers should
+    use :mod:`llm_launchpad.core.deployment_preflight` for structured findings.
+    The user-facing sentence stays identical across forms, CLI, and backends.
     """
+    from .deployment_preflight import preflight_config
 
-    caps = capabilities(config.provider)
-    provider = config.provider.display_name
-
-    if config.backend not in caps.backends:
-        return f"{provider} does not support {config.backend.display_name} deployments."
-    if config.vision is not None and config.vision.enabled and not caps.supports_vision:
-        return f"{provider} deployments currently support text models only."
-    if config.revision and config.backend not in caps.pinned_revision_backends:
-        return (
-            f"{provider} {config.backend.display_name} currently supports only "
-            "the default HF revision."
-        )
-    gpu_count = config.gpu_count or 1
-    if gpu_count > caps.max_gpu_count:
-        if caps.max_gpu_count == 1:
-            return f"{provider} deployments currently support a single GPU."
-        return f"{provider} deployments support at most {caps.max_gpu_count} GPUs."
-    if not config.do_deploy and not config.run_smoke and not caps.supports_preload_only:
-        return f"{provider} has no preload-only operation; select Deploy to rent an instance."
-    if config.run_smoke and not caps.supports_smoke_test_only:
-        return f"{provider} does not support smoke-test-only mode."
-    # GPU_CONFIG sizes the container and N_GPU becomes --tensor-parallel-size,
-    # so a tensor-parallel size above the allocated count asks vLLM to shard
-    # across devices that do not exist. It fails every time, after the GPU is
-    # allocated and billed. Only Vast refused it; how many GPUs a valid plan may
-    # leave idle stays each provider's own policy.
-    if (
-        config.backend == BackendType.VLLM
-        and config.n_gpu is not None
-        and config.n_gpu > gpu_count
-    ):
-        return (
-            f"vLLM tensor parallelism needs one GPU per shard: {config.n_gpu} "
-            f"requested across {gpu_count} allocated."
-        )
-    if caps.extra_refusal is not None:
-        return caps.extra_refusal(config)
-    return None
+    findings = preflight_config(config).findings
+    blocking = [finding for finding in findings if finding.blocking]
+    return blocking[0].message if blocking else None
 
 
 def revision_refusal(provider: ComputeProvider, backend: BackendType) -> str | None:
@@ -168,8 +138,10 @@ def connected_providers(
 def deployment_lister(provider: ComputeProvider) -> Callable[[], list[EndpointInfo] | None]:
     """Return the callable that lists one provider's deployments.
 
-    Modal reports an unavailable listing as ``None``; the marketplace providers
-    raise instead. Callers must handle both.
+    Normalized by :mod:`llm_launchpad.core.provider_adapters` into a
+    :class:`ProviderListing`: Modal's unavailable ``None`` and the
+    marketplace providers' exceptions both become error listings there, so
+    callers no longer branch on provider to interpret failures.
     """
     if provider == ComputeProvider.VAST:
         from .vast_deployment import VastDeploymentBackend

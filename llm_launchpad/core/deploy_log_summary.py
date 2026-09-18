@@ -159,6 +159,9 @@ def summary_progress_parts(text: str) -> tuple[str, int | None]:
     elapsed = _ELAPSED_SUFFIX_RE.fullmatch(stripped)
     if elapsed:
         stripped = elapsed.group("label")
+    # Transfer details change on each heartbeat but belong to the same row.
+    if stripped.startswith("Downloading model"):
+        stripped = stripped.split(" — ", 1)[0]
     match = _PROGRESS_SUFFIX_RE.fullmatch(stripped)
     if match:
         return match.group("label"), int(match.group("pct"))
@@ -591,23 +594,36 @@ class DeployLogSummarizer:
         host that was still working.
         """
         if text.startswith("Vast rental preparing:"):
+            if re.search(r"\b(pulling|downloading)\b", text, re.IGNORECASE):
+                return "Pulling runtime image"
             return "Provisioning machine"
+        if text.startswith("Vast waiting for SSH:"):
+            return "Waiting for SSH"
+        if text == "Vast SSH ready":
+            return "Machine ready"
+        if text == "Vast opening secure endpoint":
+            return "Opening secure endpoint"
         if text.startswith("Vast model starting:"):
             # Weights first, because that is where the minutes go; anything
             # else this heartbeat carries is the server already coming up.
             detail = text.split(":", 1)[1].strip()
             if detail.startswith("downloading weights"):
-                return self._download_milestone(None)
+                progress = detail.removeprefix("downloading weights")
+                status, separator, transfer = progress.partition(", ")
+                return "Downloading model" + status + (f" — {transfer}" if separator else "")
+            mapped = self._map_llamacpp_line(detail) if self.backend == BackendType.LLAMACPP else self._map_vllm_line(detail)
+            if mapped:
+                return mapped
             return "Starting server"
         if text.startswith("Rented GPUs: "):
             return f"GPU ready: {text.split(': ', 1)[1]}"
         if text.startswith("Vast instance state: "):
             state = text.split(": ", 1)[1].strip().casefold()
-            return "Machine ready" if state == "running" else "Provisioning machine"
+            return "Waiting for SSH" if state == "running" else "Provisioning machine"
         if text.startswith("Vast is throttling status checks"):
             return "Provisioning machine"
         if text.startswith("Vast host is running but not accepting SSH yet"):
-            return "Opening secure endpoint"
+            return "Waiting for SSH"
         if text.startswith("Vast streaming chat verified"):
             return "Server is ready!"
         return None

@@ -200,7 +200,9 @@ def _endpoint_compact_label(row: EndpointInfo) -> str:
 
 
 def _endpoint_summary(row: EndpointInfo) -> str:
-    return f"{_endpoint_host(row)} · {_state_label(row.state)}"
+    from ..fleet_status import deployment_and_health_line
+
+    return f"{_endpoint_host(row)} · {deployment_and_health_line(row)}"
 
 
 def _vision_summary(vision: VisionCapabilities | None) -> str:
@@ -299,13 +301,13 @@ class ManageScreen(CopyEnabledScreen):
         Binding("r", "refresh_endpoints", "Refresh", show=True),
         Binding("enter", "open_actions", "Actions", show=True),
         Binding("a", "toggle_stopped", "Stopped", show=True),
+        Binding("l", "logs_selected", "Logs", show=True),
+        Binding("u", "copy_base_url", "Copy URL", show=True),
+        Binding("s", "status_selected", "Status", show=True),
         # Keep the shortcuts for experienced users, but let the action menu
         # carry the discoverability burden in the footer and help text.
-        Binding("s", "status_selected", "Status", show=False),
-        Binding("l", "logs_selected", "Logs", show=False),
         Binding("b", "benchmark_selected", "Benchmark", show=False),
         Binding("x", "stop_selected", "Stop", show=False),
-        Binding("u", "copy_base_url", "Copy URL", show=False),
     ]
 
     def compose(self) -> ComposeResult:
@@ -611,6 +613,8 @@ class ManageScreen(CopyEnabledScreen):
                 return
 
     def _update_selection_detail(self) -> None:
+        from ..fleet_status import deployment_and_health_line
+
         detail = self.query_one("#manage-selection-detail", Static)
         row = self._selected_endpoint()
         if row is None:
@@ -638,7 +642,8 @@ class ManageScreen(CopyEnabledScreen):
         )
         detail.update(
             f"[bold]{escape(_endpoint_name(row))}[/bold]  "
-            f"[dim]{escape(_endpoint_host(row))} · {escape(_state_label(row.state))}[/dim]"
+            f"[dim]{escape(_endpoint_host(row))}[/dim]\n"
+            f"{deployment_and_health_line(row)}"
             f"{url_line}{stale_line}{_serving_detail_lines(row)}\n"
             f"Actions: {', '.join(action_labels) or 'none'}"
         )
@@ -677,12 +682,14 @@ class EndpointActionsScreen(CopyEnabledScreen):
         return tuple(labels)
 
     def compose(self) -> ComposeResult:
+        from ..fleet_status import deployment_and_health_line
+
         with VerticalScroll(classes="screen-scroll"):
             yield Static("[bold #7bf168]Endpoint Actions[/]")
             yield Static(
                 f"[bold]{escape(_endpoint_name(self.endpoint))}[/bold]  "
-                f"[dim]{escape(_endpoint_host(self.endpoint))} · "
-                f"{escape(_state_label(self.endpoint.state))}[/dim]",
+                f"[dim]{escape(_endpoint_host(self.endpoint))}[/dim]\n"
+                f"{deployment_and_health_line(self.endpoint)}",
                 id="manage-action-context",
             )
             yield OptionList(
@@ -741,8 +748,10 @@ class ConnectionInfoScreen(CopyEnabledScreen):
 
     BINDINGS = [
         Binding("escape", "pop_screen", "Back", show=True),
-        Binding("u", "copy_base_url", "Copy URL", show=False),
+        Binding("u", "copy_base_url", "Copy URL", show=True),
         Binding("k", "copy_api_key", "Copy key", show=False),
+        Binding("e", "copy_curl_example", "Copy curl", show=True),
+        Binding("j", "copy_json_config", "Copy JSON", show=True),
     ]
 
     def __init__(self, endpoint: EndpointInfo) -> None:
@@ -763,6 +772,8 @@ class ConnectionInfoScreen(CopyEnabledScreen):
                 yield Button("Copy model ID", id="connection-copy-model")
                 yield Button("Copy API key", id="connection-copy-key")
                 yield Button("Copy image request", id="connection-copy-image")
+                yield Button("Copy curl example", id="connection-copy-curl")
+                yield Button("Copy client JSON", id="connection-copy-json")
         yield FittedFooter()
 
     def on_mount(self) -> None:
@@ -812,6 +823,10 @@ class ConnectionInfoScreen(CopyEnabledScreen):
             self.action_copy_api_key()
         elif event.button.id == "connection-copy-image":
             self._copy_image_request()
+        elif event.button.id == "connection-copy-curl":
+            self.action_copy_curl_example()
+        elif event.button.id == "connection-copy-json":
+            self.action_copy_json_config()
 
     def _copy_image_request(self) -> None:
         base_url = (self._payload.get("base_url") or "").strip()
@@ -835,6 +850,26 @@ class ConnectionInfoScreen(CopyEnabledScreen):
 
     def action_copy_api_key(self) -> None:
         self._copy_field("api_key", empty_message="No API key to copy")
+
+    def action_copy_curl_example(self) -> None:
+        from ..connection import connection_curl_example
+
+        example = connection_curl_example(self._payload)
+        if example is None:
+            self.notify("No endpoint URL or model ID for a curl example", timeout=2)
+            return
+        self.app.copy_to_clipboard(example)
+        self.notify("Copied curl example", timeout=2)
+
+    def action_copy_json_config(self) -> None:
+        from ..connection import connection_json_example
+
+        example = connection_json_example(self._payload)
+        if example is None:
+            self.notify("No endpoint URL or model ID for a client config", timeout=2)
+            return
+        self.app.copy_to_clipboard(example)
+        self.notify("Copied client JSON", timeout=2)
 
     def action_pop_screen(self) -> None:
         self.app.pop_screen()
@@ -1041,27 +1076,27 @@ class StopConfirmScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(classes="screen-scroll"):
-            yield Static("[bold #7bf168]Stop Endpoint[/]")
-            yield Static("")
-            yield Static(
-                f"Stop [bold]{escape(_endpoint_name(self.endpoint))}[/bold]?\n"
-                f"[dim]{escape(self.endpoint.provider.value)}/{escape(_endpoint_backend(self.endpoint))} · "
-                f"{escape(self.endpoint.app_id or self.endpoint.name)}[/dim]"
-            )
-            yield Static(
-                (
-                    "[yellow]This destroys the Vast.ai rental and permanently deletes its disk and model cache.[/yellow]"
-                    if self.endpoint.provider == ComputeProvider.VAST
-                    else "[yellow]This will terminate the selected deployment.[/yellow]"
-                ),
-                id="stop-warning",
-            )
-            with Horizontal(id="stop-confirm-actions"):
-                yield Button("Cancel", id="stop-cancel")
-                yield Button(
-                    "Destroy rental and disk" if self.endpoint.provider == ComputeProvider.VAST else "Stop endpoint",
-                    id="stop-confirm", variant="error",
+            with Vertical(id="stop-confirm-dialog", classes="dialog-panel"):
+                yield Static("[bold #7bf168]Stop Endpoint[/]", classes="dialog-title")
+                yield Static(
+                    f"Stop [bold]{escape(_endpoint_name(self.endpoint))}[/bold]?\n"
+                    f"[dim]{escape(self.endpoint.provider.value)}/{escape(_endpoint_backend(self.endpoint))} · "
+                    f"{escape(self.endpoint.app_id or self.endpoint.name)}[/dim]"
                 )
+                yield Static(
+                    (
+                        "[yellow]This destroys the Vast.ai rental and permanently deletes its disk and model cache.[/yellow]"
+                        if self.endpoint.provider == ComputeProvider.VAST
+                        else "[yellow]This will terminate the selected deployment.[/yellow]"
+                    ),
+                    id="stop-warning",
+                )
+                with Horizontal(id="stop-confirm-actions", classes="dialog-actions"):
+                    yield Button("Cancel", id="stop-cancel")
+                    yield Button(
+                        "Destroy rental and disk" if self.endpoint.provider == ComputeProvider.VAST else "Stop endpoint",
+                        id="stop-confirm", variant="error",
+                    )
         yield FittedFooter()
 
     def on_mount(self) -> None:

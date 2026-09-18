@@ -222,6 +222,34 @@ class ManageScreenRoutingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(app.status_calls, [(endpoint, None, 60)])
 
+    async def test_connection_screen_copies_curl_and_json_examples(self) -> None:
+        import json
+
+        from llm_launchpad.tui.connection import (
+            connection_curl_example,
+            connection_json_example,
+            endpoint_connection_payload,
+        )
+
+        endpoint = _endpoint("active-endpoint", "ap-active")
+        endpoint.served_model_name = "audit-model"
+        payload = endpoint_connection_payload(endpoint, username="alice")
+        curl = connection_curl_example(payload)
+        assert curl is not None
+        self.assertIn("chat/completions", curl)
+        self.assertIn("audit-model", curl)
+        config = connection_json_example(payload)
+        assert config is not None
+        parsed = json.loads(config)
+        self.assertIn("base_url", parsed)
+        self.assertIn("model", parsed)
+
+        # Model IDs with quotes stay valid through JSON + shell quoting.
+        tricky = dict(payload, model_id='weird "model" id')
+        tricky_curl = connection_curl_example(tricky)
+        assert tricky_curl is not None
+        self.assertIn("chat/completions", tricky_curl)
+
     async def test_failed_endpoint_keeps_logs_but_blocks_runtime_actions(self) -> None:
         failed = _endpoint("failed-app", "ap-failed", state="failed")
         app = _TestApp()

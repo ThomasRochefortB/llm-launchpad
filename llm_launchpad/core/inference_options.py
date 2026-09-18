@@ -9,6 +9,7 @@ from collections.abc import Iterable, Sequence
 from ..protocol.enums import BackendType, BillingModel, ComputeProvider, QuoteAvailability
 from ..protocol.models import (
     ComputeOffer,
+    CostEvaluation,
     CostScenario,
     InferencePlan,
     InferenceRecipe,
@@ -59,7 +60,7 @@ class InferenceProviderAdapter(Protocol):
     def quote(
         self,
         recipe: InferenceRecipe,
-        workload: WorkloadProfile,
+        workload: WorkloadProfile | None = None,
     ) -> list[ProviderQuote]:
         """Return compatible quotes for one recipe."""
 
@@ -94,7 +95,7 @@ class ModalInferenceAdapter:
     def quote(
         self,
         recipe: InferenceRecipe,
-        workload: WorkloadProfile,
+        workload: WorkloadProfile | None = None,
     ) -> list[ProviderQuote]:
         del workload
         if not self.capabilities.supports_backend(recipe.backend):
@@ -141,16 +142,12 @@ class PrimeInferenceAdapter:
             provider=ComputeProvider.PRIME,
             supported_backends=frozenset({BackendType.LLAMACPP, BackendType.VLLM}),
             billing_model=BillingModel.PROVISIONED,
-            live_availability=True,
-            supports_regions=True,
-            supports_spot=True,
-            supports_secure_cloud=True,
         )
 
     def quote(
         self,
         recipe: InferenceRecipe,
-        workload: WorkloadProfile,
+        workload: WorkloadProfile | None = None,
     ) -> list[ProviderQuote]:
         del workload
         if not self.capabilities.supports_backend(recipe.backend):
@@ -202,10 +199,19 @@ def resolve_inference_plans(
     recipes: Iterable[InferenceRecipe],
     adapters: Sequence[InferenceProviderAdapter],
     workload: WorkloadProfile | None = None,
+    *,
+    scenario: CostScenario | None = None,
+    output_tokens_per_month: int | None = None,
 ) -> list[InferencePlan]:
     """Resolve and rank provider quotes for a collection of recipes."""
 
     workload = workload or WorkloadProfile()
+    resolved_scenario = scenario or COST_SCENARIO_WORKDAY
+    token_demand = (
+        output_tokens_per_month
+        if output_tokens_per_month is not None
+        else workload.output_tokens_per_month
+    )
     plans: list[InferencePlan] = []
     for recipe in recipes:
         for adapter in adapters:
@@ -218,7 +224,15 @@ def resolve_inference_plans(
                         f"Provider quote {quote.id!r} targets {quote.recipe_id!r}, "
                         f"expected {recipe.id!r}."
                     )
-                plans.append(_plan_from_quote(recipe, quote, workload))
+                plans.append(
+                    _plan_from_quote(
+                        recipe,
+                        quote,
+                        workload,
+                        scenario=resolved_scenario,
+                        output_tokens_per_month=token_demand,
+                    )
+                )
 
     plans.sort(key=_plan_monthly_cost_sort_key)
     recommended_recipes: set[str] = set()
@@ -288,51 +302,6 @@ COST_SCENARIOS: tuple[CostScenario, ...] = (
 )
 
 
-def get_cost_scenario(scenario_id: str | None) -> CostScenario:
-    """Return a named scenario, defaulting to the workday schedule."""
-    if not scenario_id:
-        return COST_SCENARIO_WORKDAY
-    for scenario in COST_SCENARIOS:
-        if scenario.id == scenario_id:
-            return scenario
-    raise ValueError(f"Unknown cost scenario: {scenario_id}")
-
-
-def workload_basis_label(workload: WorkloadProfile | None = None) -> str:
-    """State the assumptions a monthly estimate rests on, in one sentence.
-
-    Monthly figures are normalized through a workload profile, not wall-clock,
-    so a provisioned rental's "/mo" is a fraction of what leaving it running
-    costs. Printed unqualified next to "the rental bills continuously" the two
-    contradict each other, so every surface that shows the figure states this.
-    """
-
-    profile = workload or WorkloadProfile()
-    hours = profile.paid_hours_per_day
-    noun = "hour" if hours == 1 else "hours"
-    return (
-        f"Monthly estimates assume {hours:g} paid {noun} a day, scaled by "
-        f"{profile.utilization:.0%} utilization on scale-to-zero providers. "
-        f"Hourly and 24/7 figures are exact; monthly usage is a scenario."
-    )
-
-
-def scenario_basis_label(scenario: CostScenario | None = None) -> str:
-    """State an explicit cost scenario's assumptions in one sentence."""
-    resolved = scenario or COST_SCENARIO_WORKDAY
-    return (
-        f"Cost scenario '{resolved.display_name}': {resolved.describe()} "
-        f"Provisioned bills {resolved.provisioned_hours_per_day:g}h/day; "
-        f"scale-to-zero bills active plus idle timeout."
-    )
-
-
-def cost_sort_basis_label(scenario: CostScenario | None = None) -> str:
-    """Name the cost basis placement ordering uses, so it matches the display."""
-    resolved = scenario or COST_SCENARIO_WORKDAY
-    return f"Sorted by '{resolved.display_name}' scenario cost ({resolved.describe()})"
-
-
 def continuous_monthly_compute_cost(quote: ProviderQuote) -> float | None:
     """Return the monthly cost of never stopping a provisioned resource."""
 
@@ -353,7 +322,8 @@ def estimate_modal_billed_hours_per_day(
     Each session keeps its container warm for the idle timeout after its last
     request. Sparse sessions each pay the timeout; clustered sessions share
     it, so identical active time bills differently. The result never exceeds
-    the usage window and never drops below active time.
+    the usage window; when active time alone exceeds the window the window
+    wins, because the container cannot bill hours outside its uptime.
     """
     active = min(max(0.0, active_hours_per_day), 24.0)
     sessions = max(0.0, sessions_per_day)
@@ -404,71 +374,184 @@ def format_cost_summary(
     hourly = f"${quote.price_per_hour_usd:.2f}/hr while billed"
     continuous = continuous_monthly_compute_cost(quote)
     continuous_text = f"${continuous:,.2f}/mo if left running 24/7" if continuous is not None else "24/7 unavailable"
-    scenario_cost = estimate_cost_for_scenario(quote, resolved, idle_timeout_seconds=idle_timeout_seconds)
+    evaluation = evaluate_quote_cost(quote, resolved, idle_timeout_seconds=idle_timeout_seconds)
+    scenario_cost = evaluation.estimated_monthly_cost_usd
     scenario_text = (
-        f"${scenario_cost:,.2f}/mo '{resolved.display_name}' ({resolved.describe()})"
+        f"${scenario_cost:,.2f}/mo '{evaluation.scenario.display_name}' ({evaluation.scenario.describe()})"
         if scenario_cost is not None
-        else f"'{resolved.display_name}' unavailable"
+        else f"'{evaluation.scenario.display_name}' unavailable"
     )
     return f"{hourly} · {continuous_text} · {scenario_text} · storage separate"
+
+
+def evaluate_quote_cost(
+    quote: ProviderQuote,
+    scenario: CostScenario | None = None,
+    *,
+    idle_timeout_seconds: float | None = None,
+    output_tokens_per_month: int | None = None,
+    includes_storage: bool = False,
+) -> CostEvaluation:
+    """Canonical cost calculation for one quote under an explicit scenario.
+
+    Provisioned rentals bill scheduled uptime. Scale-to-zero bills active
+    compute plus one idle timeout per session, capped by the usage window.
+    Unknown hourly prices stay unknown; storage is carried as provenance on
+    the evaluation rather than silently folded into or excluded from the
+    figure.
+    """
+    resolved = scenario or COST_SCENARIO_WORKDAY
+    timeout = (
+        idle_timeout_seconds
+        if idle_timeout_seconds is not None
+        else resolved.idle_timeout_seconds
+    )
+    if quote.price_per_hour_usd is None:
+        return CostEvaluation(
+            scenario=resolved,
+            billed_hours_per_day=(
+                min(24.0, max(0.0, resolved.provisioned_hours_per_day))
+                if quote.billing_model != BillingModel.SCALE_TO_ZERO
+                else estimate_modal_billed_hours_per_day(
+                    resolved.active_hours_per_day,
+                    resolved.sessions_per_day,
+                    timeout,
+                    window_hours_per_day=resolved.provisioned_hours_per_day,
+                )
+            ),
+            estimated_monthly_cost_usd=None,
+            continuous_monthly_cost_usd=None,
+            estimated_cost_per_million_output_tokens_usd=None,
+            cost_basis="hourly price unavailable",
+            includes_storage=includes_storage,
+            output_tokens_per_month=output_tokens_per_month,
+            idle_timeout_seconds=timeout,
+        )
+    if quote.billing_model == BillingModel.SCALE_TO_ZERO:
+        billed_per_day = estimate_modal_billed_hours_per_day(
+            resolved.active_hours_per_day,
+            resolved.sessions_per_day,
+            timeout,
+            window_hours_per_day=resolved.provisioned_hours_per_day,
+        )
+        basis = (
+            f"{resolved.active_hours_per_day:g}h active + "
+            f"{resolved.sessions_per_day:g} idle tail(s), capped at "
+            f"{resolved.provisioned_hours_per_day:g}h up/day"
+        )
+    else:
+        billed_per_day = min(24.0, max(0.0, resolved.provisioned_hours_per_day))
+        basis = f"{billed_per_day:g}h up/day scheduled"
+    monthly = quote.price_per_hour_usd * billed_per_day * 30.0
+    continuous = continuous_monthly_compute_cost(quote)
+    per_million = _token_cost_from_monthly_spend(
+        quote, monthly, output_tokens_per_month=output_tokens_per_month
+    )
+    return CostEvaluation(
+        scenario=resolved,
+        billed_hours_per_day=billed_per_day,
+        estimated_monthly_cost_usd=monthly,
+        continuous_monthly_cost_usd=continuous,
+        estimated_cost_per_million_output_tokens_usd=per_million,
+        cost_basis=basis,
+        includes_storage=includes_storage,
+        output_tokens_per_month=output_tokens_per_month,
+        idle_timeout_seconds=timeout,
+    )
 
 
 def estimate_monthly_compute_cost(
     quote: ProviderQuote,
     workload: WorkloadProfile,
 ) -> float | None:
-    """Normalize active-compute and provisioned billing into monthly spend."""
+    """Legacy utilization-normalized monthly estimate.
 
-    if quote.price_per_hour_usd is None:
-        return None
-    paid_hours = min(24.0, max(0.0, workload.paid_hours_per_day))
-    utilization = min(1.0, max(0.0, workload.utilization))
-    if quote.billing_model == BillingModel.SCALE_TO_ZERO:
-        paid_hours *= utilization
-    return quote.price_per_hour_usd * paid_hours * 30.0
+    Kept for compatibility while callers migrate to
+    :func:`evaluate_quote_cost`. A ``WorkloadProfile`` charges only
+    ``paid_hours_per_day * utilization`` on scale-to-zero providers and knows
+    nothing about warm idle time, so this number intentionally differs from the
+    canonical scenario figure.
+    """
+    evaluation = workload_profile_cost_evaluation(quote, workload)
+    return evaluation.estimated_monthly_cost_usd
 
 
-def estimate_cost_per_million_output_tokens(
+def workload_profile_cost_evaluation(
     quote: ProviderQuote,
     workload: WorkloadProfile,
-    monthly_cost_usd: float | None = None,
-) -> float | None:
-    """Estimate token cost from workload demand or measured throughput."""
+) -> CostEvaluation:
+    """Translate a legacy workload into an explicit cost evaluation.
 
-    monthly_cost = (
-        monthly_cost_usd
-        if monthly_cost_usd is not None
-        else estimate_monthly_compute_cost(quote, workload)
+    The conversion preserves the old semantics exactly: active hours equal
+    paid hours times utilization, with zero idle tails. Callers that want the
+    canonical schedule should use :data:`COST_SCENARIO_WORKDAY` directly.
+    """
+    active = min(24.0, max(0.0, workload.paid_hours_per_day)) * min(
+        1.0, max(0.0, workload.utilization)
     )
-    if monthly_cost is None:
+    scenario = CostScenario(
+        id=f"workload:{workload.paid_hours_per_day:g}h@{workload.utilization:.0%}",
+        display_name="Legacy workload",
+        provisioned_hours_per_day=min(24.0, max(0.0, workload.paid_hours_per_day)),
+        active_hours_per_day=active,
+        sessions_per_day=0.0,
+        idle_timeout_seconds=0.0,
+        description=(
+            f"{min(24.0, max(0.0, workload.paid_hours_per_day)):g}h paid/day, "
+            f"{workload.utilization:.0%} utilization, no idle tails."
+        ),
+    )
+    return evaluate_quote_cost(
+        quote,
+        scenario,
+        output_tokens_per_month=workload.output_tokens_per_month,
+    )
+
+
+def _token_cost_from_monthly_spend(
+    quote: ProviderQuote,
+    monthly_cost_usd: float | None,
+    *,
+    output_tokens_per_month: int | None = None,
+) -> float | None:
+    """Token cost from explicit demand; otherwise from quoted throughput."""
+    if monthly_cost_usd is None:
         return None
-    if workload.output_tokens_per_month and workload.output_tokens_per_month > 0:
-        return monthly_cost * 1_000_000 / workload.output_tokens_per_month
+    if output_tokens_per_month and output_tokens_per_month > 0:
+        return monthly_cost_usd * 1_000_000 / output_tokens_per_month
     throughput = quote.estimated_output_tokens_per_second
     if throughput is None or throughput <= 0 or quote.price_per_hour_usd is None:
         return None
-    cost = quote.price_per_hour_usd * 1_000_000 / (throughput * 3600.0)
-    if quote.billing_model == BillingModel.PROVISIONED:
-        utilization = min(1.0, max(0.0, workload.utilization))
-        if utilization <= 0:
-            return None
-        cost /= utilization
-    return cost
+    return quote.price_per_hour_usd * 1_000_000 / (throughput * 3600.0)
 
 
 def _plan_from_quote(
     recipe: InferenceRecipe,
     quote: ProviderQuote,
     workload: WorkloadProfile,
+    *,
+    scenario: CostScenario | None = None,
+    output_tokens_per_month: int | None = None,
+    includes_storage: bool = False,
 ) -> InferencePlan:
-    monthly_cost = estimate_monthly_compute_cost(quote, workload)
+    evaluation = evaluate_quote_cost(
+        quote,
+        scenario or COST_SCENARIO_WORKDAY,
+        output_tokens_per_month=(
+            output_tokens_per_month
+            if output_tokens_per_month is not None
+            else workload.output_tokens_per_month
+        ),
+        includes_storage=includes_storage,
+    )
     return InferencePlan(
         recipe=recipe,
         quote=quote,
-        estimated_monthly_cost_usd=monthly_cost,
+        estimated_monthly_cost_usd=evaluation.estimated_monthly_cost_usd,
         estimated_cost_per_million_output_tokens_usd=(
-            estimate_cost_per_million_output_tokens(quote, workload, monthly_cost)
+            evaluation.estimated_cost_per_million_output_tokens_usd
         ),
+        cost=evaluation,
     )
 
 

@@ -163,6 +163,134 @@ class LlamaCppPlannerTests(unittest.TestCase):
             self.assertIsNone(load_runtime_attestation(changed, path))
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
+    def test_exact_attestation_overrides_a_conservative_estimate(self) -> None:
+        from llm_launchpad.core.llamacpp_planner import assess_memory_placement
+        from llm_launchpad.protocol.models import MemoryEstimate
+
+        metadata = GgufQuantMetadata(
+            quantizations=["Q4_K_M"],
+            vram_gb_by_quant={"Q4_K_M": 20.0},
+            block_count=32,
+            embedding_length=4096,
+            attention_head_count=32,
+            attention_head_count_kv=8,
+        )
+        requirements = serving_requirements(131_072)
+        tuning = tuning_for_objective(ServingObjective.GENERAL_PURPOSE)
+        fingerprint = serving_fingerprint(
+            model_id="org/model",
+            revision="abc",
+            quant="Q4_K_M",
+            runtime_id="llama.cpp-b10689-cuda12",
+            requirements=requirements,
+            tuning=tuning,
+            gpu_type="L4",
+            gpu_count=1,
+        )
+        attestation = RuntimeAttestation(
+            fingerprint=fingerprint,
+            requested_context_tokens=131_072,
+            effective_context_tokens=131_072,
+            gpu_layers=32,
+            total_layers=32,
+            gpu_resident=True,
+        )
+        base = MemoryEstimate(
+            weights_gb=10.0,
+            kv_cache_gb=11.0,
+            compute_gb=2.0,
+            speculative_gb=0.0,
+            reserve_gb=4.0,
+            total_gb=27.0,
+            per_device_required_gb=(27.0,),
+            total_layer_count=32,
+            source="gguf-metadata",
+        )
+
+        for assess in (
+            lambda: assess_placement(
+                metadata,
+                model_id="org/model",
+                revision="abc",
+                quant="Q4_K_M",
+                runtime_id="llama.cpp-b10689-cuda12",
+                weights_gb=20.0,
+                requirements=requirements,
+                tuning=tuning,
+                gpu_type="L4",
+                gpu_count=1,
+                gpu_memory_gb=24.0,
+            ),
+            lambda: assess_memory_placement(
+                base,
+                model_id="org/model",
+                revision="abc",
+                quant="Q4_K_M",
+                runtime_id="llama.cpp-b10689-cuda12",
+                requirements=requirements,
+                tuning=tuning,
+                gpu_type="L4",
+                gpu_count=1,
+                gpu_memory_gb=24.0,
+            ),
+        ):
+            with TemporaryDirectory() as directory:
+                path = Path(directory) / "certificates.json"
+                with patch(
+                    "llm_launchpad.core.llamacpp_planner.CERTIFICATE_CACHE_PATH", path
+                ):
+                    # The formula alone rejects this plan on an L4.
+                    rejected = assess()
+                    self.assertFalse(rejected.fits)
+                    # An exact successful observation promotes the same
+                    # configuration on both assessment paths.
+                    save_runtime_attestation(attestation)
+                    confirmed = assess()
+                    self.assertTrue(confirmed.fits)
+                    self.assertTrue(confirmed.gpu_resident)
+                    self.assertEqual(confirmed.certification, CertificationState.CERTIFIED)
+
+    def test_variant_search_labels_a_smaller_context_alternative(self) -> None:
+        from llm_launchpad.core.llamacpp_planner import serving_variants
+
+        metadata = GgufQuantMetadata(
+            quantizations=["Q4_K_M"],
+            vram_gb_by_quant={"Q4_K_M": 20.0},
+            block_count=32,
+            embedding_length=4096,
+            attention_head_count=32,
+            attention_head_count_kv=8,
+            attention_key_length=128,
+            attention_value_length=128,
+        )
+        variants = serving_variants(
+            metadata,
+            model_id="org/model",
+            revision="abc",
+            quant="Q4_K_M",
+            runtime_id="llama.cpp-b10689-cuda12",
+            weights_gb=20.0,
+            context_tokens=131_072,
+            gpu_type="L4",
+            gpu_count=1,
+            gpu_memory_gb=24.0,
+        )
+        self.assertTrue(variants)
+        # The full-context default always leads, whatever fits behind it.
+        self.assertEqual(variants[0].label, "full context")
+        self.assertEqual(
+            variants[0].requirements.context_tokens, 131_072
+        )
+        alternatives = variants[1:]
+        self.assertTrue(alternatives)
+        for variant in alternatives:
+            self.assertLessEqual(
+                variant.requirements.context_tokens, 131_072
+            )
+            self.assertTrue(variant.label)
+            # Every variant is recomputed from metadata, never scaled.
+            self.assertGreater(variant.memory.total_gb, 0)
+
 
 
 class KvCacheTypeTests(unittest.TestCase):

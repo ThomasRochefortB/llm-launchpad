@@ -5,7 +5,9 @@
 Deploy is model-first: each model can have multiple runtime recipes and each
 recipe can receive quotes from any compatible provider adapter. Quotes
 normalize GPU shape, availability, hourly price, billing model, and a
-workload-based monthly estimate. A GPU filter on the Deploy screen narrows the
+scenario-based monthly estimate: every plan carries its cost assumptions
+(schedule, active hours, idle tails), so ranking and display share one
+calculation. A GPU filter on the Deploy screen narrows the
 catalog to models that fit a selected GPU type. The live catalog supplies the
 curated recipes and Modal estimates; both llama.cpp and vLLM recipes can also
 use live Prime Intellect offers through the same plan-to-deployment path.
