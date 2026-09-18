@@ -13,6 +13,7 @@ from llm_launchpad.protocol.events import (
     EndpointAvailableEvent,
     LogEvent,
     OperationCompleteEvent,
+    ResourceAllocatedEvent,
 )
 from llm_launchpad.protocol.models import ComputeOffer, DeploymentConfig, PrimeProviderOptions
 
@@ -121,6 +122,12 @@ class OrchestratorPrimeDeployTests(unittest.TestCase):
         self.assertEqual(info.provider, ComputeProvider.PRIME)
         self.assertEqual(info.web_url, "http://10.0.0.1:8080")
         self.assertTrue(any(isinstance(e, EndpointAvailableEvent) for e in events))
+        allocation = next(e for e in events if isinstance(e, ResourceAllocatedEvent))
+        self.assertEqual(allocation.app_id, "pod-1")
+        self.assertLess(
+            events.index(allocation),
+            next(index for index, event in enumerate(events) if isinstance(event, EndpointAvailableEvent)),
+        )
         self.assertTrue(any(
             isinstance(e, LogEvent) and "Selected Prime offer offer-1" in e.line for e in events
         ))

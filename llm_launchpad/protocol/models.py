@@ -6,7 +6,14 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .enums import (
+    AttemptDisposition,
     BackendType,
+    CachePolicy,
+    CleanupDisposition,
+    EvidenceLevel,
+    MemoryObservationSource,
+    OperationIntent,
+    OutcomeKind,
     VisionMode,
     VisionVerification,
     BillingModel,
@@ -170,7 +177,14 @@ class RuntimeTuning:
 
 @dataclass(frozen=True)
 class MemoryEstimate:
-    """Topology-aware memory requirement for one serving configuration."""
+    """Topology-aware memory requirement for one serving configuration.
+
+    Weights, KV cache and speculative buffers shard across the devices of a
+    placement. ``compute_gb`` and ``attention_scratch_gb`` do not: every device
+    builds its own graph, so each one pays them in full. ``total_gb`` already
+    counts them once per device, which keeps ``total_gb / gpu_count`` the
+    per-device requirement.
+    """
 
     weights_gb: float
     kv_cache_gb: float
@@ -182,6 +196,10 @@ class MemoryEstimate:
     confidence: float = 0.0
     source: str = "estimated"
     total_layer_count: int | None = None
+    # Scores and mask of a graph built without flash attention. Zero whenever
+    # flash attention is on, and linear in the advertised context when it is
+    # off, which is the term that decides whether a long context is servable.
+    attention_scratch_gb: float = 0.0
     # Recurrent state is included in kv_cache_gb; retain its contribution so
     # changing concurrency can resize state without scaling the token cache.
     recurrent_gb: float = 0.0
@@ -201,7 +219,22 @@ class CatalogExclusion:
 
 @dataclass(frozen=True)
 class PerformancePoint:
-    """One measured or predicted point on an endpoint performance curve."""
+    """One measured or predicted point on an endpoint performance curve.
+
+    Metric semantics are fixed so predictions and observations are comparable:
+
+    - ``prompt_tokens``/``output_tokens`` are counted model tokens, never
+      repeated prompt filler or streaming chunks.
+    - ``output_tokens_per_second`` is a per-request decode rate: generated
+      tokens divided by decode time after the first token.
+    - ``aggregate_output_tokens_per_second`` is end-to-end: all generated
+      tokens across the scenario divided by scenario wall time, including
+      prefill, overhead, and failures to start.
+    - ``time_to_first_token_seconds`` runs from request dispatch to the first
+      generated token.
+    - ``p95_latency_seconds`` is only meaningful with enough samples
+      (``sample_count`` records how many); small samples leave it None.
+    """
 
     prompt_tokens: int
     output_tokens: int
@@ -214,6 +247,108 @@ class PerformancePoint:
     error_rate: float = 0.0
     output_tokens_per_dollar: float | None = None
     measured: bool = False
+    # Actual counted tokens behind this point; None means the count was not
+    # verified and the rates above are approximate at best.
+    actual_prompt_tokens: int | None = None
+    actual_output_tokens: int | None = None
+    sample_count: int | None = None
+    # When this point completes successfully: empty requests, truncated
+    # generations, and transport fallbacks are not successful completions.
+    completion_reason: str | None = None
+    cache_policy: CachePolicy = CachePolicy.UNSPECIFIED
+    evidence: EvidenceLevel = EvidenceLevel.PREDICTED
+
+
+@dataclass(frozen=True)
+class WorkloadScenario:
+    """One reproducible evaluation workload with fixed metric semantics."""
+
+    id: str
+    display_name: str
+    prompt_tokens: int
+    output_tokens: int
+    concurrency: int
+    request_count: int
+    cache_policy: CachePolicy = CachePolicy.UNCACHED
+    # Minimum requests before tail percentiles may be reported.
+    min_samples_for_p95: int = 20
+    # Latency target used to rank interactive recommendations.
+    latency_target_seconds: float | None = None
+    distinct_prompts: bool = True
+
+
+@dataclass(frozen=True)
+class RuntimeIdentity:
+    """Exact runtime configuration behind one observation."""
+
+    model_id: str = ""
+    revision: str | None = None
+    quant: str | None = None
+    runtime_id: str | None = None
+    backend: BackendType | None = None
+    provider: ComputeProvider | None = None
+    gpu_type: str = ""
+    gpu_count: int = 1
+    server_args: tuple[str, ...] = ()
+    effective_flags: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class MemoryObservation:
+    """One per-device memory reading with its source and phase."""
+
+    per_device_used_gb: tuple[float, ...] = ()
+    per_device_total_gb: tuple[float, ...] = ()
+    source: MemoryObservationSource = MemoryObservationSource.DEVICE_SAMPLE
+    phase: str = ""
+    # MiB margin the runtime required when this was recorded, if reported.
+    margin_mib: int | None = None
+    observed_at: str | None = None
+
+
+@dataclass(frozen=True)
+class CompatibilityEvidence:
+    """Separately testable compatibility outcomes for one configuration."""
+
+    runtime_supported: EvidenceLevel | None = None
+    memory_fit: EvidenceLevel | None = None
+    gpu_resident: EvidenceLevel | None = None
+    context_executed_tokens: int | None = None
+    context_executed_evidence: EvidenceLevel | None = None
+    concurrent_capacity: EvidenceLevel | None = None
+    service_quality: EvidenceLevel | None = None
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class PredictionSnapshot:
+    """What the planner believed before a run, frozen for scoring."""
+
+    estimator_version: str = ""
+    raw_per_device_required_gb: tuple[float, ...] = ()
+    calibrated_per_device_required_gb: tuple[float, ...] = ()
+    predicted_fits: bool = False
+    predicted_single_tps: float | None = None
+    predicted_aggregate_tps: float | None = None
+    recommended: bool = False
+    recommendation_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class EvaluationRecord:
+    """One frozen prediction paired with its independent observation."""
+
+    record_id: str
+    scenario: WorkloadScenario
+    runtime: RuntimeIdentity
+    prediction: PredictionSnapshot
+    outcome: OutcomeKind = OutcomeKind.UNKNOWN
+    compatibility: CompatibilityEvidence = field(default_factory=CompatibilityEvidence)
+    memory_observations: tuple[MemoryObservation, ...] = ()
+    performance: tuple[PerformancePoint, ...] = ()
+    price_per_hour_usd: float | None = None
+    detail: str = ""
+    created_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -228,6 +363,10 @@ class PlacementAssessment:
     fits: bool = False
     gpu_resident: bool = False
     rejection_reason: str | None = None
+    # Identifies this plan's compute graph without the hardware under it, so
+    # one runtime measurement can size every topology that serves it.
+    calibration_key: str = ""
+    runtime_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -244,11 +383,82 @@ class RuntimeAttestation:
     performance: tuple[PerformancePoint, ...] = ()
     runtime_id: str | None = None
     verified_at: str | None = None
+    # How ``gpu_resident`` was established. OBSERVED means this runtime, or an
+    # earlier run of this exact placement, reported its own offload; PREDICTED
+    # means nothing observed it and the planner's expectation stands in. A
+    # certificate that cannot say which is a certificate that claims too much.
+    residency_evidence: EvidenceLevel | None = None
+
+
+@dataclass(frozen=True)
+class ServingStats:
+    """One reading of a serving runtime's own counters and gauges.
+
+    Token counts are whatever the runtime reports, which is always "since this
+    process started" -- see :class:`ServingSnapshot` for the totals that
+    survive a container restart.
+    """
+
+    captured_at: float = 0.0
+    prompt_tokens: float | None = None
+    generation_tokens: float | None = None
+    requests_running: float | None = None
+    requests_waiting: float | None = None
+    requests_finished: float | None = None
+    kv_cache_usage: float | None = None
+    avg_ttft_seconds: float | None = None
+    # llama.cpp publishes its own decode rate, but as the last request's
+    # speed rather than a windowed average, so it reads zero between
+    # requests. Kept as a secondary "right now" reading next to the rate
+    # derived from counter deltas, which is comparable across backends.
+    reported_tokens_per_second: float | None = None
+    runtime_started_at: float | None = None
+
+    @property
+    def has_readings(self) -> bool:
+        """Whether the endpoint answered with metrics this build understands."""
+        return any(
+            value is not None
+            for value in (
+                self.prompt_tokens,
+                self.generation_tokens,
+                self.requests_running,
+                self.requests_waiting,
+                self.requests_finished,
+                self.kv_cache_usage,
+            )
+        )
+
+
+@dataclass(frozen=True)
+class ServingSnapshot:
+    """Live gauges for an endpoint plus its traffic totals across restarts.
+
+    ``observed_at`` is wall-clock time for the reading that produced the live
+    gauges. Banked totals loaded without a new request carry the timestamp of
+    the reading that banked them (or None when unknown), so passive views can
+    present them as history rather than as a current measurement.
+    """
+
+    stats: ServingStats = field(default_factory=ServingStats)
+    total_prompt_tokens: float = 0.0
+    total_generation_tokens: float = 0.0
+    tokens_per_second: float | None = None
+    observed_at: float | None = None
+
+    @property
+    def total_tokens(self) -> float:
+        return self.total_prompt_tokens + self.total_generation_tokens
 
 
 @dataclass
 class DeploymentConfig:
-    """All parameters needed to execute a deployment."""
+    """All parameters needed to execute a deployment.
+
+    Legacy mutable contract, kept for compatibility with persisted jobs and
+    existing callers. New code should build a :class:`DeploymentRequest` and
+    resolve it to a :class:`ResolvedDeploymentPlan` instead of mutating this.
+    """
 
     backend: BackendType = BackendType.LLAMACPP
     provider: ComputeProvider = ComputeProvider.MODAL
@@ -278,6 +488,12 @@ class DeploymentConfig:
     gguf_architecture: str | None = None
     llamacpp_runtime_id: str | None = None
     speculative_decoding: SpeculativeDecodingConfig | None = None
+    # Whether preflight may resolve speculative decoding from model evidence.
+    # ``speculative_decoding`` alone cannot express intent: None is what both a
+    # caller with no opinion and a caller that declined leave behind. Preflight
+    # treats None as "decide from the GGUF and the pinned runtime" so MTP is on
+    # wherever it is supported, and this flag is the only way to say no.
+    allow_speculative_decoding: bool = True
     serving_requirements: ServingRequirements | None = None
     runtime_tuning: RuntimeTuning | None = None
     placement_assessment: PlacementAssessment | None = None
@@ -313,8 +529,160 @@ class DeploymentConfig:
     # Provider-specific settings are typed and interpreted only by the adapter.
     provider_options: ProviderOptions | None = None
     endpoint_api_key: str | None = None
+    # Quoted execution price for this placement ($/hour), when a quote was
+    # selected. Distinct from ``serving_requirements.max_hourly_cost_usd``,
+    # which is the approved spending ceiling: a $5/h cap with a $1/h quote
+    # must value throughput at $1/h, never at $5/h. ``None`` means unknown.
+    price_per_hour_usd: float | None = None
     # Ephemeral Fast Deploy recovery ladder. Provider adapters ignore it.
     fallback_configs: tuple[DeploymentConfig, ...] = ()
+    # Explicit lifecycle outcome for one attempt. Replaces mutating
+    # ``fallback_configs`` to suppress retries after failed cleanup: the
+    # durable worker snapshots the ladder before running, so clearing it could
+    # not stop an already-planned next rental.
+    retry_allowed: bool = True
+
+
+@dataclass(frozen=True)
+class LlamacppRequestOptions:
+    """llama.cpp (GGUF) specific request inputs."""
+
+    preset: str | None = None
+    repo_id: str | None = None
+    quant: str | None = None
+    revision: str | None = None
+    preload: bool = True
+    server_args: str | None = None
+    host: str | None = None
+    port: int | None = None
+    n_gpu_layers: int | None = None
+    llamacpp_image_no_cache: bool | None = None
+    gguf_architecture: str | None = None
+    llamacpp_runtime_id: str | None = None
+    speculative_decoding: SpeculativeDecodingConfig | None = None
+    allow_speculative_decoding: bool = True
+
+
+@dataclass(frozen=True)
+class VllmRequestOptions:
+    """vLLM specific request inputs."""
+
+    model_name: str | None = None
+    model_revision: str | None = None
+    served_model_name: str | None = None
+    fast_boot: bool | None = None
+    n_gpu: int | None = None
+    trust_remote_code: bool | None = None
+    reasoning_parser: str | None = None
+    tool_call_parser: str | None = None
+    default_chat_template_kwargs: str | None = None
+
+
+@dataclass(frozen=True)
+class DeploymentRequest:
+    """Immutable user intent for one deployment.
+
+    This is the input contract: what the user chose, before resolution fills
+    in model evidence, tuning, compiled flags, placement, and identity.
+    """
+
+    backend: BackendType = BackendType.LLAMACPP
+    provider: ComputeProvider = ComputeProvider.MODAL
+    intent: OperationIntent = OperationIntent.SERVE
+    do_warmup: bool = True
+    show_debug_logs: bool = False
+    vision_mode: VisionMode = VisionMode.AUTO
+    projector_repo: str | None = None
+    projector_revision: str | None = None
+    projector_file: str | None = None
+    image_limit: int = 1
+    mm_processor_kwargs: str | None = None
+    llamacpp: LlamacppRequestOptions = field(default_factory=LlamacppRequestOptions)
+    vllm: VllmRequestOptions = field(default_factory=VllmRequestOptions)
+    gpu_type: str | None = None
+    gpu_count: int | None = None
+    required_vram_gb: float | None = None
+    serving_requirements: ServingRequirements | None = None
+    max_context_tokens: int | None = None
+    max_output_tokens: int | None = None
+    instance_name: str | None = None
+    app_name: str | None = None
+    function_slug: str | None = None
+    provider_options: ProviderOptions | None = None
+    cost_scenario_id: str | None = None
+    output_tokens_per_month: int | None = None
+    # Quoted execution price ($/hour) when a placement quote was selected.
+    # Distinct from ``serving_requirements.max_hourly_cost_usd`` (budget cap).
+    price_per_hour_usd: float | None = None
+
+
+@dataclass(frozen=True)
+class ResolvedDeploymentPlan:
+    """Effective inputs for one deployment attempt, resolved from a request.
+
+    Resolution never mutates the request: discovery, tuning, compiled server
+    args, placement, and identity are recorded here.
+    """
+
+    request: DeploymentRequest
+    backend: BackendType
+    provider: ComputeProvider
+    intent: OperationIntent
+    do_warmup: bool = True
+    show_debug_logs: bool = False
+    vision: VisionCapabilities | None = None
+    projector_repo: str | None = None
+    projector_revision: str | None = None
+    projector_file: str | None = None
+    image_limit: int = 1
+    mm_processor_kwargs: str | None = None
+    llamacpp: LlamacppRequestOptions = field(default_factory=LlamacppRequestOptions)
+    vllm: VllmRequestOptions = field(default_factory=VllmRequestOptions)
+    gpu_type: str | None = None
+    gpu_count: int | None = None
+    required_vram_gb: float | None = None
+    serving_requirements: ServingRequirements | None = None
+    runtime_tuning: RuntimeTuning | None = None
+    placement_assessment: PlacementAssessment | None = None
+    reasoning: ReasoningCapabilities | None = None
+    max_context_tokens: int | None = None
+    max_output_tokens: int | None = None
+    instance_name: str | None = None
+    app_name: str | None = None
+    function_slug: str | None = None
+    provider_options: ProviderOptions | None = None
+    cost_scenario_id: str | None = None
+    output_tokens_per_month: int | None = None
+    # Quoted execution price ($/hour) carried with the resolved placement.
+    # ``serving_requirements.max_hourly_cost_usd`` remains the budget cap.
+    price_per_hour_usd: float | None = None
+
+
+@dataclass(frozen=True)
+class DeploymentAttemptOutcome:
+    """Observed result of one deployment attempt."""
+
+    disposition: AttemptDisposition
+    resource_app_id: str | None = None
+    endpoint_url: str | None = None
+    endpoint: EndpointInfo | None = None
+    runtime_attestation: RuntimeAttestation | None = None
+    failure_detail: str | None = None
+    cleanup: CleanupDisposition = CleanupDisposition.UNKNOWN
+    cleanup_error: str | None = None
+    retry_allowed: bool = True
+    failure_exit_code: int | None = None
+
+
+@dataclass(frozen=True)
+class DeploymentResult:
+    """Final lifecycle result across attempts."""
+
+    succeeded: bool
+    url: str | None = None
+    app_name: str | None = None
+    attempts: tuple[DeploymentAttemptOutcome, ...] = ()
+    outcome: str = ""
 
 
 @dataclass(frozen=True)
@@ -324,10 +692,6 @@ class ProviderCapabilities:
     provider: ComputeProvider
     supported_backends: frozenset[BackendType]
     billing_model: BillingModel
-    live_availability: bool = False
-    supports_regions: bool = False
-    supports_spot: bool = False
-    supports_secure_cloud: bool = False
 
     def supports_backend(self, backend: BackendType) -> bool:
         """Return whether this provider can serve the requested runtime."""
@@ -365,6 +729,77 @@ class WorkloadProfile:
 
 
 @dataclass(frozen=True)
+class CostScenario:
+    """Explicit usage assumptions for comparing unlike billing models.
+
+    Provisioned rentals bill for every hour they stay up; scale-to-zero
+    providers bill active compute plus idle time while the container stays
+    warm. A monthly figure without these assumptions invents a schedule, so
+    every scenario names its own.
+    """
+
+    id: str
+    display_name: str
+    provisioned_hours_per_day: float = 24.0
+    active_hours_per_day: float = 8.0
+    sessions_per_day: float = 4.0
+    idle_timeout_seconds: float = 1800.0
+    description: str = ""
+
+    def describe(self) -> str:
+        """One-line statement of what this scenario assumes."""
+        if self.id == "continuous":
+            return "Running 24/7 with no shutdown."
+        sessions = f"{self.sessions_per_day:g} session(s)/day"
+        idle_minutes = self.idle_timeout_seconds / 60.0
+        return (
+            f"{self.provisioned_hours_per_day:g}h up/day, "
+            f"{self.active_hours_per_day:g}h active, {sessions}, "
+            f"{idle_minutes:g}min idle timeout."
+        )
+
+
+@dataclass(frozen=True)
+class CostEvaluation:
+    """One canonical cost calculation for a provider quote.
+
+    Older code carried two different monthly numbers: ``WorkloadProfile``
+    normalized scale-to-zero providers by active utilization while
+    ``CostScenario`` adds warm idle time between sessions. Plans now store
+    this evaluation so stored costs, cost ranking, and cost display share the
+    same assumptions.
+    """
+
+    scenario: CostScenario
+    billed_hours_per_day: float
+    estimated_monthly_cost_usd: float | None = None
+    continuous_monthly_cost_usd: float | None = None
+    estimated_cost_per_million_output_tokens_usd: float | None = None
+    cost_basis: str = ""
+    # Vast folds disk rent into its quoted hourly total, so the generic
+    # "storage excluded" label is wrong for it. Quotes keep the truth here.
+    includes_storage: bool = False
+    output_tokens_per_month: int | None = None
+    idle_timeout_seconds: float | None = None
+
+    def basis_label(self) -> str:
+        """State the effective assumptions behind this evaluation."""
+        timeout = (
+            self.idle_timeout_seconds
+            if self.idle_timeout_seconds is not None
+            else self.scenario.idle_timeout_seconds
+        )
+        idle_minutes = timeout / 60.0
+        return (
+            f"Cost scenario '{self.scenario.display_name}': "
+            f"{self.scenario.provisioned_hours_per_day:g}h up/day, "
+            f"{self.scenario.active_hours_per_day:g}h active, "
+            f"{self.scenario.sessions_per_day:g} session(s)/day, "
+            f"{idle_minutes:g}min idle timeout."
+        )
+
+
+@dataclass(frozen=True)
 class ProviderQuote:
     """Normalized provider fulfillment option for an inference recipe."""
 
@@ -384,8 +819,6 @@ class ProviderQuote:
     estimated_output_tokens_per_second: float | None = None
     configuration_id: str | None = None
     provider_options: ProviderOptions | None = None
-    estimated_prompt_tokens_per_second: float | None = None
-    estimated_aggregate_output_tokens_per_second: float | None = None
 
 
 @dataclass(frozen=True)
@@ -398,6 +831,10 @@ class InferencePlan:
     estimated_cost_per_million_output_tokens_usd: float | None = None
     recommendation_reason: str | None = None
     assessment: PlacementAssessment | None = None
+    # Canonical cost calculation, attached so ranking and display cannot drift
+    # apart. Legacy plans built before this field existed keep the two cached
+    # monthly/token fields above; treat them as assumption-free estimates.
+    cost: CostEvaluation | None = None
 
 
 @dataclass(frozen=True)
@@ -529,6 +966,11 @@ class EndpointInfo:
     quant: str | None = None
     runtime_status: str | None = None
     runtime_status_detail: str | None = None
+    # Wall-clock epoch of the last explicit (user-requested) runtime health
+    # observation. Passive fleet refreshes never touch the network for
+    # scale-to-zero providers, so they re-attach the stored verdict and show
+    # its age instead of claiming the deployment itself is healthy.
+    runtime_checked_at: float | None = None
     provider: ComputeProvider = ComputeProvider.MODAL
     endpoint_api_key: str | None = None
     max_context_tokens: int | None = None
@@ -536,6 +978,7 @@ class EndpointInfo:
     reasoning: ReasoningCapabilities | None = None
     vision: VisionCapabilities | None = None
     runtime_attestation: RuntimeAttestation | None = None
+    serving: ServingSnapshot | None = None
 
 
 @dataclass
@@ -621,8 +1064,50 @@ class OfferCostBreakdown:
 
 
 @dataclass(frozen=True)
+class MemoryUnits:
+    """One documented conversion between planner GiB and a provider display unit.
+
+    Internal fit math stays in binary GiB, matching llama.cpp's MiB fit rows.
+    Anything quoting memory another way converts at the boundary through one
+    of these definitions instead of an inline ``/ 1000`` or ``/ 1024``.
+    """
+
+    id: str
+    display_name: str
+    gib_per_unit: float
+
+
+#: Vast marketplace rows quote raw MiB straight from the API.
+VAST_RAW_MIB = MemoryUnits(id="vast-raw-mib", display_name="Vast raw MiB", gib_per_unit=1.0 / 1024.0)
+#: Vast marketplace browser labels divide those MiB by 1000, mirroring the
+#: official CLI display convention.
+VAST_DISPLAY_GB = MemoryUnits(
+    id="vast-display-gb", display_name="Vast display GB", gib_per_unit=1000.0 / 1024.0
+)
+#: Hugging Face file sizes and Modal catalog capacities are decimal GB.
+DECIMAL_GB = MemoryUnits(id="gb", display_name="GB", gib_per_unit=1.0 / 1.073741824)
+#: Runtime measurements and planner reserves are binary GiB.
+BINARY_GIB = MemoryUnits(id="gib", display_name="GiB", gib_per_unit=1.0)
+
+
+def convert_memory(value: float, source: MemoryUnits, target: MemoryUnits) -> float:
+    """Convert a memory quantity between two documented units."""
+    return value * source.gib_per_unit / target.gib_per_unit
+
+
+def vast_raw_mib_to_display_gb(raw_mib: float) -> float:
+    """Render a Vast ``gpu_ram`` reading the way the marketplace browser does."""
+    return convert_memory(raw_mib, VAST_RAW_MIB, VAST_DISPLAY_GB)
+
+
+@dataclass(frozen=True)
 class VastOffer:
-    """Normalized marketplace rental; not a certified inference placement."""
+    """Normalized marketplace rental; not a certified inference placement.
+
+    ``gpu_memory_gb`` carries Vast's decimal display units (raw MiB / 1000),
+    matching the offer browser. Use ``gpu_memory_gib`` for planner fit math,
+    which compares against runtime measurements in binary GiB.
+    """
 
     id: str
     machine_id: str
@@ -647,8 +1132,8 @@ class VastOffer:
 
     @property
     def gpu_memory_gib(self) -> float:
-        """Convert Vast CLI display units back to MiB, then to planner GiB."""
-        return self.gpu_memory_gb * 1000 / 1024
+        """Convert Vast's decimal display GB back to binary GiB for fit math."""
+        return convert_memory(self.gpu_memory_gb, VAST_DISPLAY_GB, BINARY_GIB)
 
 
 @dataclass(frozen=True)
@@ -711,8 +1196,6 @@ class BenchmarkConcurrencyResult:
     exit_code: int = 0
     success: bool = True
     detail: str = ""
-    json_export_path: str | None = None
-    csv_export_path: str | None = None
     metrics: dict[str, float | None] = field(default_factory=dict)
 
 
@@ -757,6 +1240,19 @@ class StorageSnapshot:
     @property
     def total_models(self) -> int:
         return len(self.llamacpp_models) + len(self.vllm_models)
+
+
+@dataclass(frozen=True)
+class StopEffect:
+    """What stopping one deployment's compute does to its storage and bill."""
+
+    provider: ComputeProvider
+    compute_action: str
+    storage_consequence: str
+    remains_billable: bool
+    destructive: bool
+    detail: str = ""
+    recovery_hint: str = ""
 
 
 @dataclass(frozen=True)

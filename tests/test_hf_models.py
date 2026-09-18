@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 from llm_launchpad.core import hf_models
@@ -772,6 +773,100 @@ class HFModelsTests(unittest.TestCase):
 
         self.assertEqual(context, 196608)
         self.assertEqual(calls, ["unsloth/Test-GGUF", "Owner/Base-Model"])
+
+
+class WeightSizeTableFailureTests(unittest.TestCase):
+    """A page we could not read is not a model that publishes no weights."""
+
+    def setUp(self) -> None:
+        hf_models._GGUF_QUANT_METADATA_CACHE.clear()
+
+    def _fake_hub(self, *, compatibility: list[dict[str, Any]] | None = None) -> tuple[Any, list[str]]:
+        calls: list[str] = []
+
+        class FakeApi:
+            def model_info(self, *, repo_id: str, revision: str | None, expand: list[str]):
+                self._ = (revision, expand)
+                calls.append(repo_id)
+                return SimpleNamespace(
+                    siblings=[SimpleNamespace(rfilename="Q4_K_M/model-Q4_K_M.gguf")],
+                    gguf={"architecture": "qwen35", "compatibility": compatibility or []},
+                )
+
+        return types.SimpleNamespace(HfApi=FakeApi), calls
+
+    def test_a_throttled_page_raises_instead_of_reporting_no_sizes(self) -> None:
+        response = SimpleNamespace(status_code=429, text="")
+        with patch("requests.get", return_value=response):
+            with self.assertRaises(hf_models.HubModelPageUnavailable) as caught:
+                hf_models._fetch_gguf_quantization_data_from_model_page("org/model")
+
+        self.assertIs(caught.exception.response, response)
+        self.assertIn("org/model", str(caught.exception))
+
+    def test_an_unreachable_page_raises(self) -> None:
+        with patch("requests.get", side_effect=TimeoutError("Read timed out")):
+            with self.assertRaises(hf_models.HubModelPageUnavailable):
+                hf_models._fetch_gguf_quantization_data_from_model_page("org/model")
+
+    def test_a_page_that_lists_no_quantizations_is_not_a_failure(self) -> None:
+        with patch("requests.get", return_value=SimpleNamespace(status_code=200, text="<html></html>")):
+            self.assertIsNone(
+                hf_models._fetch_gguf_quantization_data_from_model_page("org/model")
+            )
+
+    def test_required_weight_sizes_surface_the_page_failure(self) -> None:
+        fake_module, _ = self._fake_hub()
+        with (
+            patch.dict("sys.modules", {"huggingface_hub": fake_module}),
+            patch("requests.get", side_effect=TimeoutError("Read timed out")),
+        ):
+            with self.assertRaises(hf_models.HubModelPageUnavailable):
+                hf_models.fetch_gguf_quant_metadata(
+                    "org/model", require_weight_sizes=True
+                )
+
+    def test_an_optional_page_failure_is_recorded_on_the_metadata(self) -> None:
+        fake_module, _ = self._fake_hub()
+        with (
+            patch.dict("sys.modules", {"huggingface_hub": fake_module}),
+            patch("requests.get", side_effect=TimeoutError("Read timed out")),
+        ):
+            metadata = hf_models.fetch_gguf_quant_metadata("org/model")
+
+        # The architecture still arrives; only the sizes are unknown, and the
+        # metadata says so rather than presenting an empty table as the answer.
+        self.assertEqual(metadata.architecture, "qwen35")
+        self.assertEqual(metadata.vram_gb_by_quant, {})
+        self.assertIn("Could not read the model page", metadata.weight_size_error or "")
+
+    def test_a_page_failure_is_not_cached(self) -> None:
+        fake_module, calls = self._fake_hub()
+        with (
+            patch.dict("sys.modules", {"huggingface_hub": fake_module}),
+            patch("requests.get", side_effect=TimeoutError("Read timed out")),
+        ):
+            hf_models.fetch_gguf_quant_metadata("org/model")
+            hf_models.fetch_gguf_quant_metadata("org/model")
+
+        # One throttled request must not answer for this repository until the
+        # cache window lapses -- that would defeat the retries above it.
+        self.assertEqual(calls, ["org/model", "org/model"])
+
+    def test_the_page_is_optional_when_the_api_carries_sizes(self) -> None:
+        fake_module, _ = self._fake_hub(
+            compatibility=[{"quantization": "Q4_K_M", "memory": "4.66 GB"}]
+        )
+        with (
+            patch.dict("sys.modules", {"huggingface_hub": fake_module}),
+            patch("requests.get", side_effect=TimeoutError("Read timed out")),
+        ):
+            metadata = hf_models.fetch_gguf_quant_metadata(
+                "org/model", require_weight_sizes=True
+            )
+
+        self.assertAlmostEqual(metadata.vram_gb_by_quant["Q4_K_M"], 4.66, places=2)
+        self.assertIsNone(metadata.weight_size_error)
 
 
 if __name__ == "__main__":

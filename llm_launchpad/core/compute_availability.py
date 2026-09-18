@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
 import math
+import threading
+import time
 import re
 from collections.abc import Sequence
+from typing import Any
 
 from ..protocol.enums import (
     BackendType,
@@ -21,6 +23,7 @@ from ..protocol.models import (
     ComputePlacement,
     InferencePlan,
     ModalProviderOptions,
+    PlacementAssessment,
     PrimeProviderOptions,
     ProviderQuote,
     WorkloadProfile,
@@ -28,10 +31,17 @@ from ..protocol.models import (
     VastOfferQuery,
 )
 from .inference_options import (
-    estimate_cost_per_million_output_tokens,
-    estimate_monthly_compute_cost,
+    COST_SCENARIO_WORKDAY,
+    evaluate_quote_cost,
 )
-from .llamacpp_planner import assess_memory_placement, assessment_score
+from .fit_calibration import MemoryCalibration, calibration_key, load_memory_calibration
+from .llamacpp_planner import (
+    assess_memory_placement,
+    assessment_score,
+    device_capacity_bytes,
+    gib_to_bytes,
+    per_device_requirements,
+)
 from .modal_cli import resolve_modal_cli_path
 from .modal_gpu import ModalGpuSpec, fetch_modal_gpu_catalog
 from .prime_auth import get_prime_auth_status
@@ -63,6 +73,54 @@ _GPU_MEMORY_GB: dict[str, float] = {
     "B200": 180.0,
     "B200+": 180.0,
 }
+# How long every provider fetch together may hold the screen. Each of these
+# calls has its own request timeout, but they were awaited with none: one
+# catalog that never answered left Fast Deploy on "loading" with no deadline
+# and no way back, which is indistinguishable from a hung client. Availability
+# is a comparison across providers, so a slow one should cost its own row, not
+# the whole screen -- whatever has not arrived is reported unavailable and the
+# rest is still shown.
+COMPUTE_AVAILABILITY_TIMEOUT_SECONDS = 45.0
+
+
+class _ProviderFetch:
+    """One provider lookup on a daemon thread, collected against a deadline.
+
+    The thread is never joined past the deadline: an unanswered provider costs
+    its own row and nothing else, and it cannot outlive the interpreter.
+    """
+
+    def __init__(self, call: Any, *args: Any) -> None:
+        self._call = call
+        self._args = args
+        self._value: Any = None
+        self._error: BaseException | None = None
+        self._done = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
+        try:
+            self._value = self._call(*self._args)
+        except BaseException as exc:  # reported as this provider's own error
+            self._error = exc
+        finally:
+            self._done.set()
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def collect(self, deadline: float) -> tuple[Any, str | None]:
+        """Return (value, error phrase); the phrase is None on success."""
+        if not self._done.wait(timeout=max(0.0, deadline - time.monotonic())):
+            return None, (
+                "did not answer within "
+                f"{int(COMPUTE_AVAILABILITY_TIMEOUT_SECONDS)}s"
+            )
+        if self._error is not None:
+            return None, f"unavailable: {self._error}"
+        return self._value, None
+
+
 def load_compute_availability() -> ComputeAvailabilitySnapshot:
     """Fetch connected providers concurrently and return one aggregated view."""
 
@@ -84,35 +142,40 @@ def load_compute_availability() -> ComputeAvailabilitySnapshot:
 
     modal_catalog: Sequence[ModalGpuSpec] = ()
     prime_offers: Sequence[ComputeOffer] = ()
-    modal_future: Future[list[ModalGpuSpec]] | None = None
-    prime_future: Future[list[ComputeOffer]] | None = None
-    vast_future: Future[list[VastOffer]] | None = None
     vast_offers: Sequence[VastOffer] = ()
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        if include_modal:
-            modal_future = executor.submit(fetch_modal_gpu_catalog)
-        if include_prime:
-            prime_future = executor.submit(PrimeBackend().list_offers)
-        if vast_credentials.api_key:
-            vast_future = executor.submit(
+    deadline = time.monotonic() + COMPUTE_AVAILABILITY_TIMEOUT_SECONDS
+
+    # Daemon threads, not a pool. A ThreadPoolExecutor's workers are joined by
+    # the interpreter at exit whatever shutdown() was told, so a provider that
+    # never answers was not abandoned at all -- it was deferred to quitting
+    # time, where it holds the process open with no interface left to explain
+    # why. A daemon thread is genuinely dropped, which is what this budget
+    # promises. Each fetch still has its own request timeout underneath.
+    fetches: list[tuple[str, _ProviderFetch]] = []
+    if include_modal:
+        fetches.append(("Modal catalog", _ProviderFetch(fetch_modal_gpu_catalog)))
+    if include_prime:
+        fetches.append(("Prime availability", _ProviderFetch(PrimeBackend().list_offers)))
+    if vast_credentials.api_key:
+        fetches.append((
+            "Vast availability",
+            _ProviderFetch(
                 VastBackend(vast_credentials).list_offers,
                 VastOfferQuery(gpu_count=None, limit=500),
-            )
-        if modal_future is not None:
-            try:
-                modal_catalog = modal_future.result()
-            except Exception as exc:
-                errors.append(f"Modal catalog unavailable: {exc}")
-        if prime_future is not None:
-            try:
-                prime_offers = prime_future.result()
-            except Exception as exc:
-                errors.append(f"Prime availability unavailable: {exc}")
-        if vast_future is not None:
-            try:
-                vast_offers = vast_future.result()
-            except Exception as exc:
-                errors.append(f"Vast availability unavailable: {exc}")
+            ),
+        ))
+    for _, fetch in fetches:
+        fetch.start()
+
+    results: dict[str, Any] = {}
+    for label, fetch in fetches:
+        value, error = fetch.collect(deadline)
+        if error is not None:
+            errors.append(f"{label} {error}")
+        results[label] = value
+    modal_catalog = results.get("Modal catalog") or ()
+    prime_offers = results.get("Prime availability") or ()
+    vast_offers = results.get("Vast availability") or ()
 
     if not include_modal and not include_prime and not vast_credentials.api_key and not errors:
         errors.append("Connect a compute provider to load availability.")
@@ -243,26 +306,78 @@ def plans_for_compute_profile(
     *,
     rejected: list[str] | None = None,
 ) -> tuple[InferencePlan, ...]:
-    """Build ranked fulfillment plans for one model on a selected GPU type.
+    """Build ranked fulfillment plans for one recipe on a selected GPU type.
 
     Placements that cannot hold the full context on GPU are excluded. Pass
     ``rejected`` to collect the reasons: a silently shorter list tells the
     reader nothing about why their hardware is missing.
     """
+    plans, _ = assessed_plans_for_compute_profile(
+        configuration, profile, workload, rejected=rejected
+    )
+    return plans
 
-    workload = workload or WorkloadProfile()
+
+def assessed_plans_for_compute_profile(
+    configuration: ComputeConfiguration,
+    profile: QuickDeployProfile,
+    workload: WorkloadProfile | None = None,
+    *,
+    rejected: list[str] | None = None,
+) -> tuple[tuple[InferencePlan, ...], tuple[PlacementAssessment, ...]]:
+    """Return deployable plans plus the assessments behind every placement.
+
+    The returned assessments cover placements that were evaluated but not
+    offered, so callers can distinguish "does not fit this hardware" from "no
+    current offer is deployable". Policy exclusions (spot, backend, price) are
+    reported through ``rejected``; memory and runtime outcomes are reported
+    through the assessments.
+
+    ``workload`` is a compatibility shim: stored cost always uses the canonical
+    workday scenario, with explicit output-token demand when supplied.
+    """
+
+    del workload
     recipe = quick_deploy_recipe(profile)
     required_vram_gb = profile_required_vram_gb(profile)
     if recipe.required_vram_gb is None and required_vram_gb > 0:
         recipe = replace(recipe, required_vram_gb=required_vram_gb)
+    # The topology picker and the assessment below have to agree on how much
+    # memory the plan needs. If the picker sized on the formula while the
+    # assessment used a runtime measurement, it would propose shapes the
+    # assessment then rejected and the model would end up with no plan at all.
+    measured = None
+    if recipe.serving_requirements is not None and recipe.runtime_tuning is not None:
+        measured = load_memory_calibration(
+            calibration_key(
+                model_id=recipe.model_id,
+                revision=None,
+                quant=recipe.quant,
+                runtime_id=profile.llamacpp_runtime_id,
+                requirements=recipe.serving_requirements,
+                tuning=recipe.runtime_tuning,
+            )
+        )
     plans: list[InferencePlan] = []
+    evaluated: list[PlacementAssessment] = []
     for placement in configuration.placements:
         if placement.is_spot or recipe.backend not in placement.supported_backends:
+            if rejected is not None:
+                if placement.is_spot:
+                    rejected.append(
+                        f"{placement.gpu_type} is spot-only and excluded by policy."
+                    )
+                else:
+                    rejected.append(
+                        f"{placement.gpu_type} does not support the "
+                        f"{recipe.backend.value} backend."
+                    )
             continue
         gpu_count = _placement_gpu_count(
             placement,
             required_vram_gb,
             memory_estimate=profile.memory_estimate,
+            calibration=measured,
         )
         if gpu_count is None:
             if rejected is not None:
@@ -293,6 +408,7 @@ def plans_for_compute_profile(
                 gpu_memory_gb=placement.gpu_memory_gb,
                 price_per_hour_usd=price,
             )
+            evaluated.append(assessment)
             if not assessment.fits or not assessment.gpu_resident:
                 if rejected is not None:
                     rejected.append(
@@ -301,20 +417,12 @@ def plans_for_compute_profile(
                     )
                 continue
         single_tps = None
-        aggregate_tps = None
         if assessment is not None:
             single_tps = max(
                 (
                     point.output_tokens_per_second or 0.0
                     for point in assessment.performance
                     if point.concurrency == 1
-                ),
-                default=0.0,
-            ) or None
-            aggregate_tps = max(
-                (
-                    point.aggregate_output_tokens_per_second or 0.0
-                    for point in assessment.performance
                 ),
                 default=0.0,
             ) or None
@@ -335,22 +443,20 @@ def plans_for_compute_profile(
             configuration_id=configuration.id,
             provider_options=placement.provider_options,
             estimated_output_tokens_per_second=single_tps,
-            estimated_aggregate_output_tokens_per_second=aggregate_tps,
         )
-        monthly_cost = estimate_monthly_compute_cost(quote, workload)
+        monthly_cost = None
+        per_million = None
+        evaluation = evaluate_quote_cost(quote, COST_SCENARIO_WORKDAY)
+        monthly_cost = evaluation.estimated_monthly_cost_usd
+        per_million = evaluation.estimated_cost_per_million_output_tokens_usd
         plans.append(
             InferencePlan(
                 recipe=recipe,
                 quote=quote,
                 estimated_monthly_cost_usd=monthly_cost,
-                estimated_cost_per_million_output_tokens_usd=(
-                    estimate_cost_per_million_output_tokens(
-                        quote,
-                        workload,
-                        monthly_cost,
-                    )
-                ),
+                estimated_cost_per_million_output_tokens_usd=per_million,
                 assessment=assessment,
+                cost=evaluation,
             )
         )
     plans.sort(
@@ -373,7 +479,7 @@ def plans_for_compute_profile(
                 else "Best available placement for this GPU type"
             ),
         )
-    return tuple(plans)
+    return tuple(plans), tuple(evaluated)
 
 
 def profile_required_vram_gb(profile: QuickDeployProfile) -> float:
@@ -472,15 +578,46 @@ def _placement_gpu_count(
     required_vram_gb: float,
     *,
     memory_estimate: object | None = None,
+    calibration: MemoryCalibration | None = None,
 ) -> int | None:
     count = placement.gpu_count_min
     if memory_estimate is not None:
         total_gb = float(getattr(memory_estimate, "total_gb", 0.0)) - float(
             getattr(memory_estimate, "reserve_gb", 0.0)
         )
+        # Graph memory is replicated on every device, so it stays out of the
+        # division. Sharding it here proposed topologies that the placement
+        # assessment then rejected, leaving the model with no plan at all
+        # rather than the larger topology that does hold it.
+        base_count = max(1, len(getattr(memory_estimate, "per_device_required_gb", ()) or ()))
+        per_device_graph = float(getattr(memory_estimate, "compute_gb", 0.0)) + float(
+            getattr(memory_estimate, "attention_scratch_gb", 0.0)
+        )
+        shardable_gb = max(0.0, total_gb - per_device_graph * base_count)
+        layer_count = getattr(memory_estimate, "total_layer_count", None)
+        capacity = device_capacity_bytes(placement.gpu_memory_gb)
         for candidate in range(count, placement.gpu_count_max + 1):
             reserve_per_gpu = max(2.0, placement.gpu_memory_gb * 0.05)
-            if total_gb / candidate + reserve_per_gpu <= placement.gpu_memory_gb:
+            # Layers are indivisible: size on the device that ends up with the
+            # remainder, not on the average.
+            if calibration is not None:
+                busiest = max(
+                    calibration.per_device_gb(
+                        shardable_gb=shardable_gb,
+                        gpu_count=candidate,
+                        layer_count=layer_count,
+                    )
+                ) + reserve_per_gpu
+            else:
+                busiest = max(
+                    per_device_requirements(
+                        shardable_gb=shardable_gb,
+                        per_device_gb=per_device_graph + reserve_per_gpu,
+                        gpu_count=candidate,
+                        layer_count=layer_count,
+                    )
+                )
+            if gib_to_bytes(busiest) <= capacity:
                 return candidate
         return None
     if required_vram_gb > 0:

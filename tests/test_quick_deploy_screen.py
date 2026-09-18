@@ -7,7 +7,7 @@ from textual.app import App
 from textual.widgets import Button, Input, Select, Static, Switch
 
 from llm_launchpad.core import quick_deploy
-from llm_launchpad.core.inference_options import workload_basis_label
+from llm_launchpad.core.inference_options import COST_SCENARIO_WORKDAY, evaluate_quote_cost
 from llm_launchpad.core.quick_deploy import (
     QuickDeployProfile,
     get_quick_deploy_profile,
@@ -61,20 +61,22 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
             screen = app.screen
             assert isinstance(screen, QuickDeployScreen)
-            summary = str(screen.query_one("#quick-deploy-profile-body", Static).content)
+            facts = str(screen.query_one("#quick-deploy-facts", Static).content)
+            details = str(screen.query_one("#quick-deploy-profile-body", Static).content)
             title = str(screen.query_one("#quick-deploy-title", Static).content)
             self.assertIn("Kimi K2.5 [dim](UD-Q4_K_XL)[/dim]", title)
-            self.assertIn("[bold #7bf168]Kimi K2.5[/] [dim](UD-Q4_K_XL)[/dim]", summary)
-            self.assertIn("RTX PRO 6000 96GB x5", summary)
-            self.assertIn("262,144 ctx", summary)
-            self.assertNotIn("Cheap but good", summary)
-            self.assertIn("UD-Q4_K_XL", summary)
-            self.assertIn(_summary_row("Provider", "Modal"), summary)
-            self.assertIn(_summary_row("Billing", "Scale to zero"), summary)
-            self.assertIn(_summary_row("Hourly", "~$15.15/hr"), summary)
-            self.assertIn(_summary_row("Monthly", "~$909.00/mo"), summary)
-            self.assertIn("llama.cpp (GGUF)", summary)
-            self.assertIn("unsloth/Kimi-K2.5-GGUF", summary)
+            # Decision facts stay above the fold; evidence lives in details.
+            self.assertIn("Kimi K2.5", facts)
+            self.assertIn("RTX PRO 6000 96GB x5", facts)
+            self.assertIn("262,144 ctx", facts)
+            self.assertIn("~$15.15/hr while billed", facts)
+            self.assertIn("Scale to zero", facts)
+            self.assertNotIn("Cheap but good", facts)
+            self.assertIn("UD-Q4_K_XL", facts)
+            self.assertIn("llama.cpp (GGUF)", details)
+            self.assertIn("unsloth/Kimi-K2.5-GGUF", details)
+            self.assertIn(_summary_row("If left up", "~$10,908.00/mo at 24/7"), details)
+            self.assertIn(_summary_row("Scenario", "~$1,818.00/mo 'Workday 8h'"), details)
 
     def _vision_profile(self, *, certified: bool) -> QuickDeployProfile:
         from llm_launchpad.protocol.models import ServingRequirements
@@ -180,10 +182,11 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
             screen = app.screen
             assert isinstance(screen, QuickDeployScreen)
-            summary = str(screen.query_one("#quick-deploy-profile-body", Static).content)
-            self.assertIn(_summary_row("Tier", "$$$ B200"), summary)
-            self.assertIn(_summary_row("VRAM", "141 GB required"), summary)
-            self.assertIn(_summary_row("Context", "Full 196,608 ctx"), summary)
+            facts = str(screen.query_one("#quick-deploy-facts", Static).content)
+            details = str(screen.query_one("#quick-deploy-profile-body", Static).content)
+            self.assertIn(_summary_row("Tier", "$$$ B200"), details)
+            self.assertIn(_summary_row("VRAM", "141 GB required"), details)
+            self.assertIn("196,608", facts)
 
     async def test_deploy_uses_blank_override_defaults(self) -> None:
         app = _TestApp()
@@ -218,7 +221,7 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             # it must not be the thing a second enter lands on.
             self.assertFalse(screen.query_one("#quick-deploy-btn", Button).has_focus)
             self.assertTrue(
-                screen.query_one("#toggle-advanced-quick", Button).has_focus
+                screen.query_one("#toggle-quick-details", Button).has_focus
             )
 
     async def test_supported_profile_shows_default_on_mtp_toggle_and_can_disable_it(self) -> None:
@@ -269,19 +272,21 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
         """
         profile = get_quick_deploy_profile("qwen35-397b-rtxpro")
         recipe = quick_deploy_recipe(profile)
+        quote = ProviderQuote(
+            id="vast:offer-1",
+            recipe_id=recipe.id,
+            provider=ComputeProvider.VAST,
+            provider_reference="offer-1",
+            gpu_type="RTX-PRO-6000",
+            gpu_count=3,
+            price_per_hour_usd=1.0,
+            billing_model=BillingModel.PROVISIONED,
+        )
         plan = InferencePlan(
             recipe=recipe,
-            quote=ProviderQuote(
-                id="vast:offer-1",
-                recipe_id=recipe.id,
-                provider=ComputeProvider.VAST,
-                provider_reference="offer-1",
-                gpu_type="RTX-PRO-6000",
-                gpu_count=3,
-                price_per_hour_usd=1.0,
-                billing_model=BillingModel.PROVISIONED,
-            ),
+            quote=quote,
             estimated_monthly_cost_usd=240.0,
+            cost=evaluate_quote_cost(quote, COST_SCENARIO_WORKDAY),
         )
 
         app = _TestApp()
@@ -292,11 +297,17 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 app.screen.query_one("#quick-deploy-profile-body", Static).content
             )
 
-        self.assertIn(_summary_row("Monthly", "~$240.00/mo"), summary)
+        self.assertIn(_summary_row("Scenario", "~$240.00/mo 'Workday 8h'"), summary)
         self.assertIn(_summary_row("If left up", "~$720.00/mo at 24/7"), summary)
-        self.assertIn(workload_basis_label(), summary)
+        self.assertIn("8h up/day", summary)
+        self.assertNotIn("utilization on scale-to-zero", summary)
 
-    async def test_a_scale_to_zero_plan_omits_the_continuous_figure(self) -> None:
+    async def test_a_scale_to_zero_plan_shows_the_continuous_ceiling(self) -> None:
+        """Hourly and 24/7 are what a deployment bills; the scenario is extra.
+
+        The old summary omitted the continuous figure for scale-to-zero plans,
+        which hid what always-busy usage costs. Both figures are now shown.
+        """
         profile = get_quick_deploy_profile("qwen35-397b-rtxpro")
         recipe = quick_deploy_recipe(profile)
         plan = InferencePlan(
@@ -322,7 +333,8 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 app.screen.query_one("#quick-deploy-profile-body", Static).content
             )
 
-        self.assertNotIn("If left up", summary)
+        self.assertIn("If left up", summary)
+        self.assertIn("Scenario", summary)
 
     async def test_placements_the_list_cannot_tell_apart_are_collapsed(self) -> None:
         """Modal returns several quotes for one shape; the row shows none of it.
@@ -550,16 +562,16 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(selector._options), 2)
             self.assertIn(
                 "Prime Intellect",
-                str(screen.query_one("#quick-deploy-profile-body", Static).content),
+                str(screen.query_one("#quick-deploy-facts", Static).content),
             )
 
             selector.value = modal_plan.quote.id
             await pilot.pause()
 
-            summary = str(
-                screen.query_one("#quick-deploy-profile-body", Static).content
+            facts = str(
+                screen.query_one("#quick-deploy-facts", Static).content
             )
-            self.assertIn(_summary_row("Provider", "Modal"), summary)
+            self.assertIn("Modal", facts)
             screen._deploy()
 
         self.assertIsNotNone(app.deployed_config)
@@ -568,3 +580,147 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ArrowNavigationTests(unittest.IsolatedAsyncioTestCase):
+    """Up and down have to move between controls, not into a trap.
+
+    Textual moves focus with tab, but this form is mostly buttons and selects,
+    and a closed Select binds "down" to opening its own overlay. Arrowing down
+    from the fulfillment select therefore opened the dropdown and never left
+    it: every further press moved inside the overlay, so the Deploy button was
+    unreachable by arrow alone. On a phone keyboard, where tab lives in a
+    modifier bar and the arrows are the obvious way to move, that is the only
+    way most people will try.
+    """
+
+    def setUp(self) -> None:
+        from tests.catalog_fixtures import activate_static_like_catalog
+
+        quick_deploy._reset_quick_deploy_catalog_cache()
+        activate_static_like_catalog()
+
+    def tearDown(self) -> None:
+        quick_deploy._reset_quick_deploy_catalog_cache()
+
+    def _screen_with_alternatives(self) -> QuickDeployScreen:
+        from llm_launchpad.core.quick_deploy import get_quick_deploy_plan
+
+        base = get_quick_deploy_plan("kimi25-rtxpro")
+        alternatives = tuple(
+            replace(base, quote=replace(base.quote, id=f"alt-{index}",
+                                        price_per_hour_usd=1.0 + index))
+            for index in range(3)
+        )
+        return QuickDeployScreen(base, alternative_plans=(base,) + alternatives)
+
+    async def test_down_reaches_deploy_instead_of_entering_the_dropdown(self) -> None:
+        app = _StyledApp()
+        async with app.run_test(size=(52, 30)) as pilot:
+            app.push_screen(self._screen_with_alternatives())
+            await pilot.pause()
+            await pilot.pause()
+            self.assertEqual(getattr(app.focused, "id", None), "toggle-quick-details")
+
+            reached = []
+            for _ in range(3):
+                await pilot.press("down")
+                await pilot.pause()
+                reached.append(getattr(app.focused, "id", None))
+
+            self.assertIn("quick-deploy-btn", reached)
+
+    async def test_an_open_dropdown_keeps_the_arrow_keys(self) -> None:
+        # Taking them away there would make the option list unusable.
+        app = _StyledApp()
+        async with app.run_test(size=(52, 30)) as pilot:
+            app.push_screen(self._screen_with_alternatives())
+            await pilot.pause()
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, QuickDeployScreen)
+            select = screen.query_one("#quick-fulfillment", Select)
+            select.focus()
+            await pilot.pause()
+
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertTrue(select.expanded)
+            await pilot.press("down")
+            await pilot.pause()
+
+            self.assertTrue(select.expanded)
+            await pilot.press("enter")
+            await pilot.pause()
+            # A choice was actually made, not just a dismissal.
+            self.assertNotEqual(select.value, "kimi25-rtxpro")
+
+    async def test_up_walks_back(self) -> None:
+        app = _StyledApp()
+        async with app.run_test(size=(52, 30)) as pilot:
+            app.push_screen(self._screen_with_alternatives())
+            await pilot.pause()
+            await pilot.pause()
+
+            await pilot.press("down")
+            await pilot.pause()
+            forward = getattr(app.focused, "id", None)
+            await pilot.press("up")
+            await pilot.pause()
+
+            self.assertEqual(getattr(app.focused, "id", None), "toggle-quick-details")
+            self.assertNotEqual(forward, "toggle-quick-details")
+
+    async def test_collapsed_advanced_controls_are_skipped(self) -> None:
+        app = _StyledApp()
+        async with app.run_test(size=(52, 30)) as pilot:
+            app.push_screen(self._screen_with_alternatives())
+            await pilot.pause()
+            await pilot.pause()
+
+            cycle = []
+            for _ in range(8):
+                await pilot.press("down")
+                await pilot.pause()
+                cycle.append(getattr(app.focused, "id", None))
+
+            # Four stops, twice round: technical details, fulfillment, Deploy
+            # and advanced toggle; nothing hidden joins the rotation.
+            self.assertEqual(
+                set(cycle),
+                {
+                    "toggle-quick-details",
+                    "quick-fulfillment",
+                    "toggle-advanced-quick",
+                    "quick-deploy-btn",
+                },
+            )
+            self.assertNotIn("quick-instance-name", cycle)
+
+    async def test_technical_details_toggle_shows_the_evidence(self) -> None:
+        app = _StyledApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.push_screen(QuickDeployScreen(profile_id="kimi25-rtxpro"))
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, QuickDeployScreen)
+            body = screen.query_one("#quick-deploy-profile-body", Static)
+            self.assertFalse(body.display)
+            screen.query_one("#toggle-quick-details", Button).press()
+            await pilot.pause()
+            self.assertTrue(body.display)
+            self.assertIn("unsloth/Kimi-K2.5-GGUF", str(body.content))
+
+    async def test_arrowing_around_never_deploys(self) -> None:
+        # Enter on the Deploy button spends money; arriving there must not.
+        app = _StyledApp()
+        async with app.run_test(size=(52, 30)) as pilot:
+            app.push_screen(self._screen_with_alternatives())
+            await pilot.pause()
+            await pilot.pause()
+
+            for _ in range(8):
+                await pilot.press("down")
+                await pilot.pause()
+
+            self.assertIsNone(app.deployed_config)

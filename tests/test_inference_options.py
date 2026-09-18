@@ -3,10 +3,12 @@ from __future__ import annotations
 import unittest
 
 from llm_launchpad.core.inference_options import (
+    COST_SCENARIO_WORKDAY,
     ModalCatalogOption,
     ModalInferenceAdapter,
     PrimeInferenceAdapter,
     estimate_monthly_compute_cost,
+    evaluate_quote_cost,
     recommended_vllm_tool_call_parser,
     resolve_inference_plans,
 )
@@ -408,8 +410,13 @@ class ProviderAdapterTests(unittest.TestCase):
         plan = plans[0]
         self.assertEqual(plan.quote.provider, ComputeProvider.PRIME)
         self.assertEqual(plan.quote.availability, QuoteAvailability.AVAILABLE)
+        # An 8h provisioned day at $2/hr is $480/mo under the canonical workday
+        # scenario; the 100M-token demand prices that spend at $4.80/MTok.
         self.assertEqual(plan.estimated_monthly_cost_usd, 480.0)
         self.assertEqual(plan.estimated_cost_per_million_output_tokens_usd, 4.8)
+        assert plan.cost is not None
+        self.assertEqual(plan.cost.scenario.id, COST_SCENARIO_WORKDAY.id)
+        self.assertEqual(plan.cost.billed_hours_per_day, 8.0)
         self.assertIsInstance(plan.quote.provider_options, PrimeProviderOptions)
         assert isinstance(plan.quote.provider_options, PrimeProviderOptions)
         self.assertEqual(plan.quote.provider_options.offer_id, "h100")
@@ -605,8 +612,14 @@ class ProviderAdapterTests(unittest.TestCase):
             **common,  # type: ignore[arg-type]
         )
 
+        # Legacy utilization math is preserved for compatibility: 8 paid hours
+        # at 25% utilization is $120/mo. The canonical workday scenario adds
+        # four half-hour idle tails, so the same quote is $240/mo there.
         self.assertEqual(estimate_monthly_compute_cost(modal, workload), 120.0)
         self.assertEqual(estimate_monthly_compute_cost(prime, workload), 480.0)
+        canonical = evaluate_quote_cost(modal, COST_SCENARIO_WORKDAY)
+        self.assertEqual(canonical.billed_hours_per_day, 4.0)
+        self.assertEqual(canonical.estimated_monthly_cost_usd, 240.0)
 
     def test_provider_option_accessor_rejects_cross_provider_payload(self) -> None:
         config = DeploymentConfig(provider_options=None)
@@ -688,7 +701,6 @@ class PrimePlacementParityTests(unittest.TestCase):
         # The reserve is also promised to llama.cpp's runtime fitter.
         self.assertEqual(assessment.tuning.fit_target_mib, 4096)
         self.assertIsNotNone(plan.quote.estimated_output_tokens_per_second)
-        self.assertIsNotNone(plan.quote.estimated_aggregate_output_tokens_per_second)
 
     def test_prime_and_modal_agree_on_placement_for_the_same_topology(self) -> None:
         profile = _planned_profile()

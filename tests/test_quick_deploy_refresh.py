@@ -13,9 +13,14 @@ import unittest
 from unittest.mock import patch
 
 from llm_launchpad.core.gguf_metadata import GgufMtpCapability, GgufMtpStatus
-from llm_launchpad.core.hf_models import GgufQuantMetadata, ModelCandidate
+from llm_launchpad.core.hf_models import (
+    GgufQuantMetadata,
+    HubModelPageUnavailable,
+    ModelCandidate,
+)
 from llm_launchpad.core.modal_gpu import ModalGpuSpec
 from llm_launchpad.core.quick_deploy import QuickDeployProfile
+from llm_launchpad.protocol.enums import SpeculativeDecodingMethod
 from llm_launchpad.core.artificial_analysis import (
     AAModelCandidate,
     _AARankings,
@@ -27,6 +32,7 @@ from llm_launchpad.core.artificial_analysis import (
 from llm_launchpad.core.quick_deploy_refresh import (
     QUICK_DEPLOY_CATALOG_CACHE_SCHEMA_VERSION,
     _available_gpu_types,
+    _build_resolved_aa_model,
     _fetch_serving_metadata,
     _find_unsloth_gguf_match,
     _is_transient_hub_error,
@@ -37,6 +43,7 @@ from llm_launchpad.core.quick_deploy_refresh import (
     _quick_deploy_profile_to_dict,
     _read_quick_deploy_catalog_cache,
     _retained_catalog_for,
+    _selected_quants,
     _stable_profile_id,
     _with_unique_ids,
     _write_quick_deploy_catalog_cache,
@@ -132,7 +139,11 @@ class QuickDeployRefreshTests(unittest.TestCase):
             ModalGpuSpec("B200", 5.0),
         ]
 
-        def matched_repo(candidate: AAModelCandidate, _api: object) -> str | None:
+        def matched_repo(
+            candidate: AAModelCandidate,
+            _api: object,
+            _budget: object = None,
+        ) -> str | None:
             if candidate.name.startswith("Closed"):
                 return None
             return f"unsloth/{candidate.name.replace(' ', '-')}-GGUF"
@@ -201,7 +212,11 @@ class QuickDeployRefreshTests(unittest.TestCase):
         )
         gpu_catalog = [ModalGpuSpec("L4", 0.5)]
 
-        def matched_repo(candidate: AAModelCandidate, _api: object) -> str:
+        def matched_repo(
+            candidate: AAModelCandidate,
+            _api: object,
+            _budget: object = None,
+        ) -> str:
             return f"unsloth/{candidate.name.replace(' ', '-')}-GGUF"
 
         with patch(
@@ -217,14 +232,14 @@ class QuickDeployRefreshTests(unittest.TestCase):
             "llm_launchpad.core.quick_deploy_refresh.fetch_gguf_quant_metadata",
             return_value=metadata,
         ):
-            _info, profiles = build_live_quick_deploy_catalog(model_limit=2)
+            _info, profiles = build_live_quick_deploy_catalog(model_limit=2, overall_model_limit=0)
 
         self.assertEqual(
             _ordered_unique_names(profiles),
             ["Open Model 1 8B", "Open Model 2 8B"],
         )
 
-    def test_live_catalog_selects_top_models_in_each_size_bucket(self) -> None:
+    def test_live_catalog_includes_overall_top_ten_and_each_size_shortlist(self) -> None:
         candidates: list[AAModelCandidate] = []
         rank = 1
         for parameter_count_b, prefix in (
@@ -250,7 +265,11 @@ class QuickDeployRefreshTests(unittest.TestCase):
         )
         gpu_catalog = [ModalGpuSpec("L4", 0.5)]
 
-        def matched_repo(candidate: AAModelCandidate, _api: object) -> str:
+        def matched_repo(
+            candidate: AAModelCandidate,
+            _api: object,
+            _budget: object = None,
+        ) -> str:
             return f"unsloth/{candidate.name.replace(' ', '-')}-GGUF"
 
         with patch(
@@ -280,6 +299,8 @@ class QuickDeployRefreshTests(unittest.TestCase):
                 "Large Model 1 300B",
                 "Large Model 2 300B",
                 "Large Model 3 300B",
+                "Compact Model 4 8B",
+                "Medium Model 4 70B",
             ],
         )
 
@@ -309,7 +330,11 @@ class QuickDeployRefreshTests(unittest.TestCase):
         )
         gpu_catalog = [ModalGpuSpec("L4", 0.5)]
 
-        def matched_repo(candidate: AAModelCandidate, _api: object) -> str:
+        def matched_repo(
+            candidate: AAModelCandidate,
+            _api: object,
+            _budget: object = None,
+        ) -> str:
             return f"unsloth/{candidate.name.replace(' ', '-')}-GGUF"
 
         with patch(
@@ -328,10 +353,11 @@ class QuickDeployRefreshTests(unittest.TestCase):
             _info, profiles = build_live_quick_deploy_catalog()
 
         names = _ordered_unique_names(profiles)
-        self.assertEqual(len(names), 9)
+        self.assertEqual(len(names), 16)
         self.assertEqual(names[:3], [f"Compact Model {index} 8B" for index in range(1, 4)])
         self.assertEqual(names[3:6], [f"Medium Model {index} 70B" for index in range(1, 4)])
-        self.assertEqual(names[6:], [f"Large Model {index} 300B" for index in range(1, 4)])
+        self.assertEqual(names[6:9], [f"Large Model {index} 300B" for index in range(1, 4)])
+        self.assertEqual(names[9:], [f"Compact Model {index} 8B" for index in range(4, 11)])
 
     def test_live_catalog_deduplicates_variants_sharing_a_gguf_repo(self) -> None:
         candidates = (
@@ -347,7 +373,11 @@ class QuickDeployRefreshTests(unittest.TestCase):
         )
         gpu_catalog = [ModalGpuSpec("L4", 0.5)]
 
-        def matched_repo(candidate: AAModelCandidate, _api: object) -> str:
+        def matched_repo(
+            candidate: AAModelCandidate,
+            _api: object,
+            _budget: object = None,
+        ) -> str:
             if "One" in candidate.name:
                 return "unsloth/Open-Model-One-GGUF"
             return f"unsloth/{candidate.name.replace(' ', '-')}-GGUF"
@@ -395,7 +425,7 @@ class QuickDeployRefreshTests(unittest.TestCase):
         with (
             patch("llm_launchpad.core.quick_deploy_refresh._AA_RESOLUTION_WORKERS", 2),
             patch("llm_launchpad.core.quick_deploy_refresh._find_unsloth_gguf_match",
-                  side_effect=lambda candidate, api: f"unsloth/{candidate.slug}-GGUF") as match,
+                  side_effect=lambda candidate, api, budget=None: f"unsloth/{candidate.slug}-GGUF") as match,
             patch("llm_launchpad.core.quick_deploy_refresh._fetch_serving_metadata", return_value=metadata),
         ):
             profiles = _profiles_from_aa_rankings(
@@ -432,7 +462,7 @@ class QuickDeployRefreshTests(unittest.TestCase):
         with (
             patch("llm_launchpad.core.quick_deploy_refresh._AA_RESOLUTION_WORKERS", 4),
             patch("llm_launchpad.core.quick_deploy_refresh._find_unsloth_gguf_match",
-                  side_effect=lambda candidate, api: f"unsloth/{candidate.slug}-GGUF"),
+                  side_effect=lambda candidate, api, budget=None: f"unsloth/{candidate.slug}-GGUF"),
             patch("llm_launchpad.core.quick_deploy_refresh._fetch_serving_metadata", side_effect=metadata),
         ):
             profiles = _profiles_from_aa_rankings(
@@ -473,7 +503,7 @@ class QuickDeployRefreshTests(unittest.TestCase):
             with (
                 patch("llm_launchpad.core.quick_deploy_refresh.ThreadPoolExecutor", return_value=resolver),
                 patch("llm_launchpad.core.quick_deploy_refresh._find_unsloth_gguf_match",
-                      side_effect=lambda candidate, api: f"unsloth/{candidate.slug}-GGUF"),
+                      side_effect=lambda candidate, api, budget=None: f"unsloth/{candidate.slug}-GGUF"),
                 patch("llm_launchpad.core.quick_deploy_refresh._fetch_serving_metadata", side_effect=fetch),
             ):
                 result = caller.submit(
@@ -851,7 +881,11 @@ class QuickDeployRefreshTests(unittest.TestCase):
         )
         gpu_catalog = [ModalGpuSpec("L4", 0.5)]
 
-        def matched_repo(candidate: AAModelCandidate, _api: object) -> str:
+        def matched_repo(
+            candidate: AAModelCandidate,
+            _api: object,
+            _budget: object = None,
+        ) -> str:
             return f"unsloth/{candidate.name.replace(' ', '-')}-GGUF"
 
         with patch(
@@ -917,6 +951,75 @@ class QuickDeployRefreshTests(unittest.TestCase):
         )
         self.assertIsNone(profile.speculative_decoding)
         self.assertIsNotNone(upgraded[0].speculative_decoding)
+
+    def test_attach_mtp_recommendations_persists_to_the_catalog_snapshot(self) -> None:
+        """The snapshot the build wrote predates this pass, so it must be rewritten.
+
+        Without it every launch reprobes every repository and the confirm
+        screen opens with no MTP toggle until those probes land.
+        """
+
+        from llm_launchpad.core.quick_deploy import (
+            QuickDeployCatalogInfo,
+            QuickDeployProfile,
+        )
+
+        profile = QuickDeployProfile(
+            id="model-cheap-l4",
+            display_name="Open Model One 8B",
+            repo_id="unsloth/Open-Model-One-8B-GGUF",
+            quant="UD-Q2_K_XL",
+            gpu_type="L4",
+            gpu_count=2,
+            profile_label="Slow but cheap",
+            approx_cost_per_hour_usd=1.0,
+            max_context_tokens=131_072,
+            instance_slug_hint="open-model-one",
+            summary="Test profile.",
+            server_args=("--ctx-size", "131072"),
+        )
+        info = QuickDeployCatalogInfo(
+            source_label="Test catalog",
+            generated_at="2026-09-03T00:00:00Z",
+            is_live=True,
+        )
+        metadata = GgufQuantMetadata(
+            quantizations=["UD-Q2_K_XL"],
+            vram_gb_by_quant={"UD-Q2_K_XL": 20.0},
+            architecture="qwen35",
+            mtp=GgufMtpCapability(
+                status=GgufMtpStatus.SUPPORTED,
+                nextn_predict_layers=1,
+            ),
+        )
+        with TemporaryDirectory() as temporary_directory:
+            cache_path = Path(temporary_directory) / "catalog.json"
+            _write_quick_deploy_catalog_cache(info, (profile,), cache_path=cache_path)
+            before = _read_quick_deploy_catalog_cache(cache_path)
+            assert before is not None
+            self.assertIsNone(before[1][0].speculative_decoding)
+
+            with patch(
+                "llm_launchpad.core.quick_deploy_refresh.fetch_gguf_quant_metadata",
+                return_value=metadata,
+            ):
+                attach_quick_deploy_mtp_recommendations(
+                    (profile,),
+                    info=info,
+                    cache_path=cache_path,
+                )
+
+            after = _read_quick_deploy_catalog_cache(cache_path)
+            assert after is not None
+            restored = after[1][0].speculative_decoding
+            self.assertIsNotNone(restored)
+            self.assertEqual(restored.method, SpeculativeDecodingMethod.MTP)
+            self.assertEqual(restored.nextn_predict_layers, 1)
+            # A reopened snapshot must need no further probing.
+            self.assertEqual(
+                attach_quick_deploy_mtp_recommendations(after[1]),
+                after[1],
+            )
 
     def test_cached_catalog_round_trip_marks_stale_snapshots(self) -> None:
         from llm_launchpad.core.quick_deploy import QuickDeployProfile
@@ -1037,6 +1140,92 @@ class TransientHubFailureTests(unittest.TestCase):
 
         self.assertEqual(len(calls), 3)
 
+    def test_an_unreadable_weight_table_is_retried_like_any_hub_failure(self) -> None:
+        metadata = GgufQuantMetadata(quantizations=["Q4_K_M"], vram_gb_by_quant={"Q4_K_M": 4.7})
+        calls: list[int] = []
+
+        def flaky(repo_id: str, **kwargs: Any) -> GgufQuantMetadata:
+            calls.append(1)
+            if len(calls) < 2:
+                raise HubModelPageUnavailable(
+                    repo_id, "HTTP 429", response=SimpleNamespace(status_code=429)
+                )
+            return metadata
+
+        with patch(
+            "llm_launchpad.core.quick_deploy_refresh.fetch_gguf_quant_metadata",
+            side_effect=flaky,
+        ), patch("llm_launchpad.core.quick_deploy_refresh.time.sleep"):
+            self.assertIs(_fetch_serving_metadata("org/model"), metadata)
+
+        self.assertEqual(len(calls), 2)
+
+    def test_the_catalog_asks_for_the_weight_sizes_it_cannot_work_without(self) -> None:
+        metadata = GgufQuantMetadata(quantizations=["Q4_K_M"], vram_gb_by_quant={"Q4_K_M": 4.7})
+        seen: list[dict[str, Any]] = []
+
+        def record(repo_id: str, **kwargs: Any) -> GgufQuantMetadata:
+            seen.append(kwargs)
+            return metadata
+
+        with patch(
+            "llm_launchpad.core.quick_deploy_refresh.fetch_gguf_quant_metadata",
+            side_effect=record,
+        ):
+            _fetch_serving_metadata("org/model")
+
+        self.assertTrue(seen[0]["require_weight_sizes"])
+
+    def test_an_unreadable_weight_table_is_excluded_as_a_hub_failure(self) -> None:
+        candidate = _aa_candidate("Compact Model", 27.0, 80.0, rank=63)
+        exclusions: list[Any] = []
+
+        def unreadable(repo_id: str) -> GgufQuantMetadata:
+            raise HubModelPageUnavailable(
+                repo_id, "HTTP 503", response=SimpleNamespace(status_code=503)
+            )
+
+        with patch(
+            "llm_launchpad.core.quick_deploy_refresh._fetch_serving_metadata",
+            side_effect=unreadable,
+        ):
+            resolved = _build_resolved_aa_model(
+                candidate,
+                [ModalGpuSpec("L4", 0.5)],
+                "unsloth/Compact-Model-GGUF",
+                exclusions=exclusions,
+            )
+
+        self.assertIsNone(resolved)
+        reason = exclusions[0].reason
+        # The old reading -- "no usable weight-size estimate" -- is a claim
+        # about the model, and it dropped top-ranked models on a throttled run.
+        self.assertIn("Hugging Face", reason)
+        self.assertIn("weight-size table", reason)
+        self.assertNotIn("No GGUF quantization", reason)
+
+    def test_a_rate_limited_weight_table_names_the_rate_limit(self) -> None:
+        candidate = _aa_candidate("Compact Model", 27.0, 80.0, rank=63)
+        exclusions: list[Any] = []
+
+        def throttled(repo_id: str) -> GgufQuantMetadata:
+            raise HubModelPageUnavailable(
+                repo_id, "HTTP 429", response=SimpleNamespace(status_code=429)
+            )
+
+        with patch(
+            "llm_launchpad.core.quick_deploy_refresh._fetch_serving_metadata",
+            side_effect=throttled,
+        ):
+            _build_resolved_aa_model(
+                candidate,
+                [ModalGpuSpec("L4", 0.5)],
+                "unsloth/Compact-Model-GGUF",
+                exclusions=exclusions,
+            )
+
+        self.assertIn("rate limit", exclusions[0].reason)
+
     def test_metadata_fetch_does_not_retry_a_permanent_failure(self) -> None:
         calls: list[int] = []
 
@@ -1153,6 +1342,49 @@ class StableProfileIdentityTests(unittest.TestCase):
         # hardware; only then is the id assertion meaningful.
         self.assertNotEqual(cheap_small.gpu_type, cheap_large.gpu_type)
         self.assertEqual(cheap_small.id, cheap_large.id)
+
+    def test_intermediate_quants_survive_selection_and_unplaced_recipes_stay(self) -> None:
+        metadata = GgufQuantMetadata(
+            quantizations=["Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0", "UD-Q2_K_XL"],
+            vram_gb_by_quant={
+                "Q4_K_M": 18.0,
+                "Q5_K_M": 21.0,
+                "Q6_K": 24.0,
+                "Q8_0": 30.0,
+                "UD-Q2_K_XL": 10.0,
+            },
+            block_count=65,
+            embedding_length=4096,
+            attention_head_count=32,
+            attention_head_count_kv=4,
+            attention_key_length=256,
+            attention_value_length=256,
+            architecture="qwen35",
+        )
+        selected = _selected_quants(metadata)
+        # The preference order still leads, but an intermediate width that
+        # fits its own hardware is no longer dropped before placement.
+        self.assertEqual(selected[0], "Q4_K_M")
+        self.assertIn("Q5_K_M", selected)
+        self.assertIn("UD-Q2_K_XL", selected)
+        from llm_launchpad.core.quick_deploy_refresh import _profiles_for_quant
+
+        unplaced = _profiles_for_quant(
+            repo_id="unsloth/Qwen3.8-27B-GGUF",
+            display_name="Qwen3.8 27B",
+            slug_hint="qwen3-8-27b",
+            context_tokens=65_536,
+            quant="Q8_0",
+            metadata=metadata,
+            modal_gpu_catalog=[],
+            llamacpp_runtime_id="runtime-1",
+            include_unplaced=True,
+        )
+        self.assertTrue(unplaced)
+        self.assertTrue(all(profile.gpu_count == 0 for profile in unplaced))
+        self.assertEqual(unplaced[0].resource_tier, "unplaced")
+        self.assertIsNotNone(unplaced[0].memory_estimate)
+        self.assertIsNotNone(unplaced[0].serving_requirements)
 
     def test_the_id_survives_an_upstream_display_name_change(self) -> None:
         catalog = [ModalGpuSpec("RTX-PRO-6000", 2.0)]

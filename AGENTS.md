@@ -3,7 +3,7 @@
 ## Project Structure & Module Organization
 - Core package code lives in `llm_launchpad/`.
 - CLI entrypoints are in `llm_launchpad/cli/`; `main.py` owns both the default TUI launch path and the headless Typer commands (`deploy`, `warmup`, `list`, `status`, `logs`, `stop`, `switch`, `gpu-types`).
-- Deployment and orchestration logic is under `llm_launchpad/core/`; keep subprocess and Modal CLI integration in `backend.py`, high-level workflows in `orchestrator.py`, auth helpers in `modal_auth.py`/`hf_auth.py`, naming logic in `naming.py`, and canonical backend script paths in `paths.py`. The Artificial Analysis client, its cache, and its row parsing live in `artificial_analysis.py`; `quick_deploy_refresh.py` builds the catalog on top of it.
+- Deployment and orchestration logic is under `llm_launchpad/core/`; keep subprocess and Modal CLI integration in `backend.py`, provider workflows in `orchestrator.py` behind `provider_adapters.py`, the deploy→warmup→cleanup sequence in `deployment_lifecycle.py`, request validation in `deployment_preflight.py`, and request/plan/result conversion in `quick_deploy.py`. Auth helpers live in `modal_auth.py`/`hf_auth.py`, naming logic in `naming.py`, and canonical backend script paths in `paths.py`. The Artificial Analysis client, its cache, and its row parsing live in `artificial_analysis.py`; `quick_deploy_refresh.py` builds the catalog on top of it.
 - Shared protocol/event models are in `llm_launchpad/protocol/` (`enums.py`, `events.py`, `models.py`) and should remain the contract between CLI, orchestrator, and TUI workers.
 - Textual UI code is in `llm_launchpad/tui/`; `app.py` is the entrypoint, `screens/` contains deploy/manage/monitor/settings/storage flows, `widgets/` holds reusable components, and `theme.tcss` defines styling.
 - Llama.cpp preset definitions live in `llm_launchpad/presets.py`.
@@ -24,9 +24,9 @@
 - Follow Python 3.12+ style with 4-space indentation and PEP 8 spacing.
 - Use type hints consistently: PEP 604 unions (`str | None`, not `Optional[str]`), built-in generics (`list[str]`, not `List[str]`), and concrete return types.
 - Keep functions/modules `snake_case`; classes `PascalCase`; constants `UPPER_SNAKE_CASE`.
-- Prefer small, focused helpers in `core/` and keep CLI command functions thin; push long-running behavior into orchestrator/backend helpers rather than growing Typer handlers.
-- Keep cross-layer data shapes in `protocol/` dataclasses/enums instead of ad hoc dictionaries.
-- Reuse `llm_launchpad/core/paths.py` and `BackendType.script` instead of hardcoding backend script paths in new code.
+- Prefer small, focused helpers in `core/` and keep CLI command functions thin; push long-running behavior into orchestrator/backend helpers rather than growing Typer handlers. New deployment behavior belongs in `deployment_lifecycle.py` (sequence), `deployment_preflight.py` (validation), or `provider_adapters.py` (provider differences) — not in duplicated CLI/TUI/worker branches.
+- Keep cross-layer data shapes in `protocol/` dataclasses/enums instead of ad hoc dictionaries. Deployment intent uses `DeploymentRequest`, resolved execution uses `ResolvedDeploymentPlan`, outcomes use `DeploymentAttemptOutcome`/`DeploymentResult`, and cost uses `CostEvaluation` attached to `InferencePlan`.
+- Reuse `llm_launchpad/core/paths.py` and the Modal adapter instead of hardcoding backend script paths in new code (`BackendType.script` is a compatibility accessor).
 - Reuse the shared helpers instead of re-deriving them: `core/coerce.py` for parsing untrusted scalars, `core/operation_events.py` (`fail_operation`) for ending a failed operation, and `tui/format.py` for money/size/clip formatting. Escape Rich markup with `rich.markup.escape`, never a hand-rolled replacement chain.
 - Use concise docstrings for public helpers and command behavior.
 

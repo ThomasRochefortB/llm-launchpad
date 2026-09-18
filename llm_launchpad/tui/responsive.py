@@ -14,6 +14,11 @@ NARROW_TERMINAL_WIDTH = 120
 COMPACT_TERMINAL_WIDTH = 80
 MINIMAL_TERMINAL_WIDTH = 60
 ULTRA_WIDE_TERMINAL_WIDTH = 180
+# Terminals at or below this height need vertical economy (reduced padding,
+# collapsed decorative content) but not the aggressive hiding that
+# SHORT_TERMINAL_HEIGHT applies. 80x24 is the motivating size: it is neither
+# narrow-compact nor short, yet still loses six-row tables to chrome.
+CONSTRAINED_TERMINAL_HEIGHT = 24
 SHORT_TERMINAL_HEIGHT = 20
 SHALLOW_TERMINAL_HEIGHT = 15
 
@@ -94,6 +99,11 @@ class ViewportProfile:
         return self.height_mode != HeightMode.TALL
 
     @property
+    def constrained(self) -> bool:
+        """Whether vertical economy rules apply without aggressive hiding."""
+        return self.height <= CONSTRAINED_TERMINAL_HEIGHT
+
+    @property
     def shallow(self) -> bool:
         return self.height_mode == HeightMode.SHALLOW
 
@@ -109,6 +119,8 @@ class ViewportProfile:
             classes.append("viewport-minimal")
         if self.short:
             classes.append("viewport-short")
+        if self.constrained:
+            classes.append("viewport-constrained")
         if self.shallow:
             classes.append("viewport-shallow")
         if self.ultra_wide:
@@ -126,6 +138,7 @@ RESPONSIVE_CLASS_NAMES = frozenset(
         "viewport-minimal",
         "viewport-narrow",
         "viewport-short",
+        "viewport-constrained",
         "viewport-shallow",
         "viewport-ultra-wide",
         "viewport-too-small",

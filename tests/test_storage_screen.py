@@ -6,7 +6,7 @@ from rich.markup import render as render_markup
 from textual.app import App
 from textual.coordinate import Coordinate
 from textual.screen import Screen
-from textual.widgets import DataTable, Input, OptionList, Select, Static
+from textual.widgets import Button, DataTable, Input, Select, Static
 
 from llm_launchpad.protocol.enums import BackendType
 from llm_launchpad.protocol.models import StorageSnapshot, StoredModelInfo
@@ -153,20 +153,11 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             screen = app.screen
             assert isinstance(screen, StorageScreen)
-            backend_filter = screen.query_one("#storage-backend-filter", OptionList)
-            self.assertTrue(backend_filter.has_focus)
-
-            highlighted = backend_filter.highlighted_option
-            self.assertIsNotNone(highlighted)
-            assert highlighted is not None
-            self.assertEqual(highlighted.id, "filter-vllm")
-
-            await pilot.press("up")
-            await pilot.pause()
-            highlighted = backend_filter.highlighted_option
-            self.assertIsNotNone(highlighted)
-            assert highlighted is not None
-            self.assertEqual(highlighted.id, "filter-llamacpp")
+            provider_filter = screen.query_one("#storage-provider-filter", Select)
+            backend_filter = screen.query_one("#storage-backend-filter", Select)
+            # Provider scope comes first; backend filter retains its selection.
+            self.assertTrue(provider_filter.has_focus)
+            self.assertEqual(backend_filter.value, BackendType.VLLM.value)
 
     async def test_down_from_backend_filter_with_initial_backend_moves_to_filter_input(self) -> None:
         app = _TestApp()
@@ -175,11 +166,10 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             screen = app.screen
             assert isinstance(screen, StorageScreen)
-            backend_filter = screen.query_one("#storage-backend-filter", OptionList)
+            backend_filter = screen.query_one("#storage-backend-filter", Select)
             table = screen.query_one("#storage-table", DataTable)
 
             backend_filter.focus()
-            backend_filter.highlighted = 2
             await pilot.pause()
 
             await pilot.press("down")
@@ -194,11 +184,10 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             screen = app.screen
             assert isinstance(screen, StorageScreen)
-            backend_filter = screen.query_one("#storage-backend-filter", OptionList)
+            backend_filter = screen.query_one("#storage-backend-filter", Select)
             table = screen.query_one("#storage-table", DataTable)
 
             backend_filter.focus()
-            backend_filter.highlighted = 2
             await pilot.pause()
             await pilot.press("down")
             await pilot.pause()
@@ -222,7 +211,7 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertTrue(filter_input.has_focus)
 
-    async def test_down_inside_table_moves_row_until_last_then_focuses_model_id(self) -> None:
+    async def test_down_inside_table_moves_row_until_last_then_focuses_filter(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:
             app.push_screen(StorageScreen())
@@ -230,7 +219,7 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
             screen = app.screen
             assert isinstance(screen, StorageScreen)
             table = screen.query_one("#storage-table", DataTable)
-            model_id = screen.query_one("#storage-model-id", Input)
+            search = screen.query_one("#storage-filter", Input)
 
             table.focus()
             table.move_cursor(row=0)
@@ -242,7 +231,7 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
 
             await pilot.press("down")
             await pilot.pause()
-            self.assertTrue(model_id.has_focus)
+            self.assertTrue(search.has_focus)
 
     async def test_up_from_table_first_row_moves_focus_to_backend_filter(self) -> None:
         app = _TestApp()
@@ -252,7 +241,7 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
             screen = app.screen
             assert isinstance(screen, StorageScreen)
             table = screen.query_one("#storage-table", DataTable)
-            backend_filter = screen.query_one("#storage-backend-filter", OptionList)
+            backend_filter = screen.query_one("#storage-backend-filter", Select)
 
             table.focus()
             table.move_cursor(row=0)
@@ -269,12 +258,16 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             screen = app.screen
             assert isinstance(screen, StorageScreen)
-            backend_filter = screen.query_one("#storage-backend-filter", OptionList)
+            provider_filter = screen.query_one("#storage-provider-filter", Select)
+            backend_filter = screen.query_one("#storage-backend-filter", Select)
 
             self.assertGreater(backend_filter.size.height, 0)
+            self.assertTrue(provider_filter.has_focus)
+            backend_filter.focus()
+            await pilot.pause()
             self.assertTrue(backend_filter.has_focus)
 
-    async def test_small_viewport_table_boundary_moves_to_model_id(self) -> None:
+    async def test_small_viewport_table_boundary_moves_to_filter(self) -> None:
         app = _TestApp()
         async with app.run_test(size=(100, 24)) as pilot:
             app.push_screen(StorageScreen())
@@ -282,7 +275,7 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
             screen = app.screen
             assert isinstance(screen, StorageScreen)
             table = screen.query_one("#storage-table", DataTable)
-            model_id = screen.query_one("#storage-model-id", Input)
+            search = screen.query_one("#storage-filter", Input)
 
             table.focus()
             await pilot.pause()
@@ -295,7 +288,7 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
 
             await pilot.press("down")
             await pilot.pause()
-            self.assertTrue(model_id.has_focus)
+            self.assertTrue(search.has_focus)
 
     async def test_initial_storage_load_refocuses_first_navigation_target(self) -> None:
         app = _DeferredRefreshApp()
@@ -305,14 +298,14 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
             screen = app.screen
             assert isinstance(screen, StorageScreen)
             table = screen.query_one("#storage-table", DataTable)
-            backend_filter = screen.query_one("#storage-backend-filter", OptionList)
+            provider_filter = screen.query_one("#storage-provider-filter", Select)
 
             app.deliver_snapshot()
             await pilot.pause()
             await pilot.pause()
 
             self.assertEqual(table.row_count, 2)
-            self.assertTrue(backend_filter.has_focus)
+            self.assertTrue(provider_filter.has_focus)
 
     async def test_predownload_uses_form_values(self) -> None:
         app = _TestApp()
@@ -325,6 +318,7 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
             screen.query_one("#storage-model-backend", Select).value = "llamacpp"
             screen.query_one("#storage-model-quant", Input).value = "Q4_K_M"
             screen.query_one("#storage-model-revision", Input).value = "main"
+            screen.action_toggle_predownload_form()
             screen.action_predownload_selected()
             self.assertEqual(len(app.predownload_calls), 1)
             backend, model_id, quant, revision = app.predownload_calls[0]
@@ -332,6 +326,30 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(model_id, "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF")
             self.assertEqual(quant, "Q4_K_M")
             self.assertEqual(revision, "main")
+
+    async def test_predownload_button_uses_form_values(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(StorageScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, StorageScreen)
+            screen.action_toggle_predownload_form()
+            screen.query_one("#storage-model-id", Input).value = "acme/model"
+            screen.query_one("#storage-predownload-btn", Button).press()
+            await pilot.pause()
+
+        self.assertEqual(app.predownload_calls[0][1], "acme/model")
+
+    async def test_predownload_key_acts_on_the_selected_row(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(StorageScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, StorageScreen)
+            screen.action_predownload_selected()
+            self.assertEqual(len(app.predownload_calls), 1)
 
     async def test_delete_requires_confirmation_before_calling_backend(self) -> None:
         app = _TestApp()

@@ -5,6 +5,7 @@ from pathlib import Path
 import stat
 import subprocess
 from tempfile import TemporaryDirectory
+import threading
 import unittest
 from unittest.mock import Mock, patch
 
@@ -12,16 +13,34 @@ from llm_launchpad.core.orchestrator import Orchestrator
 from llm_launchpad.core.connection_store import merge_connections
 from llm_launchpad.core.vast_backend import VastApiError, VastBackend
 from llm_launchpad.core.vast_deployment import (
-    VAST_PROVISION_STALL_SECONDS, VAST_READY_DEADLINE_SECONDS,
-    VastDeploymentBackend, vast_progress_key,
+    VAST_PULL_STALL_SECONDS, VAST_READY_DEADLINE_SECONDS, VAST_SSH_STALL_SECONDS,
+    VAST_KEY_GRACE_SECONDS,
+    VAST_STARTUP_HEARTBEAT_SECONDS,
+    VastDeploymentBackend, vast_progress_key, vast_startup_detail,
 )
 from llm_launchpad.core.vast_runtime import vast_runtime_image, vast_runtime_script, verify_endpoint_auth, verify_streaming
-from llm_launchpad.core.vast_ssh import VastSsh, ssh_key_startup
+from llm_launchpad.core.vast_ssh import (
+    SSH_REFUSED, SSH_REJECTED, SSH_THROTTLED, VastSsh, VastSshError, ssh_failure_reason,
+    ssh_key_startup,
+)
 from llm_launchpad.core.vast_state import VastState
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider, OperationType
 from llm_launchpad.protocol.events import OperationCompleteEvent
 from llm_launchpad.protocol.models import DeploymentConfig, VastAuthStatus, VastInstance, VastProviderOptions
 from tests.test_vast_fast_deploy import vast_offer
+
+
+class InstantEvent(threading.Event):
+    """A cancellation event whose timed waits return immediately.
+
+    Vast's provisioning loop backs off with ``cancellation.wait(...)`` between
+    polls -- 15s after a throttled status check, 3s otherwise. Those backoffs
+    are exactly what the throttling and stall tests drive, so the loop has to
+    keep running them; waiting them out in real time just costs wall clock.
+    """
+
+    def wait(self, timeout: float | None = None) -> bool:
+        return super().wait(0)
 
 
 def config() -> DeploymentConfig:
@@ -32,6 +51,111 @@ def config() -> DeploymentConfig:
         provider_options=VastProviderOptions("1001", 100, 0.42, "42"),
         gguf_architecture="llama", server_args="--ctx-size 4096 --n-gpu-layers all",
     )
+
+
+class SshFailureReasonTests(unittest.TestCase):
+    """A refused port and a denied key need opposite decisions, so they differ."""
+
+    def test_a_host_that_has_not_started_sshd_reads_as_refused(self) -> None:
+        for stderr in (
+            "ssh: connect to host ssh9.vast.ai port 29814: Connection refused",
+            "kex_exchange_identification: Connection closed by remote host",
+            "Connection reset by 1.2.3.4 port 29814",
+        ):
+            with self.subTest(stderr=stderr):
+                self.assertEqual(ssh_failure_reason(stderr), SSH_REFUSED)
+
+    def test_a_host_that_has_decided_reads_as_rejected(self) -> None:
+        for stderr in (
+            "root@ssh9.vast.ai: Permission denied (publickey).",
+            "No supported authentication methods available",
+        ):
+            with self.subTest(stderr=stderr):
+                self.assertEqual(ssh_failure_reason(stderr), SSH_REJECTED)
+
+    def test_an_attempt_limit_is_about_our_knocking_not_about_the_key(self) -> None:
+        """The proxy's rate limit is caused by this loop, so it decides nothing.
+
+        The deploy path already notes that hundreds of failed authentications
+        look like an attack to Vast's shared SSH proxy. Reading the limit that
+        provokes as a rejected key blames the rental for our own polling.
+        """
+        for stderr in (
+            "Received disconnect from 1.2.3.4: Too many authentication failures",
+            "Maximum authentication attempts exceeded for root",
+        ):
+            with self.subTest(stderr=stderr):
+                self.assertEqual(ssh_failure_reason(stderr), SSH_THROTTLED)
+                self.assertNotEqual(ssh_failure_reason(stderr), SSH_REJECTED)
+
+    def test_a_changed_host_key_is_its_own_reason_not_a_denial(self) -> None:
+        # The rental is reached through a shared proxy that answers before the
+        # container's sshd, so the key seen first is not always the final one.
+        # A denial-shaped reading of that ends a healthy rental in seconds.
+        for stderr in (
+            "Host key verification failed.",
+            "@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@",
+            "Offending ECDSA key for IP in /x/known_hosts:1",
+        ):
+            with self.subTest(stderr=stderr):
+                self.assertNotEqual(ssh_failure_reason(stderr), SSH_REJECTED)
+
+    def test_anything_unrecognised_is_not_guessed_into_a_decision(self) -> None:
+        # Unreachable keeps waiting, like a refusal: only a positive match on
+        # a denial is allowed to end a rental early.
+        self.assertEqual(ssh_failure_reason(""), "unreachable")
+        self.assertEqual(ssh_failure_reason("ssh: Could not resolve hostname"), "unreachable")
+
+    def test_the_raised_error_carries_the_reason_without_the_stderr(self) -> None:
+        error = VastSshError("Vast SSH command failed.", SSH_REJECTED)
+        self.assertEqual(error.reason, SSH_REJECTED)
+        self.assertNotIn("publickey", str(error))
+        # Callers that only know RuntimeError keep catching it.
+        self.assertIsInstance(error, RuntimeError)
+
+
+class StartupDetailTests(unittest.TestCase):
+    """What the startup heartbeat says, given what the host could be asked."""
+
+    def test_known_total_reports_percentage_rate_and_eta(self) -> None:
+        self.assertEqual(
+            vast_startup_detail(9_000_000_000, 3_000_000_000, 30, "", total=15_000_000_000),
+            "downloading weights (60%), 9.0 / 15.0 GB at 200 MB/s, ~30s remaining",
+        )
+
+    def test_active_download_cannot_claim_completion(self) -> None:
+        self.assertIn("(99%)", vast_startup_detail(1000, 500, 30, "", total=1000))
+        self.assertIn("(100%)", vast_startup_detail(1000, 500, 30, "", total=1000, active=False))
+
+    def test_known_total_starts_at_zero(self) -> None:
+        self.assertIn("(0%)", vast_startup_detail(0, 0, 30, "stale", total=1000))
+
+    def test_the_first_sample_reports_size_without_inventing_a_rate(self) -> None:
+        self.assertEqual(
+            vast_startup_detail(3_000_000_000, 0, 31.0, "stale log line"),
+            "downloading weights, 3.0 GB fetched",
+        )
+
+    def test_a_later_sample_reports_the_rate_it_measured(self) -> None:
+        self.assertEqual(
+            vast_startup_detail(9_000_000_000, 3_000_000_000, 30.0, ""),
+            "downloading weights, 9.0 GB fetched at 200 MB/s",
+        )
+
+    def test_a_download_that_gained_nothing_reports_size_only(self) -> None:
+        self.assertEqual(
+            vast_startup_detail(9_000_000_000, 9_000_000_000, 30.0, ""),
+            "downloading weights, 9.0 GB fetched",
+        )
+
+    def test_once_the_weights_land_the_server_log_takes_over(self) -> None:
+        self.assertEqual(
+            vast_startup_detail(0, 17_000_000_000, 30.0, "load_tensors: offloaded 63/63"),
+            "load_tensors: offloaded 63/63",
+        )
+
+    def test_nothing_measurable_says_so_rather_than_showing_an_empty_line(self) -> None:
+        self.assertEqual(vast_startup_detail(0, 0, 30.0, ""), "no progress reported yet")
 
 
 class VastLifecycleTests(unittest.TestCase):
@@ -53,9 +177,16 @@ class VastLifecycleTests(unittest.TestCase):
         for patcher in (
             patch.object(self.backend, "preflight", return_value=(True, "12", "")),
             patch("llm_launchpad.core.vast_runtime.get_token", return_value=None),
+            patch("llm_launchpad.core.vast_deployment.fetch_download_files", return_value=()),
             patch("llm_launchpad.core.vast_deployment.endpoint_healthy", return_value=True),
             patch("llm_launchpad.core.vast_deployment.verify_endpoint_auth"),
             patch("llm_launchpad.core.vast_deployment.is_shutting_down", return_value=False),
+            # Provisioning and teardown both back off between polls. The waits
+            # are what the retry tests are about, but serving them out in real
+            # time costs the suite more wall clock than every other Vast test
+            # combined.
+            patch("llm_launchpad.core.vast_deployment.time.sleep"),
+            patch("llm_launchpad.core.vast_deployment.threading.Event", InstantEvent),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -147,11 +278,12 @@ class VastLifecycleTests(unittest.TestCase):
         self.assertFalse(self.deploy().success)
         self.api.create_instance.assert_not_called()
 
-    def test_a_host_that_goes_silent_while_provisioning_is_given_back(self) -> None:
-        """Silence before SSH is reachable is a stuck host, not a slow one.
+    def test_a_reporting_host_that_goes_silent_is_given_back(self) -> None:
+        """A host that reports a step and never leaves it is stuck, not slow.
 
         Vast leaves ``actual_status`` on "loading" for the whole pull and
-        provisioning, so only ``status_msg`` distinguishes the two.
+        provisioning, so only ``status_msg`` distinguishes the two. This is the
+        live GTX 1650 wedge: one BuildKit line for 20 billed minutes.
         """
         def stalled_create(offer_id: str, **kwargs: object) -> str:
             self.remote = VastInstance(
@@ -161,17 +293,448 @@ class VastLifecycleTests(unittest.TestCase):
             return "900"
 
         self.api.create_instance.side_effect = stalled_create
-        # 100s of provisioning time per clock read closes the 360s stall window
-        # on the second pass, far short of the 1800s deadline.
+        # 100s of provisioning time per clock read closes the 900s pull window
+        # within a few passes, short of the 1800s deadline.
         clock = iter(range(0, 1_000_000, 100))
         with patch("llm_launchpad.core.vast_deployment.time.monotonic", side_effect=lambda: next(clock)):
             event = self.deploy()
 
         self.assertFalse(event.success)
         self.assertIn("stopped making progress", event.detail or "")
+        # Name the step it never left: without it the report says only that
+        # something was silent, which is what made the first one undiagnosable.
+        self.assertIn("Get:8 http://archive.ubuntu.com noble InRelease", event.detail or "")
         # The rental is handed back rather than billed out to the deadline.
         self.api.destroy_instance.assert_called_once_with("900")
         self.assertEqual(self.state.records(), [])
+
+    def test_a_running_host_that_will_not_answer_ssh_is_given_back(self) -> None:
+        """A running host that refuses SSH advances no work, so it is stuck.
+
+        Live evidence: a rental sat in ``running`` with its image up for the
+        full 1800s deadline, answering status polls but never SSH, billing
+        $0.015 for nothing. The installer had finished but the daemon never
+        started, and no further wait would have changed that. The stall clock
+        must therefore fire while the loop is knocking on a running host,
+        while a host still pulling its image keeps the full deadline.
+        """
+        def running_create(offer_id: str, **kwargs: object) -> str:
+            self.remote = VastInstance(
+                "900", str(kwargs["label"]), "running", "42",
+                ssh_host="ssh12.vast.ai", ssh_port=1234,
+                status_msg="success, running ghcr.io/ggml-org/llama.cpp",
+            )
+            return "900"
+
+        self.api.create_instance.side_effect = running_create
+        self.ssh.run.side_effect = RuntimeError("connection refused")
+        # The SSH knock's own backoff doubles to 60s, so a 100s clock step
+        # sails past both the stall window and the deadline in one jump and
+        # the loop reports the deadline instead. Step 10s at a time so the
+        # stall branch wins while the deadline is still far away.
+        clock = iter(range(0, 1_000_000, 10))
+        with patch("llm_launchpad.core.vast_deployment.time.monotonic", side_effect=lambda: next(clock)):
+            event = self.deploy()
+
+        self.assertFalse(event.success)
+        self.assertIn("stopped making progress", event.detail or "")
+        self.api.destroy_instance.assert_called_once_with("900")
+        self.assertEqual(self.state.records(), [])
+
+    def test_a_host_still_installing_sshd_is_not_given_back_at_the_old_window(self) -> None:
+        """The wait that was killing healthy rentals, at the length that killed one.
+
+        A live RTX PRO 6000 refused SSH for 378s while it was still installing
+        its SSH server and was destroyed for it, which cost the rental and the
+        eight minutes of the retry. The fastest success on record answered at
+        386.6s, so the old 360s window closed on working hosts. Refuse for
+        longer than that here and then answer: the loop has to still be there.
+        """
+        def running_create(offer_id: str, **kwargs: object) -> str:
+            self.remote = VastInstance(
+                "900", str(kwargs["label"]), "running", "42",
+                ssh_host="ssh12.vast.ai", ssh_port=1234,
+                status_msg="success, running ghcr.io/ggml-org/llama.cpp",
+            )
+            return "900"
+
+        self.api.create_instance.side_effect = running_create
+        clock = [0.0]
+        refusals = [0]
+
+        def remote(instance: object, command: str, **kwargs: object) -> str:
+            if command == "true":
+                refusals[0] += 1
+                # 400s of refusals: past the window that destroyed the live
+                # rental, short of the one the evidence supports.
+                if clock[0] < 400:
+                    raise VastSshError("refused", SSH_REFUSED)
+                return ""
+            return self.gpu_inventory if "nvidia-smi" in command else ""
+
+        self.ssh.run.side_effect = remote
+
+        def tick() -> float:
+            clock[0] += 5.0
+            return clock[0]
+
+        with patch("llm_launchpad.core.vast_deployment.time.monotonic", side_effect=tick):
+            event = self.deploy()
+
+        self.assertTrue(event.success, event.detail)
+        self.assertGreater(refusals[0], 1)
+        self.api.destroy_instance.assert_not_called()
+
+    def _running_host(self) -> None:
+        def running_create(offer_id: str, **kwargs: object) -> str:
+            self.remote = VastInstance(
+                "900", str(kwargs["label"]), "running", "42",
+                ssh_host="ssh12.vast.ai", ssh_port=1234,
+                status_msg="success, running ghcr.io/ggml-org/llama.cpp",
+            )
+            return "900"
+
+        self.api.create_instance.side_effect = running_create
+
+    def test_a_key_denied_before_the_key_is_installed_is_not_an_answer(self) -> None:
+        """Vast attaches the key asynchronously, so the first denial means nothing.
+
+        Live evidence: an RTX PRO 6000 WS rental was destroyed 49.7s into its
+        deploy, one second after Vast reported the host running, because the
+        first knock was denied while authorized_keys was still being written.
+        Inside the grace window a denial is provisioning, not a decision.
+        """
+        self._running_host()
+        clock = [0.0]
+        knocks = [0]
+
+        def remote(instance: object, command: str, **kwargs: object) -> str:
+            if command == "true":
+                knocks[0] += 1
+                if clock[0] < VAST_KEY_GRACE_SECONDS - 30:
+                    raise VastSshError("denied", SSH_REJECTED)
+                return ""
+            return self.gpu_inventory if "nvidia-smi" in command else ""
+
+        self.ssh.run.side_effect = remote
+
+        def tick() -> float:
+            clock[0] += 5.0
+            return clock[0]
+
+        with patch("llm_launchpad.core.vast_deployment.time.monotonic", side_effect=tick):
+            event = self.deploy()
+
+        self.assertTrue(event.success, event.detail)
+        self.assertGreater(knocks[0], 1)
+        self.api.destroy_instance.assert_not_called()
+
+    def test_a_throttled_knock_never_ends_the_rental(self) -> None:
+        """An attempt limit must outlast the grace window without deciding."""
+        self._running_host()
+        clock = [0.0]
+
+        def remote(instance: object, command: str, **kwargs: object) -> str:
+            if command == "true":
+                # Well past the key grace window: a denial here would end it.
+                if clock[0] < VAST_KEY_GRACE_SECONDS * 2:
+                    raise VastSshError("throttled", SSH_THROTTLED)
+                return ""
+            return self.gpu_inventory if "nvidia-smi" in command else ""
+
+        self.ssh.run.side_effect = remote
+
+        def tick() -> float:
+            clock[0] += 5.0
+            return clock[0]
+
+        with patch("llm_launchpad.core.vast_deployment.time.monotonic", side_effect=tick):
+            event = self.deploy()
+
+        self.assertTrue(event.success, event.detail)
+        self.api.destroy_instance.assert_not_called()
+
+    def test_a_key_still_denied_after_the_grace_window_is_given_back(self) -> None:
+        """A denial that outlives key installation is decided, so it ends the rental.
+
+        This is the case the SSH stall window was really aimed at, and timing
+        it at 900s was the wrong instrument: the host has answered, so the
+        answer is available long before the window that watches silence.
+        """
+        self._running_host()
+        clock = [0.0]
+
+        def remote(instance: object, command: str, **kwargs: object) -> str:
+            if command == "true":
+                raise VastSshError("denied", SSH_REJECTED)
+            return self.gpu_inventory if "nvidia-smi" in command else ""
+
+        self.ssh.run.side_effect = remote
+
+        def tick() -> float:
+            clock[0] += 5.0
+            return clock[0]
+
+        with patch("llm_launchpad.core.vast_deployment.time.monotonic", side_effect=tick):
+            event = self.deploy()
+
+        self.assertFalse(event.success)
+        self.assertIn("refused the deployment key", event.detail or "")
+        # Decided well inside the window that watches a silent host.
+        self.assertLess(clock[0], VAST_SSH_STALL_SECONDS)
+        self.api.destroy_instance.assert_called_once_with("900")
+        self.assertEqual(self.state.records(), [])
+
+    def test_a_changed_host_key_while_provisioning_is_not_a_denied_key(self) -> None:
+        """The proxy answers before the rental's own sshd, so the key can change.
+
+        Reading that as an authentication decision ends a healthy rental in
+        the first seconds, which is what a denial-shaped classification did.
+        """
+        self.assertEqual(
+            ssh_failure_reason(
+                "@@@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @@@\n"
+                "Host key verification failed."
+            ),
+            "host-key",
+        )
+        self._running_host()
+        clock = [0.0]
+
+        def remote(instance: object, command: str, **kwargs: object) -> str:
+            if command == "true":
+                if clock[0] < 300:
+                    raise VastSshError("host key changed", "host-key")
+                return ""
+            return self.gpu_inventory if "nvidia-smi" in command else ""
+
+        self.ssh.run.side_effect = remote
+
+        def tick() -> float:
+            clock[0] += 5.0
+            return clock[0]
+
+        with patch("llm_launchpad.core.vast_deployment.time.monotonic", side_effect=tick):
+            event = self.deploy()
+
+        self.assertTrue(event.success, event.detail)
+        self.api.destroy_instance.assert_not_called()
+
+    def test_a_host_that_reports_nothing_is_never_called_stalled(self) -> None:
+        """An empty status line is no signal, so it cannot be a stall signal.
+
+        Vast leaves ``status_msg`` empty for stretches of a healthy pull -- the
+        certified rental logged a docker line at 32s and nothing at 64s -- and
+        a sibling rental reached SSH only at 386.6s. Reading that silence as a
+        wedge destroyed hosts that were still minutes from working, so a host
+        reporting nothing keeps the full deadline and only the deadline.
+        """
+        clock = [0.0]
+        polls = 0
+
+        def silent_create(offer_id: str, **kwargs: object) -> str:
+            self.remote = VastInstance("900", str(kwargs["label"]), "loading", "42")
+            return "900"
+
+        def silent_get(_: str) -> VastInstance | None:
+            # One clock step per poll, so the loop's own progress is the only
+            # thing that advances time and the silence below is exact.
+            nonlocal polls
+            polls += 1
+            clock[0] += 200.0
+            assert self.remote is not None
+            if polls >= 7:  # 1400s in: past the 900s window, inside the 1800s deadline.
+                self.remote = VastInstance(
+                    "900", self.remote.label, "running", "42", "ssh12.vast.ai", 1234,
+                )
+            return self.remote
+
+        self.api.create_instance.side_effect = silent_create
+        self.api.get_instance.side_effect = silent_get
+        with patch("llm_launchpad.core.vast_deployment.time.monotonic", side_effect=lambda: clock[0]):
+            event = self.deploy()
+
+        self.assertTrue(event.success, event.detail)
+        self.assertGreater(polls, 5)  # It really did sit out the pull window.
+        self.api.destroy_instance.assert_not_called()
+
+    def test_a_running_host_still_pulling_keeps_the_full_deadline(self) -> None:
+        """A loading host is not knocking on anything, so it keeps the deadline.
+
+        The same silent status key that means "stuck" on a running host is
+        normal while the image is still being pulled: no SSH address exists
+        yet, so there is nothing to knock on.
+        """
+        seen: list[str] = []
+        running: VastInstance | None = None
+
+        def flapping_create(offer_id: str, **kwargs: object) -> str:
+            nonlocal running
+            label = str(kwargs["label"])
+            self.remote = VastInstance(
+                "900", label, "loading", "42",
+                status_msg="#6 1.0 Get:8 http://archive.ubuntu.com noble InRelease",
+            )
+            # The running twin carries this rental's own label: the identity
+            # check refuses a host whose label changed mid-flight.
+            running = VastInstance(
+                "900", label, "running", "42",
+                ssh_host="ssh12.vast.ai", ssh_port=1234,
+                status_msg="success, running ghcr.io/ggml-org/llama.cpp",
+            )
+            return "900"
+
+        self.api.create_instance.side_effect = flapping_create
+
+        def flapping_get(_: str) -> VastInstance | None:
+            assert self.remote is not None
+            seen.append(self.remote.state)
+            # Once the image is up SSH answers. Flipping on the second poll
+            # proves the loop survives a silent loading state without
+            # tripping the stall clock.
+            if len(seen) > 1:
+                assert running is not None
+                self.remote = running
+            return self.remote
+
+        self.api.get_instance.side_effect = flapping_get
+        event = self.deploy()
+
+        self.assertTrue(event.success, event.detail)
+        self.assertEqual(seen[0], "loading")
+
+    def test_the_model_startup_wait_reports_what_the_runtime_is_doing(self) -> None:
+        """The longest wait of a deploy has to keep saying it is a wait.
+
+        Weights arrive with the server log holding one stale line, so a silent
+        loop here showed "Rented GPUs" until the endpoint answered: ten quiet
+        minutes that read as a hang and got a paying rental killed by hand.
+        """
+        clock = {"now": 0.0}
+        fetched = iter([3_000_000_000, 9_000_000_000, 17_000_000_000])
+        polls: list[int] = []
+
+        def healthy(*_: object) -> bool:
+            polls.append(len(polls))
+            if len(polls) > 3:
+                return True
+            # Each poll carries the wait past one heartbeat window.
+            clock["now"] += VAST_STARTUP_HEARTBEAT_SECONDS + 1
+            return False
+
+        def remote(instance: object, command: str, **kwargs: object) -> str:
+            if "nvidia-smi" in command:
+                return self.gpu_inventory
+            if "downloadInProgress" in command:
+                return f"BYTES {next(fetched)}\nLOG waiting on weights\n"
+            return ""
+
+        self.ssh.run.side_effect = remote
+        with (
+            patch("llm_launchpad.core.vast_deployment.endpoint_healthy", healthy),
+            patch(
+                "llm_launchpad.core.vast_deployment.time.monotonic",
+                lambda: clock["now"],
+            ),
+        ):
+            events = list(self.backend.deploy(self.config))
+
+        lines = [
+            event.line for event in events
+            if getattr(event, "line", "").startswith("Vast model starting:")
+        ]
+        self.assertEqual(lines, [
+            "Vast model starting: downloading weights, 3.0 GB fetched (waiting 31s)",
+            "Vast model starting: downloading weights, 9.0 GB fetched at 194 MB/s"
+            " (waiting 1m02s)",
+            "Vast model starting: downloading weights, 17.0 GB fetched at 258 MB/s"
+            " (waiting 1m33s)",
+        ])
+        # The probe rides the tunnel the deploy already opened rather than
+        # dialling Vast's shared SSH proxy once per heartbeat.
+        probes = [
+            call for call in self.ssh.run.call_args_list
+            if "downloadInProgress" in call.args[1]
+        ]
+        self.assertEqual(len(probes), 3)
+        self.assertTrue(all(call.kwargs.get("multiplex") for call in probes))
+
+    def test_a_probe_the_host_cannot_answer_never_ends_a_paid_deploy(self) -> None:
+        clock = {"now": 0.0}
+        polls: list[int] = []
+
+        def healthy(*_: object) -> bool:
+            polls.append(len(polls))
+            if len(polls) > 1:
+                return True
+            clock["now"] += VAST_STARTUP_HEARTBEAT_SECONDS + 1
+            return False
+
+        def remote(instance: object, command: str, **kwargs: object) -> str:
+            if "nvidia-smi" in command:
+                return self.gpu_inventory
+            if "downloadInProgress" in command:
+                raise RuntimeError("Vast SSH command failed.")
+            return ""
+
+        self.ssh.run.side_effect = remote
+        with (
+            patch("llm_launchpad.core.vast_deployment.endpoint_healthy", healthy),
+            patch(
+                "llm_launchpad.core.vast_deployment.time.monotonic",
+                lambda: clock["now"],
+            ),
+        ):
+            events = list(self.backend.deploy(self.config))
+
+        completion = next(
+            event for event in reversed(events)
+            if isinstance(event, OperationCompleteEvent)
+        )
+        self.assertTrue(completion.success, completion.detail)
+        self.assertIn(
+            "Vast model starting: still starting (waiting 31s)",
+            [getattr(event, "line", "") for event in events],
+        )
+
+    def test_shard_progress_completes_once_then_reports_loading(self) -> None:
+        from llm_launchpad.core.vast_download import DownloadFile
+
+        clock = {"now": 0.0}
+        samples = iter([
+            "FILE 500 8 models/blobs/a.downloadInProgress",
+            "FILE 1000 8 models/blobs/a\nFILE 500 8 models/blobs/b.downloadInProgress",
+            "FILE 1000 8 models/blobs/a\nFILE 1000 8 models/blobs/b",
+            "FILE 1000 8 models/blobs/a\nFILE 1000 8 models/blobs/b",
+        ])
+
+        def healthy(*_: object) -> bool:
+            clock["now"] += 31
+            return clock["now"] > 124
+
+        def remote(instance: object, command: str, **kwargs: object) -> str:
+            if "nvidia-smi" in command:
+                return self.gpu_inventory
+            if "downloadInProgress" in command:
+                return next(samples) + "\nLOG load_tensors: loading model tensors\n"
+            return ""
+
+        self.ssh.run.side_effect = remote
+        with (
+            patch("llm_launchpad.core.vast_deployment.fetch_download_files", return_value=(
+                DownloadFile("models/blobs/a", 1000, "q4"),
+                DownloadFile("models/blobs/b", 1000, "q4"),
+            )),
+            patch("llm_launchpad.core.vast_deployment.endpoint_healthy", healthy),
+            patch("llm_launchpad.core.vast_deployment.time.monotonic", lambda: clock["now"]),
+        ):
+            events = list(self.backend.deploy(self.config))
+        lines = [event.line for event in events if getattr(event, "line", "").startswith("Vast model starting:")]
+        self.assertEqual(len(lines), 4)
+        for line, pct in zip(lines[:3], (25, 75, 100), strict=True):
+            self.assertIn(f"({pct}%)", line)
+        self.assertIn("load_tensors: loading model tensors", lines[3])
+        self.assertTrue(next(event for event in reversed(events) if isinstance(event, OperationCompleteEvent)).success)
 
     def test_incompatible_or_unknown_cuda_driver_cannot_rent(self) -> None:
         for version in (None, 12.6):
@@ -264,10 +827,20 @@ class VastLifecycleTests(unittest.TestCase):
         self.assertEqual(self.state.records(), [])
 
     def test_uncertain_create_blocks_repeat_and_disables_fallback(self) -> None:
+        from llm_launchpad.core.provider_adapters import rollback_from_event
+
         self.api.create_instance.side_effect = VastApiError("timeout")
         self.config.fallback_configs = (config(),)
-        self.assertFalse(self.deploy().success)
-        self.assertEqual(self.config.fallback_configs, ())
+        events = list(self.backend.deploy(self.config))
+        failure = next(event for event in reversed(events) if isinstance(event, OperationCompleteEvent))
+        self.assertFalse(failure.success)
+        # Provider no longer mutates the approved ladder; it reports an
+        # unconfirmed rollback so the lifecycle blocks the next rental.
+        self.assertEqual(len(self.config.fallback_configs), 1)
+        rollback = rollback_from_event(failure)
+        self.assertIsNotNone(rollback)
+        assert rollback is not None
+        self.assertFalse(rollback.confirmed)
         self.assertEqual(len(self.state.records()), 1)
         self.assertFalse(self.deploy().success)
         self.api.create_instance.assert_called_once()
@@ -294,10 +867,20 @@ class VastLifecycleTests(unittest.TestCase):
         self.api.create_instance.assert_not_called()
 
     def test_existing_rental_blocks_fallback_and_external_destruction_is_visible(self) -> None:
+        from llm_launchpad.core.provider_adapters import rollback_from_event
+
         self.assertTrue(self.deploy().success)
         self.config.fallback_configs = (config(),)
-        self.assertFalse(self.deploy().success)
-        self.assertEqual(self.config.fallback_configs, ())
+        events = list(self.backend.deploy(self.config))
+        failure = next(event for event in reversed(events) if isinstance(event, OperationCompleteEvent))
+        self.assertFalse(failure.success)
+        # The provider reports the conflict; the lifecycle (not a mutation of
+        # the approved ladder) owns blocking the retry.
+        self.assertEqual(len(self.config.fallback_configs), 1)
+        rollback = rollback_from_event(failure)
+        self.assertIsNotNone(rollback)
+        assert rollback is not None
+        self.assertFalse(rollback.confirmed)
         self.remote = None
         row = self.backend.list_deployments()[0]
         self.assertEqual(row.state, "destroyed")
@@ -501,8 +1084,7 @@ class VastTeardownThrottlingTests(VastLifecycleTests):
         self.api.get_instance.side_effect = [
             VastApiError("throttled", status_code=429), self.remote, None,
         ]
-        with patch("llm_launchpad.core.vast_deployment.time.sleep"):
-            self.backend.destroy(instance_id="900")
+        self.backend.destroy(instance_id="900")
         self.api.destroy_instance.assert_called_once_with("900")
         self.assertEqual(self.state.records(), [])
 
@@ -515,8 +1097,7 @@ class VastTeardownThrottlingTests(VastLifecycleTests):
             raise VastApiError("request timed out")
 
         self.api.create_instance.side_effect = uncertain
-        with patch("llm_launchpad.core.vast_deployment.time.sleep"):
-            self.assertFalse(self.deploy().success)
+        self.assertFalse(self.deploy().success)
         self.api.create_instance.assert_called_once()
         self.api.destroy_instance.assert_called_once_with("900")
         self.assertEqual(self.state.records(), [])
@@ -524,9 +1105,8 @@ class VastTeardownThrottlingTests(VastLifecycleTests):
     def test_persistent_identity_throttle_preserves_rental_record(self) -> None:
         self.deploy()
         self.api.get_instance.side_effect = VastApiError("throttled", status_code=429)
-        with patch("llm_launchpad.core.vast_deployment.time.sleep"):
-            with self.assertRaises(VastApiError):
-                self.backend.destroy(instance_id="900")
+        with self.assertRaises(VastApiError):
+            self.backend.destroy(instance_id="900")
         self.api.destroy_instance.assert_not_called()
         self.assertIsNotNone(self.state.load(self.config.app_name or ""))
 
@@ -545,8 +1125,7 @@ class VastTeardownThrottlingTests(VastLifecycleTests):
             real(instance_id)
 
         self.api.destroy_instance.side_effect = throttle_once
-        with patch("llm_launchpad.core.vast_deployment.time.sleep"):
-            self.backend.destroy(name=record.name, instance_id="900")
+        self.backend.destroy(name=record.name, instance_id="900")
         self.assertIsNone(self.state.load(record.name))
         self.assertIsNone(self.remote)
 
@@ -555,9 +1134,8 @@ class VastTeardownThrottlingTests(VastLifecycleTests):
         record = self.state.load(self.config.app_name or "")
         assert record is not None
         self.api.destroy_instance.side_effect = VastApiError("nope", status_code=429)
-        with patch("llm_launchpad.core.vast_deployment.time.sleep"):
-            with self.assertRaises(VastApiError):
-                self.backend.destroy(name=record.name, instance_id="900")
+        with self.assertRaises(VastApiError):
+            self.backend.destroy(name=record.name, instance_id="900")
         # The record must survive so the rental can still be reclaimed.
         self.assertIsNotNone(self.state.load(record.name))
 
@@ -662,4 +1240,11 @@ class VastProvisioningProgressTests(unittest.TestCase):
         # The old limits were 900s for llama.cpp and 1800s for vLLM, scaled on
         # image size. Nothing in the wait scales with the image.
         self.assertEqual(VAST_READY_DEADLINE_SECONDS, 1800)
-        self.assertLess(VAST_PROVISION_STALL_SECONDS, VAST_READY_DEADLINE_SECONDS)
+        self.assertLess(VAST_PULL_STALL_SECONDS, VAST_READY_DEADLINE_SECONDS)
+        self.assertLess(VAST_SSH_STALL_SECONDS, VAST_READY_DEADLINE_SECONDS)
+        # A rental that reached SSH at 386.6s is the measurement both windows
+        # have to clear: inside it, a healthy host gets handed back. The SSH
+        # window used to sit at 360s, under that success rather than over it,
+        # and destroyed a live rental after 378s of refusals.
+        self.assertGreater(VAST_PULL_STALL_SECONDS, 386.6)
+        self.assertGreater(VAST_SSH_STALL_SECONDS, 386.6)

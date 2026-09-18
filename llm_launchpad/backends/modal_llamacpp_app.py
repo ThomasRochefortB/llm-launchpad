@@ -4,6 +4,7 @@ from typing import Any
 from collections.abc import Callable, Iterator, Sequence
 import json
 import os
+import threading
 import time
 import fnmatch
 import hashlib
@@ -129,8 +130,8 @@ SERVE_STARTUP_TIMEOUT_MINUTES = _read_int_env("LLAMACPP_SERVE_STARTUP_TIMEOUT_MI
 WARM_VOLUME = _read_bool_env("LLAMACPP_WARM_VOLUME", True)
 VOLUME_WARM_CHUNK_BYTES = _read_int_env("LLAMACPP_VOLUME_WARM_CHUNK_BYTES", 16 * 1024 * 1024)
 VOLUME_WARM_LOG_INTERVAL_SECONDS = _read_int_env("LLAMACPP_VOLUME_WARM_LOG_INTERVAL_SECONDS", 10)
-HF_HUB_DISABLE_XET_DEFAULT = _read_bool_env("HF_HUB_DISABLE_XET", True)
-HF_XET_HIGH_PERFORMANCE_DEFAULT = _read_optional_bool_env("HF_XET_HIGH_PERFORMANCE")
+HF_HUB_DISABLE_XET_DEFAULT = _read_bool_env("HF_HUB_DISABLE_XET", False)
+HF_XET_HIGH_PERFORMANCE_DEFAULT = _read_bool_env("HF_XET_HIGH_PERFORMANCE", True)
 LLAMA_CPP_IMAGE_REF = (
     os.environ.get(
         "LLAMA_CPP_IMAGE_REF",
@@ -177,6 +178,12 @@ _GGUF_SPLIT_RE = re.compile(r"-(\d+)-of-(\d+)\.gguf$", flags=re.IGNORECASE)
 
 
 def _download_image_env() -> dict[str, str]:
+    """Download env shared by the Modal image and fresh worker subprocesses.
+
+    Mirrors ``core.hf_download.hf_download_env`` defaults: Xet enabled with
+    high-performance mode unless explicitly disabled. Kept inline so the
+    remote module stays self-contained.
+    """
     env = {
         "HF_HUB_ETAG_TIMEOUT": "30",
         "HF_HUB_DOWNLOAD_TIMEOUT": "120",
@@ -186,6 +193,61 @@ def _download_image_env() -> dict[str, str]:
     elif HF_XET_HIGH_PERFORMANCE_DEFAULT:
         env["HF_XET_HIGH_PERFORMANCE"] = "1"
     return env
+
+
+def _describe_transport_env(env: dict[str, str]) -> str:
+    """Short transport label for download logs (mirrors core.hf_download)."""
+    if _env_value_is_true(env.get("HF_HUB_DISABLE_XET")):
+        return "http"
+    if _env_value_is_true(env.get("HF_XET_HIGH_PERFORMANCE")):
+        return "xet-high-performance"
+    return "xet"
+
+
+def _classify_download_failure(output: str) -> str | None:
+    """Classify a failure as non-retryable (mirrors core.hf_download)."""
+    text = (output or "").lower()
+    if not text.strip():
+        return None
+    if any(
+        marker in text
+        for marker in (
+            "401",
+            "403",
+            "unauthorized",
+            "forbidden",
+            "invalid token",
+            "invalid hf_token",
+            "gated repo",
+            "access denied",
+        )
+    ):
+        return "auth"
+    if any(
+        marker in text
+        for marker in (
+            "404",
+            "repository not found",
+            "repo not found",
+            "revision not found",
+            "no such revision",
+            "entry not found",
+            "does not exist",
+        )
+    ):
+        return "not_found"
+    if any(
+        marker in text
+        for marker in (
+            "no space left",
+            "disk quota",
+            "enospc",
+            "no space on device",
+            "volume out of space",
+        )
+    ):
+        return "no_space"
+    return None
 
 
 def _load_config() -> dict[str, Any]:
@@ -585,10 +647,114 @@ def _gguf_weight_paths(entrypoint: Path | str) -> list[Path]:
     return [found[index] for index in sorted(found)]
 
 
+# --- Volume hydration caching
+# The first GPU mmap after a large volume write can exceed 30 minutes on a
+# cold Modal volume (GLM-5.3-Flash ~109GiB); sequential hydration covers that
+# first read, and later starts stay fast because pages remain hot. A hydration
+# marker per snapshot makes "already hydrated" cheap: an empty string means
+# skip the cache entirely, "marker" trusts the marker (default), "always"
+# preserves the old behaviour of hydrating on every start.
+HYDRATION_MARKER_DIRNAME = ".llm-launchpad-hydrated"
+# ``or "marker"`` here would fold an explicit empty value back into the default,
+# making the documented skip mode unreachable while the error below went on
+# advertising it. Only an unset variable takes the default.
+LLAMACPP_HYDRATION_MODE = os.environ.get(
+    "LLAMACPP_HYDRATION_MODE", "marker"
+).strip().casefold()
+if LLAMACPP_HYDRATION_MODE not in {"", "marker", "always"}:
+    raise RuntimeError(
+        f"Environment variable LLAMACPP_HYDRATION_MODE must be one of "
+        f"'marker', 'always', or empty (skip), got: {LLAMACPP_HYDRATION_MODE!r}"
+    )
+
+
+def _hub_snapshot_name(model_path: Path | str) -> str | None:
+    """Return the HF snapshot directory name containing a weight file."""
+    try:
+        parts = Path(model_path).resolve().parts
+    except OSError:
+        parts = Path(model_path).parts
+    if "snapshots" in parts:
+        index = len(parts) - 1 - parts[::-1].index("snapshots")
+        if index + 1 < len(parts):
+            return parts[index + 1]
+    return None
+
+
+def _hydration_marker_path(repo_id: str | None, snapshot: str | None) -> Path:
+    """Location of the marker proving one snapshot's weights were hydrated."""
+    repo_slug = _hub_repo_slug((repo_id or "").strip() or "unknown")
+    snap = (snapshot or "").strip() or "unknown"
+    safe_snap = "".join(
+        ch if ch.isalnum() or ch in {"-", "_", "."} else "-" for ch in snap
+    ).strip("-.") or "unknown"
+    return (
+        Path(HF_CACHE_DIR) / HYDRATION_MARKER_DIRNAME / repo_slug / f"{safe_snap}.json"
+    )
+
+
+def _hydration_fingerprint(paths: Sequence[Path | str]) -> list[dict[str, Any]]:
+    """Describe weight files so a later start can confirm nothing changed."""
+    entries: list[dict[str, Any]] = []
+    for raw in paths:
+        path = Path(raw)
+        try:
+            resolved = str(path.resolve())
+        except OSError:
+            resolved = str(path)
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = -1
+        entries.append({"path": resolved, "size": size})
+    return entries
+
+
+def _hydration_marker_matches(
+    marker_path: Path, paths: Sequence[Path | str]
+) -> bool:
+    """Check whether the marker proves these exact weight files were hydrated."""
+    try:
+        payload = json.loads(marker_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    recorded = payload.get("files")
+    if not isinstance(recorded, list):
+        return False
+    return recorded == _hydration_fingerprint(paths)
+
+
+def _write_hydration_marker(
+    marker_path: Path, paths: Sequence[Path | str]
+) -> None:
+    """Record that these exact weight files were read end to end."""
+    try:
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "files": _hydration_fingerprint(paths),
+                    "hydrated_at_epoch": time.time(),
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        # A missing marker only means the next start hydrates again; never
+        # fail a serve for bookkeeping.
+        print(f"🦙 hydration marker write skipped: {exc}")
+
+
 def _warm_volume_paths(
     paths: Sequence[Path | str],
     *,
     chunk_bytes: int | None = None,
+    record_marker: Path | None = None,
 ) -> None:
     """Read weight files sequentially so the first GPU mmap is not a cold volume fault."""
     chunk = VOLUME_WARM_CHUNK_BYTES if chunk_bytes is None else chunk_bytes
@@ -648,6 +814,24 @@ def _warm_volume_paths(
         f"🦙 volume warm complete: {done / (1024 ** 3):.2f}GiB in {elapsed:.1f}s "
         f"({rate:.2f}MiB/s)"
     )
+    if record_marker is not None:
+        _write_hydration_marker(record_marker, files)
+
+
+def _should_hydrate_volume(
+    marker_path: Path | None, warm_paths: list[Path | str]
+) -> bool:
+    """Decide whether the expensive pre-bind sequential read can be skipped."""
+    if LLAMACPP_HYDRATION_MODE == "":
+        return False
+    if LLAMACPP_HYDRATION_MODE == "always" or marker_path is None:
+        return WARM_VOLUME
+    if not WARM_VOLUME:
+        return False
+    if _hydration_marker_matches(marker_path, warm_paths):
+        print("🦙 volume already hydrated for this snapshot; skipping warm read")
+        return False
+    return True
 
 
 def _download_lease_key(repo_id: str, revision: str | None) -> str:
@@ -776,10 +960,14 @@ def _serving_image() -> modal.Image:
         cuda_arch = os.environ.get("LLAMA_CPP_CUDA_ARCHITECTURES", "").strip()
         if cuda_arch and cuda_arch not in {"75", "80", "86", "89", "90", "100", "120"}:
             raise ValueError(f"Unknown CUDA architecture: {cuda_arch}")
+        build_jobs = os.environ.get("LLAMA_CPP_BUILD_JOBS", "").strip() or "4"
         runtime_image = modal.Image.from_dockerfile(
             Path(__file__).resolve().parents[1] / "data" / recipe,
             add_python="3.12", force_build=LLAMA_CPP_IMAGE_FORCE_BUILD,
-            build_args={"CUDA_ARCHITECTURES": cuda_arch} if cuda_arch else {},
+            build_args={
+                **({"CUDA_ARCHITECTURES": cuda_arch} if cuda_arch else {}),
+                "BUILD_JOBS": build_jobs,
+            },
         )
     else:
         runtime_image = modal.Image.from_registry(
@@ -884,7 +1072,11 @@ def _snapshot_download_with_keepalive(
     force_download: bool = False,
     heartbeat: Callable[[], None] | None = None,
 ) -> None:
-    """Run snapshot_download in a subprocess and print periodic keepalives."""
+    """Run snapshot_download in a subprocess and print periodic keepalives.
+
+    The first attempt uses Xet high-performance transfers by default; failures
+    that are not auth/missing-repo/disk errors retry once over plain HTTP.
+    """
     try:
         expected_sizes = _fetch_expected_gguf_sizes(repo_id, revision, allow_patterns)
     except Exception:
@@ -899,10 +1091,11 @@ def _snapshot_download_with_keepalive(
         "force_download": force_download,
     }
     worker_code = (
-        "import json, os\n"
+        "import json, os, sys\n"
         "from huggingface_hub import snapshot_download\n"
         "cfg = json.loads(os.environ['LLM_LAUNCHPAD_SNAPSHOT_CFG'])\n"
-        "snapshot_download("
+        "try:\n"
+        "    snapshot_download("
         "repo_id=cfg['repo_id'],"
         "revision=cfg.get('revision'),"
         "cache_dir=cfg['cache_dir'],"
@@ -910,6 +1103,9 @@ def _snapshot_download_with_keepalive(
         "max_workers=cfg.get('max_workers', 8),"
         "force_download=cfg.get('force_download', False)"
         ")\n"
+        "except Exception as exc:\n"
+        "    print(f'LLM_LAUNCHPAD_DOWNLOAD_ERROR: {exc}', file=sys.stderr)\n"
+        "    raise\n"
     )
 
     def _attempt_env(*, disable_xet: bool) -> dict[str, str]:
@@ -920,80 +1116,167 @@ def _snapshot_download_with_keepalive(
         if disable_xet:
             env["HF_HUB_DISABLE_XET"] = "1"
             env.pop("HF_XET_HIGH_PERFORMANCE", None)
+            return env
+        if _env_value_is_true(env.get("HF_HUB_DISABLE_XET")):
+            env.pop("HF_XET_HIGH_PERFORMANCE", None)
+            return env
+        env.pop("HF_HUB_DISABLE_XET", None)
+        if not _env_value_is_true(env.get("HF_XET_HIGH_PERFORMANCE")) and HF_XET_HIGH_PERFORMANCE_DEFAULT:
+            env["HF_XET_HIGH_PERFORMANCE"] = "1"
         return env
 
-    def _run_attempt(env: dict[str, str]) -> int:
+    def _run_attempt(env: dict[str, str]) -> tuple[int, str]:
         process = subprocess.Popen(
             [sys.executable, "-c", worker_code],
             env=env,
+            stderr=subprocess.PIPE,
+            text=True,
         )
         keepalive_interval_seconds = 20
         started = time.time()
+        try:
+            baseline_bytes, _ = _estimate_completed_expected_gguf_size_fallback(
+                repo_id=repo_id,
+                revision=revision,
+                expected_sizes=expected_sizes,
+                allow_patterns=allow_patterns,
+            )
+        except OSError:
+            baseline_bytes = 0
         last_bytes = -1
         stalled_intervals = 0
-        while process.poll() is None:
-            elapsed = int(time.time() - started)
-            if expected_sizes:
-                complete_bytes, complete_files = _estimate_completed_expected_gguf_size(
-                    repo_id=repo_id,
-                    revision=revision,
-                    expected_sizes=expected_sizes,
+        stderr_text = ""
+        try:
+            while process.poll() is None:
+                elapsed = int(time.time() - started)
+                try:
+                    if expected_sizes:
+                        complete_bytes, complete_files = _estimate_completed_expected_gguf_size(
+                            repo_id=repo_id,
+                            revision=revision,
+                            expected_sizes=expected_sizes,
+                        )
+                    else:
+                        complete_bytes, complete_files = _estimate_matched_snapshot_size(
+                            repo_id=repo_id,
+                            revision=revision,
+                            allow_patterns=allow_patterns,
+                        )
+                    inflight_bytes, inflight_files = _estimate_incomplete_blob_size(repo_id=repo_id)
+                except OSError:
+                    complete_bytes, complete_files = 0, 0
+                    inflight_bytes, inflight_files = 0, 0
+                observed_bytes = complete_bytes + inflight_bytes
+                observed_files = complete_files + inflight_files
+                if total_expected_bytes > 0:
+                    observed_bytes = min(observed_bytes, total_expected_bytes)
+                size_gib = observed_bytes / (1024**3)
+                transferred_bytes = max(0, observed_bytes - baseline_bytes)
+                rate_mib_s = (transferred_bytes / (1024**2)) / elapsed if elapsed > 0 else 0.0
+                if observed_bytes > last_bytes:
+                    stalled_intervals = 0
+                else:
+                    stalled_intervals += 1
+                last_bytes = observed_bytes
+                stall_note = " (no growth detected)" if stalled_intervals >= 3 else ""
+                progress_text = ""
+                if total_expected_bytes > 0:
+                    total_gib = total_expected_bytes / (1024**3)
+                    pct = int((observed_bytes * 100) / total_expected_bytes) if total_expected_bytes else 0
+                    pct = max(0, min(100, pct))
+                    progress_text = f"/{total_gib:.2f}GiB pct={pct}%"
+                print(
+                    "🦙 download in progress... "
+                    f"transport={_describe_transport_env(env)} "
+                    f"elapsed={elapsed}s files={observed_files} size={size_gib:.2f}GiB{progress_text} "
+                    f"complete={complete_files} inflight={inflight_files} "
+                    f"avg_rate={rate_mib_s:.2f}MiB/s{stall_note}"
                 )
-            else:
-                complete_bytes, complete_files = _estimate_matched_snapshot_size(
-                    repo_id=repo_id,
-                    revision=revision,
-                    allow_patterns=allow_patterns,
-                )
-            inflight_bytes, inflight_files = _estimate_incomplete_blob_size(repo_id=repo_id)
-            observed_bytes = complete_bytes + inflight_bytes
-            observed_files = complete_files + inflight_files
-            if total_expected_bytes > 0:
-                observed_bytes = min(observed_bytes, total_expected_bytes)
-            size_gib = observed_bytes / (1024**3)
-            rate_mib_s = (observed_bytes / (1024**2)) / elapsed if elapsed > 0 else 0.0
-            if observed_bytes > last_bytes:
-                stalled_intervals = 0
-            else:
-                stalled_intervals += 1
-            last_bytes = observed_bytes
-            stall_note = " (no growth detected)" if stalled_intervals >= 3 else ""
-            progress_text = ""
-            if total_expected_bytes > 0:
-                total_gib = total_expected_bytes / (1024**3)
-                pct = int((observed_bytes * 100) / total_expected_bytes) if total_expected_bytes else 0
-                pct = max(0, min(100, pct))
-                progress_text = f"/{total_gib:.2f}GiB pct={pct}%"
-            print(
-                "🦙 download in progress... "
-                f"elapsed={elapsed}s files={observed_files} size={size_gib:.2f}GiB{progress_text} "
-                f"complete={complete_files} inflight={inflight_files} "
-                f"avg_rate={rate_mib_s:.2f}MiB/s{stall_note}"
-            )
-            if heartbeat is not None:
-                heartbeat()
-            time.sleep(keepalive_interval_seconds)
-        return process.returncode
+                if heartbeat is not None:
+                    heartbeat()
+                time.sleep(keepalive_interval_seconds)
+            try:
+                _, stderr_text = process.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                _, stderr_text = process.communicate()
+        finally:
+            if process.poll() is None:
+                process.kill()
+        return process.returncode, stderr_text or ""
 
     env = _attempt_env(disable_xet=False)
-    returncode = _run_attempt(env)
+    returncode, stderr_text = _run_attempt(env)
     xet_was_enabled = not _env_value_is_true(env.get("HF_HUB_DISABLE_XET"))
     if returncode == 0:
         return
+    failure_kind = _classify_download_failure(stderr_text)
+    if failure_kind is not None:
+        raise RuntimeError(
+            f"snapshot_download failed with exit code {returncode} ({failure_kind}); "
+            "not retrying across transports because the error is not transport-specific. "
+            f"Last error: {stderr_text.strip().splitlines()[-1] if stderr_text.strip() else 'unknown'}"
+        )
     if xet_was_enabled:
         print(
-            f"🦙 snapshot_download failed with exit code {returncode}; "
+            f"🦙 snapshot_download failed with exit code {returncode} "
+            f"(transport={_describe_transport_env(env)}); "
             "retrying once with HF_HUB_DISABLE_XET=1"
         )
-        fallback_returncode = _run_attempt(_attempt_env(disable_xet=True))
+        fallback_returncode, fallback_stderr = _run_attempt(_attempt_env(disable_xet=True))
         if fallback_returncode == 0:
             return
         raise RuntimeError(
             "snapshot_download failed with exit code "
-            f"{fallback_returncode} after retrying with HF_HUB_DISABLE_XET=1"
+            f"{fallback_returncode} after retrying with HF_HUB_DISABLE_XET=1. "
+            f"Last error: {fallback_stderr.strip().splitlines()[-1] if fallback_stderr.strip() else 'unknown'}"
         )
 
-    raise RuntimeError(f"snapshot_download failed with exit code {returncode}")
+    raise RuntimeError(
+        f"snapshot_download failed with exit code {returncode}. "
+        f"Last error: {stderr_text.strip().splitlines()[-1] if stderr_text.strip() else 'unknown'}"
+    )
+
+
+def _estimate_completed_expected_gguf_size_fallback(
+    *,
+    repo_id: str,
+    revision: str | None,
+    expected_sizes: dict[str, int],
+    allow_patterns: list[str],
+) -> tuple[int, int]:
+    if expected_sizes:
+        return _estimate_completed_expected_gguf_size(
+            repo_id=repo_id,
+            revision=revision,
+            expected_sizes=expected_sizes,
+        )
+    return _estimate_matched_snapshot_size(
+        repo_id=repo_id,
+        revision=revision,
+        allow_patterns=allow_patterns,
+    )
+
+
+def _allocated_file_size(path: Path) -> int:
+    """Bytes actually allocated for a file, capped at its logical size.
+
+    Xet preallocates sparse files whose logical length is not progress, so
+    progress accounting uses allocated blocks (matches core.hf_download).
+    """
+    try:
+        stat = path.stat()
+    except OSError:
+        return 0
+    logical = max(0, int(stat.st_size))
+    blocks = getattr(stat, "st_blocks", None)
+    if not isinstance(blocks, int) or blocks < 0:
+        return logical
+    try:
+        allocated = int(blocks) * 512
+    except (OverflowError, ValueError):
+        return logical
+    return max(0, min(logical, allocated))
 
 
 def _estimate_matched_snapshot_size(
@@ -1022,7 +1305,11 @@ def _estimate_matched_snapshot_size(
 
 
 def _estimate_incomplete_blob_size(repo_id: str) -> tuple[int, int]:
-    """Estimate active download size from .incomplete blob files."""
+    """Estimate active download size from .incomplete blob files.
+
+    Uses allocated blocks rather than logical size: Xet preallocates sparse
+    files whose logical length is not progress.
+    """
     blobs_dir = _hub_model_dir(repo_id) / "blobs"
     if not blobs_dir.exists() or not blobs_dir.is_dir():
         return 0, 0
@@ -1033,24 +1320,107 @@ def _estimate_incomplete_blob_size(repo_id: str) -> tuple[int, int]:
         if not path.is_file():
             continue
         file_count += 1
-        try:
-            total_bytes += path.stat().st_size
-        except OSError:
-            continue
+        total_bytes += _allocated_file_size(path)
     return total_bytes, file_count
+
+
+def _download_projector_file(
+    *,
+    repo_id: str,
+    revision: str | None,
+    filename: str,
+    force_download: bool = False,
+) -> str:
+    """Download one file in a fresh process so transport env applies.
+
+    ``huggingface_hub`` reads transport flags at import time, so the parent
+    process env is not enough: each attempt runs isolated with Xet enabled
+    first and plain HTTP as the bounded fallback.
+    """
+    payload = {
+        "repo_id": repo_id,
+        "revision": revision,
+        "filename": filename,
+        "cache_dir": str(HF_HUB_DIR),
+        "force_download": force_download,
+    }
+    worker_code = (
+        "import json, os, sys\n"
+        "from huggingface_hub import hf_hub_download\n"
+        "cfg = json.loads(os.environ['LLM_LAUNCHPAD_PROJECTOR_CFG'])\n"
+        "try:\n"
+        "    path = hf_hub_download("
+        "repo_id=cfg['repo_id'],"
+        "revision=cfg.get('revision'),"
+        "filename=cfg['filename'],"
+        "cache_dir=cfg['cache_dir'],"
+        "force_download=cfg.get('force_download', False)"
+        ")\n"
+        "except Exception as exc:\n"
+        "    print(f'LLM_LAUNCHPAD_DOWNLOAD_ERROR: {exc}', file=sys.stderr)\n"
+        "    raise\n"
+        "print(path)\n"
+    )
+
+    def _attempt_env(*, disable_xet: bool) -> dict[str, str]:
+        env = {
+            **os.environ,
+            "LLM_LAUNCHPAD_PROJECTOR_CFG": json.dumps(payload),
+        }
+        if disable_xet:
+            env["HF_HUB_DISABLE_XET"] = "1"
+            env.pop("HF_XET_HIGH_PERFORMANCE", None)
+            return env
+        if _env_value_is_true(env.get("HF_HUB_DISABLE_XET")):
+            env.pop("HF_XET_HIGH_PERFORMANCE", None)
+            return env
+        env.pop("HF_HUB_DISABLE_XET", None)
+        if not _env_value_is_true(env.get("HF_XET_HIGH_PERFORMANCE")) and HF_XET_HIGH_PERFORMANCE_DEFAULT:
+            env["HF_XET_HIGH_PERFORMANCE"] = "1"
+        return env
+
+    def _run(env: dict[str, str]) -> tuple[int, str, str]:
+        completed = subprocess.run(
+            [sys.executable, "-c", worker_code],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        return completed.returncode, (completed.stdout or "").strip(), completed.stderr or ""
+
+    env = _attempt_env(disable_xet=False)
+    print(f"🦙 downloading projector with transport={_describe_transport_env(env)}")
+    returncode, stdout, stderr = _run(env)
+    if returncode == 0 and stdout.splitlines():
+        return stdout.splitlines()[-1].strip()
+    failure_kind = _classify_download_failure(stderr)
+    last_line = stderr.strip().splitlines()[-1] if stderr.strip() else "unknown"
+    if failure_kind is not None:
+        raise RuntimeError(
+            f"Projector download failed ({failure_kind}): {last_line}"
+        )
+    if not _env_value_is_true(env.get("HF_HUB_DISABLE_XET")):
+        print("🦙 projector download failed over Xet; retrying once with HF_HUB_DISABLE_XET=1")
+        fallback_code, fallback_out, fallback_err = _run(_attempt_env(disable_xet=True))
+        if fallback_code == 0 and fallback_out.splitlines():
+            return fallback_out.splitlines()[-1].strip()
+        fallback_last = fallback_err.strip().splitlines()[-1] if fallback_err.strip() else "unknown"
+        raise RuntimeError(
+            f"Projector download failed with exit code {fallback_code} "
+            f"after retrying with HF_HUB_DISABLE_XET=1. Last error: {fallback_last}"
+        )
+    raise RuntimeError(f"Projector download failed with exit code {returncode}. Last error: {last_line}")
 
 
 @app.function(image=download_image, volumes={cache_dir: model_cache}, timeout=PREDOWNLOAD_TIMEOUT_MINUTES * MINUTES)
 def download_projector(artifact: dict[str, Any]) -> str:
     """Cache an exact projector revision independently of the model quant."""
-    from huggingface_hub import hf_hub_download
-
     repo, revision, filename = artifact["repo_id"], artifact["revision"], artifact["filename"]
     with _acquire_download_lease(repo, revision, [filename]):
-        path = Path(hf_hub_download(repo_id=repo, revision=revision, filename=filename, cache_dir=str(HF_HUB_DIR)))
+        path = Path(_download_projector_file(repo_id=repo, revision=revision, filename=filename))
         expected = artifact.get("size_bytes")
         if expected and path.stat().st_size != expected:
-            path = Path(hf_hub_download(repo_id=repo, revision=revision, filename=filename, cache_dir=str(HF_HUB_DIR), force_download=True))
+            path = Path(_download_projector_file(repo_id=repo, revision=revision, filename=filename, force_download=True))
         if path.stat().st_size == 0 or (expected and path.stat().st_size != expected):
             raise RuntimeError("Projector download has an unexpected size.")
         with path.open("rb") as handle:
@@ -1170,6 +1540,51 @@ def _resolve_fit_binary() -> str | None:
         if resolved:
             return resolved
     return None
+
+
+# Trace, not debug: enough for the memory planner's own arithmetic without
+# turning on every backend's device chatter.
+FIT_LOG_VERBOSITY = 4
+
+# Lines the planner logs while deciding, ordered as it prints them.
+_FIT_EVIDENCE_MARKERS = (
+    "projected to use",
+    "need to reduce device memory by",
+    "MiB less in total",
+    "free vs. target of",
+)
+
+
+def fit_evidence_lines(output: str) -> list[str]:
+    """Return llama.cpp's own memory arithmetic from a fit run's output."""
+
+    return [
+        line.strip()
+        for line in output.splitlines()
+        if any(marker in line for marker in _FIT_EVIDENCE_MARKERS)
+    ]
+
+
+def _fit_rejection_message(output: str, *, returncode: int) -> str:
+    """Explain a rejected plan in terms of the memory it was short of.
+
+    llama.cpp reports the guard it stopped at, which for a GPU-only plan is
+    always the explicit ``--n-gpu-layers``: the planner only reaches that guard
+    after finding it cannot meet the free-memory margin and cannot shrink a
+    context the caller pinned. Quoting that message alone reads like a bad
+    argument rather than a placement that is too small, so lead with the cause
+    and carry the planner's numbers.
+    """
+
+    message = (
+        "llama.cpp rejected the full-context GPU-only serving plan: the model, "
+        "its full-context cache and the compute graph do not fit this "
+        f"placement's GPUs with the requested margin (fit exit {returncode})."
+    )
+    evidence = fit_evidence_lines(output)
+    if evidence:
+        return message + " llama.cpp measured: " + "; ".join(evidence)
+    return message
 
 
 def _fit_relevant_args(server_args: list[str]) -> list[str]:
@@ -1342,8 +1757,19 @@ def serve():
         warm_paths: list[Path | str] = [*_gguf_weight_paths(model_path)]
         if projector_path:
             warm_paths.append(projector_path)
-        _warm_volume_paths(warm_paths)
+        marker_path: Path | None = None
+        if _hub_snapshot_name(model_path) is not None or model_repo_id:
+            marker_path = _hydration_marker_path(
+                model_repo_id, _hub_snapshot_name(model_path)
+            )
+        hydrate = _should_hydrate_volume(marker_path, warm_paths)
+    else:
+        warm_paths = []
+        marker_path = None
+        hydrate = False
 
+    fit_binary: str | None = None
+    fit_command: list[str] | None = None
     if serving_fingerprint:
         fit_binary = _resolve_fit_binary()
         if fit_binary:
@@ -1351,32 +1777,75 @@ def serve():
                 fit_binary,
                 "--model",
                 str(model_path),
+                # The planner's measurements are logged at trace level. Without
+                # this the only thing a rejected plan leaves behind is the
+                # abort message, which names whichever guard the planner
+                # reached rather than the memory it was short of.
+                "--verbosity",
+                str(FIT_LOG_VERBOSITY),
                 *_fit_relevant_args(server_args),
             ]
-            print("🧭 verifying full-context device fit:")
-            print(" ", " ".join(fit_command))
-            fit_result = subprocess.run(
-                fit_command,
-                env=server_env,
-                cwd=server_cwd,
-                capture_output=True,
-                text=True,
-                timeout=15 * 60,
-            )
-            if fit_result.stdout:
-                print(fit_result.stdout.rstrip())
-            if fit_result.stderr:
-                print(fit_result.stderr.rstrip())
-            if fit_result.returncode != 0:
-                raise RuntimeError(
-                    "llama.cpp rejected the full-context GPU-only serving plan "
-                    f"(fit exit {fit_result.returncode})."
+
+    def _print_fit_output(stdout: str, stderr: str, returncode: int) -> None:
+        if stdout:
+            print(stdout.rstrip())
+        if stderr:
+            print(stderr.rstrip())
+        if returncode != 0:
+            raise RuntimeError(
+                _fit_rejection_message(
+                    f"{stdout}\n{stderr}",
+                    returncode=returncode,
                 )
-        else:
-            print(
-                "⚠️ llama-fit-params is unavailable; startup success with explicit "
-                "all-GPU layers will be used as the residency guard."
             )
+
+    def _run_fit_command(command: list[str]) -> None:
+        result = subprocess.run(
+            command,
+            env=server_env,
+            cwd=server_cwd,
+            capture_output=True,
+            text=True,
+            timeout=15 * 60,
+        )
+        _print_fit_output(result.stdout or "", result.stderr or "", result.returncode)
+
+    if hydrate and fit_command is not None:
+        # Both steps are read-only on the volume (sequential warm read plus the
+        # planner's header/sizing pass), so run them together instead of paying
+        # both latencies back to back before the server can bind.
+        print("🧭 verifying full-context device fit (in parallel with volume warm):")
+        print(" ", " ".join(fit_command))
+        fit_error: list[BaseException | None] = [None]
+
+        def _run_fit_check() -> None:
+            try:
+                _run_fit_command(fit_command)
+            except BaseException as exc:  # keep the warm read from masking it
+                fit_error[0] = exc
+
+        fit_thread = threading.Thread(target=_run_fit_check, daemon=True)
+        fit_thread.start()
+        try:
+            _warm_volume_paths(warm_paths, record_marker=marker_path)
+        finally:
+            fit_thread.join()
+        if fit_error[0] is not None:
+            raise fit_error[0]
+        fit_command = None
+    elif hydrate:
+        _warm_volume_paths(warm_paths, record_marker=marker_path)
+
+    if serving_fingerprint and fit_command is not None:
+        assert fit_binary is not None
+        print("🧭 verifying full-context device fit:")
+        print(" ", " ".join(fit_command))
+        _run_fit_command(fit_command)
+    elif serving_fingerprint and not fit_binary:
+        print(
+            "⚠️ llama-fit-params is unavailable; startup success with explicit "
+            "all-GPU layers will be used as the residency guard."
+        )
     command = [
         server_bin,
         "--model",

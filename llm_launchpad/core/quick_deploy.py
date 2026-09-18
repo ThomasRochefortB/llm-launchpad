@@ -7,22 +7,33 @@ import hashlib
 import shlex
 from collections.abc import Sequence
 
-from ..protocol.enums import VisionMode, BackendType, ComputeProvider, ServingObjective
+from ..protocol.enums import (
+    BackendType,
+    ComputeProvider,
+    OperationIntent,
+    ServingObjective,
+    VisionMode,
+)
 from ..protocol.models import (
     CatalogExclusion,
     DeploymentConfig,
+    DeploymentRequest,
     InferencePlan,
     InferenceRecipe,
+    LlamacppRequestOptions,
     MemoryEstimate,
     RuntimeTuning,
     ServingRequirements,
     SpeculativeDecodingConfig,
+    VllmRequestOptions,
     WorkloadProfile,
 )
 from .inference_options import (
+    COST_SCENARIO_WORKDAY,
     InferenceProviderAdapter,
     ModalCatalogOption,
     ModalInferenceAdapter,
+    evaluate_quote_cost,
     recommended_vllm_tool_call_parser,
     resolve_inference_plans,
 )
@@ -418,6 +429,12 @@ def retune_quick_deploy_plan(
     )
     tuning = tuning_for_gpu_memory(tuning, plan.quote.gpu_memory_gb)
     tuning = tuning_for_architecture(tuning, profile.gguf_architecture)
+    if profile.runtime_tuning is not None and not tuning.flash_attention:
+        # The physical batch was sized against this model's attention scratch,
+        # which depends on the context and the head count. Changing the
+        # workload objective changes neither, so rebuilding tuning from the
+        # objective must not hand the batch back to its default.
+        tuning = replace(tuning, ubatch_size=profile.runtime_tuning.ubatch_size)
     recipe = replace(
         plan.recipe,
         serving_requirements=requirements,
@@ -440,7 +457,6 @@ def retune_quick_deploy_plan(
             price_per_hour_usd=plan.quote.price_per_hour_usd,
         )
     single_tps = None
-    aggregate_tps = None
     if assessment is not None:
         single_tps = max(
             (
@@ -450,23 +466,36 @@ def retune_quick_deploy_plan(
             ),
             default=0.0,
         ) or None
-        aggregate_tps = max(
-            (
-                point.aggregate_output_tokens_per_second or 0.0
-                for point in assessment.performance
-            ),
-            default=0.0,
-        ) or None
     quote = replace(
         plan.quote,
         estimated_output_tokens_per_second=single_tps,
-        estimated_aggregate_output_tokens_per_second=aggregate_tps,
     )
+    evaluation = plan.cost
+    if evaluation is not None and (
+        quote.estimated_output_tokens_per_second
+        != plan.quote.estimated_output_tokens_per_second
+    ):
+        # Throughput changed after cost was attached, so the throughput-based
+        # token estimate no longer matches the quote it was computed from.
+        evaluation = evaluate_quote_cost(
+            quote,
+            evaluation.scenario,
+            idle_timeout_seconds=evaluation.idle_timeout_seconds,
+            output_tokens_per_month=evaluation.output_tokens_per_month,
+            includes_storage=evaluation.includes_storage,
+        )
+    else:
+        evaluation = evaluation or evaluate_quote_cost(quote, COST_SCENARIO_WORKDAY)
     return replace(
         plan,
         recipe=recipe,
         quote=quote,
         assessment=assessment,
+        estimated_monthly_cost_usd=evaluation.estimated_monthly_cost_usd,
+        estimated_cost_per_million_output_tokens_usd=(
+            evaluation.estimated_cost_per_million_output_tokens_usd
+        ),
+        cost=evaluation,
         recommendation_reason=f"Optimized for {objective.display_name.casefold()} throughput",
     )
 
@@ -535,6 +564,157 @@ def instance_slug_for_plan(
     return f"{base}-{suffix}" if base else suffix
 
 
+def intent_from_legacy_flags(
+    *,
+    do_deploy: bool,
+    run_smoke: bool,
+    preload: bool = True,
+) -> OperationIntent:
+    """Map overlapping operation booleans to one explicit intent.
+
+    vLLM historically let ``do_deploy=True`` win over ``run_smoke=True``;
+    neither flag set meant preload-only work. Unknown combinations are
+    rejected instead of silently doing nothing.
+
+    Smoke-only means ``run_smoke`` without ``do_deploy``: a config with both
+    flags set deploys (and may warm up), it does not smoke-test.
+    """
+    if do_deploy:
+        return OperationIntent.SERVE
+    if run_smoke:
+        return OperationIntent.SMOKE
+    if preload:
+        return OperationIntent.PRELOAD
+    raise ValueError("Deployment requires serve, smoke, or preload intent.")
+
+
+def request_from_config(config: DeploymentConfig) -> DeploymentRequest:
+    """Convert a legacy config to an immutable request without resolving it.
+
+    Resolution evidence (reasoning, tuning, assessment, attestation) is
+    deliberately dropped: the request records what was asked for, and
+    ``preflight_request`` recomputes what it means.
+    """
+    return DeploymentRequest(
+        backend=config.backend,
+        provider=config.provider,
+        intent=intent_from_legacy_flags(
+            do_deploy=config.do_deploy,
+            run_smoke=config.run_smoke,
+            preload=config.preload,
+        ),
+        do_warmup=config.do_warmup,
+        show_debug_logs=config.show_debug_logs,
+        vision_mode=config.vision_mode,
+        projector_repo=config.projector_repo,
+        projector_revision=config.projector_revision,
+        projector_file=config.projector_file,
+        image_limit=config.image_limit,
+        mm_processor_kwargs=config.mm_processor_kwargs,
+        llamacpp=LlamacppRequestOptions(
+            preset=config.preset,
+            repo_id=config.repo_id,
+            quant=config.quant,
+            revision=config.revision,
+            preload=config.preload,
+            server_args=config.server_args,
+            host=config.host,
+            port=config.port,
+            n_gpu_layers=config.n_gpu_layers,
+            llamacpp_image_no_cache=config.llamacpp_image_no_cache,
+            gguf_architecture=config.gguf_architecture,
+            llamacpp_runtime_id=config.llamacpp_runtime_id,
+            speculative_decoding=config.speculative_decoding,
+            allow_speculative_decoding=config.allow_speculative_decoding,
+        ),
+        vllm=VllmRequestOptions(
+            model_name=config.model_name,
+            model_revision=config.model_revision,
+            served_model_name=config.served_model_name,
+            fast_boot=config.fast_boot,
+            n_gpu=config.n_gpu,
+            trust_remote_code=config.trust_remote_code,
+            reasoning_parser=config.reasoning_parser,
+            tool_call_parser=config.tool_call_parser,
+            default_chat_template_kwargs=config.default_chat_template_kwargs,
+        ),
+        gpu_type=config.gpu_type,
+        gpu_count=config.gpu_count,
+        required_vram_gb=config.required_vram_gb,
+        serving_requirements=config.serving_requirements,
+        max_context_tokens=config.max_context_tokens,
+        max_output_tokens=config.max_output_tokens,
+        instance_name=config.instance_name,
+        app_name=config.app_name,
+        function_slug=config.function_slug,
+        provider_options=config.provider_options,
+        price_per_hour_usd=config.price_per_hour_usd,
+    )
+
+
+def config_from_request(
+    request: DeploymentRequest,
+    *,
+    endpoint_api_key: str | None = None,
+) -> DeploymentConfig:
+    """Render a request back to the legacy mutable config for adapters.
+
+    Compatibility bridge while provider adapters consume ``DeploymentConfig``.
+    Resolution results attach through ``resolve_deployment_request`` instead.
+    """
+    config = DeploymentConfig(backend=request.backend, provider=request.provider)
+    config.vision_mode = request.vision_mode
+    config.projector_repo = request.projector_repo
+    config.projector_revision = request.projector_revision
+    config.projector_file = request.projector_file
+    config.image_limit = request.image_limit
+    config.mm_processor_kwargs = request.mm_processor_kwargs
+    llamacpp = request.llamacpp
+    config.preset = llamacpp.preset
+    config.repo_id = llamacpp.repo_id
+    config.quant = llamacpp.quant
+    config.revision = llamacpp.revision
+    config.preload = llamacpp.preload
+    config.server_args = llamacpp.server_args
+    config.host = llamacpp.host
+    config.port = llamacpp.port
+    config.n_gpu_layers = llamacpp.n_gpu_layers
+    config.llamacpp_image_no_cache = llamacpp.llamacpp_image_no_cache
+    config.gguf_architecture = llamacpp.gguf_architecture
+    config.llamacpp_runtime_id = llamacpp.llamacpp_runtime_id
+    config.speculative_decoding = llamacpp.speculative_decoding
+    config.allow_speculative_decoding = llamacpp.allow_speculative_decoding
+    vllm = request.vllm
+    config.model_name = vllm.model_name
+    config.model_revision = vllm.model_revision
+    config.served_model_name = vllm.served_model_name
+    config.fast_boot = vllm.fast_boot
+    config.n_gpu = vllm.n_gpu
+    config.trust_remote_code = vllm.trust_remote_code
+    config.reasoning_parser = vllm.reasoning_parser
+    config.tool_call_parser = vllm.tool_call_parser
+    config.default_chat_template_kwargs = vllm.default_chat_template_kwargs
+    config.gpu_type = request.gpu_type
+    config.gpu_count = request.gpu_count
+    config.required_vram_gb = request.required_vram_gb
+    config.serving_requirements = request.serving_requirements
+    config.max_context_tokens = request.max_context_tokens
+    config.max_output_tokens = request.max_output_tokens
+    config.price_per_hour_usd = request.price_per_hour_usd
+    config.do_deploy = request.intent == OperationIntent.SERVE
+    config.run_smoke = request.intent == OperationIntent.SMOKE
+    if request.intent == OperationIntent.PRELOAD:
+        config.preload = True
+    config.do_warmup = request.do_warmup
+    config.show_debug_logs = request.show_debug_logs
+    config.instance_name = request.instance_name
+    config.app_name = request.app_name
+    config.function_slug = request.function_slug
+    config.provider_options = request.provider_options
+    config.endpoint_api_key = endpoint_api_key
+    return config
+
+
 def build_quick_deploy_config(
     profile: QuickDeployProfile,
     *,
@@ -574,6 +754,9 @@ def build_quick_deploy_config(
             # withheld from the catalog.
             config.vision_mode = VisionMode.OFF
         if config.serving_requirements is not None and plan is not None:
+            # The approved ceiling is set from the accepted quote, but the
+            # quote itself is recorded separately: calibration and
+            # value-per-dollar must use the price, never the cap.
             config.serving_requirements = ServingRequirements(
                 context_tokens=config.serving_requirements.context_tokens,
                 objective=config.serving_requirements.objective,
@@ -581,6 +764,7 @@ def build_quick_deploy_config(
                 gpu_only=config.serving_requirements.gpu_only,
                 max_hourly_cost_usd=plan.quote.price_per_hour_usd,
             )
+            config.price_per_hour_usd = plan.quote.price_per_hour_usd
         config.runtime_tuning = (
             plan.assessment.tuning
             if plan is not None and plan.assessment is not None
@@ -591,8 +775,17 @@ def build_quick_deploy_config(
             )
         )
         config.placement_assessment = plan.assessment if plan is not None else None
+        # Declining the toggle has to survive into preflight, which otherwise
+        # resolves MTP from the model itself and would turn it straight back on.
+        config.allow_speculative_decoding = enable_speculative_decoding
         if enable_speculative_decoding:
-            config.speculative_decoding = profile.speculative_decoding
+            # A retuned plan carries the configuration its placement was
+            # assessed with, so it wins over the catalog profile it came from.
+            config.speculative_decoding = (
+                plan.recipe.speculative_decoding
+                if plan is not None
+                else profile.speculative_decoding
+            )
         elif config.runtime_tuning is not None:
             config.runtime_tuning = RuntimeTuning(
                 parallel_slots=config.runtime_tuning.parallel_slots,
@@ -641,6 +834,8 @@ def build_quick_deploy_config(
         else profile.max_context_tokens
     )
     config.provider_options = plan.quote.provider_options if plan is not None else None
+    if plan is not None and plan.quote.price_per_hour_usd is not None:
+        config.price_per_hour_usd = plan.quote.price_per_hour_usd
     config.preload = True
     config.do_deploy = True
     # Certified Fast Deploy endpoints must pass runtime attestation and a

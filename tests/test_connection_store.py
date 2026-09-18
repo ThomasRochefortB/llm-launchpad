@@ -174,7 +174,7 @@ class ConnectionStoreReasoningMigrationTests(unittest.TestCase):
             row = EndpointInfo(
                 name="vllm-future",
                 backend=BackendType.VLLM,
-                web_url="https://live.example.com",
+                web_url="https://example.com",
             )
 
             with patch.object(

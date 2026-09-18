@@ -119,7 +119,7 @@ def _vast_offers() -> list[VastOffer]:
 
 
 class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
-    async def test_down_from_rank_mode_last_option_moves_focus_to_model_list(self) -> None:
+    async def test_down_from_rank_mode_moves_focus_to_model_list(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:
             app.push_screen(LlamaCppDeployScreen())
@@ -141,10 +141,9 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
-            rank_mode_list = screen.query_one("#llama-rank-mode", OptionList)
+            rank_mode = screen.query_one("#llama-rank-mode", Select)
             model_list = screen.query_one("#llama-model-list", OptionList)
-            rank_mode_list.focus()
-            rank_mode_list.highlighted = 2
+            rank_mode.focus()
             await pilot.pause()
 
             await pilot.press("down")
@@ -178,8 +177,8 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
-            rank_mode_list = screen.query_one("#llama-rank-mode", OptionList)
             model_list = screen.query_one("#llama-model-list", OptionList)
+            rank_mode = screen.query_one("#llama-rank-mode", Select)
             model_list.focus()
             model_list.highlighted = 0
             await pilot.pause()
@@ -187,11 +186,7 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("up")
             await pilot.pause()
 
-            self.assertTrue(rank_mode_list.has_focus)
-            highlighted = rank_mode_list.highlighted_option
-            self.assertIsNotNone(highlighted)
-            assert highlighted is not None
-            self.assertEqual(highlighted.id, "rank-trending")
+            self.assertTrue(rank_mode.has_focus)
 
     async def test_down_from_quant_list_last_option_moves_focus_to_provider_select(self) -> None:
         app = _TestApp()
@@ -272,7 +267,7 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(model_list.has_focus)
             self.assertEqual(repo_id.value, "unsloth/Qwen3-Coder-Next-GGUF")
 
-    async def test_enter_on_rank_mode_moves_focus_to_model_list(self) -> None:
+    async def test_selecting_rank_mode_reloads_model_suggestions(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:
             app.push_screen(LlamaCppDeployScreen())
@@ -280,28 +275,11 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
             screen = app.screen
             assert isinstance(screen, LlamaCppDeployScreen)
-            rank_mode_list = screen.query_one("#llama-rank-mode", OptionList)
-            model_list = screen.query_one("#llama-model-list", OptionList)
 
-            rank_mode_list.focus()
-            rank_mode_list.highlighted = 1
-            await pilot.pause()
-
-            await pilot.press("enter")
+            screen._set_rank_mode("downloads")
             await pilot.pause()
 
             self.assertEqual(app.fetch_calls, ["downloads"])
-            # The picker is hidden until it has rows, so focus is handed over
-            # when the requested ranking arrives rather than before.
-            screen.on_llama_cpp_models_loaded(
-                LlamaCppModelsLoaded(
-                    mode="downloads",
-                    models=[ModelCandidate(repo_id="unsloth/Qwen3-32B-GGUF")],
-                )
-            )
-            await pilot.pause()
-
-            self.assertTrue(model_list.has_focus)
 
     async def test_enter_on_quant_list_commits_and_exits_to_provider(self) -> None:
         app = _TestApp()
@@ -374,13 +352,10 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
             screen = app.screen
             assert isinstance(screen, LlamaCppDeployScreen)
-            rank_mode_list = screen.query_one("#llama-rank-mode", OptionList)
+            rank_mode = screen.query_one("#llama-rank-mode", Select)
 
-            self.assertTrue(rank_mode_list.has_focus)
-            highlighted = rank_mode_list.highlighted_option
-            self.assertIsNotNone(highlighted)
-            assert highlighted is not None
-            self.assertEqual(highlighted.id, "rank-cached")
+            self.assertTrue(rank_mode.has_focus)
+            self.assertEqual(rank_mode.value, "cached")
 
     async def test_default_rank_mode_highlight_matches_cached(self) -> None:
         app = _TestApp()
@@ -392,11 +367,8 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
             screen = app.screen
             assert isinstance(screen, LlamaCppDeployScreen)
-            rank_mode_list = screen.query_one("#llama-rank-mode", OptionList)
-            highlighted = rank_mode_list.highlighted_option
-            self.assertIsNotNone(highlighted)
-            assert highlighted is not None
-            self.assertEqual(highlighted.id, "rank-cached")
+            rank_mode = screen.query_one("#llama-rank-mode", Select)
+            self.assertEqual(rank_mode.value, "cached")
 
     async def test_ranked_model_selection_prefills_repo_id(self) -> None:
         app = _TestApp()
@@ -406,9 +378,9 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
             screen = app.screen
             assert isinstance(screen, LlamaCppDeployScreen)
-            rank_mode_list = screen.query_one("#llama-rank-mode", OptionList)
-            downloads_option = rank_mode_list.get_option_at_index(1)
-            screen.on_option_list_option_selected(SimpleNamespace(option_list=rank_mode_list, option=downloads_option))
+            rank_mode = screen.query_one("#llama-rank-mode", Select)
+            rank_mode.value = "downloads"
+            screen._set_rank_mode("downloads")
             self.assertEqual(app.fetch_calls, ["downloads"])
 
             screen.on_llama_cpp_models_loaded(
@@ -449,8 +421,8 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             screen = app.screen
             assert isinstance(screen, LlamaCppDeployScreen)
 
-            rank_mode_list = screen.query_one("#llama-rank-mode", OptionList)
-            self.assertEqual(rank_mode_list.get_option_at_index(0).id, "rank-cached")
+            rank_mode = screen.query_one("#llama-rank-mode", Select)
+            self.assertEqual(rank_mode.value, "cached")
 
             screen.on_storage_loaded(
                 StorageLoaded(
@@ -468,8 +440,7 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
-            cached_option = rank_mode_list.get_option_at_index(0)
-            screen.on_option_list_option_selected(SimpleNamespace(option_list=rank_mode_list, option=cached_option))
+            screen._set_rank_mode("cached")
 
             model_list = screen.query_one("#llama-model-list", OptionList)
             selected_option = model_list.get_option_at_index(0)

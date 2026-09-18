@@ -13,8 +13,20 @@ from llm_launchpad.core.quick_deploy import QuickDeployModel
 from llm_launchpad.core.vast_auth import VastCredentials
 from llm_launchpad.core.vast_backend import VastApiError, parse_vast_offer, vast_offer_search_payload
 from llm_launchpad.core.quick_deploy import quick_deploy_profile_for_plan
-from llm_launchpad.core.vast_comparison import vast_offers_for_model, vast_plan_for_offer
+from llm_launchpad.core.vast_comparison import (
+    _vast_row_sort_key,
+    vast_offers_for_model,
+    vast_plan_for_offer,
+)
+from llm_launchpad.core.vast_startup_history import (
+    machine_startup_stats,
+    rank_vast_offers_by_startup,
+    record_vast_startup,
+)
+
+
 from llm_launchpad.core.serving_tiers import serving_tiers
+from llm_launchpad.core.vast_comparison import vast_offers_for_model as _comparison_rows
 from llm_launchpad.protocol.enums import ComputeProvider, ServingObjective
 from llm_launchpad.protocol.models import MemoryEstimate, RuntimeTuning, ServingRequirements, VastOffer, VastOfferQuery
 from llm_launchpad.tui.screens.fast_deploy import (
@@ -23,6 +35,11 @@ from llm_launchpad.tui.screens.fast_deploy import (
 )
 from tests.test_fast_deploy_screen import _model, _profile, _StyledApp
 from tests.test_vast_backend import offer_payload
+
+
+def _rows_with_history(offers: tuple, history: dict) -> list:
+    rows = list(_comparison_rows(comparison_model(), offers))
+    return sorted(rows, key=lambda row: _vast_row_sort_key(row, history))
 
 
 def comparison_model(*, weights: float = 8, total: float = 14) -> QuickDeployModel:
@@ -100,6 +117,19 @@ class VastModelComparisonTests(unittest.TestCase):
         self.assertEqual(vast_offer().gpu_memory_gib, 24)
         self.assertEqual(vast_offers_for_model(comparison_model(total=24.2), (vast_offer(),)), ())
 
+    def test_cheaper_incompatible_host_does_not_shadow_eligible_host(self) -> None:
+        # An incompatible host must be filtered before cheapest-per-topology
+        # selection, not after: otherwise the cheap host wins the grouping
+        # and the model loses a topology it could actually rent.
+        rows = vast_offers_for_model(comparison_model(), (
+            vast_offer(id=1001, dph_base=0.1, dph_total=0.12, cuda_max_good=11.4),
+            vast_offer(id=1002, dph_base=0.4, dph_total=0.42),
+        ))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].offer.id, "1002")
+        self.assertEqual(rows[0].costs.total_per_hour_usd, 0.42)
+        self.assertTrue(rows[0].assessment.fits)
+
     def test_multi_gpu_offer_keeps_whole_machine_price(self) -> None:
         rows = vast_offers_for_model(comparison_model(total=40), (
             vast_offer(), vast_offer(id=1002, num_gpus=2, dph_base=0.7, dph_total=0.72),
@@ -149,6 +179,83 @@ class VastModelComparisonTests(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual({row.offer.id for row in rows}, {"1003"})
         self.assertEqual(len({row.id for row in rows}), 2)
+
+    def test_measured_startup_evidence_reorders_equal_price_rows(self) -> None:
+        import time
+
+        from llm_launchpad.core.vast_comparison import _vast_row_sort_key as sort_key
+
+        costly = vast_offer(id=1001, machine_id=42, dph_total=0.99, num_gpus=2)
+        cheap = vast_offer(id=1002, machine_id=43, dph_total=0.99, num_gpus=1)
+        rows = vast_offers_for_model(comparison_model(), (costly, cheap))
+        self.assertEqual({row.offer.id for row in rows}, {"1001", "1002"})
+        history = {
+            "43": [
+                {
+                    "observed_at_epoch": time.time(),
+                    "offer_id": "1002",
+                    "ssh_seconds": 120.0,
+                    "healthy_seconds": 300.0,
+                    "failed": False,
+                }
+            ]
+        }
+        # Same effective price, evidence first: the sort key is where
+        # measured startup enters the ranking.
+        keyed = sorted(rows, key=lambda row: sort_key(row, history))
+        self.assertEqual([row.offer.id for row in keyed], ["1002", "1001"])
+
+    def test_same_price_row_prefers_measured_fast_host(self) -> None:
+        import time
+
+        cheap_fast = vast_offer(id=1001, machine_id=42)
+        cheap_slow = vast_offer(id=1002, machine_id=43)
+        history = {
+            "43": [
+                {
+                    "observed_at_epoch": time.time(),
+                    "offer_id": "1002",
+                    "ssh_seconds": 120.0,
+                    "healthy_seconds": 300.0,
+                    "failed": False,
+                }
+            ]
+        }
+        ranked = rank_vast_offers_by_startup([cheap_fast, cheap_slow], history)
+        self.assertEqual([offer.id for offer in ranked], ["1002", "1001"])
+
+    def test_failed_machine_loses_its_evidence(self) -> None:
+        import json
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            history_path = Path(tmp) / "history.json"
+            record_vast_startup(
+                machine_id="m-1",
+                offer_id="1",
+                ssh_seconds=60.0,
+                healthy_seconds=200.0,
+                path=history_path,
+            )
+            record_vast_startup(
+                machine_id="m-1",
+                offer_id="1",
+                ssh_seconds=None,
+                healthy_seconds=None,
+                failed=True,
+                path=history_path,
+            )
+            history = json.loads(history_path.read_text())
+        self.assertIsNone(machine_startup_stats(history, "m-1"))
+
+    def test_offer_ranking_keeps_price_order_without_evidence(self) -> None:
+        cheap = vast_offer(id=1001, machine_id=42, dph_total=0.2)
+        pricey = vast_offer(id=1002, machine_id=43, dph_total=0.4)
+        self.assertEqual(
+            [offer.id for offer in rank_vast_offers_by_startup([pricey, cheap], {})],
+            ["1002", "1001"],
+        )
 
 
 class VastAvailabilityTests(unittest.TestCase):

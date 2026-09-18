@@ -28,7 +28,15 @@ class FakeModalDict:
 
 
 class LlamacppDownloadProgressTests(unittest.TestCase):
-    def test_download_image_env_disables_xet_by_default(self) -> None:
+    def test_download_image_env_enables_xet_high_performance_by_default(self) -> None:
+        with patch.object(modal_llamacpp_app, "HF_HUB_DISABLE_XET_DEFAULT", False):
+            with patch.object(modal_llamacpp_app, "HF_XET_HIGH_PERFORMANCE_DEFAULT", True):
+                env = modal_llamacpp_app._download_image_env()
+
+        self.assertEqual(env["HF_XET_HIGH_PERFORMANCE"], "1")
+        self.assertNotIn("HF_HUB_DISABLE_XET", env)
+
+    def test_download_image_env_still_honors_explicit_xet_disable(self) -> None:
         with patch.object(modal_llamacpp_app, "HF_HUB_DISABLE_XET_DEFAULT", True):
             with patch.object(modal_llamacpp_app, "HF_XET_HIGH_PERFORMANCE_DEFAULT", True):
                 env = modal_llamacpp_app._download_image_env()
@@ -360,22 +368,40 @@ class LlamacppDownloadProgressTests(unittest.TestCase):
             def poll(self) -> int:
                 return self.returncode
 
-        with patch.dict(modal_llamacpp_app.os.environ, {"HF_XET_HIGH_PERFORMANCE": "1"}, clear=True):
-            with patch.object(
+            def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+                return "", "" if self.returncode == 0 else "connection reset by peer"
+
+        # The expected-size lookup that opens the helper is a live Hub call and
+        # has nothing to do with the retry under test.
+        with (
+            patch.dict(modal_llamacpp_app.os.environ, {"HF_XET_HIGH_PERFORMANCE": "1"}, clear=True),
+            patch.object(modal_llamacpp_app, "_fetch_expected_gguf_sizes", return_value={}),
+            patch.object(
+                modal_llamacpp_app,
+                "_estimate_matched_snapshot_size",
+                return_value=(0, 0),
+            ),
+            patch.object(
+                modal_llamacpp_app,
+                "_estimate_incomplete_blob_size",
+                return_value=(0, 0),
+            ),
+            patch.object(
                 modal_llamacpp_app.subprocess,
                 "Popen",
                 side_effect=[
                     FakeProcess(23),
                     FakeProcess(0),
                 ],
-            ) as popen_mock:
-                modal_llamacpp_app._snapshot_download_with_keepalive(
-                    repo_id="unsloth/GLM-5-GGUF",
-                    revision=None,
-                    cache_dir="/tmp/hub",
-                    allow_patterns=["*UD-Q2_K_XL*.gguf"],
-                    max_workers=8,
-                )
+            ) as popen_mock,
+        ):
+            modal_llamacpp_app._snapshot_download_with_keepalive(
+                repo_id="unsloth/GLM-5-GGUF",
+                revision=None,
+                cache_dir="/tmp/hub",
+                allow_patterns=["*UD-Q2_K_XL*.gguf"],
+                max_workers=8,
+            )
 
         self.assertEqual(popen_mock.call_count, 2)
         for call in popen_mock.call_args_list:
@@ -390,14 +416,17 @@ class LlamacppDownloadProgressTests(unittest.TestCase):
 
         class FakeProcess:
             def __init__(self) -> None:
-                self._poll_results = [None, 0]
+                self._poll_results: list[int | None] = [None, None, 0]
                 self.returncode = 0
 
             def poll(self) -> int | None:
-                value = self._poll_results.pop(0)
+                value = self._poll_results.pop(0) if self._poll_results else 0
                 if value is not None:
                     self.returncode = value
                 return value
+
+            def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+                return "", ""
 
         with patch.object(
             modal_llamacpp_app,
@@ -416,7 +445,7 @@ class LlamacppDownloadProgressTests(unittest.TestCase):
                 ):
                     with patch.object(modal_llamacpp_app.subprocess, "Popen", return_value=FakeProcess()):
                         with patch.object(modal_llamacpp_app.time, "sleep", return_value=None):
-                            with patch.object(modal_llamacpp_app.time, "time", side_effect=[0.0, 20.0]):
+                            with patch.object(modal_llamacpp_app.time, "time", side_effect=[0.0, 20.0, 20.0]):
                                 with patch("builtins.print", side_effect=printed.append):
                                     modal_llamacpp_app._snapshot_download_with_keepalive(
                                         repo_id="unsloth/GLM-5-GGUF",
@@ -428,6 +457,65 @@ class LlamacppDownloadProgressTests(unittest.TestCase):
 
         self.assertTrue(any("pct=30%" in line for line in printed))
 
+    def test_snapshot_download_does_not_retry_terminal_auth_failures(self) -> None:
+        class FakeProcess:
+            def __init__(self, returncode: int) -> None:
+                self.returncode = returncode
+
+            def poll(self) -> int:
+                return self.returncode
+
+            def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+                return "", "401 Unauthorized for gated repo"
+
+        with (
+            patch.object(modal_llamacpp_app, "_fetch_expected_gguf_sizes", return_value={}),
+            patch.object(
+                modal_llamacpp_app,
+                "_estimate_matched_snapshot_size",
+                return_value=(0, 0),
+            ),
+            patch.object(
+                modal_llamacpp_app,
+                "_estimate_incomplete_blob_size",
+                return_value=(0, 0),
+            ),
+            patch.object(
+                modal_llamacpp_app.subprocess,
+                "Popen",
+                return_value=FakeProcess(23),
+            ) as popen_mock,
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                modal_llamacpp_app._snapshot_download_with_keepalive(
+                    repo_id="unsloth/GLM-5-GGUF",
+                    revision=None,
+                    cache_dir="/tmp/hub",
+                    allow_patterns=["*UD-Q2_K_XL*.gguf"],
+                    max_workers=8,
+                )
+
+        self.assertIn("(auth)", str(ctx.exception))
+        self.assertEqual(popen_mock.call_count, 1)
+
+    def test_snapshot_download_uses_allocated_blocks_for_incomplete_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            hub_dir = Path(tmp) / "hub"
+            blobs_dir = hub_dir / "models--unsloth--GLM-5-GGUF" / "blobs"
+            blobs_dir.mkdir(parents=True, exist_ok=True)
+            target = blobs_dir / "blob-a.incomplete"
+            target.write_bytes(b"a" * 4096)
+            logical = target.stat().st_size
+
+            with patch.object(modal_llamacpp_app, "HF_HUB_DIR", hub_dir):
+                size_bytes, file_count = modal_llamacpp_app._estimate_incomplete_blob_size(
+                    repo_id="unsloth/GLM-5-GGUF"
+                )
+
+            allocated = modal_llamacpp_app._allocated_file_size(target)
+            self.assertEqual((size_bytes, file_count), (allocated, 1))
+            self.assertLessEqual(size_bytes, logical)
+
     def test_snapshot_download_raises_after_xet_disabled_retry_fails(self) -> None:
         class FakeProcess:
             def __init__(self, returncode: int) -> None:
@@ -436,23 +524,41 @@ class LlamacppDownloadProgressTests(unittest.TestCase):
             def poll(self) -> int:
                 return self.returncode
 
-        with patch.dict(modal_llamacpp_app.os.environ, {"HF_XET_HIGH_PERFORMANCE": "1"}, clear=True):
-            with patch.object(
+            def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+                return "", "connection reset by peer"
+
+        # As above: the expected-size lookup is a live Hub call this test does
+        # not exercise.
+        with (
+            patch.dict(modal_llamacpp_app.os.environ, {"HF_XET_HIGH_PERFORMANCE": "1"}, clear=True),
+            patch.object(modal_llamacpp_app, "_fetch_expected_gguf_sizes", return_value={}),
+            patch.object(
+                modal_llamacpp_app,
+                "_estimate_matched_snapshot_size",
+                return_value=(0, 0),
+            ),
+            patch.object(
+                modal_llamacpp_app,
+                "_estimate_incomplete_blob_size",
+                return_value=(0, 0),
+            ),
+            patch.object(
                 modal_llamacpp_app.subprocess,
                 "Popen",
                 side_effect=[
                     FakeProcess(23),
                     FakeProcess(17),
                 ],
-            ):
-                with self.assertRaises(RuntimeError) as ctx:
-                    modal_llamacpp_app._snapshot_download_with_keepalive(
-                        repo_id="unsloth/GLM-5-GGUF",
-                        revision=None,
-                        cache_dir="/tmp/hub",
-                        allow_patterns=["*UD-Q2_K_XL*.gguf"],
-                        max_workers=8,
-                    )
+            ),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                modal_llamacpp_app._snapshot_download_with_keepalive(
+                    repo_id="unsloth/GLM-5-GGUF",
+                    revision=None,
+                    cache_dir="/tmp/hub",
+                    allow_patterns=["*UD-Q2_K_XL*.gguf"],
+                    max_workers=8,
+                )
 
         self.assertIn("after retrying with HF_HUB_DISABLE_XET=1", str(ctx.exception))
 

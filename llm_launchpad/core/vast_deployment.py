@@ -13,24 +13,29 @@ import time
 import uuid
 
 from ..protocol.enums import BackendType, ComputeProvider, DeploymentState, OperationType
-from ..protocol.events import BaseEvent, LogEvent, OperationCompleteEvent, StateChangeEvent
+from ..protocol.events import BaseEvent, LogEvent, OperationCompleteEvent, ResourceAllocatedEvent, StateChangeEvent
 from ..protocol.models import DeploymentConfig, EndpointInfo, VastDeploymentRecord, VastInstance, VastOfferQuery, VastProviderOptions
+from .deploy_log_summary import format_elapsed
 from .naming import infer_instance_from_app_name
 from .operation_events import fail_operation
 from .shutdown import is_shutting_down
 from .vast_backend import VastApiError, VastBackend
+from .vast_download import fetch_download_files, measure_download
 from .vast_runtime import (
     GPU_INVENTORY_COMMAND,
     VAST_RUNTIME_DIR,
+    VAST_STARTUP_PROBE_COMMAND,
     endpoint_healthy,
     parse_gpu_inventory,
+    parse_startup_probe,
     vast_runtime,
     vast_runtime_script,
     verify_endpoint_auth,
     verify_gpu_topology,
     verify_streaming,
 )
-from .vast_ssh import VastSsh
+from .vast_startup_history import record_vast_startup
+from .vast_ssh import SSH_REFUSED, SSH_REJECTED, SSH_THROTTLED, VastSsh, VastSshError
 from .vast_state import VastState
 
 _CANCELLATIONS: dict[str, threading.Event] = {}
@@ -45,11 +50,75 @@ _CANCELLATIONS_LOCK = threading.Lock()
 # Neither scales with the image, so both runtimes get the same allowance and a
 # stalled host is caught by its silence instead of by a clock.
 VAST_READY_DEADLINE_SECONDS = 1800
-VAST_PROVISION_STALL_SECONDS = 360
+# The two waits before SSH are watched differently because only one of them is
+# measured. Once the host is running and the loop is knocking, the knock is
+# itself the signal: a daemon that has refused this long has finished
+# provisioning without starting sshd and will not change its mind.
+#
+# 360s was that judgement set to the only measurement available, and the
+# measurement turned out to be the healthy case rather than the wedge: the
+# fastest recorded success answered SSH 386.6s after creation, so the window
+# closed on the population it was meant to keep. A live RTX PRO 6000 rental
+# was then destroyed after 378s of refusals while it was still installing its
+# SSH server, and the retry it forced cost another rental and another eight
+# minutes. The wedge this catches billed the full 1800s deadline, so the two
+# are separated anywhere between; 900s sits clear of every success on record
+# and still hands a wedged host back at half the deadline. A refusal is also
+# no longer the only signal here -- a denied key is now told apart below and
+# fails in seconds, which is the case that never needed a clock at all.
+VAST_SSH_STALL_SECONDS = 900
+# How long a key denial is treated as provisioning rather than as an answer.
+# Vast reports "running" about a second into the container and installs the
+# attached key asynchronously, so the first knocks can land on an sshd whose
+# authorized_keys is not written yet. Failing on the first denial destroyed a
+# healthy RTX PRO 6000 WS rental 49.7s into its deploy, one second after the
+# host came up. A denial that survives this window is still decisive, and
+# still ends the rental far inside the stall window above.
+VAST_KEY_GRACE_SECONDS = 150
+# Before SSH exists the only signal is Vast's own status line, which is a much
+# weaker one, so its window has to clear the normal spread rather than sit in
+# the middle of it: a rental measured at 386.6s from creation to SSH would have
+# been handed back by a 360s window while it was still working. The one wedge
+# actually observed held a single BuildKit line for ~20 minutes, so the window
+# only has to separate those two.
+VAST_PULL_STALL_SECONDS = 900
+
+# How often the model-startup wait reports in. Matches the rental loop's
+# cadence so the summary view collapses both onto one row at the same rate.
+VAST_STARTUP_HEARTBEAT_SECONDS = 30
 
 # BuildKit prefixes every progress line with its step number and an elapsed
 # counter, so the raw string keeps changing even while a step is wedged.
 _BUILDKIT_STEP_PREFIX = re.compile(r"^#\d+\s+\d+(?:\.\d+)?\s+")
+
+
+def vast_startup_detail(
+    downloaded: int, previous: int, interval: float, last_log: str,
+    *, total: int | None = None, active: bool = True,
+) -> str:
+    """Say what a starting runtime is doing, in the order the user can use.
+
+    Measured bytes beat the server log while weights are arriving: llama.cpp
+    draws its download as a carriage-returned bar that a redirected log never
+    receives, so the log holds one stale line for the whole download while the
+    partial file on disk grows. Once nothing is downloading the log is the
+    only thing left that knows about loading and warmup.
+    """
+    if downloaded > 0 or total:
+        gained = downloaded - previous
+        rate = (
+            f" at {gained / interval / 1e6:.0f} MB/s"
+            if previous > 0 and gained > 0 and interval > 0
+            else ""
+        )
+        if total is not None and total > 0:
+            pct = min(99 if active else 100, downloaded * 100 // total)
+            eta = ""
+            if rate and downloaded < total:
+                eta = f", ~{format_elapsed((total - downloaded) * interval / gained)} remaining"
+            return f"downloading weights ({pct}%), {downloaded / 1e9:.1f} / {total / 1e9:.1f} GB{rate}{eta}"
+        return f"downloading weights, {downloaded / 1e9:.1f} GB fetched{rate}"
+    return last_log or "no progress reported yet"
 
 
 def vast_progress_key(instance: VastInstance) -> str:
@@ -139,8 +208,11 @@ class VastDeploymentBackend:
             if not already_running:
                 _CANCELLATIONS[name] = cancellation
         if already_running:
-            config.fallback_configs = ()
-            yield from fail_operation(OperationType.DEPLOY, "This Vast deployment is already in progress.", recoverable=False)
+            yield from fail_operation(
+                OperationType.DEPLOY, "This Vast deployment is already in progress.",
+                recoverable=False,
+                data={"rollback": {"attempted": False, "confirmed": False, "detail": "already in progress"}},
+            )
             return
         try:
             with self.state.locked(name):
@@ -164,7 +236,6 @@ class VastDeploymentBackend:
                 raise ValueError(error)
             name = config.app_name or ""
             if self.state.load(name) is not None:
-                config.fallback_configs = ()
                 raise ValueError("A Vast rental is already recorded for this name. Connect to or destroy it before deploying again.")
             ssh = VastSsh(self.state.directory(name))
             public_key = ssh.public_key()
@@ -200,6 +271,7 @@ class VastDeploymentBackend:
             source = config.model_name if config.backend == BackendType.VLLM else config.repo_id
             config.served_model_name = config.served_model_name or (source or "model").rsplit("/", 1)[-1]
             script = vast_runtime_script(config)
+            download_files = fetch_download_files(config)
             yield StateChangeEvent(current=DeploymentState.DEPLOYING, operation=OperationType.DEPLOY, detail=f"Renting Vast offer {offer.id} at ${price:.4f}/hr including disk")
             if cancellation.is_set() or is_shutting_down():
                 raise RuntimeError("Vast deployment cancelled before rental.")
@@ -219,11 +291,14 @@ class VastDeploymentBackend:
                 offer.id, image=image, disk_gb=options.disk_gb, label=record.label,
             )
             self.state.save(record)  # Persist identity before yielding control.
+            yield ResourceAllocatedEvent(app_id=str(record.instance_id))
             self.api.attach_key(record.instance_id, public_key)
             # A rental cannot answer SSH until its image is pulled, and the
             # vLLM image is several times the size of the llama.cpp one. On a
             # modest link that is minutes of legitimate waiting, not a failure.
-            started = time.monotonic()
+            rental_started = time.monotonic()
+            ssh_ready_at: float | None = None
+            started = rental_started
             deadline = started + VAST_READY_DEADLINE_SECONDS
             instance = None
             last_state = ""
@@ -231,9 +306,9 @@ class VastDeploymentBackend:
             progress_at = started
             reported_at = started
             ssh_reported = False
-            ssh_attempted = False
             ssh_first_try = time.monotonic()
             ssh_backoff = 5.0
+            knocking_since: float | None = None
             while time.monotonic() < deadline:
                 if cancellation.is_set() or is_shutting_down():
                     raise RuntimeError("Vast deployment cancelled.")
@@ -256,35 +331,99 @@ class VastDeploymentBackend:
                     last_state = instance.state
                     yield LogEvent(line=f"Vast instance state: {instance.state}")
                 current_key = vast_progress_key(instance)
+                # Once the host is up and addressable the loop is knocking on
+                # SSH, and the knock is its own progress signal.
+                knocking = bool(
+                    instance.state == "running" and instance.ssh_host and instance.ssh_port
+                )
                 if current_key != progress_key:
                     progress_key, progress_at = current_key, time.monotonic()
-                elif not ssh_attempted and time.monotonic() - progress_at > VAST_PROVISION_STALL_SECONDS:
-                    # Silence before SSH is reachable means the host stopped
-                    # working, not that it is slow. Give the money back sooner.
+                if knocking and knocking_since is None:
+                    knocking_since = time.monotonic()
+                # The two waits are timed from their own starts. Vast freezes
+                # status_msg at "success, running <image>" the moment the pull
+                # finishes and never writes another line, so timing the SSH
+                # wait from the last status change was really timing it from
+                # the end of the pull -- and charging sshd for however long the
+                # pull happened to take. The knock is timed from the first
+                # knock instead, which is what the recorded successes measure.
+                if knocking and knocking_since is not None:
+                    stalled_for, window = time.monotonic() - knocking_since, VAST_SSH_STALL_SECONDS
+                    reason = f"refused SSH for {int(stalled_for)}s after its image came up"
+                else:
+                    stalled_for, window = time.monotonic() - progress_at, VAST_PULL_STALL_SECONDS
+                    reason = f"silent for {int(stalled_for)}s"
+                # A host that reports nothing at all is not stalled, it is
+                # unobserved, and the two must not be read the same way: Vast
+                # leaves status_msg empty for stretches of a healthy pull (a
+                # certified rental logged a docker line at 32s and nothing at
+                # 64s), so calling that a wedge hands back hosts that were
+                # minutes from answering SSH. Where the status line does
+                # report, a step it has not left inside the window is the
+                # wedge that billed 20 minutes for one BuildKit line.
+                if stalled_for > window and (knocking or instance.status_msg):
+                    # Silence means the host stopped working, not that it is
+                    # slow. Give the money back sooner; the loop's own deadline
+                    # remains the backstop for everything this cannot see.
                     raise RuntimeError(
                         "Vast instance stopped making progress while provisioning "
-                        f"(last state: {last_state}, silent for "
-                        f"{int(time.monotonic() - progress_at)}s)."
+                        f"(last state: {last_state}, {reason}, last reported: "
+                        f"{instance.status_msg[:120] or 'nothing'})."
                     )
                 # A minutes-long wait with one log line reads as a hang. Report
-                # what the host is doing without echoing every BuildKit line.
+                # what the host is doing without echoing every BuildKit line,
+                # in the heartbeat shape the summary view already knows how to
+                # collapse onto a single row.
                 if time.monotonic() - reported_at >= 30:
                     reported_at = time.monotonic()
-                    detail = instance.status_msg[:120]
-                    elapsed = int(time.monotonic() - started)
-                    yield LogEvent(
-                        line=f"Vast rental preparing ({elapsed}s): {detail}" if detail
-                        else f"Vast rental preparing ({elapsed}s); no progress reported yet."
-                    )
-                if instance.state == "running" and instance.ssh_host and instance.ssh_port:
-                    ssh_attempted = True
+                    detail = instance.status_msg[:120] or "no progress reported yet"
+                    elapsed = format_elapsed(time.monotonic() - started)
+                    phase = "waiting for SSH" if instance.state == "running" else "rental preparing"
+                    yield LogEvent(line=f"Vast {phase}: {detail} (waiting {elapsed})")
+                if knocking:
                     try:
                         ssh.run(instance, "true")
+                        ssh_ready_at = time.monotonic()
+                        yield LogEvent(line="Vast SSH ready")
                         break
                     except RuntimeError as exc:
+                        # A refused port and a denied key arrive at the same
+                        # place and mean opposite things. The port is refused
+                        # by a host that has not installed its SSH server yet,
+                        # which is most of this wait; the key is denied by one
+                        # that has finished and decided, so waiting out the
+                        # window buys nothing but rental minutes. The denial
+                        # only counts once the host has had time to install
+                        # the key Vast attached, which it does asynchronously.
+                        rejected = (
+                            isinstance(exc, VastSshError) and exc.reason == SSH_REJECTED
+                        )
+                        if isinstance(exc, VastSshError) and exc.reason == SSH_THROTTLED:
+                            # The proxy is rate-limiting this loop's own
+                            # knocking. Stop knocking for a while rather than
+                            # reading it as an answer about the key.
+                            ssh_backoff = 60.0
+                        if rejected and knocking_since is not None and (
+                            time.monotonic() - knocking_since > VAST_KEY_GRACE_SECONDS
+                        ):
+                            raise RuntimeError(
+                                "Vast rental refused the deployment key rather than the "
+                                "connection, so no further waiting would make it answer."
+                            ) from None
                         if time.monotonic() - ssh_first_try > 120 and not ssh_reported:
                             ssh_reported = True
-                            yield LogEvent(line=f"Vast host is running but not accepting SSH yet: {exc}")
+                            # The generic failure text tells the reader to
+                            # check the saved host key, which is wrong advice
+                            # for the case this almost always is: the host has
+                            # not installed its SSH server yet. Say that where
+                            # the refusal says it, and keep the prefix, which
+                            # is what the summary view matches on.
+                            detail = (
+                                "still installing its SSH server"
+                                if isinstance(exc, VastSshError) and exc.reason == SSH_REFUSED
+                                else str(exc)
+                            )
+                            yield LogEvent(line=f"Vast host is running but not accepting SSH yet: {detail}")
                         # Back off rather than retrying every few seconds. A
                         # host that is up but refusing keys will not change its
                         # mind quickly, and hundreds of failed authentications
@@ -310,15 +449,53 @@ class VastDeploymentBackend:
                 listener.bind(("127.0.0.1", 0))
                 record.local_port = listener.getsockname()[1]
             self.state.save(record)
+            yield LogEvent(line="Vast opening secure endpoint")
             ssh.connect(instance, record.local_port)
             url = f"http://127.0.0.1:{record.local_port}"
             yield StateChangeEvent(current=DeploymentState.DEPLOYING, operation=OperationType.DEPLOY, detail="Waiting for the Vast model through the local SSH tunnel")
             deadline = time.monotonic() + (3600 if config.backend == BackendType.VLLM else 1800)
+            # The longest stretch of a Vast deploy sits here, and until now it
+            # was the only one that said nothing: the rental loop above
+            # heartbeats every 30s, then the weights download in silence for
+            # as long as tens of GB take. The last line on screen stayed
+            # "Rented GPUs" for ten minutes of healthy work, which reads as a
+            # hang, so a paid deploy got killed and retried for being quiet.
+            startup_started = time.monotonic()
+            startup_reported = startup_started
+            downloaded = 0
+            download_complete = False
             while not endpoint_healthy(url, record.endpoint_api_key):
                 if cancellation.is_set() or is_shutting_down():
                     raise RuntimeError("Vast deployment cancelled.")
                 if time.monotonic() >= deadline or not ssh.connected(instance):
                     raise RuntimeError("Vast model startup timed out or its SSH tunnel disconnected.")
+                if time.monotonic() - startup_reported >= VAST_STARTUP_HEARTBEAT_SECONDS:
+                    interval = time.monotonic() - startup_reported
+                    startup_reported = time.monotonic()
+                    previous, downloaded = downloaded, 0
+                    try:
+                        output = ssh.run(instance, VAST_STARTUP_PROBE_COMMAND, multiplex=True)
+                        downloaded, last_log = parse_startup_probe(output)
+                        progress = measure_download(output, download_files)
+                        if progress is not None:
+                            downloaded = progress.downloaded
+                            if progress.active or (progress.total and not download_complete):
+                                detail = vast_startup_detail(
+                                    downloaded, previous, interval, last_log,
+                                    total=progress.total, active=progress.active,
+                                )
+                            else:
+                                detail = last_log or "loading model"
+                            download_complete = not progress.active
+                        else:
+                            detail = vast_startup_detail(downloaded, previous, interval, last_log)
+                    except (RuntimeError, ValueError):
+                        # The probe is commentary on a rental that is already
+                        # billing and already watched by the deadline above.
+                        # A host too busy to answer it is still starting.
+                        detail = "still starting"
+                    elapsed = format_elapsed(time.monotonic() - startup_started)
+                    yield LogEvent(line=f"Vast model starting: {detail} (waiting {elapsed})")
                 cancellation.wait(3)
             verify_endpoint_auth(url, record.served_model_name)
             verify_streaming(url, record.endpoint_api_key, record.served_model_name)
@@ -327,27 +504,70 @@ class VastDeploymentBackend:
             record.state = "running"
             self.state.save(record)
             completed = True
+            # Measured evidence for future host selection: advertised inet_down
+            # bandwidth predicts this wait poorly, so store what this machine
+            # actually took from rental to SSH and to a healthy endpoint.
+            try:
+                record_vast_startup(
+                    machine_id=offer.machine_id or "",
+                    offer_id=offer.id,
+                    ssh_seconds=(
+                        ssh_ready_at - rental_started
+                        if ssh_ready_at is not None
+                        else None
+                    ),
+                    healthy_seconds=time.monotonic() - rental_started,
+                )
+            except Exception:
+                pass
             yield LogEvent(line="Vast streaming chat verified. The endpoint is local to this computer; stop destroys the rental and its disk.", operation=OperationType.DEPLOY)
             yield OperationCompleteEvent(operation=OperationType.DEPLOY, success=True, data=self._endpoint(record, "running", url))
         except Exception as exc:
             detail = str(exc)
+            rollback: dict[str, object] | None = None
+            if record is None and (
+                "already recorded" in detail or "already in progress" in detail
+            ):
+                # Pre-allocation refusal for a name that may still bill: block
+                # the next rental via an explicit unconfirmed rollback rather
+                # than mutating the caller's approved ladder.
+                rollback = {"attempted": False, "confirmed": False, "detail": detail}
             if record is not None:
+                try:
+                    machine_id = getattr(record, "machine_id", "") or ""
+                except Exception:
+                    machine_id = ""
+                try:
+                    record_vast_startup(
+                        machine_id=machine_id,
+                        offer_id=getattr(record, "offer_id", "") or "",
+                        ssh_seconds=None,
+                        healthy_seconds=None,
+                        failed=True,
+                    )
+                except Exception:
+                    pass
                 try:
                     self._destroy(record)
                     record = None
+                    rollback = {"attempted": True, "confirmed": True, "detail": ""}
                 except Exception as cleanup:
-                    # Prevent the TUI recovery ladder from renting another GPU
-                    # while the first rental may still be billing.
-                    config.fallback_configs = ()
+                    # The rental may still be billing: report the unconfirmed
+                    # rollback so the lifecycle blocks the next rental instead
+                    # of mutating the approved ladder in place.
                     detail += f" Cleanup remains pending: {cleanup}"
-            yield from fail_operation(OperationType.DEPLOY, detail, recoverable=False)
+                    rollback = {"attempted": True, "confirmed": False, "detail": str(cleanup)}
+            yield from fail_operation(
+                OperationType.DEPLOY, detail, recoverable=False,
+                data={"rollback": rollback} if rollback is not None else None,
+            )
         finally:
             if record is not None and not completed:
                 # Also runs on GeneratorExit / KeyboardInterrupt, with no yields.
                 try:
                     self._destroy(record)
                 except Exception:
-                    config.fallback_configs = ()
+                    pass
 
     @staticmethod
     def _endpoint(record: VastDeploymentRecord, state: str, url: str | None) -> EndpointInfo:

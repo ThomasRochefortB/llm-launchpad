@@ -7,7 +7,10 @@ from llm_launchpad.tui.deploy_log_summary import (
     DeployLogSummarizer,
     beautify_summary_line,
     classify_summary_kind,
+    is_startup_phase_line,
+    parse_startup_phase_line,
     percent_in_text,
+    startup_phase_summary_line,
     summary_progress_parts,
 )
 
@@ -105,6 +108,63 @@ class DeployLogSummarizerTests(unittest.TestCase):
         )
         self.assertEqual(out, ["Compiling kernels"])
 
+    def test_fit_planner_arithmetic_survives_the_noise_filter(self) -> None:
+        s = DeployLogSummarizer(BackendType.LLAMACPP)
+        line = (
+            "llama_params_fit_impl: projected to use 205000 MiB of device memory "
+            "vs. 160000 MiB of free device memory"
+        )
+
+        # The only statement of how far a rejected plan overflowed.
+        self.assertEqual(s.transform(line, OperationType.WARMUP), [line])
+
+    def test_fit_planner_progress_stays_hidden(self) -> None:
+        s = DeployLogSummarizer(BackendType.LLAMACPP)
+
+        self.assertEqual(
+            s.transform(
+                "llama_params_fit: fitting params to free memory took 0.28 seconds",
+                OperationType.WARMUP,
+            ),
+            [],
+        )
+
+    def test_startup_phase_timing_lines_survive_the_summarizer(self) -> None:
+        # The phase timer's lines are the payload callers parse for
+        # before/after comparisons; the headless CLI prints every warmup
+        # event through here, so a dropped line is a measurement lost.
+        for backend in (BackendType.LLAMACPP, BackendType.VLLM):
+            s = DeployLogSummarizer(backend)
+            for line in (
+                "startup-phase deploy 12.3s",
+                "startup-phase warmup-wait 300.0s",
+                "startup-phase calibration 45.1s",
+                "startup-phase total 357.4s",
+            ):
+                self.assertEqual(s.transform(line, OperationType.WARMUP), [line], line)
+
+    def test_an_unknown_phase_name_is_not_a_timing_summary(self) -> None:
+        s = DeployLogSummarizer(BackendType.LLAMACPP)
+        self.assertEqual(
+            s.transform("startup-phase frobnicate 1.0s", OperationType.WARMUP),
+            [],
+        )
+        self.assertEqual(
+            s.transform("startup-phase deploy nope", OperationType.WARMUP),
+            [],
+        )
+
+    def test_a_phase_line_round_trips_through_the_parser(self) -> None:
+        line = startup_phase_summary_line("warmup-wait", 300.04)
+        self.assertEqual(parse_startup_phase_line(line), ("warmup-wait", 300.0))
+        self.assertTrue(is_startup_phase_line(line))
+        # The CLI prints milestones beautified; the parser reads what it prints.
+        self.assertEqual(
+            parse_startup_phase_line(beautify_summary_line(line)),
+            ("warmup-wait", 300.0),
+        )
+        self.assertFalse(is_startup_phase_line("Server is ready!"))
+
     def test_error_line_passes_through(self) -> None:
         s = DeployLogSummarizer(BackendType.VLLM)
         line = "RuntimeError: CUDA out of memory"
@@ -138,6 +198,41 @@ class DeployLogSummarizerTests(unittest.TestCase):
             ),
             [],
         )
+
+    def test_modal_image_build_steps_map_to_building_runtime_image(self) -> None:
+        s = DeployLogSummarizer(BackendType.LLAMACPP)
+        for line in (
+            "=> Step 2: COPY --from=build /src/build/bin/ /app/",
+            "=> Step 5: ENTRYPOINT [\"/app/llama-server\"]",
+            "Saving image...",
+            "Image saved, took 8.12s",
+            "Built image im-N4h4A1AiXcKoJJ8FpACJIf in 603.75s",
+            "(Reading database ... 30%",
+            "Preparing to unpack .../ca-certificates_20260601~22.04.1_all.deb ...",
+            "Unpacking libgomp1:amd64 (12.3.0-1ubuntu1~22.04.3) ...",
+            "Setting up ca-certificates (20260601~22.04.1) ...",
+            "debconf: unable to initialize frontend: Dialog",
+        ):
+            out = s.transform(line, OperationType.DEPLOY)
+            self.assertIn(out, (["Building runtime image"], []), line)
+
+    def test_modal_cmake_progress_maps_to_building_runtime_image_percent(self) -> None:
+        s = DeployLogSummarizer(BackendType.LLAMACPP)
+        out = s.transform(
+            "[ 45%] Building CXX object CMakeFiles/llama.dir/common.cpp.o",
+            OperationType.DEPLOY,
+        )
+        self.assertEqual(out, ["Building runtime image (45%)"])
+
+    def test_modal_image_build_milestone_updates_in_place(self) -> None:
+        s = DeployLogSummarizer(BackendType.LLAMACPP)
+        first = s.transform("=> Step 2: COPY --from=build /src/build/bin/ /app/", OperationType.DEPLOY)
+        second = s.transform(
+            "[ 45%] Building CXX object CMakeFiles/llama.dir/common.cpp.o",
+            OperationType.DEPLOY,
+        )
+        self.assertEqual(first, ["Building runtime image"])
+        self.assertEqual(second, ["Building runtime image (45%)"])
 
     def test_dedupe_resets_on_operation_change(self) -> None:
         s = DeployLogSummarizer(BackendType.VLLM)
@@ -407,6 +502,40 @@ class DeployLogSummarizerTests(unittest.TestCase):
         self.assertEqual(beautify_summary_line("✓ already formatted"), "✓ already formatted")
 
 
+class PreflightDecisionTests(unittest.TestCase):
+    """Preflight decisions are the only report that MTP actually engaged.
+
+    The confirm screen states what was planned; only these lines state what
+    the deployment was launched with, so the summary view has to carry them.
+    """
+
+    def test_preflight_decisions_survive_the_summary_view(self) -> None:
+        for line in (
+            "MTP preflight: enabled native draft-mtp with up to 3 draft tokens.",
+            "MTP preflight: The selected target GGUF has no embedded MTP heads. "
+            "Using normal decoding.",
+            "MTP preflight warning: metadata lookup failed. Disabling MTP and "
+            "continuing with normal decoding.",
+            "Speculative decoding disabled: unsupported method requested.",
+            "Compatibility preflight: Architecture 'qwen35' is supported.",
+            "Serving plan: full 262,144-token context, 4 parallel slot(s), "
+            "GPU-only placement.",
+        ):
+            with self.subTest(line=line):
+                summarizer = DeployLogSummarizer(BackendType.LLAMACPP)
+                self.assertEqual(
+                    summarizer.transform(line, OperationType.DEPLOY),
+                    [line],
+                )
+
+    def test_runtime_chatter_is_still_dropped(self) -> None:
+        summarizer = DeployLogSummarizer(BackendType.LLAMACPP)
+        self.assertEqual(
+            summarizer.transform("srv  update_slots: all slots are idle", OperationType.DEPLOY),
+            [],
+        )
+
+
 class StickyMilestoneTests(unittest.TestCase):
     def test_server_ready_is_announced_once_across_deploy_and_warmup(self) -> None:
         """"Server is ready!" is sticky, but was emitted without being recorded.
@@ -424,3 +553,180 @@ class StickyMilestoneTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PrimeWaitHeartbeatTests(unittest.TestCase):
+    """A long silent step has to prove it is still a step, not a hang.
+
+    Prime lines are only emitted when their detail text changes, and the
+    detail for a model download is a constant string whenever the pod cannot
+    report an expected size. A 109 GB download therefore produced one log line
+    and then minutes of nothing on a screen that bills by the hour.
+    """
+
+    def _milestone(self, line: str) -> str | None:
+        return DeployLogSummarizer(BackendType.LLAMACPP)._map_prime_line(line)
+
+    def test_a_heartbeat_carries_its_wait_onto_the_milestone(self) -> None:
+        self.assertEqual(
+            self._milestone(
+                "Prime runtime: runtime container is loading the model (waiting 5m20s)"
+            ),
+            "Loading model (5m20s)",
+        )
+
+    def test_the_ticking_row_replaces_itself_rather_than_stacking(self) -> None:
+        # The monitor replaces the last step when the label matches, so the
+        # label has to survive the clock changing.
+        labels = {
+            summary_progress_parts(
+                self._milestone(
+                    f"Prime runtime: runtime container is loading the model (waiting {elapsed})"
+                )
+                or ""
+            )[0]
+            for elapsed in ("30s", "5m20s", "1h04m20s")
+        }
+
+        self.assertEqual(labels, {"Loading model"})
+
+    def test_a_real_percentage_is_left_to_speak_for_itself(self) -> None:
+        # A percentage already shows movement; a clock beside it is noise, and
+        # it would also push the percentage into the collapse label.
+        milestone = self._milestone(
+            "Prime runtime: runtime container is downloading the model (42%) "
+            "(waiting 2m00s)"
+        )
+
+        self.assertEqual(milestone, "Downloading model (42%)")
+        self.assertEqual(summary_progress_parts(milestone or ""), ("Downloading model", 42))
+
+    def test_percentages_still_collapse_onto_one_row(self) -> None:
+        labels = {
+            summary_progress_parts(
+                self._milestone(
+                    f"Prime runtime: runtime container is downloading the model ({pct}%)"
+                )
+                or ""
+            )[0]
+            for pct in (7, 42, 99)
+        }
+
+        self.assertEqual(labels, {"Downloading model"})
+
+    def test_a_hidden_line_stays_hidden_when_it_carries_a_wait(self) -> None:
+        self.assertEqual(
+            self._milestone("Prime runtime: portable bootstrap (waiting 45s)"), ""
+        )
+
+
+class VastProvisioningSummaryTests(unittest.TestCase):
+    """A Vast rental's provisioning has to show on screen while it runs.
+
+    Nothing a Vast host does before SSH matched a summary rule, so a deploy
+    that spent six minutes pulling and unpacking its image showed the rental
+    line and then an error. That reads as a hung client rather than a host
+    that was still working.
+    """
+
+    def _transform(self, line: str) -> list[str]:
+        return DeployLogSummarizer(BackendType.LLAMACPP).transform(
+            line, OperationType.DEPLOY
+        )
+
+    def test_percentage_and_transfer_details_share_a_stable_row(self) -> None:
+        result = self._transform(
+            "Vast model starting: downloading weights (60%), 9.0 / 15.0 GB at 200 MB/s, ~30s remaining (waiting 1m00s)"
+        )
+        self.assertEqual(result, [
+            "Downloading model (60%) — 9.0 / 15.0 GB at 200 MB/s, ~30s remaining",
+        ])
+        self.assertEqual(summary_progress_parts(result[0]), ("Downloading model", 60))
+
+    def test_ssh_readiness_is_only_reported_after_a_successful_connection(self) -> None:
+        self.assertEqual(self._transform("Vast waiting for SSH: success, running image (waiting 3m00s)"), ["Waiting for SSH (3m00s)"])
+        self.assertEqual(self._transform("Vast SSH ready"), ["Machine ready"])
+        self.assertEqual(self._transform("Vast opening secure endpoint"), ["Opening secure endpoint"])
+
+    def test_image_pull_is_distinguished_when_reported(self) -> None:
+        self.assertEqual(self._transform("Vast rental preparing: pulling image layers (waiting 30s)"), ["Pulling runtime image (30s)"])
+
+    def test_the_provisioning_wait_reaches_the_summary(self) -> None:
+        self.assertEqual(
+            self._transform("Vast instance state: loading"), ["Provisioning machine"]
+        )
+        self.assertEqual(
+            self._transform(
+                "Vast rental preparing: #6 63.10 Get:9 noble/main Packages (waiting 30s)"
+            ),
+            ["Provisioning machine (30s)"],
+        )
+
+    def test_the_model_startup_wait_reaches_the_summary(self) -> None:
+        self.assertEqual(
+            self._transform(
+                "Vast model starting: downloading weights, 6.6 GB fetched at 35 MB/s"
+                " (waiting 4m10s)"
+            ),
+            ["Downloading model — 6.6 GB fetched at 35 MB/s (4m10s)"],
+        )
+        self.assertEqual(
+            self._transform(
+                "Vast model starting: load_tensors: offloaded 63/63 layers (waiting 9m00s)"
+            ),
+            ["Loading weights on GPU (9m00s)"],
+        )
+
+    def test_the_download_row_replaces_itself_rather_than_stacking(self) -> None:
+        summarizer = DeployLogSummarizer(BackendType.LLAMACPP)
+        labels = {
+            summary_progress_parts(milestone)[0]
+            for gigabytes, elapsed in ((1.2, "30s"), (6.6, "3m00s"), (14.9, "8m30s"))
+            for milestone in summarizer.transform(
+                f"Vast model starting: downloading weights, {gigabytes} GB fetched"
+                f" (waiting {elapsed})",
+                OperationType.DEPLOY,
+            )
+        }
+
+        self.assertEqual(labels, {"Downloading model"})
+
+    def test_the_ticking_row_replaces_itself_rather_than_stacking(self) -> None:
+        summarizer = DeployLogSummarizer(BackendType.LLAMACPP)
+        labels = {
+            summary_progress_parts(milestone)[0]
+            for elapsed in ("30s", "1m00s", "6m30s")
+            for milestone in summarizer.transform(
+                f"Vast rental preparing: no progress reported yet (waiting {elapsed})",
+                OperationType.DEPLOY,
+            )
+        }
+
+        self.assertEqual(labels, {"Provisioning machine"})
+
+    def test_the_rest_of_the_rental_reads_as_milestones(self) -> None:
+        self.assertEqual(self._transform("Vast instance state: running"), ["Waiting for SSH"])
+        self.assertEqual(
+            self._transform("Rented GPUs: 0:NVIDIA GeForce RTX 4090 23.5 GiB free"),
+            ["GPU ready: 0:NVIDIA GeForce RTX 4090 23.5 GiB free"],
+        )
+        self.assertEqual(
+            self._transform("Vast host is running but not accepting SSH yet: refused"),
+            ["Waiting for SSH"],
+        )
+        self.assertEqual(
+            self._transform(
+                "Vast streaming chat verified. The endpoint is local to this computer; "
+                "stop destroys the rental and its disk."
+            ),
+            ["Server is ready!"],
+        )
+
+
+class ElapsedFormatTests(unittest.TestCase):
+    def test_waits_read_as_durations(self) -> None:
+        from llm_launchpad.core.orchestrator import _format_elapsed
+
+        self.assertEqual(_format_elapsed(45), "45s")
+        self.assertEqual(_format_elapsed(320), "5m20s")
+        self.assertEqual(_format_elapsed(3860), "1h04m20s")

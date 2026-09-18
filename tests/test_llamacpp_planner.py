@@ -163,6 +163,134 @@ class LlamaCppPlannerTests(unittest.TestCase):
             self.assertIsNone(load_runtime_attestation(changed, path))
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
+    def test_exact_attestation_overrides_a_conservative_estimate(self) -> None:
+        from llm_launchpad.core.llamacpp_planner import assess_memory_placement
+        from llm_launchpad.protocol.models import MemoryEstimate
+
+        metadata = GgufQuantMetadata(
+            quantizations=["Q4_K_M"],
+            vram_gb_by_quant={"Q4_K_M": 20.0},
+            block_count=32,
+            embedding_length=4096,
+            attention_head_count=32,
+            attention_head_count_kv=8,
+        )
+        requirements = serving_requirements(131_072)
+        tuning = tuning_for_objective(ServingObjective.GENERAL_PURPOSE)
+        fingerprint = serving_fingerprint(
+            model_id="org/model",
+            revision="abc",
+            quant="Q4_K_M",
+            runtime_id="llama.cpp-b10689-cuda12",
+            requirements=requirements,
+            tuning=tuning,
+            gpu_type="L4",
+            gpu_count=1,
+        )
+        attestation = RuntimeAttestation(
+            fingerprint=fingerprint,
+            requested_context_tokens=131_072,
+            effective_context_tokens=131_072,
+            gpu_layers=32,
+            total_layers=32,
+            gpu_resident=True,
+        )
+        base = MemoryEstimate(
+            weights_gb=10.0,
+            kv_cache_gb=11.0,
+            compute_gb=2.0,
+            speculative_gb=0.0,
+            reserve_gb=4.0,
+            total_gb=27.0,
+            per_device_required_gb=(27.0,),
+            total_layer_count=32,
+            source="gguf-metadata",
+        )
+
+        for assess in (
+            lambda: assess_placement(
+                metadata,
+                model_id="org/model",
+                revision="abc",
+                quant="Q4_K_M",
+                runtime_id="llama.cpp-b10689-cuda12",
+                weights_gb=20.0,
+                requirements=requirements,
+                tuning=tuning,
+                gpu_type="L4",
+                gpu_count=1,
+                gpu_memory_gb=24.0,
+            ),
+            lambda: assess_memory_placement(
+                base,
+                model_id="org/model",
+                revision="abc",
+                quant="Q4_K_M",
+                runtime_id="llama.cpp-b10689-cuda12",
+                requirements=requirements,
+                tuning=tuning,
+                gpu_type="L4",
+                gpu_count=1,
+                gpu_memory_gb=24.0,
+            ),
+        ):
+            with TemporaryDirectory() as directory:
+                path = Path(directory) / "certificates.json"
+                with patch(
+                    "llm_launchpad.core.llamacpp_planner.CERTIFICATE_CACHE_PATH", path
+                ):
+                    # The formula alone rejects this plan on an L4.
+                    rejected = assess()
+                    self.assertFalse(rejected.fits)
+                    # An exact successful observation promotes the same
+                    # configuration on both assessment paths.
+                    save_runtime_attestation(attestation)
+                    confirmed = assess()
+                    self.assertTrue(confirmed.fits)
+                    self.assertTrue(confirmed.gpu_resident)
+                    self.assertEqual(confirmed.certification, CertificationState.CERTIFIED)
+
+    def test_variant_search_labels_a_smaller_context_alternative(self) -> None:
+        from llm_launchpad.core.llamacpp_planner import serving_variants
+
+        metadata = GgufQuantMetadata(
+            quantizations=["Q4_K_M"],
+            vram_gb_by_quant={"Q4_K_M": 20.0},
+            block_count=32,
+            embedding_length=4096,
+            attention_head_count=32,
+            attention_head_count_kv=8,
+            attention_key_length=128,
+            attention_value_length=128,
+        )
+        variants = serving_variants(
+            metadata,
+            model_id="org/model",
+            revision="abc",
+            quant="Q4_K_M",
+            runtime_id="llama.cpp-b10689-cuda12",
+            weights_gb=20.0,
+            context_tokens=131_072,
+            gpu_type="L4",
+            gpu_count=1,
+            gpu_memory_gb=24.0,
+        )
+        self.assertTrue(variants)
+        # The full-context default always leads, whatever fits behind it.
+        self.assertEqual(variants[0].label, "full context")
+        self.assertEqual(
+            variants[0].requirements.context_tokens, 131_072
+        )
+        alternatives = variants[1:]
+        self.assertTrue(alternatives)
+        for variant in alternatives:
+            self.assertLessEqual(
+                variant.requirements.context_tokens, 131_072
+            )
+            self.assertTrue(variant.label)
+            # Every variant is recomputed from metadata, never scaled.
+            self.assertGreater(variant.memory.total_gb, 0)
+
 
 
 class KvCacheTypeTests(unittest.TestCase):
@@ -182,6 +310,112 @@ class KvCacheTypeTests(unittest.TestCase):
             attention_key_length=128,
             attention_value_length=128,
         )
+
+    def test_flash_attention_costs_a_mask_and_without_it_the_scores_too(self) -> None:
+        requirements = serving_requirements(262144)
+        metadata = self._metadata()
+        with_fa = estimate_memory(
+            metadata, weights_gb=9.83, requirements=requirements, tuning=self._tuning()
+        )
+        without_fa = estimate_memory(
+            metadata,
+            weights_gb=9.83,
+            requirements=requirements,
+            tuning=replace(self._tuning(), flash_attention=False),
+        )
+
+        # Flash attention still reserves one f16 mask over the whole context.
+        self.assertAlmostEqual(
+            with_fa.attention_scratch_gb, 262144 * 512 * 2 / 1e9, places=3
+        )
+        # Without it the scores are materialized too: one f32 plane per query
+        # head, and the mask widens to f32.
+        self.assertAlmostEqual(
+            without_fa.attention_scratch_gb,
+            262144 * 512 * (32 + 1) * 4 / 1e9,
+            places=3,
+        )
+        self.assertGreater(without_fa.total_gb, with_fa.total_gb)
+
+    def test_attention_scratch_grows_with_the_advertised_context(self) -> None:
+        tuning = replace(self._tuning(), flash_attention=False)
+        metadata = self._metadata()
+        short = estimate_memory(
+            metadata, weights_gb=9.83, requirements=serving_requirements(131072), tuning=tuning
+        )
+        long = estimate_memory(
+            metadata, weights_gb=9.83, requirements=serving_requirements(262144), tuning=tuning
+        )
+
+        # Linear in context: it is why a long window without flash attention
+        # needs a bigger device rather than more of them.
+        self.assertAlmostEqual(long.attention_scratch_gb, short.attention_scratch_gb * 2, places=2)
+
+    def test_graph_memory_is_not_divided_across_devices(self) -> None:
+        requirements = serving_requirements(262144)
+        metadata = self._metadata()
+        tuning = replace(self._tuning(), flash_attention=False)
+        one = estimate_memory(
+            metadata, weights_gb=200.0, requirements=requirements, tuning=tuning, gpu_count=1
+        )
+        four = estimate_memory(
+            metadata, weights_gb=200.0, requirements=requirements, tuning=tuning, gpu_count=4
+        )
+
+        per_device_graph = four.compute_gb + four.attention_scratch_gb
+        shardable = four.weights_gb + four.kv_cache_gb + four.speculative_gb
+        # 65 layers over 4 devices is 17/16/16/16, so the busiest carries 17
+        # of them -- and a whole graph of its own on top, which is the part
+        # adding GPUs never divides.
+        self.assertAlmostEqual(
+            four.per_device_required_gb[0],
+            shardable * 17 / 65 + per_device_graph,
+            places=1,
+        )
+        # Four devices cost four copies of the graph, not one shared between
+        # them, so the total grows rather than staying put.
+        self.assertAlmostEqual(
+            four.total_gb - one.total_gb, per_device_graph * 3, places=1
+        )
+
+    def test_an_uneven_layer_split_is_sized_on_the_busiest_device(self) -> None:
+        """llama.cpp assigns whole layers, so a remainder lands on one GPU.
+
+        A measured GLM-5.3-Flash plan put 78,810 MiB on CUDA0 against 74,738
+        on CUDA1 -- 23 layers against 22 -- and was refused for the difference
+        while the two together had room to spare.
+        """
+        metadata = replace(self._metadata(), block_count=45)
+        memory = estimate_memory(
+            metadata,
+            weights_gb=109.0,
+            requirements=serving_requirements(262144),
+            tuning=self._tuning(),
+            gpu_count=2,
+        )
+
+        busiest, quietest = memory.per_device_required_gb
+        self.assertGreater(busiest, quietest)
+        shardable = memory.weights_gb + memory.kv_cache_gb + memory.speculative_gb
+        graph = memory.compute_gb + memory.attention_scratch_gb
+        self.assertAlmostEqual(busiest, shardable * 23 / 45 + graph, places=1)
+        # The total is unchanged by how it is split.
+        self.assertAlmostEqual(memory.total_gb, shardable + graph * 2, places=1)
+
+    def test_a_head_count_is_required_to_size_a_plan_without_flash_attention(self) -> None:
+        metadata = replace(self._metadata(), attention_head_count=None)
+
+        unsized = estimate_memory(
+            metadata,
+            weights_gb=9.83,
+            requirements=serving_requirements(262144),
+            tuning=replace(self._tuning(), flash_attention=False),
+        )
+
+        # Guessing would understate the requirement by an order of magnitude,
+        # so the estimate is marked unverified instead.
+        self.assertEqual(unsized.source, "conservative-fallback")
+        self.assertLess(unsized.confidence, 0.8)
 
     def test_quantized_cache_halves_the_full_context_footprint(self) -> None:
         requirements = serving_requirements(262144)

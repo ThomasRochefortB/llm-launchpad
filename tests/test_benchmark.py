@@ -35,7 +35,7 @@ class BenchmarkCoreTests(unittest.TestCase):
             parse_concurrency_values("0")
 
     def test_request_count_defaults_to_balanced_formula(self) -> None:
-        self.assertEqual(request_count_for_concurrency(1), 24)
+        self.assertEqual(request_count_for_concurrency(1), 25)
         self.assertEqual(request_count_for_concurrency(8), 32)
         self.assertEqual(request_count_for_concurrency(8, override=99), 99)
 
@@ -88,12 +88,28 @@ class BenchmarkCoreTests(unittest.TestCase):
         self.assertIn("--concurrency", cmd)
         self.assertIn("4", cmd)
         self.assertIn("--request-count", cmd)
-        self.assertIn("24", cmd)
+        self.assertIn("25", cmd)
+        self.assertIn("--warmup-request-count", cmd)
+        self.assertIn("5", cmd)
         self.assertIn("--artifact-dir", cmd)
         self.assertIn("/tmp/aiperf-c4", cmd)
-        self.assertIn("--warmup-request-count", cmd)
         self.assertNotIn("https://alice--vllm-qwen-serve.modal.run/v1", cmd)
         self.assertIn("https://alice--vllm-qwen-serve.modal.run", cmd)
+
+    def test_benchmark_request_counts_keep_enough_timed_samples_for_p95(self) -> None:
+        from llm_launchpad.core.benchmark import (
+            benchmark_timed_requests,
+            benchmark_warmup_requests,
+        )
+
+        for concurrency in (1, 2, 4, 8, 16):
+            total = request_count_for_concurrency(concurrency)
+            self.assertGreaterEqual(
+                benchmark_timed_requests(total),
+                20,
+                f"c={concurrency} leaves too few timed requests for a p95",
+            )
+            self.assertGreater(benchmark_warmup_requests(total), 0)
 
     def test_benchmark_config_from_endpoint_prefers_endpoint_metadata(self) -> None:
         row = EndpointInfo(

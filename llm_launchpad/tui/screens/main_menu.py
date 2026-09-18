@@ -8,14 +8,17 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import time
-from typing import Any, Literal
 
 from rich.cells import cell_len
 from rich.markup import escape
 
-from ..format import clip, format_free_tier, format_gib, format_money
+from ..format import (
+    clip,
+    format_token_count,
+    format_token_rate,
+)
 from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -26,12 +29,20 @@ from textual.widgets import OptionList, Static
 from textual.widgets.option_list import Option
 
 from ...core.backend import ModalBackend
+from ...core.serving_metrics import default_tracker, usage_key
 from ...core.hf_auth import HuggingFaceAuthStatus, get_huggingface_auth_status
 from ...core.modal_auth import ModalAuthStatus, get_modal_auth_status
 from ...core.prime_auth import PrimeAuthStatus, get_prime_auth_status
-from ...core.prime_backend import PrimeBackend
+from ...core.provider_billing import (
+    PROVIDER_BILLING_ORDER,
+    PROVIDER_SETUP_COMMANDS,
+    BillingStatus,
+    ProviderBilling,
+    load_modal_billing,
+    load_prime_billing,
+    load_vast_billing,
+)
 from ...core.vast_auth import resolve_vast_credentials
-from ...core.vast_backend import VastBackend
 from ...core.quick_deploy import (
     QuickDeployCatalogInfo,
     QuickDeployProfile,
@@ -48,14 +59,23 @@ from ...core.quick_deploy_refresh import (
     is_fresh_cached_quick_deploy_catalog,
     load_cached_quick_deploy_catalog,
 )
-from ...core.storage_costs import (
-    MODAL_VOLUME_FREE_TIER_GIB_MONTH,
-    estimate_monthly_storage_cost,
-)
 from ...protocol.enums import BackendType, ComputeProvider
-from ...protocol.models import EndpointInfo, FleetDiscovery, StorageSnapshot
+from ...protocol.models import EndpointInfo, FleetDiscovery, ServingSnapshot, StorageSnapshot
+from ..billing_panel import render_provider_billing
 from ..connection import endpoint_model_summary, resolve_openai_base_url
-from ..fleet_status import provider_outage_lines
+from ..fleet_status import (
+    SCALE_TO_ZERO_PROVIDERS,
+    fetch_serving_snapshot,
+    is_passive_traffic_row,
+    provider_outage_lines,
+)
+from ..markers import (
+    ARTIFICIAL_ANALYSIS_MARKER,
+    HUGGINGFACE_MARKER,
+    MODAL_MARKER,
+    PRIME_MARKER,
+    VAST_MARKER,
+)
 from ..workers import EndpointsFailed, EndpointsLoaded, StorageFailed, StorageLoaded
 from ..responsive import ViewportProfile
 from ..widgets.fitted_footer import FittedFooter
@@ -89,53 +109,16 @@ class DeploymentsLoadFailed(Message):
         self.error = error
 
 
-class BillingReportLoaded(Message):
-    """Main-menu billing report fetch completed."""
+class ProviderBillingLoaded(Message):
+    """One provider's billing snapshot arrived; the panel redraws every row."""
 
-    def __init__(self, payload: Any, storage_snapshot: StorageSnapshot | None = None) -> None:
+    def __init__(self, row: ProviderBilling) -> None:
         super().__init__()
-        self.payload = payload
-        self.storage_snapshot = storage_snapshot
+        self.row = row
 
 
-class BillingReportLoadFailed(Message):
-    """Main-menu billing report fetch failed."""
-
-    def __init__(self, error: str) -> None:
-        super().__init__()
-        self.error = error
-
-
-class PrimeBillingReportLoaded(Message):
-    """Main-menu Prime billing fetch completed."""
-
-    def __init__(self, payload: Any) -> None:
-        super().__init__()
-        self.payload = payload
-
-
-class PrimeBillingReportLoadFailed(Message):
-    """Main-menu Prime billing fetch failed."""
-
-    def __init__(self, error: str) -> None:
-        super().__init__()
-        self.error = error
-
-
-class VastBillingCreditLoaded(Message):
-    """Main-menu Vast credit fetch completed."""
-
-    def __init__(self, payload: Any) -> None:
-        super().__init__()
-        self.payload = payload
-
-
-class VastBillingCreditLoadFailed(Message):
-    """Main-menu Vast credit fetch failed."""
-
-    def __init__(self, error: str) -> None:
-        super().__init__()
-        self.error = error
+class ProviderBillingFinished(Message):
+    """Every provider's billing read has settled; another pass may start."""
 
 
 class HuggingFaceAuthLoaded(Message):
@@ -191,20 +174,6 @@ class QuickDeployCatalogLoadFailed(Message):
         self.error = error
 
 
-# Every provider marker must occupy exactly one terminal cell. The Hugging Face
-# emoji is East Asian Width "W" (two cells) and the diamonds that used to mark
-# Prime Intellect and Artificial Analysis are "Ambiguous" -- Rich measures them
-# as one cell while a CJK-configured terminal draws two. Either way the row
-# slips out of its column, and in the ambiguous case Rich and the terminal
-# disagree about where the rest of the line begins. These five are all width
-# "N": unambiguous, single-cell, and visually distinct from one another.
-MODAL_MARKER = "\u25b0"
-PRIME_MARKER = "\u2726"
-VAST_MARKER = "\u2756"
-HUGGINGFACE_MARKER = "\u25c9"
-ARTIFICIAL_ANALYSIS_MARKER = "\u2731"
-
-
 def _render_hf_auth_status(status: HuggingFaceAuthStatus | None = None) -> str:
     if status is None:
         return f"[dim]{HUGGINGFACE_MARKER} Checking Hugging Face auth...[/dim]"
@@ -225,7 +194,10 @@ def _render_modal_auth_status(status: ModalAuthStatus | None = None) -> str:
     if status.error:
         detail = escape(clip(status.error, 72))
         return f"[yellow]{MODAL_MARKER} Modal auth check failed: {detail}[/yellow]"
-    return f"[yellow]{MODAL_MARKER} Modal not authenticated (run: modal setup)[/yellow]"
+    return (
+        f"[yellow]{MODAL_MARKER} Modal not authenticated "
+        f"(run: {PROVIDER_SETUP_COMMANDS[ComputeProvider.MODAL]})[/yellow]"
+    )
 
 
 def _render_prime_auth_status(status: PrimeAuthStatus | None = None) -> str:
@@ -236,7 +208,10 @@ def _render_prime_auth_status(status: PrimeAuthStatus | None = None) -> str:
     if status.error:
         detail = escape(clip(status.error, 72))
         return f"[yellow]{PRIME_MARKER} Prime Intellect auth check failed: {detail}[/yellow]"
-    return f"[yellow]{PRIME_MARKER} Prime Intellect not authenticated (run: prime login)[/yellow]"
+    return (
+        f"[yellow]{PRIME_MARKER} Prime Intellect not authenticated "
+        f"(run: {PROVIDER_SETUP_COMMANDS[ComputeProvider.PRIME]})[/yellow]"
+    )
 
 
 def _render_vast_auth_status() -> str:
@@ -248,7 +223,10 @@ def _render_vast_auth_status() -> str:
         return f"[yellow]{VAST_MARKER} Vast.ai key unreadable: {detail}[/yellow]"
     if credentials.api_key:
         return f"[green]{VAST_MARKER} Vast.ai key configured ({escape(credentials.source)})[/green]"
-    return f"[yellow]{VAST_MARKER} Vast.ai not configured (run: llm-launchpad vast-auth login)[/yellow]"
+    return (
+        f"[yellow]{VAST_MARKER} Vast.ai not configured "
+        f"(run: {PROVIDER_SETUP_COMMANDS[ComputeProvider.VAST]})[/yellow]"
+    )
 
 
 def _render_artificial_analysis_auth_status(
@@ -267,6 +245,53 @@ def _render_artificial_analysis_auth_status(
         f"[yellow]{ARTIFICIAL_ANALYSIS_MARKER} Artificial Analysis not authenticated "
         "(run: llm-launchpad aai-auth login)[/yellow]"
     )
+
+
+def _connection_summary(
+    modal_status: ModalAuthStatus | None = None,
+    prime_status: PrimeAuthStatus | None = None,
+) -> str:
+    """One-line provider connection state for the compact home header.
+
+    Optional providers (unconfigured, no key) read neutrally; only failed
+    checks and explicit errors use warning styling. Full per-provider detail
+    lives in the Details view.
+    """
+    connected: list[str] = []
+    pending: list[str] = []
+    failed: list[str] = []
+    if modal_status is not None:
+        if modal_status.authenticated:
+            connected.append("Modal")
+        elif modal_status.error:
+            failed.append("Modal")
+        else:
+            pending.append("Modal")
+    if prime_status is not None:
+        if prime_status.authenticated:
+            connected.append("Prime")
+        elif prime_status.error:
+            failed.append("Prime")
+        else:
+            pending.append("Prime")
+    try:
+        credentials = resolve_vast_credentials()
+        if credentials.api_key:
+            connected.append("Vast.ai")
+    except ValueError:
+        failed.append("Vast.ai")
+    parts: list[str] = []
+    if connected:
+        parts.append(f"[green]{len(connected)} connected[/green]")
+    if pending:
+        parts.append(f"[dim]{len(pending)} pending[/dim]")
+    elif modal_status is None and prime_status is None and not connected:
+        parts.append("[dim]checking...[/dim]")
+    if failed:
+        parts.append(f"[yellow]{len(failed)} needs attention[/yellow]")
+    if not parts:
+        return "[dim]Providers: not configured[/dim]"
+    return f"[dim]Providers:[/dim] {' · '.join(parts)}"
 
 
 def _render_auth_status_block(
@@ -317,69 +342,127 @@ def _runtime_bucket_from_modal_state(state: str) -> str:
 
 def _runtime_bucket(row: EndpointInfo) -> str:
     status = (row.runtime_status or "").strip().lower()
-    if status in {"healthy", "in_progress", "error"}:
+    if status in {"healthy", "in_progress", "error", "unchecked"}:
         return status
+    # A deployed Modal app is not evidence its container is warm: background
+    # refreshes never probe it, so without an explicit observation it is
+    # "not checked", never "healthy". Other providers keep live probing, so
+    # their provider state still implies health until a probe says otherwise.
+    if row.provider in SCALE_TO_ZERO_PROVIDERS and _state_bucket(row.state) == "healthy":
+        return "unchecked"
     return _runtime_bucket_from_modal_state(row.state)
 
 
-def _style_runtime_bucket(bucket: str) -> str:
-    normalized = (bucket or "").strip().lower()
-    if normalized == "healthy":
-        return "[green]healthy[/green]"
-    if normalized == "in_progress":
-        return "[yellow]in progress[/yellow]"
-    if normalized == "error":
-        return "[red]error[/red]"
-    return f"[dim]{escape(normalized or 'unknown')}[/dim]"
+@dataclass(frozen=True)
+class RuntimeProbeResult:
+    """What one fleet probe learned about an endpoint."""
+
+    status: str
+    detail: str | None = None
+    serving: ServingSnapshot | None = None
 
 
-def _probe_row_runtime_status(row: EndpointInfo, username: str) -> tuple[str, str | None]:
+def _probe_row_runtime_status(
+    row: EndpointInfo,
+    username: str,
+    *,
+    explicit: bool = False,
+) -> RuntimeProbeResult:
     modal_runtime = _runtime_bucket_from_modal_state(row.state)
     if modal_runtime != "healthy":
-        return modal_runtime, None
+        return RuntimeProbeResult(modal_runtime)
     if row.backend not in {BackendType.VLLM, BackendType.LLAMACPP}:
-        return "in_progress", "unknown backend"
+        return RuntimeProbeResult("in_progress", "unknown backend")
+    # Background refreshes never contact a scale-to-zero runtime: the request
+    # itself would wake the container or extend its idle timeout. The caller
+    # re-attaches the last explicit observation instead, so this path returns
+    # before any HTTP request -- including the /health fallback, which a
+    # blocked /metrics must never trigger on its own.
+    if row.provider in SCALE_TO_ZERO_PROVIDERS and not explicit:
+        return RuntimeProbeResult("unchecked", "health not checked")
 
     base_url, was_derived = resolve_openai_base_url(row, username=username)
     if not base_url:
-        return "in_progress", "missing URL"
+        return RuntimeProbeResult("in_progress", "missing URL")
 
     try:
         import requests  # type: ignore
     except ImportError:
-        return modal_runtime, "requests unavailable"
+        return RuntimeProbeResult(modal_runtime, "requests unavailable")
 
     base_root = base_url.rstrip("/")
     host_root = base_root[:-3] if base_root.endswith("/v1") else base_root
-    probe_url = host_root.rstrip("/") + "/health"
+    host_root = host_root.rstrip("/")
+    headers = (
+        {"Authorization": f"Bearer {row.endpoint_api_key}"}
+        if row.endpoint_api_key
+        else None
+    )
+
+    # /metrics answers health and traffic together, so an endpoint that serves
+    # it never pays for a separate health request.
+    serving = fetch_serving_snapshot(row, username, explicit=explicit)
+    if serving is not None:
+        return RuntimeProbeResult("healthy", None, serving)
+
+    # A passive Modal probe ends here: without /metrics there is no liveness
+    # evidence, and falling through to /health would still wake the container.
+    if row.provider in SCALE_TO_ZERO_PROVIDERS and not explicit:
+        return RuntimeProbeResult("unchecked", "health not checked")
+
+    probe_url = host_root + "/health"
     try:
-        headers = (
-            {"Authorization": f"Bearer {row.endpoint_api_key}"}
-            if row.endpoint_api_key
-            else None
-        )
         response = requests.get(probe_url, headers=headers, timeout=2.5)
         if 200 <= response.status_code < 300:
-            return "healthy", None
+            return RuntimeProbeResult("healthy")
 
         if not was_derived and response.status_code in {401, 403, 404}:
-            return "error", f"HTTP {response.status_code}"
-        return "in_progress", f"HTTP {response.status_code}"
+            return RuntimeProbeResult("error", f"HTTP {response.status_code}")
+        return RuntimeProbeResult("in_progress", f"HTTP {response.status_code}")
     except Exception as exc:
-        return "in_progress", str(exc)
+        return RuntimeProbeResult("in_progress", str(exc))
 
 
-def _annotate_runtime_statuses(rows: list[EndpointInfo], username: str) -> None:
-    candidates = [
-        row
-        for row in rows
-        if _runtime_bucket_from_modal_state(row.state) == "healthy"
-        and row.backend in {BackendType.VLLM, BackendType.LLAMACPP}
-    ]
+def _annotate_runtime_statuses(
+    rows: list[EndpointInfo],
+    username: str,
+    *,
+    explicit: bool = False,
+) -> None:
+    tracker = default_tracker()
+    try:
+        from ...core.runtime_health import get_health
+    except Exception:  # pragma: no cover - import-time safety
+        get_health = None  # type: ignore[assignment]
+
+    candidates: list[EndpointInfo] = []
     for row in rows:
         if _runtime_bucket_from_modal_state(row.state) != "healthy":
             row.runtime_status = _runtime_bucket_from_modal_state(row.state)
             row.runtime_status_detail = None
+            row.runtime_checked_at = None
+        elif row.provider in SCALE_TO_ZERO_PROVIDERS and not explicit:
+            # Passive Modal row: provider state plus the last explicit
+            # observation, never a new request. Banked traffic stays on the
+            # row; live gauges stay off it.
+            stored = get_health(row) if get_health is not None else None
+            if stored is not None:
+                row.runtime_status = stored.status
+                row.runtime_status_detail = stored.detail
+                row.runtime_checked_at = stored.checked_at_epoch
+            else:
+                row.runtime_status = "unchecked"
+                row.runtime_status_detail = "health not checked"
+                row.runtime_checked_at = None
+        elif row.backend in {BackendType.VLLM, BackendType.LLAMACPP}:
+            candidates.append(row)
+        else:
+            row.runtime_status = "in_progress"
+            row.runtime_status_detail = "unknown backend"
+            row.runtime_checked_at = None
+        # A stopped endpoint still served what it served, so the banked total
+        # stays on the row. Only the live gauges go away with the container.
+        row.serving = tracker.snapshot(usage_key(row))
 
     if not candidates:
         return
@@ -387,17 +470,58 @@ def _annotate_runtime_statuses(rows: list[EndpointInfo], username: str) -> None:
     max_workers = min(4, len(candidates))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(_probe_row_runtime_status, row, username): row
+            executor.submit(_probe_row_runtime_status, row, username, explicit=explicit): row
             for row in candidates
         }
         for future in as_completed(futures):
             row = futures[future]
             try:
-                status, detail = future.result()
+                result = future.result()
             except Exception as exc:
-                status, detail = "in_progress", str(exc)
-            row.runtime_status = status
-            row.runtime_status_detail = detail
+                result = RuntimeProbeResult("in_progress", str(exc))
+            row.runtime_status = result.status
+            row.runtime_status_detail = result.detail
+            if result.serving is not None:
+                row.serving = result.serving
+            # An explicit Modal verdict outlives this refresh: later passive
+            # passes re-attach it with its age instead of reprobing.
+            if row.provider in SCALE_TO_ZERO_PROVIDERS and explicit:
+                try:
+                    from ...core.runtime_health import record_explicit_health as _record
+
+                    _record(row, result.status, result.detail)
+                except Exception:
+                    pass
+                # record_explicit_health stamps the row itself.
+            elif row.provider not in SCALE_TO_ZERO_PROVIDERS:
+                row.runtime_checked_at = None
+
+
+def _refresh_cached_passive_rows(rows: list[EndpointInfo]) -> None:
+    """Re-attach passive Modal observations to cached annotated rows.
+
+    The fleet fingerprint does not include health (it describes provider
+    state), so a status check that lands inside the runtime cache TTL would
+    otherwise stay invisible until the cache expires. This touches only
+    scale-to-zero rows and never the network; Prime/Vast verdicts keep their
+    cached values.
+    """
+    tracker = default_tracker()
+    try:
+        from ...core.runtime_health import get_health
+    except Exception:  # pragma: no cover - import-time safety
+        get_health = None  # type: ignore[assignment]
+    for row in rows:
+        if row.provider not in SCALE_TO_ZERO_PROVIDERS:
+            continue
+        if _runtime_bucket_from_modal_state(row.state) != "healthy":
+            continue
+        stored = get_health(row) if get_health is not None else None
+        if stored is not None:
+            row.runtime_status = stored.status
+            row.runtime_status_detail = stored.detail
+            row.runtime_checked_at = stored.checked_at_epoch
+        row.serving = tracker.snapshot(usage_key(row))
 
 
 def _backend_display_name(backend: BackendType | None) -> str:
@@ -409,24 +533,12 @@ def _backend_display_name(backend: BackendType | None) -> str:
 
 
 def _friendly_count_line(rows: list[EndpointInfo]) -> list[str]:
-    runtime_counts = Counter(_runtime_bucket(row) for row in rows)
+    from ..fleet_status import fleet_summary_line
+
     backend_counts = Counter(
         row.backend.value if row.backend is not None else "unknown"
         for row in rows
     )
-    healthy = runtime_counts.get("healthy", 0)
-    in_progress = runtime_counts.get("in_progress", 0)
-    errors = runtime_counts.get("error", 0)
-
-    noun = "launchpad app" if len(rows) == 1 else "launchpad apps"
-    chips = [f"[green]{healthy} healthy[/green]"]
-    if in_progress:
-        chips.append(f"[yellow]{in_progress} in progress[/yellow]")
-    if errors:
-        chips.append(f"[red]{errors} error[/red]")
-    summary = f"[bold]{len(rows)} active {noun}[/bold]"
-    if chips:
-        summary += "  " + "  ".join(chips)
 
     backend_parts = []
     if backend_counts.get("vllm", 0):
@@ -435,7 +547,7 @@ def _friendly_count_line(rows: list[EndpointInfo]) -> list[str]:
         backend_parts.append(f"{backend_counts['llamacpp']} llama.cpp")
     if not backend_parts:
         backend_parts.append(f"{len(rows)} launchpad")
-    return [summary, f"[dim]{' | '.join(backend_parts)}[/dim]", ""]
+    return [fleet_summary_line(rows), f"[dim]{' | '.join(backend_parts)}[/dim]", ""]
 
 
 def _wrap_url_for_panel(value: str, width: int = 44) -> list[str]:
@@ -484,6 +596,40 @@ _PROVIDER_RESOURCE_LABELS = {
 }
 
 
+def _serving_panel_line(row: EndpointInfo) -> str | None:
+    """One-line traffic summary for the fleet panel, or None with nothing to say.
+
+    Passively monitored Modal rows show banked totals only: live gauges stay
+    blank (``-`` in Manage) so a historical total is never mistaken for a
+    current measurement.
+    """
+    serving = row.serving
+    if serving is None:
+        return None
+    passive = is_passive_traffic_row(row)
+    parts: list[str] = []
+    if not passive and serving.tokens_per_second is not None:
+        parts.append(format_token_rate(serving.tokens_per_second))
+    if not passive and serving.stats.requests_running:
+        parts.append(f"{serving.stats.requests_running:,.0f} running")
+    if serving.total_tokens > 0:
+        parts.append(f"{format_token_count(serving.total_tokens)} served")
+    if not parts:
+        return None
+    return f"[dim]Traffic:[/dim] {' · '.join(parts)}"
+
+
+def _passive_metrics_line(row: EndpointInfo) -> str | None:
+    """Explain why a serving Modal row shows totals but no live gauges."""
+    if not is_passive_traffic_row(row):
+        return None
+    if row.serving is None or row.serving.total_tokens <= 0:
+        return None
+    from ..fleet_status import PASSIVE_METRICS_NOTE
+
+    return f"[dim]{PASSIVE_METRICS_NOTE}[/dim]"
+
+
 def _render_deployment_status(
     rows: list[EndpointInfo],
     username: str = "",
@@ -512,13 +658,21 @@ def _render_deployment_status(
 
     app_lines = []
     for index, row in enumerate(display_rows):
+        from ..fleet_status import deployment_and_health_line
+
         instance = (row.instance_name or "").strip() or "default"
         backend_name = _backend_display_name(row.backend)
         app_lines.append(
             f"[bold]{escape(instance)}[/bold]  "
-            f"[dim]{escape(backend_name)}[/dim]  {_style_runtime_bucket(_runtime_bucket(row))} "
-            f"[dim]({row.provider.value}: {escape((row.state or 'unknown').strip().lower())})[/dim]"
+            f"[dim]{escape(backend_name)} · {row.provider.value}[/dim]\n"
+            f"  {deployment_and_health_line(row)}"
         )
+        traffic_line = _serving_panel_line(row)
+        if traffic_line:
+            app_lines.append(traffic_line)
+        passive_line = _passive_metrics_line(row)
+        if passive_line:
+            app_lines.append(passive_line)
         resource_label = _PROVIDER_RESOURCE_LABELS.get(
             row.provider, f"{row.provider.display_name} deployment"
         )
@@ -564,291 +718,6 @@ def _render_deployment_status(
     return "\n".join(preface + header_lines + app_lines)
 
 
-def _storage_estimate_lines(snapshot: StorageSnapshot | None) -> list[str]:
-    if snapshot is None:
-        return []
-    estimate = estimate_monthly_storage_cost(snapshot)
-    return [
-        f"[dim]Launchpad storage est.[/dim] {format_money(estimate.estimated_monthly_cost_usd)}/mo",
-        (
-            f"[dim]{format_gib(estimate.total_gib_month)} cached; "
-            f"{format_gib(estimate.billable_gib_month)} billable after "
-            f"{format_free_tier(MODAL_VOLUME_FREE_TIER_GIB_MONTH)} free[/dim]"
-        ),
-    ]
-
-
-def _coerce_float(value: Any) -> float | None:
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        text = value.strip().replace("$", "").replace(",", "")
-        if not text:
-            return None
-        try:
-            return float(text)
-        except ValueError:
-            return None
-    return None
-
-
-def _find_first_float(payload: Any, dotted_keys: list[str]) -> float | None:
-    for dotted_key in dotted_keys:
-        current = payload
-        found = True
-        for key in dotted_key.split("."):
-            if isinstance(current, dict) and key in current:
-                current = current[key]
-            else:
-                found = False
-                break
-        if not found:
-            continue
-        parsed = _coerce_float(current)
-        if parsed is not None:
-            return parsed
-    return None
-
-
-def _normalize_billing_payload(payload: Any) -> Any:
-    if isinstance(payload, dict):
-        if isinstance(payload.get("report"), dict):
-            return payload["report"]
-        if isinstance(payload.get("data"), dict):
-            return payload["data"]
-        return payload
-    if isinstance(payload, list) and payload and isinstance(payload[0], dict):
-        return payload
-    return payload
-
-
-def _render_billing_report(
-    payload: Any,
-    storage_snapshot: StorageSnapshot | None = None,
-) -> str:
-    normalized = _normalize_billing_payload(payload)
-    if isinstance(normalized, list):
-        rows = [row for row in normalized if isinstance(row, dict)]
-        if not rows:
-            lines = [
-                "[bold]Workspace Spend[/bold]",
-                "[dim]Current month spend[/dim]",
-                "[dim]total[/dim] [bold]$0.00[/bold]",
-            ]
-            lines.extend(_storage_estimate_lines(storage_snapshot))
-            return "\n".join(lines)
-
-        total = 0.0
-        has_total = False
-        for row in rows:
-            cost = _coerce_float(row.get("Cost"))
-            if cost is None:
-                cost = _coerce_float(row.get("cost"))
-            if cost is not None:
-                total += cost
-                has_total = True
-
-        lines = ["[bold]Workspace Spend[/bold]", "[dim]Current month spend[/dim]"]
-        if has_total:
-            lines.append(f"[dim]total[/dim] [bold]{format_money(total)}[/bold]")
-        else:
-            lines.append("[dim]Total unavailable in report payload.[/dim]")
-        lines.extend(_storage_estimate_lines(storage_snapshot))
-        return "\n".join(lines)
-
-    if not isinstance(normalized, dict):
-        lines = [
-            "[bold]Workspace Spend[/bold]",
-            "[dim]Billing data unavailable.[/dim]",
-            "[dim]Check `modal billing report --json`.[/dim]",
-        ]
-        lines.extend(_storage_estimate_lines(storage_snapshot))
-        return "\n".join(lines)
-
-    total = _find_first_float(
-        normalized,
-        [
-            "summary.total_usd",
-            "summary.cost_usd",
-            "summary.spend_usd",
-            "totals.total_usd",
-            "totals.cost_usd",
-            "total_usd",
-            "cost_usd",
-            "spend_usd",
-        ],
-    )
-    gpu_cost = _find_first_float(
-        normalized,
-        [
-            "summary.gpu_cost_usd",
-            "totals.gpu_cost_usd",
-            "gpu_cost_usd",
-        ],
-    )
-    lines = ["[bold]Workspace Spend[/bold]", "[dim]Current month spend[/dim]"]
-    if total is not None:
-        lines.append(f"[dim]total[/dim] [bold]{format_money(total)}[/bold]")
-    else:
-        lines.append("[dim]Total unavailable in report payload.[/dim]")
-    if gpu_cost is not None:
-        lines.append(f"[dim]gpu[/dim] {format_money(gpu_cost)}")
-    lines.extend(_storage_estimate_lines(storage_snapshot))
-    return "\n".join(lines)
-
-
-def _render_billing_load_error(error: str) -> str:
-    return (
-        "[bold]Workspace Spend[/bold]\n"
-        "[yellow]Billing unavailable.[/yellow]\n"
-        f"[dim]{escape(clip(error, 80))}[/dim]"
-    )
-
-
-def _render_prime_billing_report(payload: Any) -> str:
-    """Render one Prime wallet billing snapshot for the shared panel."""
-
-    lines = ["[bold]Prime Intellect Wallet[/bold]"]
-    if not isinstance(payload, dict):
-        lines.append("[dim]Wallet data unavailable.[/dim]")
-        lines.append("[dim]Check `prime wallet`.[/dim]")
-        return "\n".join(lines)
-
-    balance = _coerce_float(payload.get("balance_usd"))
-    if balance is None:
-        lines.append("[dim]Balance unavailable in wallet payload.[/dim]")
-    else:
-        lines.append(f"[dim]balance[/dim] [bold]{format_money(balance)}[/bold]")
-
-    totals: dict[str, float] = {}
-    rows = payload.get("recent_billings")
-    if isinstance(rows, list):
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            amount = _coerce_float(row.get("amount_usd"))
-            if amount is None:
-                continue
-            resource = str(row.get("resource_type") or "other").strip().casefold() or "other"
-            totals[resource] = totals.get(resource, 0.0) + amount
-
-    if totals:
-        summary = " · ".join(
-            f"{resource} {format_money(amount)}" for resource, amount in sorted(totals.items())
-        )
-        lines.append(f"[dim]recent charges[/dim] {summary}")
-    else:
-        lines.append("[dim]No recent billing rows.[/dim]")
-    return "\n".join(lines)
-
-
-def _render_prime_billing_load_error(error: str) -> str:
-    return (
-        "[bold]Prime Intellect Wallet[/bold]\n"
-        "[yellow]Wallet unavailable.[/yellow]\n"
-        f"[dim]{escape(clip(error, 80))}[/dim]"
-    )
-
-
-def _render_vast_billing_report(payload: Any) -> str:
-    """Render remaining Vast credit for the shared panel."""
-
-    lines = ["[bold]Vast.ai Credit[/bold]"]
-    if not isinstance(payload, dict):
-        lines.append("[dim]Credit data unavailable.[/dim]")
-        return "\n".join(lines)
-    available = _coerce_float(payload.get("available_usd"))
-    if available is None:
-        lines.append("[dim]Credit unavailable in account payload.[/dim]")
-        return "\n".join(lines)
-    lines.append(f"[dim]available[/dim] [bold]{format_money(available)}[/bold]")
-    balance = _coerce_float(payload.get("balance_usd"))
-    if balance is not None and balance < 0:
-        # An owed balance is the one case worth spelling out separately.
-        lines.append(f"[yellow]owed {format_money(abs(balance))}[/yellow]")
-    lines.append("[dim]rentals bill continuously; transfer is charged separately[/dim]")
-    return "\n".join(lines)
-
-
-def _render_vast_billing_load_error(error: str) -> str:
-    return (
-        "[bold]Vast.ai Credit[/bold]\n"
-        "[yellow]Credit unavailable.[/yellow]\n"
-        f"[dim]{escape(clip(error, 80))}[/dim]"
-    )
-
-
-def _render_provider_billing_body(
-    *,
-    modal_payload: Any | None,
-    modal_error: str | None,
-    prime_state: Literal["loading", "loaded", "failed", "unavailable"],
-    prime_payload: Any | None,
-    prime_error: str | None,
-    vast_state: Literal["loading", "loaded", "failed", "unavailable"] = "unavailable",
-    vast_payload: Any | None = None,
-    vast_error: str | None = None,
-    storage_snapshot: StorageSnapshot | None = None,
-) -> str:
-    """Compose the Modal, Prime and Vast billing sections of the shared panel."""
-
-    if modal_error is not None:
-        # The storage estimate comes from a local snapshot and owes nothing to
-        # Modal's billing CLI, so a failed billing call must not take the only
-        # standing warning about ongoing storage spend down with it.
-        modal_section = "\n".join(
-            [_render_billing_load_error(modal_error), *_storage_estimate_lines(storage_snapshot)]
-        )
-    elif modal_payload is not None:
-        modal_section = _render_billing_report(
-            modal_payload,
-            storage_snapshot=storage_snapshot,
-        )
-    else:
-        modal_section = (
-            "[bold]Workspace Spend[/bold]\n"
-            "[dim]Refreshing billing report...[/dim]"
-        )
-
-    if prime_state == "unavailable":
-        prime_section = (
-            "[bold]Prime Intellect Wallet[/bold]\n"
-            "[dim]Not authenticated (run: prime login)[/dim]"
-        )
-    elif prime_state == "failed":
-        prime_section = _render_prime_billing_load_error(
-            prime_error or "Could not read Prime billing wallet."
-        )
-    elif prime_state == "loaded":
-        prime_section = _render_prime_billing_report(prime_payload)
-    else:
-        prime_section = (
-            "[bold]Prime Intellect Wallet[/bold]\n"
-            "[dim]Refreshing wallet...[/dim]"
-        )
-
-    if vast_state == "unavailable":
-        vast_section = (
-            "[bold]Vast.ai Credit[/bold]\n"
-            "[dim]No key configured (run: llm-launchpad vast-auth login)[/dim]"
-        )
-    elif vast_state == "failed":
-        vast_section = _render_vast_billing_load_error(
-            vast_error or "Could not read Vast credit."
-        )
-    elif vast_state == "loaded":
-        vast_section = _render_vast_billing_report(vast_payload)
-    else:
-        vast_section = (
-            "[bold]Vast.ai Credit[/bold]\n"
-            "[dim]Refreshing credit...[/dim]"
-        )
-
-    return f"{modal_section}\n\n{prime_section}\n\n{vast_section}"
-
-
 _ActionLabels = tuple[tuple[str, str], ...]
 
 # Fullest first. `_fit_action_labels` takes the first one that fits the width
@@ -859,6 +728,7 @@ _ACTION_LABEL_TIERS: tuple[_ActionLabels, ...] = (
         ("deploy", "  Deploy model       Pick a model, get a live placement"),
         ("custom-deploy", "  Advanced deploy    llama.cpp / vLLM expert form"),
         ("manage", "  Manage             Status, logs, benchmark, stop"),
+        ("operations", "  Operations         Reopen or cancel deployments"),
         ("storage", "  Storage            Cached models, pre-download, delete"),
         ("settings", "  Settings           Appearance and deploy defaults"),
     ),
@@ -866,6 +736,7 @@ _ACTION_LABEL_TIERS: tuple[_ActionLabels, ...] = (
         ("deploy", "  Deploy model       Pick a model and deploy"),
         ("custom-deploy", "  Advanced deploy    llama.cpp / vLLM form"),
         ("manage", "  Manage             Status, logs, stop"),
+        ("operations", "  Operations         Deployment jobs"),
         ("storage", "  Storage            Cached models"),
         ("settings", "  Settings           Appearance, defaults"),
     ),
@@ -873,6 +744,7 @@ _ACTION_LABEL_TIERS: tuple[_ActionLabels, ...] = (
         ("deploy", "  Deploy model"),
         ("custom-deploy", "  Advanced deploy"),
         ("manage", "  Manage endpoints"),
+        ("operations", "  Operations"),
         ("storage", "  Storage"),
         ("settings", "  Settings"),
     ),
@@ -911,16 +783,10 @@ class MainMenuScreen(CopyEnabledScreen):
         self._quick_deploy_catalog_refresh_inflight = False
         self._status_refresh_inflight = False
         self._billing_refresh_inflight = False
-        self._billing_payload: Any | None = None
-        self._billing_error: str | None = None
-        self._prime_billing_refresh_inflight = False
-        self._vast_billing_refresh_inflight = False
-        self._vast_billing_state: Literal["loading", "loaded", "failed", "unavailable"] = "loading"
-        self._vast_billing_payload: Any | None = None
-        self._vast_billing_error: str | None = None
-        self._prime_billing_state: Literal["loading", "loaded", "failed", "unavailable"] = "loading"
-        self._prime_billing_payload: Any | None = None
-        self._prime_billing_error: str | None = None
+        self._provider_billing: dict[ComputeProvider, ProviderBilling] = {
+            provider: ProviderBilling.loading(provider)
+            for provider in PROVIDER_BILLING_ORDER
+        }
         self._storage_snapshot: StorageSnapshot | None = None
         self._was_suspended = False
         self._secondary_refresh_started = False
@@ -958,6 +824,7 @@ class MainMenuScreen(CopyEnabledScreen):
                             Option("  Deploy model       Pick a model, get a live placement", id="deploy"),
                             Option("  Advanced deploy    llama.cpp / vLLM expert form", id="custom-deploy"),
                             Option("  Manage             Status, logs, benchmark, stop", id="manage"),
+                            Option("  Operations         Reopen or cancel deployments", id="operations"),
                             Option("  Storage            Cached models, pre-download, delete", id="storage"),
                             Option("  Settings           Appearance and deploy defaults", id="settings"),
                             id="action-list",
@@ -966,13 +833,24 @@ class MainMenuScreen(CopyEnabledScreen):
                             "[dim]↑/↓ select · enter open · i details[/dim]",
                             id="compact-menu-help",
                         )
+                        yield Static("", id="fleet-summary-line")
                     with Vertical(id="main-menu-side-column"):
                         with Vertical(id="deployment-status-panel"):
                             yield Static("[bold #7bf168]Deployment Status[/]", id="deployment-status-title")
                             yield Static("[dim]Refreshing deployment status...[/dim]", id="deployment-status-body")
                         with Vertical(id="billing-report-panel"):
                             yield Static("[bold #7bf168]Provider Billing[/]", id="billing-report-title")
-                            yield Static("[dim]Refreshing billing report...[/dim]", id="billing-report-body")
+                            # First paint already names every provider, so the
+                            # panel does not change shape as readings land.
+                            yield Static(
+                                render_provider_billing(
+                                    [
+                                        self._provider_billing[provider]
+                                        for provider in PROVIDER_BILLING_ORDER
+                                    ]
+                                ),
+                                id="billing-report-body",
+                            )
             yield Static(
                 _render_auth_status_block(username=self.username),
                 id="auth-status-block",
@@ -1135,15 +1013,8 @@ class MainMenuScreen(CopyEnabledScreen):
                 break
 
     def action_toggle_details(self) -> None:
-        """Expose secondary fleet and billing panels as a narrow drawer."""
-        if not self.viewport_profile.narrow and not self.viewport_profile.short:
-            self.notify(
-                "Fleet and billing panels are already visible on this screen size.",
-                title="Details",
-                timeout=3,
-            )
-            return
-        self.toggle_class("show-secondary-panel")
+        """Open fleet, billing and connection detail as a full-width view."""
+        self.app.push_screen(HomeDetailsScreen(self))  # type: ignore[attr-defined]
 
     def action_close_details(self) -> None:
         """Close the narrow details drawer without changing screens."""
@@ -1213,9 +1084,11 @@ class MainMenuScreen(CopyEnabledScreen):
         self.post_message(QuickDeployCatalogLoaded(info=info, profiles=profiles))
         # MTP probes are the slowest per-model fetch and only feed the
         # draft-model toggle; attach them as a trailing update so the
-        # picker stays usable while they resolve.
+        # picker stays usable while they resolve. They are written back to
+        # the snapshot so the next launch opens with MTP already resolved
+        # instead of reprobing every repository.
         try:
-            upgraded = attach_quick_deploy_mtp_recommendations(profiles)
+            upgraded = attach_quick_deploy_mtp_recommendations(profiles, info=info)
         except Exception:
             return
         if upgraded != tuple(profiles):
@@ -1244,19 +1117,35 @@ class MainMenuScreen(CopyEnabledScreen):
             if callable(notifier):
                 notifier()
 
+    def _render_connection_widgets(self) -> None:
+        """Refresh both the full auth block and the compact summary line."""
+        try:
+            self.query_one("#auth-status-block", Static).update(
+                _render_auth_status_block(
+                    username=self.username,
+                    modal_status=self._modal_auth_status,
+                    hf_status=self._hf_auth_status,
+                    prime_status=self._prime_auth_status,
+                    aai_status=self._aai_auth_status,
+                )
+            )
+        except Exception:
+            pass
+        # The compact line is fleet-first once rows arrive; connection state
+        # until then. _update_fleet_summary owns it afterwards.
+        if not self._runtime_rows:
+            try:
+                self.query_one("#fleet-summary-line", Static).update(
+                    _connection_summary(self._modal_auth_status, self._prime_auth_status)
+                )
+            except Exception:
+                pass
+
     def _refresh_modal_auth_status(self) -> None:
         if self._modal_auth_refresh_inflight:
             return
         self._modal_auth_refresh_inflight = True
-        self.query_one("#auth-status-block", Static).update(
-            _render_auth_status_block(
-                username=self.username,
-                modal_status=self._modal_auth_status,
-                hf_status=self._hf_auth_status,
-                prime_status=self._prime_auth_status,
-                aai_status=self._aai_auth_status,
-            )
-        )
+        self._render_connection_widgets()
         self.run_worker(
             self._run_load_modal_auth_status,
             name="main-menu-modal-auth-worker",
@@ -1276,14 +1165,9 @@ class MainMenuScreen(CopyEnabledScreen):
     def on_modal_auth_loaded(self, message: ModalAuthLoaded) -> None:
         self._modal_auth_refresh_inflight = False
         self._modal_auth_status = message.status
-        self.query_one("#auth-status-block", Static).update(
-            _render_auth_status_block(
-                username=self.username,
-                modal_status=self._modal_auth_status,
-                hf_status=self._hf_auth_status,
-                prime_status=self._prime_auth_status,
-                aai_status=self._aai_auth_status,
-            )
+        self._render_connection_widgets()
+        self._apply_auth_to_billing(
+            ComputeProvider.MODAL, message.status.authenticated
         )
 
     def _refresh_prime_auth_status(self) -> None:
@@ -1302,37 +1186,14 @@ class MainMenuScreen(CopyEnabledScreen):
     def on_prime_auth_loaded(self, message: PrimeAuthLoaded) -> None:
         self._prime_auth_refresh_inflight = False
         self._prime_auth_status = message.status
-        self.query_one("#auth-status-block", Static).update(
-            _render_auth_status_block(
-                username=self.username,
-                modal_status=self._modal_auth_status,
-                hf_status=self._hf_auth_status,
-                prime_status=self._prime_auth_status,
-                aai_status=self._aai_auth_status,
-            )
-        )
-        if message.status.authenticated:
-            if self._secondary_refresh_started:
-                self._refresh_prime_billing_report()
-        elif self._prime_billing_state != "loaded":
-            self._prime_billing_state = "unavailable"
-            self._prime_billing_error = None
-            self._prime_billing_refresh_inflight = False
-            self._update_billing_panel()
+        self._render_connection_widgets()
+        self._apply_auth_to_billing(ComputeProvider.PRIME, message.status.authenticated)
 
     def _refresh_hf_auth_status(self) -> None:
         if self._hf_auth_refresh_inflight:
             return
         self._hf_auth_refresh_inflight = True
-        self.query_one("#auth-status-block", Static).update(
-            _render_auth_status_block(
-                username=self.username,
-                modal_status=self._modal_auth_status,
-                hf_status=self._hf_auth_status,
-                prime_status=self._prime_auth_status,
-                aai_status=self._aai_auth_status,
-            )
-        )
+        self._render_connection_widgets()
         self.run_worker(
             self._run_load_hf_auth_status,
             name="main-menu-hf-auth-worker",
@@ -1352,15 +1213,7 @@ class MainMenuScreen(CopyEnabledScreen):
     def on_hugging_face_auth_loaded(self, message: HuggingFaceAuthLoaded) -> None:
         self._hf_auth_refresh_inflight = False
         self._hf_auth_status = message.status
-        self.query_one("#auth-status-block", Static).update(
-            _render_auth_status_block(
-                username=self.username,
-                modal_status=self._modal_auth_status,
-                hf_status=self._hf_auth_status,
-                prime_status=self._prime_auth_status,
-                aai_status=self._aai_auth_status,
-            )
-        )
+        self._render_connection_widgets()
 
     def _refresh_aai_auth_status(self) -> None:
         if self._aai_auth_refresh_inflight:
@@ -1391,15 +1244,7 @@ class MainMenuScreen(CopyEnabledScreen):
     ) -> None:
         self._aai_auth_refresh_inflight = False
         self._aai_auth_status = message.status
-        self.query_one("#auth-status-block", Static).update(
-            _render_auth_status_block(
-                username=self.username,
-                modal_status=self._modal_auth_status,
-                hf_status=self._hf_auth_status,
-                prime_status=self._prime_auth_status,
-                aai_status=self._aai_auth_status,
-            )
-        )
+        self._render_connection_widgets()
 
     def _refresh_panels(self) -> None:
         if not self._is_active_screen():
@@ -1415,16 +1260,16 @@ class MainMenuScreen(CopyEnabledScreen):
         # backstop for screens mounted before that change or refreshes
         # skipped while suspended.
         self._refresh_quick_deploy_catalog()
-        self._refresh_billing_panels()
+        # Storage first: the cached snapshot is a local read, and it is part of
+        # the Modal row the billing pass is about to paint.
         self._refresh_storage_estimate()
+        self._refresh_billing_panels()
 
     def _refresh_billing_panels(self) -> None:
         if not self._is_active_screen():
             return
         self._last_billing_refresh_at = time.monotonic()
-        self._refresh_billing_report()
-        self._refresh_prime_billing_report()
-        self._refresh_vast_billing_credit()
+        self._refresh_provider_billing()
 
     def _is_active_screen(self) -> bool:
         """Return whether this screen is the visible top of the app stack."""
@@ -1484,7 +1329,17 @@ class MainMenuScreen(CopyEnabledScreen):
         if cached_runtime_is_fresh:
             if not message.is_stale:
                 self._status_refresh_inflight = False
-            self._show_deployments([replace(row) for row in self._runtime_rows])
+            # Passive rows are cheap to refresh: re-attach banked totals and
+            # any explicit health recorded since the cache was written, so a
+            # just-completed status check shows its age instead of hiding
+            # behind the TTL. Prime/Vast rows keep their cached verdicts --
+            # reprobing them here would defeat the cache.
+            cached = [replace(row) for row in self._runtime_rows]
+            try:
+                _refresh_cached_passive_rows(cached)
+            except Exception:
+                pass
+            self._show_deployments(cached)
             return
         if message.is_stale:
             self._show_deployments(rows)
@@ -1503,119 +1358,89 @@ class MainMenuScreen(CopyEnabledScreen):
     def on_endpoints_failed(self, message: EndpointsFailed) -> None:
         self.post_message(DeploymentsLoadFailed(error=message.error))
 
-    def _refresh_billing_report(self) -> None:
-        if self._billing_refresh_inflight:
-            return
-        self._billing_refresh_inflight = True
-        self.run_worker(
-            self._run_load_billing_report,
-            name="main-menu-billing-worker",
-            thread=True,
-        )
-
     def _update_billing_panel(self) -> None:
         self.query_one("#billing-report-body", Static).update(
-            _render_provider_billing_body(
-                modal_payload=self._billing_payload,
-                modal_error=self._billing_error,
-                prime_state=self._prime_billing_state,
-                prime_payload=self._prime_billing_payload,
-                prime_error=self._prime_billing_error,
-                vast_state=self._vast_billing_state,
-                vast_payload=self._vast_billing_payload,
-                vast_error=self._vast_billing_error,
+            render_provider_billing(
+                [self._provider_billing[provider] for provider in PROVIDER_BILLING_ORDER],
                 storage_snapshot=self._storage_snapshot,
             )
         )
 
-    def _run_load_billing_report(self) -> None:
-        poster = getattr(self, "post_message", None)
-        if poster is None:
-            return
-        try:
-            payload, error = ModalBackend.billing_report_json()
-        except Exception as exc:
-            poster(BillingReportLoadFailed(error=str(exc)))
-            return
-        if payload is None:
-            poster(BillingReportLoadFailed(error=error or "Could not read billing report."))
-            return
-        storage_snapshot = None
-        cached_storage_snapshot = getattr(self.app, "cached_storage_snapshot", None)
-        if callable(cached_storage_snapshot):
-            storage_snapshot = cached_storage_snapshot()
-        poster(BillingReportLoaded(payload=payload, storage_snapshot=storage_snapshot))
+    def _apply_auth_to_billing(
+        self, provider: ComputeProvider, authenticated: bool
+    ) -> None:
+        """Fold a fresh auth verdict into that provider's billing row.
 
-    def _refresh_prime_billing_report(self) -> None:
-        if self._prime_billing_refresh_inflight:
+        Auth resolves separately from billing and usually first. A provider
+        that cannot be read is named as unconfigured straight away, rather than
+        waiting on a request that can only come back refused and then reporting
+        the refusal as though the provider were broken.
+        """
+        if authenticated:
+            if self._secondary_refresh_started:
+                self._refresh_provider_billing()
             return
-        status = self._prime_auth_status
-        if status is None:
-            # Auth resolution runs concurrently; fall back to the local check.
-            try:
-                status = get_prime_auth_status()
-            except Exception:
-                status = None
-        if status is not None and not status.authenticated:
-            self._prime_billing_state = "unavailable"
-            self._prime_billing_error = None
-            self._update_billing_panel()
+        if self._provider_billing[provider].status is BillingStatus.READY:
+            # A reading already in hand outlives a later auth wobble.
             return
-        self._prime_billing_refresh_inflight = True
+        self._provider_billing[provider] = ProviderBilling.unconfigured(provider)
+        self._update_billing_panel()
+
+    def _refresh_provider_billing(self) -> None:
+        """Read every provider's billing in one pass off the UI thread."""
+        if self._billing_refresh_inflight:
+            return
+        self._billing_refresh_inflight = True
+        # Auth is resolved on the UI thread where the cached status lives; the
+        # loaders take it as a fact so an unauthenticated provider names its
+        # setup command instead of reaching the network to be refused.
+        modal_authenticated = (
+            None if self._modal_auth_status is None else self._modal_auth_status.authenticated
+        )
+        prime_authenticated = (
+            None if self._prime_auth_status is None else self._prime_auth_status.authenticated
+        )
         self.run_worker(
-            self._run_load_prime_billing_report,
-            name="main-menu-prime-billing-worker",
+            lambda: self._run_load_provider_billing(
+                modal_authenticated=modal_authenticated,
+                prime_authenticated=prime_authenticated,
+            ),
+            name="main-menu-billing-worker",
             thread=True,
         )
 
-    def _refresh_vast_billing_credit(self) -> None:
-        if self._vast_billing_refresh_inflight:
-            return
-        # Resolving the key is a local read, so an unconfigured account never
-        # reaches the network.
-        try:
-            configured = bool(resolve_vast_credentials().api_key)
-        except ValueError:
-            configured = False
-        if not configured:
-            self._vast_billing_state = "unavailable"
-            self._vast_billing_error = None
-            self._update_billing_panel()
-            return
-        self._vast_billing_refresh_inflight = True
-        self.run_worker(
-            self._run_load_vast_billing_credit,
-            name="main-menu-vast-billing-worker",
-            thread=True,
-        )
-
-    def _run_load_vast_billing_credit(self) -> None:
+    def _run_load_provider_billing(
+        self,
+        *,
+        modal_authenticated: bool | None,
+        prime_authenticated: bool | None,
+    ) -> None:
         poster = getattr(self, "post_message", None)
         if poster is None:
             return
-        try:
-            payload, error = VastBackend().billing_credit()
-        except Exception as exc:
-            poster(VastBillingCreditLoadFailed(error=str(exc)))
-            return
-        if payload is None:
-            poster(VastBillingCreditLoadFailed(error=error or "Could not read Vast credit."))
-            return
-        poster(VastBillingCreditLoaded(payload=payload))
-
-    def _run_load_prime_billing_report(self) -> None:
-        poster = getattr(self, "post_message", None)
-        if poster is None:
-            return
-        try:
-            payload, error = PrimeBackend().billing_wallet()
-        except Exception as exc:
-            poster(PrimeBillingReportLoadFailed(error=str(exc)))
-            return
-        if payload is None:
-            poster(PrimeBillingReportLoadFailed(error=error or "Could not read Prime billing wallet."))
-            return
-        poster(PrimeBillingReportLoaded(payload=payload))
+        loaders = {
+            ComputeProvider.MODAL: lambda: load_modal_billing(
+                authenticated=modal_authenticated
+            ),
+            ComputeProvider.PRIME: lambda: load_prime_billing(
+                authenticated=prime_authenticated
+            ),
+            ComputeProvider.VAST: load_vast_billing,
+        }
+        # One provider's slow API must not hold up the two that already
+        # answered, so each row is posted as it lands.
+        with ThreadPoolExecutor(max_workers=len(loaders)) as pool:
+            futures = {
+                pool.submit(loader): provider for provider, loader in loaders.items()
+            }
+            for future in as_completed(futures):
+                provider = futures[future]
+                try:
+                    row = future.result()
+                except Exception as exc:  # pragma: no cover - loaders are total
+                    row = ProviderBilling.failed(provider, str(exc))
+                poster(ProviderBillingLoaded(row=row))
+        poster(ProviderBillingFinished())
 
     def on_deployments_loaded(self, message: DeploymentsLoaded) -> None:
         self._status_refresh_inflight = False
@@ -1633,6 +1458,26 @@ class MainMenuScreen(CopyEnabledScreen):
                 discovery=self._fleet_discovery,
             )
         )
+        self._update_fleet_summary(visible_rows)
+
+    def _update_fleet_summary(self, rows: list[EndpointInfo] | None = None) -> None:
+        """Keep the compact always-visible fleet line in step with the panel."""
+        from ..fleet_status import fleet_summary_line
+
+        try:
+            summary = self.query_one("#fleet-summary-line", Static)
+        except Exception:
+            return
+        current = rows if rows is not None else [
+            row for row in self._runtime_rows if _should_show_in_panel(row.state)
+        ]
+        if not current and self._status_refresh_inflight:
+            summary.update("[dim]Checking fleet...[/dim]")
+            return
+        if not current:
+            summary.update("[dim]No active endpoints · Deploy to start[/dim]")
+            return
+        summary.update(fleet_summary_line(current))
 
     @staticmethod
     def _runtime_fingerprint(rows: list[EndpointInfo]) -> tuple[tuple[object, ...], ...]:
@@ -1657,50 +1502,17 @@ class MainMenuScreen(CopyEnabledScreen):
             "[yellow]Status unavailable.[/yellow]\n"
             f"[dim]{clip(message.error, 80)}[/dim]"
         )
+        self._update_fleet_summary([])
 
-    def on_billing_report_loaded(self, message: BillingReportLoaded) -> None:
+    def on_provider_billing_loaded(self, message: ProviderBillingLoaded) -> None:
+        self._provider_billing[message.row.provider] = message.row
+        self._update_billing_panel()
+
+    def on_provider_billing_finished(self, _: ProviderBillingFinished) -> None:
         self._billing_refresh_inflight = False
-        self._billing_payload = message.payload
-        self._billing_error = None
-        if message.storage_snapshot is not None:
-            self._storage_snapshot = message.storage_snapshot
-        self._update_billing_panel()
-
-    def on_billing_report_load_failed(self, message: BillingReportLoadFailed) -> None:
-        self._billing_refresh_inflight = False
-        self._billing_error = message.error
-        self._update_billing_panel()
-
-    def on_prime_billing_report_loaded(self, message: PrimeBillingReportLoaded) -> None:
-        self._prime_billing_refresh_inflight = False
-        self._prime_billing_state = "loaded"
-        self._prime_billing_payload = message.payload
-        self._prime_billing_error = None
-        self._update_billing_panel()
-
-    def on_prime_billing_report_load_failed(self, message: PrimeBillingReportLoadFailed) -> None:
-        self._prime_billing_refresh_inflight = False
-        self._prime_billing_state = "failed"
-        self._prime_billing_error = message.error
-        self._update_billing_panel()
-
-    def on_vast_billing_credit_loaded(self, message: VastBillingCreditLoaded) -> None:
-        self._vast_billing_refresh_inflight = False
-        self._vast_billing_state = "loaded"
-        self._vast_billing_payload = message.payload
-        self._vast_billing_error = None
-        self._update_billing_panel()
-
-    def on_vast_billing_credit_load_failed(self, message: VastBillingCreditLoadFailed) -> None:
-        self._vast_billing_refresh_inflight = False
-        self._vast_billing_state = "failed"
-        self._vast_billing_error = message.error
-        self._update_billing_panel()
 
     def on_storage_loaded(self, message: StorageLoaded) -> None:
         self._storage_snapshot = message.snapshot
-        if self._billing_payload is None:
-            return
         self._update_billing_panel()
 
     def on_storage_failed(self, _: StorageFailed) -> None:
@@ -1714,6 +1526,8 @@ class MainMenuScreen(CopyEnabledScreen):
             self.app.action_push_custom_deploy()  # type: ignore[attr-defined]
         elif option_id == "manage":
             self.app.action_push_manage()  # type: ignore[attr-defined]
+        elif option_id == "operations":
+            self.app.action_push_operations()  # type: ignore[attr-defined]
         elif option_id == "storage":
             self.app.action_push_storage()  # type: ignore[attr-defined]
         elif option_id == "settings":
@@ -1733,3 +1547,61 @@ class MainMenuScreen(CopyEnabledScreen):
 
     def action_select_settings(self) -> None:
         self.app.action_push_settings()  # type: ignore[attr-defined]
+
+
+class HomeDetailsScreen(CopyEnabledScreen):
+    """Full-width Fleet / Billing / Connections view for compact terminals.
+
+    Replaces the narrow overlay drawer, which covered the menu it was meant
+    to accompany and left the fleet panel too short to read. Escape returns
+    to the menu with its selection intact.
+    """
+
+    BINDINGS = [
+        Binding("escape", "pop_screen", "Back", show=True),
+        Binding("m", "open_manage", "Manage", show=True),
+    ]
+
+    def __init__(self, menu: MainMenuScreen) -> None:
+        super().__init__()
+        self._menu = menu
+
+    def compose(self) -> ComposeResult:
+        from textual.containers import VerticalScroll
+
+        from ..widgets.fitted_footer import FittedFooter
+
+        with VerticalScroll(classes="screen-scroll"):
+            yield Static("[bold #7bf168]Details[/]  [dim]Fleet, billing, connections[/dim]")
+            yield Static("[bold]Fleet[/bold]", classes="settings-section")
+            yield Static("[dim]Loading fleet...[/dim]", id="home-details-fleet")
+            yield Static("[bold]Billing[/bold]", classes="settings-section")
+            yield Static("[dim]Loading billing...[/dim]", id="home-details-billing")
+            yield Static("[bold]Connections[/bold]", classes="settings-section")
+            yield Static("[dim]Loading connections...[/dim]", id="home-details-connections")
+        yield FittedFooter()
+
+    def on_mount(self) -> None:
+        menu = self._menu
+        try:
+            fleet = menu.query_one("#deployment-status-body", Static).content
+            self.query_one("#home-details-fleet", Static).update(fleet)
+        except Exception:
+            pass
+        try:
+            billing = menu.query_one("#billing-report-body", Static).content
+            self.query_one("#home-details-billing", Static).update(billing)
+        except Exception:
+            pass
+        try:
+            connections = menu.query_one("#auth-status-block", Static).content
+            self.query_one("#home-details-connections", Static).update(connections)
+        except Exception:
+            pass
+
+    def action_pop_screen(self) -> None:
+        self.app.pop_screen()
+
+    def action_open_manage(self) -> None:
+        self.app.pop_screen()
+        self.app.action_push_manage()  # type: ignore[attr-defined]

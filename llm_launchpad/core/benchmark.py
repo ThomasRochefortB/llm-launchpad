@@ -21,6 +21,7 @@ from ..protocol.models import (
     EndpointInfo,
 )
 from .config import SETTINGS_DIR
+from .coerce import optional_float
 from .diagnostics import log_exception
 from .naming import default_llamacpp_served_model_name, default_served_model_name, slugify_instance_name
 
@@ -32,6 +33,12 @@ DEFAULT_RANDOM_SEED = 42
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 300
 BENCHMARKS_DIR = SETTINGS_DIR / "benchmarks"
 SUMMARY_FILENAME = "benchmark_summary.json"
+
+# AIPerf runs one artifact directory per concurrency; each directory holds a
+# warmup phase followed by the timed phase. Only the timed phase scores, so
+# cold-start prefill never subsidizes or penalizes the reported rates.
+BENCHMARK_WARMUP_FRACTION = 0.2
+MIN_REQUESTS_FOR_P95 = 20
 
 METRIC_KEYS = (
     "output_token_throughput",
@@ -95,11 +102,8 @@ def parse_concurrency_values(value: str | Iterable[int] | None) -> list[int]:
 
 def request_count_for_concurrency(concurrency: int, override: int | None = None) -> int:
     """Return the default or overridden request count for a concurrency run."""
-    if override is not None:
-        if override < 1:
-            raise ValueError("Request count must be >= 1.")
-        return override
-    return max(24, concurrency * 4)
+
+    return benchmark_request_count(concurrency, override)
 
 
 def aiperf_cli_path() -> str | None:
@@ -223,12 +227,19 @@ def build_aiperf_command(
     artifact_dir: Path,
     executable: str = "aiperf",
 ) -> list[str]:
-    """Build the AIPerf profile command for one concurrency value."""
+    """Build the AIPerf profile command for one concurrency value.
+
+    Request counts are sized so the timed phase (after the warmup fraction)
+    still holds enough samples for tail percentiles: small concurrencies get
+    at least ``MIN_REQUESTS_FOR_P95`` timed requests rather than the raw
+    ``concurrency * 4`` minimum.
+    """
     if not (config.server_url or "").strip():
         raise ValueError("Benchmark target server URL is required.")
     if not (config.model_name or "").strip():
         raise ValueError("Benchmark target model name is required.")
 
+    total_requests = benchmark_request_count(concurrency, config.request_count)
     cmd = [
         executable,
         "profile",
@@ -258,12 +269,37 @@ def build_aiperf_command(
         "--concurrency",
         str(concurrency),
         "--request-count",
-        str(request_count_for_concurrency(concurrency, config.request_count)),
+        str(total_requests),
+        "--warmup-request-count",
+        str(benchmark_warmup_requests(total_requests)),
         "--artifact-dir",
         str(artifact_dir),
     ]
     cmd.extend(config.aiperf_args)
     return cmd
+
+
+def benchmark_request_count(concurrency: int, override: int | None = None) -> int:
+    """Return total requests so the timed phase supports tail percentiles."""
+
+    if override is not None:
+        if override < 1:
+            raise ValueError("Request count must be >= 1.")
+        return override
+    timed_floor = int(MIN_REQUESTS_FOR_P95 / (1.0 - BENCHMARK_WARMUP_FRACTION))
+    return max(24, concurrency * 4, timed_floor)
+
+
+def benchmark_warmup_requests(total_requests: int) -> int:
+    """Return warmup requests excluded from the timed measurement."""
+
+    return max(1, int(total_requests * BENCHMARK_WARMUP_FRACTION))
+
+
+def benchmark_timed_requests(total_requests: int) -> int:
+    """Return requests in the timed phase after warmup is excluded."""
+
+    return max(0, total_requests - benchmark_warmup_requests(total_requests))
 
 
 def expected_export_paths(artifact_dir: Path) -> tuple[Path, Path]:
@@ -308,7 +344,9 @@ def build_run_summary(config: BenchmarkConfig, run_dir: Path, results: list[Benc
     best_result: BenchmarkConcurrencyResult | None = None
     best_value: float | None = None
     for result in results:
-        value = result.metrics.get("output_token_throughput")
+        if not result.success:
+            continue
+        value = optional_float(result.metrics.get("output_token_throughput"))
         if value is None:
             continue
         if best_value is None or value > best_value:
@@ -318,7 +356,7 @@ def build_run_summary(config: BenchmarkConfig, run_dir: Path, results: list[Benc
         config=config,
         run_dir=str(run_dir),
         results=results,
-        success=all(result.success for result in results),
+        success=bool(results) and all(result.success for result in results),
         best_concurrency=best_result.concurrency if best_result else None,
         best_output_token_throughput=best_value,
     )
@@ -505,14 +543,6 @@ def _first_present(mapping: dict[str, Any], keys: tuple[str, ...]) -> str:
 
 
 def _coerce_float(value: Any) -> float | None:
-    if isinstance(value, bool) or value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    text = str(value).strip().replace(",", "")
-    if not text or text.upper() == "N/A":
-        return None
-    try:
-        return float(text)
-    except ValueError:
-        return None
+    if isinstance(value, str):
+        value = value.strip().replace(",", "")
+    return optional_float(value)

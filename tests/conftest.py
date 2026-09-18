@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
+import subprocess
 import unittest
 
 import pytest
@@ -281,6 +283,19 @@ def _isolate_user_settings(
 
 
 @pytest.fixture(autouse=True)
+def _reset_serving_metrics_tracker() -> None:
+    """Keep one test's serving readings out of the next test's totals.
+
+    The fleet probe accumulates into a process-wide tracker that caches the
+    previous reading and the on-disk totals in memory, so redirecting
+    ``USAGE_PATH`` alone leaves the earlier case's numbers loaded.
+    """
+    from llm_launchpad.core.serving_metrics import default_tracker
+
+    default_tracker().reset()
+
+
+@pytest.fixture(autouse=True)
 def _stub_vision_hub_inspection(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep existing deployment tests hermetic; vision tests override this boundary."""
     from llm_launchpad.protocol.models import VisionCapabilities
@@ -288,3 +303,124 @@ def _stub_vision_hub_inspection(monkeypatch: pytest.MonkeyPatch) -> None:
         "llm_launchpad.core.vision.inspect_model_vision",
         lambda repo_id, revision=None: (VisionCapabilities(), {}),
     )
+
+
+# The real implementations, captured before any fixture swaps them out so the
+# interception wrappers below can delegate without recursing into themselves.
+_REAL_SUBPROCESS_RUN = subprocess.run
+_REAL_SUBPROCESS_POPEN = subprocess.Popen
+
+_PROVIDER_CLI_NAMES = frozenset({"modal", "prime"})
+
+
+def _provider_cli_command(command: object) -> list[str] | None:
+    """Return ``command`` as argv when it invokes a provider CLI, else ``None``."""
+
+    argv = command if isinstance(command, (list, tuple)) else [command]
+    if not argv:
+        return None
+    try:
+        decoded = [os.fsdecode(argument) for argument in argv]
+    except TypeError:
+        return None
+    if Path(decoded[0]).name not in _PROVIDER_CLI_NAMES:
+        return None
+    return decoded
+
+
+@pytest.fixture(autouse=True)
+def _offline_provider_clis(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Answer provider CLI calls offline instead of spawning the real binary.
+
+    Every Modal call in the product shells out to the ``modal`` binary, and one
+    ``modal volume ls`` costs a Python interpreter start plus a round trip to
+    Modal. UI tests reach that path without asking for it -- the home screen
+    alone fans out to storage, fleet, billing and profile -- so the suite spent
+    most of its wall clock inside the Modal CLI, against the developer's own
+    workspace, and a single storage worker joined at loop teardown could stall
+    one test for over a minute.
+
+    Only a command whose argv[0] *is* a provider CLI is answered here; the
+    ``sh`` snippets the SSH tests verify, and every other local subprocess,
+    still run for real. ``--json`` calls get an empty JSON document and the
+    rest get empty output, which is what an account with nothing in it looks
+    like. Tests that drive the CLI wrapper itself patch ``subprocess.run`` at
+    this same seam, so their stub replaces this one.
+    """
+
+    def run(command: object, *args: object, **kwargs: object) -> object:
+        argv = _provider_cli_command(command)
+        if argv is None:
+            return _REAL_SUBPROCESS_RUN(command, *args, **kwargs)
+        output: str | bytes = "[]" if "--json" in argv[1:] else ""
+        if not (kwargs.get("text") or kwargs.get("universal_newlines")):
+            output = output.encode()
+        return subprocess.CompletedProcess(
+            args=argv,
+            returncode=0,
+            stdout=output,
+            stderr=output[:0],
+        )
+
+    def popen(command: object, *args: object, **kwargs: object) -> object:
+        argv = _provider_cli_command(command)
+        if argv is None:
+            return _REAL_SUBPROCESS_POPEN(command, *args, **kwargs)
+        raise AssertionError(
+            "A test started the provider CLI for real: "
+            f"{' '.join(argv)}. Streaming CLI calls (deploy, logs) have to be "
+            "stubbed by the test; they cost a live deployment otherwise."
+        )
+
+    monkeypatch.setattr(subprocess, "run", run)
+    monkeypatch.setattr(subprocess, "Popen", popen)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_prime_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """Keep Prime's own CLI config -- real API credentials -- out of the suite.
+
+    ``load_prime_config`` reads ``~/.prime/config.json`` and the ``PRIME_*``
+    environment, neither of which ``_isolate_user_settings`` covers. With a key
+    resolved from either, a fleet refresh in a UI test calls the live Prime API
+    as the developer. Pointing the loader at an empty directory leaves
+    ``api_key`` blank, and ``PrimeBackend._request`` then fails before it opens
+    a socket.
+    """
+
+    from llm_launchpad.core import prime_auth
+
+    root = tmp_path_factory.mktemp("prime-config")
+    monkeypatch.setattr(prime_auth, "PRIME_CONFIG_DIR", root)
+    monkeypatch.setattr(prime_auth, "PRIME_CONFIG_PATH", root / "config.json")
+    for name in (
+        "PRIME_API_KEY",
+        "PRIME_TEAM_ID",
+        "PRIME_USER_ID",
+        "PRIME_API_BASE_URL",
+        "PRIME_BASE_URL",
+        "PRIME_CONTEXT",
+        "PRIME_SSH_KEY_PATH",
+    ):
+        monkeypatch.delenv(name, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _stub_modal_gpu_catalog_consumers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep catalog and availability builds off Modal's documentation site.
+
+    ``fetch_modal_gpu_catalog`` scrapes two modal.com pages. The parser and its
+    caching have focused tests that patch ``requests`` inside ``modal_gpu``, so
+    stub the imported reference in each consumer instead of the fetcher itself,
+    leaving those tests their seam.
+    """
+
+    catalog = [ModalGpuSpec("A100-80GB", price_per_hour_usd=2.50)]
+    for module_name in (
+        "llm_launchpad.core.compute_availability",
+        "llm_launchpad.core.quick_deploy_refresh",
+    ):
+        monkeypatch.setattr(f"{module_name}.fetch_modal_gpu_catalog", lambda: list(catalog))

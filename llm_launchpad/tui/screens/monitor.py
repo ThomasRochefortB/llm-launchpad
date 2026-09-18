@@ -107,7 +107,7 @@ class MonitorScreen(CopyEnabledScreen):
 
     BINDINGS = [
         Binding("escape", "go_back", "Back", show=True),
-        Binding("q", "go_back", "Back"),
+        Binding("q", "go_back", "Back", show=False),
         Binding(
             "y",
             "copy_text",
@@ -129,10 +129,39 @@ class MonitorScreen(CopyEnabledScreen):
         Binding("shift+n", "previous_search_match", "Previous match", show=False),
         Binding("v", "toggle_log_view", "Raw/Summary", show=True),
         Binding("ctrl+l", "clear_log", "Clear log", show=True),
-        Binding("enter", "submit_or_finish", "Done", show=False, priority=True),
-        Binding("u", "copy_base_url", "Copy URL", show=False),
+        Binding("enter", "submit_or_finish", "Done", show=True, priority=True),
+        Binding("u", "copy_base_url", "Copy URL", show=True),
         Binding("k", "copy_api_key", "Copy key", show=False),
     ]
+
+    _RESULT_TITLES = {
+        OperationType.STATUS: "Status check complete",
+        OperationType.BENCHMARK: "Benchmark complete",
+        OperationType.DEPLOY: "Deploy complete",
+        OperationType.WARMUP: "Warmup complete",
+        OperationType.LOGS: "Logs complete",
+        OperationType.STOP: "Stop complete",
+    }
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        """Prioritize result actions once the operation finishes.
+
+        While running, the footer is about following and searching logs; once
+        done, Done/Copy URL/Copy take precedence over log navigation, which
+        remains reachable by shortcut and help.
+        """
+        if self._done and action in {
+            "page_up_log", "page_down_log", "resume_follow", "clear_log",
+        }:
+            return False
+        if not self._done and action in {"submit_or_finish", "copy_base_url"}:
+            # The result card is hidden until completion; advertising Done and
+            # Copy URL beforehand promises buttons that do not exist yet.
+            if action == "copy_base_url" and self._connection_payload is None:
+                return False
+            if action == "submit_or_finish":
+                return False
+        return super().check_action(action, parameters)
 
     def __init__(
         self,
@@ -149,6 +178,7 @@ class MonitorScreen(CopyEnabledScreen):
         self._show_debug_logs = show_debug_logs
         self._current_operation: OperationType | None = None
         self._last_summary_state_detail = ""
+        self._last_error_message = ""
         self._following = True
         self._unseen_lines = 0
         self._line_count = 0
@@ -338,6 +368,7 @@ class MonitorScreen(CopyEnabledScreen):
     def on_operation_done(self, message: OperationDone) -> None:
         self._done = True
         self._success = message.success
+        self.refresh_bindings()
         if message.success:
             self.status_header.update_from_event(
                 state=self._TERMINAL_STATES.get(
@@ -355,8 +386,13 @@ class MonitorScreen(CopyEnabledScreen):
             self._show_result_card(message)
         else:
             self._append_log_line(f"Operation failed (exit code {message.exit_code}).")
-            if message.detail:
-                self._append_log_line(f"Detail: {message.detail}")
+            # The operation has already reported the error under its own line,
+            # and fail_operation repeats it verbatim as the completion detail.
+            # Restating it here printed the same sentence twice, which on a
+            # summarized deploy took four of the dozen lines the box has.
+            detail = _strip_ansi(message.detail or "").strip()
+            if detail and detail != self._last_error_message:
+                self._append_log_line(f"Detail: {detail}")
             if self._summary_mode_enabled:
                 self._append_log_line(
                     'Tip: re-run with "Show debug logs" enabled to see full backend logs.'
@@ -411,6 +447,10 @@ class MonitorScreen(CopyEnabledScreen):
         self._result_rows = rows
         card = self.query_one("#result-card", VerticalScroll)
         card.remove_class("hidden")
+        title = self._RESULT_TITLES.get(message.operation, "Check complete")
+        self.query_one("#result-card-title", Static).update(
+            f"[bold #7bf168]{title}[/]"
+        )
         self.query_one("#result-card-body", Static).update(_result_card_markup(rows))
         self.query_one("#result-done-btn", Button).focus()
 
@@ -423,6 +463,7 @@ class MonitorScreen(CopyEnabledScreen):
         self.notify("Copied result", timeout=2)
 
     def on_operation_error(self, message: OperationError) -> None:
+        self._last_error_message = _strip_ansi(message.message).strip()
         self._append_log_line(f"Error: {message.message}")
 
     def on_log_viewer_status_changed(self, message: LogViewer.StatusChanged) -> None:
@@ -474,6 +515,9 @@ class MonitorScreen(CopyEnabledScreen):
             return
         card = self.query_one("#connection-card", VerticalScroll)
         card.remove_class("hidden")
+        self.query_one("#connection-card-title", Static).update(
+            "[bold #7bf168]Endpoint ready[/]"
+        )
         self.query_one("#connection-card-body", Static).update(
             _connection_card_markup(payload)
         )
@@ -563,6 +607,9 @@ class MonitorScreen(CopyEnabledScreen):
         self.app.pop_screen()
 
     def action_go_back(self) -> None:
+        jobs = getattr(self.app, "deployment_jobs", {})
+        if any(job.monitor is self and not job.finished.is_set() for job in jobs.values()):
+            self.notify("Deployment continues. Reopen or cancel it in Operations (Ctrl+O).", timeout=5)
         if self._success and self._connection_payload:
             self._pop_after_success()
             return
@@ -655,15 +702,23 @@ class MonitorScreen(CopyEnabledScreen):
         return None
 
     def _active_in_progress_index(self) -> int | None:
+        """Return the step still running, so something on screen is moving.
+
+        This used to take the last step-or-done row and spin it only if it was
+        a step, which assumes the two alternate. They do not: a Prime deploy
+        polls the tunnel and the runtime together, so "Secure endpoint
+        connected" lands while the container image is still being built. The
+        spinner then vanished and every row took a tick, leaving a build that
+        had twenty minutes to run looking like a finished deploy.
+
+        The last step is the one to mark. It can briefly sit on a step that
+        has just finished, in the gap before the next one starts -- that reads
+        as "still working", which is true, where a static screen does not.
+        """
+
         if self._done:
             return None
-        active: int | None = None
-        for index, item in enumerate(self._summary_items):
-            if item.kind in {"step", "done"}:
-                active = index
-        if active is not None and self._summary_items[active].kind == "step":
-            return active
-        return None
+        return self._last_summary_step_index()
 
     def _rendered_summary_lines(self) -> list[str]:
         active_index = self._active_in_progress_index()

@@ -5,15 +5,20 @@ from __future__ import annotations
 from dataclasses import replace
 from functools import lru_cache
 import math
+from typing import Any
 
 from ..protocol.enums import BackendType, BillingModel, ComputeProvider, QuoteAvailability
-from ..protocol.models import InferencePlan, OfferCostBreakdown, ProviderQuote, VastModelOffer, VastOffer, VastProviderOptions, WorkloadProfile
+from ..protocol.models import InferencePlan, OfferCostBreakdown, ProviderQuote, VastModelOffer, VastOffer, VastProviderOptions
 from .compute_availability import canonical_gpu_identity
 from .llamacpp_planner import assess_memory_placement
 from .quick_deploy import QuickDeployModel, QuickDeployProfile, quick_deploy_recipe
-from .inference_options import estimate_monthly_compute_cost
+from .inference_options import COST_SCENARIO_WORKDAY, evaluate_quote_cost
 from .runtime_support import load_llamacpp_support_manifest
 from .vast_runtime import VAST_MAX_GPU_COUNT, VAST_MIN_COMPUTE_CAPABILITY, VAST_MIN_CUDA_VERSION
+from .vast_startup_history import (
+    load_vast_startup_history,
+    machine_startup_stats,
+)
 
 
 def vast_gpu_label(offer: VastOffer) -> str:
@@ -30,8 +35,22 @@ def vast_offer_is_rentable(offer: VastOffer) -> bool:
     """
     price = offer.costs.total_per_hour_usd
     return (
-        1 <= offer.gpu_count <= VAST_MAX_GPU_COUNT
+        _vast_offer_meets_runtime_floors(offer)
         and price is not None and price > 0
+    )
+
+
+def _vast_offer_meets_runtime_floors(offer: VastOffer) -> bool:
+    """Whether a host clears the model-independent runtime floors.
+
+    This is the eligibility subset of ``vast_offer_is_rentable`` that does not
+    depend on pricing. It must run *before* cheapest-offer selection: picking
+    the cheapest host per topology first and checking rentability afterward
+    lets a cheaper incompatible host shadow a slightly more expensive host
+    that could actually serve the model.
+    """
+    return (
+        1 <= offer.gpu_count <= VAST_MAX_GPU_COUNT
         and offer.cuda_max_good is not None and offer.cuda_max_good >= VAST_MIN_CUDA_VERSION
         and offer.compute_capability is not None
         and offer.compute_capability >= VAST_MIN_COMPUTE_CAPABILITY
@@ -63,9 +82,13 @@ def vast_plan_for_offer(row: VastModelOffer, profile: QuickDeployProfile) -> Inf
         ),
         is_estimate=True,
     )
+    evaluation = evaluate_quote_cost(
+        quote, COST_SCENARIO_WORKDAY, includes_storage=True
+    )
     return InferencePlan(
         recipe=row.recipe, quote=quote, assessment=row.assessment,
-        estimated_monthly_cost_usd=estimate_monthly_compute_cost(quote, WorkloadProfile()),
+        estimated_monthly_cost_usd=evaluation.estimated_monthly_cost_usd,
+        cost=evaluation,
     )
 
 
@@ -132,6 +155,11 @@ def vast_offers_for_model(
         required_disk = max(100, math.ceil(memory.weights_gb * 1.1 + 10))
         grouped: dict[tuple[str, int, float], tuple[VastOffer, int, OfferCostBreakdown]] = {}
         for offer in offers:
+            if not _vast_offer_meets_runtime_floors(offer):
+                # Skip hosts that can never run the pinned runtime before
+                # price selection: an incompatible host must not shadow the
+                # cheapest eligible host of the same topology.
+                continue
             disk = max(required_disk, offer.disk_gb)
             capacity = offer.disk_capacity_gb if offer.disk_capacity_gb is not None else offer.disk_gb
             if capacity < disk:
@@ -159,8 +187,35 @@ def vast_offers_for_model(
                 offer=offer, gpu_label=vast_gpu_label(offer), disk_gb=disk,
                 costs=costs, assessment=assessment,
             ))
-    return tuple(sorted(result, key=lambda row: (
-        row.costs.total_per_hour_usd is None,
-        row.costs.total_per_hour_usd if row.costs.total_per_hour_usd is not None else math.inf,
+    return tuple(
+        sorted(result, key=lambda row: _vast_row_sort_key(row, _cached_startup_history()))
+    )
+
+
+def _cached_startup_history() -> dict[str, Any] | None:
+    """Best-effort measured history; a corrupt file means no evidence."""
+    try:
+        return load_vast_startup_history()
+    except Exception:
+        return None
+
+
+def _vast_row_sort_key(
+    row: VastModelOffer, history: dict[str, Any] | None
+) -> tuple[int, float, int, float, str]:
+    """Price first, measured startup second: keep the cheapest-host default.
+
+    A machine with a recent successful observation sorts ahead of an
+    unmeasured one at the *same* price, so evidence moves the needle without
+    ever spending more than the cheapest tier. ``inet_down`` stays out of the
+    ranking entirely: advertised bandwidth predicts startup poorly.
+    """
+    price = row.costs.total_per_hour_usd
+    stats = machine_startup_stats(history, row.offer.machine_id or "")
+    return (
+        price is None,
+        price if price is not None else math.inf,
+        0 if stats is not None else 1,
+        stats["healthy_seconds"] if stats is not None else 0.0,
         row.id,
-    )))
+    )

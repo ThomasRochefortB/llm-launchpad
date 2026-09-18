@@ -389,9 +389,13 @@ def _fetch_hf_file_range(
             raise RuntimeError("Hugging Face ignored the bounded Range request")
         content_range = str(response.headers.get("Content-Range", "") or "").strip()
         match = _CONTENT_RANGE_RE.match(content_range)
-        if match is None or int(match.group(1)) != start or int(match.group(2)) > end:
+        if (
+            match is None
+            or int(match.group(1)) != start
+            or not start <= int(match.group(2)) <= end
+        ):
             raise RuntimeError("Hugging Face returned an invalid Content-Range")
-        expected_max = end - start + 1
+        expected_max = int(match.group(2)) - start + 1
         chunks: list[bytes] = []
         received = 0
         for chunk in response.iter_content(chunk_size=min(expected_max, 64 * 1024)):
@@ -401,6 +405,8 @@ def _fetch_hf_file_range(
             if received > expected_max:
                 raise RuntimeError("Hugging Face returned more than the requested range")
             chunks.append(chunk)
+        if received != expected_max:
+            raise RuntimeError("Hugging Face returned a truncated range")
         return b"".join(chunks)
     finally:
         response.close()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import replace
 
 from rich.cells import cell_len
 from textual.app import ComposeResult
@@ -32,10 +33,47 @@ class FittedFooter(Footer):
     is worse than an absent one: it names a shortcut the reader cannot act on
     and hides that anything was omitted.
 
-    Hints are kept in binding order, which every screen already declares
-    most-important-first, and whatever is left over is summarised by a trailing
-    marker pointing at the help overlay -- which lists all of them.
+    Hints are kept in presentation-priority order and whatever is left over is
+    summarised by a trailing marker pointing at the help overlay -- which
+    lists all of them. Help itself is never dropped: the marker that replaces
+    the hints must never replace the way to see them.
     """
+
+    # Lower values are rendered first. ``_DEFAULT_FOOTER_PRIORITY`` is the
+    # fallback for bindings that carry no explicit priority: Back/palette
+    # management are navigation, everything else is a screen verb. Global
+    # toggles (mouse mode, operations overlay) sort last; help itself stays
+    # first in the overflow marker's guarantee (see _fit), never dropped.
+    FOOTER_PRIORITY: dict[str, int] = {
+        "show_help": 0,
+        "pop_screen": 10,
+        "go_back": 10,
+        "push_operations": 96,
+        "choose_selected": 20,
+        "deploy": 20,
+        "do_deploy": 20,
+        "copy_base_url": 20,
+        "copy_text": 20,
+        "copy_all": 20,
+        "save": 20,
+        "refresh_storage": 30,
+        "refresh_endpoints": 30,
+        "refresh_availability": 30,
+        "refresh_billing": 30,
+        "open_actions": 30,
+        "status_selected": 30,
+        "logs_selected": 30,
+        "focus_model_search": 31,
+        "focus_model_filter": 31,
+        "focus_gpu_filter": 32,
+        "toggle_model_view": 33,
+        "focus_next_control": 40,
+        "focus_previous_control": 40,
+        "navigate_option_list_up": 40,
+        "navigate_option_list_down": 40,
+        "toggle_mouse_mode": 95,
+    }
+    _DEFAULT_FOOTER_PRIORITY = 50
 
     DEFAULT_CSS = """
     FittedFooter {
@@ -73,6 +111,7 @@ class FittedFooter(Footer):
         action_to_bindings = defaultdict(list)
         for _, binding, enabled, tooltip in self.screen.active_bindings.values():
             if binding.show:
+                binding = self._stateful_binding(binding)
                 action_to_bindings[binding.action].append((binding, enabled, tooltip))
 
         palette_binding = self._command_palette_binding()
@@ -83,7 +122,9 @@ class FittedFooter(Footer):
             binding, _enabled, _tooltip = palette_binding
             budget -= _hint_width(self.app.get_key_display(binding), binding.description) + 1
 
-        shown, hidden = self._fit(list(action_to_bindings.values()), budget)
+        shown, hidden = self._fit(
+            self._prioritize(list(action_to_bindings.values())), budget
+        )
 
         self.styles.grid_size_columns = len(shown) + (1 if hidden else 0)
         for binding, enabled, tooltip in shown:
@@ -116,6 +157,23 @@ class FittedFooter(Footer):
                 tooltip=tooltip,
             )
 
+    def _stateful_binding(self, binding: Binding) -> Binding:
+        """Say what a toggle is currently set to, not just what it toggles.
+
+        Mouse reporting defaults off over SSH so terminal-native selection
+        keeps working, which means taps do nothing until it is turned on. A
+        hint reading only "Mouse" cannot tell anyone that, and on a phone
+        client tapping a button is the obvious thing to try -- so the button
+        reads as unreachable rather than as a mode being off.
+        """
+
+        if binding.action != "toggle_mouse_mode":
+            return binding
+        enabled = getattr(self.app, "mouse_enabled", None)
+        if enabled is None:
+            return binding
+        return replace(binding, description=f"Mouse {'on' if enabled else 'off'}")
+
     def _command_palette_binding(self) -> tuple[Binding, bool, str] | None:
         if not (self.show_command_palette and self.app.ENABLE_COMMAND_PALETTE):
             return None
@@ -126,6 +184,27 @@ class FittedFooter(Footer):
         except KeyError:
             return None
         return binding, enabled, binding.tooltip or binding.description
+
+    def _prioritize(
+        self, groups: list[list[tuple[Binding, bool, str]]]
+    ) -> list[list[tuple[Binding, bool, str]]]:
+        """Order footer hints so primary actions survive narrow terminals."""
+        return sorted(groups, key=lambda group: self._priority_for(group[0][0]))
+
+    def _priority_for(self, binding: Binding) -> int:
+        """Return the presentation priority for one footer binding."""
+        explicit = getattr(binding, "priority", 0)
+        # Textual's priority is a dispatch order; screens use it for hidden
+        # keys (enter-to-choose shadows submit). Only non-zero footer-visible
+        # priorities participate here so that mechanism is never overloaded.
+        try:
+            action = str(binding.action or "")
+        except Exception:
+            action = ""
+        base = self.FOOTER_PRIORITY.get(action, self._DEFAULT_FOOTER_PRIORITY)
+        if explicit:
+            return base - 1
+        return base
 
     def _fit(
         self,
@@ -156,8 +235,11 @@ class FittedFooter(Footer):
         if fitted == len(groups):
             return ([group[0] for group in groups], 0)
 
+        # Help is the way back to the dropped hints, so it is kept even when
+        # that costs another hint's width. The loop below never drops index 0
+        # because _prioritize sorts show_help there.
         marker_width = _hint_width("", _OVERFLOW_TEMPLATE.format(count=len(groups)))
-        while fitted > 0 and used + marker_width > budget:
+        while fitted > 1 and used + marker_width > budget:
             fitted -= 1
             used -= widths[fitted]
 

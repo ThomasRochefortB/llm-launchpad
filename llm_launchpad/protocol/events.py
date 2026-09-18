@@ -58,6 +58,14 @@ class OperationCompleteEvent(BaseEvent):
 
 
 @dataclass(frozen=True)
+class ResourceAllocatedEvent(BaseEvent):
+    """A billable resource exists, before its endpoint is available."""
+
+    app_id: str = ""
+    operation: OperationType = OperationType.DEPLOY
+
+
+@dataclass(frozen=True)
 class EndpointAvailableEvent(BaseEvent):
     """Public inference URL is known. The runtime may still be loading weights."""
 

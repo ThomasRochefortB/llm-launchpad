@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 from llm_launchpad.core.orchestrator import Orchestrator
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider, OperationType
-from llm_launchpad.protocol.events import LogEvent, OperationCompleteEvent
+from llm_launchpad.protocol.events import ErrorEvent, LogEvent, OperationCompleteEvent
 from llm_launchpad.protocol.models import VisionCapabilities, VisionVerification
 
 
@@ -211,3 +211,76 @@ class WarmupPrimeLogsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WarmupTerminalFailureTests(unittest.TestCase):
+    """A crash that every container restart reproduces must not be waited out."""
+
+    def setUp(self) -> None:
+        import contextlib
+
+        self._warmup_stack = contextlib.ExitStack()
+        self.addCleanup(self._warmup_stack.close)
+
+    def test_rejected_serving_plan_ends_warmup_without_waiting_for_the_timeout(self) -> None:
+        crash = (
+            "Runner failed with exception: RuntimeError('llama.cpp rejected the "
+            "full-context GPU-only serving plan: the model, its full-context cache "
+            "and the compute graph do not fit this placement's GPUs with the "
+            "requested margin (fit exit 1).')"
+        )
+
+        class _Tail:
+            """A Modal log stream that has already seen the container die."""
+
+            def __init__(self, app_name: str) -> None:
+                self.app_name = app_name
+                self.seen_lines: set[str] = set()
+                self.stopped: str | None = None
+                self._sent = False
+
+            def may_attach(self) -> bool:
+                return False
+
+            def attach(self):  # type: ignore[no-untyped-def]
+                yield from ()
+
+            def drain(self):  # type: ignore[no-untyped-def]
+                if not self._sent:
+                    self._sent = True
+                    yield LogEvent(line=crash, operation=OperationType.WARMUP)
+
+            def stop(self, reason: str) -> None:
+                self.stopped = reason
+
+        fake_requests = types.SimpleNamespace(
+            post=lambda *_a, **_k: _Response(503, "still warming"),
+            get=lambda *_a, **_k: _Response(503, "still warming"),
+        )
+        _hermetic_warmup(self, fake_requests)
+        self._warmup_stack.enter_context(
+            patch("llm_launchpad.core.warmup._ModalLogTail", _Tail)
+        )
+
+        events = list(
+            Orchestrator().warmup(
+                backend=BackendType.LLAMACPP,
+                server_url="https://example.modal.run",
+                timeout=1800,
+                tail_logs=True,
+                app_name="llp-lc-test",
+            )
+        )
+
+        completion = [e for e in events if isinstance(e, OperationCompleteEvent)]
+        self.assertEqual(len(completion), 1)
+        self.assertFalse(completion[0].success)
+        # The failure is reported as llama.cpp's verdict, not as a 30-minute
+        # readiness timeout that says nothing about why.
+        self.assertTrue(
+            completion[0].detail == ""
+            or "rejected the full-context" in completion[0].detail
+        )
+        errors = [e for e in events if isinstance(e, ErrorEvent)]
+        self.assertTrue(errors[0].message.startswith("llama.cpp rejected the full-context"))
+        self.assertFalse(errors[0].recoverable)

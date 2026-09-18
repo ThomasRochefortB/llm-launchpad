@@ -164,10 +164,9 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
-            rank_mode_list = screen.query_one("#vllm-rank-mode", OptionList)
+            rank_mode = screen.query_one("#vllm-rank-mode", Select)
             model_list = screen.query_one("#vllm-model-list", OptionList)
-            rank_mode_list.focus()
-            rank_mode_list.highlighted = 2
+            rank_mode.focus()
             await pilot.pause()
 
             await pilot.press("down")
@@ -194,7 +193,7 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
-            rank_mode_list = screen.query_one("#vllm-rank-mode", OptionList)
+            rank_mode = screen.query_one("#vllm-rank-mode", Select)
             model_list = screen.query_one("#vllm-model-list", OptionList)
             model_list.focus()
             model_list.highlighted = 0
@@ -203,11 +202,7 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("up")
             await pilot.pause()
 
-            self.assertTrue(rank_mode_list.has_focus)
-            highlighted = rank_mode_list.highlighted_option
-            self.assertIsNotNone(highlighted)
-            assert highlighted is not None
-            self.assertEqual(highlighted.id, "rank-trending")
+            self.assertTrue(rank_mode.has_focus)
 
     async def test_down_from_model_list_last_option_moves_focus_to_model_name(self) -> None:
         app = _TestApp()
@@ -271,7 +266,7 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(model_list.has_focus)
             self.assertEqual(model_name.value, "Qwen/Qwen3-4B")
 
-    async def test_enter_on_rank_mode_moves_focus_to_model_list(self) -> None:
+    async def test_selecting_rank_mode_reloads_model_suggestions(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:
             app.push_screen(VllmDeployScreen())
@@ -279,28 +274,11 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
             screen = app.screen
             assert isinstance(screen, VllmDeployScreen)
-            rank_mode_list = screen.query_one("#vllm-rank-mode", OptionList)
-            model_list = screen.query_one("#vllm-model-list", OptionList)
 
-            rank_mode_list.focus()
-            rank_mode_list.highlighted = 1
-            await pilot.pause()
-
-            await pilot.press("enter")
+            screen._set_vllm_rank_mode("downloads")
             await pilot.pause()
 
             self.assertEqual(app.fetch_calls, ["downloads"])
-            # The picker is hidden until it has rows, so focus is handed over
-            # when the requested ranking arrives rather than before.
-            screen.on_vllm_models_loaded(
-                VllmModelsLoaded(
-                    mode="downloads",
-                    models=[ModelCandidate(repo_id="Qwen/Qwen3-32B")],
-                )
-            )
-            await pilot.pause()
-
-            self.assertTrue(model_list.has_focus)
 
     async def test_down_from_model_name_follows_the_visual_form_order(self) -> None:
         """Arrow navigation must not jump past the compute provider select.
@@ -382,13 +360,10 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
             screen = app.screen
             assert isinstance(screen, VllmDeployScreen)
-            rank_mode_list = screen.query_one("#vllm-rank-mode", OptionList)
+            rank_mode = screen.query_one("#vllm-rank-mode", Select)
 
-            self.assertTrue(rank_mode_list.has_focus)
-            highlighted = rank_mode_list.highlighted_option
-            self.assertIsNotNone(highlighted)
-            assert highlighted is not None
-            self.assertEqual(highlighted.id, "rank-cached")
+            self.assertTrue(rank_mode.has_focus)
+            self.assertEqual(rank_mode.value, "cached")
 
     async def test_default_rank_mode_highlight_matches_cached(self) -> None:
         app = _TestApp()
@@ -400,11 +375,8 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
             screen = app.screen
             assert isinstance(screen, VllmDeployScreen)
-            rank_mode_list = screen.query_one("#vllm-rank-mode", OptionList)
-            highlighted = rank_mode_list.highlighted_option
-            self.assertIsNotNone(highlighted)
-            assert highlighted is not None
-            self.assertEqual(highlighted.id, "rank-cached")
+            rank_mode = screen.query_one("#vllm-rank-mode", Select)
+            self.assertEqual(rank_mode.value, "cached")
 
     async def test_served_model_alias_defaults_to_model_suffix(self) -> None:
         app = _TestApp()
@@ -512,9 +484,7 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
             screen = app.screen
             assert isinstance(screen, VllmDeployScreen)
-            rank_mode_list = screen.query_one("#vllm-rank-mode", OptionList)
-            downloads_option = rank_mode_list.get_option_at_index(1)
-            screen.on_option_list_option_selected(SimpleNamespace(option_list=rank_mode_list, option=downloads_option))
+            screen._set_vllm_rank_mode("downloads")
             self.assertEqual(app.fetch_calls, ["downloads"])
 
             screen.on_vllm_models_loaded(
@@ -546,8 +516,8 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             screen = app.screen
             assert isinstance(screen, VllmDeployScreen)
 
-            rank_mode_list = screen.query_one("#vllm-rank-mode", OptionList)
-            self.assertEqual(rank_mode_list.get_option_at_index(0).id, "rank-cached")
+            rank_mode = screen.query_one("#vllm-rank-mode", Select)
+            self.assertEqual(rank_mode.value, "cached")
 
             screen.on_storage_loaded(
                 StorageLoaded(
@@ -564,8 +534,7 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
-            cached_option = rank_mode_list.get_option_at_index(0)
-            screen.on_option_list_option_selected(SimpleNamespace(option_list=rank_mode_list, option=cached_option))
+            screen._set_vllm_rank_mode("cached")
 
             model_list = screen.query_one("#vllm-model-list", OptionList)
             selected_option = model_list.get_option_at_index(0)
@@ -583,9 +552,7 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
             screen = app.screen
             assert isinstance(screen, VllmDeployScreen)
-            rank_mode_list = screen.query_one("#vllm-rank-mode", OptionList)
-            downloads_option = rank_mode_list.get_option_at_index(1)
-            screen.on_option_list_option_selected(SimpleNamespace(option_list=rank_mode_list, option=downloads_option))
+            screen._set_vllm_rank_mode("downloads")
             screen.on_vllm_models_loaded(
                 VllmModelsLoaded(
                     mode="downloads",

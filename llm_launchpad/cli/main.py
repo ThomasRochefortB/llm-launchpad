@@ -8,11 +8,10 @@ all non-interactive commands available for automation.
 from __future__ import annotations
 
 from ..protocol.enums import VisionMode
-from ..core.vision_probe import is_vision_probe_failure
 
 import os
 import sys
-from dataclasses import asdict, replace
+from dataclasses import asdict
 import json
 from typing import Annotated, Any
 
@@ -40,7 +39,6 @@ from ..core.diagnostics import log_debug, log_exception, setup_logging
 from ..core.deploy_log_summary import DeployLogSummarizer, beautify_summary_line
 from ..core.hf_models import fetch_gguf_quant_metadata
 from ..core.modal_gpu import fetch_modal_gpu_types
-from ..tui import mouse as mouse_defaults
 from ..core.naming import (
     auto_instance_name_for_backend,
     build_deployment_name,
@@ -48,12 +46,9 @@ from ..core.naming import (
     random_function_slug,
     slugify_instance_name,
 )
-from ..core.prime_backend import PrimeBackend
 from ..core.providers import refuse as refuse_deployment
 from ..core.vast_auth import resolve_vast_credentials
-from ..core.vast_deployment import VastDeploymentBackend
 from ..core.prime_auth import get_prime_auth_status
-from ..core.provider_options import prime_provider_options
 from ..core.opencode import (
     resolve_connection_for_app,
     resolve_connections_for_rows,
@@ -67,13 +62,15 @@ from ..core.runtime_support import (
 )
 from ..protocol.enums import BackendType, ComputeProvider, OfferProvider, OperationType
 from ..protocol.events import (
-    EndpointAvailableEvent,
+    BaseEvent,
     ErrorEvent,
     LogEvent,
     OperationCompleteEvent,
     StateChangeEvent,
 )
 from ..protocol.models import DeploymentConfig, EndpointInfo, PrimeProviderOptions, VastProviderOptions
+from .jobs import jobs_app
+from .prime import prime_disks_app
 from .vast import vast_app, vast_auth_app, print_vast_offers
 
 app = typer.Typer(
@@ -86,6 +83,8 @@ aai_auth_app = typer.Typer(help="Manage the stored Artificial Analysis API key."
 app.add_typer(aai_auth_app, name="aai-auth")
 app.add_typer(vast_auth_app, name="vast-auth")
 app.add_typer(vast_app, name="vast")
+app.add_typer(prime_disks_app, name="prime-disks")
+app.add_typer(jobs_app, name="jobs")
 
 
 def _version_callback(value: bool) -> None:
@@ -186,14 +185,6 @@ def _preflight(
     return orch, username
 
 
-def _parse_bool_env(name: str, default: bool) -> bool:
-    return mouse_defaults.parse_bool_env(name, default)
-
-
-def _default_tui_mouse_enabled() -> bool:
-    return mouse_defaults.default_tui_mouse_enabled()
-
-
 def _ensure_tui_runtime() -> None:
     """Fail fast with visible CLI errors before handing off to Textual."""
     if not sys.stdin.isatty() or not sys.stdout.isatty():
@@ -250,7 +241,7 @@ def _provider_instances(
 ) -> list[EndpointInfo]:
     if provider == ComputeProvider.MODAL:
         return _backend_instances(backend)
-    rows = VastDeploymentBackend().list_deployments() if provider == ComputeProvider.VAST else PrimeBackend().list_deployments()
+    rows = _list_provider_deployments(provider) or []
     return [row for row in visible_launchpad_rows(rows) if row.backend == backend]
 
 
@@ -343,11 +334,7 @@ def _connected_compute_providers() -> tuple[ComputeProvider, ...]:
 def _load_visible_launchpad_rows(
     provider: ComputeProvider = ComputeProvider.MODAL,
 ) -> list[EndpointInfo] | None:
-    rows = (
-        ModalBackend.list_apps()
-        if provider == ComputeProvider.MODAL
-        else (VastDeploymentBackend().list_deployments() if provider == ComputeProvider.VAST else PrimeBackend().list_deployments())
-    )
+    rows = _list_provider_deployments(provider)
     if rows is None:
         return None
     return visible_launchpad_rows(merge_connections(rows))
@@ -355,15 +342,12 @@ def _load_visible_launchpad_rows(
 
 def _list_provider_deployments(provider: ComputeProvider) -> list[EndpointInfo] | None:
     """List deployments for one provider; ``None`` when the listing is unavailable."""
-    try:
-        rows = (
-            ModalBackend.list_apps()
-            if provider == ComputeProvider.MODAL
-            else (VastDeploymentBackend().list_deployments() if provider == ComputeProvider.VAST else PrimeBackend().list_deployments())
-        )
-    except Exception:
+    from ..core.provider_adapters import listing_adapter
+
+    listing = listing_adapter(provider).list()
+    if not listing.available:
         return None
-    return rows
+    return list(listing.rows)
 
 
 def _load_rows_for_opencode_sync(
@@ -466,6 +450,14 @@ def _sync_opencode_cli(
         typer.echo(line)
 
 
+def _lifecycle_exit_code(outcome: object | None) -> int:
+    """Map a failed lifecycle outcome to the CLI exit code."""
+    code = getattr(outcome, "failure_exit_code", None) if outcome is not None else None
+    if isinstance(code, int) and code > 0:
+        return code
+    return 1
+
+
 def _deploy_and_maybe_warmup(
     orch: Orchestrator,
     *,
@@ -479,175 +471,129 @@ def _deploy_and_maybe_warmup(
     debug_logs: bool = False,
 ) -> None:
     """Run deploy, optional warmup, and OpenCode sync for CLI commands."""
-    deployed_web_url: str | None = None
-    deployed_endpoint: EndpointInfo | None = None
-    deploy_succeeded = False
-    opencode_synced = False
+    from ..core.deployment_lifecycle import (
+        LifecycleAttempt,
+        LifecycleCallbacks,
+        LifecycleOptions,
+        run_lifecycle,
+    )
+    from ..protocol.enums import AttemptDisposition
+
     summarizer = None if debug_logs else DeployLogSummarizer(backend)
-    for event in orch.deploy(config):
-        if isinstance(event, LogEvent):
-            maybe_url = ModalBackend.extract_modal_web_url(event.line)
-            if maybe_url:
-                deployed_web_url = maybe_url
-        elif isinstance(event, EndpointAvailableEvent):
-            deployed_endpoint = event.endpoint
-            deployed_web_url = event.endpoint.web_url or deployed_web_url
-            if deployed_web_url and not do_warmup:
-                # save_connection silently does nothing without a URL on the
-                # endpoint itself, which stranded the generated API key while
-                # OpenCode was synced from the accumulated URL regardless.
-                save_connection(config, replace(event.endpoint, web_url=deployed_web_url))
-                _sync_opencode_cli(
-                    target_app_name=config.app_name,
-                    target_url=deployed_web_url,
-                    target_config=config,
-                    current_rows=_load_visible_launchpad_rows(config.provider),
-                    prune_providers=(config.provider,),
-                    username=username,
-                )
-                opencode_synced = True
-        elif isinstance(event, OperationCompleteEvent) and event.operation == OperationType.DEPLOY:
-            deploy_succeeded = event.success
-            if event.success and isinstance(event.data, EndpointInfo):
-                deployed_endpoint = event.data
-                deployed_web_url = event.data.web_url or deployed_web_url
-            elif not event.success and opencode_synced:
-                remove_connection(config.app_name or "")
-                _sync_opencode_cli(
-                    current_rows=_load_visible_launchpad_rows(config.provider),
-                    remove_app_names=[config.app_name or ""],
-                    prune_providers=(config.provider,),
-                    username=username,
-                )
-                opencode_synced = False
+    published_url: str | None = None
+    published_endpoint: EndpointInfo | None = None
+    synced_app: str | None = None
+
+    def _publish(url: str | None, endpoint: EndpointInfo | None) -> None:
+        nonlocal published_url, published_endpoint, synced_app
+        # The lifecycle owns endpoint resolution and warmup: only endpoint
+        # objects and warmup replacements publish here. Log-scraped Modal
+        # URLs seed nothing; the lifecycle already resolves the serving URL
+        # (including the deterministic Modal fallback) and hands it back.
+        if endpoint is not None:
+            published_endpoint = endpoint
+            if endpoint.web_url:
+                published_url = endpoint.web_url
+        elif url and published_endpoint is not None and published_url is None:
+            published_url = url
+        if published_url:
+            save_connection(
+                config,
+                published_endpoint
+                or EndpointInfo(name=config.app_name or "", backend=config.backend, web_url=published_url),
+            )
+        if published_url and not do_warmup:
+            _sync_opencode_cli(
+                target_app_name=config.app_name,
+                target_url=published_url,
+                target_config=config,
+                current_rows=_load_visible_launchpad_rows(config.provider),
+                prune_providers=(config.provider,),
+                username=username,
+            )
+            synced_app = config.app_name
+
+    def _on_event(event: BaseEvent) -> None:
         _print_event(event, summarizer=summarizer)
-        _raise_on_failed_completion(event)
+        # The lifecycle owns failure accounting and cleanup; raising here
+        # would abort the run before it records the outcome, and the typed
+        # result below already carries the provider's exit code.
 
-    if deploy_succeeded and deployed_web_url:
-        # Persist provider credentials immediately. A later warmup failure must
-        # not strand a live, billable pod without its generated bearer key.
-        save_connection(config, deployed_endpoint or EndpointInfo(name=config.app_name or "", backend=config.backend, web_url=deployed_web_url))
-
-    warmup_succeeded = False
-    final_sync_url: str | None = None
-    if do_warmup:
-        url = server_url or deployed_web_url
-        if not url and config.provider == ComputeProvider.MODAL:
-            url = ModalBackend.default_server_url(
-                username,
-                app_name=config.app_name,
-                function_slug=config.function_slug,
-            )
-        if not url:
-            typer.echo("Error: the provider did not return a usable endpoint URL.", err=True)
-            raise typer.Exit(code=1)
-        certification_kwargs = (
-            {
-                "serving_requirements": config.serving_requirements,
-                "placement_assessment": config.placement_assessment,
-                "runtime_id": config.llamacpp_runtime_id,
-            }
-            if config.serving_requirements is not None
-            else {}
+    def _save_credentials(
+        saved: DeploymentConfig, url: str | None, endpoint: EndpointInfo | None
+    ) -> None:
+        # Pre-certification save: persist the bearer key without publishing
+        # the unverified URL or syncing OpenCode.
+        target_url = (endpoint.web_url if endpoint and endpoint.web_url else None) or url
+        if not target_url:
+            return
+        save_connection(
+            saved,
+            endpoint
+            or EndpointInfo(name=saved.app_name or "", backend=saved.backend, web_url=target_url),
         )
-        if config.vision is not None:
-            certification_kwargs["vision"] = config.vision
-        warmup_events = (
-            orch.warmup(
-                backend,
-                url,
-                timeout,
-                tail_logs,
-                app_name=config.app_name,
-                served_model_name=config.served_model_name,
-                **certification_kwargs,
-            )
-            if config.provider == ComputeProvider.MODAL
-            else orch.warmup(
-                backend,
-                url,
-                timeout,
-                tail_logs,
-                app_name=config.app_name,
-                served_model_name=config.served_model_name,
-                provider=config.provider,
-                api_key=config.endpoint_api_key,
-                pod_id=deployed_endpoint.app_id if deployed_endpoint else None,
-                **certification_kwargs,
-            )
-        )
-        for event in warmup_events:
-            if (
-                isinstance(event, OperationCompleteEvent)
-                and event.success
-                and event.operation == OperationType.WARMUP
-            ):
-                warmup_succeeded = True
-                final_sync_url = url
-                if isinstance(event.data, dict):
-                    maybe_url = event.data.get("url")
-                    if isinstance(maybe_url, str) and maybe_url.strip():
-                        final_sync_url = maybe_url.strip()
-                    attestation = event.data.get("attestation")
-                    if attestation is not None:
-                        config.runtime_attestation = attestation
-                        if deployed_endpoint is not None:
-                            deployed_endpoint.runtime_attestation = attestation
-            _print_event(event, summarizer=summarizer)
-            if (
-                isinstance(event, OperationCompleteEvent)
-                and not event.success
-                and event.operation == OperationType.WARMUP
-                and config.provider in {ComputeProvider.PRIME, ComputeProvider.VAST}
-                and deployed_endpoint is not None
-                and (config.provider == ComputeProvider.VAST or not prime_provider_options(config).keep_failed_resource)
-                # A pod that only failed the image probe is still serving, so
-                # keep it for diagnosis instead of terminating it.
-                and not is_vision_probe_failure(event)
-            ):
-                typer.echo(
-                    f"Warmup failed; terminating {config.provider.display_name} instance {deployed_endpoint.app_id}."
-                )
-                for cleanup_event in orch.stop_app(
-                    backend,
-                    app_name=config.app_name,
-                    app_id=deployed_endpoint.app_id,
-                    provider=config.provider,
-                ):
-                    _print_event(cleanup_event, summarizer=summarizer)
-                remove_connection(config.app_name or "")
-                _sync_opencode_cli(
-                    current_rows=_load_visible_launchpad_rows(config.provider),
-                    remove_app_names=[config.app_name or ""],
-                    prune_providers=(config.provider,),
-                    username=username,
-                )
-                opencode_synced = False
-            _raise_on_failed_completion(event)
-    elif deploy_succeeded:
-        final_sync_url = server_url or deployed_web_url
-        if not final_sync_url and config.provider == ComputeProvider.MODAL:
-            final_sync_url = ModalBackend.default_server_url(
-                username,
-                app_name=config.app_name,
-                function_slug=config.function_slug,
-            )
 
-    if opencode_synced:
-        return
-    if (do_warmup and warmup_succeeded and final_sync_url) or (not do_warmup and final_sync_url):
-        endpoint = deployed_endpoint or EndpointInfo(
+    from ..core.deployment_preflight import lifecycle_attempts_for_configs
+
+    attempt_specs = lifecycle_attempts_for_configs([config])
+    spec = attempt_specs[0]
+    result = run_lifecycle(
+        orch,
+        [LifecycleAttempt(config=config, retry_allowed=False, plan=spec.plan)],
+        options=LifecycleOptions(
+            warmup_timeout_seconds=timeout,
+            tail_logs=tail_logs,
+            server_url_override=server_url,
+            warmup_enabled=do_warmup,
+            modal_username=username,
+        ),
+        callbacks=LifecycleCallbacks(
+            on_event=_on_event,
+            on_connection=lambda saved, url, endpoint: _publish(url, endpoint),
+            on_credentials=_save_credentials,
+        ),
+    )
+    outcome = result.attempts[0] if result.attempts else None
+    if outcome is not None and outcome.endpoint_url:
+        published_url = outcome.endpoint_url
+    if outcome is not None and outcome.endpoint is not None:
+        published_endpoint = outcome.endpoint
+    if not result.succeeded:
+        if synced_app:
+            remove_connection(config.app_name or "")
+            _sync_opencode_cli(
+                current_rows=_load_visible_launchpad_rows(config.provider),
+                remove_app_names=[config.app_name or ""],
+                prune_providers=(config.provider,),
+                username=username,
+            )
+        # The lifecycle already emitted the failed completion; surface the
+        # terminal state without re-raising a second completion event. The
+        # provider's own exit code travels on the failure outcome.
+        if outcome is not None and outcome.disposition == AttemptDisposition.CANCELLED:
+            raise typer.Exit(code=130)
+        raise typer.Exit(code=_lifecycle_exit_code(outcome))
+    if not published_url and config.provider == ComputeProvider.MODAL:
+        # A Modal deploy that emitted no URL still has a deterministic serving
+        # address from its app name and function slug.
+        published_url = ModalBackend.default_server_url(
+            username,
+            app_name=config.app_name,
+            function_slug=config.function_slug,
+        )
+    if published_url and synced_app != config.app_name:
+        endpoint = published_endpoint or EndpointInfo(
             name=config.app_name or "",
             backend=config.backend,
             instance_name=config.instance_name,
             provider=config.provider,
         )
-        endpoint.web_url = final_sync_url
+        endpoint.web_url = published_url
         endpoint.endpoint_api_key = config.endpoint_api_key
         save_connection(config, endpoint)
         _sync_opencode_cli(
             target_app_name=config.app_name,
-            target_url=final_sync_url,
+            target_url=published_url,
             target_config=config,
             current_rows=_load_visible_launchpad_rows(config.provider),
             prune_providers=(config.provider,),
@@ -900,6 +846,14 @@ def deploy(
     revision: str | None = typer.Option(None, help="llama.cpp HF revision (Modal only)"),
     server_args: str | None = typer.Option(None, help="Additional llama-server arguments"),
     n_gpu_layers: int | None = typer.Option(None, help="llama.cpp GPU layers (default: auto)"),
+    mtp: bool = typer.Option(
+        True,
+        "--mtp/--no-mtp",
+        help=(
+            "Use native MTP speculative decoding when the GGUF carries NextN "
+            "heads and the pinned llama.cpp runtime supports the architecture"
+        ),
+    ),
     model_name: str | None = typer.Option(None, help="vLLM MODEL_NAME"),
     model_revision: str | None = typer.Option(None, help="vLLM MODEL_REVISION"),
     served_model_name: str | None = typer.Option(None, help="vLLM SERVED_MODEL_NAME"),
@@ -990,6 +944,7 @@ def deploy(
         revision=revision,
         server_args=server_args,
         n_gpu_layers=n_gpu_layers,
+        allow_speculative_decoding=mtp,
         model_name=model_name,
         model_revision=model_revision,
         served_model_name=served_model_name,
@@ -1401,7 +1356,9 @@ def stop(
     instance_name: str | None = typer.Option(None, help="Target instance name"),
     app_name: str | None = typer.Option(None, help="Target deployment name"),
 ) -> None:
-    """Stop a deployed backend app. Vast destroys the rental and its disk."""
+    """Stop a deployed backend app. Storage consequences differ by provider."""
+    from ..core.storage_resources import format_stop_preview
+
     compute_provider = ComputeProvider(provider)
     orch, username = _preflight(compute_provider)
     _print_banner()
@@ -1409,12 +1366,8 @@ def stop(
     target = _resolve_manage_target(bt, compute_provider, app_name, instance_name)
     target_app_name = target.name
     if not yes:
-        question = (
-            f"Destroy Vast rental '{target_app_name}' and permanently delete its disk?"
-            if compute_provider == ComputeProvider.VAST
-            else f"Stop deployed app '{target_app_name}'?"
-        )
-        confirmed = typer.confirm(question)
+        typer.echo(format_stop_preview(compute_provider, target_app_name))
+        confirmed = typer.confirm("Proceed?")
         if not confirmed:
             typer.echo("Aborted.")
             raise typer.Exit(code=1)
@@ -1580,6 +1533,14 @@ def switch(
     repo_id: str | None = typer.Option(None, help="HF repo id"),
     quant: str | None = typer.Option(None, help="Quant pattern"),
     revision: str | None = typer.Option(None, help="HF revision"),
+    mtp: bool = typer.Option(
+        True,
+        "--mtp/--no-mtp",
+        help=(
+            "Use native MTP speculative decoding when the GGUF carries NextN "
+            "heads and the pinned llama.cpp runtime supports the architecture"
+        ),
+    ),
     model_name: str | None = typer.Option(None, help="vLLM MODEL_NAME"),
     model_revision: str | None = typer.Option(None, help="vLLM MODEL_REVISION"),
     served_model_name: str | None = typer.Option(None, help="vLLM SERVED_MODEL_NAME"),
@@ -1652,6 +1613,7 @@ def switch(
         revision=revision,
         preload=preload,
         do_deploy=False,  # first run just switches model
+        allow_speculative_decoding=mtp,
         model_name=model_name,
         model_revision=model_revision,
         served_model_name=served_model_name,

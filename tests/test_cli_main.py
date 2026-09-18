@@ -26,34 +26,6 @@ def _plain_cli_output(text: str) -> str:
 
 
 class CliMainHelperTests(unittest.TestCase):
-    def test_parse_bool_env_accepts_truthy_values(self) -> None:
-        with patch.dict("os.environ", {"LLM_LAUNCHPAD_TUI_MOUSE": "yes"}):
-            self.assertTrue(cli_main._parse_bool_env("LLM_LAUNCHPAD_TUI_MOUSE", False))
-
-    def test_default_tui_mouse_enabled_defaults_off_over_ssh(self) -> None:
-        with patch.dict("os.environ", {"SSH_CONNECTION": "1"}, clear=True):
-            self.assertFalse(cli_main._default_tui_mouse_enabled())
-
-    def test_default_tui_mouse_enabled_can_be_forced_on_by_env(self) -> None:
-        with patch.dict(
-            "os.environ",
-            {"SSH_CONNECTION": "1", "LLM_LAUNCHPAD_TUI_MOUSE": "true"},
-            clear=True,
-        ):
-            self.assertTrue(cli_main._default_tui_mouse_enabled())
-
-    def test_default_tui_mouse_enabled_can_be_forced_off_by_env(self) -> None:
-        with patch.dict("os.environ", {"LLM_LAUNCHPAD_TUI_MOUSE": "false"}, clear=True):
-            self.assertFalse(cli_main._default_tui_mouse_enabled())
-
-    def test_default_tui_mouse_enabled_stays_on_for_known_remote_clipboard_terminal(self) -> None:
-        with patch.dict(
-            "os.environ",
-            {"SSH_CONNECTION": "1", "LC_TERMINAL": "iTerm2"},
-            clear=True,
-        ):
-            self.assertTrue(cli_main._default_tui_mouse_enabled())
-
     def test_ensure_tui_runtime_requires_tty(self) -> None:
         with (
             patch("llm_launchpad.cli.main.sys.stdin.isatty", return_value=False),
@@ -277,7 +249,10 @@ class CliMainCommandTests(unittest.TestCase):
         )
         with patch("llm_launchpad.cli.main._preflight", return_value=(orch, "alice")):
             with patch("llm_launchpad.cli.main._print_banner", return_value=None):
-                result = self.runner.invoke(cli_main.app, ["deploy", "--backend", "vllm"])
+                result = self.runner.invoke(
+                    cli_main.app,
+                    ["deploy", "--backend", "vllm", "--model-name", "Qwen/Qwen3-8B"],
+                )
         self.assertEqual(result.exit_code, 9)
 
     def test_deploy_cli_summarizes_verbose_backend_logs_by_default(self) -> None:
@@ -407,6 +382,43 @@ class CliMainCommandTests(unittest.TestCase):
             ),
         )
 
+    def test_deploy_llamacpp_allows_mtp_by_default_and_honours_no_mtp(self) -> None:
+        """MTP is resolved in preflight, so the CLI only has to not forbid it."""
+
+        captured = {}
+
+        def _deploy(config):  # type: ignore[no-untyped-def]
+            captured.setdefault("configs", []).append(config)
+            return [
+                OperationCompleteEvent(
+                    operation=OperationType.DEPLOY,
+                    success=True,
+                    exit_code=0,
+                )
+            ]
+
+        orch = SimpleNamespace(deploy=_deploy)
+        base = [
+            "deploy",
+            "--backend",
+            "llamacpp",
+            "--repo-id",
+            "org/Model-GGUF",
+            "--quant",
+            "Q4_K_M",
+        ]
+        with (
+            patch("llm_launchpad.cli.main._preflight", return_value=(orch, "alice")),
+            patch("llm_launchpad.cli.main._print_banner", return_value=None),
+        ):
+            default = self.runner.invoke(cli_main.app, base)
+            declined = self.runner.invoke(cli_main.app, [*base, "--no-mtp"])
+
+        self.assertEqual(default.exit_code, 0, default.output)
+        self.assertEqual(declined.exit_code, 0, declined.output)
+        self.assertTrue(captured["configs"][0].allow_speculative_decoding)
+        self.assertFalse(captured["configs"][1].allow_speculative_decoding)
+
     def test_deploy_prime_llamacpp_requires_repo_id(self) -> None:
         orch = SimpleNamespace(deploy=lambda _config: [])
         with (
@@ -442,16 +454,17 @@ class CliMainCommandTests(unittest.TestCase):
             _tail_logs: bool,
             app_name: str | None = None,
             served_model_name: str | None = None,
+            phase_timer: object = None,
         ):
             warmup_calls.append(url)
-            return []
+            return [OperationCompleteEvent(operation=OperationType.WARMUP, success=True)]
 
         orch = SimpleNamespace(deploy=_deploy, warmup=_warmup)
         with patch("llm_launchpad.cli.main._preflight", return_value=(orch, "alice")):
             with patch("llm_launchpad.cli.main._print_banner", return_value=None):
                 result = self.runner.invoke(
                     cli_main.app,
-                    ["deploy", "--backend", "vllm", "--app-name", "vllm-test", "--do-warmup"],
+                    ["deploy", "--backend", "vllm", "--model-name", "Qwen/Qwen3-8B", "--app-name", "vllm-test", "--do-warmup"],
                 )
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(
@@ -473,7 +486,7 @@ class CliMainCommandTests(unittest.TestCase):
         ):
             result = self.runner.invoke(
                 cli_main.app,
-                ["deploy", "--backend", "vllm", "--app-name", "vllm-test"],
+                ["deploy", "--backend", "vllm", "--model-name", "Qwen/Qwen3-8B", "--app-name", "vllm-test"],
             )
         self.assertEqual(result.exit_code, 0)
         sync_mock.assert_called_once()
@@ -587,16 +600,17 @@ class CliMainCommandTests(unittest.TestCase):
             _tail_logs: bool,
             app_name: str | None = None,
             served_model_name: str | None = None,
+            phase_timer: object = None,
         ):
             warmup_calls.append(url)
-            return []
+            return [OperationCompleteEvent(operation=OperationType.WARMUP, success=True)]
 
         orch = SimpleNamespace(deploy=_deploy, warmup=_warmup)
         with patch("llm_launchpad.cli.main._preflight", return_value=(orch, "alice")):
             with patch("llm_launchpad.cli.main._print_banner", return_value=None):
                 result = self.runner.invoke(
                     cli_main.app,
-                    ["deploy", "--backend", "llamacpp", "--app-name", "llamacpp-test", "--do-warmup"],
+                    ["deploy", "--backend", "llamacpp", "--repo-id", "org/model", "--app-name", "llamacpp-test", "--do-warmup"],
                 )
         self.assertEqual(result.exit_code, 0)
         self.assertEqual(
@@ -660,6 +674,7 @@ class CliMainCommandTests(unittest.TestCase):
             tail_logs: bool,
             app_name: str | None = None,
             served_model_name: str | None = None,
+            phase_timer: object = None,
         ):
             calls.append((backend, url, timeout, tail_logs, app_name))
             return []
@@ -753,6 +768,8 @@ class CliMainCommandTests(unittest.TestCase):
                         "deploy",
                         "--backend",
                         "vllm",
+                        "--model-name",
+                        "Qwen/Qwen3-8B",
                         "--app-name",
                         "vllm-test",
                         "--do-warmup",
@@ -1190,7 +1207,7 @@ class CliMainCommandTests(unittest.TestCase):
                 return_value=(ComputeProvider.MODAL, ComputeProvider.PRIME),
             ),
             patch("llm_launchpad.cli.main.ModalBackend.list_apps", return_value=None),
-            patch("llm_launchpad.cli.main.PrimeBackend") as prime_mock,
+            patch("llm_launchpad.core.prime_backend.PrimeBackend") as prime_mock,
             patch(
                 "llm_launchpad.cli.main.merge_connections",
                 side_effect=lambda rows, **_kwargs: rows,

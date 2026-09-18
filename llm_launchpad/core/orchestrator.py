@@ -12,6 +12,7 @@ from ..protocol.models import VisionCapabilities
 
 from .shutdown import is_shutting_down, shutdown_event
 
+
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 import json
@@ -37,9 +38,10 @@ from ..protocol.events import (
     ErrorEvent,
     LogEvent,
     OperationCompleteEvent,
+    ResourceAllocatedEvent,
     StateChangeEvent,
 )
-from ..protocol.models import DeploymentConfig, EndpointInfo
+from ..protocol.models import DeploymentConfig, EndpointInfo, SpeculativeDecodingConfig
 from ..protocol.models import BenchmarkConcurrencyResult, BenchmarkConfig
 from ..protocol.models import PlacementAssessment, ServingRequirements, StoredModelInfo, StorageSnapshot
 
@@ -56,6 +58,8 @@ from .benchmark import (
 )
 from .backend import ModalBackend
 from .config import ConfigStore
+from .deploy_log_summary import format_elapsed
+from .deployment_states import is_terminal_deployment_state
 from .diagnostics import log_exception
 from .operation_events import fail_operation
 from .gguf_metadata import GgufMtpStatus
@@ -63,6 +67,7 @@ from .hf_models import fetch_gguf_quant_metadata
 from .modal_auth import get_modal_auth_status
 from .llamacpp_planner import compile_server_args_string, tuning_for_objective, tuning_for_architecture
 from .naming import legacy_app_name
+from .naming import utility_app_name
 from .naming import default_llamacpp_served_model_name
 from .naming import random_function_slug
 from .paths import MODAL_LLAMACPP_SCRIPT, MODAL_VLLM_SCRIPT
@@ -76,16 +81,28 @@ from .provider_options import prime_provider_options
 from .vast_deployment import VastDeploymentBackend
 from .reasoning_profiles import discover_selected_model_reasoning
 from .runtime_support import (
+    DEFAULT_MTP_DRAFT_TOKENS,
     RuntimeCompatibility,
     RuntimeCompatibilityDecision,
     evaluate_llamacpp_architecture,
     evaluate_llamacpp_mtp,
     load_llamacpp_support_manifest,
 )
-from .warmup import WarmupRunner
+from .warmup import StartupPhaseTimer, WarmupRunner
 from .warmup import modal_gpu_scheduling_hint as _modal_gpu_scheduling_hint
 from .warmup import probe_response_is_ready as _probe_response_is_ready
 from .warmup import status_probe_url as _status_probe_url
+
+# A wait this long with one log line reads as a hang. Vast already reports at
+# this cadence while a host provisions; Prime downloads are just as slow and
+# just as silent.
+_PRIME_PROGRESS_REPORT_SECONDS = 30.0
+
+
+# Defined where the summary mapper reads it back, so the two spellings of a
+# heartbeat duration cannot drift apart.
+_format_elapsed = format_elapsed
+
 
 # Type alias for event generators
 EventStream = Generator[BaseEvent, None, None]
@@ -103,6 +120,16 @@ def _configured_llamacpp_image(config: DeploymentConfig) -> str:
     return (
         os.environ.get("LLAMA_CPP_IMAGE_REF", "").strip()
         or load_llamacpp_support_manifest(config.gguf_architecture).image_ref
+    )
+
+
+def _has_mtp_args(server_args: str | None) -> bool:
+    """Report whether these server args already carry MTP flags."""
+
+    return any(
+        token in {"--spec-type", "--spec-draft-n-max"}
+        or token.startswith(("--spec-type=", "--spec-draft-n-max="))
+        for token in shlex.split(server_args or "")
     )
 
 
@@ -164,8 +191,7 @@ def _prime_endpoint_info(
 
 def _is_historical_modal_app_state(state: str) -> bool:
     """Return True for terminal/inactive Modal app rows that commonly accumulate."""
-    normalized = (state or "").strip().lower()
-    return normalized in {"stopped", "stopping", "terminated", "archived"}
+    return is_terminal_deployment_state(state)
 
 
 def _dedupe_launchpad_apps(rows: list[EndpointInfo]) -> list[EndpointInfo]:
@@ -213,6 +239,67 @@ def _prime_launch_requirement_error(config: DeploymentConfig) -> str | None:
     if config.backend == BackendType.LLAMACPP and (config.revision or "").strip():
         return "Prime llama.cpp currently supports only the default Hugging Face revision."
     return None
+
+
+def _prime_pod_disk_ids(pod: object) -> list[str]:
+    """Extract attached disk ids from a Prime pod payload, best-effort."""
+    if not isinstance(pod, dict):
+        return []
+    candidates: list[object] = []
+    for key in ("disks", "diskIds", "disk_ids", "diskId", "disk_id"):
+        value = pod.get(key)
+        if isinstance(value, list):
+            candidates.extend(value)
+        elif isinstance(value, str) and value.strip():
+            candidates.append(value)
+        elif isinstance(value, dict):
+            nested = value.get("id") or value.get("diskId")
+            if isinstance(nested, str) and nested.strip():
+                candidates.append(nested)
+    ids: list[str] = []
+    for item in candidates:
+        if isinstance(item, dict):
+            text = str(item.get("id") or item.get("diskId") or "").strip()
+        else:
+            text = str(item or "").strip()
+        if text and text not in ids:
+            ids.append(text)
+    return ids
+
+
+def _retained_prime_disks(attached_disk_id: str | None = None) -> list[str]:
+    """Describe the cache disks a stop leaves behind, deployment-first.
+
+    When the attached disk is known, it is named first so the result answers
+    "what did stopping *this* deployment leave behind" instead of listing
+    unrelated account disks as if they belonged to it.
+    """
+    try:
+        from .prime_disks import load_stored_prime_disks
+
+        disks = load_stored_prime_disks()
+    except Exception:
+        # Reporting is never a reason to fail a teardown.
+        return []
+    wanted = (attached_disk_id or "").strip()
+    ordered = sorted(disks, key=lambda disk: (disk.id != wanted, disk.id))
+    lines = []
+    for disk in ordered:
+        text = " · ".join(
+            part for part in (
+                disk.id,
+                f"{disk.size_gb} GB" if disk.size_gb else "",
+                disk.data_center or disk.region or disk.country,
+            ) if part
+        )
+        suffix = "; it keeps billing until deleted with llm-launchpad prime-disks delete"
+        if wanted and disk.id == wanted:
+            lines.append(f"{text} (attached to this deployment){suffix}")
+        elif wanted:
+            lines.append(f"{text} (other account disk){suffix}")
+        else:
+            lines.append(f"{text}{suffix}")
+    return lines
 
 
 class Orchestrator:
@@ -281,6 +368,15 @@ class Orchestrator:
 
     def deploy(self, config: DeploymentConfig) -> EventStream:
         """Run a full deploy workflow (optional preload + deploy + warmup)."""
+        from .deployment_preflight import preflight_config
+
+        preflight = preflight_config(config)
+        blocking = [finding for finding in preflight.findings if finding.blocking]
+        if blocking:
+            yield from fail_operation(
+                OperationType.DEPLOY, blocking[0].message, exit_code=2, recoverable=False
+            )
+            return
         try:
             config.reasoning = discover_selected_model_reasoning(config)
         except Exception as exc:
@@ -409,12 +505,21 @@ class Orchestrator:
                 "Use manual Deploy, or select text-only mode.", exit_code=2,
             )
             return
+        # Provider-specific execution lives behind ProviderAdapter; this
+        # method owns only shared preparation (preflight, reasoning, tuning,
+        # vision) that applies before any provider allocates compute.
         if config.provider == ComputeProvider.PRIME:
-            yield from self._deploy_prime(config)
+            yield from self.deploy_prime_only(config)
             return
         if config.provider == ComputeProvider.VAST:
-            yield from self.vast_backend.deploy(config)
+            from .provider_adapters import provider_adapter
+
+            yield from provider_adapter(ComputeProvider.VAST).deploy(config)
             return
+        yield from self.deploy_modal_only(config)
+
+    def deploy_modal_only(self, config: DeploymentConfig) -> EventStream:
+        """Execute the Modal-specific deploy step (adapter entrypoint)."""
         if config.do_deploy and config.backend != BackendType.VLLM and not config.function_slug:
             config.function_slug = random_function_slug()
         settings = self.config_store.load()
@@ -424,6 +529,10 @@ class Orchestrator:
             yield from self._deploy_vllm(config, env)
         else:
             yield from self._deploy_llamacpp(config, env)
+
+    def deploy_prime_only(self, config: DeploymentConfig) -> EventStream:
+        """Execute the Prime-specific deploy step (adapter entrypoint)."""
+        yield from self._deploy_prime(config)
 
     def _llamacpp_compatibility(
         self,
@@ -456,19 +565,52 @@ class Orchestrator:
         self,
         config: DeploymentConfig,
     ) -> EventStream:
-        """Revalidate and render a Fast Deploy speculative-decoding request."""
+        """Resolve speculative decoding from model evidence and render it.
+
+        MTP is the default for every llama.cpp deployment, not a Fast Deploy
+        extra: a caller that names no configuration still gets one when the
+        target GGUF carries NextN heads and the pinned runtime advertises the
+        architecture. Only ``allow_speculative_decoding=False`` suppresses it.
+
+        Evidence is re-read here even when the catalog already recommended a
+        configuration, because the catalog snapshot can predate both the model
+        revision and the runtime pin.
+        """
 
         requested = config.speculative_decoding
-        if requested is None:
+        if requested is None and _has_mtp_args(config.server_args):
+            # The caller wrote its own MTP flags. Replacing them with the
+            # managed default would overwrite a deliberate choice, so this
+            # config is left exactly as it arrived.
             return
         config.server_args = _without_managed_mtp_args(config.server_args)
-        if requested.method != SpeculativeDecodingMethod.MTP:
+        if not config.allow_speculative_decoding:
+            config.speculative_decoding = None
+            return
+        if not (config.repo_id or "").strip():
+            # Presets carry no repository to inspect, so there is no evidence
+            # to resolve and nothing to warn about.
+            config.speculative_decoding = None
+            return
+        if requested is not None and requested.method != SpeculativeDecodingMethod.MTP:
             config.speculative_decoding = None
             yield LogEvent(
                 line="Speculative decoding disabled: unsupported method requested.",
                 operation=OperationType.DEPLOY,
             )
             return
+        if requested is None and config.placement_assessment is not None:
+            # A certified placement budgeted memory for exactly the configuration
+            # it was assessed against. Turning MTP on here would add a
+            # speculative buffer that certificate never counted, so a certified
+            # plan keeps the catalog as the only place MTP is decided.
+            config.speculative_decoding = None
+            return
+        draft_tokens = (
+            requested.num_speculative_tokens
+            if requested is not None
+            else DEFAULT_MTP_DRAFT_TOKENS
+        )
 
         try:
             metadata = fetch_gguf_quant_metadata(
@@ -501,20 +643,35 @@ class Orchestrator:
 
         if decision is None or not decision.is_supported or layers is None:
             config.speculative_decoding = None
-            yield LogEvent(
-                line=(
-                    f"MTP preflight warning: {detail} Disabling MTP and continuing "
-                    "with normal decoding."
-                ),
-                operation=OperationType.DEPLOY,
-            )
+            if requested is not None or decision is None:
+                # An explicit request that cannot be honoured, and a probe that
+                # could not reach a verdict, both change what the caller gets.
+                yield LogEvent(
+                    line=(
+                        f"MTP preflight warning: {detail} Disabling MTP and continuing "
+                        "with normal decoding."
+                    ),
+                    operation=OperationType.DEPLOY,
+                )
+            else:
+                # Most models carry no MTP heads. Reporting that as a warning
+                # every time would train the reader to ignore the real ones.
+                yield LogEvent(
+                    line=f"MTP preflight: {detail} Using normal decoding.",
+                    operation=OperationType.DEPLOY,
+                )
             return
 
         config.gguf_architecture = decision.architecture
         config.llamacpp_runtime_id = decision.runtime_id
-        config.speculative_decoding = replace(
-            requested,
-            nextn_predict_layers=layers,
+        config.speculative_decoding = (
+            replace(requested, nextn_predict_layers=layers)
+            if requested is not None
+            else SpeculativeDecodingConfig(
+                method=SpeculativeDecodingMethod.MTP,
+                num_speculative_tokens=draft_tokens,
+                nextn_predict_layers=layers,
+            )
         )
         arguments = shlex.split(config.server_args or "")
         arguments.extend(
@@ -522,14 +679,14 @@ class Orchestrator:
                 "--spec-type",
                 "draft-mtp",
                 "--spec-draft-n-max",
-                str(requested.num_speculative_tokens),
+                str(draft_tokens),
             ]
         )
         config.server_args = shlex.join(arguments)
         yield LogEvent(
             line=(
                 "MTP preflight: enabled native draft-mtp with up to "
-                f"{requested.num_speculative_tokens} draft tokens."
+                f"{draft_tokens} draft tokens."
             ),
             operation=OperationType.DEPLOY,
             is_milestone=True,
@@ -539,7 +696,13 @@ class Orchestrator:
         self, pod_id: str, created: dict[str, Any]
     ) -> Generator[BaseEvent, None, dict[str, Any]]:
         """Poll until the Prime pod reports ACTIVE with SSH reachable."""
-        deadline = time.monotonic() + 1800
+        # Same shape as the runtime wait below: state lines are emitted only
+        # when the state text changes, and a pod can sit in one state for many
+        # minutes. Reported on an interval so the silence cannot be mistaken
+        # for a stall.
+        waiting_started = time.monotonic()
+        deadline = waiting_started + 1800
+        reported_at = waiting_started
         last_state = ""
         pod = created
         while time.monotonic() < deadline:
@@ -557,6 +720,7 @@ class Orchestrator:
                     is_milestone=True,
                 )
                 last_state = state_detail
+                reported_at = time.monotonic()
             if state in {"ERROR", "TERMINATED"} or install == "FAILED":
                 failure = str(pod.get("installationFailure") or state_detail)
                 raise PrimeApiError(f"Prime pod provisioning failed: {failure}")
@@ -567,6 +731,17 @@ class Orchestrator:
                 and ssh_ready
             ):
                 break
+            if (
+                last_state
+                and time.monotonic() - reported_at >= _PRIME_PROGRESS_REPORT_SECONDS
+            ):
+                reported_at = time.monotonic()
+                elapsed = _format_elapsed(time.monotonic() - waiting_started)
+                yield LogEvent(
+                    line=f"Prime pod state: {last_state} (waiting {elapsed})",
+                    operation=OperationType.DEPLOY,
+                    is_milestone=True,
+                )
             if shutdown_event().wait(timeout=5):
                 raise PrimeApiError("Prime deployment cancelled during provisioning.")
         else:
@@ -639,7 +814,15 @@ class Orchestrator:
         runtime_ready = False
         last_runtime_detail = ""
         last_tunnel_detail = ""
-        wait_deadline = time.monotonic() + 1800
+        # Lines are only emitted when the detail text changes, and the detail
+        # for a model download is a constant string whenever the pod cannot
+        # report an expected size. A 109 GB download then produced exactly one
+        # log line and minutes of silence, which reads as a hang on a screen
+        # that is billing by the hour. Vast already reports every 30s while it
+        # waits; this does the same for Prime.
+        waiting_started = time.monotonic()
+        reported_at = waiting_started
+        wait_deadline = waiting_started + 1800
         while time.monotonic() < wait_deadline:
             if not runtime_ready:
                 ready, failed, detail = self.prime_backend.bootstrap_runtime_status(pod)
@@ -650,6 +833,7 @@ class Orchestrator:
                         is_milestone=True,
                     )
                     last_runtime_detail = detail
+                    reported_at = time.monotonic()
                 if failed:
                     raise PrimeApiError(f"Prime runtime bootstrap failed: {detail}")
                 if ready:
@@ -682,6 +866,18 @@ class Orchestrator:
                     )
             if runtime_ready and tunnel_ready:
                 break
+            if (
+                not runtime_ready
+                and last_runtime_detail
+                and time.monotonic() - reported_at >= _PRIME_PROGRESS_REPORT_SECONDS
+            ):
+                reported_at = time.monotonic()
+                elapsed = _format_elapsed(time.monotonic() - waiting_started)
+                yield LogEvent(
+                    line=f"Prime runtime: {last_runtime_detail} (waiting {elapsed})",
+                    operation=OperationType.DEPLOY,
+                    is_milestone=True,
+                )
             if shutdown_event().wait(timeout=5):
                 raise PrimeApiError("Prime deployment cancelled during runtime startup.")
         else:
@@ -717,8 +913,15 @@ class Orchestrator:
 
     def _cleanup_failed_prime_pod(
         self, pod_id: str, options: Any, message: str
-    ) -> Generator[BaseEvent, None, str]:
-        """Drain the failed pod's logs and release it, returning the final message."""
+    ) -> Generator[BaseEvent, None, tuple[str, dict[str, object] | None]]:
+        """Drain the failed pod's logs and release it.
+
+        Returns (final message, rollback report). The rollback report lets the
+        lifecycle decide retry eligibility without mutating caller state: a
+        confirmed rollback allows the next approved placement, anything else
+        blocks it to avoid double-billing.
+        """
+        rollback: dict[str, object] | None = None
         if pod_id:
             try:
                 for line in self.prime_backend.get_pod_logs(pod_id):
@@ -731,6 +934,7 @@ class Orchestrator:
                     operation=OperationType.DEPLOY,
                     is_milestone=True,
                 )
+                rollback = {"attempted": False, "confirmed": False, "detail": "kept for inspection"}
             else:
                 try:
                     self.prime_backend.delete_pod(pod_id)
@@ -739,14 +943,26 @@ class Orchestrator:
                         operation=OperationType.DEPLOY,
                         is_milestone=True,
                     )
+                    rollback = {"attempted": True, "confirmed": True, "detail": ""}
                 except Exception as cleanup_exc:
                     message = f"{message} Cleanup also failed: {cleanup_exc}"
-        return message
+                    rollback = {"attempted": True, "confirmed": False, "detail": str(cleanup_exc)}
+        return message, rollback
 
     def _deploy_prime(self, config: DeploymentConfig) -> EventStream:
         """Provision a Prime pod and resolve its public inference endpoint."""
         options = prime_provider_options(config)
         requirement_error = _prime_launch_requirement_error(config)
+        if requirement_error is None:
+            # The authoritative preflight owns these messages; the local check
+            # stays as a backstop so direct orchestrator callers keep the same
+            # wording when they bypass the gate.
+            from .deployment_preflight import preflight_config
+
+            findings = preflight_config(config).findings
+            blocking = [finding for finding in findings if finding.blocking]
+            if blocking:
+                requirement_error = blocking[0].message
         if requirement_error:
             yield from fail_operation(
                 OperationType.DEPLOY, requirement_error, exit_code=2, recoverable=False
@@ -802,6 +1018,7 @@ class Orchestrator:
             pod_id = str(created.get("id") or "").strip()
             if not pod_id:
                 raise PrimeApiError("Prime did not return a pod ID.")
+            yield ResourceAllocatedEvent(app_id=pod_id)
             yield LogEvent(
                 line=f"Prime pod created: {pod_id}",
                 operation=OperationType.DEPLOY,
@@ -841,10 +1058,13 @@ class Orchestrator:
                 data=info,
             )
         except Exception as exc:
-            message = yield from self._cleanup_failed_prime_pod(
+            message, rollback = yield from self._cleanup_failed_prime_pod(
                 pod_id, options, str(exc)
             )
-            yield from fail_operation(OperationType.DEPLOY, message)
+            yield from fail_operation(
+                OperationType.DEPLOY, message,
+                data={"rollback": rollback} if rollback is not None else None,
+            )
 
     def _deploy_vllm(
         self, config: DeploymentConfig, env: dict[str, str]
@@ -992,6 +1212,8 @@ class Orchestrator:
         placement_assessment: PlacementAssessment | None = None,
         runtime_id: str | None = None,
         vision: VisionCapabilities | None = None,
+        phase_timer: StartupPhaseTimer | None = None,
+        price_per_hour_usd: float | None = None,
     ) -> EventStream:
         """Probe endpoint readiness and optionally tail logs."""
         if vision is None and app_name:
@@ -1015,6 +1237,8 @@ class Orchestrator:
             serving_requirements=serving_requirements,
             placement_assessment=placement_assessment,
             runtime_id=runtime_id,
+            phase_timer=phase_timer,
+            price_per_hour_usd=price_per_hour_usd,
         ):
             if (
                 isinstance(event, OperationCompleteEvent)
@@ -1399,8 +1623,6 @@ class Orchestrator:
                     exit_code=exit_code,
                     success=success,
                     detail=detail,
-                    json_export_path=str(json_path) if json_path.exists() else None,
-                    csv_export_path=str(csv_path) if csv_path.exists() else None,
                     metrics=metrics,
                 )
             )
@@ -1594,6 +1816,10 @@ class Orchestrator:
                 args.extend(["--revision", revision])
 
         cmd = ModalBackend.build_modal_entrypoint_command(script, entrypoint, args)
+        # `modal run` creates an app for the duration of the call. Without a
+        # name it takes the script default, which is the legacy app name, and
+        # the fleet then shows a stopped endpoint the user never deployed.
+        env = {"MODAL_APP_NAME": utility_app_name(backend)}
         yield StateChangeEvent(
             current=DeploymentState.RUNNING,
             operation=OperationType.STORAGE_PREDOWNLOAD,
@@ -1604,7 +1830,7 @@ class Orchestrator:
             operation=OperationType.STORAGE_PREDOWNLOAD,
         )
 
-        for event in ModalBackend.run_modal_script_entrypoint(script, entrypoint, args=args):
+        for event in ModalBackend.run_modal_script_entrypoint(script, entrypoint, args=args, env=env):
             if isinstance(event, OperationCompleteEvent):
                 yield OperationCompleteEvent(
                     operation=OperationType.STORAGE_PREDOWNLOAD,
@@ -1695,6 +1921,7 @@ class Orchestrator:
         captured = ModalBackend.run_modal_script_entrypoint_capture(
             MODAL_LLAMACPP_SCRIPT,
             "list_downloaded_models_json",
+            env={"MODAL_APP_NAME": utility_app_name(BackendType.LLAMACPP)},
         )
         if not captured:
             return None
@@ -2048,14 +2275,25 @@ class Orchestrator:
         app_id: str | None = None,
         provider: ComputeProvider = ComputeProvider.MODAL,
     ) -> EventStream:
-        """Stop a deployed app."""
+        """Stop a deployed app via its provider adapter.
+
+        Compute and storage are separate: Modal keeps its shared cache, Prime
+        keeps its persistent disk (still billable), and Vast destroys its
+        rental disk. The result names the consequence so `stop` never reads
+        as "spend has stopped" when a disk keeps billing. Provider-specific
+        teardown lives in :mod:`provider_adapters`; this is a facade that
+        preserves the public event stream.
+        """
         if provider == ComputeProvider.VAST:
             try:
                 self.vast_backend.destroy(name=app_name, instance_id=app_id)
             except Exception as exc:
-                yield from fail_operation(OperationType.STOP, str(exc))
+                yield from fail_operation(OperationType.STOP, str(exc) or "Stop did not confirm.")
                 return
-            yield LogEvent(line="Vast rental and disk destroyed.", operation=OperationType.STOP)
+            yield LogEvent(
+                line="Vast rental and disk destroyed. Rental disk and cached models are deleted; nothing remains billable.",
+                operation=OperationType.STOP,
+            )
             yield OperationCompleteEvent(operation=OperationType.STOP, success=True)
             return
         if provider == ComputeProvider.PRIME:
@@ -2064,6 +2302,13 @@ class Orchestrator:
                 message = "Prime termination requires a pod ID."
                 yield from fail_operation(OperationType.STOP, message, exit_code=2)
                 return
+            attached_disk_id: str | None = None
+            try:
+                pod = self.prime_backend.get_pod(pod_id)
+                disk_ids = _prime_pod_disk_ids(pod)
+                attached_disk_id = disk_ids[0] if disk_ids else None
+            except Exception:
+                attached_disk_id = None
             yield StateChangeEvent(
                 current=DeploymentState.RUNNING,
                 operation=OperationType.STOP,
@@ -2072,12 +2317,19 @@ class Orchestrator:
             try:
                 self.prime_backend.delete_pod(pod_id)
             except Exception as exc:
-                yield from fail_operation(OperationType.STOP, str(exc))
+                yield from fail_operation(OperationType.STOP, str(exc) or "Stop did not confirm.")
                 return
             yield LogEvent(
                 line=f"Terminated Prime pod: {pod_id}",
                 operation=OperationType.STOP,
             )
+            # The pod is the only thing this deletes. The cache disk it had
+            # attached is deliberately kept so the next deploy does not
+            # re-download the weights -- but it goes on billing with no pod to
+            # show for it. Name this deployment's disk first so unrelated
+            # account disks are not mistaken for its leftovers.
+            for disk in _retained_prime_disks(attached_disk_id):
+                yield LogEvent(line=f"Kept Prime cache disk {disk}", operation=OperationType.STOP)
             yield StateChangeEvent(
                 current=DeploymentState.STOPPED,
                 operation=OperationType.STOP,
@@ -2095,6 +2347,13 @@ class Orchestrator:
             line=f"Stopping app: {target_app_name}",
             operation=OperationType.STOP,
         )
+        yield LogEvent(
+            line="Shared Modal volume/cache remains for faster redeploys; delete cached weights from the Storage screen when unneeded.",
+            operation=OperationType.STOP,
+        )
+        # Modal teardown streams here so CLI/TUI keep live CLI output; the
+        # Modal adapter interprets the same command for non-streaming
+        # callers (see provider_adapters._ModalAdapter.stop).
         yield from _tag_operation(
             ModalBackend.run_streaming(cmd),
             OperationType.STOP,

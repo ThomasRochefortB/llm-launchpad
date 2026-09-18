@@ -14,8 +14,9 @@ from textual.widgets import Button, Input, Select, Static, Switch
 
 from ...core.compute_availability import display_gpu_type
 from ...core.inference_options import (
+    COST_SCENARIO_WORKDAY,
     continuous_monthly_compute_cost,
-    workload_basis_label,
+    evaluate_quote_cost,
 )
 from ...core.quick_deploy import (
     QuickDeployProfile,
@@ -39,6 +40,7 @@ from ...protocol.enums import (
     ServingObjective,
 )
 from ...protocol.models import DeploymentConfig, InferencePlan
+from ..navigation import move_focus_with_arrows
 from ..widgets.input_form import FormField, ToggleField
 from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
@@ -66,18 +68,27 @@ def _summary_row(label: str, value: str) -> str:
     return f"[bold]{label}[/bold]{' ' * (_SUMMARY_LABEL_WIDTH - len(label))}{value}"
 
 
-def _render_profile_summary(profile: QuickDeployProfile, plan: InferencePlan) -> str:
-    lines = [
-        _render_profile_label(profile, accent="bold #7bf168"),
-        f"[dim]{escape(profile.summary)}[/dim]",
-        "",
-    ]
-    # The tier label describes the shape the catalog chose for this profile, but
-    # step 2 lets the user pick any certified placement. Showing the catalog's
-    # label against someone else's choice reads as nonsense -- "Slow but cheap"
-    # on the B200 they deliberately selected -- so it is shown only when the
-    # placement is the one the tier actually describes. Everything it conveyed
-    # is stated exactly by the GPU, hourly and throughput rows below.
+def _render_decision_facts(profile: QuickDeployProfile, plan: InferencePlan) -> str:
+    """Five facts for the deploy decision: model, compute, context, cost, availability.
+
+    Rendered outside the scroll container so it stays on screen; the card
+    below carries the technical evidence and monthly assumptions.
+    """
+    return (
+        f"[bold]{escape(profile.display_name)}[/bold]"
+        f"{f' ({escape(profile.quant)})' if profile.quant else ''} · "
+        f"{escape(plan.quote.provider.display_name)} · "
+        f"{escape(display_gpu_type(plan.quote.gpu_type))} x{plan.quote.gpu_count}\n"
+        f"[dim]Context[/dim] {escape(format_context_length(profile.max_context_tokens))} · "
+        f"[bold]{escape(_plan_hourly_cost(plan))}[/bold] · "
+        f"{escape(_billing_label(plan.quote.billing_model))}\n"
+        f"[dim]Availability[/dim] {escape(_availability_label(plan))}"
+    )
+
+
+def _render_profile_details(profile: QuickDeployProfile, plan: InferencePlan) -> str:
+    """Technical evidence and cost assumptions behind the decision facts."""
+    lines = [f"[dim]{escape(profile.summary)}[/dim]", ""]
     if profile.resource_tier_label and placement_matches_profile(profile, plan):
         tier_detail = profile.resource_tier_label
         if profile.profile_label and profile.profile_label != profile.resource_tier_label:
@@ -85,24 +96,14 @@ def _render_profile_summary(profile: QuickDeployProfile, plan: InferencePlan) ->
         lines.append(_summary_row("Tier", escape(tier_detail)))
     lines.extend(
         [
-            _summary_row("Provider", escape(plan.quote.provider.display_name)),
-            _summary_row("Billing", escape(_billing_label(plan.quote.billing_model))),
             _summary_row("Backend", escape(plan.recipe.backend.display_name)),
-            _summary_row("GPU", f"{escape(display_gpu_type(plan.quote.gpu_type))} x{plan.quote.gpu_count}"),
         ]
     )
     if plan.quote.region:
         lines.append(_summary_row("Region", escape(plan.quote.region)))
-    lines.append(
-        _summary_row("Availability", escape(_availability_label(plan)))
-    )
     reference = (plan.quote.provider_reference or "").strip()
     if reference and _show_placement_reference(reference, plan.quote.gpu_type):
-        lines.append(
-            _summary_row("Placement", escape(reference))
-        )
-    if profile.quant:
-        lines.insert(-1, _summary_row("Quant", escape(profile.quant)))
+        lines.append(_summary_row("Placement", escape(reference)))
     required_memory = (
         plan.assessment.memory.total_gb
         if plan.assessment is not None
@@ -150,28 +151,22 @@ def _render_profile_summary(profile: QuickDeployProfile, plan: InferencePlan) ->
         )
     lines.extend(
         [
-            _summary_row("Context", f"Full {escape(format_context_length(profile.max_context_tokens))}"),
-            _summary_row("Hourly", escape(_plan_hourly_cost(plan))),
-            _summary_row("Monthly", escape(_plan_monthly_cost(plan))),
-        ]
-    )
-    # A provisioned rental keeps billing until it is stopped, which the
-    # fulfillment note below says in words. Stating only the windowed estimate
-    # left the two contradicting each other, with the larger number missing.
-    if plan.quote.billing_model != BillingModel.SCALE_TO_ZERO:
-        lines.append(
-            _summary_row("If left up", escape(_plan_continuous_monthly_cost(plan)))
-        )
-    lines.extend(
-        [
+            _summary_row("If left up", escape(_plan_continuous_monthly_cost(plan))),
+            _summary_row("Scenario", escape(_plan_scenario_cost(plan))),
             _summary_row("Model", escape(plan.recipe.model_id)),
             _summary_row("Default slug", escape(instance_slug_for_plan(profile, plan))),
             "",
-            f"[dim]{escape(workload_basis_label())}[/dim]",
+            f"[dim]{escape(_plan_cost_basis_label(plan))}[/dim]",
+            f"[dim]{escape(_plan_storage_note(plan))}[/dim]",
             "[dim]Availability is revalidated when deployment starts.[/dim]",
         ]
     )
     return "\n".join(lines)
+
+
+def _render_profile_summary(profile: QuickDeployProfile, plan: InferencePlan) -> str:
+    """Backwards-compatible alias: the full card is now _render_profile_details."""
+    return _render_profile_details(profile, plan)
 
 
 def _show_placement_reference(reference: str, gpu_type: str) -> bool:
@@ -195,13 +190,20 @@ def _billing_label(value: BillingModel) -> str:
 
 
 def _availability_label(plan: InferencePlan) -> str:
+    """Capacity wording, kept separate from billing behavior.
+
+    "Live now" means the provider verified capacity for this placement;
+    "On demand" describes scale-to-zero billing, not verified capacity. An
+    unverified scale-to-zero placement says both, so it never reads as
+    guaranteed capacity.
+    """
     if plan.quote.availability == QuoteAvailability.AVAILABLE:
         return "Live now"
     if plan.quote.availability == QuoteAvailability.UNAVAILABLE:
         return "Unavailable"
     if plan.quote.billing_model == BillingModel.SCALE_TO_ZERO:
-        return "On demand"
-    return "Provider reported"
+        return "Not verified · scales to zero"
+    return "Not verified"
 
 
 def _plan_hourly_cost(plan: InferencePlan) -> str:
@@ -209,7 +211,32 @@ def _plan_hourly_cost(plan: InferencePlan) -> str:
     if value is None:
         return "Unavailable"
     prefix = "~" if plan.quote.is_estimate else ""
-    return f"{prefix}${value:.2f}/hr"
+    return f"{prefix}${value:.2f}/hr while billed"
+
+
+def _plan_evaluation(plan: InferencePlan):
+    """Canonical cost assumptions attached to the plan, recomputed on demand."""
+    if plan.cost is not None:
+        return plan.cost
+    return evaluate_quote_cost(plan.quote, COST_SCENARIO_WORKDAY)
+
+
+def _plan_scenario_cost(plan: InferencePlan) -> str:
+    value = _plan_evaluation(plan).estimated_monthly_cost_usd
+    if value is None:
+        return "Unavailable"
+    scenario = _plan_evaluation(plan).scenario
+    return f"~${value:,.2f}/mo '{scenario.display_name}'"
+
+
+def _plan_cost_basis_label(plan: InferencePlan) -> str:
+    return _plan_evaluation(plan).basis_label()
+
+
+def _plan_storage_note(plan: InferencePlan) -> str:
+    if _plan_evaluation(plan).includes_storage:
+        return "Quoted hourly total already includes disk rent."
+    return "Storage is billed separately; unknown storage cost is not $0."
 
 
 def _plan_monthly_cost(plan: InferencePlan) -> str:
@@ -224,6 +251,45 @@ def _plan_continuous_monthly_cost(plan: InferencePlan) -> str:
     if value is None:
         return "Unavailable"
     return f"~${value:,.2f}/mo at 24/7"
+
+
+def _deployment_decision_summary(profile: QuickDeployProfile, plan: InferencePlan) -> str:
+    """Return the few facts needed immediately before committing a deploy."""
+    return (
+        f"[bold]{escape(profile.display_name)}[/bold] · "
+        f"{escape(display_gpu_type(plan.quote.gpu_type))} x{plan.quote.gpu_count} · "
+        f"[bold]{escape(_plan_hourly_cost(plan))}[/bold] · "
+        f"{escape(_billing_label(plan.quote.billing_model))}"
+    )
+
+
+# Enter does not deploy, on purpose. That leaves the keyboard route stated only
+# in the footer -- which the fulfillment dropdown covers while it is open, and
+# which a phone terminal hides behind its on-screen keyboard entirely. So it is
+# said here, and kept short enough to survive a narrow viewport: this line is
+# one row high, so anything that does not fit is simply cut off.
+
+
+def deploy_key_hint(*, narrow: bool, mouse_enabled: bool) -> str:
+    """Name the way out of this screen for the viewport it is being read on.
+
+    When mouse reporting is off -- the default over SSH, so that the terminal
+    keeps its own text selection -- taps never reach the app at all. It cannot
+    report a tap it never receives, so the way to turn them on has to be on
+    screen before one is tried.
+    """
+
+    if narrow:
+        return (
+            "[dim]ctrl+d deploys · ctrl+t enables tap[/dim]"
+            if not mouse_enabled
+            else "[dim]ctrl+d deploys · or tab to Deploy[/dim]"
+        )
+    tail = "" if mouse_enabled else " Taps need ctrl+t."
+    return (
+        "[dim]Press ctrl+d to deploy, or tab to Deploy and press enter."
+        f"{tail}[/dim]"
+    )
 
 
 def _fulfillment_option(plan: InferencePlan, *, recommended: bool = False) -> str:
@@ -281,6 +347,15 @@ class QuickDeployScreen(CopyEnabledScreen):
     BINDINGS = [
         Binding("escape", "pop_screen", "Back", show=True),
         Binding("ctrl+d", "deploy", "Deploy", show=True, priority=True),
+        # Up and down move between the controls. Textual moves focus with tab,
+        # but this form is mostly buttons and selects, and a closed Select
+        # binds "down" to opening itself -- so arrowing down from the
+        # fulfillment select opened the dropdown and then never left it, with
+        # every further press moving inside the overlay. On a phone keyboard,
+        # where tab is a modifier-bar item and the arrows are the obvious way
+        # to move, that made the Deploy button unreachable.
+        Binding("up", "focus_previous_control", "Previous", show=False, priority=True),
+        Binding("down", "focus_next_control", "Next", show=False, priority=True),
     ]
 
     def __init__(
@@ -337,15 +412,18 @@ class QuickDeployScreen(CopyEnabledScreen):
             id="quick-deploy-title",
         )
         yield Static(
-            "Full context, GPU residency, and throughput are verified before publication.",
-            id="quick-deploy-subtitle",
+            _render_decision_facts(self.profile, self.plan),
+            id="quick-deploy-facts",
         )
-        yield Static("")
         with VerticalScroll(id="quick-deploy-layout"):
             with Vertical(id="quick-deploy-profile-card"):
-                yield Static("[bold]Profile Summary[/bold]", id="quick-deploy-profile-title")
+                yield Button(
+                    "Technical details...",
+                    id="toggle-quick-details",
+                    variant="default",
+                )
                 yield Static(
-                    _render_profile_summary(self.profile, self.plan),
+                    _render_profile_details(self.profile, self.plan),
                     id="quick-deploy-profile-body",
                 )
             with Vertical(id="quick-deploy-form"):
@@ -382,7 +460,9 @@ class QuickDeployScreen(CopyEnabledScreen):
                         default=True,
                     )
                     yield Static(
-                        "[dim]Native MTP · drafts up to 3 tokens[/dim]",
+                        "[dim]Native MTP · drafts up to "
+                        f"{self.profile.speculative_decoding.num_speculative_tokens} "
+                        "tokens[/dim]",
                         id="quick-speculative-note",
                     )
                 yield Button("Advanced options...", id="toggle-advanced-quick", variant="default")
@@ -462,20 +542,40 @@ class QuickDeployScreen(CopyEnabledScreen):
                         classes="quick-advanced quick-prime-only",
                     )
         with Vertical(id="quick-deploy-actions"):
-            yield Static("", id="quick-deploy-feedback")
+            yield Static(
+                _deployment_decision_summary(self.profile, self.plan),
+                id="quick-deploy-decision-summary",
+            )
+            # Enter is deliberately not bound to Deploy (see on_mount), which
+            # leaves the keyboard route stated only in the footer -- and the
+            # fulfillment dropdown paints over the footer while it is open,
+            # exactly when someone is looking for how to continue. Say it
+            # here instead, next to the button it refers to.
+            yield Static(self._deploy_key_hint(), id="quick-deploy-feedback")
             yield Button("Deploy", id="quick-deploy-btn", variant="primary")
         yield FittedFooter()
 
     def on_mount(self) -> None:
         for widget in self.query(".quick-advanced"):
             widget.add_class("hidden")
+        self.query_one("#quick-deploy-profile-body", Static).display = False
         self._sync_prime_option_visibility()
         # This screen is reached by pressing enter, and Deploy spends money the
         # moment it fires, so a second enter must not be able to rent a GPU.
-        # Start on the first thing worth reading; ctrl+d and tab still deploy.
-        target = next(iter(self.query("#quick-fulfillment")), None) or next(
-            iter(self.query("#toggle-advanced-quick")), None
-        )
+        # Start on the first interactive control; ctrl+d and tab still deploy.
+        # Deferred past mount: focusing during on_mount races the footer and
+        # surrounding layout, which can steal it back before first paint.
+        self.call_after_refresh(self._focus_initial_control)
+
+    def _focus_initial_control(self) -> None:
+        """Focus the first control after mount settles (see on_mount)."""
+        if self.focused is not None and getattr(self.focused, "id", None) not in {
+            None, "quick-deploy-layout",
+        }:
+            return
+        target = next(iter(self.query("#toggle-quick-details")), None) or next(
+            iter(self.query("#quick-fulfillment")), None
+        ) or next(iter(self.query("#toggle-advanced-quick")), None)
         if target is None:
             target = self.query_one("#quick-deploy-btn", Button)
         # Not scroll_visible: on a short terminal, scrolling the form control
@@ -484,12 +584,30 @@ class QuickDeployScreen(CopyEnabledScreen):
         target.focus(scroll_visible=False)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "toggle-quick-details":
+            body = self.query_one("#quick-deploy-profile-body", Static)
+            body.display = not body.display
+            toggle = self.query_one("#toggle-quick-details", Button)
+            toggle.label = "Hide technical details" if body.display else "Technical details..."
+            return
         if event.button.id == "toggle-advanced-quick":
             for widget in self.query(".quick-advanced"):
                 widget.toggle_class("hidden")
             self._sync_prime_option_visibility()
         elif event.button.id == "quick-deploy-btn":
             self._deploy()
+
+    def _refresh_plan_widgets(self) -> None:
+        """Keep facts, details, sticky summary and caution on the same plan."""
+        self.query_one("#quick-deploy-facts", Static).update(
+            _render_decision_facts(self.profile, self.plan)
+        )
+        self.query_one("#quick-deploy-profile-body", Static).update(
+            _render_profile_details(self.profile, self.plan)
+        )
+        self.query_one("#quick-deploy-decision-summary", Static).update(
+            _deployment_decision_summary(self.profile, self.plan)
+        )
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if not isinstance(event.value, str):
@@ -512,9 +630,7 @@ class QuickDeployScreen(CopyEnabledScreen):
                 selected_quote_id,
                 self._alternative_plans[0],
             )
-            self.query_one("#quick-deploy-profile-body", Static).update(
-                _render_profile_summary(self.profile, self.plan)
-            )
+            self._refresh_plan_widgets()
             try:
                 fulfillment = self.query_one("#quick-fulfillment", Select)
             except Exception:
@@ -538,9 +654,7 @@ class QuickDeployScreen(CopyEnabledScreen):
         if plan is None:
             return
         self.plan = plan
-        self.query_one("#quick-deploy-profile-body", Static).update(
-            _render_profile_summary(self.profile, self.plan)
-        )
+        self._refresh_plan_widgets()
         self._sync_fulfillment_caution()
         self._sync_prime_option_visibility()
 
@@ -564,14 +678,41 @@ class QuickDeployScreen(CopyEnabledScreen):
                 "hidden",
             )
 
+    def _deploy_key_hint(self) -> str:
+        return deploy_key_hint(
+            narrow=self.viewport_profile.narrow,
+            mouse_enabled=bool(getattr(self.app, "mouse_enabled", True)),
+        )
+
+    def refresh_mouse_hints(self) -> None:
+        """Re-render the hint after mouse mode is toggled."""
+
+        for hint in self.query("#quick-deploy-feedback"):
+            hint.update(self._deploy_key_hint())
+
+    def viewport_profile_changed(self, profile, previous) -> None:  # type: ignore[no-untyped-def]
+        """Re-fit the hint when the terminal is resized."""
+
+        super().viewport_profile_changed(profile, previous)
+        self.refresh_mouse_hints()
+
+    def action_focus_next_control(self) -> None:
+        move_focus_with_arrows(self, 1)
+
+    def action_focus_previous_control(self) -> None:
+        move_focus_with_arrows(self, -1)
+
     def action_deploy(self) -> None:
         self._deploy()
 
     def _deploy(self) -> None:
+        # No toggle means the catalog found nothing to offer, which is not the
+        # same as the reader declining. Only an unticked switch is a decline;
+        # anything else leaves preflight free to resolve MTP from the model.
         enable_speculative_decoding = (
             self.query_one("#quick-speculative-decoding", Switch).value
             if self.profile.speculative_decoding is not None
-            else False
+            else True
         )
         instance_name = self.query_one("#quick-instance-name", Input).value
         app_name = self.query_one("#quick-app-name", Input).value

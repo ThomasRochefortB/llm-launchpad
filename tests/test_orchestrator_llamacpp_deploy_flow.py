@@ -8,6 +8,7 @@ from llm_launchpad.core.backend import ModalBackend
 from llm_launchpad.core.gguf_metadata import GgufMtpCapability, GgufMtpStatus
 from llm_launchpad.core.hf_models import GgufQuantMetadata
 from llm_launchpad.core.orchestrator import Orchestrator
+from llm_launchpad.core.runtime_support import DEFAULT_MTP_DRAFT_TOKENS
 from llm_launchpad.core.prime_backend import PrimeBackend
 from llm_launchpad.protocol.enums import (
     BackendType,
@@ -19,7 +20,10 @@ from llm_launchpad.protocol.events import ErrorEvent, LogEvent, OperationComplet
 from llm_launchpad.protocol.models import (
     DeploymentConfig,
     LaunchpadSettings,
+    MemoryEstimate,
+    PlacementAssessment,
     ReasoningCapabilities,
+    RuntimeTuning,
     SpeculativeDecodingConfig,
 )
 
@@ -27,6 +31,25 @@ from llm_launchpad.protocol.models import (
 class _FakeConfigStore:
     def load(self) -> LaunchpadSettings:
         return LaunchpadSettings()
+
+
+def _certified_placement() -> PlacementAssessment:
+    """A plan whose memory was assessed without any speculative buffer."""
+
+    return PlacementAssessment(
+        fingerprint="test-fingerprint",
+        memory=MemoryEstimate(
+            weights_gb=20.0,
+            kv_cache_gb=4.0,
+            compute_gb=2.0,
+            speculative_gb=0.0,
+            reserve_gb=2.0,
+            total_gb=28.0,
+        ),
+        tuning=RuntimeTuning(),
+        fits=True,
+        gpu_resident=True,
+    )
 
 
 class OrchestratorLlamaCppDeployFlowTests(unittest.TestCase):
@@ -112,6 +135,165 @@ class OrchestratorLlamaCppDeployFlowTests(unittest.TestCase):
         self.assertIsNone(config.speculative_decoding)
         self.assertNotIn("--spec-type", config.server_args or "")
         self.assertTrue(any("continuing with normal decoding" in event.line for event in events))
+
+    def test_mtp_is_enabled_without_being_asked_when_the_model_supports_it(self) -> None:
+        """A plain CLI deploy must get MTP; nothing on that path ever requests it."""
+
+        metadata = GgufQuantMetadata(
+            quantizations=["Q4_K_M"],
+            vram_gb_by_quant={"Q4_K_M": 20.0},
+            architecture="qwen35",
+            mtp=GgufMtpCapability(
+                status=GgufMtpStatus.SUPPORTED,
+                nextn_predict_layers=1,
+                source_file="model.gguf",
+            ),
+        )
+        config = DeploymentConfig(
+            backend=BackendType.LLAMACPP,
+            repo_id="unsloth/Qwen3.8-27B-GGUF",
+            quant="Q4_K_M",
+            server_args="--ctx-size 131072",
+        )
+        with patch(
+            "llm_launchpad.core.orchestrator.fetch_gguf_quant_metadata",
+            return_value=metadata,
+        ):
+            events = list(
+                Orchestrator(
+                    config_store=_FakeConfigStore()
+                )._prepare_llamacpp_speculative_decoding(config)
+            )
+
+        assert config.speculative_decoding is not None
+        self.assertEqual(
+            config.speculative_decoding.method, SpeculativeDecodingMethod.MTP
+        )
+        self.assertEqual(config.speculative_decoding.nextn_predict_layers, 1)
+        args = shlex.split(config.server_args or "")
+        self.assertIn("--spec-type", args)
+        self.assertIn("draft-mtp", args)
+        self.assertEqual(
+            args[args.index("--spec-draft-n-max") + 1],
+            str(DEFAULT_MTP_DRAFT_TOKENS),
+        )
+        self.assertTrue(any("enabled native draft-mtp" in event.line for event in events))
+
+    def test_mtp_opt_out_survives_preflight(self) -> None:
+        """Declining MTP must not be re-decided from the model's own evidence."""
+
+        metadata = GgufQuantMetadata(
+            quantizations=["Q4_K_M"],
+            vram_gb_by_quant={"Q4_K_M": 20.0},
+            architecture="qwen35",
+            mtp=GgufMtpCapability(
+                status=GgufMtpStatus.SUPPORTED,
+                nextn_predict_layers=1,
+                source_file="model.gguf",
+            ),
+        )
+        config = DeploymentConfig(
+            backend=BackendType.LLAMACPP,
+            repo_id="unsloth/Qwen3.8-27B-GGUF",
+            quant="Q4_K_M",
+            server_args="--ctx-size 131072",
+            allow_speculative_decoding=False,
+        )
+        with patch(
+            "llm_launchpad.core.orchestrator.fetch_gguf_quant_metadata",
+            return_value=metadata,
+        ) as fetch:
+            events = list(
+                Orchestrator(
+                    config_store=_FakeConfigStore()
+                )._prepare_llamacpp_speculative_decoding(config)
+            )
+
+        fetch.assert_not_called()
+        self.assertIsNone(config.speculative_decoding)
+        self.assertNotIn("--spec-type", config.server_args or "")
+        self.assertEqual(events, [])
+
+    def test_unrequested_mtp_reports_plainly_when_the_model_has_no_heads(self) -> None:
+        """Most models carry no MTP heads; that is not a warning."""
+
+        metadata = GgufQuantMetadata(
+            quantizations=["Q4_K_M"],
+            vram_gb_by_quant={"Q4_K_M": 20.0},
+            architecture="mistral3",
+            mtp=GgufMtpCapability(
+                status=GgufMtpStatus.UNSUPPORTED,
+                nextn_predict_layers=0,
+                source_file="model.gguf",
+            ),
+        )
+        config = DeploymentConfig(
+            backend=BackendType.LLAMACPP,
+            repo_id="unsloth/Dense-Model-GGUF",
+            quant="Q4_K_M",
+            server_args="--ctx-size 131072",
+        )
+        with patch(
+            "llm_launchpad.core.orchestrator.fetch_gguf_quant_metadata",
+            return_value=metadata,
+        ):
+            events = list(
+                Orchestrator(
+                    config_store=_FakeConfigStore()
+                )._prepare_llamacpp_speculative_decoding(config)
+            )
+
+        self.assertIsNone(config.speculative_decoding)
+        self.assertNotIn("--spec-type", config.server_args or "")
+        self.assertTrue(any("Using normal decoding" in event.line for event in events))
+        self.assertFalse(any("warning" in event.line for event in events))
+
+    def test_caller_supplied_spec_args_are_left_alone(self) -> None:
+        """An explicit --spec-type is a deliberate choice, not a default to rewrite."""
+
+        config = DeploymentConfig(
+            backend=BackendType.LLAMACPP,
+            repo_id="unsloth/Qwen3.8-27B-GGUF",
+            quant="Q4_K_M",
+            server_args="--ctx-size 131072 --spec-type draft-mtp --spec-draft-n-max 7",
+        )
+        with patch(
+            "llm_launchpad.core.orchestrator.fetch_gguf_quant_metadata"
+        ) as fetch:
+            events = list(
+                Orchestrator(
+                    config_store=_FakeConfigStore()
+                )._prepare_llamacpp_speculative_decoding(config)
+            )
+
+        fetch.assert_not_called()
+        self.assertEqual(events, [])
+        args = shlex.split(config.server_args or "")
+        self.assertEqual(args[args.index("--spec-draft-n-max") + 1], "7")
+
+    def test_unrequested_mtp_never_invalidates_a_certified_placement(self) -> None:
+        """A certified plan budgeted memory for the configuration it was assessed with."""
+
+        config = DeploymentConfig(
+            backend=BackendType.LLAMACPP,
+            repo_id="unsloth/Qwen3.8-27B-GGUF",
+            quant="Q4_K_M",
+            server_args="--ctx-size 131072",
+            placement_assessment=_certified_placement(),
+        )
+        with patch(
+            "llm_launchpad.core.orchestrator.fetch_gguf_quant_metadata"
+        ) as fetch:
+            events = list(
+                Orchestrator(
+                    config_store=_FakeConfigStore()
+                )._prepare_llamacpp_speculative_decoding(config)
+            )
+
+        fetch.assert_not_called()
+        self.assertIsNone(config.speculative_decoding)
+        self.assertNotIn("--spec-type", config.server_args or "")
+        self.assertEqual(events, [])
 
     def test_deploy_inspects_selected_model_before_allocating_compute(self) -> None:
         capabilities = ReasoningCapabilities(

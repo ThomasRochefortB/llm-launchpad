@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, UTC
 import hashlib
 import json
@@ -14,7 +14,7 @@ import shlex
 from typing import Any
 from collections.abc import Iterable
 
-from ..protocol.enums import CertificationState, ServingObjective
+from ..protocol.enums import CertificationState, EvidenceLevel, ServingObjective
 from ..protocol.models import (
     MemoryEstimate,
     PerformancePoint,
@@ -26,6 +26,7 @@ from ..protocol.models import (
 )
 from .config import SETTINGS_DIR
 from .coerce import optional_float
+from .fit_calibration import calibration_key, load_memory_calibration
 from .hf_models import GgufQuantMetadata
 
 
@@ -33,7 +34,9 @@ PLANNER_SCHEMA_VERSION = 2
 CERTIFICATE_CACHE_PATH = SETTINGS_DIR / "serving_certificates.json"
 
 # Conservative relative decode capacity. The values only rank unmeasured
-# candidates; measured performance always supersedes them.
+# candidates; measured performance always supersedes them. Keys are matched
+# canonically (exact first, then the normalized form), so "A100-80GB" resolves
+# to its own entry rather than to the earlier "A100" substring.
 _GPU_THROUGHPUT_INDEX = {
     "T4": 1.0,
     "L4": 1.25,
@@ -48,6 +51,14 @@ _GPU_THROUGHPUT_INDEX = {
     "H200": 6.1,
     "B200": 9.0,
     "B200+": 9.0,
+}
+
+# Canonical names plus the spellings providers and logs use for the same card.
+_GPU_TYPE_ALIASES = {
+    "A100": ("A100-40GB",),
+    "H100": ("H100!",),
+    "B200": ("B200+",),
+    "RTX-PRO-6000": ("RTX PRO 6000", "RTXPRO6000", "RTX-PRO6000"),
 }
 
 _CACHE_BYTES = {
@@ -142,6 +153,107 @@ def tuning_for_objective(
     )
 
 
+# Memory fields on estimates, quotes and assessments are planner GiB; provider
+# capacities arrive in their own display units. Converting the requirement to
+# bytes once keeps GB/GiB/MiB boundaries explicit instead of scattering
+# ``/ 1000`` and ``/ 1024`` through every comparison.
+_GIB_TO_BYTES = 1024**3
+
+
+def gib_to_bytes(gib: float) -> int:
+    """Convert planner GiB to whole bytes for a unit-safe comparison."""
+    return int(round(max(0.0, float(gib)) * _GIB_TO_BYTES))
+
+
+def device_capacity_bytes(capacity_gib: float) -> int:
+    """Return the usable bytes of one device quoted in planner GiB."""
+    return gib_to_bytes(capacity_gib)
+
+
+# A graph built without flash attention reserves its attention scores in full,
+# and that reservation is linear in the physical batch. Prompt processing is
+# faster with a larger batch, so the planner spends up to this much device
+# memory on it -- the same ceiling the compute-buffer heuristic uses -- and
+# then trades batch size for the context rather than buying GPUs to hold a
+# buffer none of them can share.
+ATTENTION_SCRATCH_BUDGET_GB = 16.0
+
+# Below 64 tokens per batch llama.cpp's prompt processing degrades sharply, so
+# that is the floor: a plan that still does not fit there is one the hardware
+# genuinely cannot serve, not one to shrink further.
+_UBATCH_LADDER: tuple[int, ...] = (512, 256, 128, 64)
+
+# Explicit smaller-context alternatives offered alongside the full-context
+# default. The default never moves: these are labeled fallbacks for hardware
+# that cannot hold the whole window, not a silent reduction of what is served.
+CONTEXT_ALTERNATIVES: tuple[int, ...] = (131_072, 65_536, 32_768)
+
+# Bounded physical-batch alternatives for memory search. The default 512 leads;
+# smaller rungs only trade prompt-processing speed for fit, never quality.
+BATCH_ALTERNATIVES: tuple[int, ...] = (2048, 1024, 512)
+
+
+@dataclass(frozen=True)
+class ServingVariant:
+    """One labeled serving configuration evaluated for a hardware pairing."""
+
+    requirements: ServingRequirements
+    tuning: RuntimeTuning
+    memory: MemoryEstimate
+    assessment: PlacementAssessment
+    label: str
+
+
+def ubatch_for_attention_scratch(
+    gb_per_ubatch_token: float,
+    *,
+    max_ubatch: int = _UBATCH_LADDER[0],
+) -> int:
+    """Return the largest physical batch whose attention scratch stays in budget.
+
+    The ladder is where a batch is stepped *down* to, never a ceiling to impose:
+    a caller asking for a batch above it that already fits the budget keeps the
+    batch it asked for. Clamping to the ladder's top rung silently shrank a
+    configured batch on the strength of a scratch cost of nearly nothing, while
+    a cost of exactly nothing was left alone -- the same request answered two
+    different ways either side of zero.
+    """
+
+    if gb_per_ubatch_token <= 0:
+        return max_ubatch
+    if gb_per_ubatch_token * max_ubatch <= ATTENTION_SCRATCH_BUDGET_GB:
+        return max_ubatch
+    for ubatch in _UBATCH_LADDER:
+        if ubatch <= max_ubatch and gb_per_ubatch_token * ubatch <= ATTENTION_SCRATCH_BUDGET_GB:
+            return ubatch
+    return min(max_ubatch, _UBATCH_LADDER[-1])
+
+
+def tuning_for_attention_scratch(
+    tuning: RuntimeTuning,
+    *,
+    context_tokens: int,
+    attention_head_count: int | None,
+) -> RuntimeTuning:
+    """Size the physical batch against a non-flash-attention graph's scores.
+
+    Flash attention keeps the scores out of memory, so the batch is free to
+    stay at its default. Without it the scores are reserved as
+    ``[n_ctx x n_ubatch x n_head]``, which at a long context is larger than any
+    device -- and since every device builds its own graph, adding GPUs does not
+    help. Trading the batch down is the lever that does.
+    """
+
+    if tuning.flash_attention or not attention_head_count or attention_head_count <= 0:
+        return tuning
+    # Only the scores matter for this trade: they are the plane count that
+    # makes a long context unservable, and they scale with the batch exactly
+    # as the masks do.
+    per_token_gb = context_tokens * (attention_head_count + 1) * 4 / 1_000_000_000.0
+    ubatch = ubatch_for_attention_scratch(per_token_gb, max_ubatch=tuning.ubatch_size)
+    return replace(tuning, ubatch_size=ubatch)
+
+
 def tuning_for_architecture(tuning: RuntimeTuning, architecture: str | None) -> RuntimeTuning:
     """Apply correctness requirements of the selected model implementation."""
     if architecture == "glm5next":
@@ -227,14 +339,14 @@ def memory_for_cache_type(
             "heuristic does not model cache precision."
         )
     kv_gb = memory.kv_cache_gb * (target_bytes / source_bytes)
+    count = max(1, len(memory.per_device_required_gb))
     total = (
         memory.weights_gb
         + kv_gb
-        + memory.compute_gb
         + memory.speculative_gb
+        + (memory.compute_gb + memory.attention_scratch_gb) * count
         + memory.reserve_gb
     )
-    count = max(1, len(memory.per_device_required_gb))
     return replace(
         memory,
         kv_cache_gb=round(kv_gb, 3),
@@ -302,6 +414,33 @@ def compile_server_args_string(
     return shlex.join(compile_server_args(requirements, tuning, extra_args=extra_args))
 
 
+def per_device_requirements(
+    *,
+    shardable_gb: float,
+    per_device_gb: float,
+    gpu_count: int,
+    layer_count: int | None,
+) -> tuple[float, ...]:
+    """Split a requirement the way llama.cpp actually assigns it.
+
+    Layers are indivisible, so a model that does not divide evenly leaves one
+    device carrying the remainder: 45 layers over two GPUs is 23 and 22, a
+    51/49 split rather than 50/50. Assuming an even one understates the
+    busiest device, which is the only one that has to fit -- a measured
+    GLM-5.3-Flash plan put 78,810 MiB on CUDA0 against 74,738 MiB on CUDA1
+    and was rejected for the difference while the total had room to spare.
+    """
+
+    count = max(1, gpu_count)
+    layers = layer_count if layer_count and layer_count > 0 else 0
+    if layers < count:
+        shares = [1.0 / count] * count
+    else:
+        base, remainder = divmod(layers, count)
+        shares = [(base + (1 if index < remainder else 0)) / layers for index in range(count)]
+    return tuple(shardable_gb * share + per_device_gb for share in shares)
+
+
 def estimate_memory(
     metadata: GgufQuantMetadata,
     *,
@@ -324,8 +463,11 @@ def estimate_memory(
 
     # Compute graphs, CUDA workspaces, and allocations outside the model/KV
     # tensors are deliberately conservative until an exact runtime certificate
-    # replaces this estimate.
+    # replaces this estimate. Every device builds the whole graph for the
+    # layers it holds, so this is a per-device cost that extra GPUs replicate
+    # rather than divide.
     compute_gb = max(1.5, min(16.0, weights * 0.08 + tuning.batch_size / 4096.0))
+    scratch_gb, scratch_known = _attention_scratch_gb(metadata, context, tuning)
     speculative_gb = (
         max(0.5, weights * 0.04)
         if tuning.speculative_decoding is not None
@@ -338,25 +480,260 @@ def estimate_memory(
         else 0.0
     )
     reserve_gb = reserve_per_device * count
-    total = weights + kv_gb + compute_gb + speculative_gb + reserve_gb
-    per_device = tuple(total / count for _ in range(count))
     hybrid = metadata.architecture in {"kimi-k3", "kimi-linear", "glm5next"}
     source = "gguf-hybrid-metadata" if hybrid else "gguf-metadata"
     nextn = metadata.serving_metadata.nextn_predict_layers if metadata.serving_metadata else 0
+    layer_count = (metadata.block_count - nextn) if metadata.block_count else None
+    per_device = per_device_requirements(
+        shardable_gb=weights + kv_gb + speculative_gb,
+        per_device_gb=compute_gb + scratch_gb + reserve_per_device,
+        gpu_count=count,
+        layer_count=layer_count,
+    )
+    total = sum(per_device)
     recurrent = _hybrid_recurrent_gb(metadata, tuning) if hybrid and metadata_complete else 0.0
+    complete = metadata_complete and scratch_known
     return MemoryEstimate(
         weights_gb=round(weights, 3),
         kv_cache_gb=round(kv_gb, 3),
         compute_gb=round(compute_gb, 3),
+        attention_scratch_gb=round(scratch_gb, 3),
         speculative_gb=round(speculative_gb, 3),
         reserve_gb=round(reserve_gb, 3),
         total_gb=round(total, 3),
         per_device_required_gb=tuple(round(value, 3) for value in per_device),
-        confidence=0.82 if metadata_complete else 0.55,
-        source=source if metadata_complete else "conservative-fallback",
-        total_layer_count=(metadata.block_count - nextn) if metadata.block_count else None,
+        confidence=0.82 if complete else 0.55,
+        source=source if complete else "conservative-fallback",
+        total_layer_count=layer_count,
         recurrent_gb=round(recurrent, 6),
         recurrent_state_copies=_recurrent_state_copies(tuning),
+    )
+
+
+def serving_variants(
+    metadata: GgufQuantMetadata,
+    *,
+    model_id: str,
+    revision: str | None,
+    quant: str | None,
+    runtime_id: str | None,
+    weights_gb: float,
+    context_tokens: int,
+    objective: ServingObjective = ServingObjective.GENERAL_PURPOSE,
+    speculative_decoding: SpeculativeDecodingConfig | None = None,
+    gpu_type: str,
+    gpu_count: int,
+    gpu_memory_gb: float,
+    price_per_hour_usd: float | None = None,
+    max_variants: int = 6,
+) -> tuple[ServingVariant, ...]:
+    """Evaluate a bounded set of labeled serving configurations for hardware.
+
+    The full-context default is always first and always evaluated. Smaller
+    contexts, smaller batches, and a non-speculative fallback follow, each
+    recomputed from GGUF metadata rather than scaled from the default's total.
+    At most ``max_variants`` are returned, deployable estimates first, so
+    matching stays responsive while a GPU that fails the default can still
+    surface with an explicitly labeled alternative.
+    """
+    candidates: list[tuple[ServingRequirements, RuntimeTuning, str]] = []
+    base_requirements = serving_requirements(context_tokens, objective=objective)
+    base_tuning = tuning_for_attention_scratch(
+        tuning_for_architecture(
+            tuning_for_objective(objective, speculative_decoding=speculative_decoding),
+            metadata.architecture,
+        ),
+        context_tokens=base_requirements.context_tokens,
+        attention_head_count=attention_head_count(metadata),
+    )
+    candidates.append((base_requirements, base_tuning, "full context"))
+    for alternative in CONTEXT_ALTERNATIVES:
+        if alternative >= base_requirements.context_tokens or alternative <= 0:
+            continue
+        requirements = replace(base_requirements, context_tokens=alternative)
+        tuning = tuning_for_attention_scratch(
+            replace(base_tuning),
+            context_tokens=alternative,
+            attention_head_count=attention_head_count(metadata),
+        )
+        candidates.append((requirements, tuning, f"{alternative:,} ctx"))
+    if speculative_decoding is not None:
+        plain = replace(base_tuning, speculative_decoding=None)
+        plain = tuning_for_attention_scratch(
+            plain,
+            context_tokens=base_requirements.context_tokens,
+            attention_head_count=attention_head_count(metadata),
+        )
+        candidates.append((base_requirements, plain, "no speculative decoding"))
+    for batch in BATCH_ALTERNATIVES:
+        if batch >= base_tuning.batch_size:
+            continue
+        tuned = replace(
+            base_tuning,
+            batch_size=batch,
+            ubatch_size=min(base_tuning.ubatch_size, batch),
+        )
+        candidates.append((base_requirements, tuned, f"batch {batch}"))
+    variants: list[ServingVariant] = []
+    seen: set[str] = set()
+    for requirements, tuning, label in candidates:
+        key = calibration_key(
+            model_id=model_id,
+            revision=revision,
+            quant=quant,
+            runtime_id=runtime_id,
+            requirements=requirements,
+            tuning=tuning,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        memory = estimate_memory(
+            metadata,
+            weights_gb=weights_gb,
+            requirements=requirements,
+            tuning=tuning,
+            gpu_count=gpu_count,
+            gpu_memory_gb=gpu_memory_gb,
+        )
+        assessment = assess_placement(
+            metadata,
+            model_id=model_id,
+            revision=revision,
+            quant=quant,
+            runtime_id=runtime_id,
+            weights_gb=weights_gb,
+            requirements=requirements,
+            tuning=tuning,
+            gpu_type=gpu_type,
+            gpu_count=gpu_count,
+            gpu_memory_gb=gpu_memory_gb,
+            price_per_hour_usd=price_per_hour_usd,
+        )
+        variants.append(
+            ServingVariant(
+                requirements=requirements,
+                tuning=tuning,
+                memory=memory,
+                assessment=assessment,
+                label=label,
+            )
+        )
+        if len(variants) >= max(1, max_variants):
+            break
+    variants.sort(
+        key=lambda variant: (
+            not (variant.assessment.fits and variant.assessment.gpu_resident),
+            variant.requirements.context_tokens != base_requirements.context_tokens,
+            variant.label != "full context",
+        )
+    )
+    return tuple(variants)
+
+
+def _assess_with_evidence(
+    *,
+    memory: MemoryEstimate,
+    model_id: str,
+    revision: str | None,
+    quant: str | None,
+    runtime_id: str | None,
+    requirements: ServingRequirements,
+    tuning: RuntimeTuning,
+    gpu_type: str,
+    gpu_count: int,
+    gpu_memory_gb: float,
+    price_per_hour_usd: float | None,
+    weights_gb: float,
+) -> PlacementAssessment:
+    """Apply one evidence rule to a computed requirement vector.
+
+    The formula may reject a placement that an exact successful runtime
+    observation already accepted; the observation wins. An explicit failure
+    rejects only that exact configuration, and missing evidence falls back to
+    the estimate. ``assess_placement`` and ``assess_memory_placement`` differ
+    only in how they build ``memory``; both must end here so the two paths
+    cannot disagree about what evidence means.
+
+    All ``*_gb`` values here are planner GiB. Requirement and capacity are
+    compared in whole bytes so a GB/GiB rounding boundary cannot flip a fit
+    decision; the human-readable rejection keeps GiB for continuity.
+    """
+    count = max(1, int(gpu_count))
+    capacity = device_capacity_bytes(gpu_memory_gb)
+    fits = all(gib_to_bytes(value) <= capacity for value in memory.per_device_required_gb)
+    fingerprint = serving_fingerprint(
+        model_id=model_id,
+        revision=revision,
+        quant=quant,
+        runtime_id=runtime_id,
+        requirements=requirements,
+        tuning=tuning,
+        gpu_type=gpu_type,
+        gpu_count=count,
+    )
+    measured_key = calibration_key(
+        model_id=model_id,
+        revision=revision,
+        quant=quant,
+        runtime_id=runtime_id,
+        requirements=requirements,
+        tuning=tuning,
+    )
+    cached = load_runtime_attestation(fingerprint)
+    certified = (
+        cached is not None
+        and cached.gpu_resident
+        and cached.effective_context_tokens >= requirements.context_tokens
+    )
+    if cached is not None and not certified:
+        return PlacementAssessment(
+            fingerprint=fingerprint,
+            calibration_key=measured_key,
+            runtime_id=runtime_id,
+            memory=memory,
+            tuning=tuning,
+            performance=cached.performance,
+            certification=CertificationState.REJECTED,
+            fits=False,
+            gpu_resident=False,
+            rejection_reason="Cached runtime attestation does not satisfy full-context GPU residency.",
+        )
+    performance = (
+        cached.performance
+        if certified and cached is not None and cached.performance
+        else predict_performance(
+            weights_gb=weights_gb,
+            gpu_type=gpu_type,
+            gpu_count=count,
+            tuning=tuning,
+            price_per_hour_usd=price_per_hour_usd,
+        )
+    )
+    # Evidence precedence: an exact successful runtime observation outranks
+    # the formula and may confirm a placement the heuristic rejects, while
+    # an explicit failure rejects only that exact configuration. Missing
+    # evidence falls back to the estimate.
+    return PlacementAssessment(
+        fingerprint=fingerprint,
+        calibration_key=measured_key,
+        runtime_id=runtime_id,
+        memory=cached.memory if certified and cached.memory is not None else memory,
+        tuning=tuning,
+        performance=performance,
+        certification=(
+            CertificationState.CERTIFIED if certified else CertificationState.ESTIMATED
+        ),
+        fits=fits or certified,
+        gpu_resident=(fits or certified) and requirements.gpu_only,
+        rejection_reason=(
+            None
+            if fits or certified
+            else (
+                f"Full-context plan needs {max(memory.per_device_required_gb, default=memory.total_gb):.1f} "
+                f"GB per GPU; {gpu_type} provides {gpu_memory_gb:.1f} GB."
+            )
+        ),
     )
 
 
@@ -385,8 +762,8 @@ def assess_placement(
         gpu_count=gpu_count,
         gpu_memory_gb=gpu_memory_gb,
     )
-    fits = all(value <= gpu_memory_gb for value in memory.per_device_required_gb)
-    fingerprint = serving_fingerprint(
+    return _assess_with_evidence(
+        memory=memory,
         model_id=model_id,
         revision=revision,
         quant=quant,
@@ -395,53 +772,9 @@ def assess_placement(
         tuning=tuning,
         gpu_type=gpu_type,
         gpu_count=gpu_count,
-    )
-    cached = load_runtime_attestation(fingerprint)
-    performance = (
-        cached.performance
-        if cached is not None
-        else predict_performance(
-            weights_gb=weights_gb,
-            gpu_type=gpu_type,
-            gpu_count=gpu_count,
-            tuning=tuning,
-            price_per_hour_usd=price_per_hour_usd,
-        )
-    )
-    certified = (
-        cached is not None
-        and cached.gpu_resident
-        and cached.effective_context_tokens >= requirements.context_tokens
-    )
-    if cached is not None and not certified:
-        return PlacementAssessment(
-            fingerprint=fingerprint,
-            memory=memory,
-            tuning=tuning,
-            performance=performance,
-            certification=CertificationState.REJECTED,
-            fits=False,
-            gpu_resident=False,
-            rejection_reason="Cached runtime attestation does not satisfy full-context GPU residency.",
-        )
-    return PlacementAssessment(
-        fingerprint=fingerprint,
-        memory=cached.memory if certified and cached.memory is not None else memory,
-        tuning=tuning,
-        performance=performance,
-        certification=(
-            CertificationState.CERTIFIED if certified else CertificationState.ESTIMATED
-        ),
-        fits=fits,
-        gpu_resident=fits and requirements.gpu_only,
-        rejection_reason=(
-            None
-            if fits
-            else (
-                f"Full-context plan needs {max(memory.per_device_required_gb, default=memory.total_gb):.1f} "
-                f"GB per GPU; {gpu_type} provides {gpu_memory_gb:.1f} GB."
-            )
-        ),
+        gpu_memory_gb=gpu_memory_gb,
+        price_per_hour_usd=price_per_hour_usd,
+        weights_gb=weights_gb,
     )
 
 
@@ -466,20 +799,57 @@ def assess_memory_placement(
     recurrent = base_memory.recurrent_gb * state_copies / max(1, base_memory.recurrent_state_copies)
     state_delta = recurrent - base_memory.recurrent_gb
     reserve_per_device = max(2.0, float(gpu_memory_gb) * 0.05)
-    base_without_reserve = max(0.0, base_memory.total_gb - base_memory.reserve_gb)
+    # Rebase the estimate onto this topology: only the model, cache and
+    # speculative buffers shard, so the graph memory is re-multiplied by the
+    # device count this placement actually uses instead of being carried over
+    # from the count the catalog estimate was built at.
+    base_count = max(1, len(base_memory.per_device_required_gb))
+    per_device_graph = base_memory.compute_gb + base_memory.attention_scratch_gb
+    shardable = max(
+        0.0,
+        base_memory.total_gb - base_memory.reserve_gb - per_device_graph * base_count,
+    )
     reserve = reserve_per_device * count
-    total = base_without_reserve + reserve + state_delta
+    measured_key = calibration_key(
+        model_id=model_id,
+        revision=revision,
+        quant=quant,
+        runtime_id=runtime_id,
+        requirements=requirements,
+        tuning=tuning,
+    )
+    # A runtime measurement of this exact graph outranks the formula that
+    # predicted it. The formula reconstructs ggml's allocator from outside
+    # and has been wrong in both directions; llama.cpp reports the real
+    # figure before every serve, and one report sizes every topology.
+    measured = load_memory_calibration(measured_key)
+    if measured is not None:
+        per_device = tuple(
+            value + reserve_per_device
+            for value in measured.per_device_gb(
+                shardable_gb=shardable + state_delta,
+                gpu_count=count,
+                layer_count=base_memory.total_layer_count,
+            )
+        )
+    else:
+        per_device = per_device_requirements(
+            shardable_gb=shardable + state_delta,
+            per_device_gb=per_device_graph + reserve_per_device,
+            gpu_count=count,
+            layer_count=base_memory.total_layer_count,
+        )
     memory = replace(
         base_memory,
         kv_cache_gb=round(base_memory.kv_cache_gb + state_delta, 3),
         recurrent_gb=round(recurrent, 6),
         recurrent_state_copies=state_copies,
         reserve_gb=round(reserve, 3),
-        total_gb=round(total, 3),
-        per_device_required_gb=tuple(round(total / count, 3) for _ in range(count)),
+        total_gb=round(sum(per_device), 3),
+        per_device_required_gb=tuple(round(value, 3) for value in per_device),
     )
-    fits = all(value <= gpu_memory_gb for value in memory.per_device_required_gb)
-    fingerprint = serving_fingerprint(
+    return _assess_with_evidence(
+        memory=memory,
         model_id=model_id,
         revision=revision,
         quant=quant,
@@ -488,52 +858,9 @@ def assess_memory_placement(
         tuning=tuning,
         gpu_type=gpu_type,
         gpu_count=count,
-    )
-    cached = load_runtime_attestation(fingerprint)
-    certified = (
-        cached is not None
-        and cached.gpu_resident
-        and cached.effective_context_tokens >= requirements.context_tokens
-    )
-    performance = (
-        cached.performance
-        if cached is not None and cached.performance
-        else predict_performance(
-            weights_gb=base_memory.weights_gb,
-            gpu_type=gpu_type,
-            gpu_count=count,
-            tuning=tuning,
-            price_per_hour_usd=price_per_hour_usd,
-        )
-    )
-    return PlacementAssessment(
-        fingerprint=fingerprint,
-        memory=cached.memory if certified and cached.memory is not None else memory,
-        tuning=tuning,
-        performance=performance,
-        certification=(
-            CertificationState.CERTIFIED
-            if certified
-            else (
-                CertificationState.REJECTED
-                if cached is not None and not certified
-                else CertificationState.ESTIMATED
-            )
-        ),
-        fits=fits and (cached is None or certified),
-        gpu_resident=fits and requirements.gpu_only and (cached is None or certified),
-        rejection_reason=(
-            None
-            if fits and (cached is None or certified)
-            else (
-                "A previous runtime attestation rejected this configuration."
-                if cached is not None and not certified
-                else (
-                    f"Full-context plan needs {total / count:.1f} GB per GPU; "
-                    f"{gpu_type} provides {gpu_memory_gb:.1f} GB."
-                )
-            )
-        ),
+        gpu_memory_gb=gpu_memory_gb,
+        price_per_hour_usd=price_per_hour_usd,
+        weights_gb=base_memory.weights_gb,
     )
 
 
@@ -557,7 +884,15 @@ def predict_performance(
     tuning: RuntimeTuning,
     price_per_hour_usd: float | None,
 ) -> tuple[PerformancePoint, ...]:
-    """Return conservative relative performance for an uncertified placement."""
+    """Return heuristic relative performance for an uncertified placement.
+
+    This is a ranking heuristic, not a calibrated throughput model: it knows
+    the GPU family and the weight size, and nothing about the architecture,
+    quantization kernels, prompt length, or interconnect. Callers must present
+    it as an estimate and never compare its ratios against measured points.
+    """
+
+    from ..protocol.enums import CachePolicy
 
     index = _gpu_index(gpu_type)
     weight_factor = (10.0 / max(1.0, weights_gb)) ** 0.82
@@ -590,6 +925,12 @@ def predict_performance(
                 time_to_first_token_seconds=round(4096.0 / max(1.0, single_tps * 5.0), 3),
                 output_tokens_per_dollar=(round(per_dollar, 2) if per_dollar else None),
                 measured=False,
+                actual_prompt_tokens=4096,
+                actual_output_tokens=128,
+                sample_count=0,
+                completion_reason="heuristic-estimate",
+                cache_policy=CachePolicy.UNSPECIFIED,
+                evidence=EvidenceLevel.PREDICTED,
             )
         )
     return tuple(points)
@@ -632,11 +973,22 @@ def assessment_score(
     assessment: PlacementAssessment,
     objective: ServingObjective,
 ) -> float:
-    """Score an eligible placement from its conservative performance curve."""
+    """Score an eligible placement from its conservative performance curve.
+
+    Rankings compare physical speed only. Evidence strength (measured versus
+    estimated, certified versus predicted) is tracked separately on the
+    assessment and the tier, because a 10% bonus for being measured is not a
+    speed the hardware delivers.
+    """
 
     if not assessment.fits or not assessment.gpu_resident:
         return float("-inf")
-    points = [point for point in assessment.performance if point.error_rate <= 0.05]
+    points = [
+        point
+        for point in assessment.performance
+        if point.error_rate <= 0.05
+        and (point.measured or _measured_context_matches(point, assessment))
+    ]
     if not points:
         return 0.0
     single = max(
@@ -652,15 +1004,28 @@ def assessment_score(
         default=0.0,
     )
     prompt = max((point.prompt_tokens_per_second or 0.0 for point in points), default=0.0)
-    certification_bonus = 1.10 if assessment.certification == CertificationState.CERTIFIED else 1.0
     if objective == ServingObjective.INTERACTIVE:
-        return certification_bonus * math.sqrt(max(0.001, single) * max(0.001, prompt))
+        return math.sqrt(max(0.001, single) * max(0.001, prompt))
     if objective == ServingObjective.THROUGHPUT:
-        return certification_bonus * (efficiency or aggregate)
+        return efficiency or aggregate
     if objective == ServingObjective.BENCHMARK:
-        return certification_bonus * aggregate
+        return aggregate
     values = [max(0.001, single), max(0.001, aggregate), max(0.001, efficiency or aggregate)]
-    return certification_bonus * math.prod(values) ** (1.0 / len(values))
+    return math.prod(values) ** (1.0 / len(values))
+
+
+def _measured_context_matches(point: PerformancePoint, assessment: PlacementAssessment) -> bool:
+    """Whether an estimated point may rank this assessment.
+
+    Estimated points share the planner's fixed prompt length and workload, so
+    they are comparable across placements. A measured point from a different
+    workload (short-prompt calibration versus a long-context bake-off) must
+    not outrank an estimate on speed alone; comparability is checked where
+    the two are combined.
+    """
+
+    _ = assessment
+    return not point.measured
 
 
 def save_runtime_attestation(
@@ -723,6 +1088,7 @@ def attestation_now(
     memory: MemoryEstimate | None,
     performance: tuple[PerformancePoint, ...],
     runtime_id: str | None,
+    residency_evidence: EvidenceLevel | None = None,
 ) -> RuntimeAttestation:
     """Build a timestamped attestation from runtime verification evidence."""
 
@@ -737,7 +1103,87 @@ def attestation_now(
         performance=performance,
         runtime_id=runtime_id,
         verified_at=datetime.now(UTC).isoformat(),
+        residency_evidence=residency_evidence,
     )
+
+
+def _attention_scratch_gb(
+    metadata: GgufQuantMetadata,
+    context_tokens: int,
+    tuning: RuntimeTuning,
+) -> tuple[float, bool]:
+    """Return the per-device attention scratch of a non-flash-attention graph.
+
+    Flash attention never materializes the scores, so its working set is small
+    and context-independent. Without it llama.cpp builds the full
+    ``kq = K @ Q`` tensor, shaped ``[n_ctx, n_ubatch, n_head]`` in f32, plus an
+    f32 mask of ``[n_ctx, n_ubatch]``; both are reserved at the worst case, so
+    the buffer grows linearly with the advertised context. See
+    ``llm_graph_context::build_attn_mha`` in the pinned runtime.
+
+    The graph is rebuilt on every device that holds an attention layer and the
+    allocator reuses one buffer across layers, so the cost is one copy per
+    device rather than one per layer, and adding GPUs does not divide it.
+
+    Returns the estimate and whether the architecture could be measured at all:
+    a runtime that forbids flash attention cannot be sized without a head
+    count, and guessing one would understate the requirement by an order of
+    magnitude.
+    """
+
+    heads = attention_head_count(metadata)
+    if heads is None and not tuning.flash_attention:
+        return 0.0, False
+    # llama.cpp reserves the graph one physical batch at a time.
+    tokens = max(1, min(context_tokens, tuning.ubatch_size))
+    planes = _attention_plane_bytes(metadata, tuning, heads)
+    return (context_tokens * tokens * planes / 1_000_000_000.0, True)
+
+
+def attention_head_count(metadata: GgufQuantMetadata) -> int | None:
+    """Return the query-head count GGUF headers report, if they report one."""
+
+    layout = metadata.serving_metadata
+    heads = metadata.attention_head_count or (layout.attention_head_count if layout else None)
+    return heads if heads and heads > 0 else None
+
+
+# Intermediates of the sparse-attention path, each shaped like the mask:
+# the duplicated selection mask, the top-k scatter, the candidate add, the
+# f16 cast, and the add of the base mask. Counted from build_attn_sparse in
+# the pinned runtime. Measured against a live 2x A100 GLM-5.3-Flash fit,
+# whose compute buffers came to 14.7 GiB per device where the plain
+# heuristic predicted 8.8 GiB.
+_SPARSE_ATTENTION_MASK_PLANES = 5
+
+
+def _attention_plane_bytes(
+    metadata: GgufQuantMetadata,
+    tuning: RuntimeTuning,
+    heads: int | None,
+) -> int:
+    """Bytes per context-token, per batch-token, of attention working memory.
+
+    Every attention implementation reserves at least one ``[n_ctx, n_ubatch]``
+    mask, f16 under flash attention and f32 without it. Without flash
+    attention the scores are materialized too, one f32 plane per query head,
+    which is what makes a long context impossible to serve that way.
+
+    A sparse-attention model adds more planes of the same shape whether or not
+    flash attention is on: its indexer builds the top-k mask by duplicating,
+    scattering into and adding masks, and those intermediates are the
+    difference between a compute-buffer guess and what the runtime allocates.
+    """
+
+    mask_bytes = 2 if tuning.flash_attention else 4
+    planes = 1
+    layout = metadata.serving_metadata
+    if layout is not None and layout.indexer_key_length and layout.indexer_kpool:
+        planes += _SPARSE_ATTENTION_MASK_PLANES
+    total = planes * mask_bytes
+    if not tuning.flash_attention and heads:
+        total += heads * 4
+    return total
 
 
 def _kv_cache_gb(
@@ -878,10 +1324,22 @@ def _normalized_gpu(gpu_type: str) -> str:
     return re.sub(r"[^A-Z0-9]+", "-", gpu_type.upper()).strip("-")
 
 
+def canonical_gpu_name(gpu_type: str) -> str:
+    """Return the planner's canonical name for a provider GPU spelling."""
+
+    normalized = _normalized_gpu(gpu_type)
+    for key in _GPU_THROUGHPUT_INDEX:
+        candidates = (key, *_GPU_TYPE_ALIASES.get(key, ()))
+        if any(_normalized_gpu(candidate) == normalized for candidate in candidates):
+            return key
+    return (gpu_type or "").strip() or normalized
+
+
 def _gpu_index(gpu_type: str) -> float:
     normalized = _normalized_gpu(gpu_type)
     for key, value in _GPU_THROUGHPUT_INDEX.items():
-        if _normalized_gpu(key) in normalized or normalized in _normalized_gpu(key):
+        candidates = (key, *_GPU_TYPE_ALIASES.get(key, ()))
+        if any(_normalized_gpu(candidate) == normalized for candidate in candidates):
             return value
     return 1.0
 
@@ -926,6 +1384,7 @@ def _attestation_from_dict(raw: Any) -> RuntimeAttestation | None:
                 source=str(memory_raw.get("source") or "runtime"),
                 recurrent_gb=float(memory_raw.get("recurrent_gb", 0.0)),
                 recurrent_state_copies=int(memory_raw.get("recurrent_state_copies", 1)),
+                attention_scratch_gb=float(memory_raw.get("attention_scratch_gb", 0.0)),
                 total_layer_count=(
                     int(memory_raw["total_layer_count"])
                     if memory_raw.get("total_layer_count") is not None
@@ -947,14 +1406,68 @@ def _attestation_from_dict(raw: Any) -> RuntimeAttestation | None:
             performance=performance,
             runtime_id=str(raw.get("runtime_id") or "") or None,
             verified_at=str(raw.get("verified_at") or "") or None,
+            residency_evidence=_evidence_level_or_none(raw.get("residency_evidence")),
         )
     except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _evidence_level_or_none(raw: Any) -> EvidenceLevel | None:
+    """Read a stored evidence grade, treating anything unrecognised as unknown.
+
+    Certificates written before residency carried a grade have no value here,
+    and an absent grade must not read as a graded one.
+    """
+
+    if isinstance(raw, EvidenceLevel):
+        return raw
+    try:
+        return EvidenceLevel(str(raw))
+    except (TypeError, ValueError):
         return None
 
 
 def _performance_from_dict(raw: Any) -> PerformancePoint:
     if not isinstance(raw, dict):
         raise TypeError("performance point must be an object")
+    from ..protocol.enums import CachePolicy as _CachePolicy
+    from ..protocol.enums import EvidenceLevel as _EvidenceLevel
+
+    measured = bool(raw.get("measured"))
+    evidence_raw = str(raw.get("evidence") or "").strip()
+    try:
+        evidence = _EvidenceLevel(evidence_raw) if evidence_raw else None
+    except ValueError:
+        evidence = None
+    if evidence is None:
+        evidence = (
+            _EvidenceLevel.OBSERVED if measured else _EvidenceLevel.PREDICTED
+        )
+    cache_raw = str(raw.get("cache_policy") or "").strip()
+    try:
+        cache_policy = _CachePolicy(cache_raw) if cache_raw else _CachePolicy.UNSPECIFIED
+    except ValueError:
+        cache_policy = _CachePolicy.UNSPECIFIED
+    sample_raw = raw.get("sample_count")
+    try:
+        sample_count = int(sample_raw) if sample_raw is not None else None
+    except (TypeError, ValueError):
+        sample_count = None
+    # Tail percentiles from tiny samples are not evidence; old records that
+    # stored one are read back without it rather than kept as a false p95.
+    p95 = optional_float(raw.get("p95_latency_seconds"))
+    if p95 is not None and (sample_count or 0) < 20 and measured:
+        p95 = None
+    actual_prompt_raw = raw.get("actual_prompt_tokens")
+    actual_output_raw = raw.get("actual_output_tokens")
+    try:
+        actual_prompt = int(actual_prompt_raw) if actual_prompt_raw is not None else None
+    except (TypeError, ValueError):
+        actual_prompt = None
+    try:
+        actual_output = int(actual_output_raw) if actual_output_raw is not None else None
+    except (TypeError, ValueError):
+        actual_output = None
     return PerformancePoint(
         prompt_tokens=int(raw.get("prompt_tokens", 0)),
         output_tokens=int(raw.get("output_tokens", 0)),
@@ -965,8 +1478,16 @@ def _performance_from_dict(raw: Any) -> PerformancePoint:
             raw.get("aggregate_output_tokens_per_second")
         ),
         time_to_first_token_seconds=optional_float(raw.get("time_to_first_token_seconds")),
-        p95_latency_seconds=optional_float(raw.get("p95_latency_seconds")),
+        p95_latency_seconds=p95,
         error_rate=float(raw.get("error_rate", 0.0)),
         output_tokens_per_dollar=optional_float(raw.get("output_tokens_per_dollar")),
-        measured=bool(raw.get("measured")),
+        measured=measured,
+        actual_prompt_tokens=actual_prompt,
+        actual_output_tokens=actual_output,
+        sample_count=sample_count,
+        completion_reason=(
+            str(raw.get("completion_reason") or "") or None
+        ),
+        cache_policy=cache_policy,
+        evidence=evidence,
     )

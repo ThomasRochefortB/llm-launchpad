@@ -34,6 +34,23 @@ _COMMAND_RE = re.compile(
     r"^(Running:\s*)?(modal|uv|python|docker)\s",
     flags=re.IGNORECASE,
 )
+# Modal builds the serving image inside `modal run` / `modal deploy`. The
+# output is BuildKit steps plus the inner Dockerfile RUN logs (apt/dpkg for
+# the runtime stage, cmake for a source build). None of it mentions the model,
+# so without a mapping the summary sits on "Preparing model cache" for the
+# whole compile -- ~10 min for the GLM source build -- looking stalled.
+_MODAL_BUILDKIT_PREFIX_RE = re.compile(r"^(=>\s|#\d+[\s:]|Step \d+[/:])")
+_MODAL_IMAGE_BUILD_RE = re.compile(
+    r"\b(building image|built image|saving image|image saved|pushing image|"
+    r"pushed image|copying image|transferring image|waiting for image build)\b",
+    flags=re.IGNORECASE,
+)
+_MODAL_APT_BUILD_RE = re.compile(
+    r"^(\(Reading database|Preparing to unpack|Unpacking |Selecting previously "
+    r"unselected package|Setting up |Processing triggers for |Updating certificates"
+    r"|Running hooks in |debconf:|rehash:|Fetched \d)",
+)
+_CMAKE_BUILD_PERCENT_RE = re.compile(r"\[\s*(\d{1,3})%\]")
 
 _DONE_MILESTONES = {
     "Server is ready!",
@@ -58,11 +75,41 @@ _VLLM_SHARD_PCT_RE = re.compile(
     r"Loading safetensors checkpoint shards:\s+(\d+)%"
 )
 _PERCENT_IN_PARENS_RE = re.compile(r"\((\d+)%\)")
-_PROGRESS_SUFFIX_RE = re.compile(r"^(?P<label>.*?)(?: \((?P<pct>\d+)%\))$")
+# A trailing "(42%)" or "(5m20s)" is progress on the same step, not a new one.
+# Both forms are stripped so the monitor can replace the row in place rather
+# than appending one line per update.
+_PROGRESS_SUFFIX_RE = re.compile(
+    r"^(?P<label>.*?)(?: \((?P<pct>\d+)%\))$"
+)
+_ELAPSED_SUFFIX_RE = re.compile(
+    r"^(?P<label>.*?)(?: \((?:\d+h)?(?:\d+m)?\d+s\))$"
+)
+# How a provider tags a heartbeat so the mapper can lift the duration onto
+# whatever milestone the line describes.
+WAITING_SUFFIX_RE = re.compile(r"\s*\(waiting (?P<elapsed>[0-9hms]+)\)\s*$")
+
+
+def format_elapsed(seconds: float) -> str:
+    """Render a wait as 45s / 5m20s / 1h04m20s.
+
+    Lives beside the pattern that reads it back: every provider that reports a
+    heartbeat has to spell the duration the way ``WAITING_SUFFIX_RE`` expects,
+    and a second copy of this drifts from it silently.
+    """
+
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{secs:02d}s"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
 _SUMMARY_MARKERS = ("✓ ", "· ", "✗ ")
 _INFO_PREFIXES = (
     "Warning:",
     "Prime cache disk",
+    "Kept Prime cache disk",
     "Tip:",
     "Press ",
     "Detail:",
@@ -106,6 +153,15 @@ def strip_summary_marker(text: str) -> str:
 def summary_progress_parts(text: str) -> tuple[str, int | None]:
     """Split ``Downloading model (22%)`` into a stable label and percent."""
     stripped = strip_summary_marker(text).strip()
+    # An elapsed suffix can sit outside a percentage -- "Downloading model
+    # (42%) (2m00s)" -- so it comes off first, or the percentage would stay in
+    # the label and every new percentage would look like a new step.
+    elapsed = _ELAPSED_SUFFIX_RE.fullmatch(stripped)
+    if elapsed:
+        stripped = elapsed.group("label")
+    # Transfer details change on each heartbeat but belong to the same row.
+    if stripped.startswith("Downloading model"):
+        stripped = stripped.split(" — ", 1)[0]
     match = _PROGRESS_SUFFIX_RE.fullmatch(stripped)
     if match:
         return match.group("label"), int(match.group("pct"))
@@ -158,6 +214,93 @@ def beautify_summary_line(text: str, *, spinner_frame: str | None = None) -> str
     return f"· {stripped}"
 
 
+# llama.cpp's memory planner narrates every run. Its progress and verdict
+# lines are noise on a deploy that works, but the projected-versus-free
+# arithmetic is the only place a rejected plan states what it was short of.
+_FIT_ARITHMETIC_MARKERS = (
+    "projected to use",
+    "need to reduce device memory by",
+    "MiB less in total",
+    "free vs. target of",
+)
+
+
+# What the orchestrator decided about the model before any compute was
+# allocated. These are Launchpad's own conclusions rather than runtime
+# chatter, and each one states something the confirm screen cannot: whether
+# speculative decoding is actually on, whether the architecture was verified,
+# and what context and concurrency the endpoint was launched with.
+_PREFLIGHT_DECISION_PREFIXES = (
+    "MTP preflight",
+    "Compatibility preflight",
+    "Serving plan:",
+    "Speculative decoding disabled",
+)
+
+
+def is_preflight_decision_line(text: str) -> bool:
+    """Return whether a line states a preflight decision about the model."""
+
+    return text.startswith(_PREFLIGHT_DECISION_PREFIXES)
+
+
+def is_fit_arithmetic_line(text: str) -> bool:
+    """Return whether a fit-planner line states what a plan was short of."""
+
+    # The runtime prefixes its own timestamp and level, and the function is
+    # named common_params_fit_impl in the pinned build, so neither the start
+    # of the line nor a single spelling can be relied on.
+    if "params_fit" not in text and "fit_params" not in text:
+        return False
+    return any(marker in text for marker in _FIT_ARITHMETIC_MARKERS)
+
+
+# How the orchestrator's startup-time phase timer tags its summary lines.
+# Consumers parse ``startup-phase <name> <seconds>`` back out of deploy
+# output; keep that literal format.
+STARTUP_PHASE_PREFIX = "startup-phase"
+
+STARTUP_PHASE_NAMES = (
+    "deploy",
+    "warmup-wait",
+    "calibration",
+    "total",
+)
+
+
+def startup_phase_summary_line(name: str, seconds: float) -> str:
+    """Render one startup-time phase as a parseable milestone log line."""
+    return f"{STARTUP_PHASE_PREFIX} {name} {max(0.0, seconds):.1f}s"
+
+
+def parse_startup_phase_line(line: str) -> tuple[str, float] | None:
+    """Parse a :func:`startup_phase_summary_line` back into (name, seconds).
+
+    Accepts the beautified form the CLI prints, whose ``· `` marker
+    :func:`strip_summary_marker` removes, so output can be parsed as printed.
+    """
+    text = strip_summary_marker(line or "").strip()
+    if not text.startswith(STARTUP_PHASE_PREFIX + " "):
+        return None
+    rest = text[len(STARTUP_PHASE_PREFIX) + 1 :].strip().rsplit(" ", 1)
+    if len(rest) != 2:
+        return None
+    name, seconds_text = rest
+    if name not in STARTUP_PHASE_NAMES:
+        return None
+    seconds_text = seconds_text[:-1] if seconds_text.endswith("s") else seconds_text
+    try:
+        return name, float(seconds_text)
+    except ValueError:
+        return None
+
+
+def is_startup_phase_line(text: str) -> bool:
+    """Return whether a log line is a startup-phase timing summary."""
+
+    return parse_startup_phase_line(text) is not None
+
+
 class DeployLogSummarizer:
     """Convert raw backend logs into canonical milestone messages."""
 
@@ -187,11 +330,31 @@ class DeployLogSummarizer:
         if self.backend == BackendType.LLAMACPP and self._is_llamacpp_readiness_503_noise(text):
             return []
 
+        # Kept ahead of the mapping rules: these are the orchestrator's own
+        # conclusions about the model, and the only report that speculative
+        # decoding is on. Dropping one confines it to --debug-logs, where a
+        # reader checking whether MTP engaged would never think to look.
+        if is_preflight_decision_line(text):
+            return [text]
+
         mapped = self._map_line(text)
         if mapped:
             return self._emit_once(mapped)
 
         if is_error_like(text):
+            return [text]
+
+        # Kept ahead of the noise rules: the planner's own narration is
+        # otherwise filtered wholesale, and these lines are the only statement
+        # of how much memory a rejected plan was missing.
+        if is_fit_arithmetic_line(text):
+            return [text]
+
+        # Startup-phase timing lines are orchestrator milestones, not runtime
+        # chatter. The headless CLI prints warmup events through here and the
+        # monitor's summary view transforms them, so dropping one would
+        # confine its measurement to --debug-logs.
+        if is_startup_phase_line(text):
             return [text]
 
         if self._is_noise(text):
@@ -334,7 +497,23 @@ class DeployLogSummarizer:
         return "llm_launchpad.backends" in stripped
 
     def _map_prime_line(self, text: str) -> str | None:
-        """Return a friendly Prime milestone, or empty string to hide the line."""
+        """Return a friendly Prime or Vast milestone, or "" to hide the line."""
+        # A heartbeat repeats the step it is still on and carries how long it
+        # has been on it. Strip that before matching, then put it back, so one
+        # suffix serves every milestone rather than each learning about it.
+        waiting = WAITING_SUFFIX_RE.search(text)
+        if waiting:
+            milestone = self._map_prime_line(WAITING_SUFFIX_RE.sub("", text))
+            if not milestone:
+                return milestone
+            if _PERCENT_IN_PARENS_RE.search(milestone):
+                # A real percentage already shows the step is moving; adding a
+                # clock beside it is noise.
+                return milestone
+            return f"{milestone} ({waiting.group('elapsed')})"
+        vast = self._map_vast_line(text)
+        if vast is not None:
+            return vast
         offer = _PRIME_OFFER_RE.search(text)
         if offer:
             count, gpu, extra = offer.group(1), offer.group(2), offer.group(3)
@@ -376,6 +555,11 @@ class DeployLogSummarizer:
                 if pct is not None:
                     return f"Loading model ({pct}%)"
                 return "Loading model"
+            if "building the runtime image" in detail:
+                pct = percent_in_text(text)
+                if pct is not None:
+                    return f"Building container image ({pct}%)"
+                return "Building container image"
             if "pulling" in detail:
                 return "Pulling container image"
             return "Installing runtime"
@@ -389,10 +573,59 @@ class DeployLogSummarizer:
             return "Terminated failed machine"
         if text.startswith("Keeping failed Prime pod"):
             return "Keeping failed machine; billing may continue"
+        if text.startswith("Kept Prime cache disk"):
+            # Named in full: the point of the line is the disk's identity, so
+            # a collapsed milestone would remove what makes it actionable.
+            return text
         if text.startswith("Prime cache disk"):
             return text
         if text.startswith("Selected Prime offer"):
             return "GPU ready"
+        return None
+
+    def _map_vast_line(self, text: str) -> str | None:
+        """Return a friendly Vast milestone, or None when the line is not Vast's.
+
+        A Vast rental spends minutes pulling and unpacking its image and
+        running Vast's own sshd provisioning before the runtime prints
+        anything at all. None of that matched a rule, so the summary view sat
+        on the rental line: a deploy that failed at 390s showed the user one
+        line and then an error, which reads as a hung client rather than a
+        host that was still working.
+        """
+        if text.startswith("Vast rental preparing:"):
+            if re.search(r"\b(pulling|downloading)\b", text, re.IGNORECASE):
+                return "Pulling runtime image"
+            return "Provisioning machine"
+        if text.startswith("Vast waiting for SSH:"):
+            return "Waiting for SSH"
+        if text == "Vast SSH ready":
+            return "Machine ready"
+        if text == "Vast opening secure endpoint":
+            return "Opening secure endpoint"
+        if text.startswith("Vast model starting:"):
+            # Weights first, because that is where the minutes go; anything
+            # else this heartbeat carries is the server already coming up.
+            detail = text.split(":", 1)[1].strip()
+            if detail.startswith("downloading weights"):
+                progress = detail.removeprefix("downloading weights")
+                status, separator, transfer = progress.partition(", ")
+                return "Downloading model" + status + (f" — {transfer}" if separator else "")
+            mapped = self._map_llamacpp_line(detail) if self.backend == BackendType.LLAMACPP else self._map_vllm_line(detail)
+            if mapped:
+                return mapped
+            return "Starting server"
+        if text.startswith("Rented GPUs: "):
+            return f"GPU ready: {text.split(': ', 1)[1]}"
+        if text.startswith("Vast instance state: "):
+            state = text.split(": ", 1)[1].strip().casefold()
+            return "Waiting for SSH" if state == "running" else "Provisioning machine"
+        if text.startswith("Vast is throttling status checks"):
+            return "Provisioning machine"
+        if text.startswith("Vast host is running but not accepting SSH yet"):
+            return "Waiting for SSH"
+        if text.startswith("Vast streaming chat verified"):
+            return "Server is ready!"
         return None
 
     def _map_modal_cli_line(self, text: str) -> str | None:
@@ -401,6 +634,23 @@ class DeployLogSummarizer:
             return None
         if "App deployed in " in text:
             return "Endpoint published"
+        if _MODAL_IMAGE_BUILD_RE.search(text):
+            return "Building runtime image"
+        if _MODAL_BUILDKIT_PREFIX_RE.match(stripped):
+            return "Building runtime image"
+        if _MODAL_APT_BUILD_RE.match(stripped):
+            return "Building runtime image"
+        cmake_pct = _CMAKE_BUILD_PERCENT_RE.search(text)
+        if cmake_pct is not None and (
+            "Building" in text or "Linking" in text or "Compiling" in text or text.lstrip().startswith("[")
+        ):
+            try:
+                pct = max(0, min(100, int(cmake_pct.group(1))))
+            except ValueError:
+                pct = None
+            if pct is not None:
+                return f"Building runtime image ({pct}%)"
+            return "Building runtime image"
         return None
 
     def _map_llamacpp_line(self, text: str) -> str | None:
@@ -507,8 +757,7 @@ class DeployLogSummarizer:
             or text.startswith("system_info:")
             or text.startswith("srv  log_server_r:")
             or text.startswith("common_init_result:")
-            or text.startswith("llama_params_fit")
-            or text.startswith("llama_params_fit_impl:")
+            or text.startswith(("llama_params_fit", "common_params_fit"))
             or text.startswith("llama_model_load_from_file_impl:")
             or text.startswith("llama_context:")
             or text.startswith("llama_kv_cache:")
@@ -554,6 +803,20 @@ class DeployLogSummarizer:
             or stripped.startswith("🚀 Deploying...")
             or stripped.startswith("✅ Deploy triggered.")
             or "using llama-server" in text
+            # Image-build output is summarized as "Building runtime image" by
+            # _map_modal_cli_line; the raw inner lines stay out of the summary.
+            or _MODAL_IMAGE_BUILD_RE.search(text) is not None
+            or _MODAL_BUILDKIT_PREFIX_RE.match(stripped) is not None
+            or _MODAL_APT_BUILD_RE.match(stripped) is not None
+            or (
+                _CMAKE_BUILD_PERCENT_RE.search(text) is not None
+                and (
+                    "Building" in text
+                    or "Linking" in text
+                    or "Compiling" in text
+                    or text.lstrip().startswith("[")
+                )
+            )
         )
 
     @staticmethod

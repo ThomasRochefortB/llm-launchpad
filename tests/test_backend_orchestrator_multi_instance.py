@@ -71,6 +71,8 @@ class OrchestratorMultiInstanceTests(unittest.TestCase):
         config = DeploymentConfig(
             backend=BackendType.LLAMACPP,
             app_name="llamacpp-qwen3",
+            repo_id="org/model-GGUF",
+            quant="Q4_K_M",
             do_deploy=True,
         )
         with patch("llm_launchpad.core.orchestrator.random_function_slug", return_value="alpha-bravo"):
@@ -91,6 +93,7 @@ class OrchestratorMultiInstanceTests(unittest.TestCase):
         config = DeploymentConfig(
             backend=BackendType.VLLM,
             app_name="vllm-qwen3",
+            model_name="Qwen/Qwen3-8B",
             do_deploy=True,
         )
         with patch("llm_launchpad.core.orchestrator.random_function_slug", return_value="alpha-bravo"):
@@ -193,6 +196,87 @@ class OrchestratorMultiInstanceTests(unittest.TestCase):
             list(orch.stop_app(BackendType.VLLM, app_name="vllm-qwen2-5", app_id="ap-123"))
         self.assertTrue(captured)
         self.assertEqual(captured[0], ["modal", "app", "stop", "--yes", "ap-123"])
+
+    def test_stopping_a_prime_pod_reports_the_disk_it_leaves_billing(self) -> None:
+        """A stop that halves the spend must not read as a stop that ended it.
+
+        Terminating the pod keeps the cache disk on purpose, so the next
+        deploy skips the download -- but the disk goes on billing with no pod
+        to show for it, and nothing in the product deletes it. The Vast path
+        spells out that stopping destroys its disk; this one said only that a
+        pod was terminated.
+        """
+        from llm_launchpad.core.prime_disks import StoredPrimeDisk
+        from llm_launchpad.protocol.enums import ComputeProvider
+
+        orch = Orchestrator()
+        disk = StoredPrimeDisk(id="disk-123", size_gb=100, data_center="eu-north1")
+        with patch.object(orch.prime_backend, "delete_pod"), patch(
+            "llm_launchpad.core.prime_disks.load_stored_prime_disks", return_value=[disk]
+        ):
+            events = list(
+                orch.stop_app(
+                    BackendType.LLAMACPP, app_name="llp-prime-x", app_id="pod-1",
+                    provider=ComputeProvider.PRIME,
+                )
+            )
+
+        lines = [event.line for event in events if isinstance(event, LogEvent)]
+        kept = next((line for line in lines if line.startswith("Kept Prime cache disk")), "")
+        self.assertTrue(kept, lines)
+        self.assertIn("disk-123", kept)
+        self.assertIn("100 GB", kept)
+        self.assertIn("eu-north1", kept)
+        self.assertIn("keeps billing", kept)
+        # The warning names the command that removes it, not a web console:
+        # a notice with no action attached is why this went unnoticed.
+        self.assertIn("prime-disks delete", kept)
+        # The teardown itself still succeeds.
+        self.assertTrue(
+            any(
+                isinstance(event, OperationCompleteEvent) and event.success
+                for event in events
+            )
+        )
+
+    def test_a_prime_stop_with_no_managed_disk_says_nothing_extra(self) -> None:
+        from llm_launchpad.protocol.enums import ComputeProvider
+
+        orch = Orchestrator()
+        with patch.object(orch.prime_backend, "delete_pod"), patch(
+            "llm_launchpad.core.prime_disks.load_stored_prime_disks", return_value=[]
+        ):
+            events = list(
+                orch.stop_app(
+                    BackendType.LLAMACPP, app_name="llp-prime-x", app_id="pod-1",
+                    provider=ComputeProvider.PRIME,
+                )
+            )
+
+        lines = [event.line for event in events if isinstance(event, LogEvent)]
+        self.assertFalse([line for line in lines if "Kept Prime cache disk" in line])
+
+    def test_reporting_a_disk_never_breaks_a_prime_teardown(self) -> None:
+        from llm_launchpad.protocol.enums import ComputeProvider
+
+        orch = Orchestrator()
+        with patch.object(orch.prime_backend, "delete_pod"), patch(
+            "llm_launchpad.core.prime_disks.load_stored_prime_disks",
+            side_effect=OSError("disk state unreadable"),
+        ):
+            events = list(
+                orch.stop_app(
+                    BackendType.LLAMACPP, app_name="llp-prime-x", app_id="pod-1",
+                    provider=ComputeProvider.PRIME,
+                )
+            )
+
+        self.assertTrue(
+            any(
+                isinstance(event, OperationCompleteEvent) and event.success
+                for event in events
+            )
+        )
 
     def test_stop_app_tags_generic_subprocess_events_as_stop(self) -> None:
         stream = iter(

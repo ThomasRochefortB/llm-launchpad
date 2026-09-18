@@ -8,6 +8,7 @@ from llm_launchpad.core.vast_runtime import (
     VAST_RUNTIME_DIR,
     GpuDevice,
     parse_gpu_inventory,
+    parse_startup_probe,
     vast_refusal,
     vast_runtime,
     vast_runtime_image,
@@ -97,7 +98,7 @@ class VastRefusalTests(unittest.TestCase):
         self.assertIn("preload-only", reason or "")
 
     def test_smoke_test_only_is_refused(self) -> None:
-        reason = refuse(config(run_smoke=True))
+        reason = refuse(config(do_deploy=False, run_smoke=True))
         self.assertIsNotNone(reason)
         self.assertIn("smoke-test-only", reason or "")
 
@@ -122,8 +123,8 @@ class ProviderCapabilityTests(unittest.TestCase):
 
     def test_prime_refuses_smoke_tests_and_llamacpp_revisions(self) -> None:
         prime = config(provider=ComputeProvider.PRIME, provider_options=None)
-        self.assertIn("smoke-test-only", refuse(replace(prime, run_smoke=True)) or "")
-        self.assertIn("default HF revision", refuse(replace(prime, revision="abc")) or "")
+        self.assertIn("smoke-test-only", refuse(replace(prime, do_deploy=False, run_smoke=True)) or "")
+        self.assertIn("default Hugging Face revision", refuse(replace(prime, revision="abc")) or "")
         # vLLM can pin a revision; llama.cpp cannot.
         vllm = replace(prime, backend=BackendType.VLLM, revision="abc", model_name="acme/model")
         self.assertIsNone(refuse(vllm))
@@ -152,6 +153,26 @@ class GpuInventoryTests(unittest.TestCase):
 
 def device(index: int, name: str = "NVIDIA RTX 4090", total: int = 24564, used: int = 0) -> GpuDevice:
     return GpuDevice(index=index, name=name, memory_total_mib=total, memory_used_mib=used)
+
+
+class StartupProbeTests(unittest.TestCase):
+    """The probe reports on a rental that is already billing, so it never raises."""
+
+    def test_reads_partial_download_bytes_and_the_last_log_line(self) -> None:
+        self.assertEqual(
+            parse_startup_probe("BYTES 6614223467\nLOG load_tensors: offloading 63 layers\n"),
+            (6614223467, "load_tensors: offloading 63 layers"),
+        )
+
+    def test_a_download_that_has_not_started_reads_as_zero_not_as_missing(self) -> None:
+        self.assertEqual(parse_startup_probe("BYTES 0\n"), (0, ""))
+
+    def test_unreadable_output_yields_no_progress_rather_than_an_error(self) -> None:
+        self.assertEqual(parse_startup_probe(""), (0, ""))
+        self.assertEqual(parse_startup_probe("BYTES nonsense\nnoise\n"), (0, ""))
+
+    def test_control_characters_are_stripped_from_the_reported_log_line(self) -> None:
+        self.assertEqual(parse_startup_probe("LOG \x1b[32mready\x07")[1], "[32mready")
 
 
 class TopologyVerificationTests(unittest.TestCase):
@@ -203,6 +224,20 @@ class VastVllmRuntimeTests(unittest.TestCase):
         self.assertNotIn("--api-key", script)
         self.assertIn("VLLM_WORKER_MULTIPROC_METHOD=spawn", script)
         self.assertIn(f"{VAST_RUNTIME_DIR}/hf", script)
+
+    def test_vllm_script_enables_xet_high_performance_downloads(self) -> None:
+        script = vast_runtime_script(self.vllm())
+        self.assertIn("HF_XET_HIGH_PERFORMANCE=1", script)
+        self.assertNotIn("HF_HUB_DISABLE_XET", script)
+
+    def test_llamacpp_script_stages_weights_with_hf_xet_before_serving(self) -> None:
+        script = vast_runtime_script(config(endpoint_api_key="private-key"))
+        self.assertIn("HF_XET_HIGH_PERFORMANCE=1", script)
+        self.assertIn("snapshot_download", script)
+        self.assertIn("--hf-repo acme/model-GGUF:Q4_K_M", script)
+        self.assertIn("--hf-file", script)
+        self.assertIn("weights.args", script)
+        self.assertIn("LLAMA_CACHE=/root/.llm-launchpad/gguf/hf-hub", script)
 
     def test_gpu_counts_that_cannot_shard_attention_heads_are_refused(self) -> None:
         for count in (3, 5, 6, 7):

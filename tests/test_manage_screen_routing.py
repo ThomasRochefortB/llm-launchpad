@@ -222,6 +222,34 @@ class ManageScreenRoutingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(app.status_calls, [(endpoint, None, 60)])
 
+    async def test_connection_screen_copies_curl_and_json_examples(self) -> None:
+        import json
+
+        from llm_launchpad.tui.connection import (
+            connection_curl_example,
+            connection_json_example,
+            endpoint_connection_payload,
+        )
+
+        endpoint = _endpoint("active-endpoint", "ap-active")
+        endpoint.served_model_name = "audit-model"
+        payload = endpoint_connection_payload(endpoint, username="alice")
+        curl = connection_curl_example(payload)
+        assert curl is not None
+        self.assertIn("chat/completions", curl)
+        self.assertIn("audit-model", curl)
+        config = connection_json_example(payload)
+        assert config is not None
+        parsed = json.loads(config)
+        self.assertIn("base_url", parsed)
+        self.assertIn("model", parsed)
+
+        # Model IDs with quotes stay valid through JSON + shell quoting.
+        tricky = dict(payload, model_id='weird "model" id')
+        tricky_curl = connection_curl_example(tricky)
+        assert tricky_curl is not None
+        self.assertIn("chat/completions", tricky_curl)
+
     async def test_failed_endpoint_keeps_logs_but_blocks_runtime_actions(self) -> None:
         failed = _endpoint("failed-app", "ap-failed", state="failed")
         app = _TestApp()
@@ -348,3 +376,97 @@ class ManageScreenRoutingTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ManageScreenStoppedFilterTests(unittest.IsolatedAsyncioTestCase):
+    """Manage opens on what is running; history is one key away.
+
+    Modal keeps stopped apps listed long after they served anything, and a
+    stopped row offers only its logs -- so a fleet that is mostly history
+    filled the screen with rows nothing could be done to.
+    """
+
+    def _fleet(self) -> list[EndpointInfo]:
+        return [
+            _endpoint("live-app", "ap-live", state="running"),
+            _endpoint("old-app", "ap-old", state="stopped"),
+            _endpoint("older-app", "ap-older", state="terminated"),
+        ]
+
+    async def test_stopped_endpoints_are_hidden_by_default(self) -> None:
+        app = _TestApp()
+        app.instances = self._fleet()
+
+        async with app.run_test() as pilot:
+            app.push_screen(ManageScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, ManageScreen)
+
+            self.assertEqual([row.name for row in screen._rows], ["live-app"])
+            status = screen.query_one("#manage-status", Static).renderable
+            self.assertIn("2 stopped hidden", str(status))
+
+    async def test_toggle_reveals_and_re_hides_stopped_endpoints(self) -> None:
+        app = _TestApp()
+        app.instances = self._fleet()
+
+        async with app.run_test() as pilot:
+            app.push_screen(ManageScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, ManageScreen)
+
+            await pilot.press("a")
+            await pilot.pause()
+            self.assertEqual(
+                sorted(row.name for row in screen._rows),
+                ["live-app", "old-app", "older-app"],
+            )
+
+            await pilot.press("a")
+            await pilot.pause()
+            self.assertEqual([row.name for row in screen._rows], ["live-app"])
+
+    async def test_toggling_does_not_refetch_the_fleet(self) -> None:
+        app = _TestApp()
+        app.instances = self._fleet()
+
+        async with app.run_test() as pilot:
+            app.push_screen(ManageScreen())
+            await pilot.pause()
+            refreshes = len(app.refresh_forces)
+
+            await pilot.press("a")
+            await pilot.pause()
+
+            self.assertEqual(len(app.refresh_forces), refreshes)
+
+    async def test_failed_endpoints_stay_visible(self) -> None:
+        # A failed deploy is exactly what someone opens Manage to read logs
+        # for, so it is not filed away with the stopped rows.
+        app = _TestApp()
+        app.instances = [_endpoint("broken-app", "ap-broken", state="failed")]
+
+        async with app.run_test() as pilot:
+            app.push_screen(ManageScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, ManageScreen)
+
+            self.assertEqual([row.name for row in screen._rows], ["broken-app"])
+
+    async def test_an_all_stopped_fleet_says_so_instead_of_looking_empty(self) -> None:
+        app = _TestApp()
+        app.instances = [_endpoint("old-app", "ap-old", state="stopped")]
+
+        async with app.run_test() as pilot:
+            app.push_screen(ManageScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, ManageScreen)
+
+            status = str(screen.query_one("#manage-status", Static).renderable)
+            self.assertIn("Nothing running", status)
+            self.assertIn("press a to show", status)
+            self.assertNotIn("No managed endpoints found", status)
