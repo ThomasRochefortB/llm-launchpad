@@ -766,7 +766,7 @@ def _action_label_tiers(last: LastLaunch | None) -> tuple[_ActionLabels, ...]:
     if last is None:
         return _ACTION_LABEL_TIERS
     rows = _relaunch_labels(last)
-    return tuple((row, *tier) for row, tier in zip(rows, _ACTION_LABEL_TIERS))
+    return tuple((row, *tier) for row, tier in zip(rows, _ACTION_LABEL_TIERS, strict=True))
 
 
 class MainMenuScreen(CopyEnabledScreen):

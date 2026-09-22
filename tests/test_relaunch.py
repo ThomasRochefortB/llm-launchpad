@@ -17,14 +17,14 @@ from tests.test_fast_deploy_screen import _TestApp, _model, _profile
 
 
 def _launch(**overrides: object) -> LastLaunch:
-    base = dict(
-        model_id="fits",
-        display_name="Fits",
-        provider="modal",
-        gpu_type="B200",
-        gpu_count=1,
-        price_per_hour_usd=6.25,
-    )
+    base: dict[str, object] = {
+        "model_id": "fits",
+        "display_name": "Fits",
+        "provider": "modal",
+        "gpu_type": "B200",
+        "gpu_count": 1,
+        "price_per_hour_usd": 6.25,
+    }
     return LastLaunch(**{**base, **overrides})  # type: ignore[arg-type]
 
 

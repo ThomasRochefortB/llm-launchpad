@@ -65,10 +65,10 @@ def tool_call_probe_payload(model: str) -> dict[str, Any]:
     }
 
 
-def classify_tool_call_response(payload: object) -> ToolCallProbeResult:
+def classify_tool_call_response(payload: Any) -> ToolCallProbeResult:
     """Grade one chat-completions response body."""
     try:
-        message = payload["choices"][0]["message"]  # type: ignore[index]
+        message = payload["choices"][0]["message"]
     except (KeyError, IndexError, TypeError):
         return ToolCallProbeResult(TOOL_CALLING_FAILED, "response had no assistant message")
     calls = message.get("tool_calls") if isinstance(message, dict) else None
