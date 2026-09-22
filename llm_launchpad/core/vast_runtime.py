@@ -16,7 +16,12 @@ from typing import Any
 from ..protocol.enums import BackendType
 from ..protocol.models import DeploymentConfig
 from .runtime_support import load_llamacpp_support_manifest
-from .serving_runtime import projector_setup, vllm_serve_args
+from .serving_runtime import (
+    GGUF_FILE_PLACEHOLDER,
+    gguf_exec_command,
+    projector_setup,
+    vllm_serve_args,
+)
 
 VAST_RUNTIME_DIR = "/root/.llm-launchpad"
 # CUDA_VERSION in the bundled b10689 image's immutable OCI config. Require
@@ -43,11 +48,33 @@ GPU_INVENTORY_COMMAND = (
 # Snapshot symlinks are excluded; allocated blocks let the reader distinguish
 # sparse preallocation from bytes written. BYTES is the fallback for partials
 # outside the known cache roots.
+# A failing runtime prints why over several lines -- the allocator's numbers,
+# then the refusal -- so the last line alone ("exiting due to model loading
+# error") names the symptom and never the cause. The progress heartbeat still
+# shows one line; the failure report gets the run-up to it.
+VAST_STARTUP_LOG_LINES = 25
+# What a post-mortem reads after the runtime has exited. The heartbeat keeps
+# its own window small because it runs every few seconds, but a Python
+# traceback is far longer than 25 lines -- vLLM's "Engine core initialization
+# failed. See root cause above." is itself the 25th -- so the one read that
+# explains a dead rental gets a window a traceback fits in.
+VAST_FAILURE_LOG_LINES = 200
+VAST_FAILURE_LOG_COMMAND = (
+    f"tail -c 200000 {VAST_RUNTIME_DIR}/server.log 2>/dev/null"
+    " | tr '\\r' '\\n' | grep -v '^[[:space:]]*$'"
+    f" | tail -n {VAST_FAILURE_LOG_LINES} | cut -c1-300"
+)
+
+# The bracket around each first letter keeps the probe from matching its own
+# command line, which contains these patterns verbatim.
+_VAST_RUNTIME_PROCESS_PATTERNS = ("[r]untime[.]sh", "[l]lama-server", "[v]llm")
+
 VAST_STARTUP_PROBE_COMMAND = rf"""
 cd {VAST_RUNTIME_DIR} 2>/dev/null || exit 0
 find . \( -name '*.downloadInProgress' -o -name '*.incomplete' \) -printf '%s\n' 2>/dev/null | awk '{{ total += $1 }} END {{ printf "BYTES %d\n", total }}'
 find models hf/hub -type f \( -path '*/blobs/*' -o -name '*.gguf' -o -name '*.downloadInProgress' -o -name '*.incomplete' \) -printf 'FILE %s %b %p\n' 2>/dev/null
-tail -c 4000 server.log 2>/dev/null | tr '\r' '\n' | grep -v '^[[:space:]]*$' | tail -n 1 | cut -c1-140 | sed 's|^|LOG |'
+tail -c 8000 server.log 2>/dev/null | tr '\r' '\n' | grep -v '^[[:space:]]*$' | tail -n {VAST_STARTUP_LOG_LINES} | cut -c1-200 | sed 's|^|LOG |'
+if grep -lsa {" ".join(f"-e '{pattern}'" for pattern in _VAST_RUNTIME_PROCESS_PATTERNS)} /proc/[0-9]*/cmdline >/dev/null 2>&1; then echo 'RUNTIME 1'; else echo 'RUNTIME 0'; fi
 """
 
 
@@ -67,6 +94,38 @@ def parse_startup_probe(output: str) -> tuple[int, str]:
         elif line.startswith("LOG "):
             last = "".join(char for char in line[4:] if char.isprintable()).strip()
     return downloaded, last
+
+
+def startup_log_tail(output: str) -> tuple[str, ...]:
+    """Return the server-log lines the probe collected, oldest first."""
+
+    return tuple(
+        text
+        for line in output.splitlines()
+        if line.startswith("LOG ")
+        and (text := "".join(char for char in line[4:] if char.isprintable()).strip())
+    )
+
+
+def startup_runtime_stopped(output: str) -> bool:
+    """Whether the probe positively reports no runtime process left on the host.
+
+    The startup watcher only ever read the server log, and a script that has
+    exited leaves a log that simply stops changing -- indistinguishable from a
+    slow download. A rental whose runtime died in its first second was waited
+    out for the full half-hour deadline and then reported as a timeout, with
+    the actual error sitting unread in ``server.log`` the whole time.
+
+    A missing or unreadable marker is not an answer: the probe is commentary on
+    a rental that is already billing, so only an explicit ``RUNTIME 0`` counts.
+    """
+
+    stopped = False
+    for line in output.splitlines():
+        marker = line.strip()
+        if marker.startswith("RUNTIME "):
+            stopped = marker[8:].strip() == "0"
+    return stopped
 
 
 @dataclass(frozen=True)
@@ -263,8 +322,9 @@ def vast_runtime_script(config: DeploymentConfig) -> str:
     arguments = [
         "/app/llama-server", "--hf-repo", f"{repo}:{quant}",
         # Pin the exact staged shard: same repo listing, no quant guessing.
+        # The name is spliced in after the join; see gguf_exec_command.
         hf_file_flag[0],
-        f"$(cat {hf_file_flag[1]})",
+        GGUF_FILE_PLACEHOLDER,
         *shlex.split(config.server_args or ""),
         # Serve /metrics so the fleet can read tokens and throughput off the
         # runtime itself, as Modal already does.
@@ -293,11 +353,18 @@ def vast_runtime_script(config: DeploymentConfig) -> str:
     token = get_token()
     if token:
         env["HF_TOKEN"] = token
-    lines = ["#!/bin/sh", "set -eu", "umask 077", f"mkdir -p {VAST_RUNTIME_DIR}/models"]
+    lines = [
+        "#!/bin/sh", "set -eu", "umask 077",
+        # First thing in the log, so "nothing here yet" means the script has
+        # not started rather than that it died without a word. The startup
+        # watcher reads this file to tell those two apart.
+        "echo 'llm-launchpad runtime starting'",
+        f"mkdir -p {VAST_RUNTIME_DIR}/models",
+    ]
     lines.extend(f"export {name}={shlex.quote(value)}" for name, value in env.items())
     if setup:
         lines.append(setup)
-    lines.append("exec " + shlex.join(arguments))
+    lines.append(gguf_exec_command(arguments, weights_args_path=hf_file_flag[1]))
     return "\n".join(lines) + "\n"
 
 

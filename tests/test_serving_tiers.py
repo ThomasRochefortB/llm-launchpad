@@ -476,6 +476,39 @@ class MergedRoleTests(unittest.TestCase):
         # already carried by the recommendation marker.
         self.assertEqual(tiers[0].tradeoff, "also the fastest")
 
+    def test_a_superlative_is_not_claimed_over_a_faster_saver_row(self) -> None:
+        # Observed on screen for GLM 5.3 Flash: the recommended row read
+        # "also the fastest ~12 tok/s" directly above a Saver row reading
+        # "~30 tok/s · 2.5x faster". The roles are decided across the primary
+        # bit width alone, but they are *read* against the whole list, so an
+        # unqualified superlative is disproved by the next line down.
+        plans = [
+            _plan("q8", price=18.75, single_tps=12.0, aggregate_tps=33.0, quant="Q8_0"),
+            _plan("q2", price=6.25, single_tps=30.0, aggregate_tps=80.0, quant="UD-Q2_K_XL"),
+        ]
+
+        tiers = {tier.key: tier for tier in serving_tiers(plans)}
+
+        self.assertIn(SAVER, tiers)
+        claim = tiers[ECONOMY].tradeoff or ""
+        self.assertIn("also the fastest at 8-bit", claim)
+        # The saver row is the faster one, and says so.
+        self.assertIn("faster", tiers[SAVER].tradeoff or "")
+
+    def test_an_unbeaten_superlative_is_still_claimed_plainly(self) -> None:
+        # The saver is cheaper but slower, so "also the fastest" holds across
+        # the rendered list and must not be hedged into uselessness.
+        plans = [
+            _plan("q8", price=8.00, single_tps=90.0, aggregate_tps=300.0, quant="Q8_0"),
+            _plan("q2", price=1.00, single_tps=24.0, aggregate_tps=40.0, quant="UD-Q2_K_XL"),
+        ]
+
+        tiers = {tier.key: tier for tier in serving_tiers(plans)}
+
+        self.assertIn(SAVER, tiers)
+        self.assertIn("also the fastest", tiers[ECONOMY].tradeoff or "")
+        self.assertNotIn("8-bit", tiers[ECONOMY].tradeoff or "")
+
     def test_a_saver_never_claims_a_frontier_role(self) -> None:
         plans = [
             _plan("q4", price=4.00, single_tps=40.0, aggregate_tps=300.0, quant="UD-Q4_K_XL"),

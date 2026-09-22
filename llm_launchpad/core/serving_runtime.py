@@ -7,11 +7,28 @@ here has two real callers; provider-specific bootstrap stays with its provider.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import hashlib
 import shlex
 
 from ..protocol.models import DeploymentConfig
+from .coerce import positive_int
 from .hf_download import hf_download_env
+
+
+# vLLM's own default has moved between the versions the providers pin -- 256
+# in the image Modal and Prime run, 1024 in Vast's newer one -- so the same
+# deployment decoded at four times the concurrency depending on where it
+# landed. On a hybrid model that is not a tuning difference: each decode
+# sequence holds a recurrent-state block, and a default above the blocks the
+# GPU can hold refuses to start, which is how Qwen3.8 27B served on two
+# providers and could not start on the third.
+DEFAULT_VLLM_MAX_NUM_SEQS = 256
+
+
+def vllm_max_num_seqs(config: DeploymentConfig) -> int:
+    """Return the concurrency this deployment serves, defaulted portably."""
+    return positive_int(config.max_concurrent_sequences) or DEFAULT_VLLM_MAX_NUM_SEQS
 
 
 def vllm_serve_args(config: DeploymentConfig, *, host: str, port: int) -> tuple[str, ...]:
@@ -36,6 +53,13 @@ def vllm_serve_args(config: DeploymentConfig, *, host: str, port: int) -> tuple[
         "--tensor-parallel-size", str(config.n_gpu or config.gpu_count or 1),
         "--limit-mm-per-prompt", vllm_vision_limits(config),
     ]
+    # Without this, vLLM serves at the model's own maximum position count and
+    # refuses to start when the KV cache for it does not fit -- a 262k-context
+    # model then cannot be served on any GPU the weights alone fit on.
+    context_tokens = positive_int(config.max_context_tokens)
+    if context_tokens:
+        args.extend(["--max-model-len", str(context_tokens)])
+    args.extend(["--max-num-seqs", str(vllm_max_num_seqs(config))])
     if config.mm_processor_kwargs:
         args.extend(["--mm-processor-kwargs", config.mm_processor_kwargs])
     if config.model_revision:
@@ -98,20 +122,40 @@ def gguf_stage_command(
             else "export LLM_LAUNCHPAD_GGUF_REVISION=; "
         )
         + "export HF_HUB_CACHE=\"$LLM_LAUNCHPAD_GGUF_CACHE\"; "
-        + " ".join(
-            f"export {name}={shlex.quote(value)}"
+        # Separated like every other export here. Joined on a bare space these
+        # read as one `export` command taking the next `export`, then `python3`
+        # and its `-`, as variable names -- so the rental died on
+        # "export: -: bad variable name" before staging a byte, and the deploy
+        # sat waiting for a server that had already exited.
+        + "".join(
+            f"export {name}={shlex.quote(value)}; "
             for name, value in sorted(hf_download_env().items())
             if name.startswith(("HF_HUB_", "HF_XET_"))
         )
-        + " "
-        # Shares one downloader across two shells (Prime runs sh, Vast runs
-        # it too) without heredoc quoting fights: python reads argv, never
-        # stdin, so neither shell interprets the program text.
-        + "python3 - \"$LLM_LAUNCHPAD_GGUF_REPO\" \"$LLM_LAUNCHPAD_GGUF_QUANT\" "
-        "\"$LLM_LAUNCHPAD_GGUF_DEST\" \"$LLM_LAUNCHPAD_GGUF_CACHE\" "
-        "\"$LLM_LAUNCHPAD_GGUF_REVISION\" "
+        # Shares one downloader across two shells (Prime runs sh, Vast runs it
+        # too) without heredoc quoting fights: the program is a single quoted
+        # argument, so neither shell interprets its text.
+        #
+        # ``-c``, emphatically not ``-`` -- and the program comes first.
+        # ``python3 -`` reads the program from *standard input*, which under
+        # ``nohup … < /dev/null`` is empty: the interpreter ran nothing, exited
+        # 0, and left the real program sitting in argv. Staging silently wrote
+        # no ``weights.args``, and llama.cpp was then handed an empty
+        # ``--hf-file`` and reported ``failed to load model ''`` -- a sentence
+        # about the model, for a downloader that never ran.
+        + "python3 -c "
         + shlex.quote(_GGUF_STAGE_PROGRAM)
-        + " || exit $?; "
+        + " \"$LLM_LAUNCHPAD_GGUF_REPO\" \"$LLM_LAUNCHPAD_GGUF_QUANT\" "
+        "\"$LLM_LAUNCHPAD_GGUF_DEST\" \"$LLM_LAUNCHPAD_GGUF_CACHE\" "
+        "\"$LLM_LAUNCHPAD_GGUF_REVISION\""
+        # Best effort, not a precondition. Staging is an *accelerated*
+        # replacement for a download llama.cpp can do itself, and the pinned
+        # llama.cpp server image carries no huggingface_hub, no hf-xet and no
+        # pip at all -- so insisting on it turned the fast path into a hard
+        # requirement the runtime cannot meet, and every Vast rental died
+        # before serving. A staging run that cannot happen leaves no
+        # weights.args, and the exec below falls back accordingly.
+        + " || true; "
     )
     return setup, ("--hf-file", f"{dest}/weights.args")
 
@@ -128,10 +172,26 @@ dest.mkdir(parents=True, exist_ok=True)
 try:
     import hf_xet  # noqa: F401
 except ImportError:
+    # An accelerator, not a requirement: snapshot_download works without it,
+    # only slower. The runtime images are llama.cpp servers, not Python
+    # environments -- pip is missing or externally managed on them -- so
+    # insisting on the install turned a speed optimisation into a hard
+    # dependency that aborted the whole rental.
     import subprocess
-    subprocess.run([sys.executable, "-m", "pip", "install", "--quiet", "hf-xet"], check=True)
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet", "hf-xet"], check=True
+        )
+    except Exception as exc:
+        print(f"hf-xet unavailable ({exc}); staging without the Xet accelerator")
 
-from huggingface_hub import HfApi, snapshot_download
+try:
+    from huggingface_hub import HfApi, snapshot_download
+except ImportError:
+    raise SystemExit(
+        "huggingface_hub is not installed in this runtime image, so weights "
+        "cannot be staged. Deploy with llama.cpp's own --hf-repo download."
+    )
 
 info = HfApi().model_info(repo_id, revision=revision, files_metadata=True, timeout=30)
 folded = quant.casefold()
@@ -160,6 +220,63 @@ first = sorted(files)[0].relative_to(snapshot).as_posix()
 (dest / "weights.list").write_text("\n".join(str(p) for p in files) + "\n", encoding="utf-8")
 print(f"staged {len(files)} GGUF file(s) from {repo_id}")
 """.strip()
+
+
+# Where the staged shard's name is read into before the server is started.
+GGUF_FILE_VARIABLE = "LLM_LAUNCHPAD_GGUF_FILE"
+# Only characters shlex.quote leaves alone, so the placeholder survives the join
+# as itself and can be spliced back out by name.
+GGUF_FILE_PLACEHOLDER = "@@llm-launchpad-staged-gguf@@"
+# Prime passes its key by environment for the same reason: a key in argv
+# is readable by anything that can list processes on the host.
+PRIME_API_KEY_PLACEHOLDER = "@@llm-launchpad-prime-api-key@@"
+
+
+def gguf_exec_command(
+    arguments: Sequence[str],
+    *,
+    weights_args_path: str,
+    file_flag: str = "--hf-file",
+) -> str:
+    """Build the llama-server exec line, pinned to the staged shard if there is one.
+
+    ``shlex.join`` quotes every argument -- that is what it is for -- so writing
+    ``$(cat …)`` into the argument list does not run a command substitution: it
+    starts the server with that text as its file name. Both providers did
+    exactly that, and llama.cpp reported ``failed to load model ''`` after
+    resolving the nonsense against the repo listing, which reads as a bad model
+    rather than as a bad command line.
+
+    The name is read into a shell variable and referenced as one quoted word, so
+    a shard path containing a space stays a single argument. When staging did
+    not run -- the pinned llama.cpp image has no huggingface_hub to run it with
+    -- the flag is dropped entirely and ``--hf-repo <repo>:<quant>`` resolves the
+    quant itself. That is llama.cpp's own downloader: slower than the staged
+    path, and the path this provider was certified on before staging existed.
+    """
+
+    quoted_path = shlex.quote(weights_args_path)
+    joined = shlex.join(list(arguments))
+    pinned = joined.replace(
+        shlex.quote(GGUF_FILE_PLACEHOLDER), f'"${GGUF_FILE_VARIABLE}"'
+    )
+    # Dropping the value alone would leave a dangling flag for llama.cpp to
+    # read the next argument as, so the pair goes together.
+    unpinned = joined.replace(
+        f"{shlex.quote(file_flag)} {shlex.quote(GGUF_FILE_PLACEHOLDER)} ", ""
+    )
+    # Newline-separated so each exec stays the first word of its own line: both
+    # providers hand this to a shell as one script, and a reader (or a test)
+    # looking for the server invocation should find it where it is.
+    return (
+        f"{GGUF_FILE_VARIABLE}=$(cat {quoted_path} 2>/dev/null || true)\n"
+        f'if [ -n "${GGUF_FILE_VARIABLE}" ]; then\n'
+        f"exec {pinned}\n"
+        "else\n"
+        "echo 'No staged GGUF file name; letting llama.cpp resolve the quant.' >&2\n"
+        f"exec {unpinned}\n"
+        "fi"
+    )
 
 
 def gguf_stage_args(

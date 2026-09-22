@@ -364,26 +364,54 @@ def revalidate_plan_price(
     )
 
 
-def preflight_request(request: DeploymentRequest) -> PreflightResult:
+def preflight_request(
+    request: DeploymentRequest,
+    *,
+    runtime_tuning: object | None = None,
+    placement_assessment: object | None = None,
+    reasoning: object | None = None,
+    vision: object | None = None,
+) -> PreflightResult:
     """Validate a request and resolve it to an immutable plan.
 
     Resolution here is deliberately shallow: identity defaults only. Full
     model/tuning/placement resolution happens inside the lifecycle runner so
     the orchestrator's existing evidence pipeline is reused rather than
     forked. The returned plan records exactly what the adapters will execute.
+
+    Resolution a caller has already done is passed through rather than
+    rediscovered: a ``DeploymentRequest`` carries intent, not evidence, so
+    Fast Deploy's certified tuning and placement assessment have no field to
+    travel in and would otherwise be dropped here and then assigned -- as
+    ``None`` -- onto the config the lifecycle executes.
     """
     findings = validate_request(request)
     blocking = [finding for finding in findings if finding.blocking]
     if blocking:
         return PreflightResult(request=request, plan=None, findings=tuple(findings))
-    plan = plan_from_request(request)
+    plan = plan_from_request(
+        request,
+        runtime_tuning=runtime_tuning,
+        placement_assessment=placement_assessment,
+        reasoning=reasoning,
+        vision=vision,
+    )
     return PreflightResult(
         request=plan.request, plan=plan, findings=tuple(findings)
     )
 
 
 def preflight_config(config: DeploymentConfig) -> PreflightResult:
-    """Validate a legacy config through the same authoritative gate."""
+    """Validate a legacy config through the same authoritative gate.
+
+    Resolution the caller already did travels with the plan. A
+    ``DeploymentRequest`` carries intent, not evidence, so tuning and the
+    placement assessment cannot survive the round trip through it -- and the
+    lifecycle assigns the plan's values onto the config unconditionally, so a
+    plan that resolved neither *erased* both. Fast Deploy's certified placement
+    then reached the runtime as a tuning re-derived from the objective, and
+    certification failed outright with "No placement assessment was supplied".
+    """
     from .quick_deploy import request_from_config
 
     try:
@@ -397,7 +425,13 @@ def preflight_config(config: DeploymentConfig) -> PreflightResult:
                 ),
             ),
         )
-    return preflight_request(request)
+    return preflight_request(
+        request,
+        runtime_tuning=config.runtime_tuning,
+        placement_assessment=config.placement_assessment,
+        reasoning=config.reasoning,
+        vision=config.vision,
+    )
 
 
 @dataclass(frozen=True)

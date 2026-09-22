@@ -612,10 +612,8 @@ def tui(
         bool | None,
         typer.Option(
             "--mouse/--no-mouse",
-            help=(
-                "Enable Textual mouse support. "
-                "Use --no-mouse to let the terminal handle native text selection/copy."
-            ),
+            hidden=True,
+            help="Legacy option; terminal-native selection is always enabled.",
         ),
     ] = None,
 ) -> None:
@@ -632,7 +630,7 @@ def tui(
     _ensure_tui_runtime()
     app_instance = TuiApp(mouse_enabled=mouse)
     try:
-        app_instance.run(mouse=app_instance.mouse_enabled)
+        app_instance.run(mouse=False)
     finally:
         from ..core.backend import ModalBackend
         ModalBackend.terminate_all()
@@ -877,6 +875,22 @@ def deploy(
     allow_insecure_http: bool = typer.Option(
         False, help="Bypass Prime Tunnel and use a direct HTTP endpoint"
     ),
+    max_num_seqs: int | None = typer.Option(
+        None,
+        "--max-num-seqs",
+        help=(
+            "vLLM concurrent sequences; omitted, every provider serves the "
+            "same portable default instead of its image's"
+        ),
+    ),
+    max_model_len: int | None = typer.Option(
+        None,
+        "--max-model-len",
+        help=(
+            "vLLM served context length; omitted, vLLM serves the model's own "
+            "maximum and refuses to start when that KV cache does not fit"
+        ),
+    ),
     trust_remote_code: bool | None = typer.Option(
         None,
         help="vLLM TRUST_REMOTE_CODE (allow model custom code from Hugging Face)",
@@ -953,6 +967,8 @@ def deploy(
         gpu_type=gpu_type,
         gpu_count=gpu_count,
         trust_remote_code=trust_remote_code,
+        max_context_tokens=max_model_len,
+        max_concurrent_sequences=max_num_seqs,
         reasoning_parser=reasoning_parser,
         tool_call_parser=tool_call_parser,
         default_chat_template_kwargs=default_chat_template_kwargs,
@@ -1561,6 +1577,22 @@ def switch(
         False,
         help="Bypass Prime Tunnel and use a direct HTTP endpoint",
     ),
+    max_num_seqs: int | None = typer.Option(
+        None,
+        "--max-num-seqs",
+        help=(
+            "vLLM concurrent sequences; omitted, every provider serves the "
+            "same portable default instead of its image's"
+        ),
+    ),
+    max_model_len: int | None = typer.Option(
+        None,
+        "--max-model-len",
+        help=(
+            "vLLM served context length; omitted, vLLM serves the model's own "
+            "maximum and refuses to start when that KV cache does not fit"
+        ),
+    ),
     trust_remote_code: bool | None = typer.Option(
         None,
         help="vLLM TRUST_REMOTE_CODE (allow model custom code from Hugging Face)",
@@ -1622,6 +1654,8 @@ def switch(
         gpu_type=gpu_type,
         gpu_count=gpu_count,
         trust_remote_code=trust_remote_code,
+        max_context_tokens=max_model_len,
+        max_concurrent_sequences=max_num_seqs,
         reasoning_parser=reasoning_parser,
         tool_call_parser=tool_call_parser,
         default_chat_template_kwargs=default_chat_template_kwargs,

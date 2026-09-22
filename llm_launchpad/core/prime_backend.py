@@ -130,6 +130,14 @@ PRIME_BOOTSTRAP_SSH_KEY_NAME = "llm-launchpad-bootstrap"
 LLAMACPP_FIT_LOG_VERBOSITY = 4
 
 
+# Shell variable carrying the staged shard's name into the fit projection.
+# Assigned from weights.args and spliced into the joined fit command after
+# the fact, because shlex.join quotes a command substitution into literal
+# text. Distinct from the server line's own variable: both are read in the
+# same container shell, and sharing one would clobber the other's value.
+PRIME_FIT_FILE_VARIABLE = "LLAMA_ARG_FIT_FILE"
+
+
 # cmake prints "[ 45%] Building CXX object ..." as it compiles; docker build
 # prefixes each line with its step number, so the marker is matched anywhere.
 _CMAKE_PERCENT_RE = re.compile(r"\[\s*(\d{1,3})%\]")
@@ -454,6 +462,75 @@ def is_prime_gpu_offer(offer: ComputeOffer) -> bool:
         and not gpu_type.startswith("CPU_")
         and prime_offer_gpu_memory_gb(offer) is not None
     )
+
+
+def _prime_pod_hourly_rate(pod: dict[str, Any]) -> float | None:
+    """Best-effort hourly price from a Prime pod payload (never a guess).
+
+    Pod shapes vary across API versions, so known price keys are searched at
+    the top level and one level deep. Absence means unknown, never free.
+    """
+    candidates: list[Any] = []
+    for key in (
+        "pricePerHour",
+        "price_per_hour",
+        "hourlyPrice",
+        "hourly_price",
+        "costPerHour",
+        "cost_per_hour",
+        "price",
+        "cost",
+    ):
+        candidates.append(pod.get(key))
+        nested = pod.get("billing")
+        if isinstance(nested, dict):
+            candidates.append(nested.get(key))
+        nested = pod.get("pricing")
+        if isinstance(nested, dict):
+            candidates.append(nested.get(key))
+    for candidate in candidates:
+        try:
+            rate = optional_float(candidate)
+        except Exception:
+            continue
+        if rate is not None and rate >= 0:
+            return rate
+    return None
+
+
+def _prime_pod_started_at(pod: dict[str, Any]) -> float | None:
+    """Best-effort run start from a Prime pod payload, as wall-clock epoch."""
+    from datetime import datetime, timezone
+
+    for key in ("createdAt", "created_at", "created", "startTime", "startedAt", "started_at"):
+        raw = pod.get(key)
+        if isinstance(raw, (int, float)) and raw > 0:
+            # Heuristic: seconds vs milliseconds since epoch.
+            value = float(raw)
+            if value > 1e12:
+                value /= 1000.0
+            return value
+        if isinstance(raw, str) and raw.strip():
+            text = raw.strip()
+            try:
+                normalized = text.replace("Z", "+00:00")
+                parsed = datetime.fromisoformat(normalized)
+            except ValueError:
+                continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.timestamp()
+    return None
+
+
+def _cached_hourly_rate(cached: dict[str, Any]) -> float | None:
+    try:
+        rate = optional_float(cached.get("price_per_hour_usd"))
+    except Exception:
+        return None
+    if rate is None or rate < 0:
+        return None
+    return rate
 
 
 _UNAVAILABLE_STOCK = frozenset({
@@ -1449,7 +1526,12 @@ class PrimeBackend:
             command.extend(["-v", "/data:/data"])
 
         if config.backend == BackendType.LLAMACPP:
-            from .serving_runtime import gguf_stage_command
+            from .serving_runtime import (
+                GGUF_FILE_PLACEHOLDER,
+                PRIME_API_KEY_PLACEHOLDER,
+                gguf_exec_command,
+                gguf_stage_command,
+            )
 
             repo = str(config.repo_id or "").strip()
             quant = str(config.quant or "").strip()
@@ -1470,9 +1552,12 @@ class PrimeBackend:
                 "/app/llama-server",
                 "--hf-repo",
                 hf_repo,
-                # Pin the exact staged shard: same repo listing, no quant guessing.
+                # Pin the exact staged shard: same repo listing, no quant
+                # guessing. The name is spliced in after the join, because
+                # shlex.join would quote a command substitution into literal
+                # text; see gguf_exec_command.
                 hf_file_flag[0],
-                f"$(cat {hf_file_flag[1]})",
+                GGUF_FILE_PLACEHOLDER,
             ]
             # Leave GPU placement unset by default so llama.cpp can reserve
             # enough device memory for the context and compute buffers. An
@@ -1494,12 +1579,17 @@ class PrimeBackend:
                 ]
             )
             server_extra_args = shlex.split(config.server_args or "")
+            # Pin the exact staged shard, spliced in after the join: shlex.join
+            # quotes a command substitution into literal text, so embedding
+            # ``$(cat …)`` here hands the planner that text as the file name.
+            # The server line carries the same value through its own variable;
+            # see gguf_exec_command.
             fit_args = [
                 "/app/llama-fit-params",
                 "--hf-repo",
                 hf_repo,
                 hf_file_flag[0],
-                f"$(cat {hf_file_flag[1]})",
+                GGUF_FILE_PLACEHOLDER,
                 # Trace level: llama.cpp logs the projected-versus-free
                 # arithmetic there, and without it a rejected plan leaves only
                 # the guard it aborted at, which says nothing about how much
@@ -1517,8 +1607,15 @@ class PrimeBackend:
             )
             fit_guard = ""
             if config.placement_assessment is not None:
+                joined_fit = shlex.join(fit_args).replace(
+                    shlex.quote(GGUF_FILE_PLACEHOLDER),
+                    f'"${PRIME_FIT_FILE_VARIABLE}"',
+                )
                 fit_guard = (
-                    f"if [ -x /app/llama-fit-params ]; then {shlex.join(fit_args)} "
+                    f"{PRIME_FIT_FILE_VARIABLE}="
+                    f"$(cat {shlex.quote(hf_file_flag[1])} 2>/dev/null || true); "
+                    f"if [ -x /app/llama-fit-params ] && "
+                    f"[ -n \"${PRIME_FIT_FILE_VARIABLE}\" ]; then {joined_fit} "
                     "|| exit $?; fi; "
                     f"{attestation_marker}"
                 )
@@ -1530,9 +1627,11 @@ class PrimeBackend:
                     llama_args.extend(["--mmproj", projector_path])
                 else:
                     llama_args.append("--no-mmproj")
-            inner = (
-                f'{projector_setup}{fit_guard}exec {shlex.join(llama_args)} '
-                '--api-key "$LLAMA_ARG_API_KEY"'
+            inner = projector_setup + fit_guard + gguf_exec_command(
+                [*llama_args, "--api-key", PRIME_API_KEY_PLACEHOLDER],
+                weights_args_path=hf_file_flag[1],
+            ).replace(
+                shlex.quote(PRIME_API_KEY_PLACEHOLDER), '"$LLAMA_ARG_API_KEY"'
             )
             if not options.disk_id:
                 command.extend(
@@ -2237,6 +2336,9 @@ class PrimeBackend:
                     instance_name=instance_name
                     or infer_instance_from_app_name(name, backend),
                     provider=ComputeProvider.PRIME,
+                    hourly_cost_usd=_prime_pod_hourly_rate(row)
+                    or _cached_hourly_rate(cached),
+                    run_started_at_epoch=_prime_pod_started_at(row),
                 )
             )
         return results

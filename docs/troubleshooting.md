@@ -31,8 +31,10 @@ never written to the log.
 
 ## TUI specifics
 
-- TUI copy/paste: select text by dragging in mouse mode, then use `Ctrl/Cmd+C`; `Ctrl/Cmd+V` pastes the host clipboard into focused fields.
-- Over SSH, start with `llm-launchpad tui --no-mouse` to let the terminal handle native text selection.
+- The TUI uses keyboard navigation: Tab/Shift+Tab moves between controls, arrows navigate lists, and Enter activates the focused control. Mouse selection belongs to your terminal; there is no mouse-mode toggle.
+- Copy selected text with your terminal's Copy shortcut, then focus an input and use the terminal's Paste shortcut (often Ctrl+Shift+C/V on Linux or Cmd+C/V on macOS). Terminal paste works over SSH without reading the remote machine's clipboard. Plain Ctrl+C is the app's copy-selection/quit key, not the terminal Copy shortcut.
+- If tmux captures dragging, use your terminal's selection override (usually Shift+drag, or Option+drag in iTerm2), then its Copy shortcut. This bypasses tmux clipboard forwarding.
+- App Copy buttons and `y` use the local clipboard or OSC 52 terminal requests. Remote clipboard writes cannot be confirmed and require terminal support; in tmux, `set -g allow-passthrough on` enables the app's passthrough request. Terminal-native selection is the fallback when clipboard requests are blocked. Plain Ctrl+V can paste from the host clipboard or the last text copied within the app; use the terminal Paste shortcut for your local clipboard over SSH.
 
 ## Filing an issue
 

@@ -522,6 +522,12 @@ class Orchestrator:
         """Execute the Modal-specific deploy step (adapter entrypoint)."""
         if config.do_deploy and config.backend != BackendType.VLLM and not config.function_slug:
             config.function_slug = random_function_slug()
+        if config.backend == BackendType.VLLM and config.do_deploy:
+            # A Modal web endpoint is reachable by anyone who learns its URL,
+            # so it gets the same minted bearer token Prime and Vast endpoints
+            # have always had rather than serving the account's GPU to the
+            # open internet.
+            config.endpoint_api_key = config.endpoint_api_key or secrets.token_urlsafe(32)
         settings = self.config_store.load()
         env = ModalBackend.build_full_env(settings, config)
 

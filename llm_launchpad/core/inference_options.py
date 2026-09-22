@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import re
 from typing import Protocol
 from collections.abc import Iterable, Sequence
 
@@ -29,13 +30,26 @@ from .prime_backend import (
 )
 
 
+# Qwen 3.5 and 3.8 carry a minor version in the name, which the plain
+# ``qwen3-`` prefix does not match -- and they also changed tool-call format,
+# so falling through to "no parser" was doubly wrong. Read from the published
+# chat templates: Qwen3-8B emits Hermes JSON inside ``<tool_call>``, while
+# Qwen3.5-27B, Qwen3.8-27B and Qwen3.8-Flash-Next all emit
+# ``<function=name><parameter=key>`` -- the XML shape Qwen3-Coder introduced.
+_QWEN_DOTTED_MINOR_RE = re.compile(r"^qwen3\.\d+[-.]")
+
+
 def recommended_vllm_tool_call_parser(model_name: str | None) -> str | None:
     """Return a conservative tool parser recommendation for known Qwen models.
 
     Standard Qwen 2.5/QwQ/Qwen3 chat templates emit Hermes-style JSON inside
-    ``<tool_call>`` tags. Qwen3-Coder uses vLLM's distinct XML parser. Models
-    with separate embedding, reranking, or vision runtimes are intentionally
-    left alone instead of guessing.
+    ``<tool_call>`` tags. Qwen3-Coder and the dotted Qwen 3.x releases use
+    vLLM's distinct XML parser. Models with separate embedding, reranking, or
+    vision runtimes are intentionally left alone instead of guessing.
+
+    A model served with no parser is not merely missing a feature: vLLM
+    rejects ``tool_choice: "auto"`` outright, and OpenCode sends tools on
+    every request, so the endpoint answers nothing at all.
     """
 
     model_id = (model_name or "").strip().rsplit("/", 1)[-1].casefold()
@@ -45,8 +59,34 @@ def recommended_vllm_tool_call_parser(model_name: str | None) -> str | None:
         return "qwen3_xml"
     if any(marker in model_id for marker in ("embedding", "reranker", "-vl")):
         return None
+    if _QWEN_DOTTED_MINOR_RE.match(model_id):
+        return "qwen3_xml"
     if model_id.startswith(("qwen3-", "qwen2.5-", "qwq-")):
         return "hermes"
+    return None
+
+
+def recommended_vllm_reasoning_parser(model_name: str | None) -> str | None:
+    """Return the reasoning parser a known thinking model needs, or None.
+
+    Without one, vLLM leaves the model's own ``<think>...</think>`` inside the
+    answer instead of separating it into ``reasoning_content`` -- and the
+    OpenCode provider Launchpad writes declares ``reasoning_content`` as the
+    interleaved field whenever the chat template names it, so the declaration
+    and the running server disagree and the thinking is shown as the reply.
+
+    Qwen3, QwQ and the dotted Qwen 3.x releases all emit ``<think>``, which is
+    what vLLM's ``qwen3`` parser reads. Qwen3-Coder does not think, and the
+    embedding/reranking runtimes are left alone rather than guessed at.
+    """
+
+    model_id = (model_name or "").strip().rsplit("/", 1)[-1].casefold()
+    if not model_id or model_id.startswith("qwen3-coder-"):
+        return None
+    if any(marker in model_id for marker in ("embedding", "reranker")):
+        return None
+    if _QWEN_DOTTED_MINOR_RE.match(model_id) or model_id.startswith(("qwen3-", "qwq-")):
+        return "qwen3"
     return None
 
 

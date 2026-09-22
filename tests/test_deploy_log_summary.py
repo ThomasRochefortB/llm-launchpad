@@ -391,6 +391,16 @@ class DeployLogSummarizerTests(unittest.TestCase):
             ),
             ["Downloading model (74%)"],
         )
+        # Prime reports bytes rather than a percentage for a plain
+        # snapshot download; a 55 GB model with no number on screen is
+        # twenty minutes of an unchanging row.
+        self.assertEqual(
+            s.transform(
+                "Prime runtime: runtime container is downloading the model, 46.6 GB so far",
+                OperationType.DEPLOY,
+            ),
+            ["Downloading model — 46.6 GB so far"],
+        )
         self.assertEqual(
             s.transform(
                 "Prime runtime: runtime container is loading the model (40%)",

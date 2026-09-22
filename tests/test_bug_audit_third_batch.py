@@ -363,7 +363,7 @@ class FastDeployModelSearchTests(unittest.IsolatedAsyncioTestCase):
 
 class OperationsReconcileCadenceTests(unittest.TestCase):
     def test_a_repaint_does_not_run_job_reconciliation(self) -> None:
-        from llm_launchpad.tui.screens.operations import OperationsScreen
+        from llm_launchpad.tui.screens.operations import DeploymentJobsPanel
 
         calls: list[str] = []
 
@@ -386,10 +386,10 @@ class OperationsReconcileCadenceTests(unittest.TestCase):
             app=SimpleNamespace(deployment_jobs={}, _get_job_store=lambda: store)
         )
 
-        OperationsScreen._durable_jobs(stub)
+        DeploymentJobsPanel._durable_jobs(stub)
         self.assertEqual(calls, [], "repainting twice a second must not write to SQLite")
 
-        OperationsScreen._durable_jobs(stub, reconcile=True)
+        DeploymentJobsPanel._durable_jobs(stub, reconcile=True)
         self.assertEqual(calls, ["reconcile", "import"])
 
 

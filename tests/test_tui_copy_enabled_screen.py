@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
+from textual import events
 from textual.app import App, ComposeResult
 from textual.selection import SELECT_ALL
 from textual.widgets import DataTable, Input, OptionList, Static
@@ -109,19 +110,6 @@ class _QuitCaptureApp(TuiApp):
         self.quit_calls += 1
 
 
-class _MouseDriverStub:
-    def __init__(self, mouse: bool) -> None:
-        self._mouse = mouse
-        self.enable_calls = 0
-        self.disable_calls = 0
-
-    def _enable_mouse_support(self) -> None:
-        self.enable_calls += 1
-
-    def _disable_mouse_support(self) -> None:
-        self.disable_calls += 1
-
-
 class _TuiClipboardApp(TuiApp):
     """TuiApp test shell without provider checks or terminal CSS setup."""
 
@@ -132,6 +120,22 @@ class _TuiClipboardApp(TuiApp):
 
 
 class CopyEnabledScreenTests(unittest.IsolatedAsyncioTestCase):
+    async def test_terminal_paste_over_ssh_does_not_read_remote_clipboard(self) -> None:
+        app = _TuiClipboardApp()
+        with (
+            patch.dict("os.environ", {"SSH_TTY": "/dev/pts/1", "TMUX": "/tmp/tmux"}),
+            patch("llm_launchpad.tui.app.read_system_clipboard") as read_clipboard,
+        ):
+            async with app.run_test() as pilot:
+                app.push_screen(_InputFallbackScreen())
+                await pilot.pause()
+                field = app.screen.query_one(Input)
+                field.action_select_all()
+                app.post_message(events.Paste("https://example.com/模型?key=a&b=c"))
+                await pilot.pause()
+                self.assertEqual(field.value, "https://example.com/模型?key=a&b=c")
+                read_clipboard.assert_not_called()
+
     async def test_tui_ctrl_c_copies_selected_input_instead_of_quitting(self) -> None:
         app = _TuiClipboardApp()
         with (
@@ -449,30 +453,19 @@ class TuiAppQuitTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(app.notifications), 2)
 
 
-class TuiAppMouseModeTests(unittest.TestCase):
-    def test_toggle_mouse_mode_enables_driver_mouse_support(self) -> None:
-        app = TuiApp(mouse_enabled=False)
-        driver = _MouseDriverStub(mouse=False)
-        app._driver = driver
+class TuiAppTerminalSelectionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_legacy_settings_and_launch_arguments_cannot_capture_mouse(self) -> None:
+        from llm_launchpad.protocol.models import LaunchpadSettings
 
-        app.action_toggle_mouse_mode()
-
-        self.assertTrue(app.mouse_enabled)
-        self.assertTrue(driver._mouse)
-        self.assertEqual(driver.enable_calls, 1)
-        self.assertEqual(driver.disable_calls, 0)
-
-    def test_toggle_mouse_mode_disables_driver_mouse_support(self) -> None:
-        app = TuiApp(mouse_enabled=True)
-        driver = _MouseDriverStub(mouse=True)
-        app._driver = driver
-
-        app.action_toggle_mouse_mode()
-
-        self.assertFalse(app.mouse_enabled)
-        self.assertFalse(driver._mouse)
-        self.assertEqual(driver.enable_calls, 0)
-        self.assertEqual(driver.disable_calls, 1)
+        with (
+            patch.dict("os.environ", {"LLM_LAUNCHPAD_TUI_MOUSE": "true"}),
+            patch("llm_launchpad.tui.app.ConfigStore.load", return_value=LaunchpadSettings(tui_mouse=True)),
+            patch.object(App, "run_async", new_callable=AsyncMock) as run,
+        ):
+            app = TuiApp(mouse_enabled=True)
+            await app.run_async(mouse=True)
+            self.assertFalse(app.mouse_enabled)
+            self.assertFalse(run.call_args.kwargs["mouse"])
 
 
 class CopyEnabledScreenInheritanceTests(unittest.TestCase):

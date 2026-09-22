@@ -20,7 +20,7 @@ from llm_launchpad.protocol.models import DeploymentConfig, EndpointInfo
 from llm_launchpad.tui.app import TuiApp
 from llm_launchpad.tui.deployment_jobs import DeploymentJob
 from llm_launchpad.tui.screens.monitor import MonitorScreen
-from llm_launchpad.tui.screens.operations import OperationsScreen
+from llm_launchpad.tui.screens.manage import ManageScreen
 
 
 def config(name: str, provider: ComputeProvider = ComputeProvider.MODAL) -> DeploymentConfig:
@@ -278,7 +278,7 @@ class DeploymentJobInteractionTests(unittest.IsolatedAsyncioTestCase):
                     await wait_until(first.finished.is_set)
                     self.assertFalse(second.finished.is_set())
                     await pilot.press("ctrl+o")
-                    self.assertIsInstance(app.screen, OperationsScreen)
+                    self.assertIsInstance(app.screen, ManageScreen)
                     await pilot.press("enter")
                     self.assertIs(app.screen, first.monitor)
                     await pilot.pause()

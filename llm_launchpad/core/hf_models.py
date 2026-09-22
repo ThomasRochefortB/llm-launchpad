@@ -7,10 +7,10 @@ import json
 import math
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Literal
 
-from .coerce import optional_str
+from .coerce import optional_str, positive_int
 from .diagnostics import log_debug
 from .gguf_metadata import (
     GgufMtpCapability,
@@ -82,10 +82,13 @@ class VllmMemoryBreakdown:
 
 
 _CACHE_TTL_SECONDS = 300
-_VLLM_MEMORY_CACHE_SCHEMA_VERSION = 4
+_VLLM_MEMORY_CACHE_SCHEMA_VERSION = 5
 _HF_REQUEST_TIMEOUT_SECONDS = 10.0
 _HF_ETAG_TIMEOUT_SECONDS = 10.0
 _DEFAULT_CONTEXT_TOKENS = 8192
+# Activations, CUDA graphs, the profiler's own headroom: everything vLLM holds
+# beyond the weights and the cache, as a fraction of both.
+_MEMORY_OVERHEAD_FRACTION = 0.20
 _CACHE: dict[tuple[str, str, int], tuple[float, list[ModelCandidate]]] = {}
 _GGUF_QUANT_METADATA_CACHE: dict[
     tuple[str, str, str, bool, bool], tuple[float, GgufQuantMetadata]
@@ -188,16 +191,21 @@ def fetch_vllm_memory_breakdown(
     tokenizer_config: dict[str, Any] | None = None
     generation_config: dict[str, Any] | None = None
 
-    primary_config = config if isinstance(config, dict) else {}
-    if not primary_config:
+    # ``info.config`` is Hugging Face's trimmed view: architecture, model type
+    # and the tokenizer, but never the layer shape, and never the
+    # ``text_config``/``vision_config`` split a multimodal repository keeps
+    # its shape under. A non-empty trimmed view used to stop the repository's
+    # own config.json from being read at all, so every such model was sized
+    # from a guessed transformer rather than from its own numbers.
+    root_config = config if isinstance(config, dict) else {}
+    if _model_shape_config(root_config) is None:
         repo_config = _load_repo_json_file(normalized_repo, revision_key or None, "config.json")
         if isinstance(repo_config, dict):
-            primary_config = repo_config
+            root_config = {**repo_config, **root_config}
 
-    multimodal = isinstance(primary_config.get("vision_config"), dict)
-    if isinstance(primary_config.get("text_config"), dict):
-        primary_config = primary_config["text_config"]
-    weights_bytes = _extract_safetensors_total_bytes(safetensors)
+    multimodal = isinstance(root_config.get("vision_config"), dict)
+    primary_config = _model_shape_config(root_config) or root_config
+    weights_bytes = _safetensors_weight_bytes(safetensors)
     parameter_count = _extract_parameter_count(repo_id=normalized_repo, config=primary_config, safetensors=safetensors)
     if weights_bytes is None and parameter_count is None:
         return None
@@ -276,10 +284,19 @@ def fetch_vllm_memory_breakdown(
 
     kv_cache_bytes = 0.0
     if num_layers and hidden_size and effective_context > 0:
-        # KV bytes ~= 2 (K,V) * layers * hidden_size * context * 2 bytes (fp16/bf16).
-        kv_cache_bytes = float(2 * num_layers * hidden_size * effective_context * 2)
+        # KV bytes ~= 2 (K,V) * cached layers * KV width * context * 2 bytes
+        # (fp16/bf16). The KV width is the grouped-query width -- KV heads by
+        # head dimension -- not the model's hidden size: reading the hidden
+        # size charges every query head for a cache it shares, which on a
+        # 4-KV-head model is eight times the true figure. Only the layers that
+        # keep a cache are counted, because a hybrid model's linear-attention
+        # layers hold a fixed-size recurrent state instead of growing with the
+        # context.
+        kv_width = _kv_cache_width(primary_config, hidden_size=hidden_size)
+        cached_layers = _kv_cache_layer_count(primary_config, num_layers=num_layers)
+        kv_cache_bytes = float(2 * cached_layers * kv_width * effective_context * 2)
 
-    overhead_bytes = (weights_bytes + kv_cache_bytes) * 0.20
+    overhead_bytes = (weights_bytes + kv_cache_bytes) * _MEMORY_OVERHEAD_FRACTION
     total_bytes = weights_bytes + kv_cache_bytes + overhead_bytes
     if total_bytes <= 0:
         return None
@@ -294,6 +311,31 @@ def fetch_vllm_memory_breakdown(
     )
     _VLLM_MEMORY_CACHE[cache_key] = (now, estimate)
     return estimate
+
+
+def rescale_vllm_memory_breakdown(
+    estimate: VllmMemoryBreakdown | None, context_tokens: int | None
+) -> VllmMemoryBreakdown | None:
+    """Restate an estimate at a different served context length.
+
+    The cache is the only term that moves with the context, and it moves
+    linearly, so a breakdown measured at the model's native length answers for
+    any other length without another Hugging Face round trip.
+    """
+    if estimate is None:
+        return None
+    requested = positive_int(context_tokens)
+    if requested is None or estimate.context_tokens <= 0 or requested == estimate.context_tokens:
+        return estimate
+    kv_cache_gb = estimate.kv_cache_gb * (requested / estimate.context_tokens)
+    overhead_gb = (estimate.weights_gb + kv_cache_gb) * _MEMORY_OVERHEAD_FRACTION
+    return replace(
+        estimate,
+        kv_cache_gb=kv_cache_gb,
+        overhead_gb=overhead_gb,
+        total_gb=estimate.weights_gb + kv_cache_gb + overhead_gb,
+        context_tokens=requested,
+    )
 
 
 def fetch_model_max_context(repo_id: str, revision: str | None = None) -> int | None:
@@ -1175,17 +1217,124 @@ def _normalize_quant_label(value: Any) -> str:
     return upper
 
 
-def _extract_safetensors_total_bytes(payload: Any) -> float | None:
-    if not isinstance(payload, dict):
+# Bytes per element for the dtype names Hugging Face reports in a
+# repository's safetensors header.
+_SAFETENSORS_DTYPE_BYTES: dict[str, float] = {
+    "F64": 8.0, "I64": 8.0, "U64": 8.0,
+    "F32": 4.0, "I32": 4.0, "U32": 4.0,
+    "BF16": 2.0, "F16": 2.0, "I16": 2.0, "U16": 2.0,
+    "F8_E4M3": 1.0, "F8_E5M2": 1.0, "F8": 1.0,
+    "I8": 1.0, "U8": 1.0, "BOOL": 1.0,
+    "F4": 0.5, "I4": 0.5, "U4": 0.5,
+}
+_DEFAULT_WEIGHT_DTYPE_BYTES = 2.0
+
+
+def _safetensors_field(payload: Any, name: str) -> Any:
+    """Read one field from Hugging Face's safetensors info, dict or object."""
+    if isinstance(payload, dict):
+        return payload.get(name)
+    return getattr(payload, name, None)
+
+
+def _safetensors_weight_bytes(payload: Any) -> float | None:
+    """Return the weight bytes a repository's safetensors header implies.
+
+    ``SafeTensorsInfo.total`` is a **parameter count**, not a byte count:
+    reading it as bytes sized every bf16 model at half its weights, which is
+    the direction that does not fit. The per-dtype breakdown beside it is what
+    converts to bytes, and it is also what makes a mixed-precision checkpoint
+    (fp8 experts beside a bf16 embedding) come out right.
+    """
+    if payload is None:
         return None
-    total = payload.get("total")
+    parameters = _safetensors_field(payload, "parameters")
+    total_bytes = 0.0
+    if isinstance(parameters, dict) and parameters:
+        for dtype, count in parameters.items():
+            try:
+                numeric = float(count)
+            except (TypeError, ValueError):
+                continue
+            if numeric <= 0:
+                continue
+            width = _SAFETENSORS_DTYPE_BYTES.get(
+                str(dtype).strip().upper(), _DEFAULT_WEIGHT_DTYPE_BYTES
+            )
+            total_bytes += numeric * width
+        if total_bytes > 0:
+            return total_bytes
     try:
-        numeric = float(total)
+        total = float(_safetensors_field(payload, "total"))
     except (TypeError, ValueError):
         return None
-    if numeric <= 0:
+    if total <= 0:
         return None
-    return numeric
+    return total * _DEFAULT_WEIGHT_DTYPE_BYTES
+
+
+def _model_shape_config(config: Any) -> dict[str, Any] | None:
+    """Return the sub-config carrying the decoder shape, or None if absent.
+
+    A multimodal repository keeps the decoder under ``text_config`` and the
+    encoder under ``vision_config``; a text-only one states the shape at the
+    top level.
+    """
+    if not isinstance(config, dict):
+        return None
+    text_config = config.get("text_config")
+    if isinstance(text_config, dict) and _extract_int_config(
+        text_config, "num_hidden_layers", "n_layer", "num_layers", "n_layers", "decoder_layers"
+    ):
+        return text_config
+    if _extract_int_config(
+        config, "num_hidden_layers", "n_layer", "num_layers", "n_layers", "decoder_layers"
+    ):
+        return config
+    return None
+
+
+def _kv_cache_width(config: Any, hidden_size: int) -> int:
+    """Return the per-layer K (or V) width one cached token occupies."""
+    kv_heads = _extract_int_config(
+        config, "num_key_value_heads", "num_kv_heads", "n_kv_heads"
+    )
+    query_heads = _extract_int_config(
+        config, "num_attention_heads", "n_head", "num_heads"
+    )
+    head_dim = _extract_int_config(config, "head_dim", "attention_head_dim", "v_head_dim")
+    if head_dim is None and query_heads:
+        head_dim = hidden_size // query_heads if hidden_size >= query_heads else None
+    if kv_heads is None:
+        kv_heads = query_heads
+    if not kv_heads or not head_dim:
+        # Nothing to narrow the estimate with: keep the conservative width.
+        return hidden_size
+    return kv_heads * head_dim
+
+
+# Layer kinds that hold a fixed-size recurrent state rather than a cache that
+# grows with the context. Everything else is charged the full context, which
+# overstates a sliding-window layer and is the direction that still fits.
+_RECURRENT_LAYER_TOKENS = ("linear", "mamba", "recurrent", "conv", "ssm")
+
+
+def _kv_cache_layer_count(config: Any, num_layers: int) -> int:
+    """Return how many layers hold a context-sized KV cache."""
+    if isinstance(config, dict):
+        layer_types = config.get("layer_types")
+        if isinstance(layer_types, list) and layer_types:
+            cached = sum(
+                1
+                for entry in layer_types
+                if not any(token in str(entry).lower() for token in _RECURRENT_LAYER_TOKENS)
+            )
+            if cached:
+                return cached
+        interval = _extract_int_config(config, "full_attention_interval")
+        if interval and interval > 1:
+            return max(1, num_layers // interval)
+    return num_layers
 
 
 def _extract_parameter_count(repo_id: str, config: Any, safetensors: Any) -> float | None:

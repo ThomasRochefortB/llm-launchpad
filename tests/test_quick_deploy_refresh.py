@@ -12,6 +12,8 @@ from collections.abc import Sequence
 import unittest
 from unittest.mock import patch
 
+from dataclasses import replace
+
 from llm_launchpad.core.gguf_metadata import GgufMtpCapability, GgufMtpStatus
 from llm_launchpad.core.hf_models import (
     GgufQuantMetadata,
@@ -21,6 +23,7 @@ from llm_launchpad.core.hf_models import (
 from llm_launchpad.core.modal_gpu import ModalGpuSpec
 from llm_launchpad.core.quick_deploy import QuickDeployProfile
 from llm_launchpad.protocol.enums import SpeculativeDecodingMethod
+from llm_launchpad.protocol.models import CatalogExclusion
 from llm_launchpad.core.artificial_analysis import (
     AAModelCandidate,
     _AARankings,
@@ -1296,6 +1299,121 @@ class CatalogRetentionTests(unittest.TestCase):
                     cache_path=Path(directory) / "missing.json",
                 )
             )
+
+    def test_a_rebuild_that_back_fills_past_the_throttled_top_is_kept_out(self) -> None:
+        # Observed live: Hugging Face rate limiting removed every model ranked
+        # above 390, discovery kept walking down the ranking to fill the size
+        # categories, and the rebuild published 335 profiles over a cached 167
+        # -- twice as many, none of them the models the user came for. Counting
+        # profiles said the refresh had improved.
+        with TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "catalog.json"
+            self._seed_ranked(cache_path, {"aa-glm": "GLM 5.3 Flash", "aa-qwen": "Qwen3.8 27B"})
+
+            retained = _retained_catalog_for(
+                [_catalog_profile(f"filler-{index}") for index in range(40)],
+                [
+                    CatalogExclusion(
+                        model_id="aa-glm", display_name="GLM 5.3 Flash", repo_id="",
+                        reason="Hugging Face rate limit reached; this model was not checked.",
+                        rank=29, unchecked=True,
+                    )
+                ],
+                cache_path=cache_path,
+            )
+
+            assert retained is not None
+            info, profiles = retained
+            self.assertEqual(len(profiles), 2)
+            self.assertIn("GLM 5.3 Flash", info.error or "")
+            self.assertIn("rate limiting", info.error or "")
+
+    def test_a_model_the_build_decided_against_is_not_degradation(self) -> None:
+        # Dropping a model because its architecture is unsupported is a
+        # conclusion, not a failed lookup, and must not freeze the catalog.
+        with TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "catalog.json"
+            self._seed_ranked(cache_path, {"aa-glm": "GLM 5.3 Flash", "aa-qwen": "Qwen3.8 27B"})
+
+            self.assertIsNone(
+                _retained_catalog_for(
+                    [_catalog_profile(f"filler-{index}") for index in range(40)],
+                    [
+                        CatalogExclusion(
+                            model_id="aa-glm", display_name="GLM 5.3 Flash", repo_id="",
+                            reason="GGUF architecture 'glm5' is not recognized by llama.cpp.",
+                            rank=29,
+                        )
+                    ],
+                    cache_path=cache_path,
+                )
+            )
+
+    def _seed_ranked(self, cache_path: Path, models: dict[str, str]) -> None:
+        from llm_launchpad.core.quick_deploy import QuickDeployCatalogInfo
+
+        _write_quick_deploy_catalog_cache(
+            QuickDeployCatalogInfo(
+                source_label="Cached catalog",
+                generated_at="2026-09-03T00:00:00Z",
+                is_live=True,
+            ),
+            [
+                replace(
+                    _catalog_profile(model_id),
+                    aa_model_id=model_id,
+                    display_name=display_name,
+                )
+                for model_id, display_name in models.items()
+            ],
+            cache_path=cache_path,
+        )
+
+
+class CatalogFreshnessTests(unittest.TestCase):
+    """A build that could not look everywhere is never fresh."""
+
+    def _info(self, *exclusions: CatalogExclusion):
+        from llm_launchpad.core.quick_deploy import QuickDeployCatalogInfo
+
+        return QuickDeployCatalogInfo(
+            source_label="Test catalog",
+            generated_at="2026-09-03T00:00:00Z",
+            is_live=True,
+            exclusions=exclusions,
+        )
+
+    def test_a_throttled_build_is_stale_however_recent(self) -> None:
+        # The freshness check used to match the exhausted-budget sentence
+        # alone, so a catalog that lost 82 models to HTTP 429 -- a different
+        # sentence for the same gap -- was served for the whole six-hour TTL.
+        info = self._info(
+            CatalogExclusion(
+                model_id="aa-glm", display_name="GLM 5.3 Flash", repo_id="",
+                reason="Hugging Face rate limit reached; this model was not checked.",
+                rank=29, unchecked=True,
+            )
+        )
+
+        self.assertFalse(
+            is_fresh_cached_quick_deploy_catalog(
+                info, now=datetime(2026, 9, 3, 0, 1, tzinfo=UTC)
+            )
+        )
+
+    def test_a_complete_build_with_ordinary_exclusions_stays_fresh(self) -> None:
+        info = self._info(
+            CatalogExclusion(
+                model_id="aa-old", display_name="Old model", repo_id="",
+                reason="Outside the top 3 Compact \u226440B recommendations.", rank=140,
+            )
+        )
+
+        self.assertTrue(
+            is_fresh_cached_quick_deploy_catalog(
+                info, now=datetime(2026, 9, 3, 0, 1, tzinfo=UTC)
+            )
+        )
 
 
 

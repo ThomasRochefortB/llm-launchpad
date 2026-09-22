@@ -21,7 +21,6 @@ from ..visual import (
 )
 from ..widgets.input_form import FormField, ToggleField
 from ..widgets.fitted_footer import FittedFooter
-from ..mouse import default_tui_mouse_enabled
 from ..navigation import move_focus_with_arrows
 from .copy_enabled import CopyEnabledScreen
 
@@ -50,11 +49,7 @@ class SettingsScreen(CopyEnabledScreen):
     BINDINGS = [
         Binding("escape", "pop_screen", "Back", show=True),
         Binding("ctrl+s", "save", "Save", show=True),
-        # This form had no arrow navigation at all: focus started in an input
-        # and the arrows moved nothing, so every control below it was reachable
-        # only by tab. That is a modifier-bar item on a phone keyboard, which
-        # is where this screen matters most -- it is where mouse support is
-        # turned on when taps are being ignored.
+        # Arrows supplement Tab navigation, including on phone keyboards.
         Binding("up", "focus_previous_control", "Previous", show=False, priority=True),
         Binding("down", "focus_next_control", "Next", show=False, priority=True),
     ]
@@ -80,7 +75,7 @@ class SettingsScreen(CopyEnabledScreen):
         with Vertical(id="settings-layout"):
             with VerticalScroll(id="settings-scroll", classes="screen-scroll"):
                 with Vertical(id="settings-form"):
-                    yield Static("[bold #7bf168]Settings[/]", id="settings-title")
+                    yield Static("[bold primary]Settings[/]", id="settings-title")
                     yield Static("[bold]Deployment[/bold]", classes="settings-section")
                     yield FormField(
                         "Idle timeout before scale-down",
@@ -109,22 +104,9 @@ class SettingsScreen(CopyEnabledScreen):
                             )
                             yield Static("[dim]Spacing[/dim]", classes="form-hint")
                     yield Static("[bold]Behavior[/bold]", classes="settings-section")
-                    yield ToggleField(
-                        "Enable mouse support",
-                        "tui-mouse",
-                        # Unset does not mean on: over SSH the default resolves to
-                        # off so the terminal keeps its own selection. Showing a
-                        # flat True told an SSH user that clicks were enabled while
-                        # the app was ignoring every one of them.
-                        default=(
-                            settings.tui_mouse
-                            if settings.tui_mouse is not None
-                            else default_tui_mouse_enabled()
-                        ),
-                    )
                     yield Static(
-                        "[dim]Off enables native terminal text selection and copy shortcuts; "
-                        "ctrl+t toggles this at runtime.[/dim]",
+                        "[dim]Navigate with Tab, Shift+Tab, arrow keys, and Enter. "
+                        "Use your terminal's selection and copy/paste shortcuts.[/dim]",
                         classes="form-hint",
                     )
                     yield ToggleField(
@@ -234,7 +216,6 @@ class SettingsScreen(CopyEnabledScreen):
             tui_density=normalize_tui_density(
                 self.query_one("#tui-density", Select).value
             ),
-            tui_mouse=self.query_one("#tui-mouse", Switch).value,
             confirm_quit=self.query_one("#confirm-quit", Switch).value,
         )
         result = self._store.save_result(settings)
@@ -252,14 +233,7 @@ class SettingsScreen(CopyEnabledScreen):
             )
 
     def _apply_behavior_settings(self, settings: LaunchpadSettings) -> None:
-        """Apply mouse-mode and quit-confirmation preferences to the running app."""
-        set_mouse_mode = getattr(self.app, "_set_mouse_mode", None)
-        if (
-            callable(set_mouse_mode)
-            and settings.tui_mouse is not None
-            and bool(getattr(self.app, "mouse_enabled", True)) != settings.tui_mouse
-        ):
-            set_mouse_mode(settings.tui_mouse)
+        """Apply quit-confirmation preferences to the running app."""
         self.app._confirm_quit = settings.confirm_quit
 
     def action_focus_next_control(self) -> None:

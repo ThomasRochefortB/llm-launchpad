@@ -143,5 +143,69 @@ class AuthoritativeGateTests(unittest.TestCase):
         self.assertIn("vllm-tensor-parallel-exceeds-gpus", codes)
 
 
+class ResolvedEvidenceSurvivesPreflightTests(unittest.TestCase):
+    """What the planner certified has to reach the runtime that serves it."""
+
+    def _assessed_config(self) -> DeploymentConfig:
+        from llm_launchpad.protocol.enums import CertificationState, ServingObjective
+        from llm_launchpad.protocol.models import (
+            MemoryEstimate,
+            PlacementAssessment,
+            RuntimeTuning,
+            ServingRequirements,
+        )
+
+        tuning = RuntimeTuning(
+            parallel_slots=4, batch_size=2048, ubatch_size=64,
+            cache_type_k="f16", cache_type_v="f16", flash_attention=False,
+            gpu_layers="all", fit_target_mib=9216,
+        )
+        memory = MemoryEstimate(
+            weights_gb=10.0, kv_cache_gb=4.0, compute_gb=2.0,
+            attention_scratch_gb=1.0, speculative_gb=0.0, reserve_gb=9.0,
+            total_gb=26.0, per_device_required_gb=(26.0,), confidence=0.82,
+            source="gguf-metadata", total_layer_count=32,
+        )
+        config = _vast_config()
+        config.serving_requirements = ServingRequirements(
+            context_tokens=32768, objective=ServingObjective.GENERAL_PURPOSE,
+            full_context_per_request=True, gpu_only=True,
+        )
+        config.runtime_tuning = tuning
+        config.placement_assessment = PlacementAssessment(
+            fits=True, gpu_resident=True, memory=memory, tuning=tuning,
+            certification=CertificationState.CERTIFIED,
+            fingerprint="fingerprint-under-test",
+        )
+        return config
+
+    def test_the_plan_carries_the_certified_tuning_and_assessment(self) -> None:
+        # A DeploymentRequest carries intent, not evidence, so these had no
+        # field to travel in -- and the lifecycle assigns the plan's values
+        # onto the config unconditionally, so a plan that resolved neither
+        # *erased* both. Certification then failed with "No placement
+        # assessment was supplied", and the runtime was served a tuning
+        # re-derived from the objective instead of the one it was certified
+        # with (9216 MiB of runtime margin became the 2048 MiB default).
+        config = self._assessed_config()
+
+        result = preflight_config(config)
+
+        assert result.plan is not None
+        self.assertIsNotNone(result.plan.placement_assessment)
+        assert result.plan.placement_assessment is not None
+        self.assertEqual(
+            result.plan.placement_assessment.fingerprint, "fingerprint-under-test"
+        )
+        assert result.plan.runtime_tuning is not None
+        self.assertEqual(result.plan.runtime_tuning.fit_target_mib, 9216)
+
+    def test_a_config_that_resolved_nothing_still_plans(self) -> None:
+        result = preflight_config(_vast_config())
+
+        assert result.plan is not None
+        self.assertIsNone(result.plan.placement_assessment)
+
+
 if __name__ == "__main__":
     unittest.main()

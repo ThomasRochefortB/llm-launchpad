@@ -27,7 +27,7 @@ class SetupRequiredScreen(CopyEnabledScreen):
     def compose(self) -> ComposeResult:
         with Vertical(id="setup-required-root"):
             with VerticalScroll(id="setup-required-scroll", classes="screen-scroll"):
-                yield Static("[bold #7bf168]Compute provider required[/]")
+                yield Static("[bold primary]Compute provider required[/]")
                 yield Static(
                     "llm-launchpad deploys inference endpoints through at least one "
                     "compute provider. None currently has credentials.\n",
@@ -136,7 +136,7 @@ class SetupRequiredScreen(CopyEnabledScreen):
     def _copy_command(self, command: str) -> None:
         self.app.copy_to_clipboard(command)
         self.query_one("#setup-required-feedback", Static).update(
-            f"[green]Copied:[/green] [bold]{command}[/bold]"
+            f"Copy requested: [bold]{command}[/bold]"
         )
 
     def action_recheck(self) -> None:

@@ -180,6 +180,34 @@ def _stub_orchestrator_reasoning_discovery(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 @pytest.fixture(autouse=True)
+def _isolate_opencode_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> None:
+    """Keep the suite out of the developer's own OpenCode configuration.
+
+    Seven CLI tests drive ``deploy`` and ``switch`` end to end without
+    stubbing the OpenCode sync, so the real one ran against
+    ``~/.config/opencode/opencode.json`` -- which is how a provider pointing
+    at ``https://alice--llamacpp-org-model-gguf-serve.modal.run`` came to sit
+    in a real editor config, rewritten unchanged on every test run since.
+    ``_resolve_config_path`` and the registry writer both read these module
+    attributes when they are called, so redirecting them is enough.
+    """
+
+    from llm_launchpad.core import opencode as opencode_module
+
+    root = tmp_path_factory.mktemp("opencode")
+    monkeypatch.setattr(opencode_module, "OPENCODE_CONFIG_PATH", root / "opencode.json")
+    monkeypatch.setattr(
+        opencode_module, "OPENCODE_JSONC_CONFIG_PATH", root / "opencode.jsonc"
+    )
+    monkeypatch.setattr(
+        opencode_module, "OPENCODE_REGISTRY_PATH", root / "opencode_registry.json"
+    )
+
+
+@pytest.fixture(autouse=True)
 def _isolate_quick_deploy_catalog_cache(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path_factory: pytest.TempPathFactory,

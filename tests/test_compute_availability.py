@@ -5,13 +5,18 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from dataclasses import replace
+
 from llm_launchpad.core.compute_availability import (
     aggregate_compute_availability,
     canonical_gpu_identity,
     display_gpu_type,
     load_compute_availability,
     plans_for_compute_profile,
+    recipe_for_placement,
 )
+from llm_launchpad.core.llamacpp_planner import compile_server_args
+from llm_launchpad.core.quick_deploy import quick_deploy_recipe
 from llm_launchpad.core.modal_gpu import ModalGpuSpec
 from llm_launchpad.core.prime_backend import PrimeBackend, preferred_prime_offer_image
 from llm_launchpad.core.quick_deploy import QuickDeployProfile
@@ -417,3 +422,67 @@ class ComputeAvailabilityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PlacementRuntimeMarginTests(unittest.TestCase):
+    """The runtime margin is a share of the device, so it is set per placement."""
+
+    def _profile_with_plan(self) -> QuickDeployProfile:
+        from llm_launchpad.protocol.models import (
+            MemoryEstimate,
+            RuntimeTuning,
+            ServingRequirements,
+        )
+        from llm_launchpad.protocol.enums import ServingObjective
+
+        tuning = RuntimeTuning(
+            parallel_slots=4, batch_size=2048, ubatch_size=64,
+            cache_type_k="f16", cache_type_v="f16", flash_attention=False,
+            gpu_layers="all", fit_target_mib=2048,
+        )
+        requirements = ServingRequirements(
+            context_tokens=32768, objective=ServingObjective.GENERAL_PURPOSE,
+            full_context_per_request=True, gpu_only=True,
+        )
+        memory = MemoryEstimate(
+            weights_gb=20.0, kv_cache_gb=8.0, compute_gb=2.0,
+            attention_scratch_gb=1.0, speculative_gb=0.0, reserve_gb=0.0,
+            total_gb=31.0, per_device_required_gb=(31.0,), confidence=0.82,
+            source="gguf-metadata", total_layer_count=32,
+        )
+        base = _profile(required_vram_gb=31.0)
+        return replace(
+            base,
+            serving_requirements=requirements,
+            runtime_tuning=tuning,
+            memory_estimate=memory,
+            server_args=tuple(compile_server_args(requirements, tuning)),
+        )
+
+    def test_a_large_device_gets_the_margin_its_memory_model_promises(self) -> None:
+        # Live: the catalog's 2 GiB floor packed a 180 GB B200 to within 2 GiB
+        # and llama.cpp then had nothing left for its compute graphs. Five
+        # GLM-5.3-Flash deploys died in graph_reserve; the one that survived
+        # differed from them in this argument alone (9216 against 2048).
+        recipe = quick_deploy_recipe(self._profile_with_plan())
+
+        retuned = recipe_for_placement(recipe, 180.0)
+
+        assert retuned.runtime_tuning is not None
+        self.assertEqual(retuned.runtime_tuning.fit_target_mib, 9216)
+        args = list(retuned.server_args or ())
+        self.assertEqual(args[args.index("--fit-target") + 1], "9216")
+
+    def test_a_small_device_keeps_the_two_gibibyte_floor(self) -> None:
+        recipe = quick_deploy_recipe(self._profile_with_plan())
+
+        retuned = recipe_for_placement(recipe, 24.0)
+
+        # 5% of 24 GB is under the floor, so nothing changes and the recipe is
+        # returned unchanged rather than rebuilt.
+        self.assertIs(retuned, recipe)
+
+    def test_an_unknown_device_size_changes_nothing(self) -> None:
+        recipe = quick_deploy_recipe(self._profile_with_plan())
+
+        self.assertIs(recipe_for_placement(recipe, None), recipe)

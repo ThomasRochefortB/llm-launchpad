@@ -55,6 +55,8 @@ class TuiAuditInteractionTests(unittest.IsolatedAsyncioTestCase):
                 "display_name": "Test", "api_key": "audit-example-key",
             }))
             screen.on_operation_done(OperationDone(OperationType.DEPLOY, success=True))
+            # The outcome card mounts on the next refresh, not inline.
+            await pilot.pause()
             screen.query_one("#copy-url-btn", Button).focus()
             await pilot.press("enter")
             self.assertEqual(app.clipboard, "https://example.test/v1")

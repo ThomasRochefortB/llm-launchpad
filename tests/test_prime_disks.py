@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import tempfile
 import unittest
 from pathlib import Path
@@ -315,6 +316,57 @@ class PrimeDiskHelperTests(unittest.TestCase):
         self.assertEqual(backend.list_offer_disk_ids, [None, "disk-new"])
         self.assertEqual([row.id for row in stored], ["disk-new"])
         self.assertTrue(any("Created Prime cache disk" in line for line in messages))
+
+    def test_an_unavailable_cache_disk_says_why(self) -> None:
+        """The disk is what stops the next deploy re-downloading the weights."""
+        backend = _DiskBackend()
+
+        def _refuse() -> list[PrimeDiskOffer]:
+            raise RuntimeError("disk quota exhausted")
+
+        backend.list_disk_offers = _refuse  # type: ignore[method-assign]
+        config = DeploymentConfig(
+            backend=BackendType.VLLM,
+            provider=ComputeProvider.PRIME,
+            gpu_type="H100_80GB",
+            gpu_count=1,
+            model_name="Qwen/Qwen3-4B",
+            provider_options=PrimeProviderOptions(),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            _offer, disk_id, messages = resolve_prime_offer_and_disk(
+                backend,
+                config,
+                required_image="ubuntu_22_cuda_12",
+                path=Path(tmp) / "disks.json",
+            )
+
+        self.assertIsNone(disk_id)
+        unavailable = [line for line in messages if "cache disk unavailable" in line]
+        self.assertTrue(unavailable)
+        self.assertIn("disk quota exhausted", unavailable[0])
+
+    def test_a_location_with_no_disk_product_says_so(self) -> None:
+        backend = _DiskBackend()
+        backend.disk_offer = replace(backend.disk_offer, data_center="ELSEWHERE-9")
+        config = DeploymentConfig(
+            backend=BackendType.VLLM,
+            provider=ComputeProvider.PRIME,
+            gpu_type="H100_80GB",
+            gpu_count=1,
+            model_name="Qwen/Qwen3-4B",
+            provider_options=PrimeProviderOptions(),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            _offer, disk_id, messages = resolve_prime_offer_and_disk(
+                backend,
+                config,
+                required_image="ubuntu_22_cuda_12",
+                path=Path(tmp) / "disks.json",
+            )
+
+        self.assertIsNone(disk_id)
+        self.assertTrue(any("no disk product in" in line for line in messages))
 
     def test_resolve_reuses_remembered_disk(self) -> None:
         backend = _DiskBackend()

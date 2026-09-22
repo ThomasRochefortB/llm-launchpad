@@ -295,6 +295,15 @@ def _run_single_attempt(
     url_resolver = EndpointUrlResolver()
     try:
         for event in deploy_events:
+            # The endpoint key is minted during the deploy, on the config the
+            # lifecycle executes -- which is rebuilt from the plan and is not
+            # the object the caller kept a handle to. Callers sync OpenCode
+            # from their own config, so the key never reached it and every
+            # synced provider was written without one: OpenCode then got
+            # `401 Invalid API Key` from an endpoint that had deployed,
+            # certified and was serving perfectly well.
+            if config is not attempt.config and config.endpoint_api_key:
+                attempt.config.endpoint_api_key = config.endpoint_api_key
             endpoint = _endpoint_from_event(event)
             if endpoint is not None:
                 if endpoint.web_url:

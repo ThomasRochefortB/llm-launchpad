@@ -915,9 +915,28 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("$2.50/hr", markup)
             self.assertIn("24/7", markup)
 
+    async def test_gpu_cost_preview_multiplies_by_attached_gpus(self) -> None:
+        """Modal prices one GPU; the deployment bills one per attached GPU."""
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
 
-if __name__ == "__main__":
-    unittest.main()
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+            preview = screen.query_one("#llama-cost-preview", Static)
+            screen.post_message(
+                GpuTypesLoaded(
+                    gpu_types=[ModalGpuSpec(value="A100-80GB", price_per_hour_usd=2.5)]
+                )
+            )
+            await pilot.pause()
+            screen.query_one("#gpu-count-llama", Input).value = "8"
+            await pilot.pause()
+
+            markup = str(preview.renderable)
+            self.assertIn("$20.00/hr", markup)
+            self.assertIn("8 x $2.50/hr/GPU", markup)
 
 
 class LlamaCppDeployFormPolishTests(unittest.IsolatedAsyncioTestCase):
@@ -1167,3 +1186,7 @@ class VastFieldGatingTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             for field_id in ("#host-input", "#port-input", "#revision"):
                 self.assertFalse(screen.query_one(field_id).disabled, field_id)
+
+
+if __name__ == "__main__":
+    unittest.main()

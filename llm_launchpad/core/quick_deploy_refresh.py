@@ -158,7 +158,7 @@ def _quick_deploy_catalog_cache_path() -> Path:
 
 
 QUICK_DEPLOY_CATALOG_CACHE_TTL = timedelta(hours=6)
-QUICK_DEPLOY_CATALOG_CACHE_SCHEMA_VERSION = 10
+QUICK_DEPLOY_CATALOG_CACHE_SCHEMA_VERSION = 11
 _MODEL_SIZE_BUCKETS: tuple[ModelSizeBucket, ...] = ("compact", "medium", "large")
 _MODEL_SIZE_LABELS: dict[ModelSizeBucket, str] = {
     "compact": "Compact ≤40B",
@@ -285,7 +285,7 @@ def build_live_quick_deploy_catalog(
                 is_live=True,
                 exclusions=tuple(sorted(exclusions, key=lambda row: row.rank or 10**9)),
             )
-            retained = _retained_catalog_for(profiles)
+            retained = _retained_catalog_for(profiles, exclusions)
             if retained is not None:
                 return retained
             _write_quick_deploy_catalog_cache(info, profiles)
@@ -303,16 +303,26 @@ def build_live_quick_deploy_catalog(
 
 def _retained_catalog_for(
     profiles: Sequence[QuickDeployProfile],
+    exclusions: Sequence[CatalogExclusion] = (),
     *,
     cache_path: Path | None = None,
 ) -> tuple[QuickDeployCatalogInfo, tuple[QuickDeployProfile, ...]] | None:
-    """Return the cached catalog when a rebuild lost most of its profiles.
+    """Return the cached catalog when a rebuild is worse than the one it replaces.
 
     Every model whose Hub metadata cannot be read is dropped from the rebuild,
     so a run of transient failures produces a small but structurally valid
     catalog. Persisting that would replace a good snapshot with a worse one and
     hide models the user deployed yesterday, so the previous snapshot wins and
     the next refresh recovers on its own.
+
+    Profile count alone does not detect that. Discovery walks down the ranking
+    until each size category is full, so throttling that removes the top of the
+    list is answered by filling the categories from far below it: one observed
+    rebuild lost every model ranked above 390 to HTTP 429 and still published
+    *twice* as many profiles as the catalog it overwrote. What matters is not
+    how many models survived but whether the ones that did not were rejected or
+    merely unreachable, so a rebuild that leaves a model unchecked which the
+    previous catalog had already resolved is treated as the degraded run it is.
     """
 
     previous = _read_quick_deploy_catalog_cache(
@@ -323,19 +333,43 @@ def _retained_catalog_for(
     previous_info, previous_profiles = previous
     if not previous_profiles:
         return None
-    if len(profiles) >= len(previous_profiles) * _CATALOG_RETENTION_RATIO:
+    lost = _models_lost_to_unchecked(previous_profiles, exclusions)
+    if lost:
+        detail = ", ".join(lost[:3]) + (f" and {len(lost) - 3} more" if len(lost) > 3 else "")
+        reason = (
+            f"Kept the previous catalog: this refresh could not check {len(lost)} "
+            f"model(s) it already had ({detail}), which usually means Hugging Face "
+            "was rate limiting or unreachable."
+        )
+    elif len(profiles) < len(previous_profiles) * _CATALOG_RETENTION_RATIO:
+        reason = (
+            f"Kept the previous catalog: this refresh resolved only "
+            f"{len(profiles)} of {len(previous_profiles)} models, which "
+            "usually means Hugging Face was rate limiting or unreachable."
+        )
+    else:
         return None
-    return (
-        replace(
-            previous_info,
-            error=(
-                f"Kept the previous catalog: this refresh resolved only "
-                f"{len(profiles)} of {len(previous_profiles)} models, which "
-                "usually means Hugging Face was rate limiting or unreachable."
-            ),
-        ),
-        previous_profiles,
-    )
+    return (replace(previous_info, error=reason), previous_profiles)
+
+
+def _models_lost_to_unchecked(
+    previous_profiles: Sequence[QuickDeployProfile],
+    exclusions: Sequence[CatalogExclusion],
+) -> list[str]:
+    """Name the models this rebuild could not check but the last one resolved."""
+
+    known = {
+        profile.aa_model_id
+        for profile in previous_profiles
+        if profile.aa_model_id
+    }
+    if not known:
+        return []
+    lost: dict[str, str] = {}
+    for exclusion in exclusions:
+        if exclusion.unchecked and exclusion.model_id in known:
+            lost.setdefault(exclusion.model_id, exclusion.display_name or exclusion.model_id)
+    return list(lost.values())
 
 
 def load_cached_quick_deploy_catalog(
@@ -360,15 +394,18 @@ def is_fresh_cached_quick_deploy_catalog(
 ) -> bool:
     """Return True when a cached catalog snapshot is fresh enough to trust.
 
-    A build that stopped at its request budget is never fresh, however
-    recently it ran. It is a partial answer, and the whole point of writing
-    down what it resolved is that reopening the screen carries on from there
-    instead of serving the short list for another six hours.
+    A build that could not check every model is never fresh, however recently
+    it ran. It is a partial answer, and the whole point of writing down what it
+    resolved is that reopening the screen carries on from there instead of
+    serving the short list for another six hours.
+
+    This keys off ``CatalogExclusion.unchecked`` rather than the exhausted-budget
+    reason alone: a build throttled by Hugging Face records a different sentence
+    for the same situation, and matching only the budget's wording let a catalog
+    that lost 82 models to HTTP 429 count as fresh for the whole TTL.
     """
 
-    if any(
-        exclusion.reason == UNCHECKED_BUDGET_REASON for exclusion in info.exclusions
-    ):
+    if any(exclusion.unchecked for exclusion in info.exclusions):
         return False
     generated_at = clean_string(info.generated_at)
     if not generated_at:
@@ -664,7 +701,18 @@ def _quick_deploy_catalog_info_from_dict(payload: Any) -> QuickDeployCatalogInfo
             is_live=bool(payload.get("is_live", True)),
             ready=bool(payload.get("ready", True)),
             error=payload.get("error"),
-            exclusions=tuple(CatalogExclusion(**row) for row in payload.get("exclusions", ())),
+            exclusions=tuple(
+                CatalogExclusion(
+                    model_id=str(row.get("model_id") or ""),
+                    display_name=str(row.get("display_name") or ""),
+                    repo_id=str(row.get("repo_id") or ""),
+                    reason=str(row.get("reason") or ""),
+                    rank=row.get("rank"),
+                    unchecked=bool(row.get("unchecked", False)),
+                )
+                for row in payload.get("exclusions", ())
+                if isinstance(row, dict)
+            ),
         )
     except (ValueError, TypeError):
         return None
@@ -989,12 +1037,13 @@ def _resolve_aa_model(
             exclusions, candidate, "",
             "Not checked: every Hugging Face lookup for this model failed, most likely "
             "rate limiting. Refresh the catalog to retry.",
+            unchecked=True,
         )
         return None
     except HubBudgetExhausted:
         # Not checked, so not an answer. Recording a miss here would poison
         # the store with a conclusion no request was made to support.
-        _record_exclusion(exclusions, candidate, "", UNCHECKED_BUDGET_REASON)
+        _record_exclusion(exclusions, candidate, "", UNCHECKED_BUDGET_REASON, unchecked=True)
         return None
     except Exception as exc:
         # "The search failed" and "this model has no GGUF weights" are
@@ -1003,7 +1052,9 @@ def _resolve_aa_model(
         # stretches of the ranking at once, and a silently shorter shortlist
         # gives the reader nothing to notice: a build that lost two thirds of
         # a category to throttling published as though it were complete.
-        _record_exclusion(exclusions, candidate, "", _hf_failure_reason(exc, "search for weights"))
+        _record_exclusion(
+            exclusions, candidate, "", _hf_failure_reason(exc, "search for weights"), unchecked=True,
+        )
         return None
     if match_store is not None:
         match_store.record(model_key, repo_id)
@@ -1030,12 +1081,14 @@ def _build_resolved_aa_model(
     # weight-size table -- which then reads as "this model's size cannot be
     # determined" rather than as the rate limit it is.
     if budget is not None and not budget.spend(METADATA_REQUEST_COST):
-        _record_exclusion(exclusions, candidate, repo_id, UNCHECKED_BUDGET_REASON)
+        _record_exclusion(exclusions, candidate, repo_id, UNCHECKED_BUDGET_REASON, unchecked=True)
         return None
     try:
         metadata = _fetch_serving_metadata(repo_id)
     except Exception as exc:
-        _record_exclusion(exclusions, candidate, repo_id, _hf_failure_reason(exc, "read serving metadata"))
+        _record_exclusion(
+            exclusions, candidate, repo_id, _hf_failure_reason(exc, "read serving metadata"), unchecked=True,
+        )
         return None
     size_bucket = _size_bucket_for_parameters(candidate.parameter_count_b)
     if size_bucket is None:
@@ -1100,11 +1153,20 @@ def _record_exclusion(
     candidate: AAModelCandidate,
     repo_id: str,
     reason: str,
+    *,
+    unchecked: bool = False,
 ) -> None:
+    """Record why a discovered model is not in the catalog.
+
+    ``unchecked`` separates "the build could not look" from "the build looked
+    and said no". Only the first is a reason to distrust the catalog itself.
+    """
+
     if exclusions is not None:
         exclusions.append(CatalogExclusion(
             model_id=candidate.aa_model_id or candidate.slug,
             display_name=candidate.name, repo_id=repo_id, reason=reason, rank=candidate.rank,
+            unchecked=unchecked,
         ))
 
 

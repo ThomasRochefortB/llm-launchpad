@@ -31,7 +31,6 @@ from ...core.quant_quality import is_reduced_quality, quant_quality_label
 from ...core.quick_deploy_refresh import (
     DEFAULT_MODEL_LIMIT,
     DEFAULT_OVERALL_MODEL_LIMIT,
-    UNCHECKED_BUDGET_REASON,
 )
 from ...core.serving_tiers import (
     ServingTier,
@@ -511,7 +510,7 @@ def _tier_option(
     centre; the GPU belongs in the detail pane.
     """
 
-    marker = "[#7bf168]*[/]" if tier.is_recommended else " "
+    marker = "[primary]*[/]" if tier.is_recommended else " "
     price = _format_price(tier.price_per_hour_usd, estimate=tier.plan.quote.is_estimate)
     speed = tier.output_tokens_per_second
     speed_text = f"~{speed:.0f} tok/s" if speed > 0 else "speed n/a"
@@ -716,7 +715,7 @@ def _tier_markup(profile: QuickDeployProfile) -> str:
     if label == "$":
         return "[dim]$[/dim]"
     if label == "$$":
-        return "[#7bf168]$$[/]"
+        return "[primary]$$[/]"
     if label == "$$$":
         return "[yellow]$$$[/yellow]"
     return f"[dim]{escape(label)}[/dim]"
@@ -770,7 +769,7 @@ class CatalogExclusionsScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="fast-deploy-container"):
-            yield Static("[bold #7bf168]Excluded models[/]", id="fast-deploy-title")
+            yield Static("[bold primary]Excluded models[/]", id="fast-deploy-title")
             yield Static(
                 "Candidates checked while building the overall and per-size shortlists.",
                 id="fast-deploy-subtitle",
@@ -871,7 +870,7 @@ class FastDeployScreen(CopyEnabledScreen):
     def compose(self) -> ComposeResult:
         with Vertical(id="fast-deploy-container"):
             yield Static(
-                "[bold #7bf168]Deploy[/]  [dim]Step 1: Pick a model[/dim]",
+                "[bold primary]Deploy[/]  [dim]Step 1: Pick a model[/dim]",
                 id="fast-deploy-title",
             )
             yield Static(_subtitle(self._catalog_info), id="fast-deploy-subtitle")
@@ -988,7 +987,7 @@ class FastDeployScreen(CopyEnabledScreen):
                 [Option(f"  {frame} Building the live model catalog…", disabled=True)]
             )
             status = (
-                f"[bold #7bf168]{frame}[/][dim] Building the live model catalog "
+                f"[bold primary]{frame}[/][dim] Building the live model catalog "
                 "from Artificial Analysis and Hugging Face…[/dim]"
             )
         self.query_one("#fast-deploy-status", Static).update(status)
@@ -1008,7 +1007,7 @@ class FastDeployScreen(CopyEnabledScreen):
                 [Option(f"  {frame} Building the live model catalog…", disabled=True)]
             )
             self.query_one("#fast-deploy-status", Static).update(
-                f"[bold #7bf168]{frame}[/][dim] Building the live model catalog "
+                f"[bold primary]{frame}[/][dim] Building the live model catalog "
                 "from Artificial Analysis and Hugging Face…[/dim]"
             )
         except Exception:
@@ -1070,7 +1069,7 @@ class FastDeployScreen(CopyEnabledScreen):
         self._selected_model = model
         self.query_one("#fast-deploy-model-search", Input).add_class("hidden")
         self.query_one("#fast-deploy-title", Static).update(
-            f"[bold #7bf168]Deploy[/]  "
+            f"[bold primary]Deploy[/]  "
             f"[dim]{escape(model.display_name)} · Step 2: Pick infrastructure[/dim]"
         )
         self.query_one("#fast-deploy-status", Static).update(
@@ -1496,7 +1495,7 @@ class FastDeployScreen(CopyEnabledScreen):
     def _render_model_list(self, *, preferred_id: str | None = None) -> None:
         option_list = self.query_one("#fast-deploy-list", OptionList)
         self.query_one("#fast-deploy-title", Static).update(
-            "[bold #7bf168]Deploy[/]  [dim]Step 1: Pick a model[/dim]"
+            "[bold primary]Deploy[/]  [dim]Step 1: Pick a model[/dim]"
         )
         self.query_one("#fast-deploy-model-search", Input).remove_class("hidden")
         self._catalog_building = False
@@ -1523,7 +1522,7 @@ class FastDeployScreen(CopyEnabledScreen):
             if not models:
                 continue
             if show_headings:
-                options.append(Option(f"[bold #7bf168]{title}[/]", disabled=True))
+                options.append(Option(f"[bold primary]{title}[/]", disabled=True))
             # The catalog already ranks models; preserve that order within a section.
             for model in models:
                 model_indices[model.id] = len(options)
@@ -1598,11 +1597,13 @@ class FastDeployScreen(CopyEnabledScreen):
                if self._pricing_pending and self._snapshot is None else "")
             # A build that stopped early still publishes what it found. Saying
             # so is the difference between "nothing better exists" and "we ran
-            # out of requests before we could look".
+            # out of requests before we could look". Every way of not looking
+            # counts here, not just the exhausted request budget: Hugging Face
+            # throttling leaves the same gap and used to say nothing at all.
             + (f"\n[yellow]{unchecked} model{'s' if unchecked != 1 else ''} not yet checked; "
                "reopen Deploy to carry on from here[/yellow]" if (unchecked := sum(
                    1 for exclusion in self._catalog_info.exclusions
-                   if exclusion.reason == UNCHECKED_BUDGET_REASON)) else "")
+                   if exclusion.unchecked)) else "")
         )
         if getattr(self.focused, "id", "") not in {
             "fast-deploy-gpu-filter", "fast-deploy-model-search",

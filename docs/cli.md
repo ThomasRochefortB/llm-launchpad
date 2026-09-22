@@ -242,6 +242,18 @@ Run `uv run python scripts/generate_cli_reference.py` after changing a command.
 │                                                                           endpoint               │
 │                                                                           [default:              │
 │                                                                           no-allow-insecure-htt… │
+│ --max-num-seqs                                     <int>                  vLLM concurrent        │
+│                                                                           sequences; omitted,    │
+│                                                                           every provider serves  │
+│                                                                           the same portable      │
+│                                                                           default instead of its │
+│                                                                           image's                │
+│ --max-model-len                                    <int>                  vLLM served context    │
+│                                                                           length; omitted, vLLM  │
+│                                                                           serves the model's own │
+│                                                                           maximum and refuses to │
+│                                                                           start when that KV     │
+│                                                                           cache does not fit     │
 │ --trust-remote-code       --no-trust-remote-co…                           vLLM TRUST_REMOTE_CODE │
 │                                                                           (allow model custom    │
 │                                                                           code from Hugging      │
@@ -613,6 +625,18 @@ Run `uv run python scripts/generate_cli_reference.py` after changing a command.
 │                                                                          endpoint                │
 │                                                                          [default:               │
 │                                                                          no-allow-insecure-http] │
+│ --max-num-seqs                                       <int>               vLLM concurrent         │
+│                                                                          sequences; omitted,     │
+│                                                                          every provider serves   │
+│                                                                          the same portable       │
+│                                                                          default instead of its  │
+│                                                                          image's                 │
+│ --max-model-len                                      <int>               vLLM served context     │
+│                                                                          length; omitted, vLLM   │
+│                                                                          serves the model's own  │
+│                                                                          maximum and refuses to  │
+│                                                                          start when that KV      │
+│                                                                          cache does not fit      │
 │ --trust-remote-code        --no-trust-remote-code                        vLLM TRUST_REMOTE_CODE  │
 │                                                                          (allow model custom     │
 │                                                                          code from Hugging Face) │
@@ -660,9 +684,7 @@ Run `uv run python scripts/generate_cli_reference.py` after changing a command.
  Interactive terminal UI for deploying and managing LLM backends.
 
 ╭─ Options ────────────────────────────────────────────────────────────────────────────────────────╮
-│ --mouse    --no-mouse      Enable Textual mouse support. Use --no-mouse to let the terminal      │
-│                            handle native text selection/copy.                                    │
-│ --help                     Show this message and exit.                                           │
+│ --help          Show this message and exit.                                                      │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 

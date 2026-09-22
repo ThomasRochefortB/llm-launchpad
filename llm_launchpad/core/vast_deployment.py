@@ -16,6 +16,7 @@ from ..protocol.enums import BackendType, ComputeProvider, DeploymentState, Oper
 from ..protocol.events import BaseEvent, LogEvent, OperationCompleteEvent, ResourceAllocatedEvent, StateChangeEvent
 from ..protocol.models import DeploymentConfig, EndpointInfo, VastDeploymentRecord, VastInstance, VastOfferQuery, VastProviderOptions
 from .deploy_log_summary import format_elapsed
+from .diagnostics import log_exception
 from .naming import infer_instance_from_app_name
 from .operation_events import fail_operation
 from .shutdown import is_shutting_down
@@ -23,11 +24,14 @@ from .vast_backend import VastApiError, VastBackend
 from .vast_download import fetch_download_files, measure_download
 from .vast_runtime import (
     GPU_INVENTORY_COMMAND,
+    VAST_FAILURE_LOG_COMMAND,
     VAST_RUNTIME_DIR,
     VAST_STARTUP_PROBE_COMMAND,
     endpoint_healthy,
     parse_gpu_inventory,
     parse_startup_probe,
+    startup_log_tail,
+    startup_runtime_stopped,
     vast_runtime,
     vast_runtime_script,
     verify_endpoint_auth,
@@ -50,6 +54,13 @@ _CANCELLATIONS_LOCK = threading.Lock()
 # Neither scales with the image, so both runtimes get the same allowance and a
 # stalled host is caught by its silence instead of by a clock.
 VAST_READY_DEADLINE_SECONDS = 1800
+# After SSH: staging the weights and loading them onto the GPUs. vLLM also
+# compiles and captures CUDA graphs on a cold run, which llama.cpp has no
+# equivalent of, so it gets twice the allowance. Named rather than inlined so a
+# regression that stops watching the runtime fails a test instead of spinning
+# out the full half hour the way a paid rental did.
+VAST_SERVE_DEADLINE_SECONDS = 1800
+VAST_VLLM_SERVE_DEADLINE_SECONDS = 3600
 # The two waits before SSH are watched differently because only one of them is
 # measured. Once the host is running and the loop is knocking, the knock is
 # itself the signal: a daemon that has refused this long has finished
@@ -124,6 +135,20 @@ def vast_startup_detail(
 def vast_progress_key(instance: VastInstance) -> str:
     """Reduce a status line to what changes only when work actually advances."""
     return f"{instance.state}|{_BUILDKIT_STEP_PREFIX.sub('', instance.status_msg).strip()}"
+
+
+def _create_was_refused(exc: BaseException) -> bool:
+    """Whether Vast answered a rental request by refusing it.
+
+    A 4xx other than 429 is the provider stating it did not act: the request
+    was rejected, so no rental was made and the recovery record is only noise.
+    A timeout, a 5xx or a transport error leave that genuinely unknown -- Vast
+    may act moments after the reply was lost -- so those keep the record and
+    the name blocked until the label has been reconciled by hand.
+    """
+
+    status = getattr(exc, "status_code", None)
+    return isinstance(status, int) and 400 <= status < 500 and status != 429
 
 
 class VastDeploymentBackend:
@@ -453,7 +478,11 @@ class VastDeploymentBackend:
             ssh.connect(instance, record.local_port)
             url = f"http://127.0.0.1:{record.local_port}"
             yield StateChangeEvent(current=DeploymentState.DEPLOYING, operation=OperationType.DEPLOY, detail="Waiting for the Vast model through the local SSH tunnel")
-            deadline = time.monotonic() + (3600 if config.backend == BackendType.VLLM else 1800)
+            deadline = time.monotonic() + (
+                VAST_VLLM_SERVE_DEADLINE_SECONDS
+                if config.backend == BackendType.VLLM
+                else VAST_SERVE_DEADLINE_SECONDS
+            )
             # The longest stretch of a Vast deploy sits here, and until now it
             # was the only one that said nothing: the rental loop above
             # heartbeats every 30s, then the weights download in silence for
@@ -464,6 +493,8 @@ class VastDeploymentBackend:
             startup_reported = startup_started
             downloaded = 0
             download_complete = False
+            runtime_seen_alive = False
+            runtime_gone_streak = 0
             while not endpoint_healthy(url, record.endpoint_api_key):
                 if cancellation.is_set() or is_shutting_down():
                     raise RuntimeError("Vast deployment cancelled.")
@@ -473,9 +504,13 @@ class VastDeploymentBackend:
                     interval = time.monotonic() - startup_reported
                     startup_reported = time.monotonic()
                     previous, downloaded = downloaded, 0
+                    runtime_gone = False
+                    log_tail: tuple[str, ...] = ()
                     try:
                         output = ssh.run(instance, VAST_STARTUP_PROBE_COMMAND, multiplex=True)
                         downloaded, last_log = parse_startup_probe(output)
+                        runtime_gone = startup_runtime_stopped(output)
+                        log_tail = startup_log_tail(output)
                         progress = measure_download(output, download_files)
                         if progress is not None:
                             downloaded = progress.downloaded
@@ -494,6 +529,41 @@ class VastDeploymentBackend:
                         # billing and already watched by the deadline above.
                         # A host too busy to answer it is still starting.
                         detail = "still starting"
+                    if not runtime_gone:
+                        runtime_seen_alive = True
+                    # Raised outside the probe's own handler, which exists to
+                    # forgive an unreadable answer rather than a conclusive one.
+                    #
+                    # Two independent guards, because this ends a rental the
+                    # user is paying for and a wrong verdict destroys a healthy
+                    # one. "No process and nothing logged" is not evidence of an
+                    # exit -- it is also what the seconds before the script
+                    # starts look like -- so the runtime must have left a trace
+                    # first. And a single reading is not enough either: a
+                    # process that has genuinely exited is still gone 30s later,
+                    # whereas one probe that failed to see a live process is
+                    # not. A dead runtime therefore costs one extra heartbeat
+                    # instead of the full half-hour deadline.
+                    if runtime_gone and (runtime_seen_alive or bool(last_log)):
+                        runtime_gone_streak += 1
+                    else:
+                        runtime_gone_streak = 0
+                    if runtime_gone_streak >= 2 and not endpoint_healthy(
+                        url, record.endpoint_api_key
+                    ):
+                        # Nothing is left to wait for, and the reason is in
+                        # the log. Waiting out the deadline instead bills the
+                        # rental for half an hour and then reports it as a
+                        # timeout. The heartbeat's own window is 25 lines,
+                        # which a Python traceback overflows -- vLLM's "See
+                        # root cause above" lands inside it and the cause does
+                        # not -- so the post-mortem re-reads a longer tail.
+                        for line in self._failure_log(record, instance, log_tail):
+                            yield LogEvent(line=f"Vast runtime log: {line}")
+                        raise RuntimeError(
+                            "The Vast runtime exited before the endpoint came up: "
+                            + (last_log or "server.log recorded no output.")
+                        )
                     elapsed = format_elapsed(time.monotonic() - startup_started)
                     yield LogEvent(line=f"Vast model starting: {detail} (waiting {elapsed})")
                 cancellation.wait(3)
@@ -548,7 +618,18 @@ class VastDeploymentBackend:
                 except Exception:
                     pass
                 try:
-                    self._destroy(record)
+                    if not record.instance_id and _create_was_refused(exc):
+                        # Vast answered the rental request with a refusal, so
+                        # nothing exists under this label and there is nothing
+                        # to reconcile. Going through _destroy would scan by
+                        # label, find zero instances, and report that as
+                        # uncertainty -- which left the record in place and the
+                        # name refused from both sides: deploy called it
+                        # "already recorded", destroy called it "uncertain",
+                        # and the product offered no way out.
+                        self.state.remove(record.name)
+                    else:
+                        self._destroy(record)
                     record = None
                     rollback = {"attempted": True, "confirmed": True, "detail": ""}
                 except Exception as cleanup:
@@ -642,6 +723,24 @@ class VastDeploymentBackend:
             verify_endpoint_auth(url, record.served_model_name)
             verify_streaming(url, record.endpoint_api_key, record.served_model_name)
             return self._endpoint(record, "running", url)
+
+    def _failure_log(
+        self, record: Any, instance: Any, fallback: tuple[str, ...]
+    ) -> tuple[str, ...]:
+        """Re-read enough of the runtime log to carry a whole traceback."""
+        try:
+            output = VastSsh(self.state.directory(record.name)).run(
+                instance, VAST_FAILURE_LOG_COMMAND
+            )
+        except Exception:
+            log_exception(f"Could not read the Vast runtime log for {record.name}")
+            return fallback
+        lines = tuple(
+            cleaned
+            for line in output.splitlines()
+            if (cleaned := "".join(char for char in line if char.isprintable()).strip())
+        )
+        return lines or fallback
 
     def logs(self, instance_id: str) -> list[str]:
         record = self._record(None, instance_id)

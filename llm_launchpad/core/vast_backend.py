@@ -168,6 +168,28 @@ def parse_vast_offer(raw: Any, query: VastOfferQuery) -> VastOffer | None:
     )
 
 
+# Vast names its refusals in these fields; everything else in the body may be
+# the request echoed back.
+_VAST_REJECTION_FIELDS = ("msg", "error")
+
+
+def _rejection_detail(body: object) -> str:
+    """Return Vast's own words for a rejection, without echoing the request."""
+    if not isinstance(body, str) or not body.strip():
+        return ""
+    try:
+        parsed = json.loads(body)
+    except ValueError:
+        return ""
+    if not isinstance(parsed, dict):
+        return ""
+    for field in _VAST_REJECTION_FIELDS:
+        value = parsed.get(field)
+        if isinstance(value, str) and value.strip():
+            return " " + " ".join(value.split())[:200]
+    return ""
+
+
 class VastBackend:
     """REST API client; discovery never allocates billable resources."""
 
@@ -199,13 +221,15 @@ class VastBackend:
             if not 200 <= response.status_code < 300:
                 # Vast explains its rejections in the body, but a response can
                 # echo the request back -- environment and startup script
-                # included -- so it stays out of the message unless someone
-                # explicitly asks to see it.
+                # included -- so the raw body still needs an explicit ask.
+                # The two fields carrying Vast's own words about the refusal
+                # are safe, and without them "HTTP 400" is all the user gets
+                # for a reason as ordinary as an offer someone else took.
                 body = response.text
-                detail = ""
+                detail = _rejection_detail(body)
                 if os.environ.get("LLM_LAUNCHPAD_API_DEBUG") == "1" and isinstance(body, str):
                     reason = " ".join(body.split())[:200]
-                    detail = f" {reason}" if reason else ""
+                    detail = f" {reason}" if reason else detail
                 raise VastApiError(
                     f"Vast request failed (HTTP {response.status_code}).{detail}",
                     status_code=response.status_code,
@@ -308,7 +332,19 @@ class VastBackend:
         }
         if onstart:
             payload["onstart"] = onstart
-        data = self._request("PUT", f"/asks/{_resource_id(offer_id)}/", payload)
+        try:
+            data = self._request("PUT", f"/asks/{_resource_id(offer_id)}/", payload)
+        except VastApiError as exc:
+            # Offers are a live market: the one the form quoted can be rented
+            # by someone else before this call lands, and that is not a fault
+            # the user can act on except by choosing another.
+            if "no_such_ask" in str(exc):
+                raise VastApiError(
+                    f"Vast offer {offer_id} was taken before this rental started. "
+                    "Refresh the rentals and choose another.",
+                    status_code=exc.status_code,
+                ) from None
+            raise
         instance_id = positive_int(data.get("new_contract"))
         if data.get("success") is not True or instance_id is None:
             raise VastApiError("Vast rental result is uncertain; reconcile the recorded label before retrying.")

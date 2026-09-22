@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import replace
 
 from rich.cells import cell_len
 from textual.app import ComposeResult
@@ -42,7 +41,7 @@ class FittedFooter(Footer):
     # Lower values are rendered first. ``_DEFAULT_FOOTER_PRIORITY`` is the
     # fallback for bindings that carry no explicit priority: Back/palette
     # management are navigation, everything else is a screen verb. Global
-    # toggles (mouse mode, operations overlay) sort last; help itself stays
+    # overlays (operations) sort last; help itself stays
     # first in the overflow marker's guarantee (see _fit), never dropped.
     FOOTER_PRIORITY: dict[str, int] = {
         "show_help": 0,
@@ -71,7 +70,6 @@ class FittedFooter(Footer):
         "focus_previous_control": 40,
         "navigate_option_list_up": 40,
         "navigate_option_list_down": 40,
-        "toggle_mouse_mode": 95,
     }
     _DEFAULT_FOOTER_PRIORITY = 50
 
@@ -111,7 +109,6 @@ class FittedFooter(Footer):
         action_to_bindings = defaultdict(list)
         for _, binding, enabled, tooltip in self.screen.active_bindings.values():
             if binding.show:
-                binding = self._stateful_binding(binding)
                 action_to_bindings[binding.action].append((binding, enabled, tooltip))
 
         palette_binding = self._command_palette_binding()
@@ -156,23 +153,6 @@ class FittedFooter(Footer):
                 disabled=not enabled,
                 tooltip=tooltip,
             )
-
-    def _stateful_binding(self, binding: Binding) -> Binding:
-        """Say what a toggle is currently set to, not just what it toggles.
-
-        Mouse reporting defaults off over SSH so terminal-native selection
-        keeps working, which means taps do nothing until it is turned on. A
-        hint reading only "Mouse" cannot tell anyone that, and on a phone
-        client tapping a button is the obvious thing to try -- so the button
-        reads as unreachable rather than as a mode being off.
-        """
-
-        if binding.action != "toggle_mouse_mode":
-            return binding
-        enabled = getattr(self.app, "mouse_enabled", None)
-        if enabled is None:
-            return binding
-        return replace(binding, description=f"Mouse {'on' if enabled else 'off'}")
 
     def _command_palette_binding(self) -> tuple[Binding, bool, str] | None:
         if not (self.show_command_palette and self.app.ENABLE_COMMAND_PALETTE):

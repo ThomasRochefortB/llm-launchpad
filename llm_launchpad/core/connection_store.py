@@ -107,6 +107,13 @@ def save_connection(
         "projector_file": config.projector_file,
         "runtime_attestation": runtime_attestation_to_dict(config.runtime_attestation),
         "api_key": config.endpoint_api_key or endpoint.endpoint_api_key or "",
+        "gpu_type": config.gpu_type or "",
+        "gpu_count": config.gpu_count or 1,
+        "price_per_hour_usd": (
+            config.price_per_hour_usd
+            if config.price_per_hour_usd is not None
+            else endpoint.hourly_cost_usd
+        ),
         "cached_at_epoch": time.time(),
     }
     _write(entries, path)
@@ -168,6 +175,15 @@ def merge_connections(
         row.runtime_attestation = row.runtime_attestation or runtime_attestation_from_dict(
             cached.get("runtime_attestation")
         )
+        if row.hourly_cost_usd is None:
+            try:
+                from .coerce import optional_float as _optional_float
+
+                cached_rate = _optional_float(cached.get("price_per_hour_usd"))
+            except Exception:
+                cached_rate = None
+            if cached_rate is not None and cached_rate >= 0:
+                row.hourly_cost_usd = cached_rate
         provider = str(cached.get("provider") or "")
         if provider in {item.value for item in ComputeProvider}:
             row.provider = ComputeProvider(provider)
@@ -228,9 +244,23 @@ def rows_from_connection_cache(
                 runtime_attestation=runtime_attestation_from_dict(
                     entry.get("runtime_attestation")
                 ),
+                hourly_cost_usd=_cached_price(entry),
             )
         )
     return rows
+
+
+def _cached_price(entry: dict[str, Any]) -> float | None:
+    """Read a persisted hourly quote without ever treating absence as free."""
+    try:
+        from .coerce import optional_float as _optional_float
+
+        rate = _optional_float(entry.get("price_per_hour_usd"))
+    except Exception:
+        return None
+    if rate is None or rate < 0:
+        return None
+    return rate
 
 
 def _backfill_legacy_reasoning(
