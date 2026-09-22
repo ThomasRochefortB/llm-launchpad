@@ -82,7 +82,7 @@ class MainMenuDeployDoorTests(unittest.IsolatedAsyncioTestCase):
                 ]
                 self.assertEqual(
                     option_ids,
-                    ["deploy", "custom-deploy", "manage", "operations", "storage", "settings"],
+                    ["deploy", "custom-deploy", "manage", "storage", "settings"],
                 )
                 self.assertEqual(len(screen.query("#quick-deploy-list")), 0)
                 self.assertEqual(len(screen.query("#quick-deploy-panel")), 0)

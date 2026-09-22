@@ -208,7 +208,7 @@ class CliMainCommandTests(unittest.TestCase):
         app_cls.assert_called_once_with(mouse_enabled=None)
         app_instance.run.assert_called_once_with(mouse=False)
 
-    def test_tui_allows_mouse_override(self) -> None:
+    def test_tui_ignores_legacy_mouse_override(self) -> None:
         app_instance = Mock()
         app_instance.mouse_enabled = True
         with (
@@ -220,7 +220,7 @@ class CliMainCommandTests(unittest.TestCase):
         ):
             cli_main.tui(mouse=True)
         app_cls.assert_called_once_with(mouse_enabled=True)
-        app_instance.run.assert_called_once_with(mouse=True)
+        app_instance.run.assert_called_once_with(mouse=False)
 
     def test_tui_allows_no_mouse_override(self) -> None:
         app_instance = Mock()

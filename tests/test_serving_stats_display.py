@@ -193,9 +193,17 @@ class ManageDetailTests(unittest.TestCase):
         self.assertIn("12 tok/s", detail)
         self.assertNotIn("last request", detail)
 
-    def test_an_endpoint_without_traffic_adds_no_lines(self) -> None:
-        self.assertEqual(_serving_detail_lines(_row()), "")
-        self.assertEqual(_serving_detail_lines(_row(ServingSnapshot())), "")
+    def test_an_endpoint_without_traffic_reports_no_reading_yet(self) -> None:
+        # Cached totals are labelled, including the empty state: a blank detail
+        # once hid that Refresh never contacts a scaled-to-zero runtime.
+        detail = _serving_detail_lines(_row())
+        self.assertIn("not collected yet", detail)
+        self.assertIn("Run time:", detail)
+        self.assertIn("Compute cost:", detail)
+        empty = _serving_detail_lines(_row(ServingSnapshot()))
+        self.assertNotIn("tokens served", empty)
+        self.assertIn("Run time:", empty)
+        self.assertIn("Compute cost:", empty)
 
 
 class FleetPanelTrafficTests(unittest.TestCase):

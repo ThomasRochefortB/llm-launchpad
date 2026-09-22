@@ -23,7 +23,7 @@ Useful focused commands during iteration:
 ```bash
 uv run pytest tests/test_cli_main.py
 uv run llm-launchpad --help
-uv run llm-launchpad tui --no-mouse
+uv run llm-launchpad tui
 ```
 
 ## Coding guidelines

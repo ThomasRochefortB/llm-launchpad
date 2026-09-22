@@ -612,10 +612,8 @@ def tui(
         bool | None,
         typer.Option(
             "--mouse/--no-mouse",
-            help=(
-                "Enable Textual mouse support. "
-                "Use --no-mouse to let the terminal handle native text selection/copy."
-            ),
+            hidden=True,
+            help="Legacy option; terminal-native selection is always enabled.",
         ),
     ] = None,
 ) -> None:
@@ -632,7 +630,7 @@ def tui(
     _ensure_tui_runtime()
     app_instance = TuiApp(mouse_enabled=mouse)
     try:
-        app_instance.run(mouse=app_instance.mouse_enabled)
+        app_instance.run(mouse=False)
     finally:
         from ..core.backend import ModalBackend
         ModalBackend.terminate_all()

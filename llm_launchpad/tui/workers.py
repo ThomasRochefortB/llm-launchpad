@@ -12,9 +12,11 @@ from ..core.hf_models import ModelCandidate
 from ..protocol.enums import DeploymentState, OperationType
 from ..protocol.events import (
     BaseEvent,
+    EndpointAvailableEvent,
     ErrorEvent,
     LogEvent,
     OperationCompleteEvent,
+    ResourceAllocatedEvent,
     StateChangeEvent,
 )
 from ..protocol.models import EndpointInfo, FleetDiscovery, StorageSnapshot
@@ -238,6 +240,22 @@ class ModalUsernameLoaded(Message):
         self.username = username
 
 
+class ResourceAllocated(Message):
+    """A billable resource exists before its endpoint is reachable."""
+
+    def __init__(self, app_id: str = "") -> None:
+        super().__init__()
+        self.app_id = app_id
+
+
+class EndpointAvailable(Message):
+    """The public inference URL is known; weights may still be loading."""
+
+    def __init__(self, endpoint: EndpointInfo | None = None) -> None:
+        super().__init__()
+        self.endpoint = endpoint
+
+
 # -----------------------------------------------------------------------
 # Event dispatcher: protocol event -> Textual message
 # -----------------------------------------------------------------------
@@ -259,6 +277,10 @@ def _dispatch_event(app_or_widget: object, event: BaseEvent) -> None:
         )
     elif isinstance(event, StateChangeEvent):
         poster(StateChanged(state=event.current, operation=event.operation, detail=event.detail))
+    elif isinstance(event, ResourceAllocatedEvent):
+        poster(ResourceAllocated(app_id=event.app_id))
+    elif isinstance(event, EndpointAvailableEvent):
+        poster(EndpointAvailable(endpoint=event.endpoint))
     elif isinstance(event, OperationCompleteEvent):
         poster(
             OperationDone(

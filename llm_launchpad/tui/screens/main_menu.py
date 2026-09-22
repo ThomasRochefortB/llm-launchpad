@@ -81,7 +81,7 @@ from ..responsive import ViewportProfile
 from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
 
-BANNER = r"""[bold #7bf168]
+BANNER = r"""[bold primary]
 _     _     __  __
 | |   | |   |  \/  |
 | |   | |   | |\/| |
@@ -727,24 +727,21 @@ _ACTION_LABEL_TIERS: tuple[_ActionLabels, ...] = (
     (
         ("deploy", "  Deploy model       Pick a model, get a live placement"),
         ("custom-deploy", "  Advanced deploy    llama.cpp / vLLM expert form"),
-        ("manage", "  Manage             Status, logs, benchmark, stop"),
-        ("operations", "  Operations         Reopen or cancel deployments"),
+        ("manage", "  Manage             Endpoints and jobs"),
         ("storage", "  Storage            Cached models, pre-download, delete"),
         ("settings", "  Settings           Appearance and deploy defaults"),
     ),
     (
         ("deploy", "  Deploy model       Pick a model and deploy"),
         ("custom-deploy", "  Advanced deploy    llama.cpp / vLLM form"),
-        ("manage", "  Manage             Status, logs, stop"),
-        ("operations", "  Operations         Deployment jobs"),
+        ("manage", "  Manage             Endpoints and jobs"),
         ("storage", "  Storage            Cached models"),
         ("settings", "  Settings           Appearance, defaults"),
     ),
     (
         ("deploy", "  Deploy model"),
         ("custom-deploy", "  Advanced deploy"),
-        ("manage", "  Manage endpoints"),
-        ("operations", "  Operations"),
+        ("manage", "  Manage"),
         ("storage", "  Storage"),
         ("settings", "  Settings"),
     ),
@@ -823,8 +820,7 @@ class MainMenuScreen(CopyEnabledScreen):
                         yield OptionList(
                             Option("  Deploy model       Pick a model, get a live placement", id="deploy"),
                             Option("  Advanced deploy    llama.cpp / vLLM expert form", id="custom-deploy"),
-                            Option("  Manage             Status, logs, benchmark, stop", id="manage"),
-                            Option("  Operations         Reopen or cancel deployments", id="operations"),
+                            Option("  Manage             Endpoints and jobs", id="manage"),
                             Option("  Storage            Cached models, pre-download, delete", id="storage"),
                             Option("  Settings           Appearance and deploy defaults", id="settings"),
                             id="action-list",
@@ -836,10 +832,10 @@ class MainMenuScreen(CopyEnabledScreen):
                         yield Static("", id="fleet-summary-line")
                     with Vertical(id="main-menu-side-column"):
                         with Vertical(id="deployment-status-panel"):
-                            yield Static("[bold #7bf168]Deployment Status[/]", id="deployment-status-title")
+                            yield Static("[bold primary]Deployment Status[/]", id="deployment-status-title")
                             yield Static("[dim]Refreshing deployment status...[/dim]", id="deployment-status-body")
                         with Vertical(id="billing-report-panel"):
-                            yield Static("[bold #7bf168]Provider Billing[/]", id="billing-report-title")
+                            yield Static("[bold primary]Provider Billing[/]", id="billing-report-title")
                             # First paint already names every provider, so the
                             # panel does not change shape as readings land.
                             yield Static(
@@ -1526,8 +1522,6 @@ class MainMenuScreen(CopyEnabledScreen):
             self.app.action_push_custom_deploy()  # type: ignore[attr-defined]
         elif option_id == "manage":
             self.app.action_push_manage()  # type: ignore[attr-defined]
-        elif option_id == "operations":
-            self.app.action_push_operations()  # type: ignore[attr-defined]
         elif option_id == "storage":
             self.app.action_push_storage()  # type: ignore[attr-defined]
         elif option_id == "settings":
@@ -1572,7 +1566,7 @@ class HomeDetailsScreen(CopyEnabledScreen):
         from ..widgets.fitted_footer import FittedFooter
 
         with VerticalScroll(classes="screen-scroll"):
-            yield Static("[bold #7bf168]Details[/]  [dim]Fleet, billing, connections[/dim]")
+            yield Static("[bold primary]Details[/]  [dim]Fleet, billing, connections[/dim]")
             yield Static("[bold]Fleet[/bold]", classes="settings-section")
             yield Static("[dim]Loading fleet...[/dim]", id="home-details-fleet")
             yield Static("[bold]Billing[/bold]", classes="settings-section")

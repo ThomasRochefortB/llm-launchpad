@@ -189,7 +189,7 @@ class StorageScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="storage-scroll", classes="screen-scroll"):
-            yield Static("[bold #7bf168]Storage[/]  [dim]Cached models, pre-download, delete[/dim]", id="storage-title")
+            yield Static("[bold primary]Storage[/]  [dim]Cached models, pre-download, delete[/dim]", id="storage-title")
             yield Static("[dim]Storage status appears here.[/dim]", id="storage-status")
             # Provider and backend ride side by side: each extra vertical filter
             # row is a table row lost on an 80x24 terminal, where the inventory
@@ -794,7 +794,7 @@ class StorageDeleteConfirmScreen(CopyEnabledScreen):
         detail.append(_human_bytes(self.model.size_bytes))
         with VerticalScroll(classes="screen-scroll"):
             with Vertical(id="delete-confirm-dialog", classes="dialog-panel"):
-                yield Static("[bold #7bf168]Delete Cached Model[/]", classes="dialog-title")
+                yield Static("[bold primary]Delete Cached Model[/]", classes="dialog-title")
                 yield Static(
                     f"Delete [bold]{escape(self.model.model_id)}[/bold]?\n"
                     f"[dim]{' · '.join(detail)}[/dim]"
@@ -843,7 +843,7 @@ class PrimeDiskDeleteConfirmScreen(CopyEnabledScreen):
     def compose(self) -> ComposeResult:
         with VerticalScroll(classes="screen-scroll"):
             with Vertical(id="prime-delete-confirm-dialog", classes="dialog-panel"):
-                yield Static("[bold #7bf168]Delete Prime Disk[/]", classes="dialog-title")
+                yield Static("[bold primary]Delete Prime Disk[/]", classes="dialog-title")
                 yield Static(
                     f"Permanently delete Prime disk [bold]{escape(self.disk_id)}[/bold] "
                     "and its cached weights?"

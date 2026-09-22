@@ -18,6 +18,7 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, Input, Static
 
 from ...protocol.enums import BackendType, DeploymentState, OperationType
+from ..deployment_progress import DeploymentProgress
 from ..deploy_log_summary import (
     SUMMARY_SPINNER_FRAMES,
     DeployLogSummarizer,
@@ -25,11 +26,20 @@ from ..deploy_log_summary import (
     classify_summary_kind,
     summary_progress_parts,
 )
+from ..widgets.deployment_progress import DeploymentProgressWidget
 from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
 from ..widgets.log_viewer import LogViewer, prune_retained_items
 from ..widgets.status_header import StatusHeader
-from ..workers import ConnectionSummaryReady, LogMessage, OperationDone, OperationError, StateChanged
+from ..workers import (
+    ConnectionSummaryReady,
+    EndpointAvailable,
+    LogMessage,
+    OperationDone,
+    OperationError,
+    ResourceAllocated,
+    StateChanged,
+)
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 
@@ -189,6 +199,12 @@ class MonitorScreen(CopyEnabledScreen):
         self._connection_payload: dict[str, str] | None = None
         self._status_result: dict[str, str] = {}
         self._result_rows: list[tuple[str, str]] = []
+        self._result_title = "Check complete"
+        self._failure_rows: list[tuple[str, str]] = []
+        self._failure_title = "Operation failed"
+        self._progress = DeploymentProgress()
+        self._progress.start(None, title)
+        self._progress_tick_timer = None
         self._deploy_summarizer = (
             DeployLogSummarizer(deploy_backend)
             if deploy_backend is not None and summarize_backend_logs and not show_debug_logs
@@ -206,47 +222,113 @@ class MonitorScreen(CopyEnabledScreen):
             with Horizontal(id="monitor-toolbar"):
                 yield Static(self._title_markup(), id="monitor-title")
                 yield Static(self._view_status_markup(), id="monitor-view-status")
+            yield DeploymentProgressWidget(self._progress)
             yield Input(
                 placeholder="Search logs; Enter closes, n/N navigates",
                 id="monitor-search",
                 classes="hidden",
             )
-            with VerticalScroll(id="connection-card", classes="hidden"):
-                yield Static("[bold #7bf168]Connection[/]", id="connection-card-title")
-                yield Static("", id="connection-card-body")
-                with Horizontal(id="connection-card-actions"):
-                    yield Button("Copy URL", id="copy-url-btn")
-                    yield Button("Copy API key", id="copy-key-btn")
-                    yield Button("Copy all", id="copy-all-btn")
-                    yield Button("Manage endpoint", id="connection-manage-btn")
-                    yield Button("Done", id="connection-done-btn", variant="primary")
-            with VerticalScroll(id="result-card", classes="hidden"):
-                yield Static("[bold #7bf168]Result[/]", id="result-card-title")
-                yield Static("", id="result-card-body")
-                with Horizontal(id="result-card-actions"):
-                    yield Button("Copy result", id="result-copy-btn")
-                    yield Button("Done", id="result-done-btn", variant="primary")
+            # The outcome card mounts on demand via _mount_outcome_card: only
+            # one of connection/result/failure ever exists, because each
+            # reserves up to 65% of the height and all three mounted at once
+            # overflow short terminals even while hidden.
             yield LogViewer(id="monitor-log-viewer")
         yield FittedFooter()
 
+    def _mount_outcome_card(self, card_id: str) -> VerticalScroll | None:
+        """Mount the outcome card if absent; return it, or None on failure.
+
+        Mounting must be scheduled, not done inline: message handlers run
+        outside the widget-mounted context, so ``mount`` on children raises
+        ``MountError``. ``call_after_refresh`` defers until mounting is legal.
+        Callers that only need content set can pass it and return; the card
+        appears on the next refresh.
+        """
+        try:
+            return self.query_one(f"#{card_id}", VerticalScroll)
+        except Exception:
+            pass
+        try:
+            self.call_after_refresh(self._mount_outcome_card_deferred, card_id)
+        except Exception:
+            return None
+        return None
+
+    def _mount_outcome_card_deferred(self, card_id: str) -> None:
+        try:
+            self.query_one(f"#{card_id}", VerticalScroll)
+            return
+        except Exception:
+            pass
+        try:
+            viewer = self.query_one("#monitor-log-viewer", LogViewer)
+            layout = self.query_one("#monitor-layout", Vertical)
+        except Exception:
+            return
+        card: VerticalScroll | None = None
+        if card_id == "connection-card":
+            card = VerticalScroll(id="connection-card")
+        elif card_id == "result-card":
+            card = VerticalScroll(id="result-card")
+        elif card_id == "failure-card":
+            card = VerticalScroll(id="failure-card")
+        else:
+            return
+        layout.mount(card, before=viewer)
+        if card_id == "connection-card":
+            card.mount(
+                Static("[bold]Connection[/]", id="connection-card-title"),
+                Static("", id="connection-card-body"),
+            )
+            actions = Horizontal(id="connection-card-actions")
+            card.mount(actions)
+            actions.mount(
+                Button("Copy URL", id="copy-url-btn"),
+                Button("Copy API key", id="copy-key-btn"),
+                Button("Copy all", id="copy-all-btn"),
+                Button("Manage endpoint", id="connection-manage-btn"),
+                Button("Done", id="connection-done-btn", variant="primary"),
+            )
+            self._fill_connection_card()
+        elif card_id == "result-card":
+            card.mount(
+                Static("[bold]Result[/]", id="result-card-title"),
+                Static("", id="result-card-body"),
+            )
+            actions = Horizontal(id="result-card-actions")
+            card.mount(actions)
+            actions.mount(
+                Button("Copy result", id="result-copy-btn"),
+                Button("Done", id="result-done-btn", variant="primary"),
+            )
+            self._fill_result_card()
+        elif card_id == "failure-card":
+            card.mount(
+                Static("[bold]Outcome[/]", id="failure-card-title"),
+                Static("", id="failure-card-body"),
+            )
+            actions = Horizontal(id="failure-card-actions")
+            card.mount(actions)
+            actions.mount(
+                Button("Copy error", id="failure-copy-btn"),
+                Button("Manage", id="failure-manage-btn"),
+                Button("Done", id="failure-done-btn", variant="primary"),
+            )
+            self._fill_failure_card()
+
     def _title_markup(self) -> str:
-        """Render a compact operation title and input-mode badge."""
-        mouse_enabled = getattr(self.app, "mouse_enabled", True)
-        mode = "MOUSE" if mouse_enabled else "TERMINAL SELECT"
-        return (
-            f"[bold #7bf168]{escape(self._title)}[/]  "
-            f"[dim]·[/dim]  [#93a596]{mode}[/]"
-        )
+        """Render a compact operation title."""
+        return f"[bold]{escape(self._title)}[/]"
 
     def _view_status_markup(self) -> str:
         """Render live follow and line-count state for the log viewport."""
         line_label = "line" if self._line_count == 1 else "lines"
         if self._following:
-            state = "[bold #7bf168]FOLLOWING[/]"
+            state = "[reverse]FOLLOWING[/]"
         else:
             new_label = "line" if self._unseen_lines == 1 else "lines"
             state = (
-                f"[bold yellow]PAUSED[/]  [yellow]· {self._unseen_lines} new {new_label}[/]"
+                f"[warning]PAUSED[/]  [warning]· {self._unseen_lines} new {new_label}[/]"
             )
         search = ""
         if self._search_query:
@@ -261,7 +343,7 @@ class MonitorScreen(CopyEnabledScreen):
         )
 
     def refresh_copy_help(self) -> None:
-        """Refresh compact chrome after toggling app/terminal mouse mode."""
+        """Refresh compact monitor chrome."""
         self.query_one("#monitor-title", Static).update(self._title_markup())
         self.query_one("#monitor-view-status", Static).update(
             self._view_status_markup()
@@ -287,6 +369,8 @@ class MonitorScreen(CopyEnabledScreen):
         # "backend: --" for the whole of logs, status, benchmark and stop.
         if self._deploy_backend is not None:
             self.status_header.update_from_event(backend=self._deploy_backend)
+        self._progress_tick_timer = None
+        self._refresh_progress()
         if self._summary_mode_enabled:
             self.status_header.update_from_event(
                 state=DeploymentState.QUEUED,
@@ -294,14 +378,68 @@ class MonitorScreen(CopyEnabledScreen):
                 operation=OperationType.DEPLOY,
                 detail="Preparing deployment",
             )
+            self._ensure_progress_operation(OperationType.DEPLOY)
+            self._progress.on_state(DeploymentState.QUEUED, "Preparing deployment")
+            self._refresh_progress()
             self._append_log_line("Preparing deployment", summary=True, raw=False)
             self._last_summary_state_detail = "Preparing deployment"
             self.set_interval(0.25, self._tick_summary_spinner)
+
+    def _ensure_progress_operation(self, operation: OperationType | None) -> None:
+        """Adopt the operation once the event stream names it.
+
+        The screen is built with only a title; the first state/log event names
+        the operation. Restarting the tracker then costs <1s of elapsed time
+        and buys the correct stage row for deploy vs. status/stop/benchmark.
+        """
+        if operation is None or operation == self._progress.operation:
+            return
+        if self._progress.operation is None:
+            title = self._progress.title or self._title
+            self._progress.start(operation, title)
+            self._refresh_progress()
+
+    def _refresh_progress(self) -> None:
+        try:
+            widget = self.query_one(DeploymentProgressWidget)
+        except Exception:
+            return
+        try:
+            widget.update_progress(self._progress)
+        except Exception:
+            pass
+        # Elapsed time must stay fresh without backend events, but a 1s
+        # repaint timer keeps the whole screen dirty forever. Only repaint
+        # when something visible can change: the elapsed label ticks each
+        # minute, and quiet-stage hints appear after a long silence.
+        try:
+            timer = getattr(self, "_progress_tick_timer", None)
+            if self._done or self._progress.done:
+                if timer is not None:
+                    timer.stop()
+                    self._progress_tick_timer = None
+            elif timer is None:
+                self._progress_tick_timer = self.set_interval(5.0, self._tick_progress)
+        except Exception:
+            pass
+
+    def _tick_progress(self) -> None:
+        """Repaint elapsed/quiet hints while an operation runs."""
+        if self._done:
+            return
+        try:
+            widget = self.query_one(DeploymentProgressWidget)
+            widget.update_progress(self._progress)
+        except Exception:
+            pass
 
     def on_log_message(self, message: LogMessage) -> None:
         prefix = "stderr | " if message.stream == "stderr" else ""
         cleaned = _strip_ansi(message.line)
         self._capture_result_lines(cleaned)
+        if message.is_milestone and cleaned.strip():
+            self._progress.on_milestone(cleaned.strip())
+            self._refresh_progress()
         raw_line = (
             message.line
             if self._show_debug_logs and self._summarize_backend_logs
@@ -315,6 +453,10 @@ class MonitorScreen(CopyEnabledScreen):
         if self._summary_mode_enabled:
             assert self._deploy_summarizer is not None
             for line in self._deploy_summarizer.transform(cleaned, self._current_operation):
+                stripped = _strip_ansi(line).strip()
+                if stripped:
+                    self._progress.on_milestone(stripped)
+                    self._refresh_progress()
                 self._append_log_line(
                     f"{prefix}{line}" if prefix else line,
                     summary=True,
@@ -325,12 +467,15 @@ class MonitorScreen(CopyEnabledScreen):
     def on_state_changed(self, message: StateChanged) -> None:
         if message.operation is not None:
             self._current_operation = message.operation
+            self._ensure_progress_operation(message.operation)
         self.status_header.update_from_event(
             state=message.state,
             operation=message.operation,
             detail=message.detail,
         )
         detail = _strip_ansi(message.detail).strip()
+        self._progress.on_state(message.state, detail)
+        self._refresh_progress()
         if (
             self._summary_mode_enabled
             and detail
@@ -343,8 +488,21 @@ class MonitorScreen(CopyEnabledScreen):
             ):
                 self._append_log_line(line, summary=True, raw=False)
 
+    def on_resource_allocated(self, message: ResourceAllocated) -> None:
+        self._progress.on_resource_allocated(
+            f"Resource allocated ({message.app_id})" if message.app_id else "Resource allocated"
+        )
+        self._refresh_progress()
+
+    def on_endpoint_available(self, message: EndpointAvailable) -> None:
+        _ = message.endpoint
+        self._progress.on_endpoint_available()
+        self._refresh_progress()
+
     def on_connection_summary_ready(self, message: ConnectionSummaryReady) -> None:
         self._connection_payload = dict(message.payload)
+        self._progress.on_connection_ready("Endpoint verified")
+        self._refresh_progress()
         if self._success:
             self._show_connection_card()
 
@@ -368,6 +526,16 @@ class MonitorScreen(CopyEnabledScreen):
     def on_operation_done(self, message: OperationDone) -> None:
         self._done = True
         self._success = message.success
+        self._ensure_progress_operation(message.operation)
+        self._current_operation = message.operation
+        detail = _strip_ansi(message.detail or "").strip()
+        resource_status = self._progress.resource_status
+        if message.success and resource_status == "none":
+            resource_status = "allocated"
+        if not message.success and resource_status == "none":
+            resource_status = "unknown"
+        self._progress.on_done(message.success, detail, resource_status=resource_status)
+        self._refresh_progress()
         self.refresh_bindings()
         if message.success:
             self.status_header.update_from_event(
@@ -390,7 +558,6 @@ class MonitorScreen(CopyEnabledScreen):
             # and fail_operation repeats it verbatim as the completion detail.
             # Restating it here printed the same sentence twice, which on a
             # summarized deploy took four of the dozen lines the box has.
-            detail = _strip_ansi(message.detail or "").strip()
             if detail and detail != self._last_error_message:
                 self._append_log_line(f"Detail: {detail}")
             if self._summary_mode_enabled:
@@ -400,6 +567,7 @@ class MonitorScreen(CopyEnabledScreen):
             # Not "enter to retry": enter pops this screen like esc and q do,
             # and no retry path exists to offer.
             self._append_log_line(_RETURN_HINT)
+            self._show_failure_card(message)
             return
         if message.success and self._connection_payload:
             self._append_log_line(_RETURN_HINT)
@@ -445,14 +613,25 @@ class MonitorScreen(CopyEnabledScreen):
         if not rows:
             return
         self._result_rows = rows
-        card = self.query_one("#result-card", VerticalScroll)
-        card.remove_class("hidden")
-        title = self._RESULT_TITLES.get(message.operation, "Check complete")
-        self.query_one("#result-card-title", Static).update(
-            f"[bold #7bf168]{title}[/]"
-        )
-        self.query_one("#result-card-body", Static).update(_result_card_markup(rows))
-        self.query_one("#result-done-btn", Button).focus()
+        self._result_title = self._RESULT_TITLES.get(message.operation, "Check complete")
+        card = self._mount_outcome_card("result-card")
+        if card is not None:
+            self._fill_result_card()
+
+    def _fill_result_card(self) -> None:
+        """Fill a mounted result card from retained rows (deferred mount)."""
+        if not self._result_rows:
+            return
+        try:
+            self.query_one("#result-card-title", Static).update(
+                f"[bold]{self._result_title}[/]"
+            )
+            self.query_one("#result-card-body", Static).update(
+                _result_card_markup(self._result_rows)
+            )
+            self.query_one("#result-done-btn", Button).focus()
+        except Exception:
+            pass
 
     def _copy_result(self) -> None:
         if not self._result_rows:
@@ -460,11 +639,73 @@ class MonitorScreen(CopyEnabledScreen):
             return
         text = "\n".join(f"{label}: {value}" for label, value in self._result_rows)
         self.app.copy_to_clipboard(text)
-        self.notify("Copied result", timeout=2)
+        self.notify("Copy requested: result", timeout=2)
 
     def on_operation_error(self, message: OperationError) -> None:
         self._last_error_message = _strip_ansi(message.message).strip()
+        self._progress.on_error(self._last_error_message)
+        self._refresh_progress()
         self._append_log_line(f"Error: {message.message}")
+
+    def _failure_resource_line(self) -> str:
+        """Describe the resource outcome without inventing cleanup results."""
+        status = self._progress.resource_status
+        if status == "allocated":
+            return "Resource was allocated; it may still be running. Check Manage before redeploying."
+        if status in ("unknown", "none"):
+            return "Resource state is unknown. Check Manage for stopped or retained resources."
+        if status == "retained":
+            return "Resource was retained. Stop it in Manage if it is no longer needed."
+        if status == "failed":
+            return "Cleanup did not confirm. Check Manage for unresolved resources."
+        return "Check Manage for the current resource state."
+
+    def _failure_next_steps(self, operation: OperationType) -> str:
+        if operation == OperationType.DEPLOY:
+            return "Next: review the error, try another placement, or open Manage for logs."
+        if operation == OperationType.WARMUP:
+            return "Next: the endpoint may still exist; verify in Manage or check logs."
+        if operation == OperationType.STOP:
+            return "Next: check Manage; a failed stop can leave a billable resource."
+        return "Next: check Manage or review the logs above."
+
+    def _show_failure_card(self, message: OperationDone) -> None:
+        """Render a concise failure outcome with resource state and next actions."""
+        detail = _strip_ansi(message.detail or "").strip() or self._last_error_message
+        rows: list[tuple[str, str]] = [
+            ("Operation", message.operation.value),
+            ("Error", detail or f"exit code {message.exit_code}"),
+            ("Resource", self._failure_resource_line()),
+            ("Next", self._failure_next_steps(message.operation)),
+        ]
+        self._failure_rows = rows
+        self._failure_title = f"{message.operation.value.capitalize()} failed"
+        card = self._mount_outcome_card("failure-card")
+        if card is not None:
+            self._fill_failure_card()
+
+    def _fill_failure_card(self) -> None:
+        """Fill a mounted failure card from retained rows (deferred mount)."""
+        if not self._failure_rows:
+            return
+        try:
+            self.query_one("#failure-card-title", Static).update(
+                f"[bold]{escape(self._failure_title)}[/]"
+            )
+            self.query_one("#failure-card-body", Static).update(
+                _result_card_markup(self._failure_rows)
+            )
+            self.query_one("#failure-done-btn", Button).focus()
+        except Exception:
+            pass
+
+    def _copy_failure(self) -> None:
+        if not self._failure_rows:
+            self.notify("Nothing to copy", timeout=2)
+            return
+        text = "\n".join(f"{label}: {value}" for label, value in self._failure_rows)
+        self.app.copy_to_clipboard(text)
+        self.notify("Copy requested: error", timeout=2)
 
     def on_log_viewer_status_changed(self, message: LogViewer.StatusChanged) -> None:
         """Keep compact monitor chrome synchronized with the log viewport."""
@@ -513,17 +754,27 @@ class MonitorScreen(CopyEnabledScreen):
         payload = self._connection_payload
         if payload is None:
             return
-        card = self.query_one("#connection-card", VerticalScroll)
-        card.remove_class("hidden")
-        self.query_one("#connection-card-title", Static).update(
-            "[bold #7bf168]Endpoint ready[/]"
-        )
-        self.query_one("#connection-card-body", Static).update(
-            _connection_card_markup(payload)
-        )
-        has_key = bool((payload.get("api_key") or "").strip())
-        self.query_one("#copy-key-btn", Button).display = has_key
-        self.query_one("#connection-done-btn", Button).focus()
+        card = self._mount_outcome_card("connection-card")
+        if card is not None:
+            self._fill_connection_card()
+
+    def _fill_connection_card(self) -> None:
+        """Fill a mounted connection card from the retained payload."""
+        payload = self._connection_payload
+        if payload is None:
+            return
+        try:
+            self.query_one("#connection-card-title", Static).update(
+                "[bold]Endpoint ready[/]"
+            )
+            self.query_one("#connection-card-body", Static).update(
+                _connection_card_markup(payload)
+            )
+            has_key = bool((payload.get("api_key") or "").strip())
+            self.query_one("#copy-key-btn", Button).display = has_key
+            self.query_one("#connection-done-btn", Button).focus()
+        except Exception:
+            pass
 
     def _copy_connection_field(self, field: str, *, empty_message: str) -> None:
         payload = self._connection_payload
@@ -535,7 +786,7 @@ class MonitorScreen(CopyEnabledScreen):
             self.notify(empty_message, timeout=2)
             return
         self.app.copy_to_clipboard(value)
-        self.notify(f"Copied {field.replace('_', ' ')}", timeout=2)
+        self.notify(f"Copy requested: {field.replace('_', ' ')}", timeout=2)
 
     def action_copy_base_url(self) -> None:
         self._copy_connection_field("base_url", empty_message="No base URL to copy")
@@ -553,7 +804,7 @@ class MonitorScreen(CopyEnabledScreen):
             self.notify("Nothing to copy", timeout=2)
             return
         self.app.copy_to_clipboard(text)
-        self.notify("Copied connection details", timeout=2)
+        self.notify("Copy requested: connection details", timeout=2)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "copy-url-btn":
@@ -569,6 +820,12 @@ class MonitorScreen(CopyEnabledScreen):
         elif event.button.id == "result-copy-btn":
             self._copy_result()
         elif event.button.id == "result-done-btn":
+            self.action_finish_success()
+        elif event.button.id == "failure-copy-btn":
+            self._copy_failure()
+        elif event.button.id == "failure-manage-btn":
+            self.action_open_manage()
+        elif event.button.id == "failure-done-btn":
             self.action_finish_success()
 
     def action_submit_or_finish(self) -> None:
@@ -609,7 +866,7 @@ class MonitorScreen(CopyEnabledScreen):
     def action_go_back(self) -> None:
         jobs = getattr(self.app, "deployment_jobs", {})
         if any(job.monitor is self and not job.finished.is_set() for job in jobs.values()):
-            self.notify("Deployment continues. Reopen or cancel it in Operations (Ctrl+O).", timeout=5)
+            self.notify("Deployment continues. Reopen it in Manage → Jobs (Ctrl+O).", timeout=5)
         if self._success and self._connection_payload:
             self._pop_after_success()
             return
@@ -658,7 +915,7 @@ class MonitorScreen(CopyEnabledScreen):
         self._line_count = 0
         self._result_rows = []
         try:
-            self.query_one("#result-card", VerticalScroll).add_class("hidden")
+            self.query_one("#result-card", VerticalScroll).remove()
         except Exception:
             pass
         self.query_one("#monitor-view-status", Static).update(

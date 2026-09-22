@@ -1397,7 +1397,7 @@ class DeployKeyHintTests(unittest.TestCase):
         # step two cannot rent a GPU. The footer says so, but the fulfillment
         # dropdown paints over the footer while open, and a phone terminal
         # hides the footer behind its on-screen keyboard for good.
-        wide = render_markup(deploy_key_hint(narrow=False, mouse_enabled=True)).plain
+        wide = render_markup(deploy_key_hint(narrow=False)).plain
         self.assertIn("ctrl+d", wide)
         self.assertIn("Deploy", wide)
 
@@ -1406,29 +1406,20 @@ class DeployKeyHintTests(unittest.TestCase):
 
         # The hint is one row high, so anything that does not fit is cut. The
         # full sentence lost its final word on a real phone terminal.
-        for mouse_enabled in (True, False):
-            with self.subTest(mouse_enabled=mouse_enabled):
-                narrow = render_markup(
-                    deploy_key_hint(narrow=True, mouse_enabled=mouse_enabled)
-                ).plain
-                self.assertLessEqual(cell_len(narrow), 46)
-                self.assertIn("ctrl+d", narrow)
+        narrow = render_markup(deploy_key_hint(narrow=True)).plain
+        self.assertLessEqual(cell_len(narrow), 46)
+        self.assertIn("ctrl+d", narrow)
 
-    def test_it_says_how_to_turn_taps_on_when_they_are_off(self) -> None:
+    def test_it_describes_keyboard_navigation_without_a_mouse_toggle(self) -> None:
         from llm_launchpad.tui.screens.quick_deploy import deploy_key_hint
 
-        # Mouse reporting off means taps never reach the app, so it cannot
-        # report one it never received. The remedy has to be on screen first.
         for narrow in (True, False):
             with self.subTest(narrow=narrow):
                 text = render_markup(
-                    deploy_key_hint(narrow=narrow, mouse_enabled=False)
+                    deploy_key_hint(narrow=narrow)
                 ).plain
-                self.assertIn("ctrl+t", text)
-                self.assertNotIn(
-                    "ctrl+t",
-                    render_markup(deploy_key_hint(narrow=narrow, mouse_enabled=True)).plain,
-                )
+                self.assertNotIn("ctrl+t", text)
+                self.assertIn("tab to Deploy", text)
 
     def test_enter_is_not_bound_to_deploy(self) -> None:
         from llm_launchpad.tui.screens.quick_deploy import QuickDeployScreen
