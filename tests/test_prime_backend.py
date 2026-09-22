@@ -39,6 +39,7 @@ from llm_launchpad.protocol.enums import (
     CertificationState,
     ComputeProvider,
     OperationType,
+    ServingObjective,
 )
 from llm_launchpad.core.prime_disks import remember_prime_disk, StoredPrimeDisk
 from llm_launchpad.core.provider_options import prime_provider_options
@@ -52,6 +53,7 @@ from llm_launchpad.protocol.models import (
     PrimeProviderOptions,
     ReasoningCapabilities,
     RuntimeTuning,
+    ServingRequirements,
 )
 
 
@@ -251,6 +253,144 @@ class PrimeLaunchSpecTests(unittest.TestCase):
             preferred_image,
             PRIME_DEFAULT_BOOTSTRAP_IMAGE,
         )
+
+
+class PrimeFitGuardCommandTests(unittest.TestCase):
+    """The fit guard runs llama-fit-params against the staged shard, in a shell.
+
+    Substring assertions cannot see that ``$(cat …)`` survives ``shlex.join``
+    as literal text, so these tests execute the guard fragment in a real
+    shell against a stub planner that records the argv it was handed.
+    """
+
+    def _config(self) -> DeploymentConfig:
+        tuning = RuntimeTuning(
+            parallel_slots=4, batch_size=2048, ubatch_size=64,
+            cache_type_k="f16", cache_type_v="f16", flash_attention=False,
+            gpu_layers="all", fit_target_mib=2048,
+        )
+        return DeploymentConfig(
+            backend=BackendType.LLAMACPP,
+            provider=ComputeProvider.PRIME,
+            repo_id="unsloth/Qwen3.8-27B-GGUF",
+            quant="UD-Q2_K_XL",
+            served_model_name="qwen38-27b",
+            endpoint_api_key="endpoint-secret",
+            gpu_type="H100",
+            provider_options=PrimeProviderOptions(),
+            runtime_tuning=tuning,
+            serving_requirements=ServingRequirements(
+                context_tokens=32768, objective=ServingObjective.GENERAL_PURPOSE,
+                full_context_per_request=True, gpu_only=True,
+            ),
+            placement_assessment=PlacementAssessment(
+                fits=True, gpu_resident=True, tuning=tuning,
+                certification=CertificationState.ESTIMATED,
+                fingerprint="fingerprint-under-test",
+                memory=MemoryEstimate(
+                    weights_gb=20.0, kv_cache_gb=8.0, compute_gb=2.0,
+                    attention_scratch_gb=1.0, speculative_gb=0.0,
+                    reserve_gb=0.0, total_gb=31.0,
+                    per_device_required_gb=(31.0,), confidence=0.82,
+                    source="gguf-metadata", total_layer_count=32,
+                ),
+            ),
+        )
+
+    def _run_guard_fragment(self, weights: Path) -> tuple[int, str, list[str]]:
+        """Execute the fit guard alone, fit-params stubbed, in a real shell.
+
+        The guard fragment is cut out of the container command Prime runs
+        under ``sh -lc``; its staging paths are remapped into a scratch
+        directory, and a stub stands in for ``/app/llama-fit-params`` and
+        records the argv it is handed. Returns the shell exit code, its
+        stderr, and the recorded planner argv.
+        """
+
+        import json
+        import shutil as _shutil
+        import subprocess as _subprocess
+
+        shell = _shutil.which("sh")
+        if shell is None:  # pragma: no cover - POSIX hosts always have one
+            self.skipTest("no POSIX shell available")
+        captured = weights.parent / "fit-argv.json"
+        stub = weights.parent / "llama-fit-params"
+        stub.write_text(
+            "#!/bin/sh\n"
+            f"{_shutil.which('python3')} -c \"import json,sys;"
+            f"json.dump(sys.argv[1:], open({str(captured)!r}, 'w'))\""
+            ' "$@"\n',
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+
+        config = self._config()
+        launch = resolve_prime_launch_spec(config)
+        inner = PrimeBackend._bootstrap_docker_command(config, launch)[-1]
+        guard = inner[: inner.index("echo LLM_LAUNCHPAD_ATTESTATION_JSON_BEGIN")]
+        # Only the guard's staging paths are remapped into the scratch
+        # directory; the staging prelude itself is not under test here.
+        guard = (
+            guard[guard.index("LLAMA_ARG_FIT_FILE="):]
+            .replace("/root/.cache/llama.cpp/staged/weights.args", str(weights))
+            .replace("/app/llama-fit-params", str(stub))
+        )
+        completed = _subprocess.run(
+            [shell, "-lc", guard],
+            capture_output=True, text=True, timeout=60,
+        )
+        argv: list[str] = []
+        if captured.is_file():
+            argv = json.loads(captured.read_text(encoding="utf-8"))
+        return completed.returncode, completed.stderr.strip(), argv
+
+    def test_the_fit_guard_hands_the_staged_shard_to_the_planner(self) -> None:
+        """Run the guard fragment with fit-params stubbed and weights staged.
+
+        A command substitution baked into the joined argument list reaches
+        the tool as literal text instead -- the server exec line died that
+        way, and was fixed by splicing the staged name in after the join.
+        The guard asserts on what the planner actually received, and on the
+        name surviving as one argument past a space, which an unquoted
+        reference would split.
+        """
+
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as directory:
+            weights = Path(directory) / "weights.args"
+            weights.write_text(
+                "UD-Q2_K_XL/Model One-00001-of-00004.gguf\n", encoding="utf-8"
+            )
+
+            returncode, stderr, argv = self._run_guard_fragment(weights)
+
+            self.assertEqual(returncode, 0, f"guard failed: {stderr!r}")
+            self.assertIn("--hf-file", argv)
+            self.assertEqual(
+                argv[argv.index("--hf-file") + 1],
+                "UD-Q2_K_XL/Model One-00001-of-00004.gguf",
+            )
+            self.assertNotIn("$(cat", " ".join(argv))
+
+    def test_the_fit_guard_is_skipped_when_staging_wrote_no_name(self) -> None:
+        """An unstaged name fails the guard open, not the deploy.
+
+        The staged name is best effort -- the pinned image cannot run the
+        stager at all -- so an absent ``weights.args`` must skip the planner
+        rather than hand it an empty ``--hf-file`` or abort the container.
+        """
+
+        from tempfile import TemporaryDirectory
+
+        with TemporaryDirectory() as directory:
+            absent = Path(directory) / "absent.args"
+
+            returncode, stderr, argv = self._run_guard_fragment(absent)
+
+            self.assertEqual(returncode, 0, f"guard failed: {stderr!r}")
+            self.assertEqual(argv, [])
 
 
 class _FakeResponse:

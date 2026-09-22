@@ -9,6 +9,7 @@ from llm_launchpad.core.inference_options import (
     PrimeInferenceAdapter,
     estimate_monthly_compute_cost,
     evaluate_quote_cost,
+    recommended_vllm_reasoning_parser,
     recommended_vllm_tool_call_parser,
     resolve_inference_plans,
 )
@@ -162,6 +163,30 @@ class InferenceRecipeTests(unittest.TestCase):
         self.assertIsNone(
             recommended_vllm_tool_call_parser("meta-llama/Llama-3.1-8B-Instruct")
         )
+
+    def test_dotted_qwen_releases_get_the_xml_tool_parser(self) -> None:
+        """Qwen 3.5/3.8 name themselves past the ``qwen3-`` prefix and emit XML."""
+        for model in (
+            "Qwen/Qwen3.8-27B",
+            "Qwen/Qwen3.5-27B",
+            "Qwen/Qwen3.8-Flash-Next",
+            "unsloth/Qwen3.8-27B-FP8",
+        ):
+            with self.subTest(model=model):
+                self.assertEqual(recommended_vllm_tool_call_parser(model), "qwen3_xml")
+
+    def test_thinking_models_get_a_reasoning_parser(self) -> None:
+        """Without one, `<think>` is served as the answer instead of as reasoning."""
+        for model in ("Qwen/Qwen3.8-27B", "Qwen/Qwen3-8B", "Qwen/QwQ-32B"):
+            with self.subTest(model=model):
+                self.assertEqual(recommended_vllm_reasoning_parser(model), "qwen3")
+        for model in (
+            "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+            "Qwen/Qwen2.5-7B-Instruct",
+            "meta-llama/Llama-3.1-8B-Instruct",
+        ):
+            with self.subTest(model=model):
+                self.assertIsNone(recommended_vllm_reasoning_parser(model))
 
     def test_quick_deploy_separates_one_recipe_from_multiple_modal_quotes(self) -> None:
         profiles = (

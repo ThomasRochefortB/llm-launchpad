@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import json
 import unittest
 from unittest.mock import Mock, patch
 
@@ -136,6 +137,39 @@ class VastBackendTests(unittest.TestCase):
                 self.assertFalse(result.authenticated)
                 self.assertIn(expected, result.error or "")
                 self.assertNotIn("private-key", result.error or "")
+
+    def test_a_rejection_carries_vast_own_words_but_not_the_request(self) -> None:
+        """"HTTP 400" alone cannot tell a user their offer was simply taken."""
+        self.response.status_code = 400
+        self.response.text = json.dumps(
+            {
+                "success": False,
+                "error": "invalid_args",
+                "msg": "error 404/3603: no_such_ask Instance type by id 47550078 is not available.",
+                "ask_id": 47550078,
+            }
+        )
+        result = self.backend.auth_status()
+        self.assertIn("no_such_ask", result.error or "")
+        self.assertNotIn("private-key", result.error or "")
+
+    def test_a_non_json_body_is_still_withheld(self) -> None:
+        self.response.status_code = 400
+        self.response.text = "onstart: export VLLM_API_KEY=private-key"
+        result = self.backend.auth_status()
+        self.assertIn("HTTP 400", result.error or "")
+        self.assertNotIn("private-key", result.error or "")
+
+    def test_an_offer_taken_first_is_reported_as_such(self) -> None:
+        self.response.status_code = 400
+        self.response.text = json.dumps(
+            {"success": False, "error": "invalid_args", "msg": "no_such_ask is not available."}
+        )
+        with self.assertRaises(VastApiError) as caught:
+            self.backend.create_instance(
+                "47550078", image="vllm/vllm-openai@sha256:abc", disk_gb=100, label="llp-test"
+            )
+        self.assertIn("was taken before this rental started", str(caught.exception))
 
     def test_network_failure_is_sanitized(self) -> None:
         self.request.side_effect = requests.ConnectionError("private-key")

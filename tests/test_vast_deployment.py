@@ -25,7 +25,7 @@ from llm_launchpad.core.vast_ssh import (
 )
 from llm_launchpad.core.vast_state import VastState
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider, OperationType
-from llm_launchpad.protocol.events import OperationCompleteEvent
+from llm_launchpad.protocol.events import LogEvent, OperationCompleteEvent
 from llm_launchpad.protocol.models import DeploymentConfig, VastAuthStatus, VastInstance, VastProviderOptions
 from tests.test_vast_fast_deploy import vast_offer
 
@@ -223,8 +223,13 @@ class VastLifecycleTests(unittest.TestCase):
         self.remote = None
 
     def deploy(self) -> OperationCompleteEvent:
-        events = list(self.backend.deploy(self.config))
-        return next(event for event in reversed(events) if isinstance(event, OperationCompleteEvent))
+        # Retained so a test can assert on what the deploy reported, not only
+        # on how it ended.
+        self.events = list(self.backend.deploy(self.config))
+        return next(
+            event for event in reversed(self.events)
+            if isinstance(event, OperationCompleteEvent)
+        )
 
     def test_create_verify_list_reconnect_and_destroy(self) -> None:
         event = self.deploy()
@@ -844,6 +849,234 @@ class VastLifecycleTests(unittest.TestCase):
         self.assertEqual(len(self.state.records()), 1)
         self.assertFalse(self.deploy().success)
         self.api.create_instance.assert_called_once()
+
+    def test_a_refused_create_frees_the_name_instead_of_blocking_it(self) -> None:
+        # Live: Vast answered PUT /asks/<id>/ with HTTP 400 and no rental was
+        # made. Cleanup reconciled by label, found zero instances, and read
+        # that as "creation remains uncertain" -- so the record survived, and
+        # the name was then refused by deploy ("already recorded") *and* by
+        # destroy ("uncertain"), with no way out through the product.
+        self.api.create_instance.side_effect = VastApiError(
+            "Vast request failed (HTTP 400).", status_code=400
+        )
+
+        event = self.deploy()
+
+        self.assertFalse(event.success)
+        self.assertNotIn("Cleanup remains pending", event.detail or "")
+        self.assertEqual(self.state.records(), [])
+        self.api.destroy_instance.assert_not_called()
+        # The name is free, so the obvious next move actually works.
+        self.api.create_instance.side_effect = self.create
+        self.assertTrue(self.deploy().success)
+
+    def test_an_unanswered_create_still_retains_the_record(self) -> None:
+        # A transport failure leaves it genuinely unknown whether Vast acted,
+        # and a rental that lands a moment after the label scan would bill
+        # unattended. That record is kept on purpose.
+        self.api.create_instance.side_effect = VastApiError("request timed out")
+
+        self.assertFalse(self.deploy().success)
+
+        self.assertEqual(len(self.state.records()), 1)
+
+    def test_a_throttled_create_is_not_treated_as_a_refusal(self) -> None:
+        # 429 means Vast declined to answer yet, not that it refused the
+        # rental, so it keeps the conservative path.
+        self.api.create_instance.side_effect = VastApiError(
+            "Vast rate limit reached.", status_code=429
+        )
+
+        self.assertFalse(self.deploy().success)
+
+        self.assertEqual(len(self.state.records()), 1)
+
+    def test_a_dead_runtime_reports_more_than_the_heartbeat_window(self) -> None:
+        """vLLM's "See root cause above" is useless without the above.
+
+        The heartbeat reads 25 lines because it runs every few seconds; a
+        Python traceback is longer than that, so the line naming the cause is
+        pushed out by the line that points at it. A live Vast rental failed
+        exactly this way and reported nothing but the pointer.
+        """
+        probe = (
+            f"{self.gpu_inventory}\n"
+            "BYTES 0\n"
+            "LOG RuntimeError: Engine core initialization failed. See root cause above.\n"
+            "RUNTIME 0\n"
+        )
+        post_mortem = "\n".join(
+            ["torch.OutOfMemoryError: CUDA out of memory allocating 12.00 GiB"]
+            + [f"  frame {index}" for index in range(60)]
+            + ["RuntimeError: Engine core initialization failed. See root cause above."]
+        )
+
+        def remote(instance: object, command: str, **kwargs: object) -> str:
+            if "nvidia-smi" in command:
+                return self.gpu_inventory
+            if command.startswith("tail -c 200000"):
+                return post_mortem
+            return probe
+
+        self.ssh.run.side_effect = remote
+        with patch("llm_launchpad.core.vast_deployment.endpoint_healthy", return_value=False), patch(
+            "llm_launchpad.core.vast_deployment.VAST_STARTUP_HEARTBEAT_SECONDS", 0
+        ), patch("llm_launchpad.core.vast_deployment.VAST_SERVE_DEADLINE_SECONDS", 20):
+            event = self.deploy()
+
+        self.assertFalse(event.success)
+        logged = "\n".join(line.line for line in self.events if isinstance(line, LogEvent))
+        self.assertIn("CUDA out of memory", logged)
+
+    def test_a_post_mortem_read_that_fails_keeps_the_heartbeat_lines(self) -> None:
+        probe = (
+            f"{self.gpu_inventory}\n"
+            "BYTES 0\n"
+            "LOG E srv: exiting due to model loading error\n"
+            "RUNTIME 0\n"
+        )
+
+        def remote(instance: object, command: str, **kwargs: object) -> str:
+            if "nvidia-smi" in command:
+                return self.gpu_inventory
+            if command.startswith("tail -c 200000"):
+                raise RuntimeError("ssh closed")
+            return probe
+
+        self.ssh.run.side_effect = remote
+        with patch("llm_launchpad.core.vast_deployment.endpoint_healthy", return_value=False), patch(
+            "llm_launchpad.core.vast_deployment.VAST_STARTUP_HEARTBEAT_SECONDS", 0
+        ), patch("llm_launchpad.core.vast_deployment.VAST_SERVE_DEADLINE_SECONDS", 20):
+            event = self.deploy()
+
+        self.assertFalse(event.success)
+        logged = "\n".join(line.line for line in self.events if isinstance(line, LogEvent))
+        self.assertIn("exiting due to model loading error", logged)
+
+    def test_a_runtime_that_exited_fails_now_with_the_reason_it_printed(self) -> None:
+        # Live: a malformed export killed the startup script in its first
+        # second. The watcher read only the server log, which simply stopped
+        # changing, so the rental billed for the full 30-minute deadline and
+        # then reported "startup timed out" -- while the real message sat
+        # unread in server.log the whole time.
+        probe = (
+            f"{self.gpu_inventory}\n"
+            "BYTES 0\n"
+            "LOG load_tensors: offloading 64 repeating layers to GPU\n"
+            "LOG ggml_backend_cuda_buffer_type_alloc_buffer: allocating 21474 MiB on device 0: out of memory\n"
+            "LOG E srv llama_server: exiting due to model loading error\n"
+            "RUNTIME 0\n"
+        )
+        # The post-mortem re-reads server.log directly, with a window a whole
+        # traceback fits in; the heartbeat's own 25 lines do not.
+        post_mortem = (
+            "load_tensors: offloading 64 repeating layers to GPU\n"
+            "ggml_backend_cuda_buffer_type_alloc_buffer: allocating 21474 MiB on device 0: out of memory\n"
+            "E srv llama_server: exiting due to model loading error\n"
+        )
+
+        def remote(instance: object, command: str, **kwargs: object) -> str:
+            if "nvidia-smi" in command:
+                return self.gpu_inventory
+            if command.startswith("tail -c 200000"):
+                return post_mortem
+            return probe
+
+        self.ssh.run.side_effect = remote
+        # Probe on the first pass, and bound the deadline so a regression that
+        # stops watching the runtime fails here in seconds rather than spinning
+        # out the real half hour the way the paid rental did.
+        with patch("llm_launchpad.core.vast_deployment.endpoint_healthy", return_value=False), patch(
+            "llm_launchpad.core.vast_deployment.VAST_STARTUP_HEARTBEAT_SECONDS", 0
+        ), patch("llm_launchpad.core.vast_deployment.VAST_SERVE_DEADLINE_SECONDS", 20):
+            event = self.deploy()
+
+        self.assertFalse(event.success)
+        self.assertIn("runtime exited", event.detail or "")
+        self.assertIn("exiting due to model loading error", event.detail or "")
+        # The last line names the symptom; the cause is the line before it, so
+        # the run-up is reported rather than left on a destroyed host.
+        logged = "\n".join(
+            line.line for line in self.events if isinstance(line, LogEvent)
+        )
+        self.assertIn("out of memory", logged)
+        self.assertIn("offloading 64 repeating layers", logged)
+        self.api.destroy_instance.assert_called_once_with("900")
+        self.assertEqual(self.state.records(), [])
+
+    def test_one_probe_that_missed_the_process_does_not_end_the_rental(self) -> None:
+        # A single reading is not evidence: staging spends minutes inside one
+        # quiet `snapshot_download`, and a probe that failed to see it would
+        # otherwise destroy a healthy rental mid-download.
+        alive = f"{self.gpu_inventory}\nBYTES 0\nLOG staging weights\nRUNTIME 1\n"
+        blip = f"{self.gpu_inventory}\nBYTES 0\nLOG staging weights\nRUNTIME 0\n"
+        self.ssh.run.side_effect = [alive, alive, blip, *([alive] * 40)]
+
+        with patch("llm_launchpad.core.vast_deployment.endpoint_healthy", return_value=False), patch(
+            "llm_launchpad.core.vast_deployment.VAST_STARTUP_HEARTBEAT_SECONDS", 0
+        ), patch("llm_launchpad.core.vast_deployment.VAST_SERVE_DEADLINE_SECONDS", 3):
+            event = self.deploy()
+
+        self.assertFalse(event.success)
+        # However this deploy ends, it must not end by declaring the runtime
+        # dead on the strength of one reading that disagreed with its
+        # neighbours.
+        self.assertNotIn("runtime exited", event.detail or "")
+
+    def test_a_runtime_that_has_left_no_trace_yet_is_not_called_dead(self) -> None:
+        # The seconds before the startup script runs look exactly like a script
+        # that has exited: no process, no log. Acting on that destroyed a
+        # healthy rental 74s into a deploy, so absence needs corroboration.
+        self.ssh.run.side_effect = None
+        self.ssh.run.return_value = f"{self.gpu_inventory}\nBYTES 0\nRUNTIME 0\n"
+
+        with patch("llm_launchpad.core.vast_deployment.endpoint_healthy", return_value=False), patch(
+            "llm_launchpad.core.vast_deployment.VAST_STARTUP_HEARTBEAT_SECONDS", 0
+        ), patch("llm_launchpad.core.vast_deployment.VAST_SERVE_DEADLINE_SECONDS", 3):
+            event = self.deploy()
+
+        self.assertFalse(event.success)
+        # It waits out the deadline rather than claiming an exit it cannot see.
+        self.assertIn("timed out", event.detail or "")
+        self.assertNotIn("runtime exited", event.detail or "")
+
+    def test_a_runtime_seen_running_and_then_gone_is_called_dead(self) -> None:
+        alive = f"{self.gpu_inventory}\nBYTES 0\nLOG loading model\nRUNTIME 1\n"
+        gone = f"{self.gpu_inventory}\nBYTES 0\nLOG loading model\nRUNTIME 0\n"
+        self.ssh.run.side_effect = [alive, alive, *([gone] * 40)]
+
+        with patch("llm_launchpad.core.vast_deployment.endpoint_healthy", return_value=False), patch(
+            "llm_launchpad.core.vast_deployment.VAST_STARTUP_HEARTBEAT_SECONDS", 0
+        ), patch("llm_launchpad.core.vast_deployment.VAST_SERVE_DEADLINE_SECONDS", 30):
+            event = self.deploy()
+
+        self.assertFalse(event.success)
+        self.assertIn("runtime exited", event.detail or "")
+
+    def test_a_probe_that_cannot_answer_is_not_read_as_a_dead_runtime(self) -> None:
+        from llm_launchpad.core.vast_runtime import startup_runtime_stopped
+
+        # Only an explicit marker is an answer; silence is a busy host.
+        self.assertFalse(startup_runtime_stopped("BYTES 0\nLOG loading model"))
+        self.assertFalse(startup_runtime_stopped(""))
+        self.assertFalse(startup_runtime_stopped("RUNTIME 1"))
+        self.assertTrue(startup_runtime_stopped("RUNTIME 0"))
+
+    def test_the_liveness_probe_cannot_match_its_own_command_line(self) -> None:
+        import re
+
+        from llm_launchpad.core.vast_runtime import VAST_STARTUP_PROBE_COMMAND
+
+        # The probe runs as a shell command whose own /proc entry would match a
+        # naive pattern, so every rental would look alive forever.
+        patterns = re.findall(r"-e '([^']+)'", VAST_STARTUP_PROBE_COMMAND)
+        self.assertTrue(patterns)
+        for pattern in patterns:
+            with self.subTest(pattern=pattern):
+                self.assertIsNone(re.search(pattern, VAST_STARTUP_PROBE_COMMAND))
+        # It still matches the processes it is looking for.
+        self.assertTrue(any(re.search(p, "sh /root/.llm-launchpad/runtime.sh") for p in patterns))
+        self.assertTrue(any(re.search(p, "/app/llama-server --host 127.0.0.1") for p in patterns))
 
     def test_failed_cleanup_retains_recovery_record(self) -> None:
         self.stream.side_effect = RuntimeError("stream failed")

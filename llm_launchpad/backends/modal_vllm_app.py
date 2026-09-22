@@ -88,6 +88,11 @@ DEPLOY_REASONING_PARSER = os.environ.get("REASONING_PARSER", "").strip() or None
 DEPLOY_DEFAULT_CHAT_TEMPLATE_KWARGS = os.environ.get("DEFAULT_CHAT_TEMPLATE_KWARGS", "").strip() or None
 DEPLOY_TOOL_CALL_PARSER = os.environ.get("TOOL_CALL_PARSER", "").strip() or None
 DEPLOY_ENABLE_AUTO_TOOL_CHOICE = _read_optional_bool_env("ENABLE_AUTO_TOOL_CHOICE")
+DEPLOY_MAX_MODEL_LEN = _read_int_env("MAX_MODEL_LEN", 0)
+DEPLOY_MAX_NUM_SEQS = _read_int_env("MAX_NUM_SEQS", 0)
+# vLLM reads this itself and rejects every request without it. Passing it by
+# environment rather than on the command line keeps it out of `ps`.
+DEPLOY_VLLM_API_KEY = os.environ.get("VLLM_API_KEY", "").strip()
 PREDOWNLOAD_TIMEOUT_MINUTES = _read_int_env("PREDOWNLOAD_TIMEOUT_MINUTES", 6 * 60)
 SNAPSHOT_MAX_WORKERS = _read_int_env("HF_SNAPSHOT_MAX_WORKERS", 16)
 DOWNLOAD_CPU = _read_int_env("HF_DOWNLOAD_CPU", 4)
@@ -113,6 +118,12 @@ if DEPLOY_TOOL_CALL_PARSER:
     RUNTIME_ENV["TOOL_CALL_PARSER"] = DEPLOY_TOOL_CALL_PARSER
 if DEPLOY_ENABLE_AUTO_TOOL_CHOICE is not None:
     RUNTIME_ENV["ENABLE_AUTO_TOOL_CHOICE"] = "true" if DEPLOY_ENABLE_AUTO_TOOL_CHOICE else "false"
+if DEPLOY_MAX_MODEL_LEN > 0:
+    RUNTIME_ENV["MAX_MODEL_LEN"] = str(DEPLOY_MAX_MODEL_LEN)
+if DEPLOY_MAX_NUM_SEQS > 0:
+    RUNTIME_ENV["MAX_NUM_SEQS"] = str(DEPLOY_MAX_NUM_SEQS)
+if DEPLOY_VLLM_API_KEY:
+    RUNTIME_ENV["VLLM_API_KEY"] = DEPLOY_VLLM_API_KEY
 
 
 hf_cache_vol = modal.Volume.from_name("huggingface-cache", create_if_missing=True)
@@ -289,6 +300,8 @@ def serve() -> None:
     served_model_name = os.environ.get("SERVED_MODEL_NAME", DEPLOY_SERVED_MODEL_NAME).strip() or DEPLOY_SERVED_MODEL_NAME
     fast_boot = _read_bool_env("FAST_BOOT", DEPLOY_FAST_BOOT)
     n_gpu = _read_int_env("N_GPU", DEPLOY_N_GPU)
+    max_model_len = _read_int_env("MAX_MODEL_LEN", DEPLOY_MAX_MODEL_LEN)
+    max_num_seqs = _read_int_env("MAX_NUM_SEQS", DEPLOY_MAX_NUM_SEQS)
     trust_remote_code = _read_bool_env("TRUST_REMOTE_CODE", DEPLOY_TRUST_REMOTE_CODE)
     reasoning_parser = os.environ.get("REASONING_PARSER", "").strip() or DEPLOY_REASONING_PARSER
     default_chat_template_kwargs = (
@@ -314,6 +327,15 @@ def serve() -> None:
         str(n_gpu),
     ]
 
+    if max_num_seqs > 0:
+        # Stated rather than inherited: the images the providers pin disagree
+        # on the default, and on a hybrid model too high a value refuses to
+        # start rather than merely decoding wider.
+        cmd += ["--max-num-seqs", str(max_num_seqs)]
+    if max_model_len > 0:
+        # Left unset, vLLM serves the model's own maximum position count and
+        # refuses to start when that KV cache does not fit the attached GPUs.
+        cmd += ["--max-model-len", str(max_model_len)]
     cmd += ["--limit-mm-per-prompt", os.environ.get("LIMIT_MM_PER_PROMPT", RUNTIME_ENV["LIMIT_MM_PER_PROMPT"])]
     processor_kwargs = os.environ.get("MM_PROCESSOR_KWARGS", RUNTIME_ENV["MM_PROCESSOR_KWARGS"])
     if processor_kwargs:

@@ -25,6 +25,49 @@ class BackendEnvTests(unittest.TestCase):
         self.assertEqual(env["TOOL_CALL_PARSER"], "qwen3_xml")
         self.assertEqual(env["DEFAULT_CHAT_TEMPLATE_KWARGS"], '{"enable_thinking": false}')
 
+    def test_vllm_concurrency_is_stated_rather_than_inherited(self) -> None:
+        """The pinned images disagree on the default; the deployment decides."""
+        env = ModalBackend.env_for_backend(
+            DeploymentConfig(backend=BackendType.VLLM, model_name="Qwen/Qwen3-8B")
+        )
+        self.assertEqual(env["MAX_NUM_SEQS"], "256")
+        chosen = ModalBackend.env_for_backend(
+            DeploymentConfig(
+                backend=BackendType.VLLM,
+                model_name="Qwen/Qwen3-8B",
+                max_concurrent_sequences=32,
+            )
+        )
+        self.assertEqual(chosen["MAX_NUM_SEQS"], "32")
+
+    def test_vllm_endpoint_key_is_passed_by_environment(self) -> None:
+        """vLLM reads VLLM_API_KEY itself; argv would expose it to `ps`."""
+        env = ModalBackend.env_for_backend(
+            DeploymentConfig(
+                backend=BackendType.VLLM,
+                model_name="Qwen/Qwen3-8B",
+                endpoint_api_key="minted-endpoint-key",
+            )
+        )
+        self.assertEqual(env["VLLM_API_KEY"], "minted-endpoint-key")
+
+    def test_vllm_context_cap_reaches_the_modal_app(self) -> None:
+        """The served context has to cross into the app as an env var."""
+        config = DeploymentConfig(
+            backend=BackendType.VLLM,
+            model_name="Qwen/Qwen3.8-27B",
+            max_context_tokens=32768,
+        )
+
+        env = ModalBackend.env_for_backend(config)
+        self.assertEqual(env["MAX_MODEL_LEN"], "32768")
+        self.assertNotIn(
+            "MAX_MODEL_LEN",
+            ModalBackend.env_for_backend(
+                DeploymentConfig(backend=BackendType.VLLM, model_name="Qwen/Qwen3-8B")
+            ),
+        )
+
     def test_vllm_reasoning_and_tool_fields_are_omitted_when_empty(self) -> None:
         config = DeploymentConfig(
             backend=BackendType.VLLM,

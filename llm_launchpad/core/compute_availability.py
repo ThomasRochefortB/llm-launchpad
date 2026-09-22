@@ -22,6 +22,7 @@ from ..protocol.models import (
     ComputeOffer,
     ComputePlacement,
     InferencePlan,
+    InferenceRecipe,
     ModalProviderOptions,
     PlacementAssessment,
     PrimeProviderOptions,
@@ -38,9 +39,11 @@ from .fit_calibration import MemoryCalibration, calibration_key, load_memory_cal
 from .llamacpp_planner import (
     assess_memory_placement,
     assessment_score,
+    compile_server_args,
     device_capacity_bytes,
     gib_to_bytes,
     per_device_requirements,
+    tuning_for_gpu_memory,
 )
 from .modal_cli import resolve_modal_cli_path
 from .modal_gpu import ModalGpuSpec, fetch_modal_gpu_catalog
@@ -318,6 +321,31 @@ def plans_for_compute_profile(
     return plans
 
 
+def recipe_for_placement(
+    recipe: InferenceRecipe,
+    gpu_memory_gb: float | None,
+) -> InferenceRecipe:
+    """Re-cut one recipe for the device it will actually run on.
+
+    Only the runtime margin depends on the device, and it is deliberately not
+    part of the calibration key, so a re-cut recipe still matches measurements
+    taken on any other topology of the same plan.
+    """
+
+    tuning = recipe.runtime_tuning
+    requirements = recipe.serving_requirements
+    if tuning is None or requirements is None:
+        return recipe
+    retuned = tuning_for_gpu_memory(tuning, gpu_memory_gb)
+    if retuned == tuning:
+        return recipe
+    return replace(
+        recipe,
+        runtime_tuning=retuned,
+        server_args=compile_server_args(requirements, retuned),
+    )
+
+
 def assessed_plans_for_compute_profile(
     configuration: ComputeConfiguration,
     profile: QuickDeployProfile,
@@ -389,20 +417,28 @@ def assessed_plans_for_compute_profile(
         price = placement.price_per_hour_usd
         if price is not None and placement.price_is_per_gpu:
             price *= gpu_count
+        # The catalog is built before any GPU is chosen, so its runtime margin
+        # is the 2 GiB floor. The margin the memory model actually promises is
+        # 5% of the device, and that only becomes computable here. Leaving the
+        # floor in place shipped a plan that packed a 180 GB B200 to within
+        # 2 GiB and then had nothing left for llama.cpp's compute graphs: five
+        # GLM-5.3-Flash deploys died in graph_reserve, and the one that
+        # survived differed from them in this argument alone (9216 vs 2048).
+        placement_recipe = recipe_for_placement(recipe, placement.gpu_memory_gb)
         assessment = None
         if (
             profile.memory_estimate is not None
-            and recipe.serving_requirements is not None
-            and recipe.runtime_tuning is not None
+            and placement_recipe.serving_requirements is not None
+            and placement_recipe.runtime_tuning is not None
         ):
             assessment = assess_memory_placement(
                 profile.memory_estimate,
-                model_id=recipe.model_id,
+                model_id=placement_recipe.model_id,
                 revision=None,
-                quant=recipe.quant,
+                quant=placement_recipe.quant,
                 runtime_id=profile.llamacpp_runtime_id,
-                requirements=recipe.serving_requirements,
-                tuning=recipe.runtime_tuning,
+                requirements=placement_recipe.serving_requirements,
+                tuning=placement_recipe.runtime_tuning,
                 gpu_type=placement.gpu_type,
                 gpu_count=gpu_count,
                 gpu_memory_gb=placement.gpu_memory_gb,
@@ -451,7 +487,7 @@ def assessed_plans_for_compute_profile(
         per_million = evaluation.estimated_cost_per_million_output_tokens_usd
         plans.append(
             InferencePlan(
-                recipe=recipe,
+                recipe=placement_recipe,
                 quote=quote,
                 estimated_monthly_cost_usd=monthly_cost,
                 estimated_cost_per_million_output_tokens_usd=per_million,

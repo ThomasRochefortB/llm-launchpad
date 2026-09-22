@@ -66,7 +66,7 @@ class LaunchpadSettings:
     scaledown_window: int = 1800  # seconds (30 minutes)
     tui_theme: str = "launchpad-dark"
     tui_density: str = "comfortable"
-    tui_mouse: bool | None = None  # None = follow CLI/env default
+    tui_mouse: bool | None = None  # Legacy setting; ignored by the keyboard-driven TUI
     confirm_quit: bool = True
 
     def to_env(self) -> dict[str, str]:
@@ -215,6 +215,14 @@ class CatalogExclusion:
     repo_id: str
     reason: str
     rank: int | None = None
+    #: Whether the build reached no conclusion about this model, as opposed to
+    #: deciding against it. A rate limit, an exhausted request budget and an
+    #: unreachable Hub all leave the model unchecked, and that is a transient
+    #: fact about the build rather than a durable one about the model. Readers
+    #: that treat a shorter catalog as complete -- the freshness check, the
+    #: retention guard, the screen's own status line -- key off this instead
+    #: of matching one reason string each.
+    unchecked: bool = False
 
 
 @dataclass(frozen=True)
@@ -498,6 +506,11 @@ class DeploymentConfig:
     runtime_tuning: RuntimeTuning | None = None
     placement_assessment: PlacementAssessment | None = None
     runtime_attestation: RuntimeAttestation | None = None
+
+    # How many sequences the runtime decodes at once. Left to the image, this
+    # differs per provider -- and on a hybrid model a default above the
+    # available recurrent-state blocks refuses to start at all.
+    max_concurrent_sequences: int | None = None
 
     # Model limits advertised to OpenAI-compatible clients such as OpenCode.
     max_context_tokens: int | None = None
@@ -979,6 +992,32 @@ class EndpointInfo:
     vision: VisionCapabilities | None = None
     runtime_attestation: RuntimeAttestation | None = None
     serving: ServingSnapshot | None = None
+    # Wall-clock epoch the current container/process run started. Sourced
+    # from the runtime's own process start gauge when a live reading exists;
+    # otherwise the first passive observation of the active run. Resets on
+    # restart; None when the run start cannot be established (notably a
+    # scale-to-zero Modal app with no live probe). Never deployment age.
+    run_started_at_epoch: float | None = None
+    # Known billable rate for this endpoint ($/hour). Persisted from the
+    # deployment quote via the connection store, or from provider listing
+    # metadata when available. None means the rate is unknown, never free.
+    hourly_cost_usd: float | None = None
+    # Accumulated compute cost across runs ($). Persisted by the runtime
+    # tracker; None when no billable interval has been observed with a known
+    # rate.
+    cumulative_cost_usd: float | None = None
+    # Whether the accumulated cost is an estimate (rate changes, capped
+    # scale-to-zero gaps, or missed observations) rather than a metered bill.
+    cost_estimated: bool = False
+    # Wall-clock epoch cost tracking started for this endpoint. Gaps before
+    # this (redeploys, TUI restarts before tracking) are not included, so a
+    # total without this is never presented as complete.
+    cost_tracked_since_epoch: float | None = None
+    # Last explicit live-metrics attempt (user-requested fetch that may wake
+    # a scaled-to-zero container). Failures retain banked totals and surface
+    # here instead of blanking the traffic columns.
+    live_metrics_error: str | None = None
+    live_metrics_checked_at: float | None = None
 
 
 @dataclass

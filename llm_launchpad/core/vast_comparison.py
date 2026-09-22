@@ -9,8 +9,8 @@ from typing import Any
 
 from ..protocol.enums import BackendType, BillingModel, ComputeProvider, QuoteAvailability
 from ..protocol.models import InferencePlan, OfferCostBreakdown, ProviderQuote, VastModelOffer, VastOffer, VastProviderOptions
-from .compute_availability import canonical_gpu_identity
-from .llamacpp_planner import assess_memory_placement
+from .compute_availability import canonical_gpu_identity, recipe_for_placement
+from .llamacpp_planner import assess_memory_placement, tuning_for_gpu_memory
 from .quick_deploy import QuickDeployModel, QuickDeployProfile, quick_deploy_recipe
 from .inference_options import COST_SCENARIO_WORKDAY, evaluate_quote_cost
 from .runtime_support import load_llamacpp_support_manifest
@@ -172,10 +172,20 @@ def vast_offers_for_model(
             if existing is None or (price is not None and (old_price is None or price < old_price)):
                 grouped[shape] = (offer, disk, costs)
         for offer, disk, costs in grouped.values():
+            # Same as the Modal and Prime path: the runtime margin the memory
+            # model promises is a share of the device, and the device is only
+            # known here. A rental left on the catalog's 2 GiB floor packs the
+            # card and then has nothing left for llama.cpp's compute graphs.
+            # Both derive from tuning_for_gpu_memory, so the recipe the plan
+            # carries and the tuning it was assessed under cannot disagree.
+            offer_tuning = tuning_for_gpu_memory(recipe.runtime_tuning, offer.gpu_memory_gib)
+            offer_recipe = recipe_for_placement(recipe, offer.gpu_memory_gib)
             assessment = assess_memory_placement(
-                memory, model_id=recipe.model_id, revision=None, quant=recipe.quant,
+                memory, model_id=offer_recipe.model_id, revision=None,
+                quant=offer_recipe.quant,
                 runtime_id=profile.llamacpp_runtime_id,
-                requirements=recipe.serving_requirements, tuning=recipe.runtime_tuning,
+                requirements=recipe.serving_requirements,
+                tuning=offer_tuning,
                 gpu_type=offer.gpu_type, gpu_count=offer.gpu_count,
                 gpu_memory_gb=offer.gpu_memory_gib,
                 price_per_hour_usd=costs.total_per_hour_usd,
@@ -183,7 +193,7 @@ def vast_offers_for_model(
             if not assessment.fits or not assessment.gpu_resident:
                 continue
             result.append(VastModelOffer(
-                id=f"vast:comparison:{recipe.id}:{offer.id}", recipe=recipe,
+                id=f"vast:comparison:{recipe.id}:{offer.id}", recipe=offer_recipe,
                 offer=offer, gpu_label=vast_gpu_label(offer), disk_gb=disk,
                 costs=costs, assessment=assessment,
             ))

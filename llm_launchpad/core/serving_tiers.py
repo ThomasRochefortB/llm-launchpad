@@ -21,7 +21,7 @@ and only with its bit width named.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from collections.abc import Sequence
 
 from ..protocol.enums import ServingObjective
@@ -358,17 +358,65 @@ def _saver_tier(
     )
 
 
-def _also_clause(extra: Sequence[str]) -> str:
+def _also_clause(extra: Sequence[str], scope: str = "") -> str:
     """Name the roles a placement also won, so their labels are not just lost.
 
     BALANCED is deliberately left unsaid. The recommendation marker already
     carries it, and "also the best value · recommended" says one thing twice.
+
+    ``scope`` narrows the claim to the bit width it was decided within, for the
+    rows a saver out-runs or undercuts.
     """
 
     names = [_SECONDARY_ROLE_NAMES[key] for key in extra if key != BALANCED]
     if not names:
         return ""
-    return "also " + " and ".join(names)
+    suffix = f" at {scope}" if scope else ""
+    return "also " + " and ".join(names) + suffix
+
+
+def _scoped_against_saver(
+    tiers: Sequence[ServingTier],
+    saver: ServingTier,
+    baseline: InferencePlan,
+    objective: ServingObjective,
+) -> tuple[ServingTier, ...]:
+    """Qualify the frontier's superlatives that the saver row disproves.
+
+    The frontier is drawn at one bit width, so "the fastest" means the fastest
+    at that width -- but the saver is rendered in the same list, and a reader
+    compares rows, not partitions. GLM 5.3 Flash shipped a recommended row
+    reading "also the fastest" at 12 tok/s immediately above a saver at 30.
+
+    The claim is narrowed rather than dropped: naming the width keeps the
+    reason the clause exists, which is to stop the reader going off to the full
+    placement list after something that is not there.
+    """
+
+    saver_speed = _throughput(saver.plan, objective)
+    saver_price = saver.plan.quote.price_per_hour_usd
+    rescoped: list[ServingTier] = []
+    for tier in tiers:
+        beaten = [
+            key
+            for key in tier.also
+            if (key == FASTEST and saver_speed > _throughput(tier.plan, objective))
+            or (
+                key == ECONOMY
+                and saver_price is not None
+                and (tier.plan.quote.price_per_hour_usd or 0.0) > saver_price
+            )
+        ]
+        if not beaten:
+            rescoped.append(tier)
+            continue
+        scope = quant_quality_label(tier.plan.recipe.quant) or "this quality"
+        detail = _describe_tradeoff(tier.plan, baseline, objective)
+        parts = [text for text in (_also_clause(tier.also, scope), detail) if text]
+        rescoped.append(
+            replace(tier, tradeoff=" · ".join(parts) if parts else None)
+        )
+    return tuple(rescoped)
 
 
 def serving_tiers(
@@ -393,7 +441,10 @@ def serving_tiers(
 
     primary, lower = _quality_partition(eligible)
     tiers, balanced = _frontier_tiers(primary, objective)
-    return tiers + _saver_tier(primary, lower, balanced, objective)
+    saver = _saver_tier(primary, lower, balanced, objective)
+    if saver:
+        tiers = _scoped_against_saver(tiers, saver[0], balanced, objective)
+    return tiers + saver
 
 
 def _quality_floor_note(quants: Sequence[str | None]) -> str | None:

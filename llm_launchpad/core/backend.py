@@ -13,7 +13,7 @@ from typing import Any
 from collections.abc import Generator
 
 from ..protocol.enums import BackendType
-from .coerce import optional_str
+from .coerce import optional_str, positive_int
 from ..protocol.events import ErrorEvent, LogEvent, OperationCompleteEvent
 from ..protocol.models import DeploymentConfig, EndpointInfo, LaunchpadSettings
 from .modal_auth import get_modal_profile
@@ -23,6 +23,7 @@ from .shutdown import is_shutting_down as _is_shutting_down
 from .shutdown import shutdown_event
 from .diagnostics import log_exception
 from .runtime_support import load_llamacpp_support_manifest, llamacpp_cuda_architecture
+from .serving_runtime import vllm_max_num_seqs
 from .naming import default_served_model_name
 from .naming import infer_backend_from_app_name, infer_instance_from_app_name, legacy_app_name
 from .naming import modal_function_name, modal_web_label
@@ -264,6 +265,16 @@ class ModalBackend:
             env["FAST_BOOT"] = "true" if config.fast_boot else "false"
         if config.n_gpu is not None and config.n_gpu > 0:
             env["N_GPU"] = str(config.n_gpu)
+        context_tokens = positive_int(config.max_context_tokens)
+        if context_tokens:
+            env["MAX_MODEL_LEN"] = str(context_tokens)
+        env["MAX_NUM_SEQS"] = str(vllm_max_num_seqs(config))
+        endpoint_key = (config.endpoint_api_key or "").strip()
+        if endpoint_key:
+            # A Modal web endpoint is a public URL. Prime and Vast have always
+            # passed this; Modal did not, so the endpoint served anyone who
+            # had the address, on the account's own GPU.
+            env["VLLM_API_KEY"] = endpoint_key
         if config.trust_remote_code is not None:
             env["TRUST_REMOTE_CODE"] = "true" if config.trust_remote_code else "false"
         if config.reasoning_parser:

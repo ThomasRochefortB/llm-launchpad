@@ -348,13 +348,30 @@ def _create_cache_disk(
     backend: Any,
     gpu_offer: ComputeOffer,
     config: DeploymentConfig | None = None,
+    reasons: list[str] | None = None,
 ) -> StoredPrimeDisk | None:
+    """Create a cache disk beside ``gpu_offer``, recording why if it cannot.
+
+    Every failure here used to be swallowed into a bare ``return None``, so a
+    revoked key, an exhausted quota and a region with no disk product all
+    reached the user as the same sentence, with nothing in the logs either.
+    The disk is what stops the next deploy re-downloading the weights, so
+    "unavailable" without a reason is an unactionable bill.
+    """
+
+    def _record(reason: str) -> None:
+        if reasons is not None:
+            reasons.append(reason)
+
     try:
         disk_offers = backend.list_disk_offers()
-    except Exception:
+    except Exception as exc:
+        log_exception("Could not list Prime disk offers")
+        _record(f"disk offers could not be listed ({exc})")
         return None
     disk_offer = matching_disk_offer(list(disk_offers or []), gpu_offer)
     if disk_offer is None:
+        _record(f"no disk product in {gpu_offer.data_center or gpu_offer.region or 'this location'}")
         return None
     size_gb = cache_disk_size_gb(disk_offer, config)
     try:
@@ -363,14 +380,19 @@ def _create_cache_disk(
             size_gb=size_gb,
             name=PRIME_CACHE_DISK_NAME,
         )
-    except Exception:
+    except Exception as exc:
+        log_exception(f"Could not create a {size_gb} GB Prime cache disk")
+        _record(f"creating a {size_gb} GB disk failed ({exc})")
         return None
     disk_id = str((created or {}).get("id") or "").strip()
     if not disk_id:
+        _record("Prime returned no disk id")
         return None
     try:
         wait_for_prime_disk_ready(backend, disk_id)
-    except Exception:
+    except Exception as exc:
+        log_exception(f"Prime disk {disk_id} never became ready")
+        _record(f"disk {disk_id} never became ready ({exc})")
         try:
             backend.delete_disk(disk_id)
         except Exception:
@@ -443,10 +465,13 @@ def resolve_prime_offer_and_disk(
     if not options.auto_disk:
         return offer, None, messages
 
-    created = _create_cache_disk(backend, offer, config)
+    disk_reasons: list[str] = []
+    created = _create_cache_disk(backend, offer, config, disk_reasons)
     if created is None:
+        reason = f": {disk_reasons[0]}" if disk_reasons else ""
         messages.append(
-            "Prime cache disk unavailable; model weights will not persist across deploys"
+            "Prime cache disk unavailable; model weights will not persist "
+            f"across deploys{reason}"
         )
         return offer, None, messages
     try:

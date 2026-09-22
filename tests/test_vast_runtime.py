@@ -225,6 +225,20 @@ class VastVllmRuntimeTests(unittest.TestCase):
         self.assertIn("VLLM_WORKER_MULTIPROC_METHOD=spawn", script)
         self.assertIn(f"{VAST_RUNTIME_DIR}/hf", script)
 
+    def test_vllm_script_caps_the_served_context_when_asked(self) -> None:
+        """Left uncapped, vLLM serves the model max and refuses to start."""
+        script = vast_runtime_script(self.vllm(max_context_tokens=32768))
+        self.assertIn("--max-model-len 32768", script)
+        self.assertNotIn("--max-model-len", vast_runtime_script(self.vllm()))
+
+    def test_vllm_script_states_its_own_concurrency(self) -> None:
+        """Vast pins a newer vLLM whose default refuses to start a hybrid model."""
+        self.assertIn("--max-num-seqs 256", vast_runtime_script(self.vllm()))
+        self.assertIn(
+            "--max-num-seqs 16",
+            vast_runtime_script(self.vllm(max_concurrent_sequences=16)),
+        )
+
     def test_vllm_script_enables_xet_high_performance_downloads(self) -> None:
         script = vast_runtime_script(self.vllm())
         self.assertIn("HF_XET_HIGH_PERFORMANCE=1", script)

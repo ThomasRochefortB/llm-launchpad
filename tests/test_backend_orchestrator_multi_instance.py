@@ -103,6 +103,48 @@ class OrchestratorMultiInstanceTests(unittest.TestCase):
         self.assertTrue(captured_env)
         self.assertNotIn("MODAL_FUNCTION_SLUG", captured_env[0] or {})
 
+    def test_modal_vllm_deploy_mints_and_forwards_an_endpoint_key(self) -> None:
+        """A Modal web endpoint is public, so it gets a bearer token like the rest."""
+        orch = Orchestrator(config_store=SimpleNamespace(load=lambda: LaunchpadSettings()))
+        captured_env: list[dict[str, str] | None] = []
+
+        def _fake_run_streaming(command: list[str], env=None):  # type: ignore[no-untyped-def]
+            captured_env.append(env)
+            yield OperationCompleteEvent(success=True, exit_code=0)
+
+        config = DeploymentConfig(
+            backend=BackendType.VLLM,
+            app_name="vllm-qwen3",
+            model_name="Qwen/Qwen3-8B",
+            do_deploy=True,
+        )
+        with patch("llm_launchpad.core.backend.ModalBackend.run_streaming", side_effect=_fake_run_streaming):
+            list(orch.deploy(config))
+
+        self.assertTrue(config.endpoint_api_key)
+        self.assertEqual(captured_env[0]["VLLM_API_KEY"], config.endpoint_api_key)
+
+    def test_modal_vllm_deploy_keeps_an_endpoint_key_the_caller_chose(self) -> None:
+        orch = Orchestrator(config_store=SimpleNamespace(load=lambda: LaunchpadSettings()))
+        captured_env: list[dict[str, str] | None] = []
+
+        def _fake_run_streaming(command: list[str], env=None):  # type: ignore[no-untyped-def]
+            captured_env.append(env)
+            yield OperationCompleteEvent(success=True, exit_code=0)
+
+        config = DeploymentConfig(
+            backend=BackendType.VLLM,
+            app_name="vllm-qwen3",
+            model_name="Qwen/Qwen3-8B",
+            do_deploy=True,
+            endpoint_api_key="caller-chosen-key",
+        )
+        with patch("llm_launchpad.core.backend.ModalBackend.run_streaming", side_effect=_fake_run_streaming):
+            list(orch.deploy(config))
+
+        self.assertEqual(config.endpoint_api_key, "caller-chosen-key")
+        self.assertEqual(captured_env[0]["VLLM_API_KEY"], "caller-chosen-key")
+
     def test_tail_logs_targets_explicit_app_name(self) -> None:
         orch = Orchestrator()
         captured: list[list[str]] = []

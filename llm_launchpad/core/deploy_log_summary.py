@@ -549,6 +549,13 @@ class DeployLogSummarizer:
                 pct = percent_in_text(text)
                 if pct is not None:
                     return f"Downloading model ({pct}%)"
+                # The heartbeat already says how far it has got -- "...,
+                # 46.6 GB so far" -- and the rule threw it away, so a 55 GB
+                # download showed twenty minutes of an unchanging row while
+                # the equivalent Vast rule carried its transfer detail.
+                _, separator, transfer = text.split(":", 1)[-1].strip().partition(", ")
+                if separator and transfer.strip():
+                    return f"Downloading model — {transfer.strip()}"
                 return "Downloading model"
             if "loading the model" in detail:
                 pct = percent_in_text(text)

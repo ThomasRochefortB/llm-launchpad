@@ -448,6 +448,187 @@ class HFModelsTests(unittest.TestCase):
         assert estimate is not None
         self.assertEqual(estimate.context_tokens, 8192)
 
+    def test_fetch_vllm_memory_breakdown_sizes_weights_from_dtype_widths(self) -> None:
+        """``safetensors.total`` counts parameters, so bf16 weights are 2 bytes each."""
+
+        class FakeApi:
+            def model_info(self, *, repo_id: str, revision: str | None, expand: list[str]):
+                self._ = (repo_id, revision, expand)
+                return SimpleNamespace(
+                    config={
+                        "num_hidden_layers": 32,
+                        "hidden_size": 4096,
+                        "num_attention_heads": 32,
+                        "num_key_value_heads": 32,
+                        "head_dim": 128,
+                        "max_position_embeddings": 32768,
+                    },
+                    safetensors=SimpleNamespace(
+                        parameters={"BF16": 8_000_000_000}, total=8_000_000_000
+                    ),
+                    tags=["text-generation"],
+                )
+
+        fake_module = types.SimpleNamespace(HfApi=FakeApi)
+        with patch.dict("sys.modules", {"huggingface_hub": fake_module}):
+            estimate = hf_models.fetch_vllm_memory_breakdown("acme/dense-8b")
+
+        assert estimate is not None
+        self.assertAlmostEqual(estimate.weights_gb, 16.0, places=3)
+
+    def test_fetch_vllm_memory_breakdown_mixes_dtype_widths(self) -> None:
+        class FakeApi:
+            def model_info(self, *, repo_id: str, revision: str | None, expand: list[str]):
+                self._ = (repo_id, revision, expand)
+                return SimpleNamespace(
+                    config={
+                        "num_hidden_layers": 32,
+                        "hidden_size": 4096,
+                        "max_position_embeddings": 32768,
+                    },
+                    safetensors={
+                        "parameters": {"F8_E4M3": 8_000_000_000, "BF16": 1_000_000_000},
+                        "total": 9_000_000_000,
+                    },
+                    tags=["text-generation"],
+                )
+
+        fake_module = types.SimpleNamespace(HfApi=FakeApi)
+        with patch.dict("sys.modules", {"huggingface_hub": fake_module}):
+            estimate = hf_models.fetch_vllm_memory_breakdown("acme/fp8-moe")
+
+        assert estimate is not None
+        self.assertAlmostEqual(estimate.weights_gb, 10.0, places=3)
+
+    def test_fetch_vllm_memory_breakdown_reads_grouped_query_kv_width(self) -> None:
+        """A shared KV cache is charged once per KV head, not once per query head."""
+
+        class FakeApi:
+            def model_info(self, *, repo_id: str, revision: str | None, expand: list[str]):
+                self._ = (repo_id, revision, expand)
+                return SimpleNamespace(
+                    config={
+                        "num_hidden_layers": 4,
+                        "hidden_size": 4096,
+                        "num_attention_heads": 32,
+                        "num_key_value_heads": 4,
+                        "head_dim": 128,
+                        "max_position_embeddings": 1024,
+                    },
+                    safetensors={"parameters": {"BF16": 1_000_000}, "total": 1_000_000},
+                    tags=["text-generation"],
+                )
+
+        fake_module = types.SimpleNamespace(HfApi=FakeApi)
+        with patch.dict("sys.modules", {"huggingface_hub": fake_module}):
+            estimate = hf_models.fetch_vllm_memory_breakdown("acme/gqa-model")
+
+        assert estimate is not None
+        # 2 (K,V) * 4 layers * (4 heads * 128) * 1024 tokens * 2 bytes.
+        self.assertAlmostEqual(estimate.kv_cache_gb, 2 * 4 * 512 * 1024 * 2 / 1e9, places=6)
+
+    def test_fetch_vllm_memory_breakdown_counts_only_full_attention_layers(self) -> None:
+        class FakeApi:
+            def model_info(self, *, repo_id: str, revision: str | None, expand: list[str]):
+                self._ = (repo_id, revision, expand)
+                return SimpleNamespace(
+                    config={
+                        "num_hidden_layers": 8,
+                        "hidden_size": 4096,
+                        "num_attention_heads": 32,
+                        "num_key_value_heads": 4,
+                        "head_dim": 128,
+                        "layer_types": [
+                            "linear_attention", "linear_attention", "linear_attention",
+                            "full_attention", "linear_attention", "linear_attention",
+                            "linear_attention", "full_attention",
+                        ],
+                        "max_position_embeddings": 1024,
+                    },
+                    safetensors={"parameters": {"BF16": 1_000_000}, "total": 1_000_000},
+                    tags=["text-generation"],
+                )
+
+        fake_module = types.SimpleNamespace(HfApi=FakeApi)
+        with patch.dict("sys.modules", {"huggingface_hub": fake_module}):
+            estimate = hf_models.fetch_vllm_memory_breakdown("acme/hybrid-model")
+
+        assert estimate is not None
+        # Only the two full-attention layers keep a context-sized cache.
+        self.assertAlmostEqual(estimate.kv_cache_gb, 2 * 2 * 512 * 1024 * 2 / 1e9, places=6)
+
+    def test_fetch_vllm_memory_breakdown_still_charges_sliding_window_layers(self) -> None:
+        """A bounded cache is still a cache; only recurrent state is free of it."""
+
+        class FakeApi:
+            def model_info(self, *, repo_id: str, revision: str | None, expand: list[str]):
+                self._ = (repo_id, revision, expand)
+                return SimpleNamespace(
+                    config={
+                        "num_hidden_layers": 4,
+                        "hidden_size": 4096,
+                        "num_attention_heads": 32,
+                        "num_key_value_heads": 4,
+                        "head_dim": 128,
+                        "layer_types": [
+                            "sliding_attention", "sliding_attention",
+                            "sliding_attention", "full_attention",
+                        ],
+                        "max_position_embeddings": 1024,
+                    },
+                    safetensors={"parameters": {"BF16": 1_000_000}, "total": 1_000_000},
+                    tags=["text-generation"],
+                )
+
+        fake_module = types.SimpleNamespace(HfApi=FakeApi)
+        with patch.dict("sys.modules", {"huggingface_hub": fake_module}):
+            estimate = hf_models.fetch_vllm_memory_breakdown("acme/sliding-model")
+
+        assert estimate is not None
+        self.assertAlmostEqual(estimate.kv_cache_gb, 2 * 4 * 512 * 1024 * 2 / 1e9, places=6)
+
+    def test_fetch_vllm_memory_breakdown_reads_nested_text_config(self) -> None:
+        """HF's trimmed ``config`` must not hide a multimodal repo's own shape."""
+        loaded: list[str] = []
+
+        class FakeApi:
+            def model_info(self, *, repo_id: str, revision: str | None, expand: list[str]):
+                self._ = (repo_id, revision, expand)
+                return SimpleNamespace(
+                    config={"architectures": ["AcmeForConditionalGeneration"], "model_type": "acme"},
+                    safetensors={"parameters": {"BF16": 1_000_000}, "total": 1_000_000},
+                    tags=["image-text-to-text"],
+                )
+
+        def fake_load(repo_id: str, revision: str | None, filename: str):
+            loaded.append(filename)
+            if filename != "config.json":
+                return None
+            return {
+                "model_type": "acme",
+                "vision_config": {"depth": 27, "hidden_size": 1152},
+                "text_config": {
+                    "num_hidden_layers": 4,
+                    "hidden_size": 4096,
+                    "num_attention_heads": 32,
+                    "num_key_value_heads": 4,
+                    "head_dim": 128,
+                    "max_position_embeddings": 1024,
+                },
+            }
+
+        fake_module = types.SimpleNamespace(HfApi=FakeApi)
+        with patch.dict("sys.modules", {"huggingface_hub": fake_module}):
+            with patch.object(hf_models, "_load_repo_json_file", fake_load):
+                estimate = hf_models.fetch_vllm_memory_breakdown("acme/multimodal")
+
+        assert estimate is not None
+        self.assertIn("config.json", loaded)
+        self.assertEqual(estimate.context_tokens, 1024)
+        self.assertAlmostEqual(estimate.kv_cache_gb, 2 * 4 * 512 * 1024 * 2 / 1e9, places=6)
+        # A repository with a vision tower reports unknown image working memory.
+        self.assertIsNone(estimate.vision_working_memory_gb)
+
     def test_fetch_vllm_memory_breakdown_uses_timeout_and_card_data_expand(self) -> None:
         calls: list[tuple[float, tuple[str, ...]]] = []
 
