@@ -466,3 +466,14 @@ def _stub_tool_call_probe(monkeypatch: pytest.MonkeyPatch) -> None:
         "llm_launchpad.core.tool_call_probe.verify_tool_calling",
         lambda *args, **kwargs: None,
     )
+
+
+@pytest.fixture(autouse=True)
+def _stub_local_idle_watchdog(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
+    """Never leave a detached watchdog process behind a Prime deploy test."""
+    spawned: list[dict] = []
+    monkeypatch.setattr(
+        "llm_launchpad.core.local_watchdog.spawn_local_watchdog",
+        lambda **kwargs: spawned.append(kwargs),
+    )
+    return spawned

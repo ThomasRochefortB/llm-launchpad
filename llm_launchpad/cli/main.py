@@ -818,11 +818,29 @@ def offers(
         typer.echo(f"{row.id:<7} {gpu:<19} {location:<21} {(row.security or '-'):<14} {price}")
 
 
+def _parse_idle_shutdown(value: str | None) -> int | None:
+    """``None`` defers to Settings; ``off`` disables; otherwise a duration."""
+    if value is None:
+        return None
+    if value.strip().casefold() in {"off", "never", "0"}:
+        return 0
+    from ..tui.screens.settings import parse_scaledown_window
+
+    try:
+        return parse_scaledown_window(value)
+    except ValueError as exc:
+        raise typer.BadParameter("--idle-shutdown must be a duration like 1h or 30m, or off.") from exc
+
+
 @app.command()
 def deploy(
     vast_offer_id: str | None = typer.Option(None, help="Exact Vast offer to rent."),
     vast_disk_gb: int = typer.Option(100, min=1, help="Vast disk allocation in GB."),
     max_hourly_cost: float | None = typer.Option(None, min=0.001, help="Maximum Vast hourly total including disk; required for Vast."),
+    idle_shutdown: str | None = typer.Option(
+        None,
+        help="Delete a Vast rental or Prime pod after this long without requests (e.g. 1h, 30m, off). Defaults to the Settings value.",
+    ),
     vision: VisionMode = typer.Option(VisionMode.AUTO, help="Image input: auto, on, or off"),
     projector_repo: str | None = typer.Option(None, help="llama.cpp projector HF repository override"),
     projector_revision: str | None = typer.Option(None, help="llama.cpp projector HF revision override"),
@@ -927,6 +945,7 @@ def deploy(
     compute_provider = ComputeProvider(provider)
     if compute_provider == ComputeProvider.VAST and (not vast_offer_id or max_hourly_cost is None):
         raise typer.BadParameter("Vast requires --vast-offer-id and --max-hourly-cost.")
+    idle_shutdown_seconds = _parse_idle_shutdown(idle_shutdown)
     orch, username = _preflight(compute_provider)
     _print_banner()
 
@@ -974,6 +993,7 @@ def deploy(
         default_chat_template_kwargs=default_chat_template_kwargs,
         instance_name=resolved_instance,
         app_name=resolved_app_name,
+        idle_shutdown_seconds=idle_shutdown_seconds,
         provider_options=(
             PrimeProviderOptions(
                 offer_id=prime_offer_id,

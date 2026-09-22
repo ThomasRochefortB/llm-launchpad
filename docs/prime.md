@@ -50,6 +50,16 @@ dashboard. Launchpad also caches its pinned, checksum-verified Prime Tunnel
 client locally and on the persistent disk, so pods do not repeatedly download
 it from GitHub.
 
+## Idle shutdown
+
+Pods bill until deleted, so Launchpad deletes one after an hour without
+requests. By default that is watched from this computer and only happens while
+it is awake. Settings -> "Let Prime pods stop themselves" moves the watchdog
+onto the pod so it also works while this computer sleeps, at the cost of
+storing your Prime API key on the pod (root-only, mode 600): Prime has no key
+scoped to a single pod. See
+[idle shutdown](storage-and-costs.md#idle-shutdown-for-rentals).
+
 ## Headless examples
 
 Deploy vLLM on Prime Intellect using the cheapest matching fixed-price,

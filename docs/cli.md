@@ -170,6 +170,12 @@ Run `uv run python scripts/generate_cli_reference.py` after changing a command.
 │ --max-hourly-cost                                  <float range>          Maximum Vast hourly    │
 │                                                    [x>=0.001]             total including disk;  │
 │                                                                           required for Vast.     │
+│ --idle-shutdown                                    <str>                  Delete a Vast rental   │
+│                                                                           or Prime pod after     │
+│                                                                           this long without      │
+│                                                                           requests (e.g. 1h,     │
+│                                                                           30m, off). Defaults to │
+│                                                                           the Settings value.    │
 │ --vision                                           <auto|on|off>          Image input: auto, on, │
 │                                                                           or off                 │
 │                                                                           [default: auto]        │

@@ -88,12 +88,13 @@ class SettingsArrowNavigationTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             reached = []
-            for _ in range(6):
+            for _ in range(8):
                 await pilot.press("down")
                 await pilot.pause()
                 reached.append(getattr(app.focused, "id", None))
 
             self.assertIn("confirm-quit", reached)
+            self.assertIn("rental-idle-shutdown", reached)
             self.assertIn("save-btn", reached)
 
     async def test_up_walks_back(self) -> None:
@@ -129,3 +130,43 @@ def test_idle_timeout_is_shown_as_a_duration_that_parses_back() -> None:
     for seconds, text in ((1800, "30m"), (7200, "2h"), (90, "90s"), (0, "0s")):
         assert format_scaledown_window(seconds) == text
         assert parse_scaledown_window(text) == seconds
+
+
+class RentalIdleSettingsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rental_idle_shutdown_and_prime_opt_in_round_trip(self) -> None:
+        from textual.widgets import Input, Switch
+
+        from llm_launchpad.core.config import ConfigStore
+        from llm_launchpad.tui.screens.settings import SettingsScreen
+
+        app = _TestApp()
+        async with app.run_test(size=(100, 40)) as pilot:
+            screen = SettingsScreen()
+            app.push_screen(screen)
+            await pilot.pause()
+            self.assertEqual(screen.query_one("#rental-idle-shutdown", Input).value, "1h")
+            screen.query_one("#rental-idle-shutdown", Input).value = "off"
+            screen.query_one("#prime-self-terminate", Switch).value = True
+            screen._save()
+        saved = ConfigStore().load()
+        self.assertEqual(saved.rental_idle_shutdown, 0)
+        self.assertTrue(saved.prime_self_terminate)
+
+    async def test_an_unreadable_rental_window_is_rejected_in_place(self) -> None:
+        from textual.widgets import Input
+
+        from llm_launchpad.core.config import ConfigStore
+        from llm_launchpad.tui.screens.settings import SettingsScreen
+
+        app = _TestApp()
+        async with app.run_test(size=(100, 40)) as pilot:
+            screen = SettingsScreen()
+            app.push_screen(screen)
+            await pilot.pause()
+            field = screen.query_one("#rental-idle-shutdown", Input)
+            field.value = "soon"
+            await pilot.pause()  # let the edit's Changed event land first
+            screen._save()
+            await pilot.pause()
+            self.assertTrue(field.has_class("-invalid"))
+        self.assertEqual(ConfigStore().load().rental_idle_shutdown, 3600)

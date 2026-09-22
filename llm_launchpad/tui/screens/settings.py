@@ -87,7 +87,7 @@ class SettingsScreen(CopyEnabledScreen):
                     yield Static("[bold primary]Settings[/]", id="settings-title")
                     yield Static("[bold]Deployment[/bold]", classes="settings-section")
                     yield FormField(
-                        "Idle timeout before scale-down",
+                        "Modal idle timeout before scale-down",
                         "scaledown-window",
                         default=format_scaledown_window(settings.scaledown_window),
                         hint="e.g. 30m, 90s, or 1800 · idle containers scale to zero after this",
@@ -128,6 +128,30 @@ class SettingsScreen(CopyEnabledScreen):
                         "[dim]Vast.ai marketplace rentals and saved keys.[/dim]",
                         classes="form-hint",
                     )
+                    yield FormField(
+                        "Delete idle Vast and Prime rentals after",
+                        "rental-idle-shutdown",
+                        default=(
+                            format_scaledown_window(settings.rental_idle_shutdown)
+                            if settings.rental_idle_shutdown > 0
+                            else "off"
+                        ),
+                        hint=(
+                            "e.g. 1h, 30m, or off · rentals bill until deleted; "
+                            "deleting also removes cached weights"
+                        ),
+                    )
+                    yield ToggleField(
+                        "Let Prime pods stop themselves (stores your Prime API key on the pod)",
+                        "prime-self-terminate",
+                        default=settings.prime_self_terminate,
+                    )
+                    yield Static(
+                        "[dim]Vast rentals always stop themselves with a key Vast limits "
+                        "to that rental. Prime has no such key, so without this a pod is "
+                        "only stopped while this computer is awake.[/dim]",
+                        classes="form-hint",
+                    )
                     yield Button("Vast.ai rentals", id="vast-preview-btn")
             with Horizontal(id="settings-actions"):
                 yield Button("Save", id="save-btn", variant="primary")
@@ -159,7 +183,7 @@ class SettingsScreen(CopyEnabledScreen):
             self.app.push_screen(VastPreviewScreen())
 
     def on_input_changed(self, event: Input.Changed) -> None:
-        if event.input.id == "scaledown-window":
+        if event.input.id in {"scaledown-window", "rental-idle-shutdown"}:
             try:
                 event.input.remove_class("-invalid")
             except Exception:
@@ -217,8 +241,24 @@ class SettingsScreen(CopyEnabledScreen):
         except Exception:
             pass
 
+        rental_field = self.query_one("#rental-idle-shutdown", Input)
+        rental_text = rental_field.value.strip()
+        try:
+            rental_idle = (
+                0 if rental_text.casefold() in {"off", "never", "0", ""}
+                else parse_scaledown_window(rental_text)
+            )
+        except ValueError:
+            rental_field.add_class("-invalid")
+            rental_field.focus()
+            self._announce("[red]Rental idle shutdown must be a duration like 1h, or off.[/red]")
+            return
+        rental_field.remove_class("-invalid")
+
         settings = LaunchpadSettings(
             scaledown_window=scaledown,
+            rental_idle_shutdown=rental_idle,
+            prime_self_terminate=self.query_one("#prime-self-terminate", Switch).value,
             tui_theme=normalize_tui_theme(
                 self.query_one("#tui-theme", Select).value
             ),

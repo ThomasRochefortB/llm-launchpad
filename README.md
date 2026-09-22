@@ -149,7 +149,9 @@ llm-launchpad deploy \
 ```
 
 A rental bills continuously until it is destroyed, and `stop` deletes its disk
-along with any cached models. See the [Vast.ai provider guide](docs/vast.md) for
+along with any cached models. Launchpad deletes a rental that has served
+nothing for an hour, even with this computer asleep; see
+[idle shutdown](docs/storage-and-costs.md#idle-shutdown-for-rentals). See the [Vast.ai provider guide](docs/vast.md) for
 pricing, recovery records, and the SSH transport.
 
 ## OpenCode integration

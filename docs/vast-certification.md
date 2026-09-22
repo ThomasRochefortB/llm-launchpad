@@ -282,3 +282,28 @@ cheap-per-hour, expensive-per-GB host is usually the better fix.
 Further host and GPU-architecture coverage remains necessary before describing
 the provider as generally certified; each row above is evidence from the hosts
 named in it, not from the marketplace as a whole.
+
+## Idle shutdown (2026-09-22)
+
+Stage `llamacpp_idle_shutdown` rents a host with a 120s idle window, serves one
+chat request, then leaves the rental alone and waits for it to disappear. On an
+RTX 3060 in Poland (offer 45602480, $0.0674/hr) the on-rental watchdog started
+with the runtime, and the instance was gone 171s after the last request -- the
+window plus one 60s poll and Vast's teardown -- using `CONTAINER_API_KEY` read
+from PID 1's environment. Launchpad destroyed nothing; its cleanup found the
+instance already absent. The run cost about $0.012.
+
+An earlier attempt on a GTX 1650 host in Oregon never reached the watchdog: the
+host rejected the deployment SSH key, and the rental was destroyed after four
+minutes for $0.0024. That is a host fault, not a watchdog one, and it is why
+the retry named an offer explicitly with `--offer-id`.
+
+The script runs the watchdog on vLLM rentals too, but that has not been
+certified live; the vLLM image is assumed to provide `curl`, as the llama.cpp
+image was checked to under `dash`.
+
+```bash
+uv run python scripts/validate_vast_live.py --live --stage llamacpp_idle_shutdown \
+  --offer-id <id> --max-hourly-cost 0.35 --budget-usd 0.9 --max-minutes 25 \
+  --transfer-gb 6 --disk-gb 40 --idle-seconds 120 --report /tmp/vast-idle.json
+```

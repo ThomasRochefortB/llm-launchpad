@@ -220,6 +220,43 @@ class VastDeploymentBackend:
                 pass  # Remote absence is confirmed even if the local tunnel has already died.
         self.state.remove(record.name)
 
+    @staticmethod
+    def _start_idle_watchdog(
+        ssh: VastSsh, instance: Any, config: DeploymentConfig, endpoint_api_key: str,
+    ) -> Generator[BaseEvent, None, None]:
+        """Let the rental delete itself once idle, even with this computer asleep."""
+        from .idle_watchdog import (
+            WATCHDOG_SCRIPT_NAME,
+            WatchdogSpec,
+            describe_idle_shutdown,
+            resolve_idle_shutdown,
+            start_command,
+            vast_destroy_command,
+            watchdog_script,
+        )
+
+        idle = resolve_idle_shutdown(config)
+        if idle <= 0:
+            yield LogEvent(line="Idle shutdown is off: this rental bills until you stop it.")
+            return
+        script = watchdog_script(WatchdogSpec(
+            metrics_url="http://127.0.0.1:8000/metrics",
+            endpoint_api_key=endpoint_api_key,
+            idle_seconds=idle,
+            destroy_command=vast_destroy_command(),
+            runtime_dir=VAST_RUNTIME_DIR,
+        ))
+        try:
+            ssh.run(instance, f"cat > {VAST_RUNTIME_DIR}/{WATCHDOG_SCRIPT_NAME}", input_text=script)
+            ssh.run(instance, start_command(VAST_RUNTIME_DIR))
+        except (RuntimeError, ValueError) as exc:
+            yield LogEvent(
+                line=f"Warning: could not start idle shutdown ({exc}). This rental bills until you stop it.",
+                is_milestone=True,
+            )
+            return
+        yield LogEvent(line=f"Idle shutdown: {describe_idle_shutdown(idle)}.", is_milestone=True)
+
     def deploy(self, config: DeploymentConfig) -> Generator[BaseEvent, None, None]:
         """Rent once, bootstrap, verify streaming, and clean up failures."""
         name = config.app_name or ""
@@ -469,6 +506,7 @@ class VastDeploymentBackend:
             verify_gpu_topology(devices, gpu_count=offer.gpu_count, per_device_required_gb=required)
             ssh.run(instance, f"umask 077; mkdir -p {VAST_RUNTIME_DIR}; cat > {VAST_RUNTIME_DIR}/runtime.sh", input_text=script)
             ssh.run(instance, f"nohup sh {VAST_RUNTIME_DIR}/runtime.sh > {VAST_RUNTIME_DIR}/server.log 2>&1 < /dev/null &")
+            yield from self._start_idle_watchdog(ssh, instance, config, record.endpoint_api_key)
             # Save the selected port before opening a detached SSH process.
             with socket.socket() as listener:
                 listener.bind(("127.0.0.1", 0))

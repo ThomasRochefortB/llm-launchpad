@@ -15,7 +15,9 @@ free memory per device is refused and destroyed rather than served.
 Endpoints use a managed SSH tunnel bound to `127.0.0.1`: they work on this
 computer only. OpenSSH and a POSIX system are required. Closing Launchpad leaves
 a completed rental and its tunnel running. **Stop destroys the rental and its
-disk**, including cached models. Rentals bill continuously until destroyed.
+disk**, including cached models. Rentals bill continuously until destroyed; an
+on-rental watchdog deletes one after an hour without requests
+([idle shutdown](storage-and-costs.md#idle-shutdown-for-rentals)).
 
 The [live validation recorded in PR #77](https://github.com/ThomasRochefortB/llm-launchpad/pull/77)
 covered single-GPU llama.cpp startup, authentication, tool calls, a five-minute

@@ -84,7 +84,32 @@ def _render_decision_facts(profile: QuickDeployProfile, plan: InferencePlan) -> 
         f"[bold]{escape(_plan_hourly_cost(plan))}[/bold] · "
         f"{escape(_billing_label(plan.quote.billing_model))}\n"
         f"[dim]Availability[/dim] {escape(_availability_label(plan))}"
+        f"{_idle_shutdown_fact(plan)}"
     )
+
+
+def _idle_shutdown_fact(plan: InferencePlan) -> str:
+    """What stops a rental that bills until deleted; nothing for scale-to-zero."""
+    if plan.quote.billing_model == BillingModel.SCALE_TO_ZERO:
+        return ""
+    if plan.quote.provider not in (ComputeProvider.VAST, ComputeProvider.PRIME):
+        return ""
+    from ...core.config import ConfigStore
+    from ...core.idle_watchdog import describe_idle_shutdown
+
+    try:
+        settings = ConfigStore().load()
+    except Exception:
+        return ""
+    text = describe_idle_shutdown(settings.rental_idle_shutdown)
+    if (
+        settings.rental_idle_shutdown > 0
+        and plan.quote.provider == ComputeProvider.PRIME
+        and not settings.prime_self_terminate
+    ):
+        text += " while this computer is awake"
+    style = "yellow" if settings.rental_idle_shutdown <= 0 else "dim"
+    return f"\n[dim]Idle stop[/dim] [{style}]{escape(text)}[/{style}]"
 
 
 def _render_profile_details(profile: QuickDeployProfile, plan: InferencePlan) -> str:
