@@ -84,3 +84,26 @@ def format_token_rate(value: float) -> str:
     if rate >= 10:
         return f"{rate:,.0f} tok/s"
     return f"{rate:,.1f} tok/s"
+
+
+def format_duration(seconds: float) -> str:
+    """Render a runclock duration compactly (e.g. 3m, 2h5m, 3d4h)."""
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total}s"
+    minutes, seconds_remainder = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m" if seconds_remainder == 0 else f"{minutes}m{seconds_remainder:02d}s"
+    hours, minutes_remainder = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h{minutes_remainder:02d}m" if minutes_remainder else f"{hours}h"
+    days, hours_remainder = divmod(hours, 24)
+    return f"{days}d{hours_remainder:02d}h" if hours_remainder else f"{days}d"
+
+
+def format_cost(value: float) -> str:
+    """Render an accumulated USD cost, keeping cents visible below $1k."""
+    amount = max(0.0, float(value))
+    if amount >= 1000:
+        return f"${amount:,.0f}"
+    return f"${amount:,.2f}"

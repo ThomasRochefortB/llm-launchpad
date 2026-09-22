@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -191,6 +192,54 @@ class AbandonedDeploymentRecoveryTests(unittest.TestCase):
 
         self.assertEqual(len(posted), 1)
         self.assertEqual(len(load_in_flight()), 1)
+
+    def test_a_deployment_another_live_session_owns_is_not_called_abandoned(self) -> None:
+        # Opening a second Launchpad window mid-deploy warned that the
+        # deployment then in progress "was still deploying when Launchpad last
+        # exited and may still be running" -- with a dollar figure -- about the
+        # one thing on screen that was demonstrably neither exited nor lost.
+        record_in_flight(self._entry("llamacpp-in-progress"))
+        app = TuiApp()
+        rows = [EndpointInfo(name="llamacpp-in-progress", provider=ComputeProvider.MODAL)]
+
+        with patch.object(
+            app, "_app_names_with_live_workers", return_value=frozenset({"llamacpp-in-progress"})
+        ):
+            posted = self._check(app, rows, (ComputeProvider.MODAL,))
+
+        self.assertEqual(posted, [])
+        # Still journalled: the other session owns resolving it, not this one.
+        self.assertEqual(len(load_in_flight()), 1)
+
+    def test_a_dead_worker_leaves_its_deployment_reportable(self) -> None:
+        record_in_flight(self._entry("llamacpp-orphaned"))
+        app = TuiApp()
+        rows = [EndpointInfo(name="llamacpp-orphaned", provider=ComputeProvider.MODAL)]
+
+        with patch.object(app, "_app_names_with_live_workers", return_value=frozenset()):
+            posted = self._check(app, rows, (ComputeProvider.MODAL,))
+
+        self.assertEqual(len(posted), 1)
+
+    def test_worker_liveness_comes_from_the_pid_not_the_status(self) -> None:
+        from llm_launchpad.core.job_store import JobStatus
+
+        app = TuiApp()
+        running = SimpleNamespace(app_name="llamacpp-live", worker_pid=4242, status=JobStatus.RUNNING)
+        dead = SimpleNamespace(app_name="llamacpp-dead", worker_pid=99, status=JobStatus.RUNNING)
+        store = SimpleNamespace(
+            list_jobs=lambda **_kwargs: [running, dead],
+            pid_alive=lambda pid: pid == 4242,
+        )
+
+        with patch.object(app, "_get_job_store", return_value=store):
+            self.assertEqual(app._app_names_with_live_workers(), frozenset({"llamacpp-live"}))
+
+    def test_unreadable_job_state_falls_back_to_warning(self) -> None:
+        app = TuiApp()
+
+        with patch.object(app, "_get_job_store", side_effect=RuntimeError("db locked")):
+            self.assertEqual(app._app_names_with_live_workers(), frozenset())
 
     def test_many_unresolved_entries_do_not_bury_the_screen(self) -> None:
         entries = tuple(self._entry(f"llamacpp-{index}") for index in range(5))

@@ -7,6 +7,7 @@ the screen stack and bridges user actions to Core via threaded workers.
 from __future__ import annotations
 
 import base64
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
@@ -16,10 +17,11 @@ from dataclasses import replace
 from pathlib import Path
 from uuid import uuid4
 
-from textual.app import App
+from textual.app import App, AutopilotCallbackType, SystemCommand
 from textual.binding import Binding
 from textual.filter import Monochrome
 from textual.message import Message
+from textual.screen import Screen
 from textual.widgets import Input, TextArea
 
 from ..core.backend import ModalBackend
@@ -86,14 +88,12 @@ from .screens.deploy import BackendSelectScreen
 from .screens.fast_deploy import FastDeployScreen
 from .screens.manage import ManageScreen
 from .screens.monitor import MonitorScreen
-from .screens.operations import OperationsScreen
 from .deployment_jobs import DeploymentCancelled, DeploymentJob
 from .screens.quick_deploy import QuickDeployScreen
 from .screens.setup import SetupRequiredScreen
 from .screens.storage import StorageScreen
 from .screens.settings import SettingsScreen
 from .clipboard import read_system_clipboard, write_system_clipboard
-from .mouse import default_tui_mouse_enabled
 from .visual import (
     LAUNCHPAD_THEMES,
     normalize_tui_density,
@@ -217,8 +217,7 @@ class TuiApp(App):
             show=False,
             priority=True,
         ),
-        Binding("ctrl+t", "toggle_mouse_mode", "Mouse", show=True),
-        Binding("ctrl+o", "push_operations", "Operations", show=True),
+        Binding("ctrl+o", "push_operations", "Manage", show=False),
     ]
     _CTRL_C_CONFIRM_WINDOW_SECONDS = 10.0
     _ENDPOINT_CACHE_TTL_SECONDS = 20.0
@@ -232,17 +231,13 @@ class TuiApp(App):
         self.theme = normalize_tui_theme(visual_settings.tui_theme)
         self.tui_density = normalize_tui_density(visual_settings.tui_density)
         self._confirm_quit = visual_settings.confirm_quit
-        if mouse_enabled is None:
-            mouse_enabled = (
-                visual_settings.tui_mouse
-                if visual_settings.tui_mouse is not None
-                else default_tui_mouse_enabled()
-            )
         self._monochrome_filter = Monochrome(
             enabled=self.theme == "launchpad-monochrome"
         )
         self._filters.append(self._monochrome_filter)
-        self.mouse_enabled = mouse_enabled
+        # Keep the legacy constructor argument compatible, but always leave
+        # selection to the terminal. Saved preferences cannot capture the mouse.
+        self.mouse_enabled = False
         self._ctrl_c_last_requested_at = 0.0
         self._orchestrator = Orchestrator()
         self._username: str = ""
@@ -276,6 +271,26 @@ class TuiApp(App):
             self._version = version("llm-launchpad")
         except Exception:
             pass
+
+    async def run_async(
+        self,
+        *,
+        headless: bool = False,
+        inline: bool = False,
+        inline_no_clear: bool = False,
+        mouse: bool = False,
+        size: tuple[int, int] | None = None,
+        auto_pilot: AutopilotCallbackType | None = None,
+    ) -> None:
+        """Leave mouse selection to the terminal for both sync and async launches."""
+        return await super().run_async(
+            headless=headless,
+            inline=inline,
+            inline_no_clear=inline_no_clear,
+            mouse=False,
+            size=size,
+            auto_pilot=auto_pilot,
+        )
 
     def apply_visual_preferences(self, theme: str, density: str) -> None:
         """Apply persisted visual preferences without restarting the TUI."""
@@ -353,44 +368,12 @@ class TuiApp(App):
                 return True
         return False
 
-    def _set_mouse_mode(self, enabled: bool) -> None:
-        """Enable or disable driver mouse reporting at runtime."""
-        driver = getattr(self, "_driver", None)
-        if driver is not None:
-            currently_enabled = bool(getattr(driver, "_mouse", self.mouse_enabled))
-            if enabled and not currently_enabled:
-                driver._mouse = True
-                enable = getattr(driver, "_enable_mouse_support", None)
-                if callable(enable):
-                    enable()
-            elif not enabled and currently_enabled:
-                disable = getattr(driver, "_disable_mouse_support", None)
-                if callable(disable):
-                    disable()
-                driver._mouse = False
-
-        self.mouse_enabled = enabled
-        try:
-            screen = self.screen
-        except Exception:
-            return
-
-        refresher = getattr(screen, "refresh_copy_help", None)
-        if callable(refresher):
-            refresher()
-        # A screen that tells the reader how to turn taps on must stop saying
-        # so once they are on.
-        mouse_hints = getattr(screen, "refresh_mouse_hints", None)
-        if callable(mouse_hints):
-            mouse_hints()
-        screen.refresh()
-
     async def action_quit(self) -> None:
         """Detach from durable jobs; stop only legacy in-flight deployments.
 
         Durable deployment workers survive TUI exit by design: closing the
         interface detaches from them, and reopening restores their logs and
-        results via Operations or `jobs`. Cancelling a deployment remains a
+        results via Manage or `jobs`. Cancelling a deployment remains a
         separate, explicit action. Legacy journal entries (pre-durable jobs)
         are still stopped before exit so they cannot leak silently.
         """
@@ -422,7 +405,7 @@ class TuiApp(App):
         if persistent_active:
             self.notify(
                 f"Detaching from {len(persistent_active)} background deployment(s); "
-                "they keep running. Reopen them from Operations.",
+                "they keep running. Reopen them from Manage → Jobs.",
                 timeout=8,
             )
         ModalBackend.terminate_all()
@@ -491,26 +474,6 @@ class TuiApp(App):
             severity="warning",
             timeout=self._CTRL_C_CONFIRM_WINDOW_SECONDS,
         )
-
-    def action_toggle_mouse_mode(self) -> None:
-        """Toggle between app mouse mode and terminal-native selection mode."""
-        enabled = not self.mouse_enabled
-        self._set_mouse_mode(enabled)
-        # The footer names the current state, so it has to be rebuilt when the
-        # state changes.
-        self.refresh_bindings()
-        if enabled:
-            self.notify(
-                "Mouse enabled. Clicks and drags go to llm-launchpad.",
-                title="Mouse mode on",
-                timeout=3,
-            )
-        else:
-            self.notify(
-                "Mouse disabled. Use your terminal selection and copy shortcuts.",
-                title="Terminal copy mode",
-                timeout=3,
-            )
 
     def _handle_exception(self, error: Exception) -> None:
         """Record an unhandled exception before Textual tears the app down.
@@ -594,8 +557,17 @@ class TuiApp(App):
         live_names = {row.name for row in rows} | {
             row.instance_name for row in rows if row.instance_name
         }
+        # A deployment another live session is running right now is not
+        # abandoned. The journal cannot tell the two apart -- it records that a
+        # deploy started, not who is still watching it -- so opening a second
+        # Launchpad window during a deploy raised a billing alarm about the
+        # deployment the user was in the middle of, phrased as though Launchpad
+        # had already exited on it.
+        owned = self._app_names_with_live_workers()
         unresolved: list[InFlightDeployment] = []
         for entry in entries:
+            if entry.app_name in owned:
+                continue
             confirmed_gone = (
                 entry.compute_provider in enumerated
                 and entry.app_name not in live_names
@@ -605,9 +577,30 @@ class TuiApp(App):
                 clear_in_flight(entry.app_name, provider=entry.provider, backend=entry.backend)
             else:
                 unresolved.append(entry)
+
         poster = getattr(self, "post_message", None)
         if callable(poster) and unresolved:
             poster(AbandonedDeploymentsChecked(tuple(unresolved)))
+
+    def _app_names_with_live_workers(self) -> frozenset[str]:
+        """Names whose durable deploy job is still held by a running worker.
+
+        A dead worker leaves its job behind, which is exactly what the journal
+        is for, so liveness is read from the pid rather than from the status.
+        """
+
+        try:
+            store = self._get_job_store()
+            return frozenset(
+                record.app_name
+                for record in store.list_jobs(include_terminal=False)  # type: ignore[attr-defined]
+                if record.app_name and store.pid_alive(record.worker_pid)  # type: ignore[attr-defined]
+            )
+        except Exception:
+            # Unreadable job state says nothing about the resource; fall back to
+            # warning, which is the safe direction for something that bills.
+            log_exception("Could not read durable deployment jobs")
+            return frozenset()
 
     def on_abandoned_deployments_checked(self, message: AbandonedDeploymentsChecked) -> None:
         shown = message.entries[: self._ABANDONED_WARNING_LIMIT]
@@ -723,11 +716,6 @@ class TuiApp(App):
                 name="modal-username-worker",
                 thread=True,
             )
-        if not self.mouse_enabled:
-            self.notify(
-                "Terminal copy mode active. Press Ctrl+T to enable mouse.",
-                timeout=4,
-            )
 
     def recheck_provider_setup(self) -> bool:
         """Re-run provider detection; enter the main menu when configured.
@@ -797,6 +785,53 @@ class TuiApp(App):
 
     def action_push_storage(self, backend: BackendType | None = None) -> None:
         self.push_screen(StorageScreen(initial_backend=backend))
+
+    def get_system_commands(self, screen: Screen) -> Iterable[SystemCommand]:
+        """Expose app navigation in the command palette (item 5).
+
+        Commands reuse the existing routing actions so palette navigation and
+        footer shortcuts stay consistent. Availability is context-aware: the
+        minimum-size gate disables navigation, and the active deployment job
+        (if any) is offered for quick reopen.
+        """
+        yield from super().get_system_commands(screen)
+        try:
+            gated = screen.has_class("viewport-too-small")
+        except Exception:
+            gated = False
+
+        def _nav(title: str, help_text: str, callback: object) -> SystemCommand:
+            from typing import cast
+
+            cb = cast(object, callback)
+            return SystemCommand(title, help_text, cb, discover=not gated)  # type: ignore[arg-type]
+
+        yield _nav("Deploy model", "Pick a model and get a live placement", self.action_push_deploy)
+        yield _nav(
+            "Advanced deploy", "llama.cpp / vLLM expert form", self.action_push_custom_deploy
+        )
+        yield _nav("Manage endpoints", "Endpoints and jobs", self.action_push_manage)
+        yield _nav("Jobs", "Background deployments for this session", self.action_push_operations)
+        yield _nav("Storage", "Cached models, pre-download, delete", self.action_push_storage)
+        yield _nav("Settings", "Appearance and deploy defaults", self.action_push_settings)
+        # Quick reopen for the active session job, using cached state only.
+        try:
+            jobs = dict(getattr(self, "deployment_jobs", {}) or {})
+        except Exception:
+            jobs = {}
+        active = [job for job in jobs.values() if not job.finished.is_set()]
+        if active:
+            job = active[0]
+            label = getattr(getattr(job, "config", None), "model", "") or job.id[:8]
+
+            def _reopen(job_id: str = job.id) -> None:
+                self.reopen_deployment(job_id)
+
+            yield _nav(
+                f"Reopen active deployment ({label})",
+                "Return to the running monitor without losing state",
+                _reopen,
+            )
 
     def push_quick_deploy(
         self,
@@ -1118,9 +1153,13 @@ class TuiApp(App):
             log_exception("Background OpenCode sync failed")
 
     def action_push_operations(self) -> None:
-        """Show running deployments and retained results from this session."""
-        if not isinstance(self.screen, OperationsScreen):
-            self.push_screen(OperationsScreen())
+        """Open deployment jobs within Manage."""
+        from textual.widgets import TabbedContent
+
+        if isinstance(self.screen, ManageScreen):
+            self.screen.query_one("#manage-tabs", TabbedContent).active = "manage-jobs"
+        else:
+            self.push_screen(ManageScreen(jobs=True))
 
     def reopen_deployment(self, job_id: str) -> None:
         """Return to the original monitor, preserving its logs and result."""
@@ -1933,6 +1972,12 @@ class TuiApp(App):
         discovery = self._record_provider_listings(configured, rows_by_provider, errors)
         rows = discovery.rows
         self._merge_deploy_connection_cache(rows)
+        try:
+            from ..core.endpoint_runtime import attach_endpoint_runtime
+
+            attach_endpoint_runtime(rows, explicit=False)
+        except Exception:
+            pass
         return discovery
 
     @staticmethod

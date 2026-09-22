@@ -16,10 +16,10 @@ from textual.selection import Selection
 from textual.strip import Strip
 from textual.widgets import Log
 
-_SUMMARY_DONE = "#7bf168"
-_SUMMARY_INFO = "#93a596"
-_SUMMARY_ERROR = "#ff6b6b"
-_SUMMARY_PROGRESS = "#e6c07b"
+_SUMMARY_DONE = "success"
+_SUMMARY_INFO = "dim"
+_SUMMARY_ERROR = "error"
+_SUMMARY_PROGRESS = "warning"
 MAX_RETAINED_LOG_LINES = 10_000
 _RETENTION_PRUNE_CHUNK = 1_000
 _RetainedItem = TypeVar("_RetainedItem")

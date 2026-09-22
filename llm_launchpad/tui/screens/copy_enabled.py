@@ -46,6 +46,7 @@ class CopyEnabledScreen(Screen):
         self._last_synced_selection: str | None = None
         self._viewport_profile: ViewportProfile | None = None
         self._focus_before_size_gate: Widget | None = None
+        self._focus_before_help: Widget | None = None
         self._scroll_focus_retired = False
 
     async def on_resize(self, event: events.Resize) -> None:
@@ -96,7 +97,7 @@ class CopyEnabledScreen(Screen):
             await self.mount(overlay)
 
         overlay.update(
-            "[bold #7bf168]Terminal too small[/]\n"
+            "[bold primary]Terminal too small[/]\n"
             f"Current: {size.width}×{size.height}  ·  "
             f"Minimum: {MIN_TERMINAL_WIDTH}×{MIN_TERMINAL_HEIGHT}\n"
             "[dim]Resize the terminal to continue.[/dim]"
@@ -179,6 +180,10 @@ class CopyEnabledScreen(Screen):
         """Open the keybinding help overlay for the active screen."""
         from ..widgets.help_overlay import HelpOverlayScreen
 
+        try:
+            self._focus_before_help = self.focused
+        except Exception:
+            self._focus_before_help = None  # type: ignore[attr-defined]
         self.app.push_screen(HelpOverlayScreen.from_screen(self))
 
     async def _watch_selections(

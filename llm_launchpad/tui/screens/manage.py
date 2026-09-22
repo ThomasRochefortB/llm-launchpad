@@ -8,20 +8,31 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.timer import Timer
-from textual.widgets import Button, DataTable, Input, OptionList, Static
+from textual.widgets import Button, DataTable, Input, OptionList, Static, TabbedContent, TabPane
 from textual.widgets.option_list import Option
 
+import time
+
 from ...core.benchmark import parse_concurrency_values
+from ...core.endpoint_runtime import attach_endpoint_runtime
 from ...core.vision_probe import image_test_command
 from ...protocol.enums import ComputeProvider, VisionVerification
 from ...protocol.models import EndpointInfo, ServingSnapshot, VisionCapabilities
 from ...core.deployment_states import is_terminal_deployment_state
 from ..connection import endpoint_connection_payload, resolve_openai_base_url
-from ..format import format_token_count, format_token_rate
+from ..format import (
+    format_age,
+    format_cost,
+    format_duration,
+    format_money,
+    format_token_count,
+    format_token_rate,
+)
 from ..fleet_status import (
     PASSIVE_METRICS_NOTE,
     annotate_serving_stats,
     attach_cached_serving_stats,
+    fetch_serving_snapshot,
     is_passive_traffic_row,
     is_passively_monitored,
     provider_outage_lines,
@@ -34,6 +45,7 @@ from ..widgets.input_form import FormField
 from ..workers import EndpointsFailed, EndpointsLoaded, ServingStatsReady
 from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
+from .operations import DeploymentJobsPanel
 
 
 _STOPPABLE_STATES = frozenset(
@@ -139,27 +151,129 @@ def _serving_live_parts(serving: ServingSnapshot) -> list[str]:
     return parts
 
 
-def _serving_detail_lines(row: EndpointInfo) -> str:
-    """Render the traffic summary shown under the selected endpoint."""
+def _serving_observed_age_label(row: EndpointInfo, *, now: float | None = None) -> str | None:
+    """Age of the banked traffic total, or None when never collected."""
+    serving = row.serving
+    if serving is None or serving.total_tokens <= 0:
+        return None
+    observed_at = serving.observed_at
+    if observed_at is None:
+        return "cached"
+    moment = time.time() if now is None else now
+    age = max(0.0, moment - observed_at)
+    if age < 60:
+        return "just now"
+    return format_age(age)
+
+
+def _endpoint_run_time(row: EndpointInfo, *, now: float | None = None) -> str:
+    """Current-run uptime for the table; "-" when the run start is unknown.
+
+    Deployment age is never a substitute: a Modal app can exist while its GPU
+    is asleep, so an unverified start reads as unknown rather than uptime.
+    """
+    started_at = row.serving.stats.runtime_started_at if row.serving is not None else None
+    if started_at is None or started_at <= 0:
+        started_at = row.run_started_at_epoch
+    if started_at is None or started_at <= 0:
+        return "-"
+    moment = time.time() if now is None else now
+    if moment < started_at:
+        return "-"
+    return format_duration(moment - started_at)
+
+
+def _endpoint_cost(row: EndpointInfo) -> str:
+    """Accumulated compute cost for the table; "-" when unknown."""
+    if row.cumulative_cost_usd is None:
+        return "-"
+    rendered = format_cost(row.cumulative_cost_usd)
+    return f"~{rendered}" if row.cost_estimated else rendered
+
+
+def _runtime_detail_lines(row: EndpointInfo, *, now: float | None = None) -> str:
+    """Render runclock and cumulative cost shown under the selected endpoint."""
+    moment = time.time() if now is None else now
+    lines: list[str] = []
+    live_start = row.serving.stats.runtime_started_at if row.serving is not None else None
+    started_at = live_start if live_start else row.run_started_at_epoch
+    if started_at is not None and started_at > 0 and moment >= started_at:
+        lines.append(f"\n[dim]Run time:[/dim] {format_duration(moment - started_at)} (current run)")
+    elif is_terminal_deployment_state(row.state):
+        lines.append("\n[dim]Run time:[/dim] - (not running)")
+    else:
+        if row.provider == ComputeProvider.MODAL:
+            lines.append(
+                "\n[dim]Run time:[/dim] unknown (no live probe yet; passive refreshes never wake the container)"
+            )
+        else:
+            lines.append("\n[dim]Run time:[/dim] unknown (run start not yet observed)")
+    if row.cumulative_cost_usd is not None:
+        cost_text = f"~{format_cost(row.cumulative_cost_usd)}" if row.cost_estimated else format_cost(row.cumulative_cost_usd)
+        qualifier = "est." if row.cost_estimated else "tracked"
+        detail = f"\n[dim]Compute cost:[/dim] {cost_text} ({qualifier} endpoint total)"
+        if row.hourly_cost_usd is not None:
+            detail += f" [dim]at {format_money(row.hourly_cost_usd)}/h[/dim]"
+        if row.cost_tracked_since_epoch is not None:
+            age = max(0.0, moment - row.cost_tracked_since_epoch)
+            detail += f" [dim]since {format_age(age)}[/dim]"
+        lines.append(detail)
+    elif row.hourly_cost_usd is not None:
+        lines.append(
+            f"\n[dim]Compute cost:[/dim] tracking from {format_money(row.hourly_cost_usd)}/h"
+            " [dim](no billable interval observed yet)[/dim]"
+        )
+    else:
+        lines.append("\n[dim]Compute cost:[/dim] unknown (hourly rate unavailable)")
+    return "".join(lines)
+
+
+def _serving_detail_lines(row: EndpointInfo, *, now: float | None = None) -> str:
+    """Render traffic plus runclock/cost shown under the selected endpoint.
+
+    Traffic stays passive for Modal: banked totals carry their observation age
+    so a cached number is never mistaken for a fresh measurement. Run time and
+    cost follow on every row so narrow layouts see them even when the table
+    cannot fit the columns.
+    """
+    moment = time.time() if now is None else now
+    lines: list[str] = []
     serving = row.serving
     if serving is None:
-        return ""
-    lines: list[str] = []
-    if serving.total_tokens > 0:
-        lines.append(
-            f"\n[dim]Traffic:[/dim] {format_token_count(serving.total_tokens)} tokens served"
-            f" [dim]({format_token_count(serving.total_prompt_tokens)} in /"
-            f" {format_token_count(serving.total_generation_tokens)} out)[/dim]"
-        )
-    # A passively monitored Modal row shows history only: live gauges would
-    # imply a probe that background refreshes deliberately skip.
-    if is_passive_traffic_row(row):
+        lines.append("\n[dim]Traffic:[/dim] not collected yet (no metrics reading)")
+    else:
         if serving.total_tokens > 0:
-            lines.append(f"\n[dim]{PASSIVE_METRICS_NOTE}[/dim]")
-        return "".join(lines)
-    live = _serving_live_parts(serving)
-    if live:
-        lines.append(f"\n[dim]Now:[/dim] {' · '.join(live)}")
+            age_label = _serving_observed_age_label(row, now=moment)
+            age_suffix = f" [dim](observed {age_label})[/dim]" if age_label else ""
+            lines.append(
+                f"\n[dim]Traffic:[/dim] {format_token_count(serving.total_tokens)} tokens served"
+                f" [dim]({format_token_count(serving.total_prompt_tokens)} in /"
+                f" {format_token_count(serving.total_generation_tokens)} out)[/dim]"
+                f"{age_suffix}"
+            )
+        # A passively monitored Modal row shows history only: live gauges would
+        # imply a probe that background refreshes deliberately skip.
+        if is_passive_traffic_row(row):
+            if serving.total_tokens > 0:
+                lines.append(f"\n[dim]{PASSIVE_METRICS_NOTE}[/dim]")
+            lines.append(_runtime_detail_lines(row, now=moment))
+            if row.live_metrics_error:
+                lines.append(f"\n[yellow]Last live fetch failed: {escape(row.live_metrics_error)}[/yellow]")
+            elif row.live_metrics_checked_at is not None:
+                lines.append(
+                    f"\n[dim]Last live fetch: {format_age(max(0.0, moment - row.live_metrics_checked_at))}[/dim]"
+                )
+            return "".join(lines)
+        live = _serving_live_parts(serving)
+        if live:
+            lines.append(f"\n[dim]Now:[/dim] {' · '.join(live)}")
+        elif serving.total_tokens <= 0 and not _serving_live_parts(serving):
+            # No traffic and no live gauges: traffic contributes nothing, but
+            # the caller still gets runclock/cost below.
+            pass
+    lines.append(_runtime_detail_lines(row, now=moment))
+    if row.live_metrics_error:
+        lines.append(f"\n[yellow]Last live fetch failed: {escape(row.live_metrics_error)}[/yellow]")
     return "".join(lines)
 
 
@@ -172,9 +286,18 @@ def _available_actions(row: EndpointInfo) -> frozenset[str]:
     state = _normalized_state(row.state)
     if state in _READY_STATES or bool((row.web_url or "").strip()):
         actions.update(("status", "benchmark", "connection"))
+        if row.backend.value in {"vllm", "llamacpp"}:
+            actions.add("live-metrics")
     if _is_stoppable_state(state) or row.provider == ComputeProvider.VAST:
         actions.add("stop")
     return frozenset(actions)
+
+
+def _live_metrics_label(row: EndpointInfo) -> str:
+    """Label the explicit metrics fetch with its Modal wake-up cost."""
+    if row.provider == ComputeProvider.MODAL:
+        return "  Fetch live metrics — may start GPU"
+    return "  Fetch live metrics"
 
 
 def _endpoint_name(row: EndpointInfo) -> str:
@@ -279,6 +402,18 @@ _ENDPOINT_COLUMNS = (
         _WIDE,
     ),
     AdaptiveColumn.visible(
+        "run",
+        "run",
+        _endpoint_run_time,
+        _WIDE,
+    ),
+    AdaptiveColumn.visible(
+        "cost",
+        "cost",
+        _endpoint_cost,
+        _WIDE,
+    ),
+    AdaptiveColumn.visible(
         "app",
         "app / pod",
         lambda row: row.name or row.app_id or "-",
@@ -295,34 +430,57 @@ class ManageScreen(CopyEnabledScreen):
     # readings, so a screen that reads once shows nothing at all until the
     # user thinks to press a key.
     _TRAFFIC_REFRESH_INTERVAL_SECONDS = 20.0
+    # Repaint the runclock between network passes without touching any runtime.
+    _CLOCK_REFRESH_INTERVAL_SECONDS = 30.0
 
     BINDINGS = [
         Binding("escape", "pop_screen", "Back", show=True),
         Binding("r", "refresh_endpoints", "Refresh", show=True),
         Binding("enter", "open_actions", "Actions", show=True),
         Binding("a", "toggle_stopped", "Stopped", show=True),
-        Binding("l", "logs_selected", "Logs", show=True),
-        Binding("u", "copy_base_url", "Copy URL", show=True),
-        Binding("s", "status_selected", "Status", show=True),
+        Binding("l", "logs_selected", "Logs", show=False),
+        Binding("u", "copy_base_url", "Copy URL", show=False),
+        Binding("s", "status_selected", "Status", show=False),
         # Keep the shortcuts for experienced users, but let the action menu
         # carry the discoverability burden in the footer and help text.
         Binding("b", "benchmark_selected", "Benchmark", show=False),
+        Binding("f", "fetch_live_selected", "Live metrics", show=False),
         Binding("x", "stop_selected", "Stop", show=False),
     ]
 
+    def __init__(self, *, jobs: bool = False) -> None:
+        super().__init__()
+        self._initial_tab = "manage-jobs" if jobs else "manage-endpoints"
+
     def compose(self) -> ComposeResult:
         with Vertical(id="manage-layout"):
-            yield Static(
-                "[bold #7bf168]Manage Endpoints[/]  [dim]Choose an endpoint, then press Enter[/dim]",
-                id="manage-title",
-            )
-            yield Static("[dim]Loading managed endpoints...[/dim]", id="manage-status")
-            yield AdaptiveDataTable(id="manage-endpoint-table")
-            # The footer already renders Back, Refresh and Actions with their
-            # keys; a second copy of the same list below the table was one more
-            # line to read and one more place to keep in step.
-            yield Static("[dim]No endpoint selected.[/dim]", id="manage-selection-detail")
+            yield Static("[bold primary]Manage[/]", id="manage-title")
+            with TabbedContent(initial=self._initial_tab, id="manage-tabs"):
+                with TabPane("Endpoints", id="manage-endpoints"):
+                    yield Static("[dim]Loading endpoints…[/dim]", id="manage-status")
+                    yield AdaptiveDataTable(id="manage-endpoint-table")
+                    yield Static("", id="manage-selection-detail")
+                with TabPane("Jobs", id="manage-jobs"):
+                    yield DeploymentJobsPanel()
         yield FittedFooter()
+
+    def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+        if event.tabbed_content.id != "manage-tabs":
+            return
+        self.refresh_bindings()
+        if event.pane.id == "manage-jobs":
+            self.query_one("#deployment-jobs", OptionList).focus()
+        else:
+            self.query_one("#manage-endpoint-table", AdaptiveDataTable).focus()
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action in {
+            "refresh_endpoints", "open_actions", "toggle_stopped", "logs_selected",
+            "copy_base_url", "status_selected", "benchmark_selected", "stop_selected",
+            "fetch_live_selected",
+        }:
+            return self.query_one("#manage-tabs", TabbedContent).active == "manage-endpoints"
+        return super().check_action(action, parameters)
 
     def on_mount(self) -> None:
         self._rows: list[EndpointInfo] = []
@@ -336,7 +494,9 @@ class ManageScreen(CopyEnabledScreen):
         self._selected_key: str | None = None
         self._retained_providers: set[str] = set()
         self._was_suspended = False
+        self._fleet_refresh_inflight = False
         self._traffic_refresh_timer: Timer | None = None
+        self._clock_refresh_timer: Timer | None = None
         table = self.query_one("#manage-endpoint-table", AdaptiveDataTable)
         table.cursor_type = "row"
         table.zebra_stripes = True
@@ -345,12 +505,18 @@ class ManageScreen(CopyEnabledScreen):
             row_key=_endpoint_key,
             profile=self.viewport_profile,
         )
-        table.focus()
+        if self._initial_tab == "manage-endpoints":
+            table.focus()
         self._refresh_endpoints()
         self._traffic_refresh_timer = self.set_interval(
             self._TRAFFIC_REFRESH_INTERVAL_SECONDS,
             self._refresh_serving_stats,
             name="manage-traffic-refresh",
+        )
+        self._clock_refresh_timer = self.set_interval(
+            self._CLOCK_REFRESH_INTERVAL_SECONDS,
+            self._render_rows,
+            name="manage-clock-refresh",
         )
 
     def viewport_profile_changed(
@@ -371,11 +537,15 @@ class ManageScreen(CopyEnabledScreen):
         # of all one that can wake a container that had scaled to zero.
         if self._traffic_refresh_timer is not None:
             self._traffic_refresh_timer.pause()
+        if self._clock_refresh_timer is not None:
+            self._clock_refresh_timer.pause()
 
     def on_screen_resume(self, _: events.ScreenResume) -> None:
         """Refresh the fleet after returning from an endpoint operation."""
         if self._traffic_refresh_timer is not None:
             self._traffic_refresh_timer.resume()
+        if self._clock_refresh_timer is not None:
+            self._clock_refresh_timer.resume()
         if self._was_suspended:
             self._was_suspended = False
             self.call_after_refresh(self._refresh_if_current)
@@ -387,6 +557,17 @@ class ManageScreen(CopyEnabledScreen):
         )
         self._retained_providers = retained_providers(message.discovery)
         self._outage_lines = provider_outage_lines(message.discovery)
+        if message.is_stale:
+            # The app posts the cached fleet immediately, then the live
+            # discovery. Claiming "refreshed" for the cache is what left
+            # token totals visibly frozen after pressing r: the stale rows
+            # render, but the status stays "Refreshing" until the live pass
+            # lands.
+            self._fleet_refresh_inflight = True
+            self._render_rows()
+            self._refresh_serving_stats()
+            return
+        self._fleet_refresh_inflight = False
         self._render_rows()
         self._refresh_serving_stats()
 
@@ -405,11 +586,13 @@ class ManageScreen(CopyEnabledScreen):
         """
         rows = self._all_rows
         if not rows:
+            self._render_rows()
             return
         # Modal-only fleets need no network at all: attach the banked totals
         # synchronously instead of spending a worker to learn the same thing.
         if all(is_passively_monitored(row) for row in rows):
             attach_cached_serving_stats(rows)
+            attach_endpoint_runtime(rows, explicit=False)
             self._render_rows()
             return
         username = self._modal_username()
@@ -422,7 +605,40 @@ class ManageScreen(CopyEnabledScreen):
 
     def _run_serving_stats(self, rows: list[EndpointInfo], username: str) -> None:
         annotate_serving_stats(rows, username)
+        attach_endpoint_runtime(rows, explicit=False)
         self.post_message(ServingStatsReady(rows))
+
+    def _run_live_single(self, row: EndpointInfo, username: str) -> None:
+        """Fetch one endpoint's live counters, even when that may wake it."""
+        snapshot = fetch_serving_snapshot(row, username, explicit=True)
+        moment = time.time()
+        row.live_metrics_checked_at = moment
+        if snapshot is not None:
+            row.serving = snapshot
+            row.live_metrics_error = None
+        else:
+            # Keep the banked totals: a failed explicit read says the probe
+            # missed, not that the endpoint served nothing.
+            row.live_metrics_error = "endpoint did not return metrics"
+        attach_endpoint_runtime([row], now=moment, explicit=True)
+        self.post_message(ServingStatsReady(self._all_rows))
+
+    def action_fetch_live_selected(self) -> None:
+        """Fetch live metrics for the selected endpoint (may start its GPU)."""
+        row = self._row_for_action("live-metrics")
+        if row is None:
+            return
+        key = _endpoint_key(row)
+        self.query_one("#manage-status", Static).update(
+            f"[dim]Fetching live metrics for {escape(_endpoint_name(row))}…[/dim]"
+        )
+        username = self._modal_username()
+        self.run_worker(
+            lambda: self._run_live_single(row, username),
+            name=f"manage-live-metrics-{key}",
+            thread=True,
+            exclusive=True,
+        )
 
     def on_serving_stats_ready(self, message: ServingStatsReady) -> None:
         """Repaint with the traffic that was read, unless the fleet moved on."""
@@ -475,11 +691,16 @@ class ManageScreen(CopyEnabledScreen):
             else _endpoint_key(self._rows[0])
         )
         noun = "endpoint" if len(self._rows) == 1 else "endpoints"
-        summary = (
-            f"[green]Fleet refreshed.[/green] {len(self._rows)} managed {noun}."
-            if not self._outage_lines
-            else f"[yellow]Fleet partly refreshed.[/yellow] {len(self._rows)} managed {noun}."
-        )
+        if getattr(self, "_fleet_refresh_inflight", False):
+            summary = (
+                f"[dim]Refreshing managed endpoints...[/dim] {len(self._rows)} cached {noun}."
+            )
+        else:
+            summary = (
+                f"[green]Fleet refreshed.[/green] {len(self._rows)} managed {noun}."
+                if not self._outage_lines
+                else f"[yellow]Fleet partly refreshed.[/yellow] {len(self._rows)} managed {noun}."
+            )
         if hidden:
             summary += (
                 f"  [dim]{hidden} stopped hidden; press a to show.[/dim]"
@@ -493,6 +714,7 @@ class ManageScreen(CopyEnabledScreen):
         self._update_selection_detail()
 
     def on_endpoints_failed(self, message: EndpointsFailed) -> None:
+        self._fleet_refresh_inflight = False
         self.query_one("#manage-status", Static).update(
             f"[yellow]Endpoint refresh failed:[/yellow] {escape(message.error)}"
         )
@@ -551,7 +773,7 @@ class ManageScreen(CopyEnabledScreen):
             )
             return
         self.app.copy_to_clipboard(base_url)
-        self.notify("Copied base URL", timeout=2)
+        self.notify("Copy requested: base URL", timeout=2)
 
     def _modal_username(self) -> str:
         return str(getattr(self.app, "_username", "") or "")
@@ -560,6 +782,7 @@ class ManageScreen(CopyEnabledScreen):
         self.app.pop_screen()
 
     def _refresh_endpoints(self, force: bool = False) -> None:
+        self._fleet_refresh_inflight = True
         self.query_one("#manage-status", Static).update(
             "[dim]Refreshing managed endpoints...[/dim]"
         )
@@ -627,6 +850,7 @@ class ManageScreen(CopyEnabledScreen):
                 ("status", "status"),
                 ("logs", "logs"),
                 ("benchmark", "benchmark"),
+                ("live-metrics", "live metrics"),
                 ("stop", "stop"),
                 ("connection", "connection info"),
             )
@@ -661,6 +885,7 @@ class EndpointActionsScreen(CopyEnabledScreen):
         ("status", "  Check status"),
         ("logs", "  View logs"),
         ("benchmark", "  Run benchmark"),
+        ("live-metrics", "  Fetch live metrics"),
         ("stop", "  Stop endpoint"),
     )
 
@@ -669,15 +894,17 @@ class EndpointActionsScreen(CopyEnabledScreen):
         self.endpoint = endpoint
 
     def _action_labels(self) -> tuple[tuple[str, str], ...]:
-        """Label the explicit health check with its cost on Modal.
+        """Label explicit probes with their cost on Modal.
 
         Background fleet refreshes never wake a scaled-to-zero container;
-        this action does, so the Modal label says so up front.
+        these actions do, so the Modal labels say so up front.
         """
         labels: list[tuple[str, str]] = []
         for action, label in self._ACTION_LABELS:
             if action == "status" and self.endpoint.provider == ComputeProvider.MODAL:
                 label = "  Check status — may start GPU"
+            if action == "live-metrics":
+                label = _live_metrics_label(self.endpoint)
             labels.append((action, label))
         return tuple(labels)
 
@@ -685,7 +912,7 @@ class EndpointActionsScreen(CopyEnabledScreen):
         from ..fleet_status import deployment_and_health_line
 
         with VerticalScroll(classes="screen-scroll"):
-            yield Static("[bold #7bf168]Endpoint Actions[/]")
+            yield Static("[bold primary]Endpoint Actions[/]")
             yield Static(
                 f"[bold]{escape(_endpoint_name(self.endpoint))}[/bold]  "
                 f"[dim]{escape(_endpoint_host(self.endpoint))}[/dim]\n"
@@ -728,19 +955,35 @@ class EndpointActionsScreen(CopyEnabledScreen):
     def _submit(self, action: str) -> None:
         if action not in _available_actions(self.endpoint):
             return
+        endpoint = self.endpoint
         self.app.pop_screen()
         if action == "connection":
-            self.app.push_screen(ConnectionInfoScreen(self.endpoint))
+            self.app.push_screen(ConnectionInfoScreen(endpoint))
         elif action == "status":
             # The common path probes immediately with defaults; the URL-override
             # form stays available via the hidden "s" shortcut on Manage.
-            self.app.begin_status(self.endpoint)  # type: ignore[attr-defined]
+            self.app.begin_status(endpoint)  # type: ignore[attr-defined]
+        elif action == "live-metrics":
+            # Route through Manage so the fetched totals repaint the table and
+            # detail rather than disappearing with this menu.
+            manage = self.app.screen
+            fetch = getattr(manage, "action_fetch_live_selected", None)
+            if callable(fetch):
+                # The menu holds the selected row; Manage re-resolves its own
+                # selection, so prefer the endpoint the user just chose.
+                try:
+                    manage._selected_key = _endpoint_key(endpoint)  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+                fetch()
+            else:
+                self.app.begin_status(endpoint)  # type: ignore[attr-defined]
         elif action == "logs":
-            self.app.begin_logs(self.endpoint, follow=True)  # type: ignore[attr-defined]
+            self.app.begin_logs(endpoint, follow=True)  # type: ignore[attr-defined]
         elif action == "benchmark":
-            self.app.push_screen(BenchmarkOptionsScreen(self.endpoint))
+            self.app.push_screen(BenchmarkOptionsScreen(endpoint))
         elif action == "stop":
-            self.app.push_screen(StopConfirmScreen(self.endpoint))
+            self.app.push_screen(StopConfirmScreen(endpoint))
 
 
 class ConnectionInfoScreen(CopyEnabledScreen):
@@ -761,7 +1004,7 @@ class ConnectionInfoScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(classes="screen-scroll"):
-            yield Static("[bold #7bf168]Connection Info[/]")
+            yield Static("[bold primary]Connection Info[/]")
             yield Static(
                 f"[bold]{escape(_endpoint_name(self.endpoint))}[/bold]  "
                 f"[dim]{escape(_endpoint_summary(self.endpoint))}[/dim]"
@@ -835,7 +1078,7 @@ class ConnectionInfoScreen(CopyEnabledScreen):
             self.notify("No endpoint URL or model ID to build an image request", timeout=2)
             return
         self.app.copy_to_clipboard(image_test_command(base_url, model_id))
-        self.notify("Copied image request", timeout=2)
+        self.notify("Copy requested: image request", timeout=2)
 
     def _copy_field(self, field: str, *, empty_message: str) -> None:
         value = (self._payload.get(field) or "").strip()
@@ -843,7 +1086,7 @@ class ConnectionInfoScreen(CopyEnabledScreen):
             self.notify(empty_message, timeout=2)
             return
         self.app.copy_to_clipboard(value)
-        self.notify(f"Copied {field.replace('_', ' ')}", timeout=2)
+        self.notify(f"Copy requested: {field.replace('_', ' ')}", timeout=2)
 
     def action_copy_base_url(self) -> None:
         self._copy_field("base_url", empty_message="No base URL to copy")
@@ -859,7 +1102,7 @@ class ConnectionInfoScreen(CopyEnabledScreen):
             self.notify("No endpoint URL or model ID for a curl example", timeout=2)
             return
         self.app.copy_to_clipboard(example)
-        self.notify("Copied curl example", timeout=2)
+        self.notify("Copy requested: curl example", timeout=2)
 
     def action_copy_json_config(self) -> None:
         from ..connection import connection_json_example
@@ -869,7 +1112,7 @@ class ConnectionInfoScreen(CopyEnabledScreen):
             self.notify("No endpoint URL or model ID for a client config", timeout=2)
             return
         self.app.copy_to_clipboard(example)
-        self.notify("Copied client JSON", timeout=2)
+        self.notify("Copy requested: client JSON", timeout=2)
 
     def action_pop_screen(self) -> None:
         self.app.pop_screen()
@@ -889,7 +1132,7 @@ class StatusOptionsScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(classes="screen-scroll"):
-            yield Static("[bold #7bf168]Status Check[/]")
+            yield Static("[bold primary]Status Check[/]")
             yield Static(
                 f"[bold]{escape(_endpoint_name(self.endpoint))}[/bold]  "
                 f"[dim]{escape(_endpoint_summary(self.endpoint))}[/dim]"
@@ -959,7 +1202,7 @@ class BenchmarkOptionsScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(classes="screen-scroll"):
-            yield Static("[bold #7bf168]Benchmark[/]")
+            yield Static("[bold primary]Benchmark[/]")
             yield Static(
                 f"[bold]{escape(_endpoint_name(self.endpoint))}[/bold]  "
                 f"[dim]{escape(_endpoint_summary(self.endpoint))}[/dim]"
@@ -1077,7 +1320,7 @@ class StopConfirmScreen(CopyEnabledScreen):
     def compose(self) -> ComposeResult:
         with VerticalScroll(classes="screen-scroll"):
             with Vertical(id="stop-confirm-dialog", classes="dialog-panel"):
-                yield Static("[bold #7bf168]Stop Endpoint[/]", classes="dialog-title")
+                yield Static("[bold primary]Stop Endpoint[/]", classes="dialog-title")
                 yield Static(
                     f"Stop [bold]{escape(_endpoint_name(self.endpoint))}[/bold]?\n"
                     f"[dim]{escape(self.endpoint.provider.value)}/{escape(_endpoint_backend(self.endpoint))} · "

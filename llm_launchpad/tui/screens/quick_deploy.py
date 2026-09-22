@@ -270,25 +270,12 @@ def _deployment_decision_summary(profile: QuickDeployProfile, plan: InferencePla
 # one row high, so anything that does not fit is simply cut off.
 
 
-def deploy_key_hint(*, narrow: bool, mouse_enabled: bool) -> str:
-    """Name the way out of this screen for the viewport it is being read on.
-
-    When mouse reporting is off -- the default over SSH, so that the terminal
-    keeps its own text selection -- taps never reach the app at all. It cannot
-    report a tap it never receives, so the way to turn them on has to be on
-    screen before one is tried.
-    """
-
+def deploy_key_hint(*, narrow: bool) -> str:
+    """Describe keyboard deployment for the current viewport."""
     if narrow:
-        return (
-            "[dim]ctrl+d deploys · ctrl+t enables tap[/dim]"
-            if not mouse_enabled
-            else "[dim]ctrl+d deploys · or tab to Deploy[/dim]"
-        )
-    tail = "" if mouse_enabled else " Taps need ctrl+t."
+        return "[dim]ctrl+d deploys · or tab to Deploy[/dim]"
     return (
-        "[dim]Press ctrl+d to deploy, or tab to Deploy and press enter."
-        f"{tail}[/dim]"
+        "[dim]Press ctrl+d to deploy, or tab to Deploy and press enter.[/dim]"
     )
 
 
@@ -406,7 +393,7 @@ class QuickDeployScreen(CopyEnabledScreen):
         # Steps 1 and 2 are the model and placement pickers this screen is
         # reached from; naming the last one keeps the flow's count complete.
         yield Static(
-            "[bold #7bf168]Deploy[/]  "
+            "[bold primary]Deploy[/]  "
             f"{_render_profile_label(self.profile)} "
             "[dim]· Step 3: Confirm and deploy[/dim]",
             id="quick-deploy-title",
@@ -681,11 +668,10 @@ class QuickDeployScreen(CopyEnabledScreen):
     def _deploy_key_hint(self) -> str:
         return deploy_key_hint(
             narrow=self.viewport_profile.narrow,
-            mouse_enabled=bool(getattr(self.app, "mouse_enabled", True)),
         )
 
-    def refresh_mouse_hints(self) -> None:
-        """Re-render the hint after mouse mode is toggled."""
+    def refresh_keyboard_hints(self) -> None:
+        """Re-render the keyboard hint for the current viewport."""
 
         for hint in self.query("#quick-deploy-feedback"):
             hint.update(self._deploy_key_hint())
@@ -694,7 +680,7 @@ class QuickDeployScreen(CopyEnabledScreen):
         """Re-fit the hint when the terminal is resized."""
 
         super().viewport_profile_changed(profile, previous)
-        self.refresh_mouse_hints()
+        self.refresh_keyboard_hints()
 
     def action_focus_next_control(self) -> None:
         move_focus_with_arrows(self, 1)

@@ -794,6 +794,49 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                     None,
                 )
 
+    async def test_context_cap_restates_the_estimate_and_reaches_the_deployment(self) -> None:
+        """A capped context is what vLLM serves, so it is what the estimate sizes."""
+        app = _TestApp()
+        estimate = VllmMemoryBreakdown(
+            total_gb=132.0,
+            weights_gb=90.0,
+            kv_cache_gb=20.0,
+            overhead_gb=22.0,
+            context_tokens=8192,
+        )
+        with (
+            patch(
+                "llm_launchpad.tui.screens.deploy.fetch_vllm_memory_breakdown",
+                return_value=estimate,
+            ),
+            patch(
+                "llm_launchpad.tui.screens.deploy.discover_reasoning_capabilities",
+                return_value=None,
+            ),
+        ):
+            async with app.run_test() as pilot:
+                app.push_screen(VllmDeployScreen())
+                await pilot.pause()
+
+                screen = app.screen
+                assert isinstance(screen, VllmDeployScreen)
+                screen.query_one("#model-name", Input).value = "Qwen/Qwen3.8-27B"
+                await pilot.pause(0.4)
+                self.assertIn("~132.0 GB total", str(screen.query_one("#vllm-vram-status", Static).content))
+
+                screen.query_one("#max-model-len", Input).value = "4096"
+                await pilot.pause(0.2)
+
+                text = str(screen.query_one("#vllm-vram-status", Static).content)
+                # Half the context halves the cache: 90 + 10, plus 20% overhead.
+                self.assertIn("ctx=4096", text)
+                self.assertIn("~120.0 GB total", text)
+
+                screen._do_deploy()
+
+        assert app.deployed_config is not None
+        self.assertEqual(app.deployed_config.max_context_tokens, 4096)
+
     async def test_vllm_memory_status_handles_unavailable_estimate(self) -> None:
         app = _TestApp()
         with patch("llm_launchpad.tui.screens.deploy.fetch_vllm_memory_breakdown", return_value=None):
@@ -965,6 +1008,74 @@ class VllmDeployFormPolishTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn(
                 ("Enter a model name before deploying.", "error"), app.notifications
             )
+
+    async def test_parsers_prefill_from_the_model_and_respect_a_choice(self) -> None:
+        """OpenCode sends tools on every request; a server with no parser refuses."""
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+
+            screen.query_one("#model-name", Input).value = "Qwen/Qwen3.8-27B"
+            await pilot.pause()
+            self.assertEqual(screen.query_one("#tool-call-parser", Input).value, "qwen3_xml")
+            self.assertEqual(screen.query_one("#reasoning-parser", Input).value, "qwen3")
+
+            screen.query_one("#reasoning-parser", Input).value = "deepseek_r1"
+            await pilot.pause()
+            screen.query_one("#model-name", Input).value = "Qwen/Qwen3-8B"
+            await pilot.pause()
+            self.assertEqual(screen.query_one("#reasoning-parser", Input).value, "deepseek_r1")
+
+    async def test_vast_disk_defaults_to_the_size_the_model_needs(self) -> None:
+        """The model-aware default never applied while the field was pre-filled."""
+        app = _TestApp()
+        estimate = VllmMemoryBreakdown(
+            total_gb=240.0, weights_gb=200.0, kv_cache_gb=0.0,
+            overhead_gb=40.0, context_tokens=8192,
+        )
+        with (
+            patch(
+                "llm_launchpad.tui.screens.deploy.fetch_vllm_memory_breakdown",
+                return_value=estimate,
+            ),
+            patch(
+                "llm_launchpad.tui.screens.deploy.discover_reasoning_capabilities",
+                return_value=None,
+            ),
+        ):
+            async with app.run_test() as pilot:
+                app.push_screen(VllmDeployScreen())
+                await pilot.pause()
+                screen = app.screen
+                assert isinstance(screen, VllmDeployScreen)
+                screen.query_one("#model-name", Input).value = "acme/very-large"
+                await pilot.pause(0.4)
+
+                self.assertEqual(screen.query_one("#vast-disk-vllm", Input).value, "")
+                # 240 GB of weights does not fit the flat 100 GB default.
+                self.assertEqual(screen._default_vast_disk_gb(), 284)
+
+    async def test_cost_preview_prices_every_attached_gpu(self) -> None:
+        """A Modal rate is per GPU; a marketplace offer already covers them all."""
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+            screen.on_gpu_types_loaded(
+                GpuTypesLoaded(gpu_types=[ModalGpuSpec("A100-80GB", price_per_hour_usd=2.5)])
+            )
+            await pilot.pause()
+            screen.query_one("#gpu-count-vllm", Input).value = "4"
+            await pilot.pause()
+
+            markup = str(screen.query_one("#vllm-cost-preview", Static).renderable)
+            self.assertIn("$10.00/hr", markup)
+            self.assertIn("4 x $2.50/hr/GPU", markup)
 
     async def test_switching_back_to_modal_drops_the_bound_prime_gpu(self) -> None:
         app = _TestApp()

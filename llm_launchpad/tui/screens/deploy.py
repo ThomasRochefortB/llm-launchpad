@@ -31,9 +31,18 @@ from textual.widgets import (
 from textual.widgets.option_list import Option
 
 from ...core.coerce import positive_int
-from ...core.hf_models import ModelCandidate, VllmMemoryBreakdown, fetch_vllm_memory_breakdown
-from ...core.inference_options import recommended_vllm_tool_call_parser
+from ...core.hf_models import (
+    ModelCandidate,
+    VllmMemoryBreakdown,
+    fetch_vllm_memory_breakdown,
+    rescale_vllm_memory_breakdown,
+)
+from ...core.inference_options import (
+    recommended_vllm_reasoning_parser,
+    recommended_vllm_tool_call_parser,
+)
 from ...core.modal_gpu import ModalGpuSpec, fetch_modal_gpu_catalog
+from ...core.serving_runtime import DEFAULT_VLLM_MAX_NUM_SEQS
 from ...core.naming import (
     auto_instance_name_for_backend,
     build_deployment_name,
@@ -555,6 +564,25 @@ class _CostPreviewMixin:
     _selected_gpu_type: str | None
     _vast_offers: dict[str, VastOffer]
     _selected_vast_offer_id: str | None
+    # The form field holding how many GPUs the deployment attaches.
+    GPU_COUNT_FIELD_ID: str
+
+    def _default_vast_disk_gb(self) -> int:
+        """Disk to rent when the form leaves the size to the model."""
+        return DEFAULT_VAST_DISK_GB
+
+    def _attached_gpu_count(self) -> int:
+        """Return how many GPUs the form attaches, defaulting to one."""
+        from textual.widgets import Input
+
+        field_id = getattr(self, "GPU_COUNT_FIELD_ID", "")
+        if not field_id:
+            return 1
+        try:
+            raw = self.query_one(f"#{field_id}", Input).value
+        except Exception:
+            return 1
+        return parse_gpu_count(raw, default=1)
 
     def _current_gpu_hourly_price(self) -> float | None:
         if self._provider == ComputeProvider.PRIME:
@@ -586,7 +614,8 @@ class _CostPreviewMixin:
                 timeout=6,
             )
             return None
-        disk_gb = positive_int(self.query_one(disk_field_id, Input).value)
+        raw_disk = self.query_one(disk_field_id, Input).value.strip()
+        disk_gb = positive_int(raw_disk) if raw_disk else self._default_vast_disk_gb()
         if disk_gb is None:
             self.app.notify("Vast disk size must be an integer >= 1 GB.", severity="error", timeout=5)
             return None
@@ -611,9 +640,18 @@ class _CostPreviewMixin:
         if price is None:
             preview.update("[dim]Hourly: price n/a[/dim]")
             return
+        # A marketplace offer is quoted for the whole rental, GPUs included.
+        # Modal prices one GPU and the form chooses how many to attach, so the
+        # deployment costs that rate times the count -- eight A100s read as
+        # $2.50/hr until this multiplied, an eighth of the real bill.
+        gpu_count = 1 if capabilities(self._provider).gpu_shape_from_offer else self._attached_gpu_count()
+        hourly = price * max(1, gpu_count)
+        suffix = (
+            f" · {gpu_count} x {_format_hourly_cost(price)}/GPU" if gpu_count > 1 else ""
+        )
         preview.update(
-            f"[dim]Hourly: {_format_hourly_cost(price)} · "
-            f"{_format_always_on_monthly_cost(price)}[/dim]"
+            f"[dim]Hourly: {_format_hourly_cost(hourly)} · "
+            f"{_format_always_on_monthly_cost(hourly)}{suffix}[/dim]"
         )
 
 
@@ -626,7 +664,7 @@ class BackendSelectScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(classes="screen-scroll"):
-            yield Static("[bold #7bf168]Advanced deploy[/]  [dim]Step 1: Choose serving engine[/dim]")
+            yield Static("[bold primary]Advanced deploy[/]  [dim]Step 1: Choose serving engine[/dim]")
             yield Static("")
             yield OptionList(
                 Option(
@@ -673,6 +711,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         Binding("p", "predownload_highlighted", "Pre-download", show=True),
     ]
     _MODEL_LIST_ID = "llama-model-list"
+    GPU_COUNT_FIELD_ID = "gpu-count-llama"
     OPTION_LIST_IDS = ("llama-model-list", "llama-quant-list")
     NAVIGATION_ORDER = (
         "llama-rank-mode",
@@ -710,7 +749,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(classes="screen-scroll"):
-            yield Static("[bold #7bf168]Advanced deploy llama.cpp[/]  [dim]Step 2: Model & options[/dim]")
+            yield Static("[bold primary]Advanced deploy llama.cpp[/]  [dim]Step 2: Model & options[/dim]")
             yield Static("", classes="deploy-spacer")
 
             with Vertical(classes="deploy-group"):
@@ -1786,6 +1825,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
         Binding("p", "predownload_highlighted", "Pre-download", show=True),
     ]
     _MODEL_LIST_ID = "vllm-model-list"
+    GPU_COUNT_FIELD_ID = "gpu-count-vllm"
     OPTION_LIST_IDS = ("vllm-model-list",)
     NAVIGATION_ORDER = (
         "vllm-rank-mode",
@@ -1812,6 +1852,8 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
         "fast-boot",
         "trust-remote-code",
         "show-debug-logs-vllm",
+        "max-model-len",
+        "max-num-seqs",
         "served-model-name",
         "reasoning-parser",
         "tool-call-parser",
@@ -1823,7 +1865,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(classes="screen-scroll"):
-            yield Static("[bold #7bf168]Advanced deploy vLLM[/]  [dim]Step 2: Model & options[/dim]")
+            yield Static("[bold primary]Advanced deploy vLLM[/]  [dim]Step 2: Model & options[/dim]")
             yield Static("", classes="deploy-spacer")
 
             with Vertical(classes="deploy-group"):
@@ -1955,11 +1997,14 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
                 classes="vllm-advanced prime-only",
             )
             yield FormField(
+                # Deliberately blank: a pre-filled 100 GB would mean the
+                # model-aware default below never applied, and an fp16
+                # checkpoint that outgrows the disk mid-download is a rental
+                # the user pays for and cannot use.
                 "Vast disk size (GB)",
                 "vast-disk-vllm",
-                default=str(DEFAULT_VAST_DISK_GB),
                 input_type="integer",
-                hint="Rented alongside the GPU and included in the quoted price",
+                hint="Blank sizes it for the model; rented with the GPU and included in the quoted price",
                 classes="vllm-advanced vast-only",
             )
             yield ToggleField(
@@ -1993,6 +2038,20 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
                 classes="vllm-advanced",
             )
             yield Static("Runtime", classes="form-group-heading vllm-advanced")
+            yield FormField(
+                "Max context tokens (optional)",
+                "max-model-len",
+                input_type="integer",
+                hint="vLLM --max-model-len; blank serves the model's full context",
+                classes="vllm-advanced",
+            )
+            yield FormField(
+                "Max concurrent sequences (optional)",
+                "max-num-seqs",
+                input_type="integer",
+                hint=f"vLLM --max-num-seqs; blank serves {DEFAULT_VLLM_MAX_NUM_SEQS}",
+                classes="vllm-advanced",
+            )
             yield FormField(
                 "Served model alias",
                 "served-model-name",
@@ -2063,6 +2122,9 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
         self._tool_call_parser_touched = False
         self._updating_tool_call_parser = False
         self._last_auto_tool_call_parser = ""
+        self._reasoning_parser_touched = False
+        self._updating_reasoning_parser = False
+        self._last_auto_reasoning_parser = ""
         self._model_to_memory_estimate: dict[str, VllmMemoryBreakdown | None] = {}
         self._last_memory_lookup: tuple[str, str] | None = None
         self._memory_lookup_timer: Timer | None = None
@@ -2085,6 +2147,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
         self._refresh_cached_models_from_storage()
         self._sync_served_alias_from_model(force=True)
         self._sync_tool_call_parser_from_model(force=True)
+        self._sync_reasoning_parser_from_model(force=True)
         self._refresh_app_preview()
         self._update_cost_preview("vllm-cost-preview")
         self._refresh_vllm_memory_status()
@@ -2139,6 +2202,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
         if event.input.id == "model-name":
             self._sync_served_alias_from_model()
             self._sync_tool_call_parser_from_model()
+            self._sync_reasoning_parser_from_model()
             self._schedule_vllm_memory_refresh()
         elif event.input.id == "model-revision":
             self._schedule_vllm_memory_refresh()
@@ -2150,12 +2214,24 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
             self._tool_call_parser_touched = (
                 event.input.value.strip() != self._last_auto_tool_call_parser
             )
+        elif event.input.id == "reasoning-parser" and not self._updating_reasoning_parser:
+            self._reasoning_parser_touched = (
+                event.input.value.strip() != self._last_auto_reasoning_parser
+            )
         if event.input.id in {"model-name", "instance-name-vllm", "app-name-vllm"}:
             self._refresh_app_preview()
         if event.input.id in {"model-name", "model-revision"} and self._prime_offers:
             self._refresh_prime_offer_options()
         if event.input.id == "gpu-count-vllm":
             self._update_cost_preview("vllm-cost-preview")
+        if event.input.id == "max-model-len":
+            # The cap changes the cache the estimate has to hold, and the
+            # estimate is what both marketplaces filter their offers by.
+            self._refresh_vllm_memory_status(from_cache_only=True)
+            if self._prime_offers:
+                self._refresh_prime_offer_options()
+            if self._vast_offers:
+                self._refresh_vast_offer_options()
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id == "vllm-rank-mode":
@@ -2273,13 +2349,25 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
         self._prime_offers = {offer.id: offer for offer in message.offers}
         self._refresh_prime_offer_options()
 
-    def _current_vllm_required_vram(self) -> float | None:
+    def _requested_context_tokens(self) -> int | None:
+        """Return the context the form asks vLLM to serve, if any."""
+        try:
+            raw = self.query_one("#max-model-len", Input).value
+        except Exception:
+            return None
+        return positive_int(raw.strip())
+
+    def _current_vllm_estimate(self) -> VllmMemoryBreakdown | None:
         repo_id, revision = self._current_memory_lookup()
         if not repo_id:
             return None
-        estimate = self._model_to_memory_estimate.get(
-            self._memory_cache_key(repo_id, revision)
+        return rescale_vllm_memory_breakdown(
+            self._model_to_memory_estimate.get(self._memory_cache_key(repo_id, revision)),
+            self._requested_context_tokens(),
         )
+
+    def _current_vllm_required_vram(self) -> float | None:
+        estimate = self._current_vllm_estimate()
         return estimate.total_gb if estimate is not None else None
 
     def _refresh_prime_offer_options(self) -> None:
@@ -2358,7 +2446,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
         required_vram_gb = self._current_vllm_required_vram()
         disk_field = self.query_one("#vast-disk-vllm", Input)
         if not disk_field.value.strip():
-            disk_field.placeholder = str(self._default_vast_disk_gb())
+            disk_field.placeholder = f"{self._default_vast_disk_gb()} (sized for this model)"
         offers = _compatible_vast_offers(list(self._vast_offers.values()), required_vram_gb)
         options = _vast_offer_options(offers)
         selector = self.query_one("#vast-offer-vllm", Select)
@@ -2452,6 +2540,29 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
         finally:
             self._updating_tool_call_parser = False
         self._last_auto_tool_call_parser = next_parser
+
+    def _sync_reasoning_parser_from_model(self, force: bool = False) -> None:
+        """Prefill the reasoning parser a thinking model needs to split ``<think>``."""
+
+        parser_input = self.query_one("#reasoning-parser", Input)
+        next_parser = recommended_vllm_reasoning_parser(
+            self.query_one("#model-name", Input).value
+        ) or ""
+        current_parser = parser_input.value.strip()
+        should_update = (
+            force
+            or not self._reasoning_parser_touched
+            or current_parser == self._last_auto_reasoning_parser
+        )
+        if not should_update or current_parser == next_parser:
+            self._last_auto_reasoning_parser = next_parser
+            return
+        self._updating_reasoning_parser = True
+        try:
+            parser_input.value = next_parser
+        finally:
+            self._updating_reasoning_parser = False
+        self._last_auto_reasoning_parser = next_parser
 
     def on_vllm_models_loaded(self, message: VllmModelsLoaded) -> None:
         if message.mode != self._rank_mode:
@@ -2609,6 +2720,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
         return max(1, parsed)
 
     def _render_vllm_memory_status(self, estimate: VllmMemoryBreakdown | None) -> None:
+        estimate = rescale_vllm_memory_breakdown(estimate, self._requested_context_tokens())
         if estimate is None:
             self._set_vllm_memory_status("[dim]Estimated VRAM: N/A[/dim]")
             return
@@ -2756,6 +2868,26 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
             self.query_one("#model-name", Input).focus()
             return
         config.model_revision = self.query_one("#model-revision", Input).value.strip() or None
+        context_raw = self.query_one("#max-model-len", Input).value.strip()
+        if context_raw:
+            context_tokens = positive_int(context_raw)
+            if context_tokens is None:
+                self.app.notify(
+                    "Max context tokens must be an integer >= 1.", severity="error", timeout=5
+                )
+                return
+            config.max_context_tokens = context_tokens
+        sequences_raw = self.query_one("#max-num-seqs", Input).value.strip()
+        if sequences_raw:
+            sequences = positive_int(sequences_raw)
+            if sequences is None:
+                self.app.notify(
+                    "Max concurrent sequences must be an integer >= 1.",
+                    severity="error",
+                    timeout=5,
+                )
+                return
+            config.max_concurrent_sequences = sequences
         config.required_vram_gb = self._current_vllm_required_vram()
         gpu_type = normalize_gpu_type(self._selected_gpu_type)
         if not gpu_type:

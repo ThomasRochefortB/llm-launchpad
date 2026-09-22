@@ -245,7 +245,7 @@ class FooterFitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_dropped_hints_are_declared_rather_than_silently_cut(self) -> None:
         app = _ReviewApp()
-        async with app.run_test(size=(80, 24)) as pilot:
+        async with app.run_test(size=(60, 24)) as pilot:
             await self._menu(pilot, app)
             rendered = "\n".join(_rendered_lines(app))
             self.assertIn("more (?)", rendered)
@@ -295,7 +295,7 @@ class FooterFitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_widening_the_terminal_restores_the_dropped_hints(self) -> None:
         app = _ReviewApp()
-        async with app.run_test(size=(80, 24)) as pilot:
+        async with app.run_test(size=(60, 24)) as pilot:
             await self._menu(pilot, app)
             self.assertNotIn("i Details", "\n".join(_rendered_lines(app)))
 
@@ -651,7 +651,7 @@ class ToggleFieldTests(unittest.IsolatedAsyncioTestCase):
             screen = SettingsScreen()
             app.push_screen(screen)
             await pilot.pause()
-            field = screen.query_one("#tui-mouse", Switch).parent
+            field = screen.query_one("#confirm-quit", Switch).parent
             state = str(field.query_one(".toggle-state", Static).render()).strip()
             self.assertIn(state, {"On", "Off"})
             self.assertIn(state, "\n".join(_rendered_lines(app)))
@@ -664,9 +664,9 @@ class ToggleFieldTests(unittest.IsolatedAsyncioTestCase):
             screen = SettingsScreen()
             app.push_screen(screen)
             await pilot.pause()
-            field = screen.query_one("#tui-mouse", Switch).parent
+            field = screen.query_one("#confirm-quit", Switch).parent
             before = str(field.query_one(".toggle-state", Static).render()).strip()
-            field.query_one("#tui-mouse", Switch).toggle()
+            field.query_one("#confirm-quit", Switch).toggle()
             await pilot.pause()
             after = str(field.query_one(".toggle-state", Static).render()).strip()
             self.assertNotEqual(before, after)
@@ -863,7 +863,7 @@ class MainMenuFitTests(unittest.IsolatedAsyncioTestCase):
                 )
                 for i in range(action_list.option_count)
             }
-            self.assertIn("Manage endpoints", prompts["manage"])
+            self.assertEqual("Manage", prompts["manage"].strip())
 
     async def test_the_status_panel_uses_the_column_instead_of_scrolling(self) -> None:
         """It was capped at 14 rows and scrolled its own content while the
@@ -900,48 +900,28 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class MouseModeVisibilityTests(unittest.IsolatedAsyncioTestCase):
-    """A toggle has to say which way it is currently set.
-
-    Mouse reporting defaults off over SSH so the terminal keeps its own text
-    selection. Taps then do nothing, and a footer hint reading only "Mouse"
-    cannot tell anyone why -- on a phone client, where tapping a button is the
-    obvious thing to try, the button reads as unreachable rather than as a
-    mode being off.
-    """
+class TerminalSelectionTests(unittest.IsolatedAsyncioTestCase):
+    """Keyboard navigation leaves selection to the terminal."""
 
     def _footer_descriptions(self, app: App[None]) -> list[str]:
         return [
             str(key.description) for key in app.screen.query(FooterKey)
         ]
 
-    async def test_the_footer_names_the_current_mouse_state(self) -> None:
+    async def test_the_footer_has_no_mouse_mode(self) -> None:
         app = TuiApp(mouse_enabled=False)
         async with app.run_test(size=(140, 40)) as pilot:
             await pilot.pause()
 
-            self.assertIn("Mouse off", self._footer_descriptions(app))
+            self.assertNotIn("Mouse off", self._footer_descriptions(app))
             self.assertNotIn("Mouse", self._footer_descriptions(app))
 
-    async def test_toggling_updates_the_hint(self) -> None:
+    async def test_ctrl_t_does_not_enable_mouse_capture(self) -> None:
         app = TuiApp(mouse_enabled=False)
         async with app.run_test(size=(140, 40)) as pilot:
             await pilot.pause()
             await pilot.press("ctrl+t")
             await pilot.pause()
 
-            self.assertIn("Mouse on", self._footer_descriptions(app))
-
-    async def test_an_ssh_session_starts_with_taps_disabled(self) -> None:
-        # The condition the report came from: Termius over SSH, no terminal
-        # marker the clipboard heuristic recognises.
-        from llm_launchpad.tui.mouse import default_tui_mouse_enabled
-
-        with patch.dict(
-            "os.environ",
-            {"SSH_CONNECTION": "1.2.3.4 1 5.6.7.8 22", "TERM": "xterm-256color"},
-            clear=False,
-        ):
-            for name in ("ITERM_SESSION_ID", "TERM_PROGRAM", "LC_TERMINAL", "LLM_LAUNCHPAD_TUI_MOUSE"):
-                __import__("os").environ.pop(name, None)
-            self.assertFalse(default_tui_mouse_enabled())
+            self.assertNotIn("Mouse on", self._footer_descriptions(app))
+            self.assertFalse(app.mouse_enabled)

@@ -16,7 +16,7 @@
 - `uv run pytest tests/test_cli_main.py`: run a focused test file during iteration.
 - `uv run llm-launchpad --help`: inspect CLI commands.
 - `uv run llm-launchpad`: launch the default Textual TUI flow.
-- `uv run llm-launchpad tui --no-mouse`: launch the TUI with native terminal text selection enabled.
+- `uv run llm-launchpad tui`: launch the keyboard-driven TUI with native terminal text selection.
 - `uv run llm-launchpad list` or `uv run llm-launchpad status --backend vllm --instance-name <name>`: exercise the headless management commands locally.
 - `modal deploy llm_launchpad/backends/modal_vllm_app.py` or `modal deploy llm_launchpad/backends/modal_llamacpp_app.py`: deploy a backend to Modal.
 
@@ -56,5 +56,5 @@
 - User settings and local caches live under `~/.llm_launchpad/` (`settings.json`, `storage_snapshot.json`, `deployment_connection_summaries.json`); treat them as local state, not repo artifacts.
 - Use environment variables for runtime config (`GPU_CONFIG`, `SCALEDOWN_WINDOW`, `MODEL_NAME`, `MODEL_REVISION`, `SERVED_MODEL_NAME`, `TRUST_REMOTE_CODE`, `REASONING_PARSER`, `TOOL_CALL_PARSER`, `DEFAULT_CHAT_TEMPLATE_KWARGS`).
 - Hugging Face auth is handled by the local Hub login/token state used by `huggingface_hub`; do not hardcode or commit tokens in repo files or tests.
-- `LLM_LAUNCHPAD_TUI_MOUSE` controls the default mouse/copy behavior for the TUI; prefer the CLI flag for one-off local testing.
+- The TUI always leaves mouse selection to the terminal; legacy mouse flags/settings are ignored. Use terminal copy/paste shortcuts, including over SSH/tmux.
 - llama.cpp Modal backend image selection/refresh is env-driven (`LLAMA_CPP_IMAGE_REF`, `LLAMA_CPP_IMAGE_NO_CACHE`, `LLAMA_CPP_SERVER_BIN`); prefer cache reuse by default and use `LLAMA_CPP_IMAGE_NO_CACHE=true` only when forcing a fresh latest-image pull. First GPU start after a large volume write sequentially hydrates GGUF files (`LLAMACPP_WARM_VOLUME`, default on) and waits up to `LLAMACPP_SERVE_STARTUP_TIMEOUT_MINUTES` (default 90) for the HTTP server to bind.

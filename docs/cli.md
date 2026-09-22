@@ -684,9 +684,7 @@ Run `uv run python scripts/generate_cli_reference.py` after changing a command.
  Interactive terminal UI for deploying and managing LLM backends.
 
 ╭─ Options ────────────────────────────────────────────────────────────────────────────────────────╮
-│ --mouse    --no-mouse      Enable Textual mouse support. Use --no-mouse to let the terminal      │
-│                            handle native text selection/copy.                                    │
-│ --help                     Show this message and exit.                                           │
+│ --help          Show this message and exit.                                                      │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 

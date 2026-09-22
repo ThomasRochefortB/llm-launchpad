@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from rich.markup import escape
 from textual.theme import Theme
 
 
@@ -86,3 +87,48 @@ def normalize_tui_density(value: object) -> str:
     """Return a supported density name, falling back safely."""
     normalized = str(value or "").strip().lower()
     return normalized if normalized in _DENSITY_NAMES else DEFAULT_TUI_DENSITY
+
+
+# ---------------------------------------------------------------------------
+# Semantic styling helpers (item 6: visual consistency)
+#
+# Hard-coded accent hex values in Rich markup bypass the active Textual theme,
+# so High Contrast and Monochrome kept rendering Launchpad-Dark green. These
+# helpers emit theme-variable styles (``primary``/``success``/``warning`` /
+# ``error``) which Textual resolves against the active theme.
+# ---------------------------------------------------------------------------
+
+#: Theme-variable style names, not hex values. Use these in Rich markup so the
+#: active theme decides the actual color.
+ACCENT_STYLE = "primary"
+SUCCESS_STYLE = "success"
+WARNING_STYLE = "warning"
+ERROR_STYLE = "error"
+MUTED_STYLE = "dim"
+
+#: ASCII status markers paired with a semantic style. Color is never the only
+#: signal: every marker has distinct text so monochrome terminals stay usable.
+STATUS_MARKERS: dict[str, tuple[str, str]] = {
+    "done": ("OK", SUCCESS_STYLE),
+    "active": (">>", ACCENT_STYLE),
+    "pending": ("..", MUTED_STYLE),
+    "failed": ("XX", ERROR_STYLE),
+    "paused": ("||", WARNING_STYLE),
+    "skipped": ("--", MUTED_STYLE),
+}
+
+
+def accent_title(text: str) -> str:
+    """Render a bold accent title that follows the active theme."""
+    return f"[bold {ACCENT_STYLE}]{escape(text)}[/]"
+
+
+def accent_markup(text: str) -> str:
+    """Render inline accent text that follows the active theme."""
+    return f"[{ACCENT_STYLE}]{escape(text)}[/]"
+
+
+def status_markup(status: str, text: str) -> str:
+    """Render text with a semantic status style plus an ASCII marker."""
+    marker, style = STATUS_MARKERS.get(status, ("..", MUTED_STYLE))
+    return f"[{style}]{marker}[/] {escape(text)}"

@@ -720,6 +720,22 @@ VllmDeployScreen Select:disabled > SelectCurrent {
     height: 1fr;
 }
 
+#monitor-log-viewer {
+    height: 1fr;
+    min-height: 3;
+}
+
+.viewport-shallow #monitor-log-viewer {
+    min-height: 2;
+}
+
+/* Short terminals: the log viewport keeps a floor instead of collapsing to
+   zero under the progress panel and outcome card. */
+.viewport-short #monitor-log-viewer {
+    height: 1fr;
+    min-height: 3;
+}
+
 #monitor-toolbar {
     width: 100%;
     height: 2;
@@ -742,30 +758,72 @@ VllmDeployScreen Select:disabled > SelectCurrent {
 }
 
 #connection-card,
-#result-card {
+#result-card,
+#failure-card {
     width: 100%;
     height: auto;
-    max-height: 65%;
+    max-height: 12;
     margin: 0 2 1 2;
     padding: 1 2;
     border: solid $primary;
     background: $surface-lighten-1;
 }
 
+#failure-card {
+    border: solid $error;
+}
+
 #connection-card-body,
-#result-card-body {
+#result-card-body,
+#failure-card-body {
     height: auto;
     text-wrap: wrap;
 }
 
-#connection-card-actions {
+#connection-card-actions,
+#result-card-actions,
+#failure-card-actions {
     width: 100%;
     height: auto;
     padding: 1 0 0 0;
 }
 
-#connection-card-actions Button {
+#connection-card-actions Button,
+#result-card-actions Button,
+#failure-card-actions Button {
     margin: 0 1 0 0;
+}
+
+/* Persistent progress summary above the logs: one bordered panel, not nested
+   chrome. The stage row is the widest line; hide it before the log viewport
+   collapses on compact/short terminals (the title still names the active
+   stage). The detail line hides only when height is truly scarce. */
+DeploymentProgressWidget {
+    margin: 0 2 1 2;
+}
+
+DeploymentProgressWidget #deploy-progress-title {
+    color: $text;
+    text-style: bold;
+}
+
+DeploymentProgressWidget #deploy-progress-hint {
+    color: $text-muted;
+}
+
+.viewport-compact DeploymentProgressWidget #deploy-progress-stages,
+.viewport-short DeploymentProgressWidget #deploy-progress-stages {
+    display: none;
+}
+
+.viewport-short DeploymentProgressWidget #deploy-progress-detail {
+    display: none;
+}
+
+.viewport-compact DeploymentProgressWidget,
+.viewport-short DeploymentProgressWidget {
+    margin: 0 1 1 1;
+    padding: 0 1;
 }
 
 #connection-info-actions {
@@ -790,7 +848,9 @@ VllmDeployScreen Select:disabled > SelectCurrent {
     grid-size: 2;
 }
 
-.viewport-narrow #connection-card-actions {
+.viewport-narrow #connection-card-actions,
+.viewport-narrow #failure-card-actions,
+.viewport-narrow #result-card-actions {
     layout: grid;
     grid-size: 2;
     grid-rows: 3;
@@ -800,8 +860,15 @@ VllmDeployScreen Select:disabled > SelectCurrent {
     layout: vertical;
 }
 
-.viewport-minimal #connection-card-actions {
-    layout: vertical;
+/* Narrow cards stack their action buttons vertically; on a 12-row terminal
+   five 3-row buttons alone overflow the viewport even inside a capped card.
+   Two columns keep every action reachable by keyboard without scrolling the
+   card off screen. This overrides the minimal vertical stacking above. */
+.viewport-minimal #connection-card-actions,
+.viewport-minimal #failure-card-actions,
+.viewport-minimal #result-card-actions {
+    layout: grid;
+    grid-size: 2;
 }
 
 /* ---- Manage screen ---- */
@@ -821,6 +888,19 @@ VllmDeployScreen Select:disabled > SelectCurrent {
 
 #manage-status {
     margin: 0 0 1 0;
+}
+
+#manage-tabs {
+    height: 1fr;
+}
+
+#manage-jobs DeploymentJobsPanel {
+    height: 1fr;
+}
+
+#deployment-jobs {
+    height: 1fr;
+    min-height: 3;
 }
 
 #manage-endpoint-table {
@@ -1558,6 +1638,52 @@ StatusHeader.state-error {
     padding: 0 1;
 }
 
+/* A completed deploy stacks a bordered outcome card (title, body, actions)
+   above the log viewport. On constrained/short terminals that stack is
+   taller than the terminal even with the toolbar/title collapsed, so the
+   card scrolls internally at a capped height instead of pushing the log
+   viewer off screen. The cap is rows, not percent: 65% of a 16-row terminal
+   is still 10 rows for the card alone. */
+.viewport-constrained #connection-card,
+.viewport-constrained #result-card,
+.viewport-constrained #failure-card,
+.viewport-short #connection-card,
+.viewport-short #result-card,
+.viewport-short #failure-card {
+    max-height: 4;
+    margin: 0 1 0 1;
+    padding: 0 1;
+    overflow-y: auto;
+}
+
+/* Narrow cards stack their action buttons vertically; on a 12-row terminal
+   five 3-row buttons alone overflow the viewport even inside a capped card.
+   Two columns keep Copy URL / Copy key / Copy all reachable by keyboard
+   without scrolling the card off screen.
+.viewport-minimal #connection-card-actions,
+.viewport-minimal #result-card-actions,
+.viewport-minimal #failure-card-actions {
+    layout: grid;
+    grid-size: 2;
+} */
+
+/* At 40x12 every row is spent: header (2) + toolbar (1) + progress (4) +
+   card (4) already fill the terminal before the log viewer or footer. Hide
+   the progress detail/hint rows there; the title still names the state. */
+.viewport-shallow DeploymentProgressWidget #deploy-progress-detail {
+    display: none;
+}
+
+.viewport-shallow DeploymentProgressWidget #deploy-progress-hint {
+    display: none;
+}
+
+.viewport-constrained DeploymentProgressWidget,
+.viewport-short DeploymentProgressWidget {
+    margin: 0 1 0 1;
+    padding: 0 1;
+}
+
 .viewport-short .form-hint,
 .viewport-short .form-section-subtitle,
 .viewport-short #quick-deploy-subtitle,
@@ -1593,7 +1719,7 @@ StatusHeader.state-error {
 
 .viewport-shallow #connection-card {
     padding: 0 1;
-    margin: 0;
+    margin: 0 1 0 1;
 }
 
 .viewport-shallow #connection-card-actions {

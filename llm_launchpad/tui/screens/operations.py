@@ -23,13 +23,12 @@ class DurableJobsLoaded(Message):
         self.error = error
 
 
-class OperationsScreen(CopyEnabledScreen):
+class DeploymentJobsPanel(VerticalScroll):
     """Keep background deployments and their results reachable."""
 
     BINDINGS = [
-        Binding("escape", "go_back", "Back", show=True),
-        Binding("d", "deploy_model", "Deploy model", show=True),
-        Binding("x", "cancel_selected", "Cancel deployment", show=True),
+        Binding("d", "deploy_model", "Deploy", show=True),
+        Binding("x", "cancel_selected", "Cancel", show=True),
     ]
 
     def __init__(self) -> None:
@@ -41,14 +40,10 @@ class OperationsScreen(CopyEnabledScreen):
         self._refresh_error = ""
 
     def compose(self) -> ComposeResult:
-        with VerticalScroll(classes="screen-scroll"):
-            yield Static("[bold #7bf168]Deployment operations[/]")
-            yield Static("Enter reopens logs and results. Back leaves deployments running.")
-            yield OptionList(id="deployment-jobs")
-            yield Static("Loading saved operations…", id="operations-status")
-            yield Static("", id="operations-empty")
-            yield Button("Deploy model", id="operations-deploy-btn", variant="primary")
-        yield FittedFooter()
+        yield OptionList(id="deployment-jobs")
+        yield Static("Loading jobs…", id="operations-status")
+        yield Static("", id="operations-empty")
+        yield Button("Deploy model", id="operations-deploy-btn", variant="primary")
 
     def on_mount(self) -> None:
         self.query_one("#operations-empty", Static).update(
@@ -56,7 +51,6 @@ class OperationsScreen(CopyEnabledScreen):
         )
         self._sync_empty_state(False)
         self._refresh_jobs(reconcile=True)
-        self.query_one("#deployment-jobs", OptionList).focus()
         self.set_interval(0.5, self._refresh_jobs)
         self.set_interval(
             self._RECONCILE_INTERVAL_SECONDS,
@@ -122,19 +116,20 @@ class OperationsScreen(CopyEnabledScreen):
     def _render_jobs(self) -> None:
         rows: list[tuple[str, str]] = []
         seen: set[str] = set()
-        for job in tuple(self.app.deployment_jobs.values()):
+        for job in tuple(getattr(self.app, "deployment_jobs", {}).values()):
             rows.append((job.id, f"{job.config.provider.display_name} · {job.config.app_name} · {job.outcome}"))
             if job.persistent_id:
                 seen.add(f"persistent:{job.persistent_id}")
         rows.extend(row for row in self._persistent_rows if row[0] not in seen)
-        status = "" if self._jobs_loaded else "Loading saved operations…"
+        status = "" if self._jobs_loaded else "Loading jobs…"
         if self._refresh_error:
             retained = "Showing last saved results. " if self._jobs_loaded else ""
-            status = f"[yellow]{retained}Saved operations refresh failed: {escape(self._refresh_error)}[/yellow]"
+            status = f"[yellow]{retained}Job refresh failed: {escape(self._refresh_error)}[/yellow]"
         self.query_one("#operations-status", Static).update(status)
+        self.query_one("#operations-status", Static).display = bool(status)
         options = self.query_one("#deployment-jobs", OptionList)
         labels = tuple(rows)
-        empty_label = "No deployments yet." if self._jobs_loaded else "Saved operations not loaded yet."
+        empty_label = "No deployments yet." if self._jobs_loaded else "Loading jobs…"
         render_key = (labels, empty_label)
         if render_key == getattr(self, "_labels", None):
             return
@@ -159,6 +154,7 @@ class OperationsScreen(CopyEnabledScreen):
             self.action_deploy_model()
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        event.stop()
         option_id = str(event.option.id or "")
         if option_id.startswith("persistent:"):
             self.app.reopen_persistent_deployment(option_id.removeprefix("persistent:"))  # type: ignore[attr-defined]
@@ -201,6 +197,18 @@ class OperationsScreen(CopyEnabledScreen):
         job = self.app.deployment_jobs.get(option_id)
         if job is not None and not job.finished.is_set():
             self.app.push_screen(CancelDeploymentScreen(option_id))
+
+class OperationsScreen(CopyEnabledScreen):
+    """Legacy standalone host for the reusable jobs panel."""
+
+    BINDINGS = [Binding("escape", "go_back", "Back", show=True)]
+
+    def compose(self) -> ComposeResult:
+        yield DeploymentJobsPanel()
+        yield FittedFooter()
+
+    def on_mount(self) -> None:
+        self.query_one("#deployment-jobs", OptionList).focus()
 
     def action_go_back(self) -> None:
         self.app.pop_screen()

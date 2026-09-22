@@ -212,12 +212,12 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("stderr | stderr line", content)
             title = screen.query_one("#monitor-title", Static)
             self.assertIn("Logs", str(title.content))
-            self.assertIn("MOUSE", str(title.content))
+            self.assertNotIn("MOUSE", str(title.content))
             view_status = screen.query_one("#monitor-view-status", Static)
             self.assertIn("FOLLOWING", str(view_status.content))
             self.assertIn("2 lines", str(view_status.content))
 
-    async def test_title_mentions_terminal_selection_when_mouse_disabled(self) -> None:
+    async def test_title_has_no_input_mode_badge(self) -> None:
         app = _TestApp()
         app.mouse_enabled = False
         async with app.run_test() as pilot:
@@ -227,7 +227,7 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             screen = app.screen
             assert isinstance(screen, MonitorScreen)
             title = screen.query_one("#monitor-title", Static)
-            self.assertIn("TERMINAL SELECT", str(title.content))
+            self.assertEqual(str(title.content), "[bold]Logs[/]")
 
     async def test_title_shows_paused_follow_state_and_unseen_lines(self) -> None:
         app = _TestApp()
@@ -583,8 +583,7 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
 
             screen = app.screen
             assert isinstance(screen, MonitorScreen)
-            card = screen.query_one("#connection-card")
-            self.assertTrue(card.has_class("hidden"))
+            self.assertFalse(screen.query("#connection-card"))
 
             screen.on_connection_summary_ready(
                 ConnectionSummaryReady(
@@ -601,8 +600,8 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             )
             await pilot.pause()
 
-            self.assertFalse(card.has_class("hidden"))
-            body = str(screen.query_one("#connection-card-body", Static).content)
+            self.assertTrue(screen.query("#connection-card"))
+            body = str(screen.query_one("#connection-card-body", Static).render())
             self.assertIn("https://example.modal.run/v1", body)
             self.assertIn("sk-test-key", body)
             self.assertTrue(screen.query_one("#copy-key-btn", Button).display)
@@ -640,7 +639,7 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
                 OperationDone(operation=OperationType.DEPLOY, success=False, exit_code=1)
             )
             await pilot.pause()
-            self.assertTrue(screen.query_one("#connection-card").has_class("hidden"))
+            self.assertFalse(screen.query("#connection-card"))
             screen.action_go_back()
             await pilot.pause()
             self.assertEqual(app.home_calls, 0)
@@ -671,8 +670,7 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             screen = app.screen
             assert isinstance(screen, MonitorScreen)
-            card = screen.query_one("#result-card")
-            self.assertTrue(card.has_class("hidden"))
+            self.assertFalse(screen.query("#result-card"))
 
             screen.on_state_changed(
                 StateChanged(DeploymentState.RUNNING, operation=OperationType.STATUS)
@@ -684,8 +682,8 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             )
             await pilot.pause()
 
-            self.assertFalse(card.has_class("hidden"))
-            body = str(screen.query_one("#result-card-body", Static).content)
+            self.assertTrue(screen.query("#result-card"))
+            body = str(screen.query_one("#result-card-body", Static).render())
             self.assertIn("Healthy", body)
             self.assertIn("curl https://x.test/v1/chat", body)
             title = str(screen.query_one("#result-card-title", Static).content)
@@ -763,7 +761,7 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             await pilot.pause()
-            self.assertTrue(screen.query_one("#connection-card").has_class("hidden"))
+            self.assertFalse(screen.query("#connection-card"))
             screen.action_finish_success()
             await pilot.pause()
             self.assertEqual(app.home_calls, 0)
@@ -772,7 +770,7 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
                 OperationDone(operation=OperationType.DEPLOY, success=True)
             )
             await pilot.pause()
-            self.assertFalse(screen.query_one("#connection-card").has_class("hidden"))
+            self.assertTrue(screen.query("#connection-card"))
             screen.action_finish_success()
             await pilot.pause()
             self.assertEqual(app.home_calls, 1)
