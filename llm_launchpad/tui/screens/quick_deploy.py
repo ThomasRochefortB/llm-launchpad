@@ -31,6 +31,7 @@ from ...core.quick_deploy import (
     retune_quick_deploy_plan,
     resolve_quick_deploy_plans,
 )
+from ...core.diagnostics import log_exception
 from ...core.provider_options import prime_provider_options
 from ...protocol.enums import (
     BillingModel,
@@ -83,7 +84,32 @@ def _render_decision_facts(profile: QuickDeployProfile, plan: InferencePlan) -> 
         f"[bold]{escape(_plan_hourly_cost(plan))}[/bold] · "
         f"{escape(_billing_label(plan.quote.billing_model))}\n"
         f"[dim]Availability[/dim] {escape(_availability_label(plan))}"
+        f"{_idle_shutdown_fact(plan)}"
     )
+
+
+def _idle_shutdown_fact(plan: InferencePlan) -> str:
+    """What stops a rental that bills until deleted; nothing for scale-to-zero."""
+    if plan.quote.billing_model == BillingModel.SCALE_TO_ZERO:
+        return ""
+    if plan.quote.provider not in (ComputeProvider.VAST, ComputeProvider.PRIME):
+        return ""
+    from ...core.config import ConfigStore
+    from ...core.idle_watchdog import describe_idle_shutdown
+
+    try:
+        settings = ConfigStore().load()
+    except Exception:
+        return ""
+    text = describe_idle_shutdown(settings.rental_idle_shutdown)
+    if (
+        settings.rental_idle_shutdown > 0
+        and plan.quote.provider == ComputeProvider.PRIME
+        and not settings.prime_self_terminate
+    ):
+        text += " while this computer is awake"
+    style = "yellow" if settings.rental_idle_shutdown <= 0 else "dim"
+    return f"\n[dim]Idle stop[/dim] [{style}]{escape(text)}[/{style}]"
 
 
 def _render_profile_details(profile: QuickDeployProfile, plan: InferencePlan) -> str:
@@ -164,11 +190,6 @@ def _render_profile_details(profile: QuickDeployProfile, plan: InferencePlan) ->
     return "\n".join(lines)
 
 
-def _render_profile_summary(profile: QuickDeployProfile, plan: InferencePlan) -> str:
-    """Backwards-compatible alias: the full card is now _render_profile_details."""
-    return _render_profile_details(profile, plan)
-
-
 def _show_placement_reference(reference: str, gpu_type: str) -> bool:
     """Hide provider-internal IDs and GPU names already shown on the GPU line."""
 
@@ -202,8 +223,8 @@ def _availability_label(plan: InferencePlan) -> str:
     if plan.quote.availability == QuoteAvailability.UNAVAILABLE:
         return "Unavailable"
     if plan.quote.billing_model == BillingModel.SCALE_TO_ZERO:
-        return "Not verified · scales to zero"
-    return "Not verified"
+        return "Starts on first request · scales to zero"
+    return "Checked when deployment starts"
 
 
 def _plan_hourly_cost(plan: InferencePlan) -> str:
@@ -237,13 +258,6 @@ def _plan_storage_note(plan: InferencePlan) -> str:
     if _plan_evaluation(plan).includes_storage:
         return "Quoted hourly total already includes disk rent."
     return "Storage is billed separately; unknown storage cost is not $0."
-
-
-def _plan_monthly_cost(plan: InferencePlan) -> str:
-    value = plan.estimated_monthly_cost_usd
-    if value is None:
-        return "Unavailable"
-    return f"~${value:,.2f}/mo"
 
 
 def _plan_continuous_monthly_cost(plan: InferencePlan) -> str:
@@ -414,7 +428,7 @@ class QuickDeployScreen(CopyEnabledScreen):
                     id="quick-deploy-profile-body",
                 )
             with Vertical(id="quick-deploy-form"):
-                yield Static("Fulfillment", classes="form-label")
+                yield Static("Runs on", classes="form-label")
                 caution = Static(_fulfillment_caution(self.plan), id="quick-vast-note")
                 caution.display = bool(_fulfillment_caution(self.plan))
                 yield caution
@@ -431,28 +445,27 @@ class QuickDeployScreen(CopyEnabledScreen):
                         allow_blank=False,
                         id="quick-fulfillment",
                     )
-                    yield Static(
-                        "[dim]The provider is revealed here because it determines billing, region, and credentials.[/dim]",
-                        id="quick-fulfillment-note",
-                    )
                 else:
                     yield Static(
                         _fulfillment_option(self.plan, recommended=True),
                         id="quick-fulfillment-single",
                     )
+                yield Button("Advanced options...", id="toggle-advanced-quick", variant="default")
                 if self.profile.speculative_decoding is not None:
+                    # On by default and faster; a tuning knob, not a decision.
                     yield ToggleField(
                         "Use MTP speculative decoding",
                         "quick-speculative-decoding",
                         default=True,
+                        classes="quick-advanced",
                     )
                     yield Static(
                         "[dim]Native MTP · drafts up to "
                         f"{self.profile.speculative_decoding.num_speculative_tokens} "
                         "tokens[/dim]",
                         id="quick-speculative-note",
+                        classes="quick-advanced",
                     )
-                yield Button("Advanced options...", id="toggle-advanced-quick", variant="default")
                 if self.plan.recipe.serving_requirements is not None:
                     yield Static("Optimize for", classes="form-label quick-advanced")
                     yield Select(
@@ -752,7 +765,28 @@ class QuickDeployScreen(CopyEnabledScreen):
             and (plan.assessment is None or plan.assessment.fits)
         ]
         config.fallback_configs = tuple(_config_for_plan(plan) for plan in fallback_plans)
+        self._remember_launch()
         self.app.begin_deploy(config)  # type: ignore[attr-defined]
+
+    def _remember_launch(self) -> None:
+        """Offer this choice on the home screen next time; never blocks a deploy."""
+        from ...core.last_launch import LastLaunch, save_last_launch
+        from ...core.quick_deploy import quick_deploy_model_key
+
+        quote = self.plan.quote
+        try:
+            save_last_launch(
+                LastLaunch(
+                    model_id=quick_deploy_model_key(self.profile),
+                    display_name=self.profile.display_name,
+                    provider=quote.provider.value,
+                    gpu_type=quote.gpu_type,
+                    gpu_count=quote.gpu_count,
+                    price_per_hour_usd=quote.price_per_hour_usd,
+                )
+            )
+        except Exception:
+            log_exception("Failed to remember the last launch")
 
     def action_pop_screen(self) -> None:
         self.app.pop_screen()

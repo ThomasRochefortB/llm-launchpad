@@ -286,8 +286,6 @@ def _model_option(
     # absent score reads as absent; the detail panel names it for the one
     # model the reader has actually selected.
     score = _model_score_segment(model)
-    size = (model.profiles[0].model_size_label or "").strip()
-    metrics = f"{size} · " if size else ""
     gutter = _model_row_gutter(model)
     if width_mode == WidthMode.MINIMAL:
         return (
@@ -308,17 +306,19 @@ def _model_option(
             f"{gutter}{escape(clip(model.display_name, 34)):<34} "
             f"[dim]{score}from {cost}[/dim]"
         )
+    # Wide rows drop the size bucket for the same reason: the section
+    # heading above already says it.
     return (
         f"{gutter}{escape(clip(model.display_name, 34)):<34} "
-        f"[dim]{metrics}{score}from {cost}[/dim]"
+        f"[dim]{score}from {cost}[/dim]"
     )
 
 
 def _model_score_segment(model: QuickDeployModel) -> str:
-    """`"AAI 42 · "`, or nothing at all when the model carries no score."""
+    """`"score 42 · "`, or nothing at all when the model carries no score."""
     if model.quality_score is None:
         return ""
-    return f"AAI {_format_aa_index(model.quality_score)} · "
+    return f"score {_format_aa_index(model.quality_score)} · "
 
 
 def _model_size_section(model: QuickDeployModel) -> str:
@@ -362,7 +362,7 @@ def _quant_options_label(model: QuickDeployModel) -> str:
 
 def _model_detail(model: QuickDeployModel) -> str:
     score = (
-        f"AAI {_format_aa_index(model.quality_score)}"
+        f"Score {_format_aa_index(model.quality_score)}"
         if model.quality_score is not None
         else "unranked"
     )
@@ -381,7 +381,7 @@ def _model_detail(model: QuickDeployModel) -> str:
         f"[bold]{escape(model.display_name)}[/bold]  "
         f"{escape(format_context_length(model.max_context_tokens))}\n"
         f"[dim]{score} · {_quant_options_label(model)} · "
-        f"pick one to see live infrastructure{mtp_note}[/dim]{runtime_note}"
+        f"Enter to see where it can run{mtp_note}[/dim]{runtime_note}"
     )
 
 
@@ -839,8 +839,20 @@ class FastDeployScreen(CopyEnabledScreen):
             return False
         return super().check_action(action, parameters)
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        initial_model_id: str | None = None,
+        preferred_placement: tuple[str, str, int] | None = None,
+    ) -> None:
+        """``initial_model_id`` opens straight on step two for that model.
+
+        ``preferred_placement`` is a (provider, GPU type, GPU count) shape to
+        highlight there, so a relaunch lands on what was used last time --
+        re-priced live, never replayed from a stale quote.
+        """
         super().__init__()
+        self._initial_model_id = initial_model_id
+        self._preferred_placement = preferred_placement
         # Step two offers named tiers by default. The full placement list is a
         # detail view: picking between "two L40S" and "one A100" is a question
         # almost nobody can answer, while cheap-or-fast is one everybody can.
@@ -902,6 +914,14 @@ class FastDeployScreen(CopyEnabledScreen):
         self._availability_inflight = False
         self._apply_model_catalog(force=True)
         self.query_one("#fast-deploy-list", OptionList).focus()
+        initial = self._initial_model_id
+        self._initial_model_id = None
+        if initial and initial in self._model_by_id:
+            # The infra load populates the GPU filter too, so the separate
+            # filter pricing pass would only race it.
+            self._open_model(initial)
+            return
+        self._preferred_placement = None
         self._load_availability(purpose="filter")
         self.set_interval(
             0.25,
@@ -1245,7 +1265,6 @@ class FastDeployScreen(CopyEnabledScreen):
         width_mode = self.viewport_profile.width_mode
         option_list = self.query_one("#fast-deploy-list", OptionList)
         tiers = () if self._show_all_placements else self._tiers_for(rows)
-        basis_plan = tiers[0].plan if tiers else rows[0].plan
         if tiers:
             # Tier option ids are the underlying quote ids, so selection and the
             # detail pane keep working unchanged whichever view is showing.
@@ -1263,6 +1282,9 @@ class FastDeployScreen(CopyEnabledScreen):
                 (index for index, tier in enumerate(tiers) if tier.is_recommended),
                 0,
             )
+            recommended = self._take_preferred_index(
+                [tier.plan for tier in tiers], default=recommended
+            )
             option_list.highlighted = recommended
             self._update_infra_detail(self._infra_rows[tiers[recommended].plan.quote.id])
         else:
@@ -1273,16 +1295,18 @@ class FastDeployScreen(CopyEnabledScreen):
                 ]
             )
             if rows:
-                option_list.highlighted = 0
-                self._update_infra_detail(rows[0])
+                index = self._take_preferred_index([row.plan for row in rows], default=0)
+                option_list.highlighted = index
+                self._update_infra_detail(rows[index])
         self.query_one("#fast-deploy-subtitle", Static).update(
             f"Pick infrastructure · {escape(self._catalog_info.source_label)}"
         )
         if tiers:
             status = (
-                f"[bold]Deployable options run the full "
+                f"[bold]Every option runs the full "
                 f"{model.max_context_tokens:,}-token context[/bold] "
-                f"[dim]· press a to compare all {len(rows)} placements[/dim]"
+                f"[dim]· * recommended, others compared with it "
+                f"· a: all {len(rows)} placements[/dim]"
             )
         else:
             status = (
@@ -1306,10 +1330,13 @@ class FastDeployScreen(CopyEnabledScreen):
         # cost ordering here put two contradictory statements about the same
         # list three lines apart, and the rows visibly disagreed with the one
         # that named a price.
-        status += (
-            f"\n[dim]{escape(_plan_cost_evaluation(basis_plan).basis_label())}"
-            " · storage separate[/dim]"
-        )
+        if not tiers:
+            # Only the full list carries a "/mo" column; tiers price the
+            # highlighted row in the detail pane, which names its scenario.
+            status += (
+                f"\n[dim]{escape(_plan_cost_evaluation(rows[0].plan).basis_label())}"
+                " · storage separate[/dim]"
+            )
         if self._gpu_filter not in {"", "any"}:
             status += f" [dim]· GPU {escape(self._gpu_filter)}[/dim]"
         if snapshot.vast_configured and not any(row.plan.quote.provider == ComputeProvider.VAST for row in rows):
@@ -1340,8 +1367,8 @@ class FastDeployScreen(CopyEnabledScreen):
             if policy:
                 reasons.append(f"{policy} excluded by provider policy")
             status += (
-                f"\n[dim]{len(excluded)} placement"
-                f"{'s' if len(excluded) != 1 else ''} excluded: "
+                f"\n[dim]{len(excluded)} other placement"
+                f"{'s' if len(excluded) != 1 else ''} hidden: "
                 f"{'; '.join(reasons)}.[/dim]"
             )
         if snapshot.errors:
@@ -1350,6 +1377,23 @@ class FastDeployScreen(CopyEnabledScreen):
             )
         self.query_one("#fast-deploy-status", Static).update(status)
         option_list.focus()
+
+    def _take_preferred_index(self, plans: Sequence[InferencePlan], *, default: int) -> int:
+        """Index of the relaunch shape among ``plans``; applies only once."""
+        preferred = self._preferred_placement
+        self._preferred_placement = None
+        if preferred is None:
+            return default
+        provider, gpu_type, gpu_count = preferred
+        for index, plan in enumerate(plans):
+            quote = plan.quote
+            if (
+                quote.provider.value == provider
+                and quote.gpu_type.casefold() == gpu_type.casefold()
+                and quote.gpu_count == gpu_count
+            ):
+                return index
+        return default
 
     def _render_empty_gpu_filter(self) -> None:
         self._phase = "infra"
@@ -1574,7 +1618,7 @@ class FastDeployScreen(CopyEnabledScreen):
         else:
             self.query_one("#fast-deploy-detail", Static).update("")
         self.query_one("#fast-deploy-subtitle", Static).update(_subtitle(self._catalog_info))
-        view_label = "Sort: Size" if not self._show_top_models else "Sort: AA score"
+        view_label = "Grouped by size" if not self._show_top_models else "Top 10 by score"
         plural = "s" if len(visible) != 1 else ""
         filter_note = ""
         if self._gpu_filter != "any":
@@ -1582,15 +1626,13 @@ class FastDeployScreen(CopyEnabledScreen):
         query = self._model_search.strip()
         search_note = f" · search: {escape(query)}" if query else ""
         excluded_note = (
-            f" · {len(self._catalog_info.exclusions)} excluded (x)"
+            f" · {len(self._catalog_info.exclusions)} hidden (x)"
             if self._catalog_info.exclusions else ""
         )
         # The source label belongs to the subtitle; repeating it here put the
         # same sentence on screen twice, three lines apart.
         self.query_one("#fast-deploy-status", Static).update(
-            f"[dim]{view_label} · press v for {'size groups' if self._show_top_models else 'AA top 10'} · {len(visible)} model{plural}{filter_note}{search_note}{excluded_note}[/dim]"
-            + (f"\n[dim]{len(self._snapshot.vast_offers)} Vast offers priced · r refreshes[/dim]"
-               if self._snapshot is not None and self._snapshot.vast_configured else "")
+            f"[dim]{len(visible)} model{plural} · {view_label} (v to switch){filter_note}{search_note}{excluded_note}[/dim]"
             + ("\n[yellow]Partial results: " + escape("; ".join(self._snapshot.errors)) + "[/yellow]"
                if self._snapshot is not None and self._snapshot.errors else "")
             + ("\n[dim]Pricing live placements…[/dim]"

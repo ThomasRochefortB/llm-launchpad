@@ -41,7 +41,7 @@ from ..protocol.events import (
     ResourceAllocatedEvent,
     StateChangeEvent,
 )
-from ..protocol.models import DeploymentConfig, EndpointInfo, SpeculativeDecodingConfig
+from ..protocol.models import DeploymentConfig, EndpointInfo, LaunchpadSettings, SpeculativeDecodingConfig
 from ..protocol.models import BenchmarkConcurrencyResult, BenchmarkConfig
 from ..protocol.models import PlacementAssessment, ServingRequirements, StoredModelInfo, StorageSnapshot
 
@@ -1050,6 +1050,7 @@ class Orchestrator:
                 detail="Waiting for the public inference endpoint",
             )
             self._await_prime_public_endpoint(endpoint, config.endpoint_api_key or "")
+            yield from self._start_prime_idle_shutdown(config, pod, pod_id, endpoint)
             info = announced or _prime_endpoint_info(config, pod_id, endpoint)
             info.web_url = endpoint
             info.state = "running"
@@ -1197,6 +1198,74 @@ class Orchestrator:
             success=deploy_ok,
             exit_code=deploy_exit_code,
             detail=deploy_detail,
+        )
+
+    def _start_prime_idle_shutdown(
+        self,
+        config: DeploymentConfig,
+        pod: dict[str, Any],
+        pod_id: str,
+        endpoint: str,
+    ) -> EventStream:
+        """Arrange for an idle pod to be deleted: on the pod if allowed, else here."""
+        from .idle_watchdog import describe_idle_shutdown, resolve_idle_shutdown
+        from .local_watchdog import spawn_local_watchdog
+
+        try:
+            settings = self.config_store.load()
+        except Exception:
+            settings = LaunchpadSettings()
+        idle = resolve_idle_shutdown(config, settings)
+        if idle <= 0:
+            yield LogEvent(
+                line="Idle shutdown is off: this pod bills until you stop it.",
+                operation=OperationType.DEPLOY,
+            )
+            return
+        described = describe_idle_shutdown(idle)
+        self_terminate = settings.prime_self_terminate
+        if self_terminate:
+            try:
+                self.prime_backend.start_idle_watchdog(
+                    pod, pod_id, config.endpoint_api_key or "", idle
+                )
+            except Exception as exc:
+                log_exception("Failed to start the on-pod idle watchdog")
+                yield LogEvent(
+                    line=f"Could not start idle shutdown on the pod ({exc}); watching from this computer instead.",
+                    operation=OperationType.DEPLOY,
+                )
+            else:
+                yield LogEvent(
+                    line=f"Idle shutdown: {described} (runs on the pod).",
+                    operation=OperationType.DEPLOY,
+                    is_milestone=True,
+                )
+                return
+        try:
+            spawn_local_watchdog(
+                app_name=config.app_name or "",
+                backend=config.backend.value,
+                pod_id=pod_id,
+                endpoint_url=endpoint,
+                endpoint_api_key=config.endpoint_api_key or "",
+                idle_seconds=idle,
+            )
+        except Exception as exc:
+            log_exception("Failed to start the local idle watchdog")
+            yield LogEvent(
+                line=f"Warning: could not start idle shutdown ({exc}). This pod bills until you stop it.",
+                operation=OperationType.DEPLOY,
+                is_milestone=True,
+            )
+            return
+        yield LogEvent(
+            line=(
+                f"Idle shutdown: {described}, while this computer is awake. "
+                "To cover sleep too, allow Prime pods to stop themselves in Settings."
+            ),
+            operation=OperationType.DEPLOY,
+            is_milestone=True,
         )
 
     # ------------------------------------------------------------------

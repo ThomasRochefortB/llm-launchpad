@@ -123,11 +123,6 @@ def accent_title(text: str) -> str:
     return f"[bold {ACCENT_STYLE}]{escape(text)}[/]"
 
 
-def accent_markup(text: str) -> str:
-    """Render inline accent text that follows the active theme."""
-    return f"[{ACCENT_STYLE}]{escape(text)}[/]"
-
-
 def status_markup(status: str, text: str) -> str:
     """Render text with a semantic status style plus an ASCII marker."""
     marker, style = STATUS_MARKERS.get(status, ("..", MUTED_STYLE))

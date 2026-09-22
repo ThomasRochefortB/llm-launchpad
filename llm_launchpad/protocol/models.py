@@ -68,6 +68,12 @@ class LaunchpadSettings:
     tui_density: str = "comfortable"
     tui_mouse: bool | None = None  # Legacy setting; ignored by the keyboard-driven TUI
     confirm_quit: bool = True
+    # Vast rentals and Prime pods bill until destroyed; an on-machine watchdog
+    # deletes them after this many seconds without a request. 0 turns it off.
+    rental_idle_shutdown: int = 3600
+    # Prime has no instance-scoped key, so a pod can only delete itself if the
+    # user agrees to place their Prime API key on it.
+    prime_self_terminate: bool = False
 
     def to_env(self) -> dict[str, str]:
         """Derive Modal environment variables from settings."""
@@ -83,6 +89,8 @@ class LaunchpadSettings:
             "tui_density": self.tui_density,
             "tui_mouse": self.tui_mouse,
             "confirm_quit": self.confirm_quit,
+            "rental_idle_shutdown": self.rental_idle_shutdown,
+            "prime_self_terminate": self.prime_self_terminate,
         }
 
     @classmethod
@@ -96,7 +104,16 @@ class LaunchpadSettings:
             tui_density=str(data.get("tui_density", "comfortable")),
             tui_mouse=mouse,
             confirm_quit=bool(data.get("confirm_quit", True)),
+            rental_idle_shutdown=_non_negative_int(data.get("rental_idle_shutdown"), 3600),
+            prime_self_terminate=data.get("prime_self_terminate") is True,
         )
+
+
+def _non_negative_int(value: Any, default: int) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return default
 
 
 @dataclass(frozen=True)
@@ -506,6 +523,12 @@ class DeploymentConfig:
     runtime_tuning: RuntimeTuning | None = None
     placement_assessment: PlacementAssessment | None = None
     runtime_attestation: RuntimeAttestation | None = None
+    # Outcome of the post-warmup tool-call probe: "passed", "failed", or None
+    # when it never ran. Coding agents need it to pass.
+    tool_calling: str | None = None
+    # Seconds without a request before a Vast rental or Prime pod deletes
+    # itself; None defers to the user's setting, 0 turns it off.
+    idle_shutdown_seconds: int | None = None
 
     # How many sequences the runtime decodes at once. Left to the image, this
     # differs per provider -- and on a hybrid model a default above the
@@ -991,6 +1014,7 @@ class EndpointInfo:
     reasoning: ReasoningCapabilities | None = None
     vision: VisionCapabilities | None = None
     runtime_attestation: RuntimeAttestation | None = None
+    tool_calling: str | None = None
     serving: ServingSnapshot | None = None
     # Wall-clock epoch the current container/process run started. Sourced
     # from the runtime's own process start gauge when a live reading exists;

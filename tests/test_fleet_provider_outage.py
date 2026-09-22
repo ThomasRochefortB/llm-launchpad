@@ -344,7 +344,7 @@ class ManageScreenOutageTests(unittest.IsolatedAsyncioTestCase):
             assert isinstance(screen, ManageScreen)
             status = str(screen.query_one("#manage-status", Static).content)
 
-            self.assertNotIn("No managed endpoints found", status)
+            self.assertNotIn("No endpoints running", status)
             self.assertIn("No endpoints could be listed", status)
             self.assertIn("Vast.ai unavailable", status)
 

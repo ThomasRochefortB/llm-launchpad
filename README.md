@@ -54,10 +54,12 @@ Setting up LLM endpoints usually means juggling model names, container images, G
 
 From the TUI you can:
 - Deploy a popular model by picking it, choosing live GPU placement, and confirming
+- Relaunch the last model you deployed with `r` from the home screen, priced live
 - Use Custom deploy for arbitrary Hugging Face llama.cpp or vLLM setups
 - Manage multiple deployed instances and inspect their status
 - Reopen deployment logs and results from Operations (Ctrl+O), or cancel a deployment
-- Copy the OpenAI-compatible base URL, model ID, and API key after a successful deploy
+- Copy the OpenAI-compatible base URL, model ID, and API key after a successful deploy,
+  with a check that the endpoint can make the tool calls coding agents rely on
 
 Back leaves a deployment running. Operations keeps its monitor available across
 sessions: deployments run in detached background workers, so closing the TUI
@@ -147,7 +149,9 @@ llm-launchpad deploy \
 ```
 
 A rental bills continuously until it is destroyed, and `stop` deletes its disk
-along with any cached models. See the [Vast.ai provider guide](docs/vast.md) for
+along with any cached models. Launchpad deletes a rental that has served
+nothing for an hour, even with this computer asleep; see
+[idle shutdown](docs/storage-and-costs.md#idle-shutdown-for-rentals). See the [Vast.ai provider guide](docs/vast.md) for
 pricing, recovery records, and the SSH transport.
 
 ## OpenCode integration

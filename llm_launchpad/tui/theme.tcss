@@ -531,6 +531,11 @@ Button:focus {
 #quick-deploy-profile-card {
     width: 100%;
     margin: 0 0 1 0;
+    /* Collapsed it holds one button; a bordered box around it read as an
+       empty panel above the form. */
+    border: none;
+    padding: 0;
+    background: transparent;
 }
 
 #quick-deploy-form {

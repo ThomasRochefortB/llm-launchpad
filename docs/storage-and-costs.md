@@ -49,6 +49,35 @@ passive refreshes show its age ("checked 5m ago") instead of reprobing.
 Deploy warmup records the same observation when certification succeeds.
 Prime and Vast bill continuously, so their rows keep live probing.
 
+## Idle shutdown for rentals
+
+Vast rentals and Prime pods bill until they are deleted, so Launchpad deletes
+one after it has served nothing for an hour. Change the window, or turn it off,
+under Settings -> Providers ("Delete idle Vast and Prime rentals after"). The
+confirm screen states the rule for the placement you are about to rent.
+
+Idle means the runtime's own token counters stopped moving and no request is
+in flight. Reading `/metrics` does not count, so Manage and the home screen
+never keep a rental alive; any served request does. The clock starts when the
+model starts serving, so a long first download is not idle time. A runtime
+that never serves is deleted after three hours.
+
+- **Vast** runs the watchdog on the rental itself, so it works with this
+  computer asleep or off. It deletes the rental with `CONTAINER_API_KEY`, which
+  Vast scopes to that one instance; your account key never leaves this
+  computer.
+- **Prime** has no instance-scoped key. By default Launchpad watches from this
+  computer in a detached process, which only acts while the computer is awake.
+  Turn on "Let Prime pods stop themselves" to run the watchdog on the pod
+  instead; that stores your Prime API key on the pod (`/opt/llm-launchpad`,
+  root-only, mode 600).
+
+Deleting a rental removes its disk and cached weights on Vast; Prime keeps its
+persistent cache disk, which still bills (see above). A rental that deleted
+itself shows as `destroyed` in Manage until you stop it, which removes the
+local record. The watchdog logs to `idle-watchdog.log` next to the runtime, or
+`~/.llm_launchpad/logs/idle-watchdog-<name>.log` for the local Prime watchdog.
+
 ## Costs and scaledown
 
 GPU costs depend on the selected provider's billing model. Every placement

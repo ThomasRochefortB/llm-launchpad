@@ -225,3 +225,45 @@ class LifecycleParityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ToolCallVerificationTests(unittest.TestCase):
+    def _run(self, probe_status: str):  # type: ignore[no-untyped-def]
+        from unittest.mock import patch
+
+        from llm_launchpad.core.tool_call_probe import ToolCallProbeResult
+
+        endpoint = EndpointInfo(name="llamacpp-test", app_id="ap-1", web_url="https://e.example")
+
+        def _deploy(_c):  # type: ignore[no-untyped-def]
+            return [OperationCompleteEvent(operation=OperationType.DEPLOY, success=True, data=endpoint)]
+
+        def _warmup(*_a, **_k):  # type: ignore[no-untyped-def]
+            return [OperationCompleteEvent(operation=OperationType.WARMUP, success=True)]
+
+        published: list[DeploymentConfig] = []
+        lines: list[str] = []
+        probe = MagicMock(return_value=ToolCallProbeResult(probe_status, "the model answered in text"))
+        with patch("llm_launchpad.core.tool_call_probe.verify_tool_calling", probe):
+            result = run_lifecycle(
+                SimpleNamespace(deploy=_deploy, warmup=_warmup),
+                [LifecycleAttempt(config=_modal_config(do_warmup=True))],
+                callbacks=LifecycleCallbacks(
+                    on_connection=lambda c, url, ep: published.append(c),
+                    on_event=lambda e: lines.append(getattr(e, "line", "")),
+                ),
+            )
+        return result, published, lines, probe
+
+    def test_failed_probe_publishes_with_warning(self) -> None:
+        result, published, lines, probe = self._run("failed")
+        self.assertTrue(result.succeeded)
+        probe.assert_called_once()
+        self.assertEqual(published[-1].tool_calling, "failed")
+        self.assertTrue(any("tool calling failed" in line for line in lines))
+
+    def test_passed_probe_is_recorded(self) -> None:
+        result, published, lines, _ = self._run("passed")
+        self.assertTrue(result.succeeded)
+        self.assertEqual(published[-1].tool_calling, "passed")
+        self.assertTrue(any("Tool calling verified" in line for line in lines))

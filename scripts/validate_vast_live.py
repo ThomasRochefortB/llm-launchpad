@@ -157,6 +157,49 @@ def long_stream(session: requests.Session, endpoint: EndpointInfo, seconds: int)
     raise RuntimeError(f"Long stream ended early after {time.monotonic() - started:.1f} seconds.")
 
 
+def await_self_destruction(
+    api: VastBackend,
+    backend: VastDeploymentBackend,
+    name: str,
+    instance_id: str,
+    idle_seconds: int,
+    last_request: float,
+    checks: dict[str, Any],
+    save: Any,
+) -> None:
+    """Leave the rental alone and confirm its own watchdog deletes it.
+
+    Nothing here destroys anything: the finally block of ``run`` is the
+    backstop if the watchdog does not act before the deadline.
+    """
+    instance = api.get_instance(instance_id)
+    assert instance is not None
+    ssh = VastSsh(backend.state.directory(name))
+    checks["watchdog_running"] = "idle-watchdog.sh" in ssh.run(instance, "ps -eo args")
+    checks["watchdog_log_at_ready"] = ssh.run(
+        instance, f"cat {VAST_RUNTIME_DIR}/idle-watchdog.log"
+    ).splitlines()[-5:]
+    save()
+    if not checks["watchdog_running"]:
+        raise RuntimeError("The idle watchdog is not running on the rental.")
+    print(f"Idle; waiting for the rental to delete itself (window {idle_seconds}s)", flush=True)
+    # One poll interval of lag, plus the destroy call and Vast's own teardown.
+    deadline = last_request + idle_seconds + 300
+    while time.monotonic() < deadline:
+        current = api.get_instance(instance_id)
+        if current is None:
+            checks["self_destroyed"] = True
+            checks["seconds_from_last_request_to_gone"] = time.monotonic() - last_request
+            save()
+            print(f"Rental deleted itself {checks['seconds_from_last_request_to_gone']:.0f}s after the last request", flush=True)
+            return
+        checks["last_seen_state"] = current.state
+        time.sleep(15)
+    checks["self_destroyed"] = False
+    save()
+    raise RuntimeError("The rental did not delete itself within the idle window plus five minutes.")
+
+
 def select_offer(api: VastBackend, args: argparse.Namespace) -> Any:
     """Choose a rentable offer now, rather than trusting an id from minutes ago.
 
@@ -345,6 +388,8 @@ def run(args: argparse.Namespace) -> int:
             ]),
             provider_options=options,
         )
+    if stage == "llamacpp_idle_shutdown":
+        config.idle_shutdown_seconds = args.idle_seconds
     save()
     print(f"LIVE {name}: offer {offer.id}, ${hourly:.4f}/hr, headroom estimate ${estimate:.3f}", flush=True)
     signal.signal(signal.SIGALRM, expired)
@@ -369,6 +414,15 @@ def run(args: argparse.Namespace) -> int:
         checks["cold_start_seconds"] = time.monotonic() - started
         save()
         print(f"READY in {checks['cold_start_seconds']:.1f}s; testing auth and tools", flush=True)
+        if stage == "llamacpp_idle_shutdown":
+            with requests.Session() as session:
+                session.trust_env = False
+                probe_chat(session, endpoint, checks)
+            last_request = time.monotonic()
+            await_self_destruction(api, backend, name, instance_id, args.idle_seconds, last_request, checks, save)
+            report["success"] = True
+            save()
+            raise _StageComplete
         with requests.Session() as session:
             session.trust_env = False
             probe_chat(session, endpoint, checks)
@@ -504,12 +558,17 @@ def main() -> int:
             "llamacpp_multi_gpu",
             "vllm_single_gpu",
             "vllm_tensor_parallel",
+            "llamacpp_idle_shutdown",
         ],
         help="What this rental certifies. vLLM stages stop after streaming verification.",
     )
     parser.add_argument("--model", default="Qwen/Qwen3-0.6B-GGUF", help="GGUF repo, or HF model for vLLM.")
     parser.add_argument("--quant", default="Q8_0")
     parser.add_argument("--transfer-gb", type=float, default=20.0, help="Inbound GB to budget for.")
+    parser.add_argument(
+        "--idle-seconds", type=int, default=120,
+        help="Idle window for the llamacpp_idle_shutdown stage's on-rental watchdog.",
+    )
     args = parser.parse_args()
     if not args.live:
         parser.error("Pass --live to explicitly authorize a paid rental.")

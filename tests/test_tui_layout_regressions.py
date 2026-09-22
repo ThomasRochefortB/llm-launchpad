@@ -806,12 +806,12 @@ class FastDeployHeaderTests(unittest.IsolatedAsyncioTestCase):
         unscored = replace(scored, quality_score=None)
 
         self.assertEqual(_model_score_segment(unscored), "")
-        self.assertIn("AAI", _model_score_segment(scored))
+        self.assertIn("score", _model_score_segment(scored))
 
         row = _model_option(unscored)
         self.assertNotIn("unranked", row)
         self.assertIn("from", row)
-        self.assertIn("AAI", _model_option(scored))
+        self.assertIn("score", _model_option(scored))
 
 
 class MainMenuFitTests(unittest.IsolatedAsyncioTestCase):

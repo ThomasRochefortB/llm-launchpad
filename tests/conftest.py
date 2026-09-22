@@ -452,3 +452,28 @@ def _stub_modal_gpu_catalog_consumers(monkeypatch: pytest.MonkeyPatch) -> None:
         "llm_launchpad.core.quick_deploy_refresh",
     ):
         monkeypatch.setattr(f"{module_name}.fetch_modal_gpu_catalog", lambda: list(catalog))
+
+
+@pytest.fixture(autouse=True)
+def _stub_tool_call_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the post-warmup tool-call probe off the network.
+
+    Lifecycle tests point at fake endpoint URLs; a real probe would spend its
+    timeout on DNS. ``None`` is the probe's "did not run" answer, so the
+    config stays unmarked. ``test_tool_call_probe`` exercises the real one.
+    """
+    monkeypatch.setattr(
+        "llm_launchpad.core.tool_call_probe.verify_tool_calling",
+        lambda *args, **kwargs: None,
+    )
+
+
+@pytest.fixture(autouse=True)
+def _stub_local_idle_watchdog(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
+    """Never leave a detached watchdog process behind a Prime deploy test."""
+    spawned: list[dict] = []
+    monkeypatch.setattr(
+        "llm_launchpad.core.local_watchdog.spawn_local_watchdog",
+        lambda **kwargs: spawned.append(kwargs),
+    )
+    return spawned

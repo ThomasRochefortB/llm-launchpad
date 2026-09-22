@@ -1761,6 +1761,46 @@ class PrimeBackend:
                 f"{(started.stderr or started.stdout).strip()}"
             )
 
+    def start_idle_watchdog(
+        self,
+        pod: dict[str, Any],
+        pod_id: str,
+        endpoint_api_key: str,
+        idle_seconds: int,
+    ) -> None:
+        """Let the pod delete itself once idle, with the user's opted-in key.
+
+        Prime has no instance-scoped key, so this places the account key on
+        the pod (mode 600, root-only). Only called when the user turned on
+        ``prime_self_terminate``.
+        """
+        from .idle_watchdog import (
+            WATCHDOG_SCRIPT_NAME,
+            WatchdogSpec,
+            prime_destroy_command,
+            start_command,
+            watchdog_script,
+        )
+
+        key_path = f"{PRIME_RUNTIME_ROOT}/prime-api-key"
+        self._write_remote_runtime_file(pod, "prime-api-key", f"{self.config.api_key}\n", mode="600")
+        script = watchdog_script(WatchdogSpec(
+            metrics_url="http://127.0.0.1:8000/metrics",
+            endpoint_api_key=endpoint_api_key,
+            idle_seconds=idle_seconds,
+            destroy_command=prime_destroy_command(
+                f"{self.config.base_url}/api/v1", pod_id, key_path
+            ),
+            runtime_dir=PRIME_RUNTIME_ROOT,
+        ))
+        self._write_remote_runtime_file(pod, WATCHDOG_SCRIPT_NAME, script, mode="700")
+        started = self._run_privileged_ssh(pod, start_command(PRIME_RUNTIME_ROOT))
+        if started.returncode != 0:
+            raise RuntimeError(
+                "Could not start the idle watchdog: "
+                f"{(started.stderr or started.stdout).strip()}"
+            )
+
     @staticmethod
     def _tunnel_config(tunnel: PrimeTunnel, *, local_port: int = 8000) -> str:
         """Build the minimal frpc configuration documented by Prime Tunnel."""

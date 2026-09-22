@@ -82,8 +82,18 @@ def _connection_card_markup(payload: dict[str, str]) -> str:
             ("Model ID", _field("model_id")),
             ("Display", _field("display_name")),
             ("API key", (payload.get("api_key") or "").strip() or "none"),
+            *_tool_calling_rows(payload),
         ]
     )
+
+
+def _tool_calling_rows(payload: dict[str, str]) -> list[tuple[str, str]]:
+    status = payload.get("tool_calling")
+    if status == "passed":
+        return [("Tools", "[green]verified[/] · ready for coding agents")]
+    if status == "failed":
+        return [("Tools", "[yellow]failed[/] · chat only; coding agents cannot edit files")]
+    return []
 
 
 @dataclass
@@ -340,13 +350,6 @@ class MonitorScreen(CopyEnabledScreen):
         return (
             f"{state}  [dim]· {self._line_count} {line_label} · "
             f"{self._view_mode.upper()}[/dim]{search}"
-        )
-
-    def refresh_copy_help(self) -> None:
-        """Refresh compact monitor chrome."""
-        self.query_one("#monitor-title", Static).update(self._title_markup())
-        self.query_one("#monitor-view-status", Static).update(
-            self._view_status_markup()
         )
 
     @property
