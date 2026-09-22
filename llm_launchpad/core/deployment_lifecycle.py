@@ -57,6 +57,8 @@ class LifecycleOptions:
     # placement that just ran, not the first config captured in a closure.
     attempt_index: int = 0
     attempt_id: str | None = None
+    # Ask the certified endpoint for one tool call before publishing it.
+    verify_tool_calls: bool = True
 
 
 @dataclass
@@ -527,6 +529,9 @@ def _run_single_attempt(
             failure_exit_code=warmup_outcome.failure_exit_code,
         ), config
 
+    if opts.verify_tool_calls:
+        _verify_tool_calling(hooks, config, warmed_url or observed_url, observed_endpoint)
+
     hooks.on_event(
         StateChangeEvent(
             current=DeploymentState.PUBLISHING,
@@ -543,6 +548,43 @@ def _run_single_attempt(
         runtime_attestation=attestation,
         cleanup=CleanupDisposition.NOTHING_TO_CLEAN,
     ), config
+
+
+def _verify_tool_calling(
+    hooks: LifecycleCallbacks,
+    config: DeploymentConfig,
+    url: str | None,
+    endpoint: EndpointInfo | None,
+) -> None:
+    """Record whether coding agents can drive the endpoint.
+
+    A failure is published, not fatal: the endpoint still serves chat, and
+    tearing down a certified deployment over a chat-template gap would bill
+    the user for nothing. The warning names what will not work instead.
+    """
+    from .opencode import build_openai_connection_payload
+    from .tool_call_probe import verify_tool_calling
+
+    if not url:
+        return
+    hooks.on_event(
+        LogEvent(line="Verifying tool calling for coding agents.", operation=OperationType.WARMUP)
+    )
+    model_id = str(build_openai_connection_payload(config, url).get("model_id") or "") or None
+    result = verify_tool_calling(url, model_id, config.endpoint_api_key)
+    if result is None:
+        return
+    config.tool_calling = result.status
+    if endpoint is not None:
+        endpoint.tool_calling = result.status
+    if result.passed:
+        line = "Tool calling verified: coding agents can use this endpoint."
+    else:
+        line = (
+            f"Warning: tool calling failed ({result.detail}). Chat works, but coding "
+            "agents such as OpenCode will not be able to edit files or run commands."
+        )
+    hooks.on_event(LogEvent(line=line, operation=OperationType.WARMUP, is_milestone=True))
 
 
 def _run_warmup(

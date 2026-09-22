@@ -15,6 +15,7 @@ from collections.abc import Iterable
 
 from ..protocol.enums import BackendType, ComputeProvider
 from ..protocol.models import DeploymentConfig, EndpointInfo, ReasoningCapabilities, VisionCapabilities
+from .tool_call_probe import TOOL_CALLING_FAILED
 from .vision import image_input_verified, vision_to_dict, vision_from_dict
 from .config import SETTINGS_DIR
 from .deployment_states import is_terminal_deployment_state
@@ -63,6 +64,7 @@ class OpenCodeConnection:
     output_limit: int | None = None
     reasoning: ReasoningCapabilities | None = None
     vision: VisionCapabilities | None = None
+    tool_calling: str | None = None
 
 
 @dataclass
@@ -225,6 +227,8 @@ def build_openai_connection_payload(
         payload["vision"] = vision_to_dict(config.vision)
     if config.reasoning is not None:
         payload["reasoning"] = reasoning_capabilities_to_dict(config.reasoning)
+    if config.tool_calling:
+        payload["tool_calling"] = config.tool_calling
     return payload
 
 
@@ -283,6 +287,7 @@ def build_connection_from_config(
         output_limit=payload.get("output_limit"),
         reasoning=reasoning_capabilities_from_dict(payload.get("reasoning")),
         vision=vision_from_dict(payload.get("vision")),
+        tool_calling=payload.get("tool_calling"),
     )
 
 
@@ -359,6 +364,7 @@ def build_connection_from_endpoint(
         output_limit=output_limit,
         reasoning=row.reasoning,
         vision=row.vision,
+        tool_calling=row.tool_calling,
     )
 
 
@@ -716,6 +722,9 @@ def _provider_payload(connection: OpenCodeConnection) -> dict[str, Any]:
             "context": context_limit,
             "output": output_limit,
         }
+    if connection.tool_calling == TOOL_CALLING_FAILED:
+        # OpenCode would otherwise send tools the endpoint cannot answer.
+        model["tool_call"] = False
     if connection.reasoning is not None:
         model["reasoning"] = True
         model["variants"] = reasoning_variants(connection.reasoning)
@@ -747,6 +756,7 @@ def _registry_entry_for_connection(connection: OpenCodeConnection) -> dict[str, 
         "output_limit": connection.output_limit,
         "reasoning": reasoning_capabilities_to_dict(connection.reasoning),
         "vision": vision_to_dict(connection.vision),
+        "tool_calling": connection.tool_calling,
     }
 
 

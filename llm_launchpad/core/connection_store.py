@@ -14,6 +14,7 @@ from .vision import vision_from_dict, vision_to_dict
 from .config import SETTINGS_DIR
 from .coerce import positive_int
 from .opencode import build_openai_connection_payload
+from .tool_call_probe import TOOL_CALLING_FAILED, TOOL_CALLING_PASSED
 from .llamacpp_planner import runtime_attestation_from_dict, runtime_attestation_to_dict
 from .reasoning_profiles import (
     discover_reasoning_capabilities,
@@ -106,6 +107,7 @@ def save_connection(
         "projector_revision": config.projector_revision,
         "projector_file": config.projector_file,
         "runtime_attestation": runtime_attestation_to_dict(config.runtime_attestation),
+        "tool_calling": payload.get("tool_calling"),
         "api_key": config.endpoint_api_key or endpoint.endpoint_api_key or "",
         "gpu_type": config.gpu_type or "",
         "gpu_count": config.gpu_count or 1,
@@ -175,6 +177,7 @@ def merge_connections(
         row.runtime_attestation = row.runtime_attestation or runtime_attestation_from_dict(
             cached.get("runtime_attestation")
         )
+        row.tool_calling = row.tool_calling or _tool_calling(cached)
         if row.hourly_cost_usd is None:
             try:
                 from .coerce import optional_float as _optional_float
@@ -244,10 +247,16 @@ def rows_from_connection_cache(
                 runtime_attestation=runtime_attestation_from_dict(
                     entry.get("runtime_attestation")
                 ),
+                tool_calling=_tool_calling(entry),
                 hourly_cost_usd=_cached_price(entry),
             )
         )
     return rows
+
+
+def _tool_calling(entry: dict[str, Any]) -> str | None:
+    value = entry.get("tool_calling")
+    return value if value in (TOOL_CALLING_PASSED, TOOL_CALLING_FAILED) else None
 
 
 def _cached_price(entry: dict[str, Any]) -> float | None:

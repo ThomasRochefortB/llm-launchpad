@@ -506,6 +506,9 @@ class DeploymentConfig:
     runtime_tuning: RuntimeTuning | None = None
     placement_assessment: PlacementAssessment | None = None
     runtime_attestation: RuntimeAttestation | None = None
+    # Outcome of the post-warmup tool-call probe: "passed", "failed", or None
+    # when it never ran. Coding agents need it to pass.
+    tool_calling: str | None = None
 
     # How many sequences the runtime decodes at once. Left to the image, this
     # differs per provider -- and on a hybrid model a default above the
@@ -991,6 +994,7 @@ class EndpointInfo:
     reasoning: ReasoningCapabilities | None = None
     vision: VisionCapabilities | None = None
     runtime_attestation: RuntimeAttestation | None = None
+    tool_calling: str | None = None
     serving: ServingSnapshot | None = None
     # Wall-clock epoch the current container/process run started. Sourced
     # from the runtime's own process start gauge when a live reading exists;
