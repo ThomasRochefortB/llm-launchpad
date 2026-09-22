@@ -54,10 +54,12 @@ Setting up LLM endpoints usually means juggling model names, container images, G
 
 From the TUI you can:
 - Deploy a popular model by picking it, choosing live GPU placement, and confirming
+- Relaunch the last model you deployed with `r` from the home screen, priced live
 - Use Custom deploy for arbitrary Hugging Face llama.cpp or vLLM setups
 - Manage multiple deployed instances and inspect their status
 - Reopen deployment logs and results from Operations (Ctrl+O), or cancel a deployment
-- Copy the OpenAI-compatible base URL, model ID, and API key after a successful deploy
+- Copy the OpenAI-compatible base URL, model ID, and API key after a successful deploy,
+  with a check that the endpoint can make the tool calls coding agents rely on
 
 Back leaves a deployment running. Operations keeps its monitor available across
 sessions: deployments run in detached background workers, so closing the TUI

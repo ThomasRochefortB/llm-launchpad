@@ -31,6 +31,7 @@ from ...core.quick_deploy import (
     retune_quick_deploy_plan,
     resolve_quick_deploy_plans,
 )
+from ...core.diagnostics import log_exception
 from ...core.provider_options import prime_provider_options
 from ...protocol.enums import (
     BillingModel,
@@ -202,8 +203,8 @@ def _availability_label(plan: InferencePlan) -> str:
     if plan.quote.availability == QuoteAvailability.UNAVAILABLE:
         return "Unavailable"
     if plan.quote.billing_model == BillingModel.SCALE_TO_ZERO:
-        return "Not verified · scales to zero"
-    return "Not verified"
+        return "Starts on first request · scales to zero"
+    return "Checked when deployment starts"
 
 
 def _plan_hourly_cost(plan: InferencePlan) -> str:
@@ -414,7 +415,7 @@ class QuickDeployScreen(CopyEnabledScreen):
                     id="quick-deploy-profile-body",
                 )
             with Vertical(id="quick-deploy-form"):
-                yield Static("Fulfillment", classes="form-label")
+                yield Static("Runs on", classes="form-label")
                 caution = Static(_fulfillment_caution(self.plan), id="quick-vast-note")
                 caution.display = bool(_fulfillment_caution(self.plan))
                 yield caution
@@ -431,28 +432,27 @@ class QuickDeployScreen(CopyEnabledScreen):
                         allow_blank=False,
                         id="quick-fulfillment",
                     )
-                    yield Static(
-                        "[dim]The provider is revealed here because it determines billing, region, and credentials.[/dim]",
-                        id="quick-fulfillment-note",
-                    )
                 else:
                     yield Static(
                         _fulfillment_option(self.plan, recommended=True),
                         id="quick-fulfillment-single",
                     )
+                yield Button("Advanced options...", id="toggle-advanced-quick", variant="default")
                 if self.profile.speculative_decoding is not None:
+                    # On by default and faster; a tuning knob, not a decision.
                     yield ToggleField(
                         "Use MTP speculative decoding",
                         "quick-speculative-decoding",
                         default=True,
+                        classes="quick-advanced",
                     )
                     yield Static(
                         "[dim]Native MTP · drafts up to "
                         f"{self.profile.speculative_decoding.num_speculative_tokens} "
                         "tokens[/dim]",
                         id="quick-speculative-note",
+                        classes="quick-advanced",
                     )
-                yield Button("Advanced options...", id="toggle-advanced-quick", variant="default")
                 if self.plan.recipe.serving_requirements is not None:
                     yield Static("Optimize for", classes="form-label quick-advanced")
                     yield Select(
@@ -752,7 +752,28 @@ class QuickDeployScreen(CopyEnabledScreen):
             and (plan.assessment is None or plan.assessment.fits)
         ]
         config.fallback_configs = tuple(_config_for_plan(plan) for plan in fallback_plans)
+        self._remember_launch()
         self.app.begin_deploy(config)  # type: ignore[attr-defined]
+
+    def _remember_launch(self) -> None:
+        """Offer this choice on the home screen next time; never blocks a deploy."""
+        from ...core.last_launch import LastLaunch, save_last_launch
+        from ...core.quick_deploy import quick_deploy_model_key
+
+        quote = self.plan.quote
+        try:
+            save_last_launch(
+                LastLaunch(
+                    model_id=quick_deploy_model_key(self.profile),
+                    display_name=self.profile.display_name,
+                    provider=quote.provider.value,
+                    gpu_type=quote.gpu_type,
+                    gpu_count=quote.gpu_count,
+                    price_per_hour_usd=quote.price_per_hour_usd,
+                )
+            )
+        except Exception:
+            log_exception("Failed to remember the last launch")
 
     def action_pop_screen(self) -> None:
         self.app.pop_screen()

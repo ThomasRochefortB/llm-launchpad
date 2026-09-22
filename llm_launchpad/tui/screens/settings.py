@@ -43,6 +43,15 @@ def parse_scaledown_window(value: str) -> int:
     return max(0, int(round(amount * multiplier)))
 
 
+def format_scaledown_window(seconds: int) -> str:
+    """Render seconds in the largest unit ``parse_scaledown_window`` reads back."""
+    if seconds and seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
+    if seconds and seconds % 60 == 0:
+        return f"{seconds // 60}m"
+    return f"{seconds}s"
+
+
 class SettingsScreen(CopyEnabledScreen):
     """Edit and persist scaledown, appearance, and TUI behavior settings."""
 
@@ -80,7 +89,7 @@ class SettingsScreen(CopyEnabledScreen):
                     yield FormField(
                         "Idle timeout before scale-down",
                         "scaledown-window",
-                        default=str(settings.scaledown_window),
+                        default=format_scaledown_window(settings.scaledown_window),
                         hint="e.g. 30m, 90s, or 1800 · idle containers scale to zero after this",
                     )
                     yield Static("[bold]Appearance[/bold]", classes="settings-section")

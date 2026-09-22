@@ -488,7 +488,7 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(option_list.option_count, 1)
                 prompt = str(option_list.get_option_at_index(0).prompt)
                 self.assertIn("Test Model", prompt)
-                self.assertIn("AAI 12.5", prompt)
+                self.assertIn("score 12.5", prompt)
                 self.assertIn("from ~$4.00/hr", prompt)
 
     async def test_infra_rows_sorted_cheapest_first_and_routes_selection(self) -> None:

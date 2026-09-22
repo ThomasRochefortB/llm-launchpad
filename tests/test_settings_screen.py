@@ -121,3 +121,11 @@ class KeyboardSettingsTests(unittest.IsolatedAsyncioTestCase):
             app.push_screen(SettingsScreen())
             await pilot.pause()
             self.assertFalse(app.screen.query("#tui-mouse"))
+
+
+def test_idle_timeout_is_shown_as_a_duration_that_parses_back() -> None:
+    from llm_launchpad.tui.screens.settings import format_scaledown_window, parse_scaledown_window
+
+    for seconds, text in ((1800, "30m"), (7200, "2h"), (90, "90s"), (0, "0s")):
+        assert format_scaledown_window(seconds) == text
+        assert parse_scaledown_window(text) == seconds

@@ -29,6 +29,8 @@ from textual.widgets import OptionList, Static
 from textual.widgets.option_list import Option
 
 from ...core.backend import ModalBackend
+from ...core.compute_availability import display_gpu_type
+from ...core.last_launch import LastLaunch, load_last_launch
 from ...core.serving_metrics import default_tracker, usage_key
 from ...core.hf_auth import HuggingFaceAuthStatus, get_huggingface_auth_status
 from ...core.modal_auth import ModalAuthStatus, get_modal_auth_status
@@ -748,11 +750,31 @@ _ACTION_LABEL_TIERS: tuple[_ActionLabels, ...] = (
 )
 
 
+def _relaunch_labels(last: LastLaunch) -> tuple[tuple[str, str], ...]:
+    """One relaunch row per label tier, fullest first."""
+    shape = f"{display_gpu_type(last.gpu_type)} x{last.gpu_count}" if last.gpu_type else ""
+    name = clip(last.display_name, 30)
+    return (
+        ("relaunch", f"  Relaunch           {name}{f' · {shape}' if shape else ''}"),
+        ("relaunch", f"  Relaunch           {name}"),
+        ("relaunch", "  Relaunch last"),
+    )
+
+
+def _action_label_tiers(last: LastLaunch | None) -> tuple[_ActionLabels, ...]:
+    """The static tiers, headed by a relaunch row once something was deployed."""
+    if last is None:
+        return _ACTION_LABEL_TIERS
+    rows = _relaunch_labels(last)
+    return tuple((row, *tier) for row, tier in zip(rows, _ACTION_LABEL_TIERS))
+
+
 class MainMenuScreen(CopyEnabledScreen):
     """Top-level menu: deploy a model, custom deploy, manage, storage, settings."""
 
     BINDINGS = [
         Binding("d", "select_deploy", "Deploy", show=True),
+        Binding("r", "select_relaunch", "Relaunch", show=True),
         Binding("c", "select_custom_deploy", "Advanced", show=True),
         Binding("m", "select_manage", "Manage", show=True),
         Binding("t", "select_storage", "Storage", show=True),
@@ -797,6 +819,7 @@ class MainMenuScreen(CopyEnabledScreen):
         self._fleet_discovery: FleetDiscovery | None = None
         self._action_labels: _ActionLabels | None = None
         self._action_label_ceiling = 0
+        self._last_launch = load_last_launch()
 
     def compose(self) -> ComposeResult:
         with Vertical(id="main-menu-root"):
@@ -818,11 +841,10 @@ class MainMenuScreen(CopyEnabledScreen):
                         )
                         yield Static("", classes="decorative-spacer")
                         yield OptionList(
-                            Option("  Deploy model       Pick a model, get a live placement", id="deploy"),
-                            Option("  Advanced deploy    llama.cpp / vLLM expert form", id="custom-deploy"),
-                            Option("  Manage             Endpoints and jobs", id="manage"),
-                            Option("  Storage            Cached models, pre-download, delete", id="storage"),
-                            Option("  Settings           Appearance and deploy defaults", id="settings"),
+                            *(
+                                Option(label, id=option_id)
+                                for option_id, label in _action_label_tiers(self._last_launch)[0]
+                            ),
                             id="action-list",
                         )
                         yield Static(
@@ -895,6 +917,13 @@ class MainMenuScreen(CopyEnabledScreen):
         self._was_suspended = False
         self._resume_refresh_timers()
         self._refresh_panels()
+        last = load_last_launch()
+        if last != self._last_launch:
+            # A deploy started from a nested flow is now the one to offer.
+            self._last_launch = last
+            self._action_labels = None
+            self._fit_action_labels()
+            self.refresh_bindings()
         if not self._secondary_refresh_started:
             if self._secondary_refresh_timer is not None:
                 self._secondary_refresh_timer.stop()
@@ -965,8 +994,9 @@ class MainMenuScreen(CopyEnabledScreen):
         # A compact terminal deliberately drops the description column for
         # concise names; measurement may shorten labels further but must never
         # talk that decision back up into a padded two-column grid.
-        self._action_label_ceiling = len(_ACTION_LABEL_TIERS) - 1 if profile.compact else 0
-        self._apply_action_labels(_ACTION_LABEL_TIERS[self._action_label_ceiling])
+        tiers = _action_label_tiers(self._last_launch)
+        self._action_label_ceiling = len(tiers) - 1 if profile.compact else 0
+        self._apply_action_labels(tiers[self._action_label_ceiling])
         # The terminal is not the width these labels have to fit. Whenever the
         # side column is showing, the list gets what is left of a layout capped
         # at 126 columns -- which is how "Cached models, pre-download, delete"
@@ -983,11 +1013,12 @@ class MainMenuScreen(CopyEnabledScreen):
         available = action_list.content_size.width
         if available <= 0:
             return
-        for tier in _ACTION_LABEL_TIERS[self._action_label_ceiling:]:
+        tiers = _action_label_tiers(self._last_launch)
+        for tier in tiers[self._action_label_ceiling:]:
             if max(cell_len(label) for _option_id, label in tier) <= available:
                 self._apply_action_labels(tier)
                 return
-        self._apply_action_labels(_ACTION_LABEL_TIERS[-1])
+        self._apply_action_labels(tiers[-1])
 
     def _apply_action_labels(self, labels: _ActionLabels) -> None:
         """Install a label set, keeping whichever action was highlighted."""
@@ -1518,6 +1549,8 @@ class MainMenuScreen(CopyEnabledScreen):
         option_id = event.option.id
         if option_id == "deploy":
             self.app.action_push_deploy()  # type: ignore[attr-defined]
+        elif option_id == "relaunch":
+            self.app.action_push_relaunch()  # type: ignore[attr-defined]
         elif option_id == "custom-deploy":
             self.app.action_push_custom_deploy()  # type: ignore[attr-defined]
         elif option_id == "manage":
@@ -1529,6 +1562,14 @@ class MainMenuScreen(CopyEnabledScreen):
 
     def action_select_deploy(self) -> None:
         self.app.action_push_deploy()  # type: ignore[attr-defined]
+
+    def action_select_relaunch(self) -> None:
+        self.app.action_push_relaunch()  # type: ignore[attr-defined]
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action == "select_relaunch" and self._last_launch is None:
+            return False
+        return super().check_action(action, parameters)
 
     def action_select_custom_deploy(self) -> None:
         self.app.action_push_custom_deploy()  # type: ignore[attr-defined]

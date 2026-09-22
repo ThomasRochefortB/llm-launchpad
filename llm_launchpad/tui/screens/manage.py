@@ -676,7 +676,7 @@ class ManageScreen(CopyEnabledScreen):
                     f"{'endpoint' if hidden == 1 else 'endpoints'} hidden; press a to show."
                 )
             elif not self._outage_lines:
-                summary = "[yellow]No managed endpoints found.[/yellow]  Press r to refresh."
+                summary = "[yellow]No endpoints running.[/yellow]  Press esc then d to deploy one, or r to refresh."
             else:
                 summary = "[yellow]No endpoints could be listed.[/yellow]  Press r to retry."
             self.query_one("#manage-status", Static).update(

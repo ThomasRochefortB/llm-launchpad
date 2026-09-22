@@ -469,4 +469,4 @@ class ManageScreenStoppedFilterTests(unittest.IsolatedAsyncioTestCase):
             status = str(screen.query_one("#manage-status", Static).renderable)
             self.assertIn("Nothing running", status)
             self.assertIn("press a to show", status)
-            self.assertNotIn("No managed endpoints found", status)
+            self.assertNotIn("No endpoints running", status)

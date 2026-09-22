@@ -759,6 +759,24 @@ class TuiApp(App):
             current_screen.ensure_quick_deploy_catalog_refresh()
         self.push_screen(FastDeployScreen())
 
+    def action_push_relaunch(self) -> None:
+        """Reopen the last launched model on its placement step, priced live."""
+        from ..core.last_launch import load_last_launch
+
+        last = load_last_launch()
+        if last is None:
+            self.action_push_deploy()
+            return
+        current_screen = self.screen
+        if isinstance(current_screen, MainMenuScreen):
+            current_screen.ensure_quick_deploy_catalog_refresh()
+        self.push_screen(
+            FastDeployScreen(
+                initial_model_id=last.model_id,
+                preferred_placement=(last.provider, last.gpu_type, last.gpu_count),
+            )
+        )
+
     def quick_deploy_catalog_updated(self) -> None:
         """Notify the active model picker that the shared catalog changed."""
         try:
