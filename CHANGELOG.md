@@ -26,7 +26,7 @@ and this project follows [Semantic Versioning](https://semver.org/).
 - Image input on Vast.ai rentals through Advanced deploy, on both runtimes. The llama.cpp projector is staged on the rental over the same pinned image Prime uses; vLLM serves images through its native multimodal path. Fast Deploy still refuses vision for every provider, because vision working memory is not calibrated for guaranteed-fit placement.
 - `llm-launchpad vast-auth` (login/status/logout), `vast connect`, `offers --provider vast`, and `--provider vast` on deploy/list/status/logs/stop. `doctor` checks for a local Vast key the way it checks Modal and Prime, without authenticating it over the network.
 - Advanced deploy can bind a selected Vast rental on either runtime. Disk size is quoted with the GPU.
-- Docs for the provider and the broader release plan: `docs/vast.md`, `docs/vast-integration-plan.md`.
+- Provider guide: `docs/vast.md`.
 - Added an always-on rotating debug log under `~/.llm_launchpad/logs/` and routed previously silent failure paths (cache persistence, auth probing, log-tail cleanup, SSH key permissions) to it.
 - Added `llm-launchpad doctor`, a self-check command that verifies the Modal CLI, Modal/Prime/Vast/Hugging Face authentication, that at least one compute provider is usable, the optional Artificial Analysis key, and state-directory writability, with fix hints per failure.
 - Added `llm-launchpad --version`.

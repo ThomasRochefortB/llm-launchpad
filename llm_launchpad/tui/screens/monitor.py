@@ -352,13 +352,6 @@ class MonitorScreen(CopyEnabledScreen):
             f"{self._view_mode.upper()}[/dim]{search}"
         )
 
-    def refresh_copy_help(self) -> None:
-        """Refresh compact monitor chrome."""
-        self.query_one("#monitor-title", Static).update(self._title_markup())
-        self.query_one("#monitor-view-status", Static).update(
-            self._view_status_markup()
-        )
-
     @property
     def log_viewer(self) -> LogViewer:
         return self.query_one("#monitor-log-viewer", LogViewer)

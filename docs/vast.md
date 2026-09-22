@@ -311,4 +311,8 @@ separate ingress account. A public HTTPS endpoint remains future work.
 [SSH connections](https://docs.vast.ai/guides/instances/connect/ssh),
 [Cloudflare tunnel limitations](https://developers.cloudflare.com/tunnel/setup/).
 
-See the [integration plan](vast-integration-plan.md) for the broader release scope.
+Vast was chosen over direct Runpod support
+([issue #6](https://github.com/ThomasRochefortB/llm-launchpad/issues/6), closed as
+not planned) to widen the choice of rentals for personal inference. Prime already
+resells some Runpod supply, though not every Runpod offer runs Launchpad's Prime
+runtime.

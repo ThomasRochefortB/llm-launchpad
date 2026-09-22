@@ -190,11 +190,6 @@ def _render_profile_details(profile: QuickDeployProfile, plan: InferencePlan) ->
     return "\n".join(lines)
 
 
-def _render_profile_summary(profile: QuickDeployProfile, plan: InferencePlan) -> str:
-    """Backwards-compatible alias: the full card is now _render_profile_details."""
-    return _render_profile_details(profile, plan)
-
-
 def _show_placement_reference(reference: str, gpu_type: str) -> bool:
     """Hide provider-internal IDs and GPU names already shown on the GPU line."""
 
@@ -263,13 +258,6 @@ def _plan_storage_note(plan: InferencePlan) -> str:
     if _plan_evaluation(plan).includes_storage:
         return "Quoted hourly total already includes disk rent."
     return "Storage is billed separately; unknown storage cost is not $0."
-
-
-def _plan_monthly_cost(plan: InferencePlan) -> str:
-    value = plan.estimated_monthly_cost_usd
-    if value is None:
-        return "Unavailable"
-    return f"~${value:,.2f}/mo"
 
 
 def _plan_continuous_monthly_cost(plan: InferencePlan) -> str:

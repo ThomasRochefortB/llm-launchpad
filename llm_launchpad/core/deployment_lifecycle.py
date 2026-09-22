@@ -839,25 +839,6 @@ def _finalize_failed_attempt(
     return cleanup
 
 
-def _cleanup_failed_attempt(
-    orchestrator: Any,
-    hooks: LifecycleCallbacks,
-    config: DeploymentConfig,
-    observed_endpoint: EndpointInfo | None,
-    *,
-    resource_app_id: str | None = None,
-) -> Any:
-    """Stop a placement that failed certification, with retention policy.
-
-    Compatibility wrapper over :func:`_finalize_failed_attempt`.
-    """
-    return _finalize_failed_attempt(
-        orchestrator, hooks, config,
-        resource_app_id=resource_app_id,
-        observed_endpoint=observed_endpoint,
-    )
-
-
 def _cancel_cleanup(
     orchestrator: Any,
     hooks: LifecycleCallbacks,
