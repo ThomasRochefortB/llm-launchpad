@@ -17,12 +17,12 @@ class FormField(Vertical):
         padding: 0 0 1 0;
     }
     FormField .form-label {
-        color: #c8d6c9;
+        color: $text;
         height: auto;
         text-wrap: wrap;
     }
     FormField .form-hint {
-        color: #7f9082;
+        color: $text-muted;
         height: auto;
         text-wrap: wrap;
     }
@@ -83,7 +83,7 @@ class ToggleField(Horizontal):
         padding: 0 0 1 0;
     }
     ToggleField .toggle-label {
-        color: #c8d6c9;
+        color: $text;
         width: 1fr;
         height: 3;
         content-align: left middle;
@@ -94,10 +94,10 @@ class ToggleField(Horizontal):
         height: 3;
         padding-right: 1;
         content-align: right middle;
-        color: #7f9082;
+        color: $text-muted;
     }
     ToggleField.-on .toggle-state {
-        color: #c8d6c9;
+        color: $text;
         text-style: bold;
     }
     """

@@ -124,7 +124,7 @@ class DeploymentJobsPanel(VerticalScroll):
         status = "" if self._jobs_loaded else "Loading jobs…"
         if self._refresh_error:
             retained = "Showing last saved results. " if self._jobs_loaded else ""
-            status = f"[yellow]{retained}Job refresh failed: {escape(self._refresh_error)}[/yellow]"
+            status = f"[$warning]{retained}Job refresh failed: {escape(self._refresh_error)}[/$warning]"
         self.query_one("#operations-status", Static).update(status)
         self.query_one("#operations-status", Static).display = bool(status)
         options = self.query_one("#deployment-jobs", OptionList)
@@ -225,14 +225,14 @@ class CancelDeploymentScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         job = self.app.deployment_jobs[self.job_id]
-        with VerticalScroll(classes="screen-scroll"):
+        with VerticalScroll(classes="screen-scroll dialog-scroll"):
             with Vertical(id="cancel-deploy-dialog", classes="dialog-panel"):
                 yield Static("Cancel deployment?", classes="dialog-title")
                 yield Static(f"[bold]{escape(job.config.app_name)}[/bold]")
                 yield Static(
                     "This stops the provider resource after the current provider call returns. "
-                    "[yellow]For rentals, termination can permanently delete the rental disk "
-                    "and cached models.[/yellow]"
+                    "[$warning]For rentals, termination can permanently delete the rental disk "
+                    "and cached models.[/$warning]"
                 )
                 with Horizontal(id="cancel-deploy-actions", classes="dialog-actions"):
                     yield Button("Keep running", id="keep-running")
@@ -261,7 +261,7 @@ class PersistentCancelDeploymentScreen(CopyEnabledScreen):
         self.persistent_id = persistent_id
 
     def compose(self) -> ComposeResult:
-        with VerticalScroll(classes="screen-scroll"):
+        with VerticalScroll(classes="screen-scroll dialog-scroll"):
             with Vertical(id="cancel-persistent-dialog", classes="dialog-panel"):
                 yield Static("Cancel background deployment?", classes="dialog-title")
                 yield Static(f"[bold]{escape(self.persistent_id)}[/bold]")

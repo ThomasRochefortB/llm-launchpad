@@ -121,11 +121,11 @@ def style_health_bucket(bucket: str) -> str:
     """
     normalized = (bucket or "").strip().lower()
     if normalized == "healthy":
-        return "[green]Healthy[/green]"
+        return "[$success]Healthy[/$success]"
     if normalized == "in_progress":
-        return "[yellow]Starting[/yellow]"
+        return "[$warning]Starting[/$warning]"
     if normalized == "error":
-        return "[red]Failed[/red]"
+        return "[$error]Failed[/$error]"
     if normalized == "unchecked":
         return "[dim]Not checked[/dim]"
     return f"[dim]{escape(normalized or 'unknown')}[/dim]"
@@ -163,11 +163,11 @@ def fleet_summary_line(rows: list[EndpointInfo]) -> str:
     noun = "endpoint" if total == 1 else "endpoints"
     parts = [f"[bold]{total} {noun}[/bold]"]
     if running:
-        parts.append(f"[green]{running} running[/green]")
+        parts.append(f"[$success]{running} running[/$success]")
     if starting:
-        parts.append(f"[yellow]{starting} starting[/yellow]")
+        parts.append(f"[$warning]{starting} starting[/$warning]")
     if failed:
-        parts.append(f"[red]{failed} failed[/red]")
+        parts.append(f"[$error]{failed} failed[/$error]")
     return " · ".join(parts)
 
 
@@ -191,7 +191,7 @@ def provider_outage_lines(
             detail = f"showing {count} {noun} from {format_age(age)}"
         else:
             detail = "its deployments are not listed"
-        lines.append(f"[yellow]{escape(name)} unavailable:[/yellow] {reason} [dim]({detail})[/dim]")
+        lines.append(f"[$warning]{escape(name)} unavailable:[/$warning] {reason} [dim]({detail})[/dim]")
     return lines
 
 

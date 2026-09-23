@@ -540,6 +540,17 @@ def _run_single_attempt(
         )
     )
     hooks.on_connection(config, warmed_url, observed_endpoint)
+    # Warmup reported HEALTHY before publishing began, so PUBLISHING was the
+    # last state anyone saw: a finished deploy kept reading "publishing" in
+    # the TUI's context bar and the job record. Close the sequence on the
+    # state the endpoint is actually in.
+    hooks.on_event(
+        StateChangeEvent(
+            current=DeploymentState.HEALTHY,
+            operation=OperationType.WARMUP,
+            detail="Endpoint ready",
+        )
+    )
     return DeploymentAttemptOutcome(
         disposition=AttemptDisposition.SUCCEEDED,
         resource_app_id=resource_app_id,

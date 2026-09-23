@@ -67,6 +67,8 @@ from ...protocol.models import (
 from ..responsive import ViewportProfile, WidthMode
 from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
+from ..visual import DEPLOY_STEPS, screen_title
+from ..widgets.fitted_option_list import FittedOptionList
 
 
 class FastDeployAvailabilityLoaded(Message):
@@ -165,16 +167,18 @@ def _quant_markup(profile: QuickDeployProfile) -> str:
     if is_reduced_quality(profile.quant):
         # Green here used to mark the smallest quantization, which read as a
         # recommendation for the row that quietly costs the most quality.
-        return f"[yellow]{escape(quant)}[/yellow]"
+        return f"[$warning]{escape(quant)}[/$warning]"
     return f"[dim]{escape(quant)}[/dim]"
 
 
 # Marks a model whose GGUF carries native MTP heads the pinned runtime can
-# use. U+26A1 is East Asian Wide, so it measures two cells in every terminal
-# and fills exactly the two-column gutter each model row already reserves --
-# a width-1 glyph would pull the name a column left on marked rows only, and
-# a width-ambiguous one renders differently per locale.
-MTP_MARKER = "⚡"
+# use. A one-cell glyph plus a space fills exactly the two-column gutter each
+# model row already reserves. The bolt emoji (U+26A1) used to fill it alone,
+# but it is emoji-presented: terminals disagree about how to draw it, and
+# Termius on iOS drew it over the list's edge. "↯" is East Asian Width "N" --
+# one cell everywhere, never an emoji -- and still reads as a lightning bolt.
+MTP_GLYPH = "↯"
+MTP_MARKER = f"{MTP_GLYPH} "
 MODEL_ROW_GUTTER = "  "
 
 
@@ -205,11 +209,11 @@ def _capacity_label(count: int, adjective: str, color: str) -> str:
 def _availability_label(configuration: ComputeConfiguration) -> str:
     parts = []
     if configuration.live_placement_count:
-        parts.append(_capacity_label(configuration.live_placement_count, "live", "green"))
+        parts.append(_capacity_label(configuration.live_placement_count, "live", "$success"))
     if configuration.has_on_demand_capacity:
-        parts.append("[yellow]on demand[/yellow]")
+        parts.append("[$warning]on demand[/$warning]")
     if configuration.spot_placement_count:
-        parts.append(_capacity_label(configuration.spot_placement_count, "spot", "magenta"))
+        parts.append(_capacity_label(configuration.spot_placement_count, "spot", "$accent"))
     return " + ".join(parts) or "[dim]availability unknown[/dim]"
 
 
@@ -373,15 +377,14 @@ def _model_detail(model: QuickDeployModel) -> str:
     # Names the bolt in the list for the one model the reader has selected,
     # so the marker does not have to be guessed at from the rows alone.
     mtp_note = (
-        f" · {MTP_MARKER} native MTP speculative decoding"
+        f" · {MTP_GLYPH} native MTP speculative decoding"
         if _model_supports_mtp(model)
         else ""
     )
     return (
         f"[bold]{escape(model.display_name)}[/bold]  "
         f"{escape(format_context_length(model.max_context_tokens))}\n"
-        f"[dim]{score} · {_quant_options_label(model)} · "
-        f"Enter to see where it can run{mtp_note}[/dim]{runtime_note}"
+        f"[dim]{score} · {_quant_options_label(model)}{mtp_note}[/dim]{runtime_note}"
     )
 
 
@@ -510,7 +513,7 @@ def _tier_option(
     centre; the GPU belongs in the detail pane.
     """
 
-    marker = "[primary]*[/]" if tier.is_recommended else " "
+    marker = "[$primary]*[/]" if tier.is_recommended else " "
     price = _format_price(tier.price_per_hour_usd, estimate=tier.plan.quote.is_estimate)
     speed = tier.output_tokens_per_second
     speed_text = f"~{speed:.0f} tok/s" if speed > 0 else "speed n/a"
@@ -530,7 +533,7 @@ def _tier_option(
             else ""
         )
         padded = f"{escape(label):<{quality_width}}"
-        quality = f" [yellow]{padded}[/yellow]" if label else f" {padded}"
+        quality = f" [$warning]{padded}[/$warning]" if label else f" {padded}"
     if width_mode == WidthMode.MINIMAL:
         return f" {marker} {escape(tier.label):<9}{quality} [dim]{price}[/dim]"
     if width_mode == WidthMode.COMPACT:
@@ -715,9 +718,9 @@ def _tier_markup(profile: QuickDeployProfile) -> str:
     if label == "$":
         return "[dim]$[/dim]"
     if label == "$$":
-        return "[primary]$$[/]"
+        return "[$primary]$$[/]"
     if label == "$$$":
-        return "[yellow]$$$[/yellow]"
+        return "[$warning]$$$[/$warning]"
     return f"[dim]{escape(label)}[/dim]"
 
 
@@ -754,7 +757,7 @@ def _fallback_detail(profile: QuickDeployProfile) -> str:
         )
     return (
         f"[bold]{escape(profile.display_name)}[/bold]  {_quant_markup(profile)}\n"
-        f"[dim]{shape} · {cost} · catalog estimate (availability unavailable)[/dim]"
+        f"[dim]{shape} · {cost} · catalog estimate[/dim]"
     )
 
 
@@ -769,12 +772,12 @@ class CatalogExclusionsScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="fast-deploy-container"):
-            yield Static("[bold primary]Excluded models[/]", id="fast-deploy-title")
+            yield Static(screen_title("Excluded models"), id="fast-deploy-title")
             yield Static(
                 "Candidates checked while building the overall and per-size shortlists.",
                 id="fast-deploy-subtitle",
             )
-            yield OptionList(
+            yield FittedOptionList(
                 *(Option(escape(row.display_name), id=str(i)) for i, row in enumerate(self.exclusions)),
                 id="fast-deploy-list",
             )
@@ -882,7 +885,7 @@ class FastDeployScreen(CopyEnabledScreen):
     def compose(self) -> ComposeResult:
         with Vertical(id="fast-deploy-container"):
             yield Static(
-                "[bold primary]Deploy[/]  [dim]Step 1: Pick a model[/dim]",
+                screen_title("Deploy", steps=DEPLOY_STEPS, current=0),
                 id="fast-deploy-title",
             )
             yield Static(_subtitle(self._catalog_info), id="fast-deploy-subtitle")
@@ -906,7 +909,7 @@ class FastDeployScreen(CopyEnabledScreen):
                         id="fast-deploy-gpu-filter",
                     )
             yield Static("[dim]Loading models...[/dim]", id="fast-deploy-status")
-            yield OptionList(id="fast-deploy-list")
+            yield FittedOptionList(id="fast-deploy-list")
             yield Static("", id="fast-deploy-detail")
         yield FittedFooter()
 
@@ -995,7 +998,7 @@ class FastDeployScreen(CopyEnabledScreen):
             )
             option_list.highlighted = 0
             status = (
-                "[yellow]Live model catalog unavailable.[/yellow]\n"
+                "[$warning]Live model catalog unavailable.[/$warning]\n"
                 "[dim]Enter opens Advanced deploy for manual setup; "
                 "press Esc to go back.[/dim]\n"
                 f"[dim]{escape(clip(info.error, 140))}[/dim]"
@@ -1007,7 +1010,7 @@ class FastDeployScreen(CopyEnabledScreen):
                 [Option(f"  {frame} Building the live model catalog…", disabled=True)]
             )
             status = (
-                f"[bold primary]{frame}[/][dim] Building the live model catalog "
+                f"[bold $primary]{frame}[/][dim] Building the live model catalog "
                 "from Artificial Analysis and Hugging Face…[/dim]"
             )
         self.query_one("#fast-deploy-status", Static).update(status)
@@ -1027,7 +1030,7 @@ class FastDeployScreen(CopyEnabledScreen):
                 [Option(f"  {frame} Building the live model catalog…", disabled=True)]
             )
             self.query_one("#fast-deploy-status", Static).update(
-                f"[bold primary]{frame}[/][dim] Building the live model catalog "
+                f"[bold $primary]{frame}[/][dim] Building the live model catalog "
                 "from Artificial Analysis and Hugging Face…[/dim]"
             )
         except Exception:
@@ -1087,10 +1090,11 @@ class FastDeployScreen(CopyEnabledScreen):
         if model is None or self._availability_inflight:
             return
         self._selected_model = model
-        self.query_one("#fast-deploy-model-search", Input).add_class("hidden")
+        # Hide the whole group: hiding only the input left its "Search" label
+        # above an empty gap on the placement step.
+        self.query_one("#fast-deploy-search-group").add_class("hidden")
         self.query_one("#fast-deploy-title", Static).update(
-            f"[bold primary]Deploy[/]  "
-            f"[dim]{escape(model.display_name)} · Step 2: Pick infrastructure[/dim]"
+            screen_title("Deploy", model.display_name, steps=DEPLOY_STEPS, current=1)
         )
         self.query_one("#fast-deploy-status", Static).update(
             "[dim]Checking live infrastructure across connected sources...[/dim]"
@@ -1322,7 +1326,7 @@ class FastDeployScreen(CopyEnabledScreen):
             else reduced_quality_plan_note([row.plan for row in rows])
         )
         if quality_note:
-            status += f"\n[yellow]{escape(quality_note)}[/yellow]"
+            status += f"\n[$warning]{escape(quality_note)}[/$warning]"
         # Hourly and 24/7 are what a deployment bills; the monthly figure on
         # each row is an explicit scenario. It is not what the list is ordered
         # by -- placements sort on their assessment, which the line above
@@ -1372,7 +1376,7 @@ class FastDeployScreen(CopyEnabledScreen):
                 f"{'; '.join(reasons)}.[/dim]"
             )
         if snapshot.errors:
-            status += "\n[yellow]Partial results:[/yellow] " + escape(
+            status += "\n[$warning]Partial results:[/$warning] " + escape(
                 "; ".join(snapshot.errors)
             )
         self.query_one("#fast-deploy-status", Static).update(status)
@@ -1409,7 +1413,7 @@ class FastDeployScreen(CopyEnabledScreen):
             f"Pick infrastructure · {escape(self._catalog_info.source_label)}"
         )
         self.query_one("#fast-deploy-status", Static).update(
-            f"[yellow]No live placements on {gpu}.[/yellow] "
+            f"[$warning]No live placements on {gpu}.[/$warning] "
             "[dim]Press g to change the GPU filter.[/dim]"
         )
         option_list.focus()
@@ -1427,7 +1431,7 @@ class FastDeployScreen(CopyEnabledScreen):
             )
             self.query_one("#fast-deploy-detail", Static).update("")
             status = (
-                "[yellow]No compatible connected provider is available.[/yellow]\n"
+                "[$warning]No compatible connected provider is available.[/$warning]\n"
                 "[dim]Catalog fallback estimates require Modal.[/dim]"
             )
             if reason:
@@ -1438,7 +1442,7 @@ class FastDeployScreen(CopyEnabledScreen):
         option_list = self.query_one("#fast-deploy-list", OptionList)
         options = [Option(_fallback_option(profile), id=profile.id) for profile in profiles]
         self.query_one("#fast-deploy-subtitle", Static).update(
-            f"Catalog estimates · {escape(self._catalog_info.source_label)}"
+            escape(self._catalog_info.source_label)
         )
         if not options:
             options = [Option("  No catalog profiles for this model", disabled=True)]
@@ -1446,7 +1450,7 @@ class FastDeployScreen(CopyEnabledScreen):
         if profiles:
             option_list.highlighted = 0
             self._update_fallback_detail(profiles[0])
-        status = "[yellow]Live availability unavailable — showing catalog estimates.[/yellow]"
+        status = "[$warning]Live availability unavailable — showing catalog estimates.[/$warning]"
         if reason:
             status += f"\n[dim]{escape(clip(reason, 120))}[/dim]"
         self.query_one("#fast-deploy-status", Static).update(status)
@@ -1539,9 +1543,9 @@ class FastDeployScreen(CopyEnabledScreen):
     def _render_model_list(self, *, preferred_id: str | None = None) -> None:
         option_list = self.query_one("#fast-deploy-list", OptionList)
         self.query_one("#fast-deploy-title", Static).update(
-            "[bold primary]Deploy[/]  [dim]Step 1: Pick a model[/dim]"
+            screen_title("Deploy", steps=DEPLOY_STEPS, current=0)
         )
-        self.query_one("#fast-deploy-model-search", Input).remove_class("hidden")
+        self.query_one("#fast-deploy-search-group").remove_class("hidden")
         self._catalog_building = False
         visible = self._visible_models()
         if not self._models and not self._catalog_info.ready:
@@ -1566,7 +1570,7 @@ class FastDeployScreen(CopyEnabledScreen):
             if not models:
                 continue
             if show_headings:
-                options.append(Option(f"[bold primary]{title}[/]", disabled=True))
+                options.append(Option(f"[bold $primary]{title}[/]", disabled=True))
             # The catalog already ranks models; preserve that order within a section.
             for model in models:
                 model_indices[model.id] = len(options)
@@ -1632,8 +1636,8 @@ class FastDeployScreen(CopyEnabledScreen):
         # The source label belongs to the subtitle; repeating it here put the
         # same sentence on screen twice, three lines apart.
         self.query_one("#fast-deploy-status", Static).update(
-            f"[dim]{len(visible)} model{plural} · {view_label} (v to switch){filter_note}{search_note}{excluded_note}[/dim]"
-            + ("\n[yellow]Partial results: " + escape("; ".join(self._snapshot.errors)) + "[/yellow]"
+            f"[dim]{len(visible)} model{plural} · {view_label}{filter_note}{search_note}{excluded_note}[/dim]"
+            + ("\n[$warning]Partial results: " + escape("; ".join(self._snapshot.errors)) + "[/$warning]"
                if self._snapshot is not None and self._snapshot.errors else "")
             + ("\n[dim]Pricing live placements…[/dim]"
                if self._pricing_pending and self._snapshot is None else "")
@@ -1642,8 +1646,8 @@ class FastDeployScreen(CopyEnabledScreen):
             # out of requests before we could look". Every way of not looking
             # counts here, not just the exhausted request budget: Hugging Face
             # throttling leaves the same gap and used to say nothing at all.
-            + (f"\n[yellow]{unchecked} model{'s' if unchecked != 1 else ''} not yet checked; "
-               "reopen Deploy to carry on from here[/yellow]" if (unchecked := sum(
+            + (f"\n[$warning]{unchecked} model{'s' if unchecked != 1 else ''} not yet checked; "
+               "reopen Deploy to carry on from here[/$warning]" if (unchecked := sum(
                    1 for exclusion in self._catalog_info.exclusions
                    if exclusion.unchecked)) else "")
         )

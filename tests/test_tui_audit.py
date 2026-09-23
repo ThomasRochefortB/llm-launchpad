@@ -5,7 +5,7 @@ from __future__ import annotations
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from rich.markup import render as render_markup
+from textual.content import Content
 from textual.app import App
 from textual.widgets import Button, Input, Static
 
@@ -95,7 +95,7 @@ class TuiAuditInteractionTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             screen.on_storage_failed(StorageFailed("provider returned [/unexpected]"))
             text = str(screen.query_one("#storage-status", Static).content)
-            self.assertIn("[/unexpected]", render_markup(text).plain)
+            self.assertIn("[/unexpected]", Content.from_markup(text).plain)
 
     async def test_setup_quit_keyboard_awaits_app_shutdown(self) -> None:
         app = _StyledApp()

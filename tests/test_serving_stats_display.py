@@ -375,10 +375,10 @@ class ManageScreenReadsItsOwnTrafficTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
 
                 table = screen.query_one("#manage-endpoint-table", AdaptiveDataTable)
-                served = table.get_cell_at(Coordinate(0, table.visible_column_keys.index("served")))
-                # No banked totals yet, so nothing to show -- but crucially no
-                # request was sent to learn that.
-                self.assertEqual(served, "-")
+                # No banked totals yet, so nothing to show -- the column is left
+                # out rather than filled with dashes -- but crucially no request
+                # was sent to learn that.
+                self.assertNotIn("served", table.visible_column_keys)
 
     async def test_a_second_pass_turns_counters_into_a_rate(self) -> None:
         # Throughput is a delta, so one reading can never produce it. The
@@ -428,12 +428,13 @@ class ManageScreenReadsItsOwnTrafficTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
 
                 table = screen.query_one("#manage-endpoint-table", AdaptiveDataTable)
-                column = table.visible_column_keys.index("throughput")
-                self.assertEqual(table.get_cell_at(Coordinate(0, column)), "-")
+                # One reading has no rate yet, so the column is not shown.
+                self.assertNotIn("throughput", table.visible_column_keys)
 
                 screen._refresh_serving_stats()
                 await screen.workers.wait_for_complete()
                 await pilot.pause()
+                column = table.visible_column_keys.index("throughput")
                 self.assertEqual(table.get_cell_at(Coordinate(0, column)), "0 tok/s")
 
     async def test_the_traffic_timer_stops_while_the_screen_is_away(self) -> None:

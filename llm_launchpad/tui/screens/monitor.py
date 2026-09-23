@@ -26,6 +26,7 @@ from ..deploy_log_summary import (
     classify_summary_kind,
     summary_progress_parts,
 )
+from ..visual import SUCCESS_STYLE, WARNING_STYLE, labelled_rows_markup, tag
 from ..widgets.deployment_progress import DeploymentProgressWidget
 from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
@@ -54,21 +55,8 @@ def _strip_ansi(text: str) -> str:
 _RETURN_HINT = "Press esc, q or enter to return"
 
 
-def _labelled_rows_markup(rows: list[tuple[str, str]]) -> str:
-    """Render label/value rows with the values in one column.
-
-    Hand-counted padding kept drifting: the connection card lined its values up
-    and the result card did not, so `Status  Healthy` and `Test command  curl`
-    began at different columns in the same style of panel. Measuring the widest
-    label keeps every card aligned and every future row aligned with it.
-    """
-    if not rows:
-        return ""
-    width = max(len(label) for label, _ in rows) + 2
-    return "\n".join(
-        f"[dim]{escape(label)}[/dim]{' ' * (width - len(label))}{escape(value)}"
-        for label, value in rows
-    )
+def _plain_rows(rows: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    return [(label, escape(value)) for label, value in rows]
 
 
 def _connection_card_markup(payload: dict[str, str]) -> str:
@@ -76,23 +64,23 @@ def _connection_card_markup(payload: dict[str, str]) -> str:
     def _field(key: str) -> str:
         return (payload.get(key) or "").strip() or "(unavailable)"
 
-    return _labelled_rows_markup(
-        [
-            ("Base URL", _field("base_url")),
-            ("Model ID", _field("model_id")),
-            ("Display", _field("display_name")),
-            ("API key", (payload.get("api_key") or "").strip() or "none"),
-            *_tool_calling_rows(payload),
-        ]
-    )
+    model_id = _field("model_id")
+    display = _field("display_name")
+    rows = [("Base URL", _field("base_url")), ("Model ID", model_id)]
+    # Usually the served name is the display name; only a different one earns
+    # a row of its own.
+    if display not in (model_id, "(unavailable)"):
+        rows.append(("Display", display))
+    rows.append(("API key", (payload.get("api_key") or "").strip() or "none"))
+    return labelled_rows_markup([*_plain_rows(rows), *_tool_calling_rows(payload)])
 
 
 def _tool_calling_rows(payload: dict[str, str]) -> list[tuple[str, str]]:
     status = payload.get("tool_calling")
     if status == "passed":
-        return [("Tools", "[green]verified[/] · ready for coding agents")]
+        return [("Tools", "[$success]verified[/] · ready for coding agents")]
     if status == "failed":
-        return [("Tools", "[yellow]failed[/] · chat only; coding agents cannot edit files")]
+        return [("Tools", "[$warning]failed[/] · chat only; coding agents cannot edit files")]
     return []
 
 
@@ -117,7 +105,7 @@ def _connection_copy_text(payload: dict[str, str]) -> str:
 
 def _result_card_markup(rows: list[tuple[str, str]]) -> str:
     """Render result-card fields for a finished status check or benchmark."""
-    return _labelled_rows_markup(rows)
+    return labelled_rows_markup(_plain_rows(rows))
 
 
 class MonitorScreen(CopyEnabledScreen):
@@ -334,11 +322,12 @@ class MonitorScreen(CopyEnabledScreen):
         """Render live follow and line-count state for the log viewport."""
         line_label = "line" if self._line_count == 1 else "lines"
         if self._following:
-            state = "[reverse]FOLLOWING[/]"
+            state = tag("FOLLOWING", SUCCESS_STYLE)
         else:
             new_label = "line" if self._unseen_lines == 1 else "lines"
             state = (
-                f"[warning]PAUSED[/]  [warning]· {self._unseen_lines} new {new_label}[/]"
+                f"{tag('PAUSED', WARNING_STYLE)}  "
+                f"[$warning]{self._unseen_lines} new {new_label}[/]"
             )
         search = ""
         if self._search_query:
@@ -572,11 +561,10 @@ class MonitorScreen(CopyEnabledScreen):
             self._append_log_line(_RETURN_HINT)
             self._show_failure_card(message)
             return
-        if message.success and self._connection_payload:
-            self._append_log_line(_RETURN_HINT)
+        # No return hint in the log on success: the progress panel above says
+        # it, and a deploy followed by warmup printed it once per phase.
+        if self._connection_payload:
             self._show_connection_card()
-        else:
-            self._append_log_line(_RETURN_HINT)
 
     def _capture_result_lines(self, cleaned_line: str) -> None:
         """Capture structured status-probe output while an operation runs."""

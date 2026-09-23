@@ -359,8 +359,8 @@ class LogViewer(Vertical):
     DEFAULT_CSS = """
     LogViewer {
         height: 1fr;
-        border: solid #17321e;
-        background: #0a0f0b;
+        border: round $foreground 20%;
+        background: $surface;
         padding: 0 1;
     }
     LogViewer Log {

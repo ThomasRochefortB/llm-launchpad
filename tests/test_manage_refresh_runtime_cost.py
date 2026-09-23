@@ -172,8 +172,8 @@ class ExplicitLiveFetchTests(unittest.IsolatedAsyncioTestCase):
             await screen.workers.wait_for_complete()
             await pilot.pause()
             table = screen.query_one("#manage-endpoint-table", AdaptiveDataTable)
-            served_col = table.visible_column_keys.index("served")
-            self.assertEqual(table.get_cell_at(Coordinate(0, served_col)), "-")
+            # No totals yet: the served column is left out, not filled with "-".
+            self.assertNotIn("served", table.visible_column_keys)
 
             # An explicit fetch is allowed to wake the container.
             fake_requests = types.SimpleNamespace(
@@ -185,7 +185,7 @@ class ExplicitLiveFetchTests(unittest.IsolatedAsyncioTestCase):
                 screen.action_fetch_live_selected()
                 await screen.workers.wait_for_complete()
                 await pilot.pause()
-            served = table.get_cell_at(Coordinate(0, served_col))
+            served = table.get_cell_at(Coordinate(0, table.visible_column_keys.index("served")))
             self.assertEqual(served, "4.6K")
             self.assertIsNone(cached.live_metrics_error)
             self.assertIsNotNone(cached.live_metrics_checked_at)

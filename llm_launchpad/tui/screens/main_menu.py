@@ -64,6 +64,7 @@ from ...core.quick_deploy_refresh import (
 from ...protocol.enums import BackendType, ComputeProvider
 from ...protocol.models import EndpointInfo, FleetDiscovery, ServingSnapshot, StorageSnapshot
 from ..billing_panel import render_provider_billing
+from ...core.deploy_log_summary import SUMMARY_SPINNER_FRAMES
 from ..connection import endpoint_model_summary, resolve_openai_base_url
 from ..fleet_status import (
     SCALE_TO_ZERO_PROVIDERS,
@@ -82,15 +83,15 @@ from ..workers import EndpointsFailed, EndpointsLoaded, StorageFailed, StorageLo
 from ..responsive import ViewportProfile
 from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
+from ..visual import screen_title
 
-BANNER = r"""[bold primary]
-_     _     __  __
-| |   | |   |  \/  |
-| |   | |   | |\/| |
-| |___| |___| |  | |
-|_____|_____|_|  |_|
-    LAUNCHPAD
-[/]"""
+# A letter-spaced wordmark rather than figlet art: one row instead of seven,
+# so the menu sits near the top of the column instead of under a block of
+# ASCII, and it reads the same at every width that shows it.
+BANNER = "[bold $primary]L L M[/]   [bold]L A U N C H P A D[/]"
+
+_STATUS_PLACEHOLDER = "Refreshing deployment status…"
+_SPINNER_INTERVAL_SECONDS = 0.1
 
 PANEL_SEPARATOR = "[dim]----------------------------------------[/dim]"
 
@@ -180,25 +181,25 @@ def _render_hf_auth_status(status: HuggingFaceAuthStatus | None = None) -> str:
     if status is None:
         return f"[dim]{HUGGINGFACE_MARKER} Checking Hugging Face auth...[/dim]"
     if status.authenticated:
-        return f"[green]{HUGGINGFACE_MARKER} Hugging Face authenticated[/green]"
+        return f"[$success]{HUGGINGFACE_MARKER} Hugging Face authenticated[/$success]"
     if status.error:
-        color = "red" if "invalid" in status.error.lower() else "yellow"
+        color = "$error" if "invalid" in status.error.lower() else "$warning"
         detail = escape(clip(status.error, 72))
         return f"[{color}]{HUGGINGFACE_MARKER} Hugging Face auth check failed: {detail}[/{color}]"
-    return f"[yellow]{HUGGINGFACE_MARKER} Hugging Face not authenticated (run: hf auth login)[/yellow]"
+    return f"[$warning]{HUGGINGFACE_MARKER} Hugging Face not authenticated (run: hf auth login)[/$warning]"
 
 
 def _render_modal_auth_status(status: ModalAuthStatus | None = None) -> str:
     if status is None:
         return f"[dim]{MODAL_MARKER} Checking Modal auth...[/dim]"
     if status.authenticated:
-        return f"[green]{MODAL_MARKER} Modal authenticated[/green]"
+        return f"[$success]{MODAL_MARKER} Modal authenticated[/$success]"
     if status.error:
         detail = escape(clip(status.error, 72))
-        return f"[yellow]{MODAL_MARKER} Modal auth check failed: {detail}[/yellow]"
+        return f"[$warning]{MODAL_MARKER} Modal auth check failed: {detail}[/$warning]"
     return (
-        f"[yellow]{MODAL_MARKER} Modal not authenticated "
-        f"(run: {PROVIDER_SETUP_COMMANDS[ComputeProvider.MODAL]})[/yellow]"
+        f"[$warning]{MODAL_MARKER} Modal not authenticated "
+        f"(run: {PROVIDER_SETUP_COMMANDS[ComputeProvider.MODAL]})[/$warning]"
     )
 
 
@@ -206,13 +207,13 @@ def _render_prime_auth_status(status: PrimeAuthStatus | None = None) -> str:
     if status is None:
         return f"[dim]{PRIME_MARKER} Checking Prime Intellect auth...[/dim]"
     if status.authenticated:
-        return f"[green]{PRIME_MARKER} Prime Intellect authenticated[/green]"
+        return f"[$success]{PRIME_MARKER} Prime Intellect authenticated[/$success]"
     if status.error:
         detail = escape(clip(status.error, 72))
-        return f"[yellow]{PRIME_MARKER} Prime Intellect auth check failed: {detail}[/yellow]"
+        return f"[$warning]{PRIME_MARKER} Prime Intellect auth check failed: {detail}[/$warning]"
     return (
-        f"[yellow]{PRIME_MARKER} Prime Intellect not authenticated "
-        f"(run: {PROVIDER_SETUP_COMMANDS[ComputeProvider.PRIME]})[/yellow]"
+        f"[$warning]{PRIME_MARKER} Prime Intellect not authenticated "
+        f"(run: {PROVIDER_SETUP_COMMANDS[ComputeProvider.PRIME]})[/$warning]"
     )
 
 
@@ -222,12 +223,12 @@ def _render_vast_auth_status() -> str:
         credentials = resolve_vast_credentials()
     except ValueError as exc:
         detail = escape(clip(str(exc), 72))
-        return f"[yellow]{VAST_MARKER} Vast.ai key unreadable: {detail}[/yellow]"
+        return f"[$warning]{VAST_MARKER} Vast.ai key unreadable: {detail}[/$warning]"
     if credentials.api_key:
-        return f"[green]{VAST_MARKER} Vast.ai key configured ({escape(credentials.source)})[/green]"
+        return f"[$success]{VAST_MARKER} Vast.ai key configured ({escape(credentials.source)})[/$success]"
     return (
-        f"[yellow]{VAST_MARKER} Vast.ai not configured "
-        f"(run: {PROVIDER_SETUP_COMMANDS[ComputeProvider.VAST]})[/yellow]"
+        f"[$warning]{VAST_MARKER} Vast.ai not configured "
+        f"(run: {PROVIDER_SETUP_COMMANDS[ComputeProvider.VAST]})[/$warning]"
     )
 
 
@@ -238,62 +239,15 @@ def _render_artificial_analysis_auth_status(
         return f"[dim]{ARTIFICIAL_ANALYSIS_MARKER} Checking Artificial Analysis auth...[/dim]"
     if status.authenticated:
         tier = f" ({escape(status.tier)} tier)" if status.tier else ""
-        return f"[green]{ARTIFICIAL_ANALYSIS_MARKER} Artificial Analysis authenticated{tier}[/green]"
+        return f"[$success]{ARTIFICIAL_ANALYSIS_MARKER} Artificial Analysis authenticated{tier}[/$success]"
     if status.error:
-        color = "red" if "invalid" in status.error.casefold() else "yellow"
+        color = "$error" if "invalid" in status.error.casefold() else "$warning"
         detail = escape(clip(status.error, 72))
         return f"[{color}]{ARTIFICIAL_ANALYSIS_MARKER} Artificial Analysis auth check failed: {detail}[/{color}]"
     return (
-        f"[yellow]{ARTIFICIAL_ANALYSIS_MARKER} Artificial Analysis not authenticated "
-        "(run: llm-launchpad aai-auth login)[/yellow]"
+        f"[$warning]{ARTIFICIAL_ANALYSIS_MARKER} Artificial Analysis not authenticated "
+        "(run: llm-launchpad aai-auth login)[/$warning]"
     )
-
-
-def _connection_summary(
-    modal_status: ModalAuthStatus | None = None,
-    prime_status: PrimeAuthStatus | None = None,
-) -> str:
-    """One-line provider connection state for the compact home header.
-
-    Optional providers (unconfigured, no key) read neutrally; only failed
-    checks and explicit errors use warning styling. Full per-provider detail
-    lives in the Details view.
-    """
-    connected: list[str] = []
-    pending: list[str] = []
-    failed: list[str] = []
-    if modal_status is not None:
-        if modal_status.authenticated:
-            connected.append("Modal")
-        elif modal_status.error:
-            failed.append("Modal")
-        else:
-            pending.append("Modal")
-    if prime_status is not None:
-        if prime_status.authenticated:
-            connected.append("Prime")
-        elif prime_status.error:
-            failed.append("Prime")
-        else:
-            pending.append("Prime")
-    try:
-        credentials = resolve_vast_credentials()
-        if credentials.api_key:
-            connected.append("Vast.ai")
-    except ValueError:
-        failed.append("Vast.ai")
-    parts: list[str] = []
-    if connected:
-        parts.append(f"[green]{len(connected)} connected[/green]")
-    if pending:
-        parts.append(f"[dim]{len(pending)} pending[/dim]")
-    elif modal_status is None and prime_status is None and not connected:
-        parts.append("[dim]checking...[/dim]")
-    if failed:
-        parts.append(f"[yellow]{len(failed)} needs attention[/yellow]")
-    if not parts:
-        return "[dim]Providers: not configured[/dim]"
-    return f"[dim]Providers:[/dim] {' · '.join(parts)}"
 
 
 def _render_auth_status_block(
@@ -302,13 +256,81 @@ def _render_auth_status_block(
     hf_status: HuggingFaceAuthStatus | None = None,
     prime_status: PrimeAuthStatus | None = None,
     aai_status: ArtificialAnalysisAuthStatus | None = None,
+    spinner: str = "",
 ) -> str:
+    """Render one line per credential; ``spinner`` animates checks in flight."""
     lines: list[str] = [_render_modal_auth_status(modal_status)]
     lines.append(_render_prime_auth_status(prime_status))
     lines.append(_render_vast_auth_status())
     lines.append(_render_hf_auth_status(hf_status))
     lines.append(_render_artificial_analysis_auth_status(aai_status))
+    if spinner:
+        lines = [_with_spinner(line, spinner) for line in lines]
     return "\n".join(lines)
+
+
+_CHECKING_SUFFIX = "...[/dim]"
+
+# Compute providers get a line of their own on Home when they need attention;
+# the optional services only change colour there, since the Details view
+# carries their full text.
+_COMPUTE_CREDENTIALS = frozenset({"Modal", "Prime Intellect", "Vast.ai"})
+
+
+def _render_auth_status_compact(
+    modal_status: ModalAuthStatus | None = None,
+    hf_status: HuggingFaceAuthStatus | None = None,
+    prime_status: PrimeAuthStatus | None = None,
+    aai_status: ArtificialAnalysisAuthStatus | None = None,
+    spinner: str = "",
+) -> str:
+    """One line naming every credential, coloured by state, plus fixes.
+
+    Five full sentences -- mostly "Checking ... auth..." or "authenticated"
+    -- took five rows of the home screen to say "all fine". The marker line
+    says the same at a glance; a compute provider that needs attention still
+    gets its own line with the command that fixes it.
+    """
+    entries = (
+        (MODAL_MARKER, "Modal", _render_modal_auth_status(modal_status)),
+        (PRIME_MARKER, "Prime Intellect", _render_prime_auth_status(prime_status)),
+        (VAST_MARKER, "Vast.ai", _render_vast_auth_status()),
+        (HUGGINGFACE_MARKER, "Hugging Face", _render_hf_auth_status(hf_status)),
+        (
+            ARTIFICIAL_ANALYSIS_MARKER,
+            "Artificial Analysis",
+            _render_artificial_analysis_auth_status(aai_status),
+        ),
+    )
+    chips: list[str] = []
+    problems: list[str] = []
+    for marker, name, line in entries:
+        label = f"{marker} {name}"
+        if line.startswith("[$success]"):
+            chips.append(f"[$success]{label}[/]")
+        elif line.endswith(_CHECKING_SUFFIX):
+            frame = f" [$primary]{spinner}[/]" if spinner else ""
+            chips.append(f"[dim]{label}[/]{frame}")
+        elif line.startswith(("[$warning]", "[$error]")):
+            style = "$error" if line.startswith("[$error]") else "$warning"
+            chips.append(f"[{style}]{label}[/]")
+            if name in _COMPUTE_CREDENTIALS:
+                problems.append(line)
+        else:
+            chips.append(f"[dim]{label}[/]")
+    # Compute providers on one line, optional services on the next: each fits
+    # 40 columns, where a single line wrapped mid-name ("Artificial /
+    # Analysis") at 80.
+    compute = "  ".join(chips[:3])
+    services = "  ".join(chips[3:])
+    return "\n".join([compute, services, *problems])
+
+
+def _with_spinner(line: str, spinner: str) -> str:
+    """Turn a "Checking ... auth..." line's trailing dots into a spinner."""
+    if not line.endswith(_CHECKING_SUFFIX):
+        return line
+    return f"{line.removesuffix(_CHECKING_SUFFIX)}[/dim] [$primary]{spinner}[/]"
 
 
 def _state_bucket(state: str) -> str:
@@ -820,6 +842,7 @@ class MainMenuScreen(CopyEnabledScreen):
         self._action_labels: _ActionLabels | None = None
         self._action_label_ceiling = 0
         self._last_launch = load_last_launch()
+        self._spinner_index = 0
 
     def compose(self) -> ComposeResult:
         with Vertical(id="main-menu-root"):
@@ -836,7 +859,7 @@ class MainMenuScreen(CopyEnabledScreen):
                         # Wraps rather than stopping mid-word: the narrow left
                         # column used to cut this to "... Vast.ai LLM".
                         yield Static(
-                            f"[bold]{version_text}[/bold][dim]Modal + Prime Intellect + Vast.ai LLM backends[/dim]",
+                            f"[dim]{version_text.strip()}[/dim]",
                             classes="centered main-menu-version",
                         )
                         yield Static("", classes="decorative-spacer")
@@ -853,11 +876,13 @@ class MainMenuScreen(CopyEnabledScreen):
                         )
                         yield Static("", id="fleet-summary-line")
                     with Vertical(id="main-menu-side-column"):
-                        with Vertical(id="deployment-status-panel"):
-                            yield Static("[bold primary]Deployment Status[/]", id="deployment-status-title")
-                            yield Static("[dim]Refreshing deployment status...[/dim]", id="deployment-status-body")
-                        with Vertical(id="billing-report-panel"):
-                            yield Static("[bold primary]Provider Billing[/]", id="billing-report-title")
+                        status_panel = Vertical(id="deployment-status-panel")
+                        status_panel.border_title = "Deployment Status"
+                        with status_panel:
+                            yield Static(self._status_placeholder(), id="deployment-status-body")
+                        billing_panel = Vertical(id="billing-report-panel")
+                        billing_panel.border_title = "Provider Billing"
+                        with billing_panel:
                             # First paint already names every provider, so the
                             # panel does not change shape as readings land.
                             yield Static(
@@ -870,7 +895,7 @@ class MainMenuScreen(CopyEnabledScreen):
                                 id="billing-report-body",
                             )
             yield Static(
-                _render_auth_status_block(username=self.username),
+                _render_auth_status_compact(),
                 id="auth-status-block",
             )
         yield FittedFooter()
@@ -905,6 +930,48 @@ class MainMenuScreen(CopyEnabledScreen):
             self._refresh_billing_panels,
             name="main-menu-billing-refresh",
         )
+        self.set_interval(
+            _SPINNER_INTERVAL_SECONDS,
+            self._tick_loading,
+            name="main-menu-loading-spinner",
+        )
+
+    def _loading_frame(self) -> str:
+        return SUMMARY_SPINNER_FRAMES[self._spinner_index]
+
+    def _status_placeholder(self) -> str:
+        return f"[$primary]{self._loading_frame()}[/] [dim]{_STATUS_PLACEHOLDER}[/dim]"
+
+    def _tick_loading(self) -> None:
+        """Turn the spinner on every loading placeholder that is still showing.
+
+        Static "checking..." text reads the same whether a request is in flight
+        or has hung; motion says work is happening. Nothing is re-rendered once
+        every placeholder has been replaced by a result.
+        """
+        try:
+            body = self.query_one("#deployment-status-body", Static)
+        except Exception:
+            return
+        status_loading = _STATUS_PLACEHOLDER in str(body.content)
+        billing_loading = any(
+            row.status is BillingStatus.LOADING for row in self._provider_billing.values()
+        )
+        auth_loading = None in (
+            self._modal_auth_status,
+            self._prime_auth_status,
+            self._hf_auth_status,
+            self._aai_auth_status,
+        )
+        if not (status_loading or billing_loading or auth_loading):
+            return
+        self._spinner_index = (self._spinner_index + 1) % len(SUMMARY_SPINNER_FRAMES)
+        if status_loading:
+            body.update(self._status_placeholder())
+        if billing_loading:
+            self._update_billing_panel()
+        if auth_loading:
+            self._render_connection_widgets()
 
     def on_screen_suspend(self, _: events.ScreenSuspend) -> None:
         self._was_suspended = True
@@ -1148,25 +1215,20 @@ class MainMenuScreen(CopyEnabledScreen):
         """Refresh both the full auth block and the compact summary line."""
         try:
             self.query_one("#auth-status-block", Static).update(
-                _render_auth_status_block(
-                    username=self.username,
+                _render_auth_status_compact(
                     modal_status=self._modal_auth_status,
                     hf_status=self._hf_auth_status,
                     prime_status=self._prime_auth_status,
                     aai_status=self._aai_auth_status,
+                    spinner=self._loading_frame(),
                 )
             )
         except Exception:
             pass
         # The compact line is fleet-first once rows arrive; connection state
         # until then. _update_fleet_summary owns it afterwards.
-        if not self._runtime_rows:
-            try:
-                self.query_one("#fleet-summary-line", Static).update(
-                    _connection_summary(self._modal_auth_status, self._prime_auth_status)
-                )
-            except Exception:
-                pass
+        # The marker line above already says which providers are connected;
+        # the compact line waits for fleet rows rather than repeating it.
 
     def _refresh_modal_auth_status(self) -> None:
         if self._modal_auth_refresh_inflight:
@@ -1317,7 +1379,7 @@ class MainMenuScreen(CopyEnabledScreen):
         if self._status_refresh_inflight:
             return
         self._status_refresh_inflight = True
-        self.query_one("#deployment-status-body", Static).update("[dim]Refreshing deployment status...[/dim]")
+        self.query_one("#deployment-status-body", Static).update(self._status_placeholder())
         refresh = getattr(self.app, "begin_endpoint_refresh", None)
         if callable(refresh):
             refresh(self, force=False)
@@ -1390,6 +1452,7 @@ class MainMenuScreen(CopyEnabledScreen):
             render_provider_billing(
                 [self._provider_billing[provider] for provider in PROVIDER_BILLING_ORDER],
                 storage_snapshot=self._storage_snapshot,
+                spinner=self._loading_frame(),
             )
         )
 
@@ -1526,7 +1589,7 @@ class MainMenuScreen(CopyEnabledScreen):
     def on_deployments_load_failed(self, message: DeploymentsLoadFailed) -> None:
         self._status_refresh_inflight = False
         self.query_one("#deployment-status-body", Static).update(
-            "[yellow]Status unavailable.[/yellow]\n"
+            "[$warning]Status unavailable.[/$warning]\n"
             f"[dim]{clip(message.error, 80)}[/dim]"
         )
         self._update_fleet_summary([])
@@ -1607,7 +1670,7 @@ class HomeDetailsScreen(CopyEnabledScreen):
         from ..widgets.fitted_footer import FittedFooter
 
         with VerticalScroll(classes="screen-scroll"):
-            yield Static("[bold primary]Details[/]  [dim]Fleet, billing, connections[/dim]")
+            yield Static(screen_title("Details"))
             yield Static("[bold]Fleet[/bold]", classes="settings-section")
             yield Static("[dim]Loading fleet...[/dim]", id="home-details-fleet")
             yield Static("[bold]Billing[/bold]", classes="settings-section")
@@ -1629,8 +1692,17 @@ class HomeDetailsScreen(CopyEnabledScreen):
         except Exception:
             pass
         try:
-            connections = menu.query_one("#auth-status-block", Static).content
-            self.query_one("#home-details-connections", Static).update(connections)
+            # Home shows the compact marker line; this view is where each
+            # credential's full sentence belongs.
+            self.query_one("#home-details-connections", Static).update(
+                _render_auth_status_block(
+                    username=menu.username,
+                    modal_status=menu._modal_auth_status,
+                    hf_status=menu._hf_auth_status,
+                    prime_status=menu._prime_auth_status,
+                    aai_status=menu._aai_auth_status,
+                )
+            )
         except Exception:
             pass
 

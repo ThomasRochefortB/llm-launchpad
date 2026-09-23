@@ -10,6 +10,7 @@ from textual.widgets import Button, Static
 
 from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
+from ..visual import screen_title
 
 _MODAL_COMMAND = "modal setup"
 _PRIME_COMMAND = "prime login"
@@ -27,7 +28,7 @@ class SetupRequiredScreen(CopyEnabledScreen):
     def compose(self) -> ComposeResult:
         with Vertical(id="setup-required-root"):
             with VerticalScroll(id="setup-required-scroll", classes="screen-scroll"):
-                yield Static("[bold primary]Compute provider required[/]")
+                yield Static(screen_title("Compute provider required"))
                 yield Static(
                     "llm-launchpad deploys inference endpoints through at least one "
                     "compute provider. None currently has credentials.\n",
@@ -106,12 +107,12 @@ class SetupRequiredScreen(CopyEnabledScreen):
             stage = getattr(getattr(row, "stage", None), "display_name", str(getattr(row, "stage", "")))
             detail = str(getattr(row, "detail", "") or "")
             color = {
-                "Authenticated": "green",
-                "Checking": "yellow",
+                "Authenticated": "$success",
+                "Checking": "$warning",
                 "Not configured": "dim",
                 "Not installed": "dim",
-                "Authentication failed": "red",
-                "Verification unavailable": "yellow",
+                "Authentication failed": "$error",
+                "Verification unavailable": "$warning",
             }.get(stage, "")
             label = f"[{color}]{escape(stage)}[/]" if color else escape(stage)
             lines.append(f"• {escape(str(name))}: {label}" + (f" — {escape(detail)}" if detail else ""))
@@ -153,7 +154,7 @@ class SetupRequiredScreen(CopyEnabledScreen):
                 pass
         self._render_readiness(self._local_readiness())
         self.query_one("#setup-required-feedback", Static).update(
-            "[yellow]Still no provider with credentials.[/yellow] "
+            "[$warning]Still no provider with credentials.[/$warning] "
             f"Run {_MODAL_COMMAND}, {_PRIME_COMMAND}, or {_VAST_COMMAND}, "
             "then re-check."
         )

@@ -5,11 +5,23 @@ from __future__ import annotations
 from rich.markup import escape
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Static
 
 from .fitted_footer import FittedFooter
+
+# Wide enough for `ctrl+shift+c`-sized chords; longer key lists wrap.
+_MAX_KEY_WIDTH = 16
+_MAX_KEYS_PER_ROW = 2
+
+# Textual names some keys after the character rather than the key cap.
+_KEY_NAMES = {"question_mark": "?", "slash": "/", "escape": "esc", "space": "space"}
+
+
+def _key_label(key: str) -> str:
+    """Spell a binding key the way the key cap reads, keeping full chords."""
+    return "+".join(_KEY_NAMES.get(part, part) for part in key.split("+"))
 
 
 def _class_bindings(obj: object) -> list[Binding]:
@@ -102,6 +114,13 @@ def _iter_effective_bindings(
             "Half Page Down",
             "Focus Next",
             "Focus Previous",
+            # A focused list's own movement keys: the "Focused control"
+            # section already sums these up as one row.
+            "Up",
+            "Down",
+            "First",
+            "Last",
+            "Select",
         }
     )
     if app is not None:
@@ -179,16 +198,42 @@ class HelpOverlayScreen(ModalScreen):
         align: center middle;
     }
     #help-overlay-card {
-        width: 64;
+        width: 72;
         max-width: 92%;
         height: auto;
         max-height: 80%;
         background: $surface;
         border: round $primary;
-        padding: 1 2;
+        border-title-color: $primary;
+        border-title-style: bold;
+        padding: 0 2;
     }
     #help-overlay-body {
         height: auto;
+    }
+    .help-section {
+        color: $text-muted;
+        text-style: bold;
+        margin: 1 0 0 0;
+    }
+    .help-row {
+        height: auto;
+    }
+    .help-key {
+        color: $accent;
+        text-style: bold;
+        height: auto;
+        /* The gutter lives inside the key cell, so a key list that wraps to
+           the full column still stops two cells short of its description. */
+        padding: 0 2 0 0;
+    }
+    .help-label {
+        width: 1fr;
+        height: auto;
+    }
+    #help-overlay-hint {
+        color: $text-muted;
+        margin: 1 0;
     }
     """
 
@@ -230,25 +275,43 @@ class HelpOverlayScreen(ModalScreen):
         return cls(sections)
 
     def compose(self) -> ComposeResult:
-        # One column width for every section, measured rather than guessed:
-        # a fixed 12 left `ctrl+shift+c` touching its own description.
-        keys = [key for _section, bindings in self._sections for key, _label in bindings]
-        key_width = max((len(key) for key in keys), default=0) + 2
+        # One key column for every section, measured rather than guessed (a
+        # fixed 12 left `ctrl+shift+c` touching its description) but capped:
+        # Copy lists six chords, and sizing the column to that pushed every
+        # description in the overlay onto a line of its own. A longer key list
+        # wraps inside its own column instead.
+        # Copy and Paste each carry six platform aliases (super+c, meta+c,
+        # cmd+c, ...). The first two work in every terminal; the rest turned
+        # one row into four.
+        sections = [
+            (
+                name,
+                [
+                    (", ".join(map(_key_label, key.split(", ")[:_MAX_KEYS_PER_ROW])), label)
+                    for key, label in bindings
+                ],
+            )
+            for name, bindings in self._sections
+        ]
+        keys = [key for _section, bindings in sections for key, _label in bindings]
+        key_width = min(max((len(key) for key in keys), default=0), _MAX_KEY_WIDTH) + 2
 
-        with Vertical(id="help-overlay-card"):
-            yield Static("[bold]Keyboard shortcuts[/]", id="help-overlay-title")
+        card = Vertical(id="help-overlay-card")
+        card.border_title = "Keyboard shortcuts"
+        with card:
             with VerticalScroll(id="help-overlay-body"):
-                for section_name, bindings in self._sections:
-                    yield Static(f"[bold]{section_name}[/bold]")
+                for section_name, bindings in sections:
+                    yield Static(section_name, classes="help-section")
                     for key, label in bindings:
-                        padding = " " * (key_width - len(key))
-                        yield Static(f"  [bold]{escape(key)}[/]{padding}{escape(label)}")
-                    yield Static("")
+                        with Horizontal(classes="help-row"):
+                            key_cell = Static(escape(key), classes="help-key")
+                            key_cell.styles.width = key_width
+                            yield key_cell
+                            yield Static(escape(label), classes="help-label")
                 yield Static(
-                    "[dim]Navigate with Tab, Shift+Tab, arrow keys, and Enter. "
-                    "Select text and copy/paste with your terminal's shortcuts. "
-                    "In tmux, use the terminal's selection override if needed "
-                    "(usually Shift+drag).[/dim]"
+                    "Tab moves between controls · select and copy text with "
+                    "your terminal (in tmux, usually Shift+drag)",
+                    id="help-overlay-hint",
                 )
         yield FittedFooter()
 

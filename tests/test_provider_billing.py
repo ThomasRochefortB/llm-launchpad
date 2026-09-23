@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import unittest
 
-from rich.markup import render as render_markup
+from textual.content import Content
 
 from llm_launchpad.core.provider_billing import (
     PROVIDER_BILLING_ORDER,
@@ -31,7 +31,7 @@ _GIB = 1024**3
 
 
 def _plain(markup: str) -> str:
-    return str(render_markup(markup))
+    return Content.from_markup(markup).plain
 
 
 def _snapshot(size_bytes: int) -> StorageSnapshot:
