@@ -112,6 +112,44 @@ class VastBackendTests(unittest.TestCase):
         patcher = patch("llm_launchpad.core.vast_backend.requests.request", return_value=self.response)
         self.request = patcher.start()
         self.addCleanup(patcher.stop)
+        sleeper = patch("llm_launchpad.core.vast_backend.time.sleep")
+        self.sleep = sleeper.start()
+        self.addCleanup(sleeper.stop)
+
+    def test_a_throttled_read_is_retried_and_then_succeeds(self) -> None:
+        """One 429 cost a live certification its last check (2026-09-23)."""
+        throttled = Mock(status_code=429, headers={"Retry-After": "2"})
+        self.response.json.return_value = {"id": 12}
+        self.request.side_effect = [throttled, self.response]
+        self.assertEqual(self.backend.account_id(), "12")
+        self.sleep.assert_called_once_with(2.0)
+        throttled.close.assert_called_once()
+
+    def test_a_throttled_create_is_not_repeated(self) -> None:
+        """Renting twice would bill twice; only safe requests are retried."""
+        self.response.status_code = 429
+        with self.assertRaises(VastApiError):
+            self.backend.create_instance("1001", image="image", disk_gb=100, label="owned")
+        self.assertEqual(self.request.call_count, 1)
+        self.sleep.assert_not_called()
+
+    def test_an_offer_search_is_retried_despite_being_a_post(self) -> None:
+        """Search is POST /bundles/ but rents nothing; a 429 there failed a run."""
+        from llm_launchpad.protocol.models import VastOfferQuery
+
+        throttled = Mock(status_code=429, headers={})
+        self.response.json.return_value = {"offers": []}
+        self.request.side_effect = [throttled, self.response]
+        self.backend.list_offers(VastOfferQuery())
+        self.assertEqual(self.request.call_count, 2)
+        self.assertEqual(self.request.call_args.args[0], "POST")
+
+    def test_a_read_gives_up_after_bounded_retries(self) -> None:
+        self.response.status_code = 429
+        with self.assertRaises(VastApiError):
+            self.backend.account_id()
+        self.assertEqual(self.request.call_count, 4)
+        self.assertTrue(all(call.args[0] <= 8.0 for call in self.sleep.call_args_list))
 
     def test_validates_account_without_returning_account_secrets(self) -> None:
         self.response.json.return_value = {"id": 12, "ssh_key": "secret", "api_key": "private-key"}

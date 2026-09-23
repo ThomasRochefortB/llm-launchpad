@@ -67,6 +67,7 @@ from ...protocol.models import (
 from ..responsive import ViewportProfile, WidthMode
 from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
+from ..compat import highlighted_option, replace_options
 from ..visual import DEPLOY_STEPS, screen_title
 from ..widgets.fitted_option_list import FittedOptionList
 
@@ -988,7 +989,7 @@ class FastDeployScreen(CopyEnabledScreen):
         self.query_one("#fast-deploy-detail", Static).update("")
         if info.error:
             self._catalog_building = False
-            option_list.set_options(
+            replace_options(option_list, 
                 [
                     Option(
                         "  Open Advanced deploy to configure a model manually",
@@ -1006,7 +1007,7 @@ class FastDeployScreen(CopyEnabledScreen):
         else:
             self._catalog_building = True
             frame = SUMMARY_SPINNER_FRAMES[self._catalog_spinner_index]
-            option_list.set_options(
+            replace_options(option_list, 
                 [Option(f"  {frame} Building the live model catalog…", disabled=True)]
             )
             status = (
@@ -1026,7 +1027,7 @@ class FastDeployScreen(CopyEnabledScreen):
         frame = SUMMARY_SPINNER_FRAMES[self._catalog_spinner_index]
         try:
             option_list = self.query_one("#fast-deploy-list", OptionList)
-            option_list.set_options(
+            replace_options(option_list, 
                 [Option(f"  {frame} Building the live model catalog…", disabled=True)]
             )
             self.query_one("#fast-deploy-status", Static).update(
@@ -1067,7 +1068,7 @@ class FastDeployScreen(CopyEnabledScreen):
                         plan.quote.price_per_hour_usd or float("inf"),
                     )
                 )
-                self.app.push_quick_deploy(  # type: ignore[attr-defined]
+                self.app.push_quick_deploy(
                     row.plan,
                     alternative_plans=tuple(alternatives),
                     catalog_profile=row.profile,
@@ -1078,12 +1079,12 @@ class FastDeployScreen(CopyEnabledScreen):
             return
         plans = resolve_quick_deploy_plans((profile,))
         if plans:
-            self.app.push_quick_deploy(  # type: ignore[attr-defined]
+            self.app.push_quick_deploy(
                 plans[0],
                 alternative_plans=plans,
             )
         else:
-            self.app.push_quick_deploy(profile)  # type: ignore[attr-defined]
+            self.app.push_quick_deploy(profile)
 
     def _open_model(self, option_id: str) -> None:
         model = self._model_by_id.get(option_id)
@@ -1100,7 +1101,7 @@ class FastDeployScreen(CopyEnabledScreen):
             "[dim]Checking live infrastructure across connected sources...[/dim]"
         )
         option_list = self.query_one("#fast-deploy-list", OptionList)
-        option_list.set_options(
+        replace_options(option_list, 
             [Option("  Checking live infrastructure...", disabled=True)]
         )
         self.query_one("#fast-deploy-detail", Static).update("")
@@ -1240,7 +1241,7 @@ class FastDeployScreen(CopyEnabledScreen):
         elif self._selected_model is not None:
             self._phase = "loading"
             self._infra_rows = {}
-            self.query_one("#fast-deploy-list", OptionList).set_options([
+            replace_options(self.query_one("#fast-deploy-list", OptionList), [
                 Option("  Refreshing infrastructure…", disabled=True),
             ])
             self._load_availability(purpose="infra")
@@ -1273,7 +1274,7 @@ class FastDeployScreen(CopyEnabledScreen):
             # Tier option ids are the underlying quote ids, so selection and the
             # detail pane keep working unchanged whichever view is showing.
             quality_width = _tier_quality_width(tiers)
-            option_list.set_options(
+            replace_options(option_list, 
                 [
                     Option(
                         _tier_option(tier, width_mode, quality_width),
@@ -1292,7 +1293,7 @@ class FastDeployScreen(CopyEnabledScreen):
             option_list.highlighted = recommended
             self._update_infra_detail(self._infra_rows[tiers[recommended].plan.quote.id])
         else:
-            option_list.set_options(
+            replace_options(option_list, 
                 [
                     Option(_infra_option(row, width_mode), id=row.plan.quote.id)
                     for row in rows
@@ -1405,7 +1406,7 @@ class FastDeployScreen(CopyEnabledScreen):
         self._infra_rows = {}
         gpu = escape(self._gpu_filter)
         option_list = self.query_one("#fast-deploy-list", OptionList)
-        option_list.set_options(
+        replace_options(option_list, 
             [Option(f"  No placements on {gpu}", disabled=True)]
         )
         self.query_one("#fast-deploy-detail", Static).update("")
@@ -1426,7 +1427,7 @@ class FastDeployScreen(CopyEnabledScreen):
         if connected_providers is not None and ComputeProvider.MODAL not in connected_providers:
             self._fallback_profiles = {}
             option_list = self.query_one("#fast-deploy-list", OptionList)
-            option_list.set_options(
+            replace_options(option_list, 
                 [Option("  No compatible connected provider is available", disabled=True)]
             )
             self.query_one("#fast-deploy-detail", Static).update("")
@@ -1446,7 +1447,7 @@ class FastDeployScreen(CopyEnabledScreen):
         )
         if not options:
             options = [Option("  No catalog profiles for this model", disabled=True)]
-        option_list.set_options(options)
+        replace_options(option_list, options)
         if profiles:
             option_list.highlighted = 0
             self._update_fallback_detail(profiles[0])
@@ -1460,7 +1461,7 @@ class FastDeployScreen(CopyEnabledScreen):
             option_list = self.query_one("#fast-deploy-list", OptionList)
         except Exception:
             return None
-        highlighted = option_list.highlighted_option
+        highlighted = highlighted_option(option_list)
         if highlighted is None or highlighted.id is None:
             return None
         return str(highlighted.id)
@@ -1611,7 +1612,7 @@ class FastDeployScreen(CopyEnabledScreen):
                 ]
             else:
                 options = [Option("  No models in the quick-deploy catalog", disabled=True)]
-        option_list.set_options(options)
+        replace_options(option_list, options)
         if visible:
             selected_id = preferred_id if preferred_id in model_indices else next(iter(model_indices))
             option_list.highlighted = model_indices[selected_id]
@@ -1720,7 +1721,7 @@ class FastDeployScreen(CopyEnabledScreen):
     def action_choose_selected(self) -> None:
         if isinstance(self.focused, (Select, Input)):
             raise SkipAction()
-        highlighted = self.query_one("#fast-deploy-list", OptionList).highlighted_option
+        highlighted = highlighted_option(self.query_one("#fast-deploy-list", OptionList))
         if highlighted is not None and highlighted.id is not None:
             self._choose(str(highlighted.id))
 

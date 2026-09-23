@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from typing import Any, Literal
+
+from rich.markup import escape
+
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import Input, Static, Switch
@@ -26,6 +30,14 @@ class FormField(Vertical):
         height: auto;
         text-wrap: wrap;
     }
+    FormField .form-error {
+        color: $error;
+        height: auto;
+        text-wrap: wrap;
+    }
+    FormField .form-error.hidden {
+        display: none;
+    }
     """
 
     def __init__(
@@ -36,8 +48,8 @@ class FormField(Vertical):
         hint: str = "",
         password: bool = False,
         required: bool = False,
-        input_type: str = "text",
-        **kwargs: object,
+        input_type: Literal["integer", "number", "text"] = "text",
+        **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self._label = label
@@ -62,10 +74,28 @@ class FormField(Vertical):
         )
         if self._hint:
             yield Static(self._hint, classes="form-hint")
+        # Validation that refuses a deploy says why here, under the field, and
+        # keeps saying it until the value changes: a toast was gone before the
+        # reader had scrolled back to find which field it meant.
+        yield Static("", classes="form-error hidden")
 
     @property
     def value(self) -> str:
         return self.query_one(f"#{self._field_id}", Input).value
+
+    def show_error(self, message: str) -> None:
+        """Mark the field invalid and say why beneath it."""
+        self.query_one(f"#{self._field_id}", Input).add_class("-rejected")
+        error = self.query_one(".form-error", Static)
+        error.update(f"✗ {escape(message)}")
+        error.remove_class("hidden")
+
+    def clear_error(self) -> None:
+        """Drop an error shown by :meth:`show_error`."""
+        self.query_one(f"#{self._field_id}", Input).remove_class("-rejected")
+        error = self.query_one(".form-error", Static)
+        error.update("")
+        error.add_class("hidden")
 
 
 class ToggleField(Horizontal):
@@ -107,7 +137,7 @@ class ToggleField(Horizontal):
         label: str,
         field_id: str,
         default: bool = False,
-        **kwargs: object,
+        **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self._label = label

@@ -279,6 +279,15 @@ Input.-invalid {
     border: tall $error;
 }
 
+/* A field a refused deploy pointed at (see _DeployFormFeedbackMixin). Not
+   `-invalid`: Textual owns that class and clears it on its own validation. */
+Input.-rejected,
+Select.-rejected > SelectCurrent,
+Input.-rejected:focus,
+Select.-rejected:focus > SelectCurrent {
+    border: tall $error;
+}
+
 Input:focus {
     border: tall $primary;
     background: $surface-lighten-1;
@@ -363,11 +372,6 @@ Button.-error:focus {
 .dialog-title {
     color: $primary;
     text-style: bold;
-}
-
-.dialog-warning {
-    color: $warning;
-    text-wrap: wrap;
 }
 
 .dialog-actions {

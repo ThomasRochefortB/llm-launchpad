@@ -83,6 +83,7 @@ from ..workers import EndpointsFailed, EndpointsLoaded, StorageFailed, StorageLo
 from ..responsive import ViewportProfile
 from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
+from ..compat import highlighted_option, replace_options, static_content
 from ..visual import screen_title
 
 # A letter-spaced wordmark rather than figlet art: one row instead of seven,
@@ -410,7 +411,7 @@ def _probe_row_runtime_status(
         return RuntimeProbeResult("in_progress", "missing URL")
 
     try:
-        import requests  # type: ignore
+        import requests
     except ImportError:
         return RuntimeProbeResult(modal_runtime, "requests unavailable")
 
@@ -953,7 +954,7 @@ class MainMenuScreen(CopyEnabledScreen):
             body = self.query_one("#deployment-status-body", Static)
         except Exception:
             return
-        status_loading = _STATUS_PLACEHOLDER in str(body.content)
+        status_loading = _STATUS_PLACEHOLDER in str(static_content(body))
         billing_loading = any(
             row.status is BillingStatus.LOADING for row in self._provider_billing.values()
         )
@@ -1095,10 +1096,10 @@ class MainMenuScreen(CopyEnabledScreen):
             return
         if self._action_labels == labels:
             return
-        highlighted = action_list.highlighted_option
+        highlighted = highlighted_option(action_list)
         selected_id = str(highlighted.id) if highlighted is not None else "deploy"
         self._action_labels = labels
-        action_list.set_options(
+        replace_options(action_list, 
             [Option(label, id=option_id) for option_id, label in labels]
         )
         for index, (option_id, _) in enumerate(labels):
@@ -1108,7 +1109,7 @@ class MainMenuScreen(CopyEnabledScreen):
 
     def action_toggle_details(self) -> None:
         """Open fleet, billing and connection detail as a full-width view."""
-        self.app.push_screen(HomeDetailsScreen(self))  # type: ignore[attr-defined]
+        self.app.push_screen(HomeDetailsScreen(self))
 
     def action_close_details(self) -> None:
         """Close the narrow details drawer without changing screens."""
@@ -1391,7 +1392,7 @@ class MainMenuScreen(CopyEnabledScreen):
         if poster is None:
             return
         try:
-            list_instances = getattr(self.app, "list_instances", None)  # type: ignore[attr-defined]
+            list_instances = getattr(self.app, "list_instances", None)
             rows = list_instances() if callable(list_instances) else ModalBackend.list_apps()
         except Exception as exc:
             poster(DeploymentsLoadFailed(error=str(exc)))
@@ -1611,23 +1612,23 @@ class MainMenuScreen(CopyEnabledScreen):
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         option_id = event.option.id
         if option_id == "deploy":
-            self.app.action_push_deploy()  # type: ignore[attr-defined]
+            self.app.action_push_deploy()
         elif option_id == "relaunch":
-            self.app.action_push_relaunch()  # type: ignore[attr-defined]
+            self.app.action_push_relaunch()
         elif option_id == "custom-deploy":
-            self.app.action_push_custom_deploy()  # type: ignore[attr-defined]
+            self.app.action_push_custom_deploy()
         elif option_id == "manage":
-            self.app.action_push_manage()  # type: ignore[attr-defined]
+            self.app.action_push_manage()
         elif option_id == "storage":
-            self.app.action_push_storage()  # type: ignore[attr-defined]
+            self.app.action_push_storage()
         elif option_id == "settings":
-            self.app.action_push_settings()  # type: ignore[attr-defined]
+            self.app.action_push_settings()
 
     def action_select_deploy(self) -> None:
-        self.app.action_push_deploy()  # type: ignore[attr-defined]
+        self.app.action_push_deploy()
 
     def action_select_relaunch(self) -> None:
-        self.app.action_push_relaunch()  # type: ignore[attr-defined]
+        self.app.action_push_relaunch()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         if action == "select_relaunch" and self._last_launch is None:
@@ -1635,16 +1636,16 @@ class MainMenuScreen(CopyEnabledScreen):
         return super().check_action(action, parameters)
 
     def action_select_custom_deploy(self) -> None:
-        self.app.action_push_custom_deploy()  # type: ignore[attr-defined]
+        self.app.action_push_custom_deploy()
 
     def action_select_manage(self) -> None:
-        self.app.action_push_manage()  # type: ignore[attr-defined]
+        self.app.action_push_manage()
 
     def action_select_storage(self) -> None:
-        self.app.action_push_storage()  # type: ignore[attr-defined]
+        self.app.action_push_storage()
 
     def action_select_settings(self) -> None:
-        self.app.action_push_settings()  # type: ignore[attr-defined]
+        self.app.action_push_settings()
 
 
 class HomeDetailsScreen(CopyEnabledScreen):
@@ -1682,12 +1683,12 @@ class HomeDetailsScreen(CopyEnabledScreen):
     def on_mount(self) -> None:
         menu = self._menu
         try:
-            fleet = menu.query_one("#deployment-status-body", Static).content
+            fleet = static_content(menu.query_one("#deployment-status-body", Static))
             self.query_one("#home-details-fleet", Static).update(fleet)
         except Exception:
             pass
         try:
-            billing = menu.query_one("#billing-report-body", Static).content
+            billing = static_content(menu.query_one("#billing-report-body", Static))
             self.query_one("#home-details-billing", Static).update(billing)
         except Exception:
             pass
@@ -1711,4 +1712,4 @@ class HomeDetailsScreen(CopyEnabledScreen):
 
     def action_open_manage(self) -> None:
         self.app.pop_screen()
-        self.app.action_push_manage()  # type: ignore[attr-defined]
+        self.app.action_push_manage()

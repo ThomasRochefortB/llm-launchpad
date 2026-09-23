@@ -314,6 +314,11 @@ class MonitorScreen(CopyEnabledScreen):
             )
             self._fill_failure_card()
 
+    @property
+    def title_text(self) -> str:
+        """The operation this monitor follows, e.g. "Status Check"."""
+        return self._title
+
     def _title_markup(self) -> str:
         """Render a compact operation title."""
         return f"[bold]{escape(self._title)}[/]"

@@ -6,6 +6,8 @@ as Textual messages to the app/screen.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from textual.message import Message
 from ..core.hf_models import ModelCandidate
 
@@ -26,6 +28,10 @@ from ..protocol.models import EndpointInfo, FleetDiscovery, StorageSnapshot
 # Textual Messages (thin wrappers around protocol events)
 # -----------------------------------------------------------------------
 
+
+
+if TYPE_CHECKING:
+    from ..core.prime_disks import RetainedPrimeDisk
 
 class LogMessage(Message):
     """A log line from an operation."""
@@ -183,7 +189,7 @@ class StorageFailed(Message):
 class PrimeDisksLoaded(Message):
     """Prime persistent-disk inventory loaded."""
 
-    def __init__(self, disks: list[object]) -> None:
+    def __init__(self, disks: list[RetainedPrimeDisk]) -> None:
         super().__init__()
         self.disks = disks
 

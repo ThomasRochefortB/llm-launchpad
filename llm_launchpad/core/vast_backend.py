@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import json
 import os
+import time
 from typing import Any
 
 import requests
@@ -190,6 +191,22 @@ def _rejection_detail(body: object) -> str:
     return ""
 
 
+# Three waits of at most _MAX_RETRY_WAIT_SECONDS each: long enough to ride out
+# Vast's throttle, short enough that a status poll never hangs a screen.
+_RATE_LIMIT_RETRIES = 3
+_MAX_RETRY_WAIT_SECONDS = 8.0
+
+
+def _retry_after_seconds(response: requests.Response, attempt: int) -> float:
+    """Honour Vast's Retry-After when it sends one, else back off 1, 2, 4s."""
+    header = response.headers.get("Retry-After", "")
+    try:
+        wait = float(header)
+    except (TypeError, ValueError):
+        wait = 2.0 ** attempt
+    return max(0.0, min(wait, _MAX_RETRY_WAIT_SECONDS))
+
+
 class VastBackend:
     """REST API client; discovery never allocates billable resources."""
 
@@ -199,18 +216,33 @@ class VastBackend:
     def _request(
         self, method: str, path: str, payload: dict[str, Any] | None = None,
         *, version: int = 0, params: dict[str, Any] | None = None,
+        idempotent: bool | None = None,
     ) -> dict[str, Any]:
         if not self.credentials.api_key:
             raise VastApiError("No Vast API key configured. Run llm-launchpad vast-auth login.")
         key = normalize_vast_api_key(self.credentials.api_key)
-        try:
-            response = requests.request(
-                method, f"{VAST_API_URL.removesuffix('0')}{version}{path}", json=payload, params=params,
-                headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
-                timeout=(5, 20), allow_redirects=False,
-            )
-        except requests.RequestException:
-            raise VastApiError("Could not reach Vast. Check your connection and retry.") from None
+        # Throttling says nothing about the request, so a read or a delete --
+        # both safe to repeat -- waits it out briefly instead of failing the
+        # whole operation. A live certification lost its last check (a tunnel
+        # reconnect) to one 429. Creating a rental is not safe to repeat and
+        # still fails fast.
+        # Offer search is a POST that creates nothing, so callers can say so.
+        safe = method.upper() in {"GET", "DELETE"} if idempotent is None else idempotent
+        attempts = _RATE_LIMIT_RETRIES + 1 if safe else 1
+        for attempt in range(attempts):
+            try:
+                response = requests.request(
+                    method, f"{VAST_API_URL.removesuffix('0')}{version}{path}", json=payload, params=params,
+                    headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
+                    timeout=(5, 20), allow_redirects=False,
+                )
+            except requests.RequestException:
+                raise VastApiError("Could not reach Vast. Check your connection and retry.") from None
+            if response.status_code != 429 or attempt == attempts - 1:
+                break
+            wait = _retry_after_seconds(response, attempt)
+            response.close()
+            time.sleep(wait)
         try:
             if response.status_code in {401, 403}:
                 raise VastApiError("Vast rejected the API key or its permissions.")
@@ -290,7 +322,9 @@ class VastBackend:
     def list_offers(self, query: VastOfferQuery | None = None) -> list[VastOffer]:
         """Fetch a bounded preview of eligible offers, with unknown prices last."""
         query = query or VastOfferQuery()
-        payload = self._request("POST", "/bundles/", vast_offer_search_payload(query))
+        payload = self._request(
+            "POST", "/bundles/", vast_offer_search_payload(query), idempotent=True
+        )
         raw = payload.get("offers")
         if not isinstance(raw, list):
             raise VastApiError("Vast offer response must contain an offers list.")
@@ -312,7 +346,7 @@ class VastBackend:
         # Search's `id` addresses the bundle, while returned `id` is the
         # rentable ask contract. Filtering `id` wrongly hides available asks.
         payload["ask_contract_id"] = {"eq": int(offer_id)}
-        data = self._request("POST", "/bundles/", payload)
+        data = self._request("POST", "/bundles/", payload, idempotent=True)
         rows = data.get("offers")
         if isinstance(rows, list):
             for raw in rows:

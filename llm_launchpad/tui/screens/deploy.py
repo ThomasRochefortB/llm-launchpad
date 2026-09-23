@@ -7,6 +7,7 @@ Keyboard-driven form navigation with enter-to-proceed.
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING
 
 from ..widgets.vision_options import VisionOptions
 
@@ -91,6 +92,7 @@ from ..workers import (
 from ..widgets.input_form import FormField, ToggleField
 from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
+from ..compat import highlighted_option, replace_options
 from ..visual import ADVANCED_DEPLOY_STEPS, screen_title
 
 
@@ -131,7 +133,7 @@ def _set_option_list(option_list: OptionList, options: list[Option]) -> None:
     terminal. Hiding it through the shared ``hidden`` class also keeps it out
     of keyboard navigation until it holds something selectable.
     """
-    option_list.set_options(options)
+    replace_options(option_list, options)
     option_list.set_class(not options, "hidden")
 
 
@@ -406,12 +408,12 @@ VAST_VRAM_HEADROOM_FACTOR = 1.05
 DEFAULT_VAST_DISK_GB = 100
 
 
-def _disable_with_reason(screen: object, field_id: str, reason: str | None) -> None:
+def _disable_with_reason(screen: Widget, field_id: str, reason: str | None) -> None:
     """Disable a control and say why, because a grey field reads as broken."""
     from textual.widgets import Input, Select, Switch
 
     try:
-        widget = screen.query_one(field_id)  # type: ignore[attr-defined]
+        widget = screen.query_one(field_id)
     except Exception:
         return
     widget.disabled = reason is not None
@@ -509,7 +511,15 @@ def _advance_deploy_focus(screen: CopyEnabledScreen, navigation_order: tuple[str
     )
 
 
-class _OptionListArrowNavigationMixin:
+# The mixins are only ever mixed into a CopyEnabledScreen; saying so lets the
+# type checker see the screen API (query_one, app) they call.
+if TYPE_CHECKING:
+    _ScreenMixinBase = CopyEnabledScreen
+else:
+    _ScreenMixinBase = object
+
+
+class _OptionListArrowNavigationMixin(_ScreenMixinBase):
     """Arrow keys walk a screen's option lists first, then its focus order."""
 
     OPTION_LIST_IDS: tuple[str, ...] = ()
@@ -534,7 +544,105 @@ class _OptionListArrowNavigationMixin:
         self._navigate_option_lists(-1)
 
 
-class _CostPreviewMixin:
+class _DeployFormFeedbackMixin(_ScreenMixinBase):
+    """Refuse a deploy where the reader will see it, and point at the field.
+
+    Validation used to raise a five-second toast and leave focus where it was,
+    so on a long form the message was gone before the reader had found the
+    field it meant. Now the reason stays beside the Deploy button, the field
+    itself turns red with the reason under it, a collapsed Advanced section
+    opens if that is where the field lives, and focus moves to the field.
+    Editing the field clears it.
+    """
+
+    FEEDBACK_ID: str = ""
+    ADVANCED_CLASS: str = ""
+    _rejected_field_id: str | None = None
+    _rejected_value: object = None
+
+    def _reject(self, message: str, field_id: str | None = None) -> None:
+        from textual.css.query import NoMatches
+        from textual.widgets import Static
+
+        self._clear_rejection()
+        self.app.notify(message, severity="error", timeout=5)
+        try:
+            self.query_one(self.FEEDBACK_ID, Static).update(f"[$error]✗ {escape(message)}[/]")
+        except NoMatches:
+            pass
+        if field_id is None:
+            return
+        try:
+            field = self.query_one(field_id)
+        except NoMatches:
+            return
+        self._rejected_field_id = field_id
+        self._rejected_value = getattr(field, "value", None)
+        container = next(
+            (node for node in field.ancestors_with_self if isinstance(node, FormField)),
+            None,
+        )
+        if container is not None:
+            container.show_error(message)
+        else:
+            field.add_class("-rejected")
+        self._reveal_advanced(field)
+        # Focus without scrolling, then bring the whole field -- label, input
+        # and the reason under it -- into view: scrolling to the input alone
+        # left the reason below the fold.
+        field.focus(scroll_visible=False)
+        (container or field).scroll_visible(animate=False)
+
+    def _reveal_advanced(self, field: Widget) -> None:
+        """Open the Advanced section when the rejected field is inside it."""
+        if not self.ADVANCED_CLASS:
+            return
+        inside = any(
+            node.has_class(self.ADVANCED_CLASS) and node.has_class("hidden")
+            for node in field.ancestors_with_self
+        )
+        if inside:
+            for widget in self.query(f".{self.ADVANCED_CLASS}"):
+                widget.remove_class("hidden")
+
+    def _clear_rejection(self) -> None:
+        from textual.css.query import NoMatches
+        from textual.widgets import Static
+
+        try:
+            self.query_one(self.FEEDBACK_ID, Static).update("")
+        except NoMatches:
+            pass
+        field_id, self._rejected_field_id = self._rejected_field_id, None
+        if field_id is None:
+            return
+        try:
+            field = self.query_one(field_id)
+        except NoMatches:
+            return
+        field.remove_class("-rejected")
+        for node in field.ancestors_with_self:
+            if isinstance(node, FormField):
+                node.clear_error()
+                break
+
+    def _clear_rejection_for(self, widget: Widget) -> None:
+        if not self._rejected_field_id or widget.id != self._rejected_field_id.lstrip("#"):
+            return
+        # A Changed event still in flight from before the refusal carries the
+        # refused value; only a different value is a correction.
+        if getattr(widget, "value", None) == self._rejected_value:
+            return
+        self._clear_rejection()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        self._clear_rejection_for(event.input)
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        self._clear_rejection_for(event.select)
+
+
+class _CostPreviewMixin(_DeployFormFeedbackMixin):
     """Shared hourly cost preview behavior for custom deploy forms."""
 
     _gpu_price_by_value: dict[str, float]
@@ -582,22 +690,19 @@ class _CostPreviewMixin:
         """
         from textual.widgets import Input
 
+        offer_field_id = disk_field_id.replace("-disk-", "-offer-")
         offer = self._vast_offers.get(self._selected_vast_offer_id or "")
         if offer is None:
-            self.app.notify("Select a live Vast.ai rental.", severity="error", timeout=5)
+            self._reject("Select a live Vast.ai rental.", offer_field_id)
             return None
         price = offer.costs.total_per_hour_usd
         if price is None or price <= 0:
-            self.app.notify(
-                "The selected Vast.ai rental has no quoted hourly price. Refresh rentals.",
-                severity="error",
-                timeout=6,
-            )
+            self._reject("The selected Vast.ai rental has no quoted hourly price. Refresh rentals.", offer_field_id)
             return None
         raw_disk = self.query_one(disk_field_id, Input).value.strip()
         disk_gb = positive_int(raw_disk) if raw_disk else self._default_vast_disk_gb()
         if disk_gb is None:
-            self.app.notify("Vast disk size must be an integer >= 1 GB.", severity="error", timeout=5)
+            self._reject("Vast disk size must be an integer >= 1 GB.", disk_field_id)
             return None
         return VastProviderOptions(
             offer_id=offer.id,
@@ -677,8 +782,13 @@ class BackendSelectScreen(CopyEnabledScreen):
         self.app.pop_screen()
 
 
-class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyEnabledScreen):
+class LlamaCppDeployScreen(
+    _OptionListArrowNavigationMixin, _CostPreviewMixin, _DeployFormFeedbackMixin, CopyEnabledScreen
+):
     """llama.cpp deploy form."""
+
+    FEEDBACK_ID = "#llama-deploy-feedback"
+    ADVANCED_CLASS = "llama-advanced"
 
     BINDINGS = [
         Binding("up", "navigate_option_list_up", show=False, priority=True),
@@ -974,7 +1084,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
                     self._show_cached_models()
                 self._refresh_cached_models_from_storage()
             else:
-                self.app.begin_fetch_llamacpp_models(self._rank_mode, self)  # type: ignore[attr-defined]
+                self.app.begin_fetch_llamacpp_models(self._rank_mode, self)
         model_list = self.query_one("#llama-model-list", OptionList)
         # The picker is hidden until it has rows, so a still-loading list
         # cannot take focus yet. Hand it over once the rows land.
@@ -1388,7 +1498,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         if quant is None and selected.quantizations:
             quant = selected.quantizations[0]
         revision = self.query_one("#revision", Input).value.strip() or None
-        self.app.begin_storage_predownload(  # type: ignore[attr-defined]
+        self.app.begin_storage_predownload(
             backend=BackendType.LLAMACPP,
             model_id=selected.repo_id,
             quant=quant,
@@ -1402,12 +1512,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         )
         config.repo_id = self.query_one("#repo-id", Input).value.strip() or None
         if not config.repo_id:
-            self.app.notify(
-                "Enter a Hugging Face repo-id before deploying.",
-                severity="error",
-                timeout=5,
-            )
-            self.query_one("#repo-id", Input).focus()
+            self._reject("Enter a Hugging Face repo-id before deploying.", "#repo-id")
             return
         config.quant = self.query_one("#quant", Input).value.strip() or None
         config.required_vram_gb = self._current_llamacpp_required_vram()
@@ -1421,7 +1526,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
             status, message, runtime_id = compatibility
             config.llamacpp_runtime_id = runtime_id
             if status == "unsupported":
-                self.app.notify(message, severity="error", timeout=8)
+                self._reject(message, "#repo-id")
                 return
 
         config.preload = False
@@ -1429,27 +1534,23 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         config.do_warmup = self.query_one("#warmup", Switch).value
         config.show_debug_logs = self.query_one("#show-debug-logs-llama", Switch).value
 
-        gpu_type = normalize_gpu_type(self._selected_gpu_type)
+        gpu_type = normalize_gpu_type(self._selected_gpu_type or "")
         if not gpu_type:
-            self.app.notify("GPU type is required.", severity="error", timeout=5)
+            self._reject("GPU type is required.", "#gpu-type-llama")
             return
         gpu_count = parse_gpu_count(self.query_one("#gpu-count-llama", Input).value, default=0)
         if gpu_count <= 0:
-            self.app.notify("GPU count must be an integer >= 1.", severity="error", timeout=5)
+            self._reject("GPU count must be an integer >= 1.", "#gpu-count-llama")
             return
         config.gpu_type = gpu_type
         config.gpu_count = gpu_count
         if self._provider == ComputeProvider.PRIME:
             offer = self._prime_offers.get(self._selected_prime_offer_id or "")
             if offer is None:
-                self.app.notify("Select a live Prime GPU offer.", severity="error", timeout=5)
+                self._reject("Select a live Prime GPU offer.", "#prime-offer-llama")
                 return
             if config.revision:
-                self.app.notify(
-                    "Prime llama.cpp currently supports only the default HF revision.",
-                    severity="error",
-                    timeout=5,
-                )
+                self._reject("Prime llama.cpp currently supports only the default HF revision.", "#revision")
                 return
             config.gpu_type = offer.gpu_type
             config.gpu_count = offer.gpu_count
@@ -1484,14 +1585,14 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         if p:
             config.port = positive_int(p)
             if config.port is None or config.port > 65535:
-                self.app.notify("Port must be an integer from 1 to 65535.", severity="error", timeout=5)
+                self._reject("Port must be an integer from 1 to 65535.", "#port-input")
                 return
         ngl = self.query_one("#n-gpu-layers", Input).value.strip()
         if ngl:
             try:
                 config.n_gpu_layers = int(ngl)
             except ValueError:
-                self.app.notify("GPU layers must be an integer, or blank for auto.", severity="error", timeout=5)
+                self._reject("GPU layers must be an integer, or blank for auto.", "#n-gpu-layers")
                 return
         config.llamacpp_image_no_cache = self.query_one("#llama-image-no-cache", Switch).value
 
@@ -1515,15 +1616,15 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         try:
             self.query_one(VisionOptions).apply(config)
         except ValueError as exc:
-            self.app.notify(str(exc), severity="error", timeout=8)
+            self._reject(str(exc))
             return
         # Refuse here rather than after routing, so the form never accepts a
         # configuration its provider will reject.
         reason = refuse_deployment(config)
         if reason:
-            self.app.notify(reason, severity="error", timeout=8)
+            self._reject(reason)
             return
-        self.app.begin_deploy(config)  # type: ignore[attr-defined]
+        self.app.begin_deploy(config)
 
     def _focus_model_list_if_pending(self) -> None:
         """Give the model picker focus once a requested ranking has loaded."""
@@ -1594,7 +1695,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         finally:
             self._updating_rank_mode = False
         self._set_model_status("[dim]Nothing cached yet. Loading popular models...[/dim]")
-        self.app.begin_fetch_llamacpp_models("downloads", self)  # type: ignore[attr-defined]
+        self.app.begin_fetch_llamacpp_models("downloads", self)
         return True
 
     def _apply_ranked_model_selection(self, option_id: str) -> None:
@@ -1618,7 +1719,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         self._refresh_app_preview()
 
     def _highlighted_ranked_model(self) -> ModelCandidate | None:
-        highlighted = self.query_one("#llama-model-list", OptionList).highlighted_option
+        highlighted = highlighted_option(self.query_one("#llama-model-list", OptionList))
         option_id = highlighted.id if highlighted is not None else ""
         return _model_from_option_id(option_id or "", self._ranked_models)
 
@@ -1667,7 +1768,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         self._last_quant_lookup = cache_key
 
         self._set_quant_status("[dim]Loading quantizations...[/dim]")
-        self.app.begin_fetch_llamacpp_quants(repo_id, revision or None, self)  # type: ignore[attr-defined]
+        self.app.begin_fetch_llamacpp_quants(repo_id, revision or None, self)
 
     def _cancel_quantization_lookup(self) -> None:
         timer = self._quant_lookup_timer
@@ -1777,11 +1878,16 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         self.app.pop_screen()
 
     def action_open_storage(self) -> None:
-        self.app.action_push_storage(BackendType.LLAMACPP)  # type: ignore[attr-defined]
+        self.app.action_push_storage(BackendType.LLAMACPP)
 
 
-class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyEnabledScreen):
+class VllmDeployScreen(
+    _OptionListArrowNavigationMixin, _CostPreviewMixin, _DeployFormFeedbackMixin, CopyEnabledScreen
+):
     """vLLM deploy form."""
+
+    FEEDBACK_ID = "#vllm-deploy-feedback"
+    ADVANCED_CLASS = "vllm-advanced"
 
     BINDINGS = [
         Binding("up", "navigate_option_list_up", show=False, priority=True),
@@ -2132,7 +2238,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
                     self._show_cached_models()
                 self._refresh_cached_models_from_storage()
             else:
-                self.app.begin_fetch_vllm_models(self._rank_mode, self)  # type: ignore[attr-defined]
+                self.app.begin_fetch_vllm_models(self._rank_mode, self)
         model_list = self.query_one("#vllm-model-list", OptionList)
         # The picker is hidden until it has rows, so a still-loading list
         # cannot take focus yet. Hand it over once the rows land.
@@ -2579,7 +2685,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
             self.app.notify("Highlight a model in Model ranking first.", severity="warning", timeout=5)
             return
         revision = self.query_one("#model-revision", Input).value.strip() or None
-        self.app.begin_storage_predownload(  # type: ignore[attr-defined]
+        self.app.begin_storage_predownload(
             backend=BackendType.VLLM,
             model_id=selected.repo_id,
             revision=revision,
@@ -2644,7 +2750,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
         finally:
             self._updating_rank_mode = False
         self._set_model_status("[dim]Nothing cached yet. Loading popular models...[/dim]")
-        self.app.begin_fetch_vllm_models("downloads", self)  # type: ignore[attr-defined]
+        self.app.begin_fetch_vllm_models("downloads", self)
         return True
 
     def _apply_ranked_model_selection(self, option_id: str) -> None:
@@ -2791,7 +2897,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
             self._refresh_prime_offer_options()
 
     def _highlighted_ranked_model(self) -> ModelCandidate | None:
-        highlighted = self.query_one("#vllm-model-list", OptionList).highlighted_option
+        highlighted = highlighted_option(self.query_one("#vllm-model-list", OptionList))
         option_id = highlighted.id if highlighted is not None else ""
         return _model_from_option_id(option_id or "", self._ranked_models)
 
@@ -2815,49 +2921,38 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
         config = DeploymentConfig(backend=BackendType.VLLM, provider=self._provider)
         config.model_name = self.query_one("#model-name", Input).value.strip() or None
         if not config.model_name:
-            self.app.notify(
-                "Enter a model name before deploying.",
-                severity="error",
-                timeout=5,
-            )
-            self.query_one("#model-name", Input).focus()
+            self._reject("Enter a model name before deploying.", "#model-name")
             return
         config.model_revision = self.query_one("#model-revision", Input).value.strip() or None
         context_raw = self.query_one("#max-model-len", Input).value.strip()
         if context_raw:
             context_tokens = positive_int(context_raw)
             if context_tokens is None:
-                self.app.notify(
-                    "Max context tokens must be an integer >= 1.", severity="error", timeout=5
-                )
+                self._reject("Max context tokens must be an integer >= 1.", "#max-model-len")
                 return
             config.max_context_tokens = context_tokens
         sequences_raw = self.query_one("#max-num-seqs", Input).value.strip()
         if sequences_raw:
             sequences = positive_int(sequences_raw)
             if sequences is None:
-                self.app.notify(
-                    "Max concurrent sequences must be an integer >= 1.",
-                    severity="error",
-                    timeout=5,
-                )
+                self._reject("Max concurrent sequences must be an integer >= 1.", "#max-num-seqs")
                 return
             config.max_concurrent_sequences = sequences
         config.required_vram_gb = self._current_vllm_required_vram()
-        gpu_type = normalize_gpu_type(self._selected_gpu_type)
+        gpu_type = normalize_gpu_type(self._selected_gpu_type or "")
         if not gpu_type:
-            self.app.notify("GPU type is required.", severity="error", timeout=5)
+            self._reject("GPU type is required.", "#gpu-type-vllm")
             return
         gpu_count = parse_gpu_count(self.query_one("#gpu-count-vllm", Input).value, default=0)
         if gpu_count <= 0:
-            self.app.notify("GPUs attached must be an integer >= 1.", severity="error", timeout=5)
+            self._reject("GPUs attached must be an integer >= 1.", "#gpu-count-vllm")
             return
         config.gpu_type = gpu_type
         config.gpu_count = gpu_count
         if self._provider == ComputeProvider.PRIME:
             offer = self._prime_offers.get(self._selected_prime_offer_id or "")
             if offer is None:
-                self.app.notify("Select a live Prime GPU offer.", severity="error", timeout=5)
+                self._reject("Select a live Prime GPU offer.", "#prime-offer-vllm")
                 return
             config.gpu_type = offer.gpu_type
             config.gpu_count = offer.gpu_count
@@ -2887,7 +2982,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
             n_gpu_str = self.query_one("#n-gpu", Input).value.strip()
             config.n_gpu = positive_int(n_gpu_str or "1")
             if config.n_gpu is None:
-                self.app.notify("Tensor parallel size must be an integer >= 1.", severity="error", timeout=5)
+                self._reject("Tensor parallel size must be an integer >= 1.", "#n-gpu")
                 return
         config.tool_call_parser = self.query_one("#tool-call-parser", Input).value.strip() or None
         # Advanced values are always read: collapsing the section must never
@@ -2898,27 +2993,15 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
             try:
                 parsed = json.loads(kwargs_raw)
             except json.JSONDecodeError:
-                self.app.notify(
-                    "Default chat template kwargs must be valid JSON.",
-                    severity="error",
-                    timeout=6,
-                )
+                self._reject("Default chat template kwargs must be valid JSON.", "#chat-template-kwargs")
                 return
             if not isinstance(parsed, dict):
-                self.app.notify(
-                    "Default chat template kwargs must be a JSON object.",
-                    severity="error",
-                    timeout=6,
-                )
+                self._reject("Default chat template kwargs must be a JSON object.", "#chat-template-kwargs")
                 return
             config.default_chat_template_kwargs = kwargs_raw
         smoke_only = self.query_one("#smoke-only-vllm", Switch).value
         if smoke_only and self._provider != ComputeProvider.MODAL:
-            self.app.notify(
-                f"{self._provider.display_name} does not support smoke-test-only mode.",
-                severity="error",
-                timeout=5,
-            )
+            self._reject(f"{self._provider.display_name} does not support smoke-test-only mode.", "#smoke-only-vllm")
             return
         config.do_deploy = not smoke_only
         config.run_smoke = smoke_only
@@ -2943,18 +3026,18 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
         try:
             self.query_one(VisionOptions).apply(config)
         except ValueError as exc:
-            self.app.notify(str(exc), severity="error", timeout=8)
+            self._reject(str(exc))
             return
         # Refuse here rather than after routing, so the form never accepts a
         # configuration its provider will reject.
         reason = refuse_deployment(config)
         if reason:
-            self.app.notify(reason, severity="error", timeout=8)
+            self._reject(reason)
             return
-        self.app.begin_deploy(config)  # type: ignore[attr-defined]
+        self.app.begin_deploy(config)
 
     def action_pop_screen(self) -> None:
         self.app.pop_screen()
 
     def action_open_storage(self) -> None:
-        self.app.action_push_storage(BackendType.VLLM)  # type: ignore[attr-defined]
+        self.app.action_push_storage(BackendType.VLLM)

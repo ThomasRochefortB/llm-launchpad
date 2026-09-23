@@ -109,3 +109,19 @@ uv run python scripts/validate_prime_live.py \
   --budget-usd 3 \
   --stage portable_vllm_and_auth
 ```
+
+The idle-shutdown watchdogs have their own stages, `llamacpp_idle_on_pod` and
+`llamacpp_idle_local`. Each deploys the smallest llama.cpp model with a 120s
+window, serves the harness's requests, then leaves the pod alone until its
+watchdog deletes it; a tunnel left behind fails the stage. Neither is certified
+yet. The first attempt (2026-09-23, A10 at $1.29/hr, $0.15) served correctly but
+found that the TUI's summary log dropped the "Idle shutdown" line, so nothing on
+screen said which watchdog was armed; that is fixed. Budget about $0.30 per
+stage at current A10 prices. The spend cutoff is the budget less a $0.30
+cleanup reserve and counts what earlier stages spent, so both stages need about
+$1:
+
+```bash
+uv run python scripts/validate_prime_live.py --confirm-live --budget-usd 1.00 \
+  --stage llamacpp_idle_local --stage llamacpp_idle_on_pod
+```

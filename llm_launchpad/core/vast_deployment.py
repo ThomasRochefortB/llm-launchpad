@@ -386,7 +386,17 @@ class VastDeploymentBackend:
                     cancellation.wait(15)
                     continue
                 if instance is None or instance.state in {"error", "exited", "offline", "destroyed"}:
-                    raise RuntimeError("Vast instance stopped before the runtime became ready.")
+                    # Say what Vast said: "stopped" alone could not tell a host
+                    # that failed to start the container from a runtime crash.
+                    reason = (
+                        f" (state: {instance.state}; Vast: {instance.status_msg})"
+                        if instance is not None and instance.status_msg
+                        else f" (state: {instance.state})" if instance is not None
+                        else " (the instance no longer exists)"
+                    )
+                    raise RuntimeError(
+                        f"Vast instance stopped before the runtime became ready{reason}."
+                    )
                 if instance.state != last_state:
                     # Pulling a large image can take many minutes. Say which
                     # step is slow instead of reporting a bare timeout.

@@ -1190,3 +1190,65 @@ class VastFieldGatingTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InlineValidationTests(unittest.IsolatedAsyncioTestCase):
+    """A refused deploy points at the field and keeps saying why."""
+
+    async def test_an_invalid_advanced_field_is_opened_marked_and_focused(self) -> None:
+        from llm_launchpad.tui.widgets.input_form import FormField
+
+        app = _TestApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+            screen.query_one("#repo-id", Input).value = "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF"
+            port = screen.query_one("#port-input", Input)
+            port.value = "70000"
+            # Advanced options are collapsed: the port field is not on screen.
+            self.assertTrue(any(
+                node.has_class("hidden") for node in port.ancestors_with_self
+            ))
+
+            screen._do_deploy()
+            await pilot.pause()
+
+            self.assertIsNone(app.deployed_config)
+            self.assertFalse(any(
+                node.has_class("hidden") for node in port.ancestors_with_self
+            ))
+            self.assertIs(app.focused, port)
+            self.assertTrue(port.has_class("-rejected"))
+            field = next(n for n in port.ancestors_with_self if isinstance(n, FormField))
+            error = field.query_one(".form-error", Static)
+            self.assertFalse(error.has_class("hidden"))
+            self.assertIn("Port must be", str(error.render()))
+            feedback = screen.query_one("#llama-deploy-feedback", Static)
+            self.assertIn("Port must be", str(feedback.render()))
+
+            # Correcting the value clears the field and the summary.
+            port.value = "8088"
+            await pilot.pause()
+            self.assertFalse(port.has_class("-rejected"))
+            self.assertTrue(error.has_class("hidden"))
+            self.assertEqual(str(feedback.render()).strip(), "")
+
+    async def test_a_missing_select_choice_is_focused_and_explained(self) -> None:
+        app = _TestApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            app.push_screen(LlamaCppDeployScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, LlamaCppDeployScreen)
+            screen.query_one("#repo-id", Input).value = "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF"
+            screen._selected_gpu_type = None
+
+            screen._do_deploy()
+            await pilot.pause()
+
+            self.assertIsNone(app.deployed_config)
+            self.assertEqual(getattr(app.focused, "id", None), "gpu-type-llama")
+            feedback = screen.query_one("#llama-deploy-feedback", Static)
+            self.assertIn("GPU type is required", str(feedback.render()))
