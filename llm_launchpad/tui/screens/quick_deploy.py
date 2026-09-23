@@ -9,7 +9,7 @@ from dataclasses import replace
 from rich.markup import escape
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, Input, Select, Static, Switch
 
 from ...core.compute_availability import display_gpu_type
@@ -45,6 +45,7 @@ from ..navigation import move_focus_with_arrows
 from ..widgets.input_form import FormField, ToggleField
 from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
+from ..visual import DEPLOY_STEPS, screen_title
 
 
 def _render_profile_label(profile: QuickDeployProfile, *, accent: str = "") -> str:
@@ -70,15 +71,15 @@ def _summary_row(label: str, value: str) -> str:
 
 
 def _render_decision_facts(profile: QuickDeployProfile, plan: InferencePlan) -> str:
-    """Five facts for the deploy decision: model, compute, context, cost, availability.
+    """Four facts for the deploy decision: compute, context, cost, availability.
 
-    Rendered outside the scroll container so it stays on screen; the card
-    below carries the technical evidence and monthly assumptions.
+    Rendered outside the scroll container so it stays on screen; the model is
+    the card's border title, and the details toggle below carries the
+    technical evidence and monthly assumptions.
     """
     return (
-        f"[bold]{escape(profile.display_name)}[/bold]"
-        f"{f' ({escape(profile.quant)})' if profile.quant else ''} · "
-        f"{escape(plan.quote.provider.display_name)} · "
+        f"[bold]{escape(plan.quote.provider.display_name)}[/bold] · "
+        f"{f'{escape(plan.quote.region)} · ' if plan.quote.region else ''}"
         f"{escape(display_gpu_type(plan.quote.gpu_type))} x{plan.quote.gpu_count}\n"
         f"[dim]Context[/dim] {escape(format_context_length(profile.max_context_tokens))} · "
         f"[bold]{escape(_plan_hourly_cost(plan))}[/bold] · "
@@ -108,7 +109,7 @@ def _idle_shutdown_fact(plan: InferencePlan) -> str:
         and not settings.prime_self_terminate
     ):
         text += " while this computer is awake"
-    style = "yellow" if settings.rental_idle_shutdown <= 0 else "dim"
+    style = "$warning" if settings.rental_idle_shutdown <= 0 else "dim"
     return f"\n[dim]Idle stop[/dim] [{style}]{escape(text)}[/{style}]"
 
 
@@ -223,7 +224,8 @@ def _availability_label(plan: InferencePlan) -> str:
     if plan.quote.availability == QuoteAvailability.UNAVAILABLE:
         return "Unavailable"
     if plan.quote.billing_model == BillingModel.SCALE_TO_ZERO:
-        return "Starts on first request · scales to zero"
+        # "Scale to zero" is the billing fact beside it on the card.
+        return "Starts on first request"
     return "Checked when deployment starts"
 
 
@@ -267,16 +269,6 @@ def _plan_continuous_monthly_cost(plan: InferencePlan) -> str:
     return f"~${value:,.2f}/mo at 24/7"
 
 
-def _deployment_decision_summary(profile: QuickDeployProfile, plan: InferencePlan) -> str:
-    """Return the few facts needed immediately before committing a deploy."""
-    return (
-        f"[bold]{escape(profile.display_name)}[/bold] · "
-        f"{escape(display_gpu_type(plan.quote.gpu_type))} x{plan.quote.gpu_count} · "
-        f"[bold]{escape(_plan_hourly_cost(plan))}[/bold] · "
-        f"{escape(_billing_label(plan.quote.billing_model))}"
-    )
-
-
 # Enter does not deploy, on purpose. That leaves the keyboard route stated only
 # in the footer -- which the fulfillment dropdown covers while it is open, and
 # which a phone terminal hides behind its on-screen keyboard entirely. So it is
@@ -286,11 +278,10 @@ def _deployment_decision_summary(profile: QuickDeployProfile, plan: InferencePla
 
 def deploy_key_hint(*, narrow: bool) -> str:
     """Describe keyboard deployment for the current viewport."""
-    if narrow:
-        return "[dim]ctrl+d deploys · or tab to Deploy[/dim]"
-    return (
-        "[dim]Press ctrl+d to deploy, or tab to Deploy and press enter.[/dim]"
-    )
+    # One wording at every width: the sentence form said nothing more, and it
+    # wrapped to two lines in the column beside the button.
+    del narrow
+    return "[dim]ctrl+d deploys · or tab to Deploy[/dim]"
 
 
 def _fulfillment_option(plan: InferencePlan, *, recommended: bool = False) -> str:
@@ -336,9 +327,9 @@ def _fulfillment_caution(plan: InferencePlan) -> str:
     if plan.quote.provider != ComputeProvider.VAST:
         return ""
     return (
-        "[yellow]Vast.ai serves through an SSH endpoint on this computer only. "
+        "[$warning]Vast.ai serves through an SSH endpoint on this computer only. "
         "The rental bills continuously; Stop destroys the instance and its disk. "
-        "Hourly prices include disk; traffic costs extra.[/yellow]"
+        "Hourly prices include disk; traffic costs extra.[/$warning]"
     )
 
 
@@ -404,18 +395,31 @@ class QuickDeployScreen(CopyEnabledScreen):
         )
 
     def compose(self) -> ComposeResult:
-        # Steps 1 and 2 are the model and placement pickers this screen is
-        # reached from; naming the last one keeps the flow's count complete.
+        # Model and Placement are the pickers this screen is reached from;
+        # naming them keeps the flow's count complete.
         yield Static(
-            "[bold primary]Deploy[/]  "
-            f"{_render_profile_label(self.profile)} "
-            "[dim]· Step 3: Confirm and deploy[/dim]",
+            screen_title("Deploy", steps=DEPLOY_STEPS, current=2),
             id="quick-deploy-title",
         )
-        yield Static(
-            _render_decision_facts(self.profile, self.plan),
-            id="quick-deploy-facts",
-        )
+        # The decision and the button that commits it sit together above the
+        # scroll container, so neither can scroll away on a short terminal and
+        # nothing has to repeat the facts beside the button. The model names
+        # the card rather than opening its first line.
+        with Horizontal(id="quick-deploy-summary"):
+            facts = Static(
+                _render_decision_facts(self.profile, self.plan),
+                id="quick-deploy-facts",
+            )
+            facts.border_title = _render_profile_label(self.profile)
+            yield facts
+            with Vertical(id="quick-deploy-actions"):
+                yield Button("Deploy", id="quick-deploy-btn", variant="primary")
+                # Enter is deliberately not bound to Deploy (see on_mount),
+                # which leaves the keyboard route stated only in the footer --
+                # and the fulfillment dropdown paints over the footer while it
+                # is open, exactly when someone is looking for how to continue.
+                # Say it here instead, next to the button it refers to.
+                yield Static(self._deploy_key_hint(), id="quick-deploy-feedback")
         with VerticalScroll(id="quick-deploy-layout"):
             with Vertical(id="quick-deploy-profile-card"):
                 yield Button(
@@ -428,7 +432,10 @@ class QuickDeployScreen(CopyEnabledScreen):
                     id="quick-deploy-profile-body",
                 )
             with Vertical(id="quick-deploy-form"):
-                yield Static("Runs on", classes="form-label")
+                # With one placement there is no choice to make, and the line
+                # only restated the facts card; the label goes with it.
+                if len(self._alternative_plans) > 1:
+                    yield Static("Runs on", classes="form-label")
                 caution = Static(_fulfillment_caution(self.plan), id="quick-vast-note")
                 caution.display = bool(_fulfillment_caution(self.plan))
                 yield caution
@@ -444,11 +451,6 @@ class QuickDeployScreen(CopyEnabledScreen):
                         value=self.plan.quote.id,
                         allow_blank=False,
                         id="quick-fulfillment",
-                    )
-                else:
-                    yield Static(
-                        _fulfillment_option(self.plan, recommended=True),
-                        id="quick-fulfillment-single",
                     )
                 yield Button("Advanced options...", id="toggle-advanced-quick", variant="default")
                 if self.profile.speculative_decoding is not None:
@@ -541,23 +543,12 @@ class QuickDeployScreen(CopyEnabledScreen):
                         default=False,
                         classes="quick-advanced quick-prime-only",
                     )
-        with Vertical(id="quick-deploy-actions"):
-            yield Static(
-                _deployment_decision_summary(self.profile, self.plan),
-                id="quick-deploy-decision-summary",
-            )
-            # Enter is deliberately not bound to Deploy (see on_mount), which
-            # leaves the keyboard route stated only in the footer -- and the
-            # fulfillment dropdown paints over the footer while it is open,
-            # exactly when someone is looking for how to continue. Say it
-            # here instead, next to the button it refers to.
-            yield Static(self._deploy_key_hint(), id="quick-deploy-feedback")
-            yield Button("Deploy", id="quick-deploy-btn", variant="primary")
         yield FittedFooter()
 
     def on_mount(self) -> None:
         for widget in self.query(".quick-advanced"):
             widget.add_class("hidden")
+        self._sync_form_frame()
         self.query_one("#quick-deploy-profile-body", Static).display = False
         self._sync_prime_option_visibility()
         # This screen is reached by pressing enter, and Deploy spends money the
@@ -569,8 +560,10 @@ class QuickDeployScreen(CopyEnabledScreen):
 
     def _focus_initial_control(self) -> None:
         """Focus the first control after mount settles (see on_mount)."""
+        # Textual's automatic first focus lands on Deploy, which now leads the
+        # DOM beside the facts; that is exactly the focus this must replace.
         if self.focused is not None and getattr(self.focused, "id", None) not in {
-            None, "quick-deploy-layout",
+            None, "quick-deploy-layout", "quick-deploy-btn",
         }:
             return
         target = next(iter(self.query("#toggle-quick-details")), None) or next(
@@ -594,19 +587,17 @@ class QuickDeployScreen(CopyEnabledScreen):
             for widget in self.query(".quick-advanced"):
                 widget.toggle_class("hidden")
             self._sync_prime_option_visibility()
+            self._sync_form_frame()
         elif event.button.id == "quick-deploy-btn":
             self._deploy()
 
     def _refresh_plan_widgets(self) -> None:
-        """Keep facts, details, sticky summary and caution on the same plan."""
+        """Keep facts, details and caution on the same plan."""
         self.query_one("#quick-deploy-facts", Static).update(
             _render_decision_facts(self.profile, self.plan)
         )
         self.query_one("#quick-deploy-profile-body", Static).update(
             _render_profile_details(self.profile, self.plan)
-        )
-        self.query_one("#quick-deploy-decision-summary", Static).update(
-            _deployment_decision_summary(self.profile, self.plan)
         )
 
     def on_select_changed(self, event: Select.Changed) -> None:
@@ -664,6 +655,18 @@ class QuickDeployScreen(CopyEnabledScreen):
         note = self.query_one("#quick-vast-note", Static)
         note.update(caution)
         note.display = bool(caution)
+
+    def _sync_form_frame(self) -> None:
+        """Frame the form only when it holds more than its toggle button.
+
+        With one placement and the options collapsed, the bordered box held a
+        single button and read as an empty panel.
+        """
+        collapsed = all(
+            widget.has_class("hidden") for widget in self.query(".quick-advanced")
+        )
+        bare = collapsed and len(self._alternative_plans) <= 1
+        self.query_one("#quick-deploy-form").set_class(bare, "-bare")
 
     def _sync_prime_option_visibility(self) -> None:
         advanced_visible = any(

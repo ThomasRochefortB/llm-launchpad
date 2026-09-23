@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from rich.markup import render as render_markup
+from textual.content import Content
 from textual.app import App
 from textual.coordinate import Coordinate
 from textual.screen import Screen
@@ -118,8 +118,9 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
             status = screen.query_one("#storage-status", Static)
             rendered_status = str(status.renderable)
             self.assertIn("5.0 GiB cached", rendered_status)
-            self.assertIn("0.00 GiB billable", rendered_status)
-            self.assertIn("1 TiB free", rendered_status)
+            # Nothing is billable inside the free tier, so the arithmetic that
+            # would say "0.00 GiB billable past 1 TiB free" is left out.
+            self.assertNotIn("billable", rendered_status)
             self.assertIn("$0.00/mo", rendered_status)
 
     async def test_table_adapts_columns_and_preserves_highlight_on_resize(self) -> None:
@@ -431,14 +432,14 @@ class StorageDeleteScopeTests(unittest.TestCase):
             backend=BackendType.LLAMACPP, model_id="unsloth/Qwen3-4B-GGUF",
             revision="abc", quant="Q8_0", size_bytes=4_300_000_000,
         )
-        warning = render_markup(
+        warning = Content.from_markup(
             StorageDeleteConfirmScreen(q4, also_removed=(q8,))._warning()
         ).plain
         self.assertIn("whole cached repository", warning)
         self.assertIn("Q8_0", warning)
         self.assertIn("6.4 GiB total", warning)
 
-        only = render_markup(StorageDeleteConfirmScreen(q4)._warning()).plain
+        only = Content.from_markup(StorageDeleteConfirmScreen(q4)._warning()).plain
         self.assertNotIn("whole cached repository", only)
 
     def test_sibling_rows_are_collected_from_the_loaded_snapshot(self) -> None:

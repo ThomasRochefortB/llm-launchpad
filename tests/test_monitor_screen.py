@@ -606,7 +606,9 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("sk-test-key", body)
             self.assertTrue(screen.query_one("#copy-key-btn", Button).display)
             content = "\n".join(screen.log_viewer.log_widget.lines)
-            self.assertIn("Press esc, q or enter to return", content)
+            # The progress panel carries the return hint; the log does not
+            # repeat it after every successful phase.
+            self.assertNotIn("Press esc, q or enter to return", content)
 
             screen.action_copy_base_url()
             self.assertEqual(app.clipboard, "https://example.modal.run/v1")

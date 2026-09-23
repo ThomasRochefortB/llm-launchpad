@@ -45,6 +45,7 @@ from ..widgets.input_form import FormField
 from ..workers import EndpointsFailed, EndpointsLoaded, ServingStatsReady
 from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
+from ..visual import labelled_rows_markup, screen_title
 from .operations import DeploymentJobsPanel
 
 
@@ -202,12 +203,9 @@ def _runtime_detail_lines(row: EndpointInfo, *, now: float | None = None) -> str
     elif is_terminal_deployment_state(row.state):
         lines.append("\n[dim]Run time:[/dim] - (not running)")
     else:
-        if row.provider == ComputeProvider.MODAL:
-            lines.append(
-                "\n[dim]Run time:[/dim] unknown (no live probe yet; passive refreshes never wake the container)"
-            )
-        else:
-            lines.append("\n[dim]Run time:[/dim] unknown (run start not yet observed)")
+        # Say only that it is unknown; why (refreshes never wake a Modal
+        # container) is the kind of paragraph that made this pane a wall.
+        lines.append("\n[dim]Run time:[/dim] unknown")
     if row.cumulative_cost_usd is not None:
         cost_text = f"~{format_cost(row.cumulative_cost_usd)}" if row.cost_estimated else format_cost(row.cumulative_cost_usd)
         qualifier = "est." if row.cost_estimated else "tracked"
@@ -221,7 +219,6 @@ def _runtime_detail_lines(row: EndpointInfo, *, now: float | None = None) -> str
     elif row.hourly_cost_usd is not None:
         lines.append(
             f"\n[dim]Compute cost:[/dim] tracking from {format_money(row.hourly_cost_usd)}/h"
-            " [dim](no billable interval observed yet)[/dim]"
         )
     else:
         lines.append("\n[dim]Compute cost:[/dim] unknown (hourly rate unavailable)")
@@ -240,7 +237,7 @@ def _serving_detail_lines(row: EndpointInfo, *, now: float | None = None) -> str
     lines: list[str] = []
     serving = row.serving
     if serving is None:
-        lines.append("\n[dim]Traffic:[/dim] not collected yet (no metrics reading)")
+        lines.append("\n[dim]Traffic:[/dim] not collected yet")
     else:
         if serving.total_tokens > 0:
             age_label = _serving_observed_age_label(row, now=moment)
@@ -258,7 +255,7 @@ def _serving_detail_lines(row: EndpointInfo, *, now: float | None = None) -> str
                 lines.append(f"\n[dim]{PASSIVE_METRICS_NOTE}[/dim]")
             lines.append(_runtime_detail_lines(row, now=moment))
             if row.live_metrics_error:
-                lines.append(f"\n[yellow]Last live fetch failed: {escape(row.live_metrics_error)}[/yellow]")
+                lines.append(f"\n[$warning]Last live fetch failed: {escape(row.live_metrics_error)}[/$warning]")
             elif row.live_metrics_checked_at is not None:
                 lines.append(
                     f"\n[dim]Last live fetch: {format_age(max(0.0, moment - row.live_metrics_checked_at))}[/dim]"
@@ -273,7 +270,7 @@ def _serving_detail_lines(row: EndpointInfo, *, now: float | None = None) -> str
             pass
     lines.append(_runtime_detail_lines(row, now=moment))
     if row.live_metrics_error:
-        lines.append(f"\n[yellow]Last live fetch failed: {escape(row.live_metrics_error)}[/yellow]")
+        lines.append(f"\n[$warning]Last live fetch failed: {escape(row.live_metrics_error)}[/$warning]")
     return "".join(lines)
 
 
@@ -300,6 +297,31 @@ def _live_metrics_label(row: EndpointInfo) -> str:
     return "  Fetch live metrics"
 
 
+# The Manage screen's single-key shortcuts for each endpoint action, in the
+# order the selection detail lists them.
+_ACTION_KEYS = (
+    ("status", "s"),
+    ("logs", "l"),
+    ("benchmark", "b"),
+    ("live-metrics", "f"),
+    ("connection", "u"),
+    ("stop", "x"),
+)
+_ACTION_KEY_LABELS = (
+    ("enter", "all actions"),
+    ("s", "status"),
+    ("l", "logs"),
+    ("b", "benchmark"),
+    ("f", "live metrics"),
+    ("u", "copy URL"),
+    ("x", "stop"),
+)
+
+
+def _endpoint_model(row: EndpointInfo) -> str:
+    return (row.served_model_name or row.model_name or "-").strip() or "-"
+
+
 def _endpoint_name(row: EndpointInfo) -> str:
     return (row.instance_name or row.name or "unnamed").strip()
 
@@ -323,15 +345,20 @@ def _endpoint_compact_label(row: EndpointInfo) -> str:
 
 
 def _endpoint_summary(row: EndpointInfo) -> str:
+    """Markup: the host, then the shared deployment and health line.
+
+    Already markup, so callers must not escape it: escaping printed the
+    health line's own ``[dim]`` tags as text.
+    """
     from ..fleet_status import deployment_and_health_line
 
-    return f"{_endpoint_host(row)} · {deployment_and_health_line(row)}"
+    return f"[dim]{escape(_endpoint_host(row))} ·[/dim] {deployment_and_health_line(row)}"
 
 
 def _vision_summary(vision: VisionCapabilities | None) -> str:
     """Describe image input without implying a deployment was ever tested."""
     if vision is None:
-        return "unknown (deployed before image support, or never inspected)"
+        return "unknown"
     if not vision.enabled:
         return "disabled (text only)"
     return f"enabled · {_VISION_VERIFICATION_LABELS[vision.verification]}"
@@ -387,6 +414,15 @@ _ENDPOINT_COLUMNS = (
         _COMPACT,
         _MINIMAL,
     ),
+    # What the endpoint serves: the column that tells two rows apart, and the
+    # one that uses the width the four short columns leave empty.
+    AdaptiveColumn.visible(
+        "model",
+        "model",
+        _endpoint_model,
+        _WIDE,
+        _STANDARD,
+    ),
     # Traffic only fits where there is room to spare; every width gets the
     # same numbers in the selection detail below the table.
     AdaptiveColumn.visible(
@@ -394,30 +430,37 @@ _ENDPOINT_COLUMNS = (
         "tok/s",
         _endpoint_throughput,
         _WIDE,
+        hide_when_empty=True,
     ),
     AdaptiveColumn.visible(
         "served",
         "served",
         _endpoint_tokens_served,
         _WIDE,
+        hide_when_empty=True,
     ),
     AdaptiveColumn.visible(
         "run",
         "run",
         _endpoint_run_time,
         _WIDE,
+        hide_when_empty=True,
     ),
     AdaptiveColumn.visible(
         "cost",
         "cost",
         _endpoint_cost,
         _WIDE,
+        hide_when_empty=True,
     ),
     AdaptiveColumn.visible(
         "app",
         "app / pod",
         lambda row: row.name or row.app_id or "-",
         _WIDE,
+        # Usually the app is named after the endpoint; only a different name
+        # is worth a column.
+        redundant=lambda row: (row.name or row.app_id or "-") == _endpoint_name(row),
     ),
 )
 
@@ -454,7 +497,7 @@ class ManageScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         with Vertical(id="manage-layout"):
-            yield Static("[bold primary]Manage[/]", id="manage-title")
+            yield Static(screen_title("Manage"), id="manage-title")
             with TabbedContent(initial=self._initial_tab, id="manage-tabs"):
                 with TabPane("Endpoints", id="manage-endpoints"):
                     yield Static("[dim]Loading endpoints…[/dim]", id="manage-status")
@@ -676,9 +719,9 @@ class ManageScreen(CopyEnabledScreen):
                     f"{'endpoint' if hidden == 1 else 'endpoints'} hidden; press a to show."
                 )
             elif not self._outage_lines:
-                summary = "[yellow]No endpoints running.[/yellow]  Press esc then d to deploy one, or r to refresh."
+                summary = "[$warning]No endpoints running.[/$warning]  Press esc then d to deploy one, or r to refresh."
             else:
-                summary = "[yellow]No endpoints could be listed.[/yellow]  Press r to retry."
+                summary = "[$warning]No endpoints could be listed.[/$warning]  Press r to retry."
             self.query_one("#manage-status", Static).update(
                 "\n".join([summary, *self._outage_lines])
             )
@@ -697,9 +740,9 @@ class ManageScreen(CopyEnabledScreen):
             )
         else:
             summary = (
-                f"[green]Fleet refreshed.[/green] {len(self._rows)} managed {noun}."
+                f"[$success]Fleet refreshed[/$success] [dim]· {len(self._rows)} {noun}[/dim]"
                 if not self._outage_lines
-                else f"[yellow]Fleet partly refreshed.[/yellow] {len(self._rows)} managed {noun}."
+                else f"[$warning]Fleet partly refreshed[/$warning] [dim]· {len(self._rows)} {noun}[/dim]"
             )
         if hidden:
             summary += (
@@ -716,7 +759,7 @@ class ManageScreen(CopyEnabledScreen):
     def on_endpoints_failed(self, message: EndpointsFailed) -> None:
         self._fleet_refresh_inflight = False
         self.query_one("#manage-status", Static).update(
-            f"[yellow]Endpoint refresh failed:[/yellow] {escape(message.error)}"
+            f"[$warning]Endpoint refresh failed:[/$warning] {escape(message.error)}"
         )
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
@@ -844,23 +887,22 @@ class ManageScreen(CopyEnabledScreen):
             detail.update("[dim]No endpoint selected.[/dim]")
             return
         actions = _available_actions(row)
-        action_labels = [
-            label
-            for action, label in (
-                ("status", "status"),
-                ("logs", "logs"),
-                ("benchmark", "benchmark"),
-                ("live-metrics", "live metrics"),
-                ("stop", "stop"),
-                ("connection", "connection info"),
-            )
+        # Keys, not a comma list of action names: the list read as prose and
+        # said nothing about how to reach any of them.
+        action_keys = ["enter", *(
+            key
+            for action, key in _ACTION_KEYS
             if action in actions
-        ]
+        )]
+        key_labels = dict(_ACTION_KEY_LABELS)
+        action_hints = "  ".join(
+            f"[bold $accent]{key}[/] [dim]{key_labels[key]}[/dim]" for key in action_keys
+        )
         base_url, _derived = resolve_openai_base_url(row, username=self._modal_username())
         url_line = f"\n[dim]Base URL:[/dim] {escape(base_url)}" if base_url else ""
         stale_line = (
-            f"\n[yellow]{escape(row.provider.display_name)} did not answer the last refresh;"
-            " this state may be out of date.[/yellow]"
+            f"\n[$warning]{escape(row.provider.display_name)} did not answer the last refresh;"
+            " this state may be out of date.[/$warning]"
             if row.provider.value in self._retained_providers
             else ""
         )
@@ -868,8 +910,8 @@ class ManageScreen(CopyEnabledScreen):
             f"[bold]{escape(_endpoint_name(row))}[/bold]  "
             f"[dim]{escape(_endpoint_host(row))}[/dim]\n"
             f"{deployment_and_health_line(row)}"
-            f"{url_line}{stale_line}{_serving_detail_lines(row)}\n"
-            f"Actions: {', '.join(action_labels) or 'none'}"
+            f"{url_line}{stale_line}{_serving_detail_lines(row)}\n\n"
+            f"{action_hints}"
         )
 
 
@@ -912,7 +954,7 @@ class EndpointActionsScreen(CopyEnabledScreen):
         from ..fleet_status import deployment_and_health_line
 
         with VerticalScroll(classes="screen-scroll"):
-            yield Static("[bold primary]Endpoint Actions[/]")
+            yield Static(screen_title("Endpoint actions"))
             yield Static(
                 f"[bold]{escape(_endpoint_name(self.endpoint))}[/bold]  "
                 f"[dim]{escape(_endpoint_host(self.endpoint))}[/dim]\n"
@@ -926,10 +968,6 @@ class EndpointActionsScreen(CopyEnabledScreen):
                     if action in _available_actions(self.endpoint)
                 ),
                 id="manage-actions",
-            )
-            yield Static(
-                "[dim]↑/↓ choose · Enter open · Esc back[/dim]",
-                id="manage-action-help",
             )
         yield FittedFooter()
 
@@ -1004,10 +1042,10 @@ class ConnectionInfoScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(classes="screen-scroll"):
-            yield Static("[bold primary]Connection Info[/]")
+            yield Static(screen_title("Connection info"))
             yield Static(
                 f"[bold]{escape(_endpoint_name(self.endpoint))}[/bold]  "
-                f"[dim]{escape(_endpoint_summary(self.endpoint))}[/dim]"
+                f"{_endpoint_summary(self.endpoint)}"
             )
             yield Static("", id="connection-info-fields")
             with Horizontal(id="connection-info-actions"):
@@ -1042,20 +1080,14 @@ class ConnectionInfoScreen(CopyEnabledScreen):
     def _fields_markup(payload: dict[str, str | None], vision: VisionCapabilities | None = None) -> str:
         base_url = payload.get("base_url") or "(unavailable while the app is starting)"
         model_id = payload.get("model_id") or "(unknown)"
-        display_name = payload.get("display_name") or "(unknown)"
-        api_key = (payload.get("api_key") or "").strip()
-        key_line = (
-            f"[dim]API key[/dim]   {escape(api_key)}"
-            if api_key
-            else "[dim]API key[/dim]   none (no auth by default)"
-        )
-        return (
-            f"[dim]Base URL[/dim]   {escape(base_url)}\n"
-            f"[dim]Model ID[/dim]   {escape(model_id)}\n"
-            f"[dim]Display[/dim]    {escape(display_name)}\n"
-            f"{key_line}\n"
-            f"[dim]Images[/dim]     {escape(_vision_summary(vision))}"
-        )
+        display_name = payload.get("display_name") or ""
+        rows = [("Base URL", base_url), ("Model ID", model_id)]
+        # Only a display name that differs from the served one says anything.
+        if display_name and display_name != model_id:
+            rows.append(("Display", display_name))
+        rows.append(("API key", (payload.get("api_key") or "").strip() or "none"))
+        rows.append(("Images", _vision_summary(vision)))
+        return labelled_rows_markup([(label, escape(value)) for label, value in rows])
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "connection-copy-url":
@@ -1132,10 +1164,10 @@ class StatusOptionsScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(classes="screen-scroll"):
-            yield Static("[bold primary]Status Check[/]")
+            yield Static(screen_title("Status check"))
             yield Static(
                 f"[bold]{escape(_endpoint_name(self.endpoint))}[/bold]  "
-                f"[dim]{escape(_endpoint_summary(self.endpoint))}[/dim]"
+                f"{_endpoint_summary(self.endpoint)}"
             )
             yield FormField(
                 "Server URL override (optional)",
@@ -1170,12 +1202,12 @@ class StatusOptionsScreen(CopyEnabledScreen):
             timeout = int(timeout_text or "60")
         except ValueError:
             self.query_one("#status-feedback", Static).update(
-                "[red]Timeout must be an integer.[/red]"
+                "[$error]Timeout must be an integer.[/$error]"
             )
             return
         if timeout <= 0:
             self.query_one("#status-feedback", Static).update(
-                "[red]Timeout must be greater than zero.[/red]"
+                "[$error]Timeout must be greater than zero.[/$error]"
             )
             return
         url_override = self.query_one("#status-url", Input).value.strip() or None
@@ -1202,10 +1234,10 @@ class BenchmarkOptionsScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(classes="screen-scroll"):
-            yield Static("[bold primary]Benchmark[/]")
+            yield Static(screen_title("Benchmark"))
             yield Static(
                 f"[bold]{escape(_endpoint_name(self.endpoint))}[/bold]  "
-                f"[dim]{escape(_endpoint_summary(self.endpoint))}[/dim]"
+                f"{_endpoint_summary(self.endpoint)}"
             )
             yield FormField(
                 "Concurrency sweep",
@@ -1253,7 +1285,7 @@ class BenchmarkOptionsScreen(CopyEnabledScreen):
             parse_concurrency_values(concurrency)
         except ValueError as exc:
             self.query_one("#benchmark-feedback", Static).update(
-                f"[red]{escape(str(exc))}[/red]"
+                f"[$error]{escape(str(exc))}[/$error]"
             )
             return
         request_count_text = self.query_one("#benchmark-request-count", Input).value.strip()
@@ -1263,7 +1295,7 @@ class BenchmarkOptionsScreen(CopyEnabledScreen):
                 request_count = int(request_count_text)
             except ValueError:
                 self.query_one("#benchmark-feedback", Static).update(
-                    "[red]Request count must be an integer.[/red]"
+                    "[$error]Request count must be an integer.[/$error]"
                 )
                 return
         try:
@@ -1275,17 +1307,17 @@ class BenchmarkOptionsScreen(CopyEnabledScreen):
             )
         except ValueError:
             self.query_one("#benchmark-feedback", Static).update(
-                "[red]Token lengths must be integers.[/red]"
+                "[$error]Token lengths must be integers.[/$error]"
             )
             return
         if request_count is not None and request_count <= 0:
             self.query_one("#benchmark-feedback", Static).update(
-                "[red]Request count must be greater than zero.[/red]"
+                "[$error]Request count must be greater than zero.[/$error]"
             )
             return
         if input_tokens <= 0 or output_tokens <= 0:
             self.query_one("#benchmark-feedback", Static).update(
-                "[red]Token lengths must be greater than zero.[/red]"
+                "[$error]Token lengths must be greater than zero.[/$error]"
             )
             return
         tokenizer = self.query_one("#benchmark-tokenizer", Input).value
@@ -1318,9 +1350,9 @@ class StopConfirmScreen(CopyEnabledScreen):
         self.endpoint = endpoint
 
     def compose(self) -> ComposeResult:
-        with VerticalScroll(classes="screen-scroll"):
+        with VerticalScroll(classes="screen-scroll dialog-scroll"):
             with Vertical(id="stop-confirm-dialog", classes="dialog-panel"):
-                yield Static("[bold primary]Stop Endpoint[/]", classes="dialog-title")
+                yield Static("[bold $primary]Stop Endpoint[/]", classes="dialog-title")
                 yield Static(
                     f"Stop [bold]{escape(_endpoint_name(self.endpoint))}[/bold]?\n"
                     f"[dim]{escape(self.endpoint.provider.value)}/{escape(_endpoint_backend(self.endpoint))} · "
@@ -1328,9 +1360,9 @@ class StopConfirmScreen(CopyEnabledScreen):
                 )
                 yield Static(
                     (
-                        "[yellow]This destroys the Vast.ai rental and permanently deletes its disk and model cache.[/yellow]"
+                        "[$warning]This destroys the Vast.ai rental and permanently deletes its disk and model cache.[/$warning]"
                         if self.endpoint.provider == ComputeProvider.VAST
-                        else "[yellow]This will terminate the selected deployment.[/yellow]"
+                        else "[$warning]This will terminate the selected deployment.[/$warning]"
                     ),
                     id="stop-warning",
                 )

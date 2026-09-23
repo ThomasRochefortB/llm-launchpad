@@ -423,10 +423,16 @@ class ResponsiveLayoutTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(header.display)
                 self.assertTrue(help_text.display)
                 self.assertTrue(summary.display)
-                self.assertFalse(footer.display)
+                # A tall phone has the rows for the key hints; only a short one
+                # (the on-screen keyboard open) gives them up.
+                self.assertTrue(footer.display)
                 self.assertLessEqual(summary.region.y - help_text.region.bottom, 2)
                 self.assertLessEqual(auth.region.y - summary.region.bottom, 2)
                 self.assertLess(auth.region.y, screen.region.height // 2)
+
+                await pilot.resize_terminal(55, 18)
+                await pilot.pause()
+                self.assertFalse(footer.display)
 
 
 if __name__ == "__main__":

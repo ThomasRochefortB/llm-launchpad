@@ -118,7 +118,7 @@ class ManageScreenRoutingTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(table.has_focus)
             self.assertEqual(table.row_count, 3)
             self.assertEqual(app.refresh_forces, [False])
-            self.assertIn("3 managed endpoints", str(screen.query_one("#manage-status", Static).content))
+            self.assertIn("3 endpoints", str(screen.query_one("#manage-status", Static).content))
 
     async def test_selected_endpoint_routes_status_logs_benchmark_and_stop(self) -> None:
         first = _endpoint("alpha", "ap-first")

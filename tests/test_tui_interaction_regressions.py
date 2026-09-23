@@ -183,11 +183,11 @@ class StatusHeaderFailureTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("failed", str(header.render()))
 
     def test_every_state_marker_stays_safe_to_interpolate(self) -> None:
-        from rich.markup import render as render_markup
+        from textual.content import Content
 
         from llm_launchpad.tui.widgets.status_header import FAILED_STATE, _state_icon
 
-        self.assertEqual(render_markup(_state_icon(FAILED_STATE)).plain.strip(), "XX")
+        self.assertEqual(Content.from_markup(_state_icon(FAILED_STATE)).plain.strip(), "✗")
 
 
 class StorageRefreshTests(unittest.IsolatedAsyncioTestCase):

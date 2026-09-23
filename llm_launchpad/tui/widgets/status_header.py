@@ -7,6 +7,7 @@ from textual.reactive import reactive
 from textual.widgets import Static
 
 from ...protocol.enums import BackendType, DeploymentState, OperationType
+from ..visual import tag
 
 
 class StatusHeader(Static):
@@ -18,7 +19,7 @@ class StatusHeader(Static):
         height: 2;
         padding: 0 2;
         background: $surface;
-        border-bottom: solid $border;
+        border-bottom: solid $foreground 15%;
         /* The operation detail is a full provider command line. Letting it
            wrap turns the context bar into three lines of truncated JSON; the
            log pane below already carries the command in full. */
@@ -38,16 +39,23 @@ class StatusHeader(Static):
         # failed are two different facts, and the bar has to carry both: an
         # operation that exited non-zero used to leave this reading
         # `state: deploying`, describing work that had stopped.
-        state_icon = _state_icon(FAILED_STATE if self.failed else self.state)
+        state_key = FAILED_STATE if self.failed else self.state
         state_text = f"{self.state} (failed)" if self.failed else self.state
         compact = self.screen.has_class("viewport-compact")
         short = self.screen.has_class("viewport-short")
+        # Muted field names, bold values, and the state as a tag in its own
+        # colour, so the eye finds the one field that changes first.
+        marker, style = _STATE_MARKERS.get(state_key, ("?", "dim"))
+        state = f"{marker} {state_text}"
+        state_markup = (
+            tag(state, style) if style.startswith("$") else f"[bold]{escape(state)}[/]"
+        )
         parts = [
-            f"[bold]backend:[/] {escape(self.backend)}",
-            f"  {state_icon} [bold]state:[/] {escape(state_text)}",
+            f"[dim]backend[/] [bold]{escape(self.backend)}[/]",
+            f"  [dim]state[/] {state_markup}",
         ]
         if not compact and self.operation and self.operation != "--":
-            parts.append(f"  [bold]op:[/] {escape(self.operation)}")
+            parts.append(f"  [dim]op[/] [bold]{escape(self.operation)}[/]")
         if not compact and not short and self.detail:
             parts.append(f"  [dim]{escape(self.detail)}[/]")
         return " ".join(parts)
@@ -98,27 +106,32 @@ class StatusHeader(Static):
 FAILED_STATE = "error"
 
 
-# Deliberately ASCII: these have to stay readable with colour stripped, which
-# is what the monochrome theme and low-colour terminals do. Every marker is
-# padded to the same width so `state:` does not shift sideways as the state
-# changes underneath it.
-_STATE_MARKER_WIDTH = 2
+# One cell each, East Asian Width "N" and never emoji-presented, so `state:`
+# does not shift sideways as the state changes underneath it. The marker names
+# the kind of state (settled, in progress, healthy, failed); the state word
+# beside it names the state itself, so neither depends on colour.
+_STATE_MARKER_WIDTH = 1
 
-# No marker may begin with "[": these are interpolated into Rich markup.
+_IN_PROGRESS = ("↻", "$primary")
+
+# No marker may begin with "[": these are interpolated into markup.
 _STATE_MARKERS: dict[str, tuple[str, str]] = {
-    "idle": ("..", "dim"),
-    "queued": ("~~", "yellow"),
-    "running": (">>", "green"),
-    "deploying": ("^^", "green"),
-    "warming_up": ("**", "yellow"),
-    "healthy": ("OK", "green"),
-    "unhealthy": ("!!", "red"),
-    "stopped": ("--", "dim"),
-    "error": ("XX", "red"),
-    "cancelled": ("//", "dim"),
+    "idle": ("◦", "dim"),
+    "queued": ("⋯", "$warning"),
+    "running": ("▸", "$success"),
+    "deploying": _IN_PROGRESS,
+    "warming_up": _IN_PROGRESS,
+    "verifying": _IN_PROGRESS,
+    "calibrating": _IN_PROGRESS,
+    "publishing": _IN_PROGRESS,
+    "healthy": ("✓", "$success"),
+    "unhealthy": ("!", "$error"),
+    "stopped": ("▪", "dim"),
+    "error": ("✗", "$error"),
+    "cancelled": ("⊘", "dim"),
 }
 
 
 def _state_icon(state: str) -> str:
-    marker, style = _STATE_MARKERS.get(state, ("??", "dim"))
+    marker, style = _STATE_MARKERS.get(state, ("?", "dim"))
     return f"[{style}]{marker:<{_STATE_MARKER_WIDTH}}[/]"

@@ -91,40 +91,20 @@ from ..workers import (
 from ..widgets.input_form import FormField, ToggleField
 from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
+from ..visual import ADVANCED_DEPLOY_STEPS, screen_title
 
 
 _MODEL_LOOKUP_DEBOUNCE_SECONDS = 0.35
 
-_RANKING_SUBTITLES: dict[str, dict[str, str]] = {
-    BackendType.LLAMACPP: {
-        "cached": "models cached in your storage volumes",
-        "downloads": "top 10 GGUF text-generation models on Hugging Face",
-        "trending": "trending GGUF text-generation models on Hugging Face",
-    },
-    BackendType.VLLM: {
-        "cached": "models cached in your storage volumes",
-        "downloads": "top 10 text-generation models on Hugging Face",
-        "trending": "trending text-generation models on Hugging Face",
-    },
-}
-
-
-def _ranking_subtitle(backend: BackendType, mode: str) -> str:
-    subtitles = _RANKING_SUBTITLES.get(backend) or {}
-    return subtitles.get(mode) or "models cached in your storage volumes"
-
-
 _GPU_PANEL_SUBTITLES: dict[str, dict[ComputeProvider, str]] = {
     BackendType.LLAMACPP: {
-        ComputeProvider.MODAL: "Select a Modal GPU shape.",
+        # Modal's fields explain themselves; only a bound offer needs a note.
+        ComputeProvider.MODAL: "",
         ComputeProvider.PRIME: "GPU shape and count come from the Prime offer bound above.",
         ComputeProvider.VAST: "GPU shape comes from the Vast.ai rental bound above.",
     },
     BackendType.VLLM: {
-        ComputeProvider.MODAL: (
-            "Choose deployment GPUs and in-replica tensor sharding. "
-            "Base Modal hourly price per GPU is shown when available."
-        ),
+        ComputeProvider.MODAL: "",
         ComputeProvider.PRIME: (
             "GPU shape and count come from the Prime offer bound above; "
             "tensor sharding follows its GPU count."
@@ -406,7 +386,7 @@ def _prime_offer_status(
                 "choose a model to narrow them.[/dim]"
             )
         return (
-            f"[yellow]No {strategy} GPU offers are currently available.[/yellow]"
+            f"[$warning]No {strategy} GPU offers are currently available.[/$warning]"
         )
     required_with_headroom = required_vram_gb * PRIME_VRAM_HEADROOM_FACTOR
     if offer_count:
@@ -415,8 +395,8 @@ def _prime_offer_status(
             f"~{required_with_headroom:.1f} GB requirement.[/dim]"
         )
     return (
-        f"[yellow]No live {strategy} GPU offer has enough memory for this model's "
-        f"~{required_with_headroom:.1f} GB requirement.[/yellow]"
+        f"[$warning]No live {strategy} GPU offer has enough memory for this model's "
+        f"~{required_with_headroom:.1f} GB requirement.[/$warning]"
     )
 
 
@@ -505,7 +485,7 @@ def _vast_offer_status(offer_count: int, required_vram_gb: float | None) -> str:
                 "network traffic is billed separately. Choose a model to narrow "
                 "them.[/dim]"
             )
-        return "[yellow]No live Vast.ai rentals are currently available.[/yellow]"
+        return "[$warning]No live Vast.ai rentals are currently available.[/$warning]"
     required_with_headroom = required_vram_gb * VAST_VRAM_HEADROOM_FACTOR
     if offer_count:
         return (
@@ -514,8 +494,8 @@ def _vast_offer_status(offer_count: int, required_vram_gb: float | None) -> str:
             "network traffic is billed separately.[/dim]"
         )
     return (
-        "[yellow]No live Vast.ai rental has enough memory for this "
-        f"model's ~{required_with_headroom:.1f} GB requirement.[/yellow]"
+        "[$warning]No live Vast.ai rental has enough memory for this "
+        f"model's ~{required_with_headroom:.1f} GB requirement.[/$warning]"
     )
 
 
@@ -664,19 +644,17 @@ class BackendSelectScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(classes="screen-scroll"):
-            yield Static("[bold primary]Advanced deploy[/]  [dim]Step 1: Choose serving engine[/dim]")
+            yield Static(screen_title("Advanced deploy", steps=ADVANCED_DEPLOY_STEPS, current=0))
             yield Static("")
             yield OptionList(
                 Option(
                     "  [bold]llama.cpp (GGUF)[/bold]  [dim]· recommended[/dim]\n"
-                    "  [dim]Quantized single-file models. Smaller GPUs, faster cold starts,\n"
-                    "  one request at a time.[/dim]",
+                    "  [dim]Quantized models · smaller GPUs · fast cold starts[/dim]",
                     id="llamacpp",
                 ),
                 Option(
                     "  [bold]vLLM[/bold]\n"
-                    "  [dim]Full-precision Hugging Face models. Higher throughput under\n"
-                    "  concurrency, tensor parallelism across GPUs.[/dim]",
+                    "  [dim]Full-precision models · high concurrency · multi-GPU[/dim]",
                     id="vllm",
                 ),
                 id="backend-list",
@@ -749,20 +727,17 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(classes="screen-scroll"):
-            yield Static("[bold primary]Advanced deploy llama.cpp[/]  [dim]Step 2: Model & options[/dim]")
+            yield Static(screen_title("Advanced deploy", "llama.cpp", steps=ADVANCED_DEPLOY_STEPS, current=1))
             yield Static("", classes="deploy-spacer")
 
-            with Vertical(classes="deploy-group"):
-                yield Static("Model", classes="deploy-group-title")
-                yield Static(
-                    "[dim]Cached models in your storage volumes[/dim]",
-                    id="llama-model-ranking-title",
-                )
+            group = Vertical(classes="deploy-group")
+            group.border_title = "Model"
+            with group:
                 yield Select(
                     options=[
                         ("Cached in storage", "cached"),
-                        ("Most downloaded", "downloads"),
-                        ("Trending", "trending"),
+                        ("Top 10 downloads on Hugging Face", "downloads"),
+                        ("Trending on Hugging Face", "trending"),
                     ],
                     value="cached",
                     allow_blank=False,
@@ -780,9 +755,10 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
                 yield Static("[dim]Quantizations: enter repo-id to detect GGUF variants[/dim]", id="llama-quant-status")
                 yield OptionList(id="llama-quant-list")
 
-            with Vertical(classes="deploy-group"):
-                yield Static("Compute", classes="deploy-group-title")
-                yield Static("Compute provider", classes="form-label")
+            group = Vertical(classes="deploy-group")
+            group.border_title = "Compute"
+            with group:
+                yield Static("Provider", classes="form-label")
                 yield Select(
                     options=[
                         ("Modal", "modal"),
@@ -819,12 +795,13 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
                 )
 
                 # Options
-                with Vertical(classes="gpu-config-panel"):
-                    yield Static("GPU configuration", classes="form-section-title")
+                gpu_panel = Vertical(classes="gpu-config-panel")
+                gpu_panel.border_title = "GPU configuration"
+                with gpu_panel:
                     yield Static(
-                        "Select a Modal GPU shape.",
+                        "",
                         id="gpu-config-subtitle-llama",
-                        classes="form-section-subtitle",
+                        classes="form-section-subtitle hidden",
                     )
                     with Horizontal(id="gpu-config-row-llama", classes="gpu-config-main-row"):
                         with Vertical(id="gpu-type-group-llama"):
@@ -975,7 +952,6 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
             widget.add_class("hidden")
         self.query_one("#llama-rank-mode", Select).value = "cached"
         self.query_one("#llama-rank-mode", Select).focus()
-        self._set_ranking_title()
         self._refresh_gpu_types()
         self._set_model_status("[dim]Loading cached models from storage...[/dim]")
         self._refresh_cached_models_from_storage()
@@ -989,7 +965,6 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         self._rank_mode_touched = True
         if selected_mode != self._rank_mode:
             self._rank_mode = selected_mode
-            self._set_ranking_title()
             self._ranked_models = []
             self._set_model_status("[dim]Loading model suggestions...[/dim]")
             _set_option_list(self.query_one("#llama-model-list", OptionList), [])
@@ -1119,9 +1094,10 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         self._update_cost_preview("llama-cost-preview")
 
     def _sync_prime_visibility(self) -> None:
-        self.query_one("#gpu-config-subtitle-llama", Static).update(
-            _gpu_panel_subtitle(BackendType.LLAMACPP, self._provider)
-        )
+        subtitle = _gpu_panel_subtitle(BackendType.LLAMACPP, self._provider)
+        subtitle_widget = self.query_one("#gpu-config-subtitle-llama", Static)
+        subtitle_widget.update(subtitle)
+        subtitle_widget.set_class(not subtitle, "hidden")
         # A bound Prime offer dictates the GPU shape and count, and the deploy
         # path overwrites whatever these hold. Leaving them editable invites
         # changes that are silently discarded.
@@ -1203,7 +1179,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
 
     def on_prime_offers_failed(self, message: PrimeOffersFailed) -> None:
         self.query_one("#prime-offer-status-llama", Static).update(
-            f"[red]Could not load Prime offers:[/red] {escape(message.error)}"
+            f"[$error]Could not load Prime offers:[/$error] {escape(message.error)}"
         )
 
     def _refresh_vast_offers(self) -> None:
@@ -1232,7 +1208,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
 
     def on_vast_offers_failed(self, message: VastOffersFailed) -> None:
         self.query_one("#vast-offer-status-llama", Static).update(
-            f"[red]Could not load Vast.ai rentals:[/red] {escape(message.error)}"
+            f"[$error]Could not load Vast.ai rentals:[/$error] {escape(message.error)}"
         )
 
     def _vast_disk_gb(self) -> int:
@@ -1315,7 +1291,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
             self._set_model_status(f"[dim]{mode_label} models loaded. Select one to prefill repo-id.[/dim]")
             self._focus_model_list_if_pending()
         else:
-            self._set_model_status("[yellow]No matching GGUF text-generation models found.[/yellow]")
+            self._set_model_status("[$warning]No matching GGUF text-generation models found.[/$warning]")
             self._repo_to_quants = {}
 
     def on_storage_loaded(self, message: StorageLoaded) -> None:
@@ -1330,7 +1306,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
             return
         self._ranked_models = []
         _set_option_list(self.query_one("#llama-model-list", OptionList), [])
-        self._set_model_status(f"[yellow]Could not load cached models:[/yellow] {escape(message.error)}")
+        self._set_model_status(f"[$warning]Could not load cached models:[/$warning] {escape(message.error)}")
 
     def on_llama_cpp_models_failed(self, message: LlamaCppModelsFailed) -> None:
         if message.mode != self._rank_mode:
@@ -1339,7 +1315,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         self._repo_to_quants = {}
         _set_option_list(self.query_one("#llama-model-list", OptionList), [])
         self._set_model_status(
-            f"[yellow]Could not load model suggestions:[/yellow] {escape(message.error)} [dim](manual input still works)[/dim]"
+            f"[$warning]Could not load model suggestions:[/$warning] {escape(message.error)} [dim](manual input still works)[/dim]"
         )
 
     def on_llama_cpp_quants_loaded(self, message: LlamaCppQuantsLoaded) -> None:
@@ -1368,12 +1344,12 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         if message.compatibility_status == "supported":
             self._set_quant_status(
                 "[dim]Quantizations:[/dim] "
-                f"[green]Compatible architecture={architecture_label}[/green]"
+                f"[$success]Compatible architecture={architecture_label}[/$success]"
             )
         elif message.compatibility_status == "unsupported":
             self._set_quant_status(
                 "[dim]Quantizations:[/dim] "
-                f"[red]Unsupported architecture {architecture_label}:[/red] "
+                f"[$error]Unsupported architecture {architecture_label}:[/$error] "
                 f"{escape(message.compatibility_message)}"
             )
         else:
@@ -1383,7 +1359,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
             )
             self._set_quant_status(
                 f"[dim]Quantizations:[/dim] "
-                f"[yellow]Compatibility unknown:[/yellow] {escape(detail)}"
+                f"[$warning]Compatibility unknown:[/$warning] {escape(detail)}"
             )
         if self._prime_offers:
             self._refresh_prime_offer_options()
@@ -1397,7 +1373,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
             return
         _set_option_list(self.query_one("#llama-quant-list", OptionList), [])
         self._set_quant_status(
-            f"[yellow]Could not load quantizations:[/yellow] {escape(message.error)} [dim](manual quant still works)[/dim]"
+            f"[$warning]Could not load quantizations:[/$warning] {escape(message.error)} [dim](manual quant still works)[/dim]"
         )
 
     def action_do_deploy(self) -> None:
@@ -1564,14 +1540,6 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
     def _set_model_status(self, text: str) -> None:
         self.query_one("#llama-model-status", Static).update(text)
 
-    def _set_ranking_title(self) -> None:
-        subtitle = _ranking_subtitle(BackendType.LLAMACPP, self._rank_mode)
-        try:
-            self.query_one("#llama-model-ranking-title", Static).update(
-                f"[bold]Model[/bold]  [dim]({subtitle})[/dim]"
-            )
-        except Exception:
-            return
 
     def _set_quant_status(self, text: str) -> None:
         self.query_one("#llama-quant-status", Static).update(text)
@@ -1600,12 +1568,12 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
             options.append(Option(label, id=f"model-{idx}"))
         _set_option_list(model_list, options)
         if self._ranked_models:
-            self._set_model_status("[dim]Cached models loaded. Select one to prefill repo-id.[/dim]")
+            self._set_model_status("[dim]Select one to prefill repo-id.[/dim]")
             self._focus_model_list_if_pending()
         elif self._fall_back_to_downloads_ranking():
             return
         else:
-            self._set_model_status("[yellow]No cached llama.cpp models found in storage.[/yellow]")
+            self._set_model_status("[$warning]No cached llama.cpp models found in storage.[/$warning]")
 
     def _fall_back_to_downloads_ranking(self) -> bool:
         """Switch an empty default "Cached in storage" view to "Most downloaded".
@@ -1625,7 +1593,6 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
                 pass
         finally:
             self._updating_rank_mode = False
-        self._set_ranking_title()
         self._set_model_status("[dim]Nothing cached yet. Loading popular models...[/dim]")
         self.app.begin_fetch_llamacpp_models("downloads", self)  # type: ignore[attr-defined]
         return True
@@ -1756,7 +1723,7 @@ class LlamaCppDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, C
         if quantizations:
             self._set_quant_status("[dim]Quantizations:[/dim]")
         else:
-            self._set_quant_status("[yellow]No GGUF quantizations detected.[/yellow]")
+            self._set_quant_status("[$warning]No GGUF quantizations detected.[/$warning]")
 
         quant_input = self.query_one("#quant", Input)
         current_quant = quant_input.value.strip().upper()
@@ -1865,20 +1832,17 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(classes="screen-scroll"):
-            yield Static("[bold primary]Advanced deploy vLLM[/]  [dim]Step 2: Model & options[/dim]")
+            yield Static(screen_title("Advanced deploy", "vLLM", steps=ADVANCED_DEPLOY_STEPS, current=1))
             yield Static("", classes="deploy-spacer")
 
-            with Vertical(classes="deploy-group"):
-                yield Static("Model", classes="deploy-group-title")
-                yield Static(
-                    "[dim]Cached models in your storage volumes[/dim]",
-                    id="vllm-model-ranking-title",
-                )
+            group = Vertical(classes="deploy-group")
+            group.border_title = "Model"
+            with group:
                 yield Select(
                     options=[
                         ("Cached in storage", "cached"),
-                        ("Most downloaded", "downloads"),
-                        ("Trending", "trending"),
+                        ("Top 10 downloads on Hugging Face", "downloads"),
+                        ("Trending on Hugging Face", "trending"),
                     ],
                     value="cached",
                     allow_blank=False,
@@ -1892,9 +1856,10 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
                     "model-name",
                 )
                 yield Static("[dim]Estimated VRAM: enter model name to compute[/dim]", id="vllm-vram-status")
-            with Vertical(classes="deploy-group"):
-                yield Static("Compute", classes="deploy-group-title")
-                yield Static("Compute provider", classes="form-label")
+            group = Vertical(classes="deploy-group")
+            group.border_title = "Compute"
+            with group:
+                yield Static("Provider", classes="form-label")
                 yield Select(
                     options=[
                         ("Modal", "modal"),
@@ -1929,13 +1894,13 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
                 id="vast-offer-status-vllm",
                 classes="vast-only",
             )
-            with Vertical(classes="gpu-config-panel"):
-                yield Static("GPU configuration", classes="form-section-title")
+            gpu_panel = Vertical(classes="gpu-config-panel")
+            gpu_panel.border_title = "GPU configuration"
+            with gpu_panel:
                 yield Static(
-                    "Choose deployment GPUs and in-replica tensor sharding. "
-                    "Base Modal hourly price per GPU is shown when available.",
+                    "",
                     id="gpu-config-subtitle-vllm",
-                    classes="form-section-subtitle",
+                    classes="form-section-subtitle hidden",
                 )
                 with Horizontal(id="gpu-config-row-vllm", classes="gpu-config-main-row"):
                     with Vertical(id="gpu-type-group-vllm"):
@@ -2141,7 +2106,6 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
             widget.add_class("hidden")
         self.query_one("#vllm-rank-mode", Select).value = "cached"
         self.query_one("#vllm-rank-mode", Select).focus()
-        self._set_ranking_title()
         self._refresh_gpu_types()
         self._set_model_status("[dim]Loading cached models from storage...[/dim]")
         self._refresh_cached_models_from_storage()
@@ -2159,7 +2123,6 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
         self._rank_mode_touched = True
         if selected_mode != self._rank_mode:
             self._rank_mode = selected_mode
-            self._set_ranking_title()
             self._ranked_models = []
             self._set_model_status("[dim]Loading model suggestions...[/dim]")
             _set_option_list(self.query_one("#vllm-model-list", OptionList), [])
@@ -2305,9 +2268,10 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
         self._update_cost_preview("vllm-cost-preview")
 
     def _sync_prime_visibility(self) -> None:
-        self.query_one("#gpu-config-subtitle-vllm", Static).update(
-            _gpu_panel_subtitle(BackendType.VLLM, self._provider)
-        )
+        subtitle = _gpu_panel_subtitle(BackendType.VLLM, self._provider)
+        subtitle_widget = self.query_one("#gpu-config-subtitle-vllm", Static)
+        subtitle_widget.update(subtitle)
+        subtitle_widget.set_class(not subtitle, "hidden")
         # A bound Prime offer dictates the GPU shape and count, and the deploy
         # path overwrites whatever these hold. Leaving them editable invites
         # changes that are silently discarded.
@@ -2395,7 +2359,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
 
     def on_prime_offers_failed(self, message: PrimeOffersFailed) -> None:
         self.query_one("#prime-offer-status", Static).update(
-            f"[red]Could not load Prime offers:[/red] {escape(message.error)}"
+            f"[$error]Could not load Prime offers:[/$error] {escape(message.error)}"
         )
 
     def _refresh_vast_offers(self) -> None:
@@ -2424,7 +2388,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
 
     def on_vast_offers_failed(self, message: VastOffersFailed) -> None:
         self.query_one("#vast-offer-status-vllm", Static).update(
-            f"[red]Could not load Vast.ai rentals:[/red] {escape(message.error)}"
+            f"[$error]Could not load Vast.ai rentals:[/$error] {escape(message.error)}"
         )
 
     def _vast_disk_gb(self) -> int:
@@ -2582,7 +2546,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
             self._set_model_status(f"[dim]{mode_label} models loaded. Select one to prefill Model name.[/dim]")
             self._focus_model_list_if_pending()
         else:
-            self._set_model_status("[yellow]No matching text-generation models found.[/yellow]")
+            self._set_model_status("[$warning]No matching text-generation models found.[/$warning]")
 
     def on_storage_loaded(self, message: StorageLoaded) -> None:
         self._cached_models = _cached_models_from_snapshot(message.snapshot, BackendType.VLLM)
@@ -2595,7 +2559,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
             return
         self._ranked_models = []
         _set_option_list(self.query_one("#vllm-model-list", OptionList), [])
-        self._set_model_status(f"[yellow]Could not load cached models:[/yellow] {escape(message.error)}")
+        self._set_model_status(f"[$warning]Could not load cached models:[/$warning] {escape(message.error)}")
 
     def on_vllm_models_failed(self, message: VllmModelsFailed) -> None:
         if message.mode != self._rank_mode:
@@ -2603,7 +2567,7 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
         self._ranked_models = []
         _set_option_list(self.query_one("#vllm-model-list", OptionList), [])
         self._set_model_status(
-            f"[yellow]Could not load model suggestions:[/yellow] {escape(message.error)} [dim](manual input still works)[/dim]"
+            f"[$warning]Could not load model suggestions:[/$warning] {escape(message.error)} [dim](manual input still works)[/dim]"
         )
 
     def action_do_deploy(self) -> None:
@@ -2636,14 +2600,6 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
     def _set_model_status(self, text: str) -> None:
         self.query_one("#vllm-model-status", Static).update(text)
 
-    def _set_ranking_title(self) -> None:
-        subtitle = _ranking_subtitle(BackendType.VLLM, self._rank_mode)
-        try:
-            self.query_one("#vllm-model-ranking-title", Static).update(
-                f"[bold]Model[/bold]  [dim]({subtitle})[/dim]"
-            )
-        except Exception:
-            return
 
     def _resolve_rank_mode(self, option_id: str) -> str | None:
         cleaned = (option_id or "").strip().lower()
@@ -2662,12 +2618,12 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
         options = [Option(f"  {model.repo_id}", id=f"model-{idx}") for idx, model in enumerate(self._ranked_models)]
         _set_option_list(model_list, options)
         if self._ranked_models:
-            self._set_model_status("[dim]Cached models loaded. Select one to prefill Model name.[/dim]")
+            self._set_model_status("[dim]Select one to prefill Model name.[/dim]")
             self._focus_model_list_if_pending()
         elif self._fall_back_to_downloads_ranking():
             return
         else:
-            self._set_model_status("[yellow]No cached vLLM models found in storage.[/yellow]")
+            self._set_model_status("[$warning]No cached vLLM models found in storage.[/$warning]")
 
     def _fall_back_to_downloads_ranking(self) -> bool:
         """Switch an empty default "Cached in storage" view to "Most downloaded".
@@ -2687,7 +2643,6 @@ class VllmDeployScreen(_OptionListArrowNavigationMixin, _CostPreviewMixin, CopyE
                 pass
         finally:
             self._updating_rank_mode = False
-        self._set_ranking_title()
         self._set_model_status("[dim]Nothing cached yet. Loading popular models...[/dim]")
         self.app.begin_fetch_vllm_models("downloads", self)  # type: ignore[attr-defined]
         return True

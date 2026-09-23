@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from rich.cells import cell_len
-from rich.markup import render as render_markup
+from textual.content import Content
 from textual.app import App
 from textual.widgets import Input, OptionList, Static
 
@@ -223,7 +223,7 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
         def rows() -> list[str]:
             option_list = screen.query_one("#fast-deploy-list", OptionList)
             return [
-                render_markup(str(option_list.get_option_at_index(index).prompt)).plain
+                Content.from_markup(str(option_list.get_option_at_index(index).prompt)).plain
                 for index in range(option_list.option_count)
             ]
 
@@ -284,7 +284,7 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
                 option_list = screen.query_one("#fast-deploy-list", OptionList)
                 rendered = [
-                    render_markup(str(option_list.get_option_at_index(index).prompt)).plain
+                    Content.from_markup(str(option_list.get_option_at_index(index).prompt)).plain
                     for index in range(option_list.option_count)
                 ]
                 self.assertTrue(any("$" in row for row in rendered))
@@ -899,7 +899,12 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 assert isinstance(screen, FastDeployScreen)
                 option_list = screen.query_one("#fast-deploy-list", OptionList)
                 detail = screen.query_one("#fast-deploy-detail", Static)
-                self.assertGreaterEqual(option_list.size.height, 10)
+                # Every option shows, and the list stops there: a one-model
+                # list used to fill twenty rows and push its detail panel to
+                # the bottom of the screen.
+                self.assertGreaterEqual(option_list.size.height, option_list.option_count)
+                self.assertLessEqual(option_list.size.height, option_list.option_count + 1)
+                self.assertLessEqual(detail.region.y - option_list.region.bottom, 1)
                 self.assertGreaterEqual(detail.size.height, 3)
 
     async def test_gpu_filter_limits_model_list_to_compatible_shapes(self) -> None:
@@ -1095,13 +1100,45 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 screen = app.screen
                 assert isinstance(screen, FastDeployScreen)
                 option_list = screen.query_one("#fast-deploy-list", OptionList)
-                self.assertGreaterEqual(option_list.size.height, 6)
+                self.assertGreaterEqual(option_list.size.height, option_list.option_count)
 
                 await pilot.press("/")
                 search = screen.query_one("#fast-deploy-model-search", Input)
                 self.assertTrue(search.display)
                 self.assertIs(screen.focused, search)
 
+
+    async def test_a_phone_in_portrait_keeps_the_list_and_its_detail(self) -> None:
+        """Width alone used to trigger the 40x12 economies.
+
+        A phone in portrait is under 60 columns but tall: it got a three-row
+        list showing one model, no detail, no status and no footer above thirty
+        empty rows. Only a terminal that is also short gives those up.
+        """
+        models = tuple(
+            _model((_profile(f"fits-{index}", required_vram_gb=100.0),))
+            for index in range(4)
+        )
+        app = _StyledApp()
+        with patch(
+            "llm_launchpad.tui.screens.fast_deploy.list_quick_deploy_models",
+            return_value=models,
+        ):
+            async with app.run_test(size=(51, 45)) as pilot:
+                app.push_screen(FastDeployScreen())
+                await pilot.pause()
+
+                screen = app.screen
+                assert isinstance(screen, FastDeployScreen)
+                option_list = screen.query_one("#fast-deploy-list", OptionList)
+                detail = screen.query_one("#fast-deploy-detail", Static)
+                self.assertGreaterEqual(option_list.size.height, option_list.option_count)
+                self.assertTrue(detail.display)
+                self.assertGreater(detail.region.height, 0)
+
+                await pilot.resize_terminal(51, 18)
+                await pilot.pause()
+                self.assertFalse(detail.display)
 
     async def test_model_rows_stay_inside_the_list_at_eighty_columns(self) -> None:
         """The row carried the size bucket its own section heading states.
@@ -1134,7 +1171,7 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 for index in range(option_list.option_count):
                     prompt = str(option_list.get_option_at_index(index).prompt)
                     with self.subTest(row=prompt):
-                        plain = render_markup(prompt).plain
+                        plain = Content.from_markup(prompt).plain
                         self.assertLessEqual(cell_len(plain), width)
 
     async def test_pending_catalog_renders_building_state(self) -> None:
@@ -1346,7 +1383,7 @@ class QuantDisclosureRenderTests(unittest.TestCase):
         for mode in (WidthMode.MINIMAL, WidthMode.COMPACT, WidthMode.WIDE):
             with self.subTest(width_mode=mode):
                 columns = {
-                    render_markup(_tier_option(tier, mode, width)).plain.index("$")
+                    Content.from_markup(_tier_option(tier, mode, width)).plain.index("$")
                     for tier in tiers
                 }
                 # One shared column, whether or not the row fills it.
@@ -1361,7 +1398,7 @@ class QuantDisclosureRenderTests(unittest.TestCase):
         # Otherwise every row of every model is indented to make room for a
         # disclosure none of them carries.
         self.assertEqual(_tier_quality_width(tiers), 0)
-        rendered = render_markup(_tier_option(tiers[0], WidthMode.WIDE, 0)).plain
+        rendered = Content.from_markup(_tier_option(tiers[0], WidthMode.WIDE, 0)).plain
         self.assertNotIn("-bit", rendered)
 
     def test_the_bit_width_survives_the_narrowest_terminal(self) -> None:
@@ -1370,7 +1407,7 @@ class QuantDisclosureRenderTests(unittest.TestCase):
 
         # MINIMAL drops the tradeoff clause, which is the other place the
         # disclosure lives. It must not be the only place.
-        rendered = render_markup(_tier_option(saver, WidthMode.MINIMAL, width)).plain
+        rendered = Content.from_markup(_tier_option(saver, WidthMode.MINIMAL, width)).plain
         self.assertIn("2-bit", rendered)
 
     def test_a_reduced_quant_is_flagged_rather_than_highlighted(self) -> None:
@@ -1382,7 +1419,7 @@ class QuantDisclosureRenderTests(unittest.TestCase):
         )
 
         # Green read as a recommendation for the row costing the most quality.
-        self.assertIn("yellow", reduced)
+        self.assertIn("$warning", reduced)
         self.assertNotIn("#7bf168", reduced)
         self.assertIn("dim", full)
 
@@ -1397,7 +1434,7 @@ class DeployKeyHintTests(unittest.TestCase):
         # step two cannot rent a GPU. The footer says so, but the fulfillment
         # dropdown paints over the footer while open, and a phone terminal
         # hides the footer behind its on-screen keyboard for good.
-        wide = render_markup(deploy_key_hint(narrow=False)).plain
+        wide = Content.from_markup(deploy_key_hint(narrow=False)).plain
         self.assertIn("ctrl+d", wide)
         self.assertIn("Deploy", wide)
 
@@ -1406,7 +1443,7 @@ class DeployKeyHintTests(unittest.TestCase):
 
         # The hint is one row high, so anything that does not fit is cut. The
         # full sentence lost its final word on a real phone terminal.
-        narrow = render_markup(deploy_key_hint(narrow=True)).plain
+        narrow = Content.from_markup(deploy_key_hint(narrow=True)).plain
         self.assertLessEqual(cell_len(narrow), 46)
         self.assertIn("ctrl+d", narrow)
 
@@ -1415,7 +1452,7 @@ class DeployKeyHintTests(unittest.TestCase):
 
         for narrow in (True, False):
             with self.subTest(narrow=narrow):
-                text = render_markup(
+                text = Content.from_markup(
                     deploy_key_hint(narrow=narrow)
                 ).plain
                 self.assertNotIn("ctrl+t", text)

@@ -54,7 +54,7 @@ Footer {
     height: 2;
     background: $footer-background;
     color: $footer-foreground;
-    border-top: solid $border;
+    border-top: solid $foreground 15%;
     /* Restore Textual's own footer scrollbar settings, which the global `*`
        rule above overrides. The border leaves exactly one content row, and a
        horizontal scrollbar would spend it; a reserved gutter collapses every
@@ -71,14 +71,14 @@ StatusHeader {
     height: 2;
     padding: 0 2;
     background: $surface;
-    border-bottom: solid $border;
+    border-bottom: solid $foreground 15%;
 }
 
 /* ---- Log viewer ---- */
 
 LogViewer {
     height: 1fr;
-    border: solid $border;
+    border: round $foreground 20%;
     background: $surface;
     padding: 0 1;
 }
@@ -127,19 +127,21 @@ LogViewer Log {
     max-height: 100%;
     margin: 1 0 0 1;
     overflow-y: auto;
+    /* The menu beside it is centred; content-sized panels pinned to the top
+       left the two columns visibly out of step. */
+    align-vertical: middle;
 }
 
-/* Takes the column height that billing does not, rather than capping at 14
-   rows and scrolling its own content while the rows below it stay blank. Two
-   deployments were already enough to clip an entry mid-endpoint with ten
-   unused rows directly underneath. */
+/* Sized to its content: stretched to the column height, one "no endpoints"
+   line sat in a thirty-row empty box. The side column scrolls instead when a
+   long fleet outgrows it, so no entry is clipped mid-endpoint. */
 #deployment-status-panel {
     width: 100%;
-    height: 1fr;
-    min-height: 6;
+    height: auto;
+    min-height: 3;
     overflow-y: auto;
     padding: 0 2;
-    border: solid $foreground-muted;
+    border: round $foreground 20%;
     background: $panel;
 }
 
@@ -150,22 +152,20 @@ LogViewer Log {
     overflow-y: auto;
     margin: 1 0 0 0;
     padding: 0 2;
-    border: solid $foreground-muted;
+    border: round $foreground 20%;
     background: $panel;
 }
 
-#deployment-status-title {
-    padding: 0 0 0 0;
+#deployment-status-panel,
+#billing-report-panel {
+    border-title-color: $primary;
+    border-title-style: bold;
 }
 
 #deployment-status-body {
     color: $text;
     text-wrap: wrap;
     overflow-y: auto;
-}
-
-#billing-report-title {
-    padding: 0 0 0 0;
 }
 
 #billing-report-body {
@@ -176,12 +176,19 @@ LogViewer Log {
 #banner-text {
     text-align: center;
     color: $primary;
-    padding: 0 0 1 0;
+    padding: 0;
 }
 
-/* Compact fleet + connection line under the menu: always visible, even when
-   the side panels are hidden on constrained terminals. */
+/* Compact fleet line under the menu. It stands in for the Deployment Status
+   panel, so it shows only where that panel is hidden; beside the panel it
+   repeated it. */
+.viewport-narrow #fleet-summary-line,
+.viewport-short #fleet-summary-line {
+    display: block;
+}
+
 #fleet-summary-line {
+    display: none;
     width: 100%;
     height: auto;
     padding: 1 1 0 1;
@@ -193,7 +200,6 @@ LogViewer Log {
     width: auto;
     max-width: 92;
     height: auto;
-    min-height: 4;
     margin: 0 0 1 1;
     padding: 0 1;
     border-left: tall $foreground-muted;
@@ -205,31 +211,31 @@ LogViewer Log {
 
 OptionList {
     background: $surface;
-    border: solid $foreground-muted;
+    border: round $foreground 20%;
     padding: 0;
     height: auto;
     max-height: 20;
 }
 
 OptionList:focus {
-    border: solid $primary;
+    border: round $primary;
 }
 
 OptionList > .option-list--option-highlighted {
-    background: $primary-background;
+    background: $primary 15%;
     color: $text;
     text-style: bold;
 }
 
 OptionList > .option-list--option-hover-highlighted {
-    background: $primary-background;
+    background: $primary 15%;
     color: $text;
     text-style: bold;
 }
 
 DataTable {
     background: $surface;
-    border: solid $foreground-muted;
+    border: round $foreground 20%;
     height: 1fr;
     /* Two rows go to the border, so a floor of 3 left a single content row for
        the header and none for the data. A table that shows no rows is worse
@@ -241,7 +247,7 @@ DataTable {
 }
 
 DataTable:focus {
-    border: solid $primary;
+    border: round $primary;
 }
 
 SelectionList {
@@ -257,13 +263,13 @@ ListView {
 }
 
 ListView > ListItem.--highlight {
-    background: $primary-background;
+    background: $primary 15%;
 }
 
 /* ---- Inputs ---- */
 
 Input {
-    border: tall $foreground-muted;
+    border: tall $foreground 25%;
     background: $surface;
     color: $text;
     padding: 0 1;
@@ -291,11 +297,11 @@ Select {
    primary border, so keyboard input always has exactly one bright target. */
 Button:focus,
 Select:focus > SelectCurrent {
-    background: $primary-background;
+    background: $primary 15%;
 }
 
 Select > SelectCurrent {
-    border: tall $foreground-muted;
+    border: tall $foreground 25%;
 }
 
 Select:focus > SelectCurrent {
@@ -304,14 +310,14 @@ Select:focus > SelectCurrent {
 }
 
 OptionList > .option-list--option-highlighted {
-    background: $primary-background;
+    background: $primary 15%;
     color: $text;
     text-style: bold;
 }
 
 OptionList:focus > .option-list--option-highlighted {
-    background: $primary;
-    color: $button-color-foreground;
+    background: $primary 30%;
+    color: $text;
     text-style: bold;
 }
 
@@ -321,22 +327,28 @@ DataTable:focus > .datatable--header {
 }
 
 DataTable:focus > .datatable--cursor {
-    background: $primary;
-    color: $button-color-foreground;
+    background: $primary 30%;
+    color: $text;
     text-style: bold;
 }
 
-Button.-danger {
-    border: solid $error;
+/* `variant="error"` adds `-error`; this rule used to target `-danger`, which
+   nothing sets, so destructive buttons looked like every other button. */
+Button.-error {
+    border: round $error;
     color: $error;
     text-style: bold;
 }
 
-Button.-danger:hover,
-Button.-danger:focus {
+Button.-error:hover,
+Button.-error:focus {
     background: $error;
     color: $background;
-    border: solid $error;
+    border: round $error;
+}
+
+.dialog-scroll {
+    align: center middle;
 }
 
 .dialog-panel {
@@ -344,7 +356,7 @@ Button.-danger:focus {
     max-width: 76;
     height: auto;
     padding: 1 2;
-    border: solid $foreground-muted;
+    border: round $foreground 20%;
     background: $surface;
 }
 
@@ -388,24 +400,33 @@ Button {
     min-width: 16;
     background: $panel;
     color: $text;
-    border: solid $foreground-muted;
+    border: round $foreground 30%;
 }
 
 Button:hover {
-    background: $primary-background;
-    border: solid $primary;
+    background: $primary 15%;
+    border: round $primary;
 }
 
 Button.-primary {
     background: $primary;
     color: $button-color-foreground;
     text-style: bold;
-    border: solid $primary;
+    border: round $primary;
 }
 
+/* One focus treatment for every control: the primary border that Input,
+   Select, OptionList and DataTable also use. `$accent` drew a yellow ring in
+   High Contrast that no other control shared. */
 Button:focus {
     text-style: bold;
-    border: solid $accent;
+    border: round $primary;
+}
+
+/* A primary button is already filled and bordered in the primary colour, so
+   focus shows as a light ring instead. */
+Button.-primary:focus {
+    border: round $foreground;
 }
 
 /* ---- Fast deploy flow ---- */
@@ -506,12 +527,24 @@ Button:focus {
     padding: 1 2 0 2;
 }
 
-/* The five decision facts sit above the scroll container so they cannot
-   scroll away on a short terminal; technical evidence lives behind a toggle. */
+/* The decision facts and the Deploy button share one row above the scroll
+   container, so neither can scroll away on a short terminal; technical
+   evidence lives behind a toggle. Compact viewports stack the two. */
+#quick-deploy-summary {
+    width: 100%;
+    height: auto;
+    padding: 1 2 1 2;
+}
+
 #quick-deploy-facts {
-    padding: 0 2 1 2;
+    width: 1fr;
+    height: auto;
+    padding: 0 1;
     color: $text;
     text-wrap: wrap;
+    border: round $primary;
+    border-title-color: $text;
+    border-title-style: bold;
 }
 
 #quick-deploy-layout {
@@ -524,7 +557,7 @@ Button:focus {
 #quick-deploy-form {
     height: auto;
     padding: 1 2;
-    border: solid $foreground-muted;
+    border: round $foreground 20%;
     background: $surface;
 }
 
@@ -543,20 +576,20 @@ Button:focus {
     margin: 0 0 0 0;
 }
 
-#quick-deploy-actions {
-    width: 100%;
-    height: auto;
-    padding: 0 2 1 2;
+#quick-deploy-form.-bare {
+    border: none;
+    padding: 0;
+    background: transparent;
 }
 
-#quick-deploy-decision-summary {
-    width: 100%;
+#quick-deploy-actions {
+    width: 36;
     height: auto;
-    padding: 0 1;
-    margin: 0 0 1 0;
-    border-left: tall $primary;
-    background: $surface-lighten-1;
-    text-wrap: wrap;
+    padding: 0 0 0 2;
+}
+
+#quick-deploy-btn {
+    width: 100%;
 }
 
 #quick-deploy-profile-title {
@@ -575,13 +608,41 @@ Button:focus {
 }
 
 .viewport-compact #quick-deploy-title,
-.viewport-compact #quick-deploy-facts {
+.viewport-compact #quick-deploy-summary {
     padding-left: 1;
     padding-right: 1;
 }
 
+/* Below 120 columns the facts need the full width; Deploy and its hint take
+   the row under them instead of a squeezed column beside them. */
+.viewport-narrow #quick-deploy-summary {
+    layout: vertical;
+}
+
+.viewport-narrow #quick-deploy-actions {
+    width: 100%;
+    height: auto;
+    padding: 1 0 0 0;
+    layout: horizontal;
+}
+
+.viewport-narrow #quick-deploy-btn {
+    width: auto;
+    min-width: 16;
+}
+
+.viewport-narrow #quick-deploy-feedback {
+    width: 1fr;
+    padding: 1 0 0 2;
+}
+
+.viewport-constrained #quick-deploy-actions {
+    padding-top: 0;
+}
+
 #quick-deploy-feedback {
-    height: 1;
+    height: auto;
+    text-wrap: wrap;
 }
 
 #quick-fulfillment,
@@ -610,13 +671,6 @@ Button:focus {
     text-wrap: wrap;
 }
 
-.form-section-title {
-    color: $primary;
-    text-style: bold;
-    height: auto;
-    text-wrap: wrap;
-}
-
 .form-section-subtitle {
     color: $text-muted;
     height: auto;
@@ -639,14 +693,16 @@ VllmDeployScreen .form-section-subtitle {
     color: $text-muted;
 }
 
+/* `$border` is the primary color, so every idle field used to wear the focus
+   color and the focused one could not stand out. */
 LlamaCppDeployScreen Input,
 VllmDeployScreen Input {
-    border: tall $border;
+    border: tall $foreground 25%;
 }
 
 LlamaCppDeployScreen Select > SelectCurrent,
 VllmDeployScreen Select > SelectCurrent {
-    border: tall $border;
+    border: tall $foreground 25%;
 }
 
 LlamaCppDeployScreen Input:focus,
@@ -663,7 +719,7 @@ VllmDeployScreen Select:focus > SelectCurrent {
 
 LlamaCppDeployScreen .gpu-config-panel,
 VllmDeployScreen .gpu-config-panel {
-    border: tall $border;
+    border: round $foreground 20%;
     background: $surface-lighten-1;
 }
 
@@ -746,7 +802,7 @@ VllmDeployScreen Select:disabled > SelectCurrent {
     height: 2;
     padding: 0 2;
     background: $surface;
-    border-bottom: solid $border;
+    border-bottom: solid $foreground 15%;
 }
 
 #monitor-title {
@@ -769,13 +825,16 @@ VllmDeployScreen Select:disabled > SelectCurrent {
     height: auto;
     max-height: 12;
     margin: 0 2 1 2;
-    padding: 1 2;
-    border: solid $primary;
+    /* No vertical padding: a title, four fields, the action gap and a
+       three-row button row fill ten rows, and the padding pushed the buttons'
+       bottom edge past the cap into the card's own scroll. */
+    padding: 0 2;
+    border: round $primary;
     background: $surface-lighten-1;
 }
 
 #failure-card {
-    border: solid $error;
+    border: round $error;
 }
 
 #connection-card-body,
@@ -831,15 +890,21 @@ DeploymentProgressWidget #deploy-progress-hint {
     padding: 0 1;
 }
 
+/* Rows are sized explicitly: left to the grid default, an auto-height grid
+   gave each row two cells, so every button lost its label row and drew as an
+   empty box. */
 #connection-info-actions {
     width: 100%;
     height: auto;
     layout: grid;
     grid-size: 3;
+    grid-rows: 3;
+    grid-gutter: 1 1;
+    margin: 1 0 0 0;
 }
 
-#connection-info-actions Button {
-    margin: 0 1 1 0;
+.viewport-minimal #connection-info-actions Button {
+    margin: 0 0 1 0;
 }
 
 .viewport-narrow #connection-info-actions {
@@ -926,13 +991,8 @@ DeploymentProgressWidget #deploy-progress-hint {
     margin: 1 0 0 0;
 }
 
-#manage-action-context,
-#manage-action-help {
+#manage-action-context {
     height: auto;
-}
-
-#manage-action-help {
-    margin: 1 0 0 0;
 }
 
 #stop-confirm-actions {
@@ -970,7 +1030,7 @@ DeploymentProgressWidget #deploy-progress-hint {
     height: auto;
     padding: 0 2 1 2;
     background: $footer-background;
-    border-top: solid $border;
+    border-top: solid $foreground 15%;
     align: left middle;
 }
 
@@ -1065,13 +1125,28 @@ DeploymentProgressWidget #deploy-progress-hint {
     max-height: 100%;
 }
 
-#storage-hint {
+#storage-hint-row {
+    width: 100%;
+    height: auto;
     margin: 1 0 0 0;
+}
+
+#storage-hint {
+    width: 1fr;
+    height: auto;
+    padding: 1 2 0 0;
 }
 
 #storage-predownload-toggle {
     width: auto;
-    margin: 1 0 0 0;
+}
+
+.viewport-compact #storage-hint-row {
+    layout: vertical;
+}
+
+.viewport-compact #storage-hint {
+    padding: 0;
 }
 
 #storage-predownload-form {
@@ -1079,7 +1154,7 @@ DeploymentProgressWidget #deploy-progress-hint {
     height: auto;
     margin: 1 0 0 0;
     padding: 1 2;
-    border: solid $foreground-muted;
+    border: round $foreground 20%;
     background: $surface;
 }
 
@@ -1096,7 +1171,7 @@ DeploymentProgressWidget #deploy-progress-hint {
 #storage-empty {
     height: auto;
     padding: 1 1;
-    border: solid $foreground-muted;
+    border: round $foreground 20%;
     background: $surface;
     text-wrap: wrap;
 }
@@ -1109,7 +1184,7 @@ DeploymentProgressWidget #deploy-progress-hint {
     max-width: 88;
     height: auto;
     padding: 1 2;
-    border: solid $foreground-muted;
+    border: round $foreground 20%;
     background: $surface;
 }
 
@@ -1170,20 +1245,21 @@ DeploymentProgressWidget #deploy-progress-hint {
 
 /* Advanced deploy: model source and compute sit in labelled groups so the
    compute configuration is visible without scrolling past a tall picker. */
+/* Each section names itself in its border, so no heading row (and no blank
+   row above one) sits between the border and the first field. */
+.deploy-group,
+.gpu-config-panel {
+    border-title-color: $primary;
+    border-title-style: bold;
+}
+
 .deploy-group {
     width: 100%;
     height: auto;
     margin: 0 0 1 0;
-    padding: 0 1 1 1;
-    border: solid $foreground-muted;
+    padding: 0 1;
+    border: round $foreground 20%;
     background: $surface;
-}
-
-.deploy-group-title {
-    color: $primary;
-    text-style: bold;
-    height: auto;
-    padding: 1 0 0 0;
 }
 
 #llama-deploy-actions,
@@ -1227,8 +1303,8 @@ DeploymentProgressWidget #deploy-progress-hint {
     width: 100%;
     height: auto;
     margin: 0 0 1 0;
-    padding: 0 1 1 1;
-    border: tall $border;
+    padding: 0 1;
+    border: round $foreground 20%;
     background: $surface;
 }
 
@@ -1278,7 +1354,7 @@ DeploymentProgressWidget #deploy-progress-hint {
 .viewport-constrained .screen-scroll,
 .viewport-constrained #fast-deploy-container,
 .viewport-constrained #quick-deploy-layout,
-.viewport-constrained #quick-deploy-actions {
+.viewport-constrained #quick-deploy-summary {
     padding-top: 0;
     padding-bottom: 0;
 }
@@ -1434,6 +1510,7 @@ StatusHeader.state-error {
     background: $background;
     border-left: solid $primary;
     overflow-y: auto;
+    align-vertical: top;
 }
 
 .viewport-narrow #main-menu-layout {
@@ -1522,15 +1599,11 @@ StatusHeader.state-error {
 .viewport-compact .screen-scroll,
 .viewport-compact #fast-deploy-container,
 .viewport-compact #quick-deploy-layout,
-.viewport-compact #quick-deploy-actions {
-    padding: 0 1;
-}
-
 .viewport-minimal #main-menu-primary,
 .viewport-minimal .screen-scroll,
 .viewport-minimal #fast-deploy-container,
 .viewport-minimal #quick-deploy-layout,
-.viewport-minimal #quick-deploy-actions {
+.viewport-minimal #quick-deploy-summary {
     padding: 0;
 }
 
@@ -1580,7 +1653,6 @@ StatusHeader.state-error {
 
 .viewport-compact #quick-deploy-profile-card,
 .viewport-compact #quick-deploy-form,
-.viewport-compact #quick-deploy-actions,
 .viewport-compact #settings-form {
     padding: 0 1;
 }
@@ -1713,11 +1785,11 @@ StatusHeader.state-error {
     overflow-y: auto;
 }
 
-.viewport-short #quick-deploy-decision-summary {
-    margin-bottom: 0;
-}
-
-.viewport-minimal Footer,
+/* Width alone never hides content: a phone in portrait is under 60 columns
+   but has plenty of rows, and these rules used to leave it one model row, no
+   detail, no status and no footer above thirty empty lines. The vertical
+   economies below apply only when the terminal is also short. */
+.viewport-minimal.viewport-short Footer,
 .viewport-shallow Footer {
     display: none;
 }
@@ -1753,32 +1825,33 @@ StatusHeader.state-error {
     margin-bottom: 0;
 }
 
-.viewport-minimal #fast-deploy-status {
+.viewport-minimal.viewport-short #fast-deploy-status {
     display: none;
 }
 
-.viewport-minimal #fast-deploy-detail {
+.viewport-minimal.viewport-short #fast-deploy-detail {
     display: none;
 }
 
-.viewport-minimal #fast-deploy-list {
+.viewport-minimal.viewport-short #fast-deploy-list {
     min-height: 3;
     max-height: 3;
 }
 
-.viewport-minimal #quick-deploy-facts {
-    max-height: 3;
+.viewport-minimal.viewport-short #quick-deploy-facts {
+    /* The border keeps the model name; two fact lines fit inside it. */
+    max-height: 4;
     overflow-y: hidden;
 }
 
 /* At the 40x12 floor only the facts and Deploy survive: the key hint hides
    rather than overflowing the viewport. The scrollable card keeps its place
    in the focus chain -- hiding it would strand arrow-key users on Deploy. */
-.viewport-minimal #quick-deploy-feedback {
+.viewport-minimal.viewport-short #quick-deploy-feedback {
     display: none;
 }
 
-.viewport-minimal #quick-deploy-actions {
+.viewport-minimal #quick-deploy-summary {
     padding: 0 1;
 }
 
@@ -1797,7 +1870,7 @@ StatusHeader.state-error {
 .density-compact #quick-deploy-layout,
 .density-compact #quick-deploy-profile-card,
 .density-compact #quick-deploy-form,
-.density-compact #quick-deploy-actions,
+.density-compact #quick-deploy-summary,
 .density-compact #settings-form {
     padding-top: 0;
     padding-bottom: 0;
@@ -1810,6 +1883,6 @@ CopyEnabledScreen.viewport-ultra-wide {
 .viewport-ultra-wide .screen-scroll,
 .viewport-ultra-wide #fast-deploy-container,
 .viewport-ultra-wide #quick-deploy-layout,
-.viewport-ultra-wide #quick-deploy-actions {
+.viewport-ultra-wide #quick-deploy-summary {
     max-width: 160;
 }

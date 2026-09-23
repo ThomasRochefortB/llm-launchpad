@@ -239,12 +239,12 @@ class SemanticStyleTests(unittest.TestCase):
 
     def test_status_markup_escapes_text(self) -> None:
         rendered = status_markup("failed", "[boom]")
-        self.assertIn("XX", rendered)
+        self.assertIn("✗", rendered)
         self.assertNotIn("[boom]", rendered.replace("\\[boom]", ""))
 
     def test_stage_chips_use_semantic_styles(self) -> None:
-        self.assertIn("[success]", _stage_chip("Validate", "done"))
-        self.assertIn("[error]", _stage_chip("Load", "failed"))
+        self.assertIn("$success", _stage_chip("Validate", "done"))
+        self.assertIn("$error", _stage_chip("Load", "failed"))
         self.assertNotIn("#", _stage_chip("Load", "failed"))
 
     def test_progress_widget_renders_without_mount(self) -> None:

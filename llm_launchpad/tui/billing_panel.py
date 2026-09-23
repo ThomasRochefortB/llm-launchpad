@@ -41,8 +41,8 @@ _COLUMN_GAP = 2
 
 _STATUS_MARKUP: dict[BillingStatus, str] = {
     BillingStatus.LOADING: "[dim]checking...[/dim]",
-    BillingStatus.UNCONFIGURED: "[yellow]not configured[/yellow]",
-    BillingStatus.FAILED: "[yellow]unavailable[/yellow]",
+    BillingStatus.UNCONFIGURED: "[$warning]not configured[/$warning]",
+    BillingStatus.FAILED: "[$warning]unavailable[/$warning]",
 }
 _STATUS_PLAIN: dict[BillingStatus, str] = {
     BillingStatus.LOADING: "checking...",
@@ -71,8 +71,11 @@ def storage_estimate_lines(snapshot: StorageSnapshot | None) -> tuple[str, ...]:
     )
 
 
-def _headline(row: ProviderBilling) -> tuple[str, str]:
+def _headline(row: ProviderBilling, spinner: str = "") -> tuple[str, str]:
     """Return the figure column as (markup, plain text) for width measuring."""
+    if row.status is BillingStatus.LOADING and spinner:
+        # One cell per frame, so the column stays put while it turns.
+        return f"[$primary]{spinner}[/] [dim]checking[/dim]", f"{spinner} checking"
     if row.status is BillingStatus.READY:
         if row.amount_usd is None:
             return "[dim]unknown[/dim]", "unknown"
@@ -94,7 +97,7 @@ def _summary_fragments(row: ProviderBilling) -> list[str]:
     if row.owed_usd is not None:
         # An owed balance is the one case worth breaking the dim line for: it
         # is why a healthy-looking credit figure will not start a rental.
-        fragments.append(f"[yellow]owed {format_money(row.owed_usd)}[/yellow]")
+        fragments.append(f"[$warning]owed {format_money(row.owed_usd)}[/$warning]")
 
     fragments.extend(
         f"{escape(charge.label)} {format_money(charge.amount_usd)}"
@@ -131,15 +134,20 @@ def render_provider_billing(
     rows: tuple[ProviderBilling, ...] | list[ProviderBilling],
     *,
     storage_snapshot: StorageSnapshot | None = None,
+    spinner: str = "",
 ) -> str:
-    """Render every provider's billing row into the shared panel body."""
+    """Render every provider's billing row into the shared panel body.
+
+    ``spinner`` is the current frame for rows still loading; without one they
+    read "checking...".
+    """
     if not rows:
         return "[dim]No providers configured.[/dim]"
 
     names = [
         f"{provider_marker(row.provider)} {row.provider.display_name}" for row in rows
     ]
-    headlines = [_headline(row) for row in rows]
+    headlines = [_headline(row, spinner) for row in rows]
     # Both columns are measured against the rows themselves rather than the
     # panel, which is 56 columns wide but narrows to 42 and to 40 in the
     # overlay. Padding to the panel width would wrap every row at the narrow

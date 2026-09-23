@@ -18,6 +18,7 @@ from ..visual import (
     TUI_THEME_OPTIONS,
     normalize_tui_density,
     normalize_tui_theme,
+    screen_title,
 )
 from ..widgets.input_form import FormField, ToggleField
 from ..widgets.fitted_footer import FittedFooter
@@ -84,13 +85,13 @@ class SettingsScreen(CopyEnabledScreen):
         with Vertical(id="settings-layout"):
             with VerticalScroll(id="settings-scroll", classes="screen-scroll"):
                 with Vertical(id="settings-form"):
-                    yield Static("[bold primary]Settings[/]", id="settings-title")
+                    yield Static(screen_title("Settings"), id="settings-title")
                     yield Static("[bold]Deployment[/bold]", classes="settings-section")
                     yield FormField(
                         "Modal idle timeout before scale-down",
                         "scaledown-window",
                         default=format_scaledown_window(settings.scaledown_window),
-                        hint="e.g. 30m, 90s, or 1800 · idle containers scale to zero after this",
+                        hint="e.g. 30m, 90s or 1800",
                     )
                     yield Static("[bold]Appearance[/bold]", classes="settings-section")
                     with Horizontal(id="settings-appearance-row"):
@@ -102,7 +103,6 @@ class SettingsScreen(CopyEnabledScreen):
                                 allow_blank=False,
                                 id="tui-theme",
                             )
-                            yield Static("[dim]Color palette[/dim]", classes="form-hint")
                         with Vertical(classes="settings-appearance-control"):
                             yield Static("Density", classes="form-label")
                             yield Select(
@@ -111,23 +111,13 @@ class SettingsScreen(CopyEnabledScreen):
                                 allow_blank=False,
                                 id="tui-density",
                             )
-                            yield Static("[dim]Spacing[/dim]", classes="form-hint")
                     yield Static("[bold]Behavior[/bold]", classes="settings-section")
-                    yield Static(
-                        "[dim]Navigate with Tab, Shift+Tab, arrow keys, and Enter. "
-                        "Use your terminal's selection and copy/paste shortcuts.[/dim]",
-                        classes="form-hint",
-                    )
                     yield ToggleField(
                         "Require a second Ctrl+C to quit",
                         "confirm-quit",
                         default=settings.confirm_quit,
                     )
                     yield Static("[bold]Providers[/bold]", classes="settings-section")
-                    yield Static(
-                        "[dim]Vast.ai marketplace rentals and saved keys.[/dim]",
-                        classes="form-hint",
-                    )
                     yield FormField(
                         "Delete idle Vast and Prime rentals after",
                         "rental-idle-shutdown",
@@ -136,10 +126,7 @@ class SettingsScreen(CopyEnabledScreen):
                             if settings.rental_idle_shutdown > 0
                             else "off"
                         ),
-                        hint=(
-                            "e.g. 1h, 30m, or off · rentals bill until deleted; "
-                            "deleting also removes cached weights"
-                        ),
+                        hint="e.g. 1h, 30m or off · deleting also removes cached weights",
                     )
                     yield ToggleField(
                         "Let Prime pods stop themselves (stores your Prime API key on the pod)",
@@ -147,16 +134,14 @@ class SettingsScreen(CopyEnabledScreen):
                         default=settings.prime_self_terminate,
                     )
                     yield Static(
-                        "[dim]Vast rentals always stop themselves with a key Vast limits "
-                        "to that rental. Prime has no such key, so without this a pod is "
-                        "only stopped while this computer is awake.[/dim]",
+                        "[dim]Off: a Prime pod is only stopped while this computer is awake.[/dim]",
                         classes="form-hint",
                     )
                     yield Button("Vast.ai rentals", id="vast-preview-btn")
             with Horizontal(id="settings-actions"):
                 yield Button("Save", id="save-btn", variant="primary")
                 yield Static(
-                    f"[yellow]{escape(self._load_error)} Using defaults.[/yellow]"
+                    f"[$warning]{escape(self._load_error)} Using defaults.[/$warning]"
                     if self._load_error
                     else "",
                     id="save-feedback",
@@ -200,7 +185,7 @@ class SettingsScreen(CopyEnabledScreen):
         if not self._accepting_edits:
             return
         self._dirty = True
-        self._announce("[yellow]Unsaved changes — ctrl+s to save.[/yellow]")
+        self._announce("[$warning]Unsaved changes — ctrl+s to save.[/$warning]")
 
     def _announce(self, markup: str) -> None:
         """Update the feedback line in the persistent action bar.
@@ -223,11 +208,11 @@ class SettingsScreen(CopyEnabledScreen):
         try:
             field = self.query_one("#scaledown-window", Input)
         except Exception:
-            self._announce("[red]Idle timeout must be seconds or a duration like 30m.[/red]")
+            self._announce("[$error]Idle timeout must be seconds or a duration like 30m.[/$error]")
             return
         field.add_class("-invalid")
         field.focus()
-        self._announce("[red]Idle timeout must be seconds or a duration like 30m.[/red]")
+        self._announce("[$error]Idle timeout must be seconds or a duration like 30m.[/$error]")
 
     def _save(self) -> None:
         scaledown_str = self.query_one("#scaledown-window", Input).value.strip()
@@ -251,7 +236,7 @@ class SettingsScreen(CopyEnabledScreen):
         except ValueError:
             rental_field.add_class("-invalid")
             rental_field.focus()
-            self._announce("[red]Rental idle shutdown must be a duration like 1h, or off.[/red]")
+            self._announce("[$error]Rental idle shutdown must be a duration like 1h, or off.[/$error]")
             return
         rental_field.remove_class("-invalid")
 
@@ -271,14 +256,14 @@ class SettingsScreen(CopyEnabledScreen):
         if result.success:
             self._dirty = False
             self._unsaved_warning_at = 0.0
-            self._announce("[green]Settings saved.[/green]")
+            self._announce("[$success]Settings saved.[/$success]")
             apply_preferences = getattr(self.app, "apply_visual_preferences", None)
             if callable(apply_preferences):
                 apply_preferences(settings.tui_theme, settings.tui_density)
             self._apply_behavior_settings(settings)
         else:
             self._announce(
-                f"[red]{escape(result.error or 'Settings could not be saved.')}[/red]"
+                f"[$error]{escape(result.error or 'Settings could not be saved.')}[/$error]"
             )
 
     def _apply_behavior_settings(self, settings: LaunchpadSettings) -> None:
@@ -303,6 +288,6 @@ class SettingsScreen(CopyEnabledScreen):
             return True
         self._unsaved_warning_at = now
         self._announce(
-            "[yellow]Unsaved changes. Press esc again to discard, or ctrl+s to save.[/yellow]"
+            "[$warning]Unsaved changes. Press esc again to discard, or ctrl+s to save.[/$warning]"
         )
         return False

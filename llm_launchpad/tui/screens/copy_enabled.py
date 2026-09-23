@@ -4,13 +4,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from rich.errors import MarkupError
-from rich.markup import render as render_markup
 from textual import events
 from textual.binding import Binding
 from textual.css.query import NoMatches
 from textual.geometry import Size
+from textual.markup import MarkupError
 from textual.containers import ScrollableContainer
+from textual.content import Content
 from textual.scroll_view import ScrollView
 from textual.selection import Selection
 from textual.screen import Screen
@@ -97,7 +97,7 @@ class CopyEnabledScreen(Screen):
             await self.mount(overlay)
 
         overlay.update(
-            "[bold primary]Terminal too small[/]\n"
+            "[bold $primary]Terminal too small[/]\n"
             f"Current: {size.width}×{size.height}  ·  "
             f"Minimum: {MIN_TERMINAL_WIDTH}×{MIN_TERMINAL_HEIGHT}\n"
             "[dim]Resize the terminal to continue.[/dim]"
@@ -268,6 +268,6 @@ class CopyEnabledScreen(Screen):
 
     def _strip_markup(self, text: str) -> str:
         try:
-            return render_markup(text).plain
+            return Content.from_markup(text).plain
         except MarkupError:
             return text

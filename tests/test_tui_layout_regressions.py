@@ -15,12 +15,13 @@ from unittest.mock import patch
 
 from rich.cells import cell_len
 from textual.app import App
+from textual.content import Content
 from textual.geometry import Region
 from textual.widgets import Button, Input, OptionList, Static
 from textual.widgets._footer import FooterKey
 
 from llm_launchpad.core.quick_deploy import QuickDeployModel, QuickDeployProfile
-from llm_launchpad.protocol.enums import SpeculativeDecodingMethod
+from llm_launchpad.protocol.enums import DeploymentState, SpeculativeDecodingMethod
 from llm_launchpad.protocol.models import SpeculativeDecodingConfig, StorageSnapshot
 from llm_launchpad.tui.responsive import WidthMode
 from llm_launchpad.tui.app import TuiApp
@@ -350,30 +351,30 @@ class MtpMarkerTests(unittest.TestCase):
             cell_len(fast_deploy_module.MTP_MARKER),
             cell_len(fast_deploy_module.MODEL_ROW_GUTTER),
         )
-        # "W" is rendered as two cells everywhere; "A" (ambiguous) is two in a
-        # CJK locale and one elsewhere while Rich measures one either way,
-        # which is what knocks a row out of column.
+        # "N" is one cell in every terminal and never emoji-presented. "W"
+        # emoji were drawn over the list edge by Termius on iOS, and "A"
+        # (ambiguous) is two cells in a CJK locale while Rich measures one.
         self.assertEqual(
-            unicodedata.east_asian_width(fast_deploy_module.MTP_MARKER),
-            "W",
+            unicodedata.east_asian_width(fast_deploy_module.MTP_GLYPH),
+            "N",
         )
 
     def test_a_marked_row_starts_its_name_in_the_same_column(self) -> None:
-        from rich.markup import render as render_markup
+        from textual.content import Content
 
         marked = _quick_deploy_model(mtp=True)
         plain = _quick_deploy_model(mtp=False)
         for width_mode in WidthMode:
             with self.subTest(width_mode=width_mode):
                 rendered = [
-                    render_markup(
+                    Content.from_markup(
                         fast_deploy_module._model_option(model, width_mode)
                     ).plain
                     for model in (marked, plain)
                 ]
                 self.assertTrue(rendered[0].startswith(fast_deploy_module.MTP_MARKER))
                 self.assertEqual(
-                    *(cell_len(text) - cell_len(text.lstrip(" ⚡")) for text in rendered)
+                    *(cell_len(text) - cell_len(text.lstrip(" ↯")) for text in rendered)
                 )
 
     def test_an_unprobed_model_is_left_unmarked(self) -> None:
@@ -412,7 +413,7 @@ class ProviderMarkerTests(unittest.TestCase):
         self.assertEqual(len(set(self.MARKERS)), len(self.MARKERS))
 
     def test_auth_rows_all_start_their_text_in_the_same_column(self) -> None:
-        from rich.markup import render as render_markup
+        from textual.content import Content
 
         rows = [
             main_menu_module._render_modal_auth_status(),
@@ -420,13 +421,9 @@ class ProviderMarkerTests(unittest.TestCase):
             main_menu_module._render_hf_auth_status(),
             main_menu_module._render_artificial_analysis_auth_status(),
         ]
-        offsets = {cell_len(render_markup(row).plain.split(" ", 1)[0]) for row in rows}
+        offsets = {cell_len(Content.from_markup(row).plain.split(" ", 1)[0]) for row in rows}
         self.assertEqual(offsets, {1})
 
-
-# Keys never contain two consecutive spaces, so the run of two or more is
-# always the gap between a help row's key column and its description.
-_HELP_ROW = re.compile(r"^  (?P<key>\S.*?) {2,}(?P<description>\S.*)$")
 
 _LABELLED_ROW = re.compile(r"^\[(?:bold|dim)\](?P<label>.*?)\[/(?:bold|dim)?\](?P<pad> *)")
 
@@ -517,33 +514,37 @@ class StatusHeaderTests(unittest.IsolatedAsyncioTestCase):
     """A four-row box for one line of text, and markers of varying width."""
 
     def test_every_state_marker_is_the_same_width(self) -> None:
-        from rich.markup import render as render_markup
-
         widths = {
-            cell_len(render_markup(_state_icon(state)).plain)
+            cell_len(Content.from_markup(_state_icon(state)).plain)
             for state in list(_STATE_MARKERS) + ["something-unknown"]
         }
-        self.assertEqual(widths, {2})
+        self.assertEqual(widths, {1})
 
-    def test_no_marker_is_swallowed_as_rich_markup(self) -> None:
+    def test_no_marker_is_swallowed_as_markup(self) -> None:
         """The markers are interpolated into markup, so "[..]" would vanish."""
-        from rich.markup import render as render_markup
-
         for state, (marker, _style) in _STATE_MARKERS.items():
             with self.subTest(state=state):
                 self.assertFalse(marker.startswith("["))
                 self.assertEqual(
-                    render_markup(_state_icon(state)).plain.strip(), marker
+                    Content.from_markup(_state_icon(state)).plain.strip(), marker
                 )
 
-    def test_markers_survive_colour_being_stripped(self) -> None:
-        from rich.markup import render as render_markup
+    def test_every_deployment_state_has_a_marker(self) -> None:
+        """An unmapped state rendered "??" beside `state: publishing`."""
+        from llm_launchpad.tui.widgets.status_header import FAILED_STATE
+
+        for state in [*DeploymentState, FAILED_STATE]:
+            with self.subTest(state=state):
+                self.assertIn(getattr(state, "value", state), _STATE_MARKERS)
+
+    def test_outcomes_stay_distinct_without_colour(self) -> None:
+        from llm_launchpad.tui.widgets.status_header import FAILED_STATE
 
         plains = {
-            render_markup(_state_icon(state)).plain.strip()
-            for state in _STATE_MARKERS
+            Content.from_markup(_state_icon(state)).plain.strip()
+            for state in ("idle", "deploying", "healthy", "unhealthy", FAILED_STATE)
         }
-        self.assertEqual(len(plains), len(_STATE_MARKERS))
+        self.assertEqual(len(plains), 5)
 
     async def test_the_header_does_not_reserve_blank_rows(self) -> None:
         from llm_launchpad.tui.widgets.status_header import StatusHeader
@@ -598,14 +599,13 @@ class HelpOverlayTests(unittest.IsolatedAsyncioTestCase):
             # Textual's own ctrl+c row claims to copy; this app quits with it.
             self.assertNotIn("Copy selected text", rendered)
 
-    async def _help_rows(self, pilot, app) -> list[str]:
+    async def _help_rows(self, pilot, app) -> list[tuple[Static, Static]]:
         await self._open_help(pilot, app)
         screen = app.screen
         assert isinstance(screen, HelpOverlayScreen)
         return [
-            line
-            for line in (str(static.render()) for static in screen.query(Static))
-            if line.startswith("  ") and line.strip()
+            (row.query_one(".help-key", Static), row.query_one(".help-label", Static))
+            for row in screen.query(".help-row")
         ]
 
     async def test_no_key_column_collides_with_its_description(self) -> None:
@@ -613,30 +613,40 @@ class HelpOverlayTests(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(120, 40)) as pilot:
             rows = await self._help_rows(pilot, app)
             self.assertTrue(rows)
-            for row in rows:
-                match = _HELP_ROW.match(row)
-                self.assertIsNotNone(
-                    match, f"key and description ran together: {row!r}"
+            for key, label in rows:
+                # Key text wraps inside the key cell's content box, which ends
+                # at its right padding, before the description begins.
+                self.assertLessEqual(key.region.right, label.region.x)
+                self.assertGreaterEqual(key.styles.padding.right, 2)
+                self.assertEqual(
+                    key.content_region.right + key.styles.padding.right, label.region.x
                 )
 
     async def test_the_widest_key_sets_the_column_for_all_of_them(self) -> None:
         app = _ReviewApp()
         async with app.run_test(size=(120, 40)) as pilot:
             rows = await self._help_rows(pilot, app)
-            columns = set()
-            for row in rows:
-                match = _HELP_ROW.match(row)
-                assert match is not None
-                columns.add(match.start("description"))
+            columns = {label.region.x for _key, label in rows}
             self.assertEqual(len(columns), 1, columns)
 
     async def test_the_longest_key_is_present_and_still_separated(self) -> None:
         app = _ReviewApp()
         async with app.run_test(size=(120, 40)) as pilot:
             rows = await self._help_rows(pilot, app)
-            combined = [row for row in rows if "ctrl+shift+c" in row]
+            combined = [
+                (key, label) for key, label in rows if "ctrl+shift+c" in str(key.render())
+            ]
             self.assertTrue(combined, "the grouped copy row is missing")
-            self.assertIn("  Copy", combined[0])
+            self.assertEqual(str(combined[0][1].render()), "Copy")
+
+    async def test_descriptions_share_the_row_of_their_key(self) -> None:
+        """A key column sized to six chords put every description on its own line."""
+        app = _ReviewApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            rows = await self._help_rows(pilot, app)
+            for key, label in rows:
+                self.assertEqual(key.region.y, label.region.y)
+                self.assertGreaterEqual(label.region.width, 30)
 
 
 class ToggleFieldTests(unittest.IsolatedAsyncioTestCase):
@@ -769,8 +779,8 @@ class FastDeployHeaderTests(unittest.IsolatedAsyncioTestCase):
             screen = await self._screen(pilot, app)
             title = str(screen.query_one("#fast-deploy-title", Static).render())
             subtitle = str(screen.query_one("#fast-deploy-subtitle", Static).render())
-            self.assertIn("Pick a model", title)
-            self.assertNotIn("Pick a model", subtitle)
+            self.assertIn("▸ Model", title)
+            self.assertNotIn("Model ›", subtitle)
 
     async def test_both_filter_controls_carry_a_label(self) -> None:
         app = _StyledApp()

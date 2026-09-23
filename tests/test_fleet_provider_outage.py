@@ -368,7 +368,7 @@ class ManageScreenOutageTests(unittest.IsolatedAsyncioTestCase):
             status = str(screen.query_one("#manage-status", Static).content)
             detail = str(screen.query_one("#manage-selection-detail", Static).content)
 
-            self.assertIn("Fleet refreshed.", status)
+            self.assertIn("Fleet refreshed", status)
             self.assertNotIn("unavailable", status)
             self.assertNotIn("may be out of date", detail)
 

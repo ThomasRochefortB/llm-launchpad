@@ -33,6 +33,7 @@ from ..responsive import ViewportProfile, WidthMode
 from ..widgets.adaptive_table import AdaptiveColumn, AdaptiveDataTable
 from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
+from ..visual import screen_title
 
 
 def _human_bytes(size_bytes: int) -> str:
@@ -189,7 +190,7 @@ class StorageScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="storage-scroll", classes="screen-scroll"):
-            yield Static("[bold primary]Storage[/]  [dim]Cached models, pre-download, delete[/dim]", id="storage-title")
+            yield Static(screen_title("Storage"), id="storage-title")
             yield Static("[dim]Storage status appears here.[/dim]", id="storage-status")
             # Provider and backend ride side by side: each extra vertical filter
             # row is a table row lost on an 80x24 terminal, where the inventory
@@ -223,18 +224,17 @@ class StorageScreen(CopyEnabledScreen):
                 placeholder="Filter models (type to filter)",
                 id="storage-filter",
             )
-            yield AdaptiveDataTable(id="storage-table")
+            yield AdaptiveDataTable(id="storage-table", fit_to_rows=True)
             # A table showing only its header cannot say whether nothing is
             # cached, the filter excluded everything, or the refresh failed.
             yield Static("", id="storage-empty", classes="hidden")
             # The footer names the p and x keys already; what it cannot say is
-            # that they act on whichever row is selected here.
-            yield Static(
-                "[dim]Selecting a row prefills the form below and targets it "
-                "for pre-download or delete.[/dim]",
-                id="storage-hint",
-            )
-            yield Button("Pre-download a model...", id="storage-predownload-toggle")
+            # that they act on whichever row is selected here. The button
+            # shares the row so it is not the first thing pushed off an 80x24
+            # screen.
+            with Horizontal(id="storage-hint-row"):
+                yield Static("", id="storage-hint")
+                yield Button("Pre-download a model...", id="storage-predownload-toggle")
             with Vertical(id="storage-predownload-form"):
                 yield Static("[bold]Pre-download a model[/bold]")
                 yield Input(
@@ -288,9 +288,20 @@ class StorageScreen(CopyEnabledScreen):
         self._refresh_storage_snapshot()
 
     def _render_scope(self) -> None:
+        # The provider dropdown already shows "Modal · shared volume cache";
+        # repeating it in the label cut the part only the label carried --
+        # what the inventory can show -- off at the column edge. That part
+        # now leads the hint under the table it describes.
+        # Modal's note ("file inventory available") describes the table the
+        # reader is looking at; only Prime's and Vast's limits are news.
+        scope = storage_scope_label(self._selected_provider)
+        _name, _sep, note = scope.partition(" (")
+        note = note.rstrip(")") if self._selected_provider != ComputeProvider.MODAL else ""
+        lead = f"{escape(note[:1].upper() + note[1:])}. " if note else ""
         try:
-            self.query_one("#storage-provider-label", Static).update(
-                f"[bold]Provider[/bold]  [dim]{escape(storage_scope_label(self._selected_provider))}[/dim]"
+            self.query_one("#storage-provider-label", Static).update("[bold]Provider[/bold]")
+            self.query_one("#storage-hint", Static).update(
+                f"[dim]{lead}p and x act on the selected row.[/dim]"
             )
         except Exception:
             pass
@@ -395,11 +406,16 @@ class StorageScreen(CopyEnabledScreen):
         estimate = estimate_monthly_storage_cost(self._snapshot)
         # One line, and only the numbers: the instruction that used to trail it
         # wrapped the status onto a second row and repeated the hint below.
-        self.query_one("#storage-status", Static).update(
-            f"[green]{_human_bytes(estimate.total_size_bytes)} cached[/green] "
-            f"[dim]· {format_gib(estimate.billable_gib_month)} billable past "
+        # The free-tier arithmetic only matters once something is billable.
+        billable = (
+            f"· {format_gib(estimate.billable_gib_month)} billable past "
             f"{format_free_tier(MODAL_VOLUME_FREE_TIER_GIB_MONTH)} free "
-            f"· est. {format_money(estimate.estimated_monthly_cost_usd)}/mo[/dim]"
+            if estimate.billable_gib_month > 0
+            else ""
+        )
+        self.query_one("#storage-status", Static).update(
+            f"[$success]{_human_bytes(estimate.total_size_bytes)} cached[/$success] "
+            f"[dim]{billable}· est. {format_money(estimate.estimated_monthly_cost_usd)}/mo[/dim]"
         )
         should_refocus = self._initial_focus_pending
         self._initial_focus_pending = False
@@ -411,7 +427,7 @@ class StorageScreen(CopyEnabledScreen):
         if self._selected_provider != ComputeProvider.MODAL:
             return
         self.query_one("#storage-status", Static).update(
-            f"[yellow]Storage refresh failed:[/yellow] {escape(message.error)}"
+            f"[$warning]Storage refresh failed:[/$warning] {escape(message.error)}"
         )
 
     def on_prime_disks_loaded(self, message: PrimeDisksLoaded) -> None:
@@ -424,7 +440,7 @@ class StorageScreen(CopyEnabledScreen):
             for disk in self._prime_disks
         )
         self.query_one("#storage-status", Static).update(
-            f"[green]{len(self._prime_disks)} Prime disk(s)[/green] "
+            f"[$success]{len(self._prime_disks)} Prime disk(s)[/$success] "
             f"[dim]· {total} GB retained · stop keeps disks billing; "
             f"delete unneeded ones[/dim]"
         )
@@ -434,7 +450,7 @@ class StorageScreen(CopyEnabledScreen):
         self._prime_disks = []
         self._prime_error = message.error
         self.query_one("#storage-status", Static).update(
-            f"[yellow]Prime disk refresh failed:[/yellow] {escape(message.error)}"
+            f"[$warning]Prime disk refresh failed:[/$warning] {escape(message.error)}"
         )
         self._render_table()
 
@@ -527,7 +543,7 @@ class StorageScreen(CopyEnabledScreen):
         if self._selected_provider == ComputeProvider.PRIME:
             if self._prime_error:
                 empty.update(
-                    f"[yellow]Prime disk inventory unavailable:[/yellow] {escape(self._prime_error)}"
+                    f"[$warning]Prime disk inventory unavailable:[/$warning] {escape(self._prime_error)}"
                 )
             else:
                 empty.update(
@@ -578,7 +594,7 @@ class StorageScreen(CopyEnabledScreen):
                 refresher(self)
                 return
             self.query_one("#storage-status", Static).update(
-                "[yellow]Prime disk refresh is unavailable in this session.[/yellow]"
+                "[$warning]Prime disk refresh is unavailable in this session.[/$warning]"
             )
             return
         if self._selected_provider == ComputeProvider.VAST:
@@ -775,16 +791,16 @@ class StorageDeleteConfirmScreen(CopyEnabledScreen):
         every other cached quant of that model with it.
         """
         if not self.also_removed:
-            return "[yellow]This will remove the cached model files from provider storage.[/yellow]"
+            return "[$warning]This will remove the cached model files from provider storage.[/$warning]"
         quants = ", ".join(
             escape((row.quant or "unquantized").strip()) for row in self.also_removed
         )
         total = self.model.size_bytes + sum(row.size_bytes for row in self.also_removed)
         noun = "quant" if len(self.also_removed) == 1 else "quants"
         return (
-            f"[yellow]This removes the whole cached repository, including "
+            f"[$warning]This removes the whole cached repository, including "
             f"{len(self.also_removed)} other {noun} ({quants}). "
-            f"{_human_bytes(total)} total.[/yellow]"
+            f"{_human_bytes(total)} total.[/$warning]"
         )
 
     def compose(self) -> ComposeResult:
@@ -792,9 +808,9 @@ class StorageDeleteConfirmScreen(CopyEnabledScreen):
         if (self.model.quant or "").strip():
             detail.append(escape(self.model.quant.strip()))
         detail.append(_human_bytes(self.model.size_bytes))
-        with VerticalScroll(classes="screen-scroll"):
+        with VerticalScroll(classes="screen-scroll dialog-scroll"):
             with Vertical(id="delete-confirm-dialog", classes="dialog-panel"):
-                yield Static("[bold primary]Delete Cached Model[/]", classes="dialog-title")
+                yield Static("[bold $primary]Delete Cached Model[/]", classes="dialog-title")
                 yield Static(
                     f"Delete [bold]{escape(self.model.model_id)}[/bold]?\n"
                     f"[dim]{' · '.join(detail)}[/dim]"
@@ -841,16 +857,16 @@ class PrimeDiskDeleteConfirmScreen(CopyEnabledScreen):
         self.disk_id = disk_id
 
     def compose(self) -> ComposeResult:
-        with VerticalScroll(classes="screen-scroll"):
+        with VerticalScroll(classes="screen-scroll dialog-scroll"):
             with Vertical(id="prime-delete-confirm-dialog", classes="dialog-panel"):
-                yield Static("[bold primary]Delete Prime Disk[/]", classes="dialog-title")
+                yield Static("[bold $primary]Delete Prime Disk[/]", classes="dialog-title")
                 yield Static(
                     f"Permanently delete Prime disk [bold]{escape(self.disk_id)}[/bold] "
                     "and its cached weights?"
                 )
                 yield Static(
-                    "[yellow]The disk keeps billing until deleted. Deleting it means "
-                    "the next deploy re-downloads the weights.[/yellow]"
+                    "[$warning]The disk keeps billing until deleted. Deleting it means "
+                    "the next deploy re-downloads the weights.[/$warning]"
                 )
                 with Horizontal(id="delete-confirm-actions", classes="dialog-actions"):
                     yield Button("Cancel", id="delete-cancel")

@@ -15,11 +15,13 @@ from llm_launchpad.protocol.enums import (
     AttemptDisposition,
     BackendType,
     ComputeProvider,
+    DeploymentState,
     OperationType,
 )
 from llm_launchpad.protocol.events import (
     LogEvent,
     OperationCompleteEvent,
+    StateChangeEvent,
 )
 from llm_launchpad.protocol.models import DeploymentConfig, EndpointInfo
 
@@ -160,6 +162,37 @@ class LifecycleParityTests(unittest.TestCase):
         self.assertTrue(result.succeeded)
         self.assertEqual(result.url, "https://new.example")
         self.assertTrue(any(url == "https://new.example" for url, _ in published))
+
+    def test_a_published_endpoint_ends_on_healthy_not_publishing(self) -> None:
+        """Warmup reports HEALTHY before publishing starts.
+
+        PUBLISHING was therefore the last state emitted, and a finished deploy
+        kept reading "state: publishing" in the TUI's context bar.
+        """
+        endpoint = EndpointInfo(name="app", app_id="ap-1", web_url="https://e.example")
+        orch = SimpleNamespace(
+            deploy=lambda _c: [OperationCompleteEvent(
+                operation=OperationType.DEPLOY, success=True, data=endpoint
+            )],
+            warmup=lambda *_a, **_k: [
+                StateChangeEvent(current=DeploymentState.HEALTHY, operation=OperationType.WARMUP),
+                OperationCompleteEvent(operation=OperationType.WARMUP, success=True),
+            ],
+        )
+        events: list[object] = []
+        result = run_lifecycle(
+            orch,
+            [LifecycleAttempt(config=_modal_config(do_warmup=True))],
+            callbacks=LifecycleCallbacks(on_event=events.append),
+        )
+        self.assertTrue(result.succeeded)
+        states = [event.current for event in events if isinstance(event, StateChangeEvent)]
+        self.assertIn(DeploymentState.PUBLISHING, states)
+        self.assertEqual(states[-1], DeploymentState.HEALTHY)
+        self.assertGreater(
+            len(states) - 1 - states[::-1].index(DeploymentState.HEALTHY),
+            states.index(DeploymentState.PUBLISHING),
+        )
 
     def test_failed_cleanup_blocks_fallback(self) -> None:
         endpoint = EndpointInfo(
