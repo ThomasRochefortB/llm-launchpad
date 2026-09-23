@@ -262,6 +262,13 @@ def effective_config_for_attempt(attempt: LifecycleAttempt) -> DeploymentConfig:
     # Preserve caller-supplied secrets and ladder metadata that never live in
     # the immutable request.
     config.endpoint_api_key = attempt.config.endpoint_api_key
+    # Also never in the request, so they were silently dropped here: every
+    # planned deploy ignored `--idle-shutdown` and `--max-num-seqs` and fell
+    # back to the Settings window and the runtime's default. A live Prime
+    # certification armed a 1h watchdog for a requested 120s window.
+    config.idle_shutdown_seconds = attempt.config.idle_shutdown_seconds
+    config.max_concurrent_sequences = attempt.config.max_concurrent_sequences
+    config.tool_calling = attempt.config.tool_calling
     config.provider_options = plan.provider_options or attempt.config.provider_options
     config.fallback_configs = attempt.config.fallback_configs
     config.retry_allowed = attempt.config.retry_allowed

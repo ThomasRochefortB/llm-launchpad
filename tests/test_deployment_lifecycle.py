@@ -194,6 +194,48 @@ class LifecycleParityTests(unittest.TestCase):
             states.index(DeploymentState.PUBLISHING),
         )
 
+    def test_a_planned_attempt_keeps_every_setting_the_caller_made(self) -> None:
+        """A plan re-renders the config from its request; nothing may fall out.
+
+        `idle_shutdown_seconds` and `max_concurrent_sequences` live only on the
+        config, so re-rendering dropped them: `--idle-shutdown 2m` armed the
+        Settings default (1h) on a live Prime pod. Every simple field is probed,
+        so the next field added to the config cannot be lost the same way.
+        """
+        import typing
+        from dataclasses import fields, replace
+
+        from llm_launchpad.core.deployment_lifecycle import effective_config_for_attempt
+        from llm_launchpad.core.deployment_preflight import lifecycle_attempts_for_configs
+
+        # Derived from the request's intent rather than carried: a serve
+        # request is not also a smoke test.
+        derived = {"backend", "provider", "run_smoke"}
+        hints = typing.get_type_hints(DeploymentConfig)
+        base = _modal_config()
+        for field in fields(DeploymentConfig):
+            if field.name in derived:
+                continue
+            kinds = typing.get_args(hints[field.name]) or (hints[field.name],)
+            current = getattr(base, field.name)
+            if bool in kinds:
+                value: object = not bool(current)
+            elif int in kinds:
+                value = 4242
+            elif float in kinds:
+                value = 42.5
+            elif str in kinds:
+                value = "probe-value"
+            else:
+                continue
+            with self.subTest(field=field.name):
+                config = replace(base, **{field.name: value})
+                plan = lifecycle_attempts_for_configs([config])[0].plan
+                rendered = effective_config_for_attempt(
+                    LifecycleAttempt(config=config, plan=plan)
+                )
+                self.assertEqual(getattr(rendered, field.name), value)
+
     def test_failed_cleanup_blocks_fallback(self) -> None:
         endpoint = EndpointInfo(
             name="vast-app", app_id="i-1", web_url="https://vast.example"

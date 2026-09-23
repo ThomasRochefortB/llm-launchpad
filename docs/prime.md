@@ -116,7 +116,11 @@ window, serves the harness's requests, then leaves the pod alone until its
 watchdog deletes it; a tunnel left behind fails the stage. Neither is certified
 yet. The first attempt (2026-09-23, A10 at $1.29/hr, $0.15) served correctly but
 found that the TUI's summary log dropped the "Idle shutdown" line, so nothing on
-screen said which watchdog was armed; that is fixed. Budget about $0.30 per
+screen said which watchdog was armed; that is fixed. The second (same day, $0.81,
+most of it 25 minutes the pod spent in Prime's provisioning) armed the on-pod
+watchdog with the 1h Settings window instead of the requested 120s: planned
+deploys dropped `idle_shutdown_seconds`. Also fixed; the watchdog itself has not
+yet been observed deleting a pod. Budget about $0.30 per
 stage at current A10 prices. The spend cutoff is the budget less a $0.30
 cleanup reserve and counts what earlier stages spent, so both stages need about
 $1:
