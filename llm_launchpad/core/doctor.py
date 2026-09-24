@@ -140,7 +140,7 @@ def run_doctor_checks(
                 name="Hugging Face auth",
                 ok=False,
                 detail=hf_status.error or "no local token",
-                hint="run: huggingface-cli login",
+                hint="run: hf auth login",
             )
         )
 

@@ -415,6 +415,25 @@ class _FakeSession:
 
 
 class PrimeBackendTests(unittest.TestCase):
+    def test_the_on_pod_watchdog_deletes_through_the_same_endpoint_as_stop(self) -> None:
+        from llm_launchpad.core.idle_watchdog import prime_destroy_command
+
+        config = PrimeConfig(api_key="secret")
+        session = _FakeSession([_FakeResponse(200, {"tunnels": []}), _FakeResponse(200, {})])
+        backend = PrimeBackend(config, session=session)
+        with patch("llm_launchpad.core.prime_backend.PRIME_KNOWN_HOSTS_DIR", Path(tempfile.mkdtemp())):
+            backend.delete_pod("pod-123")
+
+        delete = session.calls[-1]
+        self.assertEqual(delete["method"], "DELETE")
+        self.assertEqual(delete["headers"]["Authorization"], "Bearer secret")  # type: ignore[index]
+        # The watchdog builds its URL the way start_idle_watchdog does.
+        command = prime_destroy_command(f"{config.base_url}/api/v1", "pod-123", "/k")
+        argv = shlex.split(command.split("&&", 1)[1].rstrip("; }"))
+        self.assertEqual(argv[argv.index("-X") + 1], "DELETE")
+        self.assertIn('Authorization: Bearer $key', argv)
+        self.assertIn(delete["url"], argv)
+
     def test_request_formats_structured_422_detail_without_echoing_input(self) -> None:
         session = _FakeSession(
             [

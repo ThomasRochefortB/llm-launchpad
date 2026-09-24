@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import TypeVar
+from typing import Any, TypeVar
 
 from rich.cells import cell_len
 from rich.text import Text
@@ -79,7 +79,7 @@ class SelectableLog(Log):
     line counts, and copy behavior.
     """
 
-    def __init__(self, *args: object, **kwargs: object) -> None:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         max_lines = kwargs.pop("max_lines", None)
         self._retention_limit = int(max_lines) if max_lines is not None else None
         super().__init__(*args, **kwargs)
@@ -221,7 +221,9 @@ class SelectableLog(Log):
             self.refresh()
         return self
 
-    def _update_size(self, updates: int, lines: list[str]) -> None:
+    # Textual's version is a @work thread worker; this deliberately replaces it
+    # with a plain no-op, which the checker reads as a signature change.
+    def _update_size(self, updates: int, lines: list[str]) -> None:  # ty: ignore[invalid-method-override]
         """Skip the base log's asynchronous longest-line width calculation."""
         _ = (updates, lines)
 
@@ -284,7 +286,7 @@ class SelectableLog(Log):
         line_text = self._wrapped_lines[line_index]
         start = Offset(0, line_index)
         end = Offset(len(line_text), line_index)
-        self.screen.selections = {  # ty: ignore[invalid-assignment]
+        self.screen.selections = {
             self: Selection(start, end)
         }
         return True
@@ -348,7 +350,7 @@ class LogViewer(Vertical):
             self.current = current
             self.total = total
 
-    def __init__(self, *args: object, **kwargs: object) -> None:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._plain_lines: list[str] = []
         self._search_query = ""

@@ -27,3 +27,25 @@ class DeploymentJob:
     persistent_id: str | None = None
     last_seen_seq: int = 0
     opencode_synced: bool = False
+
+
+@dataclass
+class OperationRecord:
+    """A finished-or-running non-deploy operation this session can reopen.
+
+    Status checks, benchmarks, logs, stops and storage work each open a monitor
+    and used to vanish with it: leaving the screen lost the result. Keeping the
+    monitor (installed as a named screen) lets Operations reopen it.
+    """
+
+    id: str
+    title: str
+    subject: str
+    monitor: MonitorScreen
+    started_at: float
+
+    @property
+    def outcome(self) -> str:
+        if not getattr(self.monitor, "_done", False):
+            return "Running"
+        return "Done" if getattr(self.monitor, "_success", False) else "Failed"

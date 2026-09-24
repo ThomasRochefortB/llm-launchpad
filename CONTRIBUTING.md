@@ -45,12 +45,32 @@ uv run llm-launchpad tui
 - Add screenshots or GIFs for TUI changes.
 - Link related issues or follow-up work when relevant.
 
+## Live canary
+
+Offline tests cannot see a broken generated startup script, so
+`.github/workflows/live-canary.yml` runs `scripts/canary_live.py` every Monday:
+it deploys `bartowski/Qwen2.5-0.5B-Instruct-GGUF` (Q4_K_M) on each provider
+through the CLI, requires a chat answer during warmup, and stops it. A run costs
+cents. It tests the providers whose secrets the repository has, and skips the
+rest:
+
+| Provider | Repository secrets |
+| --- | --- |
+| Modal | `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET` |
+| Prime Intellect | `PRIME_API_KEY` |
+| Vast.ai | `VAST_API_KEY` |
+| Hugging Face (optional, for rate limits) | `HF_TOKEN` |
+
+A failed scheduled run opens, or comments on, an issue labelled `canary`. Run it
+by hand from the Actions tab, or locally with
+`uv run python scripts/canary_live.py --live [--provider vast]`.
+
 ## Release checklist
 
 For a release tag such as `v0.0.3`:
 
 1. Update `llm_launchpad/_version.py`.
 2. Move the relevant notes from `Unreleased` into a new `CHANGELOG.md` release section.
-3. Run `uv run pytest`, `uv run ruff check .`, and `uv run ty check`.
+3. Run `uv run pytest`, `uv run ruff check .`, and `uv run ty check`, and make sure the latest live canary run passed.
 4. Commit the release changes and create the matching Git tag (`vX.Y.Z`).
 5. Push the branch and tag so the publish workflow can build, smoke test, and publish the package.

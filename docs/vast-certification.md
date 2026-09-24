@@ -307,3 +307,49 @@ uv run python scripts/validate_vast_live.py --live --stage llamacpp_idle_shutdow
   --offer-id <id> --max-hourly-cost 0.35 --budget-usd 0.9 --max-minutes 25 \
   --transfer-gb 6 --disk-gb 40 --idle-seconds 120 --report /tmp/vast-idle.json
 ```
+
+## Re-certification after the staging regression (2026-09-23)
+
+`623ba8b` broke every Vast llama.cpp deploy until `63a8940`, so the
+2026-09-09/10 results above said nothing about the fixed tree. Stage
+`llamacpp_single_gpu` was re-run on it.
+
+On an RTX 3060 in Oregon (offer at $0.0876/hr) the endpoint was ready 466s
+after the rental was created, and every functional check passed: wrong keys
+refused (401, 401), chat, a valid tool call, the deployment's own streaming
+verifier, a continuous 60s stream (5,519 chunks) cancelled by the client, a
+chat after the cancellation, weights resident on the GPU (1,219 MiB), and the
+disconnected endpoint unpublished. The last step, reconnecting the tunnel, lost
+its Vast API call to a single HTTP 429, and the run was recorded as failed.
+That is fixed rather than retried around: reads, deletes and offer searches now
+wait out a 429 (`Retry-After`, at most three short retries), while renting
+still fails fast. Cost $0.0117; cleanup confirmed.
+
+Two other rentals did not reach the model, both for host reasons and both
+destroyed by the harness:
+
+- An RTX 3060 in South Korea exited ~95s in, after its image pull and before
+  SSH existed. The failure now reports Vast's own state and status message.
+- An RTX A2000 in Poland opened its SSH port and kept denying the attached key
+  past the 150s grace window (`VAST_KEY_GRACE_SECONDS`).
+
+### vLLM idle shutdown: not certified
+
+Stage `vllm_idle_shutdown` (new) did not reach a serving endpoint in six
+attempts: a 429 on offer search (now retried), a budget refusal on a host
+charging $0.039/GB, a host reporting CUDA below the 13.0 the pinned vLLM image
+needs, two offers taken between listing and renting, and one RTX 3060 in South
+Korea that denied the key past the grace window. Total spend $0.0055.
+
+Open question: two of the three rentals that reached SSH today denied the key
+past the grace window, on different machines. That may be two faulty hosts, or
+hosts that install the attached key later than 150s after SSH opens; the
+evidence does not tell them apart. Look at `authorized_keys` timing on the next
+rental that denies a key before changing the window.
+
+```bash
+uv run python scripts/validate_vast_live.py --live --stage vllm_idle_shutdown \
+  --model Qwen/Qwen3-0.6B --min-cuda 13.0 --min-compute 8.0 --min-gpu-memory-gb 12 \
+  --max-hourly-cost 0.15 --budget-usd 0.40 --max-minutes 45 --transfer-gb 12 \
+  --idle-seconds 120 --report /tmp/vast-vllm-idle.json
+```

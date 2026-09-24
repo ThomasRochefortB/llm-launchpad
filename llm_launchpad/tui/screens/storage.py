@@ -603,7 +603,7 @@ class StorageScreen(CopyEnabledScreen):
                 "[dim]Vast has no separate storage inventory; rental disks are destroyed with the rental.[/dim]"
             )
             return
-        self.app.begin_storage_refresh(self, force=force)  # type: ignore[attr-defined]
+        self.app.begin_storage_refresh(self, force=force)
 
     def action_predownload_selected(self) -> None:
         if self._selected_provider != ComputeProvider.MODAL:
@@ -626,7 +626,7 @@ class StorageScreen(CopyEnabledScreen):
         backend = BackendType(backend_raw)
         if backend == BackendType.VLLM:
             quant = None
-        self.app.begin_storage_predownload(  # type: ignore[attr-defined]
+        self.app.begin_storage_predownload(
             backend=backend,
             model_id=model_id,
             quant=quant,
@@ -805,8 +805,9 @@ class StorageDeleteConfirmScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         detail = [escape(self.model.backend.value)]
-        if (self.model.quant or "").strip():
-            detail.append(escape(self.model.quant.strip()))
+        quant = (self.model.quant or "").strip()
+        if quant:
+            detail.append(escape(quant))
         detail.append(_human_bytes(self.model.size_bytes))
         with VerticalScroll(classes="screen-scroll dialog-scroll"):
             with Vertical(id="delete-confirm-dialog", classes="dialog-panel"):
@@ -841,7 +842,7 @@ class StorageDeleteConfirmScreen(CopyEnabledScreen):
 
     def action_confirm_delete(self) -> None:
         self.app.pop_screen()
-        self.app.begin_storage_delete(self.model)  # type: ignore[attr-defined]
+        self.app.begin_storage_delete(self.model)
 
 
 class PrimeDiskDeleteConfirmScreen(CopyEnabledScreen):

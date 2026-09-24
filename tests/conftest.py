@@ -19,6 +19,23 @@ from llm_launchpad.core.hf_models import GgufQuantMetadata
 
 
 @pytest.fixture(autouse=True)
+def _reset_runtime_health() -> object:
+    """Start every test with no remembered health verdicts.
+
+    The store is process-global. While the fleet panel's lookup was broken
+    (an import one package too far up, swallowed by ``except``) nothing read
+    it, so verdicts one test recorded never reached another. With the lookup
+    fixed, a status check recorded by an app test turned a later test's
+    "Not checked" into "Healthy", depending on test order.
+    """
+    from llm_launchpad.core.runtime_health import reset
+
+    reset()
+    yield
+    reset()
+
+
+@pytest.fixture(autouse=True)
 def _disable_isolated_asyncio_debug(monkeypatch: pytest.MonkeyPatch) -> None:
     """Run async UI tests without asyncio's expensive debug instrumentation."""
 

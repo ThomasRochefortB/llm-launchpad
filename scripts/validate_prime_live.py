@@ -83,7 +83,12 @@ LIVE_STAGES = (
     "management_restart_and_tunnel_recovery",
     "failed_deployment_cleanup",
     "qwen38_27b_quick_deploy",
+    "llamacpp_idle_on_pod",
+    "llamacpp_idle_local",
 )
+# Short enough to certify in one sitting, long enough that the harness's own
+# requests are well clear of it.
+IDLE_TEST_SECONDS = 120
 _ACTIVE_LIVE_RUN: tuple[
     PrimeBackend,
     PrimeResourceLedger,
@@ -134,9 +139,13 @@ class LiveTuiApp(TuiApp):
         fast_snapshot: ComputeAvailabilitySnapshot | None = None,
         fast_provider: ComputeProvider | None = None,
         fast_profile_id: str | None = None,
+        idle_shutdown_seconds: int | None = None,
+        prime_self_terminate: bool | None = None,
     ) -> None:
         super().__init__(mouse_enabled=False)
         self.live_backend = backend
+        self.idle_shutdown_seconds = idle_shutdown_seconds
+        self.prime_self_terminate = prime_self_terminate
         self.quick_plan = quick_plan
         self.fast_snapshot = fast_snapshot
         self.fast_provider = fast_provider
@@ -170,6 +179,21 @@ class LiveTuiApp(TuiApp):
             config.app_name = build_deployment_name(
                 config.provider, config.backend, config.instance_name
             )
+        if self.idle_shutdown_seconds is not None:
+            config.idle_shutdown_seconds = self.idle_shutdown_seconds
+        if self.prime_self_terminate is not None:
+            # Which watchdog runs is a user setting, read at deploy time; pin
+            # it for this run without touching the user's settings file.
+            store = self._orchestrator.config_store
+            load_settings = store.load
+            wanted = self.prime_self_terminate
+
+            def load_with_override() -> Any:
+                settings = load_settings()
+                settings.prime_self_terminate = wanted
+                return settings
+
+            store.load = load_with_override  # type: ignore[method-assign]
         self.deployed_config = config
         monitor = CaptureMonitorScreen(
             title="Deploy",
@@ -599,6 +623,8 @@ async def _run_tui_stage(
     fast_snapshot: ComputeAvailabilitySnapshot | None = None,
     fast_provider: ComputeProvider | None = None,
     fast_profile_id: str | None = None,
+    idle_shutdown_seconds: int | None = None,
+    prime_self_terminate: bool | None = None,
 ) -> tuple[dict[str, Any], DeploymentConfig]:
     budget.require_capacity(
         hourly_rate_usd=offer.price_per_hour or 0.0,
@@ -612,6 +638,8 @@ async def _run_tui_stage(
         fast_snapshot=fast_snapshot,
         fast_provider=fast_provider,
         fast_profile_id=fast_profile_id,
+        idle_shutdown_seconds=idle_shutdown_seconds,
+        prime_self_terminate=prime_self_terminate,
     )
     pod: dict[str, Any] = {}
     config: DeploymentConfig | None = None
@@ -693,6 +721,54 @@ async def _run_tui_stage(
     finally:
         stage.duration_seconds = round(time.monotonic() - started, 3)
         stage.finished_at = utc_now_iso()
+
+
+def _await_idle_self_deletion(
+    prime: PrimeBackend,
+    stage: PrimeLiveStage,
+    pod: dict[str, Any],
+    *,
+    on_pod: bool,
+    idle_seconds: int,
+) -> dict[str, Any]:
+    """Leave the pod alone and confirm its idle watchdog deletes it.
+
+    The harness's auth probe was the last request. Nothing here deletes the
+    pod: the stage's own cleanup is the backstop if the watchdog never acts.
+    A tunnel the watchdog leaves behind is recorded as a finding and then
+    removed, so a failed certification never leaves a resource running.
+    """
+    pod_id = str(pod.get("id") or "")
+    milestones = "\n".join(stage.evidence.get("tui_milestones") or [])
+    expected = "runs on the pod" if on_pod else "while this computer is awake"
+    evidence: dict[str, Any] = {
+        "idle_seconds": idle_seconds,
+        "watchdog_path": "on_pod" if on_pod else "local",
+        "watchdog_announced": expected in milestones,
+    }
+    if not evidence["watchdog_announced"]:
+        raise AssertionError(f"The deploy did not report the {evidence['watchdog_path']} watchdog.")
+    last_request = time.monotonic()
+    # Local polls every 60s; the on-pod watchdog every 30s. Allow a poll,
+    # Prime's teardown and a margin.
+    deadline = last_request + idle_seconds + 600
+    while time.monotonic() < deadline:
+        if not any(str(row.get("id") or "") == pod_id for row in prime.list_pods()):
+            evidence["self_deleted"] = True
+            evidence["seconds_from_last_request_to_gone"] = round(time.monotonic() - last_request, 1)
+            break
+        time.sleep(15)
+    else:
+        evidence["self_deleted"] = False
+        raise AssertionError("The pod did not delete itself within the idle window plus ten minutes.")
+    time.sleep(20)
+    leftover = [t for t in prime.list_tunnels() if f"pod:{pod_id}" in t.labels]
+    evidence["tunnel_left_behind"] = bool(leftover)
+    if leftover:
+        prime.delete_tunnels_for_pod(pod_id)
+        stage.evidence.update(evidence)
+        raise AssertionError("The pod deleted itself but left its Prime Tunnel behind.")
+    return evidence
 
 
 async def _run_expected_failure_cleanup_stage(
@@ -1615,6 +1691,53 @@ async def run(args: argparse.Namespace) -> int:
                     ),
                     inspect_stops_pod=True,
                     secrets=secrets,
+                ),
+            )
+
+        for idle_stage, on_pod in (("llamacpp_idle_on_pod", True), ("llamacpp_idle_local", False)):
+            if idle_stage not in selected_stages:
+                continue
+            offer = _choose_offer(
+                prime,
+                BackendType.LLAMACPP,
+                gpu_count=1,
+                required_vram_gb=0.75,
+            )
+            stage = PrimeLiveStage(
+                name=idle_stage,
+                offer_id=offer.id,
+                gpu_type=offer.gpu_type,
+                gpu_count=offer.gpu_count,
+                hourly_rate_usd=offer.price_per_hour,
+            )
+
+            def _inspect(
+                _config: DeploymentConfig,
+                pod: dict[str, Any],
+                stage: PrimeLiveStage = stage,
+                on_pod: bool = on_pod,
+            ) -> dict[str, Any]:
+                return _await_idle_self_deletion(
+                    prime, stage, pod, on_pod=on_pod, idle_seconds=IDLE_TEST_SECONDS
+                )
+
+            await execute(
+                stage,
+                lambda stage=stage, offer=offer, on_pod=on_pod, inspect=_inspect: _run_tui_stage(
+                    prime,
+                    budget,
+                    ledger,
+                    stage,
+                    backend=BackendType.LLAMACPP,
+                    offer=offer,
+                    run_id=run_id,
+                    stage_slug=f"idle-{'pod' if on_pod else 'local'}",
+                    timeout_seconds=1200 + IDLE_TEST_SECONDS + 600,
+                    inspect=inspect,
+                    inspect_stops_pod=True,
+                    secrets=secrets,
+                    idle_shutdown_seconds=IDLE_TEST_SECONDS,
+                    prime_self_terminate=on_pod,
                 ),
             )
 

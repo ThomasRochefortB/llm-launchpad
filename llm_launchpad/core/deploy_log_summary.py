@@ -115,6 +115,8 @@ _INFO_PREFIXES = (
     "Detail:",
     "Keeping failed",
     "Terminated failed",
+    # Styled as information; transform() keeps these lines (see there).
+    "Idle shutdown",
 )
 SUMMARY_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 
@@ -335,6 +337,11 @@ class DeployLogSummarizer:
         # decoding is on. Dropping one confines it to --debug-logs, where a
         # reader checking whether MTP engaged would never think to look.
         if is_preflight_decision_line(text):
+            return [text]
+
+        # Whether this rental deletes itself when idle, and from where, is a
+        # billing fact the reader must see; the summary used to drop it.
+        if text.startswith("Idle shutdown"):
             return [text]
 
         mapped = self._map_line(text)

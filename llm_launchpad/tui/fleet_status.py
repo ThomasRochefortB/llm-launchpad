@@ -90,7 +90,7 @@ def _health_bucket(row: EndpointInfo) -> str:
         return status
     if row.provider in SCALE_TO_ZERO_PROVIDERS and _state_bucket(row.state) == "running":
         try:
-            from ...core.runtime_health import get_health as _get_health
+            from ..core.runtime_health import get_health as _get_health
 
             stored = _get_health(row)
         except Exception:
@@ -267,7 +267,7 @@ def fetch_serving_snapshot(
     if not base_url:
         return None
     try:
-        import requests  # type: ignore
+        import requests
     except ImportError:
         return None
 

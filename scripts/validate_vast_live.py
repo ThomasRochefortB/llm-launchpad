@@ -388,7 +388,7 @@ def run(args: argparse.Namespace) -> int:
             ]),
             provider_options=options,
         )
-    if stage == "llamacpp_idle_shutdown":
+    if stage.endswith("_idle_shutdown"):
         config.idle_shutdown_seconds = args.idle_seconds
     save()
     print(f"LIVE {name}: offer {offer.id}, ${hourly:.4f}/hr, headroom estimate ${estimate:.3f}", flush=True)
@@ -414,7 +414,7 @@ def run(args: argparse.Namespace) -> int:
         checks["cold_start_seconds"] = time.monotonic() - started
         save()
         print(f"READY in {checks['cold_start_seconds']:.1f}s; testing auth and tools", flush=True)
-        if stage == "llamacpp_idle_shutdown":
+        if stage.endswith("_idle_shutdown"):
             with requests.Session() as session:
                 session.trust_env = False
                 probe_chat(session, endpoint, checks)
@@ -559,6 +559,9 @@ def main() -> int:
             "vllm_single_gpu",
             "vllm_tensor_parallel",
             "llamacpp_idle_shutdown",
+            # The watchdog shells out to curl; the vLLM image is not the
+            # llama.cpp one, so it needs its own proof that curl is there.
+            "vllm_idle_shutdown",
         ],
         help="What this rental certifies. vLLM stages stop after streaming verification.",
     )
@@ -567,7 +570,7 @@ def main() -> int:
     parser.add_argument("--transfer-gb", type=float, default=20.0, help="Inbound GB to budget for.")
     parser.add_argument(
         "--idle-seconds", type=int, default=120,
-        help="Idle window for the llamacpp_idle_shutdown stage's on-rental watchdog.",
+        help="Idle window for the *_idle_shutdown stages' on-rental watchdog.",
     )
     args = parser.parse_args()
     if not args.live:

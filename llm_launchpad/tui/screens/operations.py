@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from rich.markup import escape
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -12,7 +14,12 @@ from textual.widgets.option_list import Option
 
 from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
+from ..compat import highlighted_option
 
+
+
+if TYPE_CHECKING:
+    from ..app import TuiApp
 
 class DurableJobsLoaded(Message):
     """Result of one serialized durable-job refresh."""
@@ -25,6 +32,10 @@ class DurableJobsLoaded(Message):
 
 class DeploymentJobsPanel(VerticalScroll):
     """Keep background deployments and their results reachable."""
+
+    if TYPE_CHECKING:
+        @property
+        def app(self) -> TuiApp: ...
 
     BINDINGS = [
         Binding("d", "deploy_model", "Deploy", show=True),
@@ -66,7 +77,7 @@ class DeploymentJobsPanel(VerticalScroll):
     def _durable_jobs(self, *, reconcile: bool = False) -> list[tuple[str, str]]:
         """Read durable rows in a worker; failures must not masquerade as empty."""
         rows: list[tuple[str, str]] = []
-        store = self.app._get_job_store()  # type: ignore[attr-defined]
+        store = self.app._get_job_store()
         if reconcile:
             reconciler = getattr(store, "reconcile_workers", None)
             if callable(reconciler):
@@ -74,7 +85,7 @@ class DeploymentJobsPanel(VerticalScroll):
             importer = getattr(store, "import_journal_entries", None)
             if callable(importer):
                 importer()
-        for record in store.list_jobs():  # type: ignore[attr-defined]
+        for record in store.list_jobs():
             try:
                 provider_name = record.config.provider.display_name
             except Exception:
@@ -121,6 +132,11 @@ class DeploymentJobsPanel(VerticalScroll):
             if job.persistent_id:
                 seen.add(f"persistent:{job.persistent_id}")
         rows.extend(row for row in self._persistent_rows if row[0] not in seen)
+        # Status checks, benchmarks, logs, stops and storage work, newest
+        # first, after the deployments they are usually about.
+        for record in reversed(tuple(getattr(self.app, "operation_history", {}).values())):
+            subject = f" · {record.subject}" if record.subject else ""
+            rows.append((f"op:{record.id}", f"{record.title}{subject} · {record.outcome}"))
         status = "" if self._jobs_loaded else "Loading jobs…"
         if self._refresh_error:
             retained = "Showing last saved results. " if self._jobs_loaded else ""
@@ -129,13 +145,13 @@ class DeploymentJobsPanel(VerticalScroll):
         self.query_one("#operations-status", Static).display = bool(status)
         options = self.query_one("#deployment-jobs", OptionList)
         labels = tuple(rows)
-        empty_label = "No deployments yet." if self._jobs_loaded else "Loading jobs…"
+        empty_label = "No operations yet." if self._jobs_loaded else "Loading jobs…"
         render_key = (labels, empty_label)
         if render_key == getattr(self, "_labels", None):
             return
         self._labels = render_key
         highlighted = options.highlighted
-        selected = options.highlighted_option
+        selected = highlighted_option(options)
         selected_id = selected.id if selected is not None else None
         options.clear_options()
         options.add_options(Option(escape(label), id=job_id) for job_id, label in labels)
@@ -157,7 +173,10 @@ class DeploymentJobsPanel(VerticalScroll):
         event.stop()
         option_id = str(event.option.id or "")
         if option_id.startswith("persistent:"):
-            self.app.reopen_persistent_deployment(option_id.removeprefix("persistent:"))  # type: ignore[attr-defined]
+            self.app.reopen_persistent_deployment(option_id.removeprefix("persistent:"))
+            return
+        if option_id.startswith("op:"):
+            self.app.reopen_operation(option_id.removeprefix("op:"))
             return
         self.app.reopen_deployment(option_id)
 
@@ -190,9 +209,12 @@ class DeploymentJobsPanel(VerticalScroll):
             self.app.notify("Nothing to cancel.", timeout=2)
             return
         option_id = str(options.get_option_at_index(options.highlighted).id or "")
+        if option_id.startswith("op:"):
+            self.app.notify("Only deployments can be cancelled.", timeout=3)
+            return
         if option_id.startswith("persistent:"):
             persistent_id = option_id.removeprefix("persistent:")
-            self.app.push_screen(PersistentCancelDeploymentScreen(persistent_id))  # type: ignore[attr-defined]
+            self.app.push_screen(PersistentCancelDeploymentScreen(persistent_id))
             return
         job = self.app.deployment_jobs.get(option_id)
         if job is not None and not job.finished.is_set():
@@ -228,7 +250,7 @@ class CancelDeploymentScreen(CopyEnabledScreen):
         with VerticalScroll(classes="screen-scroll dialog-scroll"):
             with Vertical(id="cancel-deploy-dialog", classes="dialog-panel"):
                 yield Static("Cancel deployment?", classes="dialog-title")
-                yield Static(f"[bold]{escape(job.config.app_name)}[/bold]")
+                yield Static(f"[bold]{escape(job.config.app_name or '')}[/bold]")
                 yield Static(
                     "This stops the provider resource after the current provider call returns. "
                     "[$warning]For rentals, termination can permanently delete the rental disk "
@@ -280,7 +302,7 @@ class PersistentCancelDeploymentScreen(CopyEnabledScreen):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "cancel-deployment":
-            canceller = getattr(self.app._get_job_store(), "request_cancel", None)  # type: ignore[attr-defined]
+            canceller = getattr(self.app._get_job_store(), "request_cancel", None)
             if callable(canceller):
                 try:
                     canceller(self.persistent_id)

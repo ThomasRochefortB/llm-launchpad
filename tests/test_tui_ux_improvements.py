@@ -199,3 +199,47 @@ class StorageFilterTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SetupAutoContinueTests(unittest.IsolatedAsyncioTestCase):
+    """Credentials found in the background take the reader past Setup."""
+
+    async def _run(self, *, stage: str, configured: bool) -> type:
+        from llm_launchpad.core.provider_readiness import (
+            ProviderReadiness,
+            ProviderReadinessStage,
+        )
+        from llm_launchpad.protocol.enums import ComputeProvider
+        from llm_launchpad.tui.app import ProviderReadinessUpdated, TuiApp
+        from llm_launchpad.tui.screens.main_menu import MainMenuScreen
+
+        class _App(TuiApp):
+            def on_mount(self) -> None:
+                self.push_screen(SetupRequiredScreen())
+
+            def _provider_is_configured(self) -> bool:
+                return configured
+
+        app = _App()
+        with patch.object(MainMenuScreen, "on_mount", lambda self: None):
+            async with app.run_test(size=(100, 30)) as pilot:
+                await pilot.pause()
+                app.post_message(ProviderReadinessUpdated((
+                    ProviderReadiness(
+                        provider=ComputeProvider.VAST,
+                        stage=ProviderReadinessStage(stage),
+                    ),
+                )))
+                await pilot.pause()
+                await pilot.pause()
+                return type(app.screen)
+
+    async def test_a_verified_provider_enters_the_main_menu(self) -> None:
+        from llm_launchpad.tui.screens.main_menu import MainMenuScreen
+
+        screen_type = await self._run(stage="ready", configured=True)
+        self.assertIs(screen_type, MainMenuScreen)
+
+    async def test_a_failed_check_leaves_setup_in_place(self) -> None:
+        screen_type = await self._run(stage="auth_failed", configured=False)
+        self.assertIs(screen_type, SetupRequiredScreen)

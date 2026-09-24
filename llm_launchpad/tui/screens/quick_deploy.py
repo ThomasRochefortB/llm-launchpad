@@ -689,7 +689,7 @@ class QuickDeployScreen(CopyEnabledScreen):
     def refresh_keyboard_hints(self) -> None:
         """Re-render the keyboard hint for the current viewport."""
 
-        for hint in self.query("#quick-deploy-feedback"):
+        for hint in self.query("#quick-deploy-feedback").results(Static):
             hint.update(self._deploy_key_hint())
 
     def viewport_profile_changed(self, profile, previous) -> None:  # type: ignore[no-untyped-def]
@@ -769,7 +769,7 @@ class QuickDeployScreen(CopyEnabledScreen):
         ]
         config.fallback_configs = tuple(_config_for_plan(plan) for plan in fallback_plans)
         self._remember_launch()
-        self.app.begin_deploy(config)  # type: ignore[attr-defined]
+        self.app.begin_deploy(config)
 
     def _remember_launch(self) -> None:
         """Offer this choice on the home screen next time; never blocks a deploy."""

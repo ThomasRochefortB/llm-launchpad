@@ -6,8 +6,13 @@ the screen stack and bridges user actions to Core via threaded workers.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from ..core.job_store import JobRecord, JobStore
+
 import base64
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 import json
 import os
@@ -21,11 +26,13 @@ from textual.app import App, AutopilotCallbackType, SystemCommand
 from textual.binding import Binding
 from textual.filter import Monochrome
 from textual.message import Message
+from textual.message_pump import MessagePump
 from textual.screen import Screen
 from textual.widgets import Input, TextArea
 
 from ..core.backend import ModalBackend
 from ..core.benchmark import benchmark_config_from_endpoint, parse_concurrency_values
+from ..core.coerce import positive_int
 from ..core.config import ConfigStore, SETTINGS_DIR
 from ..core.deploy_events import EndpointUrlResolver
 from ..core.deploy_journal import (
@@ -88,7 +95,7 @@ from .screens.deploy import BackendSelectScreen
 from .screens.fast_deploy import FastDeployScreen
 from .screens.manage import ManageScreen
 from .screens.monitor import MonitorScreen
-from .deployment_jobs import DeploymentCancelled, DeploymentJob
+from .deployment_jobs import DeploymentCancelled, DeploymentJob, OperationRecord
 from .screens.quick_deploy import QuickDeployScreen
 from .screens.setup import SetupRequiredScreen
 from .screens.storage import StorageScreen
@@ -223,7 +230,7 @@ class TuiApp(App):
     _ENDPOINT_CACHE_TTL_SECONDS = 20.0
     _STORAGE_CACHE_TTL_SECONDS = 20.0
 
-    def __init__(self, *, mouse_enabled: bool | None = None, **kwargs: object) -> None:
+    def __init__(self, *, mouse_enabled: bool | None = None, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         for theme in LAUNCHPAD_THEMES:
             self.register_theme(theme)
@@ -254,14 +261,15 @@ class TuiApp(App):
         self._storage_snapshot_cached_at_epoch: float = 0.0
         self._storage_refresh_inflight = False
         self._storage_refresh_lock = threading.Lock()
-        self._storage_refresh_receivers: list[object] = []
+        self._storage_refresh_receivers: list[MessagePump] = []
         self._storage_cache_path = SETTINGS_DIR / "storage_snapshot.json"
         self._deploy_connection_cache_path = SETTINGS_DIR / "deployment_connection_summaries.json"
         self._deploy_connection_cache: dict[str, dict[str, object]] = {}
         self._in_flight_deploys: dict[tuple[str, str, str], InFlightDeployment] = {}
         self._deployment_lock = threading.RLock()
         self.deployment_jobs: dict[str, DeploymentJob] = {}
-        self._job_store: object | None = None
+        self.operation_history: dict[str, OperationRecord] = {}
+        self._job_store: JobStore | None = None
         self._quitting = False
         self._load_persisted_storage_cache()
         self._load_persisted_deploy_connection_cache()
@@ -593,8 +601,8 @@ class TuiApp(App):
             store = self._get_job_store()
             return frozenset(
                 record.app_name
-                for record in store.list_jobs(include_terminal=False)  # type: ignore[attr-defined]
-                if record.app_name and store.pid_alive(record.worker_pid)  # type: ignore[attr-defined]
+                for record in store.list_jobs(include_terminal=False)
+                if record.app_name and store.pid_alive(record.worker_pid)
             )
         except Exception:
             # Unreadable job state says nothing about the resource; fall back to
@@ -690,6 +698,18 @@ class TuiApp(App):
 
     def on_provider_readiness_updated(self, message: ProviderReadinessUpdated) -> None:
         self._provider_readiness = message.readiness
+        # Someone authenticated in another terminal while Setup was open: the
+        # screen went on saying "None currently has credentials" beside a list
+        # reading "Authenticated" until they thought to press r.
+        if (
+            isinstance(self.screen, SetupRequiredScreen)
+            and any(row.verified for row in message.readiness)
+            and self._provider_is_configured()
+        ):
+            self.pop_screen()
+            self._enter_main_menu()
+            self.notify("Provider credentials found.", timeout=3)
+            return
         for screen in list(self.screen_stack):
             updater = getattr(screen, "on_provider_readiness", None)
             if callable(updater):
@@ -818,11 +838,8 @@ class TuiApp(App):
         except Exception:
             gated = False
 
-        def _nav(title: str, help_text: str, callback: object) -> SystemCommand:
-            from typing import cast
-
-            cb = cast(object, callback)
-            return SystemCommand(title, help_text, cb, discover=not gated)  # type: ignore[arg-type]
+        def _nav(title: str, help_text: str, callback: Callable[[], Any]) -> SystemCommand:
+            return SystemCommand(title, help_text, callback, discover=not gated)
 
         yield _nav("Deploy model", "Pick a model and get a live placement", self.action_push_deploy)
         yield _nav(
@@ -879,7 +896,7 @@ class TuiApp(App):
     # Deploy
     # ------------------------------------------------------------------
 
-    def _get_job_store(self) -> object:
+    def _get_job_store(self) -> JobStore:
         if self._job_store is None:
             from ..core.job_store import JobStore
 
@@ -921,7 +938,7 @@ class TuiApp(App):
             importer = getattr(store, "import_journal_entries", None)
             if callable(importer):
                 importer()
-            persistent = store.create_job(config)  # type: ignore[attr-defined]
+            persistent = store.create_job(config)
         except ValueError as exc:
             # Duplicate active target across sessions: reopen it instead of renting twice.
             existing_id = self._persistent_job_for_key(config)
@@ -973,7 +990,7 @@ class TuiApp(App):
         """Return an active persistent job id for one deployment target, if any."""
         try:
             store = self._get_job_store()
-            for record in store.list_jobs(include_terminal=False):  # type: ignore[attr-defined]
+            for record in store.list_jobs(include_terminal=False):
                 if (
                     record.provider == config.provider.value
                     and record.backend == config.backend.value
@@ -998,7 +1015,7 @@ class TuiApp(App):
             if self._quitting:
                 return
             try:
-                events = store.get_events(job.persistent_id, after_seq=job.last_seen_seq)  # type: ignore[attr-defined]
+                events = store.get_events(job.persistent_id, after_seq=job.last_seen_seq)
             except Exception:
                 break
             for stored in events:
@@ -1037,7 +1054,7 @@ class TuiApp(App):
                     except Exception:
                         pass
             try:
-                record = store.get_job(job.persistent_id)  # type: ignore[attr-defined]
+                record = store.get_job(job.persistent_id)
             except Exception:
                 break
             if record is None:
@@ -1057,7 +1074,7 @@ class TuiApp(App):
             if job.cancel_requested.is_set():
                 # Mirror a session cancel into the durable flag exactly once.
                 try:
-                    store.request_cancel(job.persistent_id)  # type: ignore[attr-defined]
+                    store.request_cancel(job.persistent_id)
                 except Exception:
                     pass
             try:
@@ -1071,7 +1088,7 @@ class TuiApp(App):
         """Rebuild a monitor from retained events, live if the worker runs."""
         store = self._get_job_store()
         try:
-            record = store.get_job(persistent_id)  # type: ignore[attr-defined]
+            record = store.get_job(persistent_id)
         except Exception:
             return
         if record is None:
@@ -1096,7 +1113,7 @@ class TuiApp(App):
             outcome=record.outcome,
         )
         try:
-            stored_events = store.get_events(persistent_id)  # type: ignore[attr-defined]
+            stored_events = store.get_events(persistent_id)
         except Exception:
             stored_events = []
         for stored in stored_events:
@@ -1127,21 +1144,20 @@ class TuiApp(App):
                 thread=True,
             )
 
-    def _post_connection_card_for_record(self, job: DeploymentJob, record: object, store: object) -> None:
+    def _post_connection_card_for_record(self, job: DeploymentJob, record: JobRecord, store: JobStore) -> None:
         """Restore the connection card (copy buttons, Done-home) from a durable result."""
         try:
-            getter = getattr(store, "get_result", None)
-            result = getter(record.id) if callable(getter) else None  # type: ignore[attr-defined]
+            result = store.get_result(record.id)
             url = result.get("url") if isinstance(result, dict) else None
             if not url:
                 return
             job.monitor.post_message(
-                ConnectionSummaryReady(_deploy_connection_card_payload(record.config, url))  # type: ignore[arg-type]
+                ConnectionSummaryReady(_deploy_connection_card_payload(record.config, url))
             )
         except Exception:
             log_exception("Could not restore deployment connection card")
 
-    def _sync_finished_job(self, job: DeploymentJob, record: object) -> None:
+    def _sync_finished_job(self, job: DeploymentJob, record: JobRecord) -> None:
         """Sync one successful background deployment into OpenCode, once.
 
         The worker persists the connection but cannot sync: fleet context and
@@ -1153,15 +1169,15 @@ class TuiApp(App):
         job.opencode_synced = True
         try:
             store = self._get_job_store()
-            result = store.get_result(record.id)  # type: ignore[attr-defined]
+            result = store.get_result(record.id)
             url = result.get("url") if isinstance(result, dict) else None
             if not url:
                 return
             live_rows, prune_providers = self._visible_rows_and_prune_scope()
             self._sync_opencode(
-                target_app_name=record.app_name,  # type: ignore[attr-defined]
+                target_app_name=record.app_name,
                 target_url=url,
-                target_config=record.config,  # type: ignore[attr-defined]
+                target_config=record.config,
                 current_rows=live_rows,
                 prune_providers=prune_providers,
                 monitor=job.monitor,
@@ -1178,6 +1194,45 @@ class TuiApp(App):
             self.screen.query_one("#manage-tabs", TabbedContent).active = "manage-jobs"
         else:
             self.push_screen(ManageScreen(jobs=True))
+
+    # Enough to find today's status checks and benchmarks; each entry keeps a
+    # monitor screen (and its log) alive, so the history is bounded.
+    _OPERATION_HISTORY_LIMIT = 20
+
+    def _track_operation(self, monitor: MonitorScreen, subject: str) -> str:
+        """Keep a non-deploy operation's monitor reachable from Operations.
+
+        Returns the name to push: the monitor is installed under it, so popping
+        the screen does not destroy the log and result behind it.
+        """
+        op_id = f"op-{uuid4().hex}"
+        self.install_screen(monitor, name=op_id)
+        self.operation_history[op_id] = OperationRecord(
+            id=op_id,
+            title=monitor.title_text,
+            subject=subject,
+            monitor=monitor,
+            started_at=time.time(),
+        )
+        while len(self.operation_history) > self._OPERATION_HISTORY_LIMIT:
+            oldest_id = next(iter(self.operation_history))
+            oldest = self.operation_history[oldest_id]
+            if oldest.monitor in self.screen_stack:
+                break
+            del self.operation_history[oldest_id]
+            self.uninstall_screen(oldest_id)
+        return op_id
+
+    def reopen_operation(self, op_id: str) -> None:
+        """Return to a status check, benchmark or other operation's monitor."""
+        record = self.operation_history.get(op_id)
+        if record is None:
+            return
+        if record.monitor in self.screen_stack:
+            while self.screen is not record.monitor:
+                self.pop_screen()
+        else:
+            self.push_screen(op_id)
 
     def reopen_deployment(self, job_id: str) -> None:
         """Return to the original monitor, preserving its logs and result."""
@@ -1199,7 +1254,7 @@ class TuiApp(App):
             job.cancel_requested.set()
             if job.persistent_id:
                 try:
-                    self._get_job_store().request_cancel(job.persistent_id)  # type: ignore[attr-defined]
+                    self._get_job_store().request_cancel(job.persistent_id)
                 except Exception:
                     log_exception("Could not persist deployment cancellation")
 
@@ -1450,6 +1505,10 @@ class TuiApp(App):
                 continue
             self._finish_in_flight(fallback, resolved=True)
             attempts.append(_attempt_with_plan(fallback))
+        def _observe_and_forward(event: BaseEvent) -> None:
+            self._observe_lifecycle_event(config, monitor, event)
+            _on_event(event)
+
         result = run_lifecycle(
             self._orchestrator,
             attempts,
@@ -1460,10 +1519,7 @@ class TuiApp(App):
                 modal_username=self._username,
             ),
             callbacks=LifecycleCallbacks(
-                on_event=lambda event: (
-                    self._observe_lifecycle_event(config, monitor, event),
-                    _on_event(event),
-                ),
+                on_event=_observe_and_forward,
                 is_cancelled=lambda: self._is_deploy_cancelled(monitor),
                 on_resource=lambda resource_id: self._record_lifecycle_resource(
                     config, monitor, resource_id
@@ -1581,7 +1637,7 @@ class TuiApp(App):
                 timeout=4,
             )
         monitor = MonitorScreen(title="Status Check", deploy_backend=endpoint.backend)
-        self.push_screen(monitor)
+        self.push_screen(self._track_operation(monitor, endpoint.name or endpoint.app_id or ""))
         self.run_worker(
             lambda: self._run_status(
                 endpoint,
@@ -1685,7 +1741,7 @@ class TuiApp(App):
             output_dir=output_dir,
         )
         monitor = MonitorScreen(title="Benchmark", deploy_backend=row.backend)
-        self.push_screen(monitor)
+        self.push_screen(self._track_operation(monitor, row.name or row.app_id or ""))
         self.run_worker(
             lambda: self._run_benchmark(config, monitor),
             name="benchmark-worker",
@@ -1713,13 +1769,15 @@ class TuiApp(App):
         if endpoint.backend is None:
             self.notify("This endpoint has no recognized backend.", severity="error", timeout=6)
             return
-        monitor = MonitorScreen(title="Logs", deploy_backend=endpoint.backend)
-        self.push_screen(monitor)
-        target_app_name = endpoint.name or legacy_app_name(endpoint.backend)
+        # Bound here: a lambda does not keep the `is None` narrowing above.
+        backend = endpoint.backend
+        monitor = MonitorScreen(title="Logs", deploy_backend=backend)
+        self.push_screen(self._track_operation(monitor, endpoint.name or endpoint.app_id or ""))
+        target_app_name = endpoint.name or legacy_app_name(backend)
         target_ref = (endpoint.app_id or target_app_name).strip()
         self.run_worker(
             lambda: self._run_logs(
-                endpoint.backend,
+                backend,
                 follow,
                 target_ref,
                 target_app_name,
@@ -1767,13 +1825,14 @@ class TuiApp(App):
         if endpoint.backend is None:
             self.notify("This endpoint has no recognized backend.", severity="error", timeout=6)
             return
-        monitor = MonitorScreen(title="Stop", deploy_backend=endpoint.backend)
-        self.push_screen(monitor)
-        target_app_name = endpoint.name or legacy_app_name(endpoint.backend)
+        backend = endpoint.backend
+        monitor = MonitorScreen(title="Stop", deploy_backend=backend)
+        self.push_screen(self._track_operation(monitor, endpoint.name or endpoint.app_id or ""))
+        target_app_name = endpoint.name or legacy_app_name(backend)
         target_ref = (endpoint.app_id or target_app_name).strip()
         self.run_worker(
             lambda: self._run_stop(
-                endpoint.backend,
+                backend,
                 target_ref,
                 target_app_name,
                 monitor,
@@ -1831,7 +1890,7 @@ class TuiApp(App):
         with self._endpoint_refresh_lock:
             self._endpoint_snapshot_cached_at_epoch = 0.0
 
-    def begin_endpoint_refresh(self, receiver: object, force: bool = False) -> None:
+    def begin_endpoint_refresh(self, receiver: MessagePump, force: bool = False) -> None:
         """Load endpoints once and deliver the result to every waiting screen."""
         poster = getattr(receiver, "post_message", None)
         if poster is None:
@@ -2097,7 +2156,7 @@ class TuiApp(App):
         with self._storage_refresh_lock:
             return self._storage_snapshot_cache
 
-    def begin_storage_refresh(self, receiver: object, force: bool = False) -> None:
+    def begin_storage_refresh(self, receiver: MessagePump, force: bool = False) -> None:
         poster = getattr(receiver, "post_message", None)
         if poster is None:
             return
@@ -2164,7 +2223,7 @@ class TuiApp(App):
         revision: str | None = None,
     ) -> None:
         monitor = MonitorScreen(title="Pre-download", deploy_backend=backend)
-        self.push_screen(monitor)
+        self.push_screen(self._track_operation(monitor, model_id))
         self.run_worker(
             lambda: self._run_storage_predownload(
                 backend=backend,
@@ -2197,7 +2256,7 @@ class TuiApp(App):
 
     def begin_storage_delete(self, model: StoredModelInfo) -> None:
         monitor = MonitorScreen(title="Delete model", deploy_backend=model.backend)
-        self.push_screen(monitor)
+        self.push_screen(self._track_operation(monitor, model.model_id))
         self.run_worker(
             lambda: self._run_storage_delete(model=model, monitor=monitor),
             name="storage-delete-worker",
@@ -2229,7 +2288,7 @@ class TuiApp(App):
         except Exception:
             log_exception("Failed to remove cached storage snapshot")
 
-    def begin_prime_disks_refresh(self, receiver: object) -> None:
+    def begin_prime_disks_refresh(self, receiver: MessagePump) -> None:
         """Fetch Prime persistent disks without blocking the Storage screen."""
         poster = getattr(receiver, "post_message", None)
         if poster is None:
@@ -2240,7 +2299,7 @@ class TuiApp(App):
             thread=True,
         )
 
-    def _run_prime_disks_refresh(self, receiver: object) -> None:
+    def _run_prime_disks_refresh(self, receiver: MessagePump) -> None:
         from .workers import PrimeDisksFailed, PrimeDisksLoaded
 
         try:
@@ -2249,23 +2308,23 @@ class TuiApp(App):
 
             disks = list_retained_prime_disks(PrimeBackend())
         except Exception as exc:
-            receiver.post_message(PrimeDisksFailed(error=str(exc)))  # type: ignore[attr-defined]
+            receiver.post_message(PrimeDisksFailed(error=str(exc)))
             return
-        receiver.post_message(PrimeDisksLoaded(disks=disks))  # type: ignore[attr-defined]
+        receiver.post_message(PrimeDisksLoaded(disks=disks))
 
-    def begin_prime_disk_delete(self, disk_id: str, receiver: object) -> None:
+    def begin_prime_disk_delete(self, disk_id: str, receiver: MessagePump) -> None:
         """Delete one Prime disk, then refresh the Storage screen's inventory."""
         from .screens.monitor import MonitorScreen
 
         monitor = MonitorScreen(title="Delete Prime disk")
-        self.push_screen(monitor)
+        self.push_screen(self._track_operation(monitor, disk_id))
         self.run_worker(
             lambda: self._run_prime_disk_delete(disk_id=disk_id, monitor=monitor, receiver=receiver),
             name="prime-disk-delete-worker",
             thread=True,
         )
 
-    def _run_prime_disk_delete(self, *, disk_id: str, monitor: object, receiver: object) -> None:
+    def _run_prime_disk_delete(self, *, disk_id: str, monitor: MonitorScreen, receiver: MessagePump) -> None:
         from ..protocol.enums import OperationType
         from ..protocol.events import LogEvent, OperationCompleteEvent
         from .workers import _dispatch_event
@@ -2276,10 +2335,10 @@ class TuiApp(App):
 
             message = delete_retained_prime_disk(PrimeBackend(), disk_id)
         except Exception as exc:
-            _dispatch_event(monitor, OperationCompleteEvent(operation=OperationType.STORAGE_DELETE, success=False, detail=str(exc)))  # type: ignore[arg-type]
+            _dispatch_event(monitor, OperationCompleteEvent(operation=OperationType.STORAGE_DELETE, success=False, detail=str(exc)))
             return
-        _dispatch_event(monitor, LogEvent(line=message, operation=OperationType.STORAGE_DELETE))  # type: ignore[arg-type]
-        _dispatch_event(monitor, OperationCompleteEvent(operation=OperationType.STORAGE_DELETE, success=True, detail=message))  # type: ignore[arg-type]
+        _dispatch_event(monitor, LogEvent(line=message, operation=OperationType.STORAGE_DELETE))
+        _dispatch_event(monitor, OperationCompleteEvent(operation=OperationType.STORAGE_DELETE, success=True, detail=message))
         refresher = getattr(receiver, "post_message", None)
         if callable(refresher):
             self.begin_prime_disks_refresh(receiver)
@@ -2406,8 +2465,8 @@ class TuiApp(App):
             model_id=str(payload.get("model_id", "")).strip(),
             revision=str(payload.get("revision")) if payload.get("revision") not in {None, ""} else None,
             quant=str(payload.get("quant")) if payload.get("quant") not in {None, ""} else None,
-            size_bytes=int(payload.get("size_bytes", 0) or 0),
-            file_count=int(payload.get("file_count", 0) or 0),
+            size_bytes=positive_int(payload.get("size_bytes")) or 0,
+            file_count=positive_int(payload.get("file_count")) or 0,
             source_volume=str(payload.get("source_volume", "") or ""),
             paths=paths,
             incomplete=bool(payload.get("incomplete", False)),
@@ -2446,7 +2505,7 @@ class TuiApp(App):
     # vLLM model discovery
     # ------------------------------------------------------------------
 
-    def begin_fetch_vllm_models(self, mode: str, receiver: object) -> None:
+    def begin_fetch_vllm_models(self, mode: str, receiver: MessagePump) -> None:
         """Load ranked HF model candidates for vLLM without blocking the UI."""
         self.run_worker(
             lambda: self._run_fetch_vllm_models(mode, receiver),
@@ -2454,7 +2513,7 @@ class TuiApp(App):
             thread=True,
         )
 
-    def _run_fetch_vllm_models(self, mode: str, receiver: object) -> None:
+    def _run_fetch_vllm_models(self, mode: str, receiver: MessagePump) -> None:
         poster = getattr(receiver, "post_message", None)
         if poster is None:
             return
@@ -2469,7 +2528,7 @@ class TuiApp(App):
     # llama.cpp model discovery
     # ------------------------------------------------------------------
 
-    def begin_fetch_llamacpp_models(self, mode: str, receiver: object) -> None:
+    def begin_fetch_llamacpp_models(self, mode: str, receiver: MessagePump) -> None:
         """Load ranked HF model candidates for llama.cpp without blocking UI."""
         self.run_worker(
             lambda: self._run_fetch_llamacpp_models(mode, receiver),
@@ -2477,7 +2536,7 @@ class TuiApp(App):
             thread=True,
         )
 
-    def _run_fetch_llamacpp_models(self, mode: str, receiver: object) -> None:
+    def _run_fetch_llamacpp_models(self, mode: str, receiver: MessagePump) -> None:
         poster = getattr(receiver, "post_message", None)
         if poster is None:
             return
@@ -2488,7 +2547,7 @@ class TuiApp(App):
             return
         poster(LlamaCppModelsLoaded(mode=mode, models=models))
 
-    def begin_fetch_llamacpp_quants(self, repo_id: str, revision: str | None, receiver: object) -> None:
+    def begin_fetch_llamacpp_quants(self, repo_id: str, revision: str | None, receiver: MessagePump) -> None:
         """Load GGUF quant variants for a llama.cpp model repo."""
         self.run_worker(
             lambda: self._run_fetch_llamacpp_quants(repo_id, revision, receiver),
@@ -2496,7 +2555,7 @@ class TuiApp(App):
             thread=True,
         )
 
-    def _run_fetch_llamacpp_quants(self, repo_id: str, revision: str | None, receiver: object) -> None:
+    def _run_fetch_llamacpp_quants(self, repo_id: str, revision: str | None, receiver: MessagePump) -> None:
         poster = getattr(receiver, "post_message", None)
         if poster is None:
             return

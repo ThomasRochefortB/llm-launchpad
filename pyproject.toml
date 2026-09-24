@@ -34,7 +34,7 @@ dependencies = [
 
 [project.optional-dependencies]
 benchmark = [
-  "aiperf>=0.7,<0.13",
+  "aiperf>=0.7,<0.14",
 ]
 
 [project.scripts]
@@ -95,6 +95,5 @@ python-version = "3.12"
 include = ["llm_launchpad", "tests/smoke_test.py", "tests/test_release_metadata.py"]
 exclude = [
     "llm_launchpad/backends",
-    "llm_launchpad/tui",
     "llm_launchpad/core/hf_models.py",
 ]

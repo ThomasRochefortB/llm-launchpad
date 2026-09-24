@@ -346,6 +346,28 @@ class VastLifecycleTests(unittest.TestCase):
         self.api.destroy_instance.assert_called_once_with("900")
         self.assertEqual(self.state.records(), [])
 
+    def test_a_rental_that_stops_says_what_vast_reported(self) -> None:
+        """"Stopped before the runtime became ready" alone was undiagnosable.
+
+        Live evidence (2026-09-23): an RTX 3060 host pulled the image and the
+        container exited before SSH was ever up -- a host fault, not the
+        runtime -- but the report could not say which.
+        """
+        def exited_create(offer_id: str, **kwargs: object) -> str:
+            self.remote = VastInstance(
+                "900", str(kwargs["label"]), "exited", "42",
+                status_msg="Error response from daemon: failed to create task",
+            )
+            return "900"
+
+        self.api.create_instance.side_effect = exited_create
+        event = self.deploy()
+
+        self.assertFalse(event.success)
+        self.assertIn("state: exited", event.detail or "")
+        self.assertIn("failed to create task", event.detail or "")
+        self.api.destroy_instance.assert_called_once_with("900")
+
     def test_a_host_still_installing_sshd_is_not_given_back_at_the_old_window(self) -> None:
         """The wait that was killing healthy rentals, at the length that killed one.
 

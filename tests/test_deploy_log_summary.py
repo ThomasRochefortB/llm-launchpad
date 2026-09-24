@@ -740,3 +740,26 @@ class ElapsedFormatTests(unittest.TestCase):
         self.assertEqual(_format_elapsed(45), "45s")
         self.assertEqual(_format_elapsed(320), "5m20s")
         self.assertEqual(_format_elapsed(3860), "1h04m20s")
+
+
+class IdleShutdownSummaryTests(unittest.TestCase):
+    """Whether a rental deletes itself is a billing fact, not log chatter.
+
+    The summary view dropped every "Idle shutdown" line, so a live Prime
+    certification (2026-09-23) found nothing on screen saying which watchdog
+    was armed -- or that the local one only runs while this computer is awake.
+    """
+
+    def test_each_idle_shutdown_outcome_reaches_the_summary(self) -> None:
+        lines = (
+            "Idle shutdown: deleted after 1h with no requests (runs on the pod).",
+            "Idle shutdown: deleted after 1h with no requests, while this computer is awake. "
+            "To cover sleep too, allow Prime pods to stop themselves in Settings.",
+            "Idle shutdown: deleted after 1h with no requests.",
+            "Idle shutdown is off: this pod bills until you stop it.",
+        )
+        for backend in (BackendType.LLAMACPP, BackendType.VLLM):
+            summarizer = DeployLogSummarizer(backend)
+            for line in lines:
+                with self.subTest(backend=backend, line=line[:30]):
+                    self.assertEqual(summarizer.transform(line, OperationType.DEPLOY), [line])

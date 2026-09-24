@@ -71,7 +71,7 @@ _FIT_MIN_ROWS = 9
 class AdaptiveDataTable(DataTable[Any]):
     """Rebuild visible columns while retaining row data and cursor identity."""
 
-    def __init__(self, *args: object, fit_to_rows: bool = False, **kwargs: object) -> None:
+    def __init__(self, *args: Any, fit_to_rows: bool = False, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         # With `height: 1fr` alone a two-row inventory sat in a box twenty rows
         # tall. Fitting caps the height at the rows plus header and border;

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from collections import defaultdict
 
 from rich.cells import cell_len
@@ -84,7 +86,7 @@ class FittedFooter(Footer):
     }
     """
 
-    def __init__(self, *args: object, **kwargs: object) -> None:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._fitted_width = 0
 

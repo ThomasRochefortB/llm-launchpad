@@ -16,7 +16,7 @@
 
 ## Quickstart
 
-Get up and running in four steps:
+Get up and running in five steps:
 
 1. Install the CLI so `llm-launchpad` is available in your shell:
    ```bash
@@ -35,7 +35,7 @@ Get up and running in four steps:
 
 3. Authenticate Hugging Face:
    ```bash
-   huggingface-cli login
+   hf auth login
    ```
 
 4. Verify your setup:

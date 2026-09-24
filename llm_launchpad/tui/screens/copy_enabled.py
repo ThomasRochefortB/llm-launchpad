@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from textual import events
 from textual.binding import Binding
@@ -25,6 +25,9 @@ from ..responsive import (
 )
 from ..visual import DEFAULT_TUI_DENSITY, DEFAULT_TUI_THEME, TUI_THEME_OPTIONS
 
+if TYPE_CHECKING:
+    from ..app import TuiApp
+
 
 class CopyEnabledScreen(Screen):
     """Screen base class that provides consistent copy behavior."""
@@ -40,7 +43,14 @@ class CopyEnabledScreen(Screen):
         ),
     ]
 
-    def __init__(self, *args: object, **kwargs: object) -> None:
+    if TYPE_CHECKING:
+        # Every screen runs inside TuiApp and calls its begin_* / action_push_*
+        # methods; Textual types `app` as the bare App, which hid misspelt or
+        # removed app methods from the type checker.
+        @property
+        def app(self) -> TuiApp: ...
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._selection_sync_scheduled = False
         self._last_synced_selection: str | None = None
@@ -183,13 +193,13 @@ class CopyEnabledScreen(Screen):
         try:
             self._focus_before_help = self.focused
         except Exception:
-            self._focus_before_help = None  # type: ignore[attr-defined]
+            self._focus_before_help = None
         self.app.push_screen(HelpOverlayScreen.from_screen(self))
 
     async def _watch_selections(
         self,
-        old_selections: dict[Static, Selection],
-        selections: dict[Static, Selection],
+        old_selections: dict[Widget, Selection],
+        selections: dict[Widget, Selection],
     ) -> None:
         await super()._watch_selections(old_selections, selections)
         if not selections:

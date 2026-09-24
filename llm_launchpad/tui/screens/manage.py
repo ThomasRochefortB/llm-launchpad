@@ -45,6 +45,7 @@ from ..widgets.input_form import FormField
 from ..workers import EndpointsFailed, EndpointsLoaded, ServingStatsReady
 from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
+from ..compat import highlighted_option
 from ..visual import labelled_rows_markup, screen_title
 from .operations import DeploymentJobsPanel
 
@@ -789,7 +790,7 @@ class ManageScreen(CopyEnabledScreen):
     def action_logs_selected(self) -> None:
         row = self._row_for_action("logs")
         if row is not None:
-            self.app.begin_logs(row, follow=True)  # type: ignore[attr-defined]
+            self.app.begin_logs(row, follow=True)
 
     def action_benchmark_selected(self) -> None:
         row = self._row_for_action("benchmark")
@@ -835,7 +836,7 @@ class ManageScreen(CopyEnabledScreen):
             return
 
         try:
-            rows = self.app.list_instances()  # type: ignore[attr-defined]
+            rows = self.app.list_instances()
         except Exception as exc:
             self.post_message(EndpointsFailed(error=str(exc)))
             return
@@ -986,7 +987,7 @@ class EndpointActionsScreen(CopyEnabledScreen):
 
     def action_submit_selected(self) -> None:
         actions = self.query_one("#manage-actions", OptionList)
-        highlighted = actions.highlighted_option
+        highlighted = highlighted_option(actions)
         if highlighted is not None:
             self._submit(str(highlighted.id))
 
@@ -1000,24 +1001,20 @@ class EndpointActionsScreen(CopyEnabledScreen):
         elif action == "status":
             # The common path probes immediately with defaults; the URL-override
             # form stays available via the hidden "s" shortcut on Manage.
-            self.app.begin_status(endpoint)  # type: ignore[attr-defined]
+            self.app.begin_status(endpoint)
         elif action == "live-metrics":
             # Route through Manage so the fetched totals repaint the table and
             # detail rather than disappearing with this menu.
             manage = self.app.screen
-            fetch = getattr(manage, "action_fetch_live_selected", None)
-            if callable(fetch):
+            if isinstance(manage, ManageScreen):
                 # The menu holds the selected row; Manage re-resolves its own
                 # selection, so prefer the endpoint the user just chose.
-                try:
-                    manage._selected_key = _endpoint_key(endpoint)  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-                fetch()
+                manage._selected_key = _endpoint_key(endpoint)
+                manage.action_fetch_live_selected()
             else:
-                self.app.begin_status(endpoint)  # type: ignore[attr-defined]
+                self.app.begin_status(endpoint)
         elif action == "logs":
-            self.app.begin_logs(endpoint, follow=True)  # type: ignore[attr-defined]
+            self.app.begin_logs(endpoint, follow=True)
         elif action == "benchmark":
             self.app.push_screen(BenchmarkOptionsScreen(endpoint))
         elif action == "stop":
@@ -1212,7 +1209,7 @@ class StatusOptionsScreen(CopyEnabledScreen):
             return
         url_override = self.query_one("#status-url", Input).value.strip() or None
         self.app.pop_screen()
-        self.app.begin_status(  # type: ignore[attr-defined]
+        self.app.begin_status(
             self.endpoint,
             url_override=url_override,
             timeout=timeout,
@@ -1323,7 +1320,7 @@ class BenchmarkOptionsScreen(CopyEnabledScreen):
         tokenizer = self.query_one("#benchmark-tokenizer", Input).value
         output_dir = self.query_one("#benchmark-output-dir", Input).value.strip() or None
         self.app.pop_screen()
-        self.app.begin_benchmark(  # type: ignore[attr-defined]
+        self.app.begin_benchmark(
             self.endpoint,
             concurrency=concurrency,
             request_count=request_count,
@@ -1394,4 +1391,4 @@ class StopConfirmScreen(CopyEnabledScreen):
 
     def action_confirm_stop(self) -> None:
         self.app.pop_screen()
-        self.app.begin_stop(self.endpoint)  # type: ignore[attr-defined]
+        self.app.begin_stop(self.endpoint)
