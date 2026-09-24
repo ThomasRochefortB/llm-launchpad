@@ -113,17 +113,22 @@ uv run python scripts/validate_prime_live.py \
 The idle-shutdown watchdogs have their own stages, `llamacpp_idle_on_pod` and
 `llamacpp_idle_local`. Each deploys the smallest llama.cpp model with a 120s
 window, serves the harness's requests, then leaves the pod alone until its
-watchdog deletes it; a tunnel left behind fails the stage. Neither is certified
-yet. The first attempt (2026-09-23, A10 at $1.29/hr, $0.15) served correctly but
-found that the TUI's summary log dropped the "Idle shutdown" line, so nothing on
-screen said which watchdog was armed; that is fixed. The second (same day, $0.81,
-most of it 25 minutes the pod spent in Prime's provisioning) armed the on-pod
-watchdog with the 1h Settings window instead of the requested 120s: planned
-deploys dropped `idle_shutdown_seconds`. Also fixed; the watchdog itself has not
-yet been observed deleting a pod. Budget about $0.30 per
-stage at current A10 prices. The spend cutoff is the budget less a $0.30
-cleanup reserve and counts what earlier stages spent, so both stages need about
-$1:
+watchdog deletes it; a tunnel left behind fails the stage.
+
+**`llamacpp_idle_local` (the default) is certified**: 2026-09-24, commit
+`8804b39`, A6000 at $0.54/hr, $0.07. The pod and its tunnel were gone 184s after
+the last request (the 120s window plus the watchdog's polling), and no watchdog
+process was left on this computer.
+
+`llamacpp_idle_on_pod` is not certified. Two earlier attempts (2026-09-23, $0.96
+together) each found a bug before the watchdog could act: the summary log hid
+the "Idle shutdown" line, and planned deploys dropped `idle_shutdown_seconds` so
+the 1h Settings window applied. Both are fixed. A unit test checks that the
+on-pod curl targets the same URL and auth as `delete_pod`. One suspected gap:
+the on-pod watchdog deletes only the pod, while `delete_pod` removes the pod's
+Prime tunnel first. Unless Prime removes a pod's tunnels with it, this stage will
+fail on a leftover tunnel. The spend cutoff is the budget less a $0.30 cleanup reserve and
+counts what earlier stages spent, so both stages need about $1:
 
 ```bash
 uv run python scripts/validate_prime_live.py --confirm-live --budget-usd 1.00 \
