@@ -7,7 +7,7 @@ from collections.abc import Sequence
 
 from rich.markup import escape
 
-from ..format import clip
+from ..format import clip, format_money
 from textual.actions import SkipAction
 from textual.app import ComposeResult
 from textual.binding import Binding
@@ -25,6 +25,7 @@ from ...core.compute_availability import (
 from ...core.inference_options import (
     COST_SCENARIO_WORKDAY,
     evaluate_quote_cost,
+    first_hour_cost_usd,
 )
 from ...core.llamacpp_planner import assessment_score
 from ...core.quant_quality import is_reduced_quality, quant_quality_label
@@ -63,6 +64,7 @@ from ...protocol.models import (
     ComputeConfiguration,
     ComputePlacement,
     InferencePlan,
+    ProviderQuote,
 )
 from ..responsive import ViewportProfile, WidthMode
 from ..widgets.fitted_footer import FittedFooter
@@ -122,6 +124,14 @@ def _format_price(value: float | None, *, estimate: bool = False) -> str:
         return "price n/a"
     prefix = "~" if estimate else ""
     return f"{prefix}${value:.2f}/hr"
+
+
+def _one_time_label(quote: ProviderQuote) -> str:
+    """Name a per-deployment charge, since ranking counts it and the rate does not show it."""
+    once = quote.one_time_cost_usd
+    if once is None:
+        return "download price n/a"
+    return f"+{format_money(once)} download" if once >= 0.005 else ""
 
 
 def _plan_cost_evaluation(plan: object):
@@ -520,7 +530,9 @@ def _tier_option(
     speed_text = f"~{speed:.0f} tok/s" if speed > 0 else "speed n/a"
     # A merged role now occupies the tradeoff column on the recommended row,
     # where the bare word "recommended" used to sit alone. Both belong there.
-    note = tier.tradeoff or ""
+    note = " · ".join(
+        text for text in (_one_time_label(tier.plan.quote), tier.tradeoff or "") if text
+    )
     if tier.is_recommended:
         note = f"{note} · recommended" if note else "recommended"
     # The tradeoff clause is the first thing a narrow terminal drops, and it is
@@ -581,6 +593,8 @@ def _infra_detail(row: _InfraRow) -> str:
     quote = row.plan.quote
     gpu = _infra_gpu_label(row)
     price = _format_price(quote.price_per_hour_usd, estimate=quote.is_estimate)
+    if once := _one_time_label(quote):
+        price = f"{price} {once}"
     monthly = _scenario_monthly_label(row.plan)
     region = (quote.region or "").strip() or "provider-managed regions"
     performance = ""
@@ -619,7 +633,7 @@ def _infra_detail(row: _InfraRow) -> str:
 
 
 def _infra_sort_key(row: _InfraRow) -> tuple[int, float, str, int]:
-    price = row.plan.quote.price_per_hour_usd
+    price = first_hour_cost_usd(row.plan.quote)
     requirements = row.plan.recipe.serving_requirements
     if row.plan.assessment is not None and requirements is not None:
         score = assessment_score(row.plan.assessment, requirements.objective)
@@ -1064,8 +1078,8 @@ class FastDeployScreen(CopyEnabledScreen):
                 alternatives.sort(
                     key=lambda plan: (
                         plan.quote.id != row.plan.quote.id,
-                        plan.quote.price_per_hour_usd is None,
-                        plan.quote.price_per_hour_usd or float("inf"),
+                        first_hour_cost_usd(plan.quote) is None,
+                        first_hour_cost_usd(plan.quote) or float("inf"),
                     )
                 )
                 self.app.push_quick_deploy(
@@ -1706,7 +1720,12 @@ class FastDeployScreen(CopyEnabledScreen):
             rentable = tuple(row for row in deployable_vast_offers(model, self._snapshot.vast_offers)
                              if self._gpu_filter in {"any", row.gpu_label})
             if rentable:
-                price = rentable[0].costs.total_per_hour_usd
+                # Rows are ranked by first-hour cost, so the lowest rent may not lead.
+                price = min(
+                    (row.costs.total_per_hour_usd for row in rentable
+                     if row.costs.total_per_hour_usd is not None),
+                    default=None,
+                )
                 deploy_price, estimate = _model_cheapest_price(model, self._snapshot, self._gpu_filter)
                 detail += f"\n[dim]Deploy from {_format_price(deploy_price, estimate=estimate)} · Vast from {_format_price(price, estimate=True)} incl. disk; traffic extra.[/dim]"
                 detail += "\n[dim]Vast deployments use a local SSH endpoint on this computer.[/dim]"

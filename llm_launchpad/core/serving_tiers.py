@@ -26,6 +26,7 @@ from collections.abc import Sequence
 
 from ..protocol.enums import ServingObjective
 from ..protocol.models import InferencePlan
+from .inference_options import first_hour_cost_usd
 from .llamacpp_planner import assessment_score
 from .quant_quality import (
     QUALITY_FLOOR_BITS,
@@ -105,6 +106,17 @@ class ServingTier:
         return any(point.measured for point in assessment.performance)
 
 
+def _comparison_price(plan: InferencePlan) -> float | None:
+    """What tiers compare: an hour of rent plus one-time charges.
+
+    Equal to the hourly rate except where a provider bills something once per
+    deployment, as Vast does for the weight download. Ranking on the rate
+    alone let a cheap-rent, costly-transfer host win Economy.
+    """
+
+    return first_hour_cost_usd(plan.quote)
+
+
 def _performance_points(plan: InferencePlan) -> tuple:
     """Return comparable performance points for tier ranking.
 
@@ -168,7 +180,7 @@ def _efficiency(plan: InferencePlan) -> float:
     assessment = plan.assessment
     if assessment is None:
         return 0.0
-    price = plan.quote.price_per_hour_usd
+    price = _comparison_price(plan)
     if not price:
         return 0.0
     return _aggregate_tps(plan) / price
@@ -191,8 +203,8 @@ def _describe_tradeoff(
         return None
     speed = _throughput(tier_plan, objective)
     baseline_speed = _throughput(baseline, objective)
-    price = tier_plan.quote.price_per_hour_usd
-    baseline_price = baseline.quote.price_per_hour_usd
+    price = _comparison_price(tier_plan)
+    baseline_price = _comparison_price(baseline)
     speed_text = ""
     if _evidence_classes_match(tier_plan, baseline) and speed > 0 and baseline_speed > 0:
         ratio = speed / baseline_speed
@@ -254,9 +266,9 @@ def _frontier_tiers(
 ) -> tuple[tuple[ServingTier, ...], InferencePlan]:
     """Name the cheapest, best-value and fastest points at one quality level."""
 
-    priced = [plan for plan in plans if plan.quote.price_per_hour_usd is not None]
+    priced = [plan for plan in plans if _comparison_price(plan) is not None]
     cheapest = (
-        min(priced, key=lambda plan: plan.quote.price_per_hour_usd or 0.0)
+        min(priced, key=lambda plan: _comparison_price(plan) or 0.0)
         if priced
         else plans[0]
     )
@@ -327,18 +339,18 @@ def _saver_tier(
     """
 
     priced_lower = [
-        plan for plan in lower if plan.quote.price_per_hour_usd is not None
+        plan for plan in lower if _comparison_price(plan) is not None
     ]
     priced_primary = [
-        plan for plan in primary if plan.quote.price_per_hour_usd is not None
+        plan for plan in primary if _comparison_price(plan) is not None
     ]
     if not priced_lower or not priced_primary:
         return ()
     cheapest_lower = min(
-        priced_lower, key=lambda plan: plan.quote.price_per_hour_usd or 0.0
+        priced_lower, key=lambda plan: _comparison_price(plan) or 0.0
     )
-    floor_price = min(plan.quote.price_per_hour_usd or 0.0 for plan in priced_primary)
-    saver_price = cheapest_lower.quote.price_per_hour_usd or 0.0
+    floor_price = min(_comparison_price(plan) or 0.0 for plan in priced_primary)
+    saver_price = _comparison_price(cheapest_lower) or 0.0
     if not floor_price or saver_price > floor_price * (1.0 - SAVER_MIN_SAVING):
         return ()
 
@@ -394,7 +406,7 @@ def _scoped_against_saver(
     """
 
     saver_speed = _throughput(saver.plan, objective)
-    saver_price = saver.plan.quote.price_per_hour_usd
+    saver_price = _comparison_price(saver.plan)
     rescoped: list[ServingTier] = []
     for tier in tiers:
         beaten = [
@@ -404,7 +416,7 @@ def _scoped_against_saver(
             or (
                 key == ECONOMY
                 and saver_price is not None
-                and (tier.plan.quote.price_per_hour_usd or 0.0) > saver_price
+                and (_comparison_price(tier.plan) or 0.0) > saver_price
             )
         ]
         if not beaten:

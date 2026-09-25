@@ -424,6 +424,24 @@ def format_cost_summary(
     return f"{hourly} · {continuous_text} · {scenario_text} · storage separate"
 
 
+#: Rent counted when comparing placements: the default idle-shutdown window,
+#: so the least a rental that serves one request bills before it deletes itself.
+COMPARISON_RENT_HOURS = 1.0
+
+
+def first_hour_cost_usd(quote: ProviderQuote) -> float | None:
+    """An hour of rent plus one-time charges; ``None`` if either is unknown.
+
+    Placements are compared on this rather than the hourly rate because Vast
+    bills the weight download per GB, and that charge can outweigh the rent
+    a cheaper host saves.
+    """
+    price, once = quote.price_per_hour_usd, quote.one_time_cost_usd
+    if price is None or once is None:
+        return None
+    return price * COMPARISON_RENT_HOURS + once
+
+
 def evaluate_quote_cost(
     quote: ProviderQuote,
     scenario: CostScenario | None = None,

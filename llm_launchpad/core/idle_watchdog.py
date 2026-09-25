@@ -155,15 +155,25 @@ def vast_destroy_command() -> str:
     )
 
 
-def prime_destroy_command(api_base_url: str, pod_id: str, key_path: str) -> str:
-    """Delete this Prime pod with the account key the user opted to place here."""
-    url = f"{api_base_url.rstrip('/')}/pods/{pod_id}"
+def prime_destroy_command(
+    api_base_url: str, pod_id: str, key_path: str, tunnel_id_path: str
+) -> str:
+    """Delete this Prime pod and its tunnel with the key the user opted to place here.
+
+    Mirrors ``PrimeBackend.delete_pod``: the tunnel goes first, best effort,
+    because deleting only the pod leaves the tunnel registered. Its id is read
+    at destroy time, so a tunnel replaced after the watchdog started is found.
+    """
+    base = api_base_url.rstrip("/")
     return (
         "{ "
         f'key="$(cat {shlex.quote(key_path)} 2>/dev/null)"; '
-        '[ -n "$key" ] && '
+        '[ -n "$key" ] && { '
+        f'tunnel="$(cat {shlex.quote(tunnel_id_path)} 2>/dev/null)"; '
+        '[ -z "$tunnel" ] || curl -sS -m 30 -o /dev/null -X DELETE '
+        f'-H "Authorization: Bearer $key" {shlex.quote(base + "/tunnel/")}"$tunnel" || :; '
         'curl -fsS -m 30 -X DELETE -H "Authorization: Bearer $key" '
-        f"{shlex.quote(url)} >/dev/null; }}"
+        f"{shlex.quote(f'{base}/pods/{pod_id}')} >/dev/null; }}; }}"
     )
 
 

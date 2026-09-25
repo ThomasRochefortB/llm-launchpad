@@ -123,6 +123,7 @@ PRIME_RUNTIME_CONTAINER_NAME = "llm-launchpad-runtime"
 PRIME_RUNTIME_ROOT = "/opt/llm-launchpad"
 PRIME_TUNNEL_LABEL = "llm-launchpad"
 PRIME_TUNNEL_PID_PATH = f"{PRIME_RUNTIME_ROOT}/tunnel.pid"
+PRIME_TUNNEL_ID_NAME = "tunnel-id"
 PRIME_TUNNEL_LOG_PATH = f"{PRIME_RUNTIME_ROOT}/tunnel.log"
 PRIME_BOOTSTRAP_SSH_KEY_NAME = "llm-launchpad-bootstrap"
 
@@ -1789,7 +1790,10 @@ class PrimeBackend:
             endpoint_api_key=endpoint_api_key,
             idle_seconds=idle_seconds,
             destroy_command=prime_destroy_command(
-                f"{self.config.base_url}/api/v1", pod_id, key_path
+                f"{self.config.base_url}/api/v1",
+                pod_id,
+                key_path,
+                f"{PRIME_RUNTIME_ROOT}/{PRIME_TUNNEL_ID_NAME}",
             ),
             runtime_dir=PRIME_RUNTIME_ROOT,
         ))
@@ -1920,6 +1924,10 @@ class PrimeBackend:
             "tunnel.toml",
             self._tunnel_config(tunnel, local_port=local_port),
             mode="600",
+        )
+        # The on-pod idle watchdog deletes this tunnel along with the pod.
+        self._write_remote_runtime_file(
+            pod, PRIME_TUNNEL_ID_NAME, f"{tunnel.tunnel_id}\n", mode="600"
         )
         arch = self._pod_frpc_arch(pod)
         self._ensure_remote_frpc(pod, arch)
