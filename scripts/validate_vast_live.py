@@ -54,15 +54,26 @@ def budget_estimate(offer: VastOffer, args: argparse.Namespace, credit: float) -
         args.max_hourly_cost, args.budget_usd, args.max_minutes, args.transfer_gb,
     )):
         raise ValueError("Live validation requires positive finite budgets and a deadline.")
-    hourly, download, upload = (float(rate) for rate in rates if rate is not None)
-    # Reserve five additional minutes for bounded destruction retries.
-    estimate = hourly * (args.max_minutes + 5) / 60 + download * args.transfer_gb + upload
+    hourly = float(rates[0] or 0.0)
+    estimate = stage_cost(offer, args)
     if (
         hourly > args.max_hourly_cost or estimate > args.budget_usd
         or not math.isfinite(credit) or credit < args.budget_usd
     ):
         raise ValueError("Offer or available credit does not meet the live budget guard.")
     return estimate
+
+
+def stage_cost(offer: VastOffer, args: argparse.Namespace) -> float:
+    """Rent for the stage plus its transfer; unknown transfer prices cost infinity."""
+    costs = offer.costs
+    if costs.download_per_gb_usd is None or costs.upload_per_gb_usd is None:
+        return math.inf
+    # Reserve five additional minutes for bounded destruction retries.
+    return (
+        (costs.total_per_hour_usd or 0.0) * (args.max_minutes + 5) / 60
+        + costs.download_per_gb_usd * args.transfer_gb + costs.upload_per_gb_usd
+    )
 
 
 def expired(signum: int, frame: Any) -> None:
@@ -227,8 +238,9 @@ def select_offer(api: VastBackend, args: argparse.Namespace) -> Any:
     ]
     if not fitting:
         raise ValueError("No rentable offer matches this stage's requirements.")
-    fitting.sort(key=lambda offer: offer.costs.total_per_hour_usd or 0.0)
-    return fitting[0]
+    # Rank by the whole stage, not the hourly price: the cheapest host per hour
+    # once charged $0.039/GB, about $0.47 of transfer for one vLLM stage.
+    return min(fitting, key=lambda offer: stage_cost(offer, args))
 
 
 def probe_image(args: argparse.Namespace) -> int:

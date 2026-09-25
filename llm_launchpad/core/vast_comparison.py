@@ -12,13 +12,35 @@ from ..protocol.models import InferencePlan, OfferCostBreakdown, ProviderQuote, 
 from .compute_availability import canonical_gpu_identity, recipe_for_placement
 from .llamacpp_planner import assess_memory_placement, tuning_for_gpu_memory
 from .quick_deploy import QuickDeployModel, QuickDeployProfile, quick_deploy_recipe
-from .inference_options import COST_SCENARIO_WORKDAY, evaluate_quote_cost
+from .inference_options import COMPARISON_RENT_HOURS, COST_SCENARIO_WORKDAY, evaluate_quote_cost
 from .runtime_support import load_llamacpp_support_manifest
 from .vast_runtime import VAST_MAX_GPU_COUNT, VAST_MIN_COMPUTE_CAPABILITY, VAST_MIN_CUDA_VERSION
 from .vast_startup_history import (
     load_vast_startup_history,
     machine_startup_stats,
 )
+
+
+def vast_first_hour_cost_usd(costs: OfferCostBreakdown, download_gb: float) -> float | None:
+    """An hour of rent plus downloading the weights once; ``None`` if either price is unknown.
+
+    Hourly price alone ranked a host charging $0.039/GB first, whose ~$0.47
+    of transfer outweighed the rent it saved several times over.
+    """
+    hourly, per_gb = costs.total_per_hour_usd, costs.download_per_gb_usd
+    if hourly is None or per_gb is None:
+        return None
+    return hourly * COMPARISON_RENT_HOURS + per_gb * download_gb
+
+
+def _cost_rank(costs: OfferCostBreakdown, download_gb: float) -> tuple[bool, float, bool, float]:
+    """Known first-hour cost first, then hourly price; unknown prices sort last."""
+    total = vast_first_hour_cost_usd(costs, download_gb)
+    hourly = costs.total_per_hour_usd
+    return (
+        total is None, total if total is not None else math.inf,
+        hourly is None, hourly if hourly is not None else math.inf,
+    )
 
 
 def vast_gpu_label(offer: VastOffer) -> str:
@@ -81,6 +103,10 @@ def vast_plan_for_offer(row: VastModelOffer, profile: QuickDeployProfile) -> Inf
             row.offer.id, row.disk_gb, price, row.offer.machine_id, row.offer.gpu_count
         ),
         is_estimate=True,
+        one_time_cost_usd=(
+            row.costs.download_per_gb_usd * row.download_gb
+            if row.costs.download_per_gb_usd is not None else None
+        ),
     )
     evaluation = evaluate_quote_cost(
         quote, COST_SCENARIO_WORKDAY, includes_storage=True
@@ -167,9 +193,9 @@ def vast_offers_for_model(
             costs = _costs_for_disk(offer, disk)
             shape = (offer.gpu_type, offer.gpu_count, offer.gpu_memory_gib)
             existing = grouped.get(shape)
-            price = costs.total_per_hour_usd
-            old_price = existing[2].total_per_hour_usd if existing else None
-            if existing is None or (price is not None and (old_price is None or price < old_price)):
+            if existing is None or (
+                _cost_rank(costs, memory.weights_gb) < _cost_rank(existing[2], memory.weights_gb)
+            ):
                 grouped[shape] = (offer, disk, costs)
         for offer, disk, costs in grouped.values():
             # Same as the Modal and Prime path: the runtime margin the memory
@@ -195,7 +221,7 @@ def vast_offers_for_model(
             result.append(VastModelOffer(
                 id=f"vast:comparison:{recipe.id}:{offer.id}", recipe=offer_recipe,
                 offer=offer, gpu_label=vast_gpu_label(offer), disk_gb=disk,
-                costs=costs, assessment=assessment,
+                costs=costs, assessment=assessment, download_gb=memory.weights_gb,
             ))
     return tuple(
         sorted(result, key=lambda row: _vast_row_sort_key(row, _cached_startup_history()))
@@ -212,19 +238,19 @@ def _cached_startup_history() -> dict[str, Any] | None:
 
 def _vast_row_sort_key(
     row: VastModelOffer, history: dict[str, Any] | None
-) -> tuple[int, float, int, float, str]:
-    """Price first, measured startup second: keep the cheapest-host default.
+) -> tuple[bool, float, bool, float, int, float, str]:
+    """Cost first, measured startup second: keep the cheapest-host default.
 
+    Cost is the first hour including the weight download, not the hourly
+    price: transfer is billed per GB and varies more than rent between hosts.
     A machine with a recent successful observation sorts ahead of an
-    unmeasured one at the *same* price, so evidence moves the needle without
+    unmeasured one at the *same* cost, so evidence moves the needle without
     ever spending more than the cheapest tier. ``inet_down`` stays out of the
     ranking entirely: advertised bandwidth predicts startup poorly.
     """
-    price = row.costs.total_per_hour_usd
     stats = machine_startup_stats(history, row.offer.machine_id or "")
     return (
-        price is None,
-        price if price is not None else math.inf,
+        *_cost_rank(row.costs, row.download_gb),
         0 if stats is not None else 1,
         stats["healthy_seconds"] if stats is not None else 0.0,
         row.id,

@@ -415,24 +415,75 @@ class _FakeSession:
 
 
 class PrimeBackendTests(unittest.TestCase):
-    def test_the_on_pod_watchdog_deletes_through_the_same_endpoint_as_stop(self) -> None:
+    def test_the_on_pod_watchdog_deletes_what_stop_deletes(self) -> None:
+        # Deleting only the pod left its tunnel registered; run the watchdog's
+        # command in a real sh against a stub curl and compare with delete_pod.
         from llm_launchpad.core.idle_watchdog import prime_destroy_command
 
         config = PrimeConfig(api_key="secret")
-        session = _FakeSession([_FakeResponse(200, {"tunnels": []}), _FakeResponse(200, {})])
+        tunnel = {
+            "tunnel_id": "tun-9",
+            "hostname": "tun-9.example",
+            "url": "https://tun-9.example",
+            "labels": ["llm-launchpad", "pod:pod-123"],
+        }
+        session = _FakeSession([
+            _FakeResponse(200, {"tunnels": [tunnel], "total": 1}),
+            _FakeResponse(200, {}),
+            _FakeResponse(200, {}),
+        ])
         backend = PrimeBackend(config, session=session)
         with patch("llm_launchpad.core.prime_backend.PRIME_KNOWN_HOSTS_DIR", Path(tempfile.mkdtemp())):
             backend.delete_pod("pod-123")
+        expected = [
+            (call["method"], call["url"]) for call in session.calls if call["method"] == "DELETE"
+        ]
+        self.assertEqual(len(expected), 2)
 
-        delete = session.calls[-1]
-        self.assertEqual(delete["method"], "DELETE")
-        self.assertEqual(delete["headers"]["Authorization"], "Bearer secret")  # type: ignore[index]
-        # The watchdog builds its URL the way start_idle_watchdog does.
-        command = prime_destroy_command(f"{config.base_url}/api/v1", "pod-123", "/k")
-        argv = shlex.split(command.split("&&", 1)[1].rstrip("; }"))
-        self.assertEqual(argv[argv.index("-X") + 1], "DELETE")
-        self.assertIn('Authorization: Bearer $key', argv)
-        self.assertIn(delete["url"], argv)
+        root = Path(tempfile.mkdtemp())
+        (root / "key").write_text("secret\n")
+        (root / "tunnel-id").write_text("tun-9\n")
+        (root / "bin").mkdir()
+        curl = root / "bin" / "curl"
+        curl.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$CURL_LOG"\n')
+        curl.chmod(0o755)
+        log = root / "curl.log"
+        command = prime_destroy_command(
+            f"{config.base_url}/api/v1", "pod-123", str(root / "key"), str(root / "tunnel-id")
+        )
+        subprocess.run(
+            ["sh", "-c", command],
+            env={"PATH": f"{root / 'bin'}:/usr/bin:/bin", "CURL_LOG": str(log)},
+            check=True,
+        )
+        actual = []
+        for line in log.read_text().splitlines():
+            argv = line.split()
+            self.assertIn("Bearer secret", line)
+            actual.append((argv[argv.index("-X") + 1], argv[-1]))
+        self.assertEqual(actual, expected)
+
+    def test_the_on_pod_watchdog_still_deletes_the_pod_without_a_tunnel(self) -> None:
+        from llm_launchpad.core.idle_watchdog import prime_destroy_command
+
+        root = Path(tempfile.mkdtemp())
+        (root / "key").write_text("secret\n")
+        (root / "bin").mkdir()
+        curl = root / "bin" / "curl"
+        curl.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$CURL_LOG"\n')
+        curl.chmod(0o755)
+        log = root / "curl.log"
+        command = prime_destroy_command(
+            "https://api.example/api/v1", "pod-1", str(root / "key"), str(root / "missing")
+        )
+        subprocess.run(
+            ["sh", "-c", command],
+            env={"PATH": f"{root / 'bin'}:/usr/bin:/bin", "CURL_LOG": str(log)},
+            check=True,
+        )
+        lines = log.read_text().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("https://api.example/api/v1/pods/pod-1", lines[0])
 
     def test_request_formats_structured_422_detail_without_echoing_input(self) -> None:
         session = _FakeSession(
@@ -941,7 +992,7 @@ class PrimeBackendTests(unittest.TestCase):
             backend.start_tunnel({"id": "pod-1"}, tunnel)
 
         ensure_frpc.assert_called_once()
-        self.assertEqual(uploaded, ["tunnel.toml", "tunnel-bootstrap.sh"])
+        self.assertEqual(uploaded, ["tunnel.toml", "tunnel-id", "tunnel-bootstrap.sh"])
         self.assertNotIn("github.com", PrimeBackend._tunnel_start_script())
 
     def test_tunnel_runtime_status_accepts_connected_prime_status(self) -> None:

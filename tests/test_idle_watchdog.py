@@ -146,7 +146,7 @@ def test_the_idle_clock_starts_when_serving_starts(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "command",
-    [vast_destroy_command(), prime_destroy_command("https://api.example/api/v1", "pod-1", "/r/key")],
+    [vast_destroy_command(), prime_destroy_command("https://api.example/api/v1", "pod-1", "/r/key", "/r/tunnel-id")],
 )
 def test_destroy_commands_are_valid_shell(command: str) -> None:
     script = watchdog_script(WatchdogSpec("http://x/metrics", "k", 60, command, "/r"))

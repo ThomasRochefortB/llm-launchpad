@@ -855,6 +855,9 @@ class ProviderQuote:
     estimated_output_tokens_per_second: float | None = None
     configuration_id: str | None = None
     provider_options: ProviderOptions | None = None
+    # Billed once per deployment on top of the hourly rate: Vast charges the
+    # weight download per GB. ``None`` means charged at an unpublished rate.
+    one_time_cost_usd: float | None = 0.0
 
 
 @dataclass(frozen=True)
@@ -1210,6 +1213,8 @@ class VastModelOffer:
     disk_gb: int
     costs: OfferCostBreakdown
     assessment: PlacementAssessment
+    # Weights the rental downloads once; transfer is billed per GB on top of rent.
+    download_gb: float = 0.0
 
 
 @dataclass(frozen=True)

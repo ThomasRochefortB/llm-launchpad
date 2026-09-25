@@ -31,7 +31,7 @@ from llm_launchpad.protocol.enums import ComputeProvider, ServingObjective
 from llm_launchpad.protocol.models import MemoryEstimate, RuntimeTuning, ServingRequirements, VastOffer, VastOfferQuery
 from llm_launchpad.tui.screens.fast_deploy import (
     FastDeployAvailabilityLoaded, FastDeployScreen, _gpu_filter_options,
-    _model_cost_label, _model_fits_gpu_type, infra_rows_for_model,
+    _infra_detail, _model_cost_label, _model_fits_gpu_type, _tier_option, infra_rows_for_model,
 )
 from tests.test_fast_deploy_screen import _model, _profile, _StyledApp
 from tests.test_vast_backend import offer_payload
@@ -80,6 +80,36 @@ class VastModelComparisonTests(unittest.TestCase):
             {row.plan.quote.gpu_count for row in rows if row.plan.quote.provider == ComputeProvider.VAST},
             {1, 2},
         )
+
+    def test_vast_transfer_counts_when_choosing_economy_across_providers(self) -> None:
+        # $0.20/hr beats Modal's $0.80/hr on rent, but 8 GB at $0.10/GB makes
+        # its first hour $1.00: Modal is the cheaper way to serve one session.
+        snapshot = replace(
+            aggregate_compute_availability(modal_catalog=[ModalGpuSpec("L4", price_per_hour_usd=0.8)]),
+            vast_offers=(vast_offer(dph_total=0.2, inet_down_cost=0.1),),
+        )
+        rows = infra_rows_for_model(comparison_model(), snapshot)
+        vast = next(row.plan for row in rows if row.plan.quote.provider == ComputeProvider.VAST)
+        self.assertAlmostEqual(vast.quote.one_time_cost_usd or 0.0, 0.8)
+        tiers = serving_tiers([row.plan for row in rows], ServingObjective.GENERAL_PURPOSE)
+        economy = next(tier for tier in tiers if tier.key == "economy")
+        self.assertEqual(economy.plan.quote.provider, ComputeProvider.MODAL)
+        self.assertNotIn(ComputeProvider.VAST, {tier.plan.quote.provider for tier in tiers})
+        (vast_tier,) = serving_tiers([vast], ServingObjective.GENERAL_PURPOSE)
+        self.assertIn("+$0.80 download", _tier_option(vast_tier))
+
+    def test_vast_without_a_transfer_price_is_not_called_cheapest(self) -> None:
+        snapshot = replace(
+            aggregate_compute_availability(modal_catalog=[ModalGpuSpec("L4", price_per_hour_usd=0.8)]),
+            vast_offers=(vast_offer(dph_total=0.2, inet_down_cost=None),),
+        )
+        rows = infra_rows_for_model(comparison_model(), snapshot)
+        vast = next(row for row in rows if row.plan.quote.provider == ComputeProvider.VAST)
+        self.assertIsNone(vast.plan.quote.one_time_cost_usd)
+        self.assertIn("download price n/a", _infra_detail(vast))
+        tiers = serving_tiers([row.plan for row in rows], ServingObjective.GENERAL_PURPOSE)
+        economy = next(tier for tier in tiers if tier.key == "economy")
+        self.assertEqual(economy.plan.quote.provider, ComputeProvider.MODAL)
 
     def test_search_includes_single_and_multi_gpu_topologies(self) -> None:
         query = VastOfferQuery(gpu_count=None, limit=500)
@@ -179,6 +209,26 @@ class VastModelComparisonTests(unittest.TestCase):
         self.assertEqual(len(rows), 2)
         self.assertEqual({row.offer.id for row in rows}, {"1003"})
         self.assertEqual(len({row.id for row in rows}), 2)
+
+    def test_cheaper_transfer_beats_cheaper_rent_within_a_gpu_shape(self) -> None:
+        # 8 GB of weights: $0.40 + 8 x $0.002 = $0.416 beats $0.38 + 8 x $0.039 = $0.692.
+        cheap_rent = vast_offer(id=1001, machine_id=42, dph_total=0.38, inet_down_cost=0.039)
+        cheap_transfer = vast_offer(id=1002, machine_id=43, dph_total=0.40, inet_down_cost=0.002)
+        rows = vast_offers_for_model(comparison_model(), (cheap_rent, cheap_transfer))
+        self.assertEqual([row.offer.id for row in rows], ["1002"])
+        self.assertEqual(rows[0].download_gb, 8)
+
+    def test_rows_rank_by_first_hour_cost_across_gpu_shapes(self) -> None:
+        cheap_rent = vast_offer(id=1001, machine_id=42, num_gpus=2, dph_total=0.30, inet_down_cost=0.05)
+        cheap_transfer = vast_offer(id=1002, machine_id=43, dph_total=0.42, inet_down_cost=0.002)
+        rows = vast_offers_for_model(comparison_model(), (cheap_rent, cheap_transfer))
+        self.assertEqual([row.offer.id for row in rows], ["1002", "1001"])
+
+    def test_unknown_transfer_price_ranks_after_known_costs(self) -> None:
+        unknown = vast_offer(id=1001, machine_id=42, num_gpus=2, dph_total=0.10, inet_down_cost=None)
+        known = vast_offer(id=1002, machine_id=43, dph_total=0.42)
+        rows = vast_offers_for_model(comparison_model(), (unknown, known))
+        self.assertEqual([row.offer.id for row in rows], ["1002", "1001"])
 
     def test_measured_startup_evidence_reorders_equal_price_rows(self) -> None:
         import time
