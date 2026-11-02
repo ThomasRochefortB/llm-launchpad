@@ -30,6 +30,7 @@ dependencies = [
   "textual>=3.0.0",
   "requests>=2.32.0",
   "huggingface_hub>=0.26.2",
+  "keyring>=25.7.0,<26",
   # Security floors for the provider dependency chain. Keep these in wheel
   # metadata so installs cannot reuse vulnerable transitive versions.
   "aiohttp>=3.14.4,<4",

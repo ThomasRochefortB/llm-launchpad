@@ -1843,12 +1843,16 @@ def aai_auth_login(
                 err=True,
             )
             raise typer.Exit(code=1)
-    saved_path = save_artificial_analysis_api_key(key)
+    try:
+        save_artificial_analysis_api_key(key)
+    except RuntimeError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from None
     if no_verify:
-        typer.echo(f"Artificial Analysis API key stored at {saved_path} without verification.")
+        typer.echo("Artificial Analysis API key stored in the OS credential store without verification.")
         return
     tier_suffix = f" ({status.tier} tier)" if status.tier else ""
-    typer.echo(f"Artificial Analysis API key stored at {saved_path}. Authenticated{tier_suffix}.")
+    typer.echo(f"Artificial Analysis API key stored in the OS credential store. Authenticated{tier_suffix}.")
 
 
 @aai_auth_app.command("status")
@@ -1890,7 +1894,12 @@ def aai_auth_clear() -> None:
     """Remove the stored Artificial Analysis API key."""
     from ..core.artificial_analysis_auth import clear_artificial_analysis_api_key
 
-    if not clear_artificial_analysis_api_key():
+    try:
+        removed = clear_artificial_analysis_api_key()
+    except RuntimeError as exc:
+        typer.echo(f"Error: {exc}", err=True)
+        raise typer.Exit(code=1) from None
+    if not removed:
         typer.echo("No stored Artificial Analysis API key to remove.", err=True)
         raise typer.Exit(code=1)
     typer.echo("Stored Artificial Analysis API key removed.")

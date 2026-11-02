@@ -1211,6 +1211,14 @@ class CliMainCommandTests(unittest.TestCase):
 class CliMainAaiAuthCommandTests(unittest.TestCase):
     def setUp(self) -> None:
         self.runner = CliRunner()
+        self.values = {}
+        self.store = unittest.mock.MagicMock()
+        self.store.get_password.side_effect = lambda service, account: self.values.get((service, account))
+        self.store.set_password.side_effect = lambda service, account, value: self.values.update({(service, account): value})
+        self.store.delete_password.side_effect = lambda service, account: self.values.pop((service, account))
+        patcher = patch("llm_launchpad.core.artificial_analysis_auth._credential_store", return_value=self.store)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def test_login_stores_validated_key(self) -> None:
         with TemporaryDirectory() as temporary_directory:
@@ -1229,7 +1237,8 @@ class CliMainAaiAuthCommandTests(unittest.TestCase):
 
             self.assertEqual(result.exit_code, 0)
             self.assertIn("Authenticated (pro tier)", result.output)
-            self.assertTrue(key_path.exists())
+            self.assertFalse(key_path.exists())
+            self.assertIn("secret-key", self.values.values())
 
     def test_login_rejects_invalid_key_without_storing(self) -> None:
         with TemporaryDirectory() as temporary_directory:
@@ -1311,6 +1320,21 @@ class CliMainAaiAuthCommandTests(unittest.TestCase):
 
         self.assertEqual(result.exit_code, 1)
         self.assertIn("No stored Artificial Analysis API key to remove.", result.output)
+
+
+    def test_login_reports_secure_store_failure_without_leaking_key(self) -> None:
+        self.store.set_password.side_effect = RuntimeError("secret-key")
+        result = self.runner.invoke(cli_main.app, ["aai-auth", "login", "secret-key", "--no-verify"])
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("ARTIFICIAL_ANALYSIS_API_KEY", result.output)
+        self.assertNotIn("secret-key", result.output)
+
+    def test_clear_reports_locked_store_without_leaking_key(self) -> None:
+        self.store.get_password.side_effect = RuntimeError("secret-key")
+        result = self.runner.invoke(cli_main.app, ["aai-auth", "clear"])
+        self.assertEqual(result.exit_code, 1)
+        self.assertIn("credential store", result.output)
+        self.assertNotIn("secret-key", result.output)
 
 
 class CliTargetResolutionTests(unittest.TestCase):

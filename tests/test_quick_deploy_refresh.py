@@ -725,13 +725,12 @@ class QuickDeployRefreshTests(unittest.TestCase):
                 cache_path,
                 payload,
                 fetched_at=now - timedelta(hours=1),
-                api_key="key",
             )
             with patch(
                 "llm_launchpad.core.artificial_analysis.fetch_artificial_analysis_models"
             ) as fetch:
                 rankings = _load_aa_rankings(
-                    api_key="key",
+                    api_key="",
                     cache_path=cache_path,
                     now=now,
                 )

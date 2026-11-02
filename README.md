@@ -77,6 +77,16 @@ recipe can receive quotes from any compatible provider adapter. For details on
 recommendations, the Artificial Analysis ranking, caching, and llama.cpp
 runtime support, see the [deploy catalog guide](docs/catalog.md).
 
+Artificial Analysis API keys saved with `llm-launchpad aai-auth login` use the OS
+credential store (macOS Keychain, Windows Credential Locker, or Linux Secret
+Service/KWallet). On headless systems, configure a supported credential store or
+provide `ARTIFICIAL_ANALYSIS_API_KEY` through the environment. Plaintext credential
+files are no longer written. Existing JSON credentials migrate and are removed
+only after a successful, verified save to the OS store. If the store is unavailable,
+the legacy file is retained for recovery but is not used for authentication.
+Model caches contain no API-key fingerprints; authentication is checked again
+after restarting the app.
+
 ## Headless CLI examples
 
 The TUI is the recommended path for interactive use, but the same workflows are available from the command line for scripts and repeatable operations. See the [full CLI reference](docs/cli.md) for every command and option.
