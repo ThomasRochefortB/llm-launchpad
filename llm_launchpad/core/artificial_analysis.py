@@ -15,7 +15,6 @@ from datetime import datetime, timedelta, UTC
 from pathlib import Path
 from threading import Lock
 from typing import Any, Literal
-import hashlib
 import json
 import re
 
@@ -73,9 +72,10 @@ class _AARankings:
 class _AACacheEntry:
     fetched_at: datetime
     payload: dict[str, Any]
-    key_fingerprint: str | None = None
 
 _AA_AUTH_STATUS_BY_KEY: dict[str, ArtificialAnalysisAuthStatus] = {}
+# Credential associations never survive this process or enter the disk cache.
+_AA_CACHE_OWNER_BY_PATH: dict[Path, str] = {}
 
 def fetch_artificial_analysis_models(
     api_key: str,
@@ -166,19 +166,18 @@ def _load_aa_rankings_locked(
     now: datetime | None = None,
 ) -> _AARankings | None:
     current_time = now or datetime.now(UTC)
-    key_fingerprint = _api_key_fingerprint(api_key) if api_key else None
     cached = _read_aa_cache(cache_path)
     if cached is not None:
         cache_is_fresh = current_time - cached.fetched_at <= AA_CACHE_TTL
         cache_matches_key = bool(
-            key_fingerprint
-            and cached.key_fingerprint == key_fingerprint
+            api_key
+            and _AA_CACHE_OWNER_BY_PATH.get(cache_path) == api_key
         )
         if cache_is_fresh and (not api_key or cache_matches_key):
             candidates = normalize_aa_model_candidates(cached.payload)
             if candidates:
-                if key_fingerprint:
-                    _AA_AUTH_STATUS_BY_KEY[key_fingerprint] = (
+                if api_key:
+                    _AA_AUTH_STATUS_BY_KEY[api_key] = (
                         ArtificialAnalysisAuthStatus(
                             authenticated=True,
                             tier=clean_string(cached.payload.get("tier")) or None,
@@ -194,31 +193,21 @@ def _load_aa_rankings_locked(
         try:
             payload = fetch_artificial_analysis_models(api_key)
         except Exception as exc:
-            if key_fingerprint:
-                _AA_AUTH_STATUS_BY_KEY[key_fingerprint] = (
-                    ArtificialAnalysisAuthStatus(
-                        authenticated=False,
-                        error=_artificial_analysis_auth_error(exc),
-                    )
-                )
+            _AA_AUTH_STATUS_BY_KEY[api_key] = ArtificialAnalysisAuthStatus(
+                authenticated=False,
+                error=_artificial_analysis_auth_error(exc),
+            )
             payload = None
         if payload is not None:
             tier = clean_string(payload.get("tier")) or None
-            if key_fingerprint:
-                _AA_AUTH_STATUS_BY_KEY[key_fingerprint] = (
-                    ArtificialAnalysisAuthStatus(
-                        authenticated=True,
-                        tier=tier,
-                    )
-                )
+            _AA_AUTH_STATUS_BY_KEY[api_key] = ArtificialAnalysisAuthStatus(
+                authenticated=True,
+                tier=tier,
+            )
             candidates = normalize_aa_model_candidates(payload)
             if candidates:
-                _write_aa_cache(
-                    cache_path,
-                    payload,
-                    fetched_at=current_time,
-                    api_key=api_key,
-                )
+                if _write_aa_cache(cache_path, payload, fetched_at=current_time):
+                    _AA_CACHE_OWNER_BY_PATH[cache_path] = api_key
                 return _AARankings(
                     candidates=candidates,
                     freshness="live",
@@ -247,9 +236,8 @@ def get_artificial_analysis_auth_status(
     ).strip()
     if not normalized_key:
         return ArtificialAnalysisAuthStatus(authenticated=False)
-    key_fingerprint = _api_key_fingerprint(normalized_key)
     with _AA_CACHE_LOCK:
-        cached_status = _AA_AUTH_STATUS_BY_KEY.get(key_fingerprint)
+        cached_status = _AA_AUTH_STATUS_BY_KEY.get(normalized_key)
     if cached_status is not None:
         return cached_status
 
@@ -259,7 +247,7 @@ def get_artificial_analysis_auth_status(
     )
     with _AA_CACHE_LOCK:
         return _AA_AUTH_STATUS_BY_KEY.get(
-            key_fingerprint,
+            normalized_key,
             ArtificialAnalysisAuthStatus(
                 authenticated=False,
                 error="Artificial Analysis auth check failed",
@@ -328,7 +316,6 @@ def _read_aa_cache(path: Path) -> _AACacheEntry | None:
         return _AACacheEntry(
             fetched_at=fetched_at.astimezone(UTC),
             payload=payload,
-            key_fingerprint=clean_string(envelope.get("key_fingerprint")) or None,
         )
     except Exception:
         return None
@@ -338,8 +325,8 @@ def _write_aa_cache(
     payload: dict[str, Any],
     *,
     fetched_at: datetime,
-    api_key: str | None = None,
-) -> None:
+) -> bool:
+    """Persist model data only; credential associations remain in memory."""
     envelope = {
         "schema_version": 1,
         "fetched_at": fetched_at.astimezone(UTC)
@@ -348,8 +335,6 @@ def _write_aa_cache(
         .replace("+00:00", "Z"),
         "payload": payload,
     }
-    if api_key:
-        envelope["key_fingerprint"] = _api_key_fingerprint(api_key)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path = path.with_suffix(f"{path.suffix}.tmp")
@@ -359,10 +344,8 @@ def _write_aa_cache(
         )
         temporary_path.replace(path)
     except Exception:
-        return
-
-def _api_key_fingerprint(api_key: str) -> str:
-    return hashlib.sha256(api_key.strip().encode("utf-8")).hexdigest()
+        return False
+    return True
 
 def _artificial_analysis_auth_error(exc: Exception) -> str:
     if isinstance(exc, _AAHttpError):
@@ -378,6 +361,7 @@ def _reset_artificial_analysis_auth_status_cache() -> None:
 
     with _AA_CACHE_LOCK:
         _AA_AUTH_STATUS_BY_KEY.clear()
+        _AA_CACHE_OWNER_BY_PATH.clear()
 
 def _is_explicitly_closed_weight(row: dict[str, Any]) -> bool:
     licensing = row.get("licensing")

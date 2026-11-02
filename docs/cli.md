@@ -104,6 +104,14 @@ Run `uv run python scripts/generate_cli_reference.py` after changing a command.
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯
 ```
 
+Saved keys use a supported OS credential store; plaintext and null keyring
+backends are rejected. If the store is unavailable or locked, login fails with a
+clear message. `ARTIFICIAL_ANALYSIS_API_KEY` remains available for headless use.
+Legacy JSON credentials migrate when the secure store is available and are deleted
+only after the saved key is read back successfully. Failed migration retains the
+legacy file without using its key. Authentication is revalidated after an app
+restart; disk caches do not authenticate credentials.
+
 ## `llm-launchpad aai-auth status`
 
 ```text

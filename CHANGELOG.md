@@ -8,6 +8,7 @@ and this project follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Security
+- Store Artificial Analysis API keys in supported OS credential stores, migrate legacy JSON credentials after verifying the secure save, and reject plaintext/null keyring backends. Remove API-key fingerprints from disk caches and revalidate credentials after app restart (CodeQL alerts #1–#3).
 - Update vulnerable provider dependencies and enforce patched minimum versions in package metadata.
 - Temporarily disable AIPerf benchmarking and empty the optional `benchmark` extra because the current AIPerf release pins a vulnerable Pillow version. Existing benchmark commands return an explanation without contacting providers or executing AIPerf.
 
