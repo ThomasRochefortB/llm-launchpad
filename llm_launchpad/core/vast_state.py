@@ -1,6 +1,6 @@
 """Atomic rental records and process locks for Vast recovery."""
 
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import asdict
 import hashlib
@@ -25,7 +25,7 @@ class VastState:
         return self.root / hashlib.sha256(name.encode()).hexdigest()[:24]
 
     @contextmanager
-    def locked(self, name: str) -> Iterator[None]:
+    def locked(self, name: str) -> Generator[None]:
         import fcntl
 
         directory = self.directory(name)

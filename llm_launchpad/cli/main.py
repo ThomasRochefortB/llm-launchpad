@@ -1456,7 +1456,7 @@ def _redeploy_modal_llamacpp(
             timeout,
             tail_logs,
             app_name=resolved_app_name,
-            **({"vision": config.vision} if config.vision else {}),
+            vision=config.vision,
         ):
             if (
                 isinstance(event, OperationCompleteEvent)
