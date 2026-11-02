@@ -7,6 +7,12 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.2] - 2026-11-02
+
+### Fixed
+- Drain final background-deployment events before marking their monitors finished, including cancellation completed between polling reads.
+
+
 ### Changed
 - Apply Dependabot updates for Modal 1.6.3, Typer 0.27.3, Ruff 0.17.3, ty 0.0.95, and github-script v9.0.0 (pinned to its upstream commit). Keep Prime on 0.4.x because Prime 0.19.0 requires Typer below 0.26, conflicting with the selected Typer update.
 
