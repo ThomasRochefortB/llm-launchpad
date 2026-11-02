@@ -7,6 +7,9 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- Apply Dependabot updates for Modal 1.6.3, Typer 0.27.3, Ruff 0.17.3, ty 0.0.95, and github-script v9.0.0 (pinned to its upstream commit). Keep Prime on 0.4.x because Prime 0.19.0 requires Typer below 0.26, conflicting with the selected Typer update.
+
 ### Security
 - Store Artificial Analysis API keys in supported OS credential stores, migrate legacy JSON credentials after verifying the secure save, and reject plaintext/null keyring backends. Remove API-key fingerprints from disk caches and revalidate credentials after app restart (CodeQL alerts #1–#3).
 - Update vulnerable provider dependencies and enforce patched minimum versions in package metadata.
