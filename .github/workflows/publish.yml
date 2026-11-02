@@ -6,8 +6,30 @@ on:
       - "v*"
 
 jobs:
+  validate-release:
+    name: Validate release tag
+    if: github.repository == 'ThomasRochefortB/llm-launchpad'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out release history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version-file: pyproject.toml
+      - name: Verify version and main-branch ancestry
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python scripts/check_release.py
+
   package-checks:
     name: Package checks
+    needs: validate-release
     uses: ./.github/workflows/package-checks.yml
     permissions:
       contents: read
@@ -25,24 +47,11 @@ jobs:
       url: https://pypi.org/project/llm-launchpad/
 
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v7
-
-      - name: Set up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version-file: "pyproject.toml"
-
-      - name: Set up uv
-        uses: astral-sh/setup-uv@v7
-        with:
-          version: "0.7.4"
-
       - name: Download build artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: python-package-distributions
           path: dist/
 
       - name: Publish distributions
-        run: uv publish
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086 # release/v1

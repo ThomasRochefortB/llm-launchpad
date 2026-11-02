@@ -952,7 +952,6 @@ class MonitorLaunchBackendTests(unittest.IsolatedAsyncioTestCase):
         launchers = (
             ("logs", lambda app: app.begin_logs(endpoint), BackendType.LLAMACPP),
             ("status", lambda app: app.begin_status(endpoint), BackendType.LLAMACPP),
-            ("benchmark", lambda app: app.begin_benchmark(endpoint), BackendType.LLAMACPP),
             ("stop", lambda app: app.begin_stop(endpoint), BackendType.LLAMACPP),
             (
                 "predownload",

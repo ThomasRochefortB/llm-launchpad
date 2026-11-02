@@ -1,0 +1,33 @@
+name: Dependency audit
+
+on:
+  workflow_call:
+  schedule:
+    - cron: "31 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: Audit locked dependencies
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version-file: pyproject.toml
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          version: "0.10.0"
+      - name: Export all locked dependency groups
+        run: uv export --locked --all-groups --all-extras --no-emit-project --no-hashes --output-file requirements-audit.txt
+      - name: Audit without installing project dependencies
+        run: uvx --from pip-audit==2.10.1 pip-audit --requirement requirements-audit.txt --no-deps --disable-pip --strict

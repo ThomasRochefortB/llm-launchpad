@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from llm_launchpad.core.benchmark import BENCHMARK_UNAVAILABLE_REASON
 from llm_launchpad.core.orchestrator import Orchestrator
 from llm_launchpad.protocol.enums import BackendType, OperationType
 from llm_launchpad.protocol.events import ErrorEvent, LogEvent, OperationCompleteEvent
@@ -44,7 +45,7 @@ class BenchmarkOrchestratorTests(unittest.TestCase):
                 patch("llm_launchpad.core.orchestrator.aiperf_cli_path", return_value="aiperf"),
                 patch("llm_launchpad.core.orchestrator.ModalBackend.run_streaming", side_effect=_run_streaming),
             ):
-                events = list(Orchestrator().benchmark(config))
+                events = list(Orchestrator()._benchmark_aiperf(config))
 
             completions = [event for event in events if isinstance(event, OperationCompleteEvent)]
             self.assertEqual(completions[-1].operation, OperationType.BENCHMARK)
@@ -84,7 +85,7 @@ class BenchmarkOrchestratorTests(unittest.TestCase):
                 patch("llm_launchpad.core.orchestrator.aiperf_cli_path", return_value="aiperf"),
                 patch("llm_launchpad.core.orchestrator.ModalBackend.run_streaming", side_effect=_run_streaming),
             ):
-                events = list(Orchestrator().benchmark(config))
+                events = list(Orchestrator()._benchmark_aiperf(config))
 
         completion = [event for event in events if isinstance(event, OperationCompleteEvent)][-1]
         self.assertFalse(completion.success)
@@ -100,12 +101,12 @@ class BenchmarkOrchestratorTests(unittest.TestCase):
         )
 
         with patch("llm_launchpad.core.orchestrator.aiperf_cli_path", return_value=None):
-            events = list(Orchestrator().benchmark(config))
+            events = list(Orchestrator()._benchmark_aiperf(config))
 
         self.assertTrue(any(isinstance(event, ErrorEvent) for event in events))
         completion = [event for event in events if isinstance(event, OperationCompleteEvent)][-1]
         self.assertFalse(completion.success)
-        self.assertIn("llm-launchpad[benchmark]", completion.detail)
+        self.assertIn(BENCHMARK_UNAVAILABLE_REASON, completion.detail)
 
     def test_benchmark_marks_export_parse_failure_as_failed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -125,11 +126,24 @@ class BenchmarkOrchestratorTests(unittest.TestCase):
                     return_value=iter([OperationCompleteEvent(success=True, exit_code=0)]),
                 ),
             ):
-                events = list(Orchestrator().benchmark(config))
+                events = list(Orchestrator()._benchmark_aiperf(config))
 
         completion = [event for event in events if isinstance(event, OperationCompleteEvent)][-1]
         self.assertFalse(completion.success)
         self.assertIn("One or more benchmark runs failed", completion.detail)
+
+    def test_benchmark_is_disabled_even_when_aiperf_is_installed(self) -> None:
+        config = BenchmarkConfig(backend=BackendType.VLLM, server_url="https://example.invalid")
+        with (
+            patch("llm_launchpad.core.orchestrator.aiperf_cli_path", return_value="aiperf") as lookup,
+            patch("llm_launchpad.core.orchestrator.ModalBackend.run_streaming") as run,
+        ):
+            events = list(Orchestrator().benchmark(config))
+        lookup.assert_not_called()
+        run.assert_not_called()
+        completion = next(event for event in events if isinstance(event, OperationCompleteEvent))
+        self.assertFalse(completion.success)
+        self.assertEqual(completion.detail, BENCHMARK_UNAVAILABLE_REASON)
 
 
 if __name__ == "__main__":

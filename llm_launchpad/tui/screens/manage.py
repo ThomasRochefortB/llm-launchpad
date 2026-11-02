@@ -13,7 +13,7 @@ from textual.widgets.option_list import Option
 
 import time
 
-from ...core.benchmark import parse_concurrency_values
+from ...core.benchmark import BENCHMARK_UNAVAILABLE_REASON, parse_concurrency_values
 from ...core.endpoint_runtime import attach_endpoint_runtime
 from ...core.vision_probe import image_test_command
 from ...protocol.enums import ComputeProvider, VisionVerification
@@ -793,9 +793,7 @@ class ManageScreen(CopyEnabledScreen):
             self.app.begin_logs(row, follow=True)
 
     def action_benchmark_selected(self) -> None:
-        row = self._row_for_action("benchmark")
-        if row is not None:
-            self.app.push_screen(BenchmarkOptionsScreen(row))
+        self.notify(BENCHMARK_UNAVAILABLE_REASON, severity="warning", timeout=8)
 
     def action_stop_selected(self) -> None:
         row = self._row_for_action("stop")
@@ -1016,7 +1014,7 @@ class EndpointActionsScreen(CopyEnabledScreen):
         elif action == "logs":
             self.app.begin_logs(endpoint, follow=True)
         elif action == "benchmark":
-            self.app.push_screen(BenchmarkOptionsScreen(endpoint))
+            self.notify(BENCHMARK_UNAVAILABLE_REASON, severity="warning", timeout=8)
         elif action == "stop":
             self.app.push_screen(StopConfirmScreen(endpoint))
 

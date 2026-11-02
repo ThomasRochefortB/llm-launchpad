@@ -46,6 +46,7 @@ from ..protocol.models import BenchmarkConcurrencyResult, BenchmarkConfig
 from ..protocol.models import PlacementAssessment, ServingRequirements, StoredModelInfo, StorageSnapshot
 
 from .benchmark import (
+    BENCHMARK_UNAVAILABLE_REASON,
     aiperf_metrics_have_successful_requests,
     aiperf_cli_path,
     build_aiperf_command,
@@ -1547,15 +1548,16 @@ class Orchestrator:
     # ------------------------------------------------------------------
 
     def benchmark(self, config: BenchmarkConfig) -> EventStream:
+        """Reject benchmarking until a compatible patched AIPerf is available."""
+        yield from fail_operation(
+            OperationType.BENCHMARK, BENCHMARK_UNAVAILABLE_REASON, recoverable=False
+        )
+
+    def _benchmark_aiperf(self, config: BenchmarkConfig) -> EventStream:
         """Run an AIPerf benchmark sweep against a deployed endpoint."""
         executable = aiperf_cli_path()
         if not executable:
-            message = (
-                "AIPerf CLI not found. Install benchmark support with: "
-                'uv tool install "llm-launchpad[benchmark]". '
-                "For a local checkout, run: uv sync --extra benchmark "
-                "or launch with: uv run --extra benchmark llm-launchpad"
-            )
+            message = "AIPerf CLI not found. " + BENCHMARK_UNAVAILABLE_REASON
             yield from fail_operation(OperationType.BENCHMARK, message, recoverable=False)
             return
 

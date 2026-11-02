@@ -23,11 +23,7 @@ except Exception:
     Console = None
 
 from ..core.backend import ModalBackend
-from ..core.benchmark import (
-    benchmark_config_from_endpoint,
-    merge_cached_benchmark_connections,
-    parse_concurrency_values,
-)
+from ..core.benchmark import BENCHMARK_UNAVAILABLE_REASON
 from ..core.config import ConfigStore
 from ..core.connection_store import (
     merge_connections,
@@ -1288,58 +1284,9 @@ def benchmark(
         ),
     ] = None,
 ) -> None:
-    """Benchmark a deployed OpenAI-compatible backend with AIPerf."""
-    compute_provider = ComputeProvider(provider)
-    orch, username = _preflight(compute_provider)
-    _print_banner()
-    bt = BackendType(backend)
-    target = _resolve_manage_target(bt, compute_provider, app_name, instance_name)
-    target_app_name = target.name
-    rows = _load_visible_launchpad_rows(compute_provider) or []
-    merge_cached_benchmark_connections(rows)
-    target_row = next((row for row in rows if (row.name or "").strip() == target_app_name), None)
-    if server_url is None and target_row is None and compute_provider == ComputeProvider.MODAL:
-        server_url = ModalBackend.default_server_url(
-            username,
-            app_name=target_app_name,
-            function_slug=function_slug or os.environ.get("MODAL_FUNCTION_SLUG"),
-        )
-
-    try:
-        concurrency_values = parse_concurrency_values(concurrency)
-    except ValueError as exc:
-        typer.echo(f"Error: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
-
-    config = benchmark_config_from_endpoint(
-        target_row,
-        backend=bt,
-        provider=compute_provider,
-        username=username,
-        app_name=target_app_name,
-        instance_name=instance_name,
-        server_url=server_url,
-        model_name=model,
-        concurrency=concurrency_values,
-        request_count=request_count,
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
-        tokenizer=tokenizer,
-        request_timeout_seconds=request_timeout_seconds,
-        output_dir=output_dir,
-        aiperf_args=list(aiperf_arg or []),
-        api_key=(target_row.endpoint_api_key if target_row else target.endpoint_api_key),
-    )
-    if not (config.server_url or "").strip():
-        typer.echo("Error: could not resolve benchmark server URL.", err=True)
-        raise typer.Exit(code=1)
-    typer.echo(
-        f"Benchmark target: backend={bt.value} app={target_app_name} "
-        f"url={config.server_url} model={config.model_name}"
-    )
-    for event in orch.benchmark(config):
-        _print_event(event)
-        _raise_on_failed_completion(event)
+    """Benchmarking is temporarily unavailable pending dependency security updates."""
+    typer.echo(BENCHMARK_UNAVAILABLE_REASON, err=True)
+    raise typer.Exit(code=1)
 
 
 @app.command()

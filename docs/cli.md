@@ -119,6 +119,9 @@ Run `uv run python scripts/generate_cli_reference.py` after changing a command.
 
 ## `llm-launchpad benchmark`
 
+Benchmarking is temporarily disabled pending dependency security updates. The command exits
+before contacting a provider or running AIPerf, even if AIPerf is already installed.
+
 ```text
 
  Usage: llm-launchpad benchmark [OPTIONS]
