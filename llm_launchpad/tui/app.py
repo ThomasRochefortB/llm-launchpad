@@ -1013,6 +1013,15 @@ class TuiApp(App):
         while True:
             if self._quitting:
                 return
+            # Read status first: a worker can append its terminal event and
+            # finish between two reads. Once terminal is observed, fetching
+            # events afterwards guarantees its final messages are drained.
+            try:
+                record = store.get_job(job.persistent_id)
+            except Exception:
+                break
+            if record is None:
+                break
             try:
                 events = store.get_events(job.persistent_id, after_seq=job.last_seen_seq)
             except Exception:
@@ -1052,12 +1061,6 @@ class TuiApp(App):
                         )
                     except Exception:
                         pass
-            try:
-                record = store.get_job(job.persistent_id)
-            except Exception:
-                break
-            if record is None:
-                break
             job.config = record.config
             job.outcome = record.outcome or job.outcome
             if record.cancel_requested:

@@ -31,6 +31,35 @@ def config(name: str, provider: ComputeProvider = ComputeProvider.MODAL) -> Depl
 
 
 class DeploymentTrackingTests(unittest.TestCase):
+    def test_tail_drains_terminal_event_when_worker_finishes_between_reads(self) -> None:
+        from llm_launchpad.core.job_store import JobStatus
+
+        app = TuiApp()
+        store = app._get_job_store()
+        record = store.create_job(config("terminal-race"))
+        monitor = MonitorScreen()
+        job = DeploymentJob("tail-race", record.config, monitor, persistent_id=record.id)
+        completion = OperationCompleteEvent(operation=OperationType.DEPLOY, success=False)
+        get_events = store.get_events
+        finished = False
+
+        def finish_after_read(job_id, *, after_seq):
+            nonlocal finished
+            events = get_events(job_id, after_seq=after_seq)
+            if not finished:
+                store.append_event(job_id, completion)
+                store.finish_job(job_id, JobStatus.CANCELLED, "Cancelled")
+                finished = True
+            return events
+
+        with patch.object(store, "get_events", side_effect=finish_after_read), patch.object(
+            app, "_get_job_store", return_value=store
+        ), patch("llm_launchpad.tui.workers._dispatch_event") as dispatch, patch("time.sleep"):
+            app._tail_persistent_job(job)
+
+        dispatch.assert_called_once_with(monitor, completion)
+        self.assertTrue(job.finished.is_set())
+
     def test_closing_one_modal_stream_terminates_only_its_client(self) -> None:
         process = Mock(stdout=io.StringIO("Starting deployment\n"))
         process.poll.return_value = None
@@ -301,6 +330,7 @@ class DeploymentJobInteractionTests(unittest.IsolatedAsyncioTestCase):
                     app.reopen_deployment(second.id)
                     await pilot.pause()
                     self.assertIs(app.screen, second.monitor)
+                    await wait_until(lambda: second.monitor._done)
                     self.assertTrue(second.monitor._done)
                 finally:
                     for release in releases.values():
