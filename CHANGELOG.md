@@ -7,6 +7,10 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+- Update vulnerable provider dependencies and enforce patched minimum versions in package metadata.
+- Temporarily disable AIPerf benchmarking and empty the optional `benchmark` extra because the current AIPerf release pins a vulnerable Pillow version. Existing benchmark commands return an explanation without contacting providers or executing AIPerf.
+
 ### Added
 - A weekly live canary (`.github/workflows/live-canary.yml`, `scripts/canary_live.py`) deploys the smallest llama.cpp model on each provider through the real CLI, requires a chat answer during warmup, and always stops what it started. Regressions in generated startup scripts pass every offline test -- 623ba8b broke every Prime and Vast llama.cpp deploy for days -- and only a real endpoint catches them. Spend is capped by the model and GPU, a wall-clock limit, and a 30-minute idle shutdown on the rental as backstop; the report is redacted before upload; a failed scheduled run opens (or comments on) a `canary` issue. Providers without repository secrets are skipped.
 - Operations (Ctrl+O) lists status checks, benchmarks, logs, stops and storage work alongside deployments, and reopens their monitors with the result intact. Leaving one of those screens used to discard its result. The session keeps the latest 20.

@@ -1,4 +1,8 @@
 <h1 align="center">LLM-Launchpad</h1>
+
+Benchmarking is temporarily unavailable while AIPerf's dependencies receive security updates.
+The `benchmark` extra currently installs no additional packages.
+
 <p align="center">Spin up personal LLM endpoints on Modal, Prime Intellect, or Vast.ai</p>
 <p align="center">
   <img src="docs/assets/llm_launchpad_header.png" alt="LLM Launchpad header" width="900" />

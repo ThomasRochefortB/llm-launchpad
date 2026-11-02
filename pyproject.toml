@@ -30,12 +30,23 @@ dependencies = [
   "textual>=3.0.0",
   "requests>=2.32.0",
   "huggingface_hub>=0.26.2",
+  # Security floors for the provider dependency chain. Keep these in wheel
+  # metadata so installs cannot reuse vulnerable transitive versions.
+  "aiohttp>=3.14.4,<4",
+  "certifi>=2026.10.19",
+  "datasets>=5.0.1,<6",
+  "filelock>=4.2.1,<5",
+  "fsspec>=2026.6.0",
+  "mcp>=1.30.0,<2",
+  "opentelemetry-api>=1.45.1,<2",
+  "PyJWT>=2.15.1,<3",
+  "urllib3>=2.8.0,<3",
 ]
 
 [project.optional-dependencies]
-benchmark = [
-  "aiperf>=0.7,<0.14",
-]
+# Keep the extra name compatible, but do not install AIPerf until its Pillow
+# constraint allows a patched release. CLI/TUI benchmarking is disabled too.
+benchmark = []
 
 [project.scripts]
 llm-launchpad = "llm_launchpad.cli.main:main"

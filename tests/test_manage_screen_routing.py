@@ -149,11 +149,8 @@ class ManageScreenRoutingTests(unittest.IsolatedAsyncioTestCase):
             assert isinstance(screen, ManageScreen)
             screen.action_benchmark_selected()
             await pilot.pause()
-            self.assertIsInstance(app.screen, BenchmarkOptionsScreen)
-            assert isinstance(app.screen, BenchmarkOptionsScreen)
-            self.assertIs(app.screen.endpoint, second)
-            app.pop_screen()
-            await pilot.pause()
+            self.assertIs(app.screen, screen)
+            self.assertEqual(app.benchmark_calls, [])
 
             screen = app.screen
             assert isinstance(screen, ManageScreen)

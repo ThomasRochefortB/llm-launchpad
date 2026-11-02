@@ -31,7 +31,7 @@ from textual.screen import Screen
 from textual.widgets import Input, TextArea
 
 from ..core.backend import ModalBackend
-from ..core.benchmark import benchmark_config_from_endpoint, parse_concurrency_values
+from ..core.benchmark import BENCHMARK_UNAVAILABLE_REASON
 from ..core.coerce import positive_int
 from ..core.config import ConfigStore, SETTINGS_DIR
 from ..core.deploy_events import EndpointUrlResolver
@@ -81,7 +81,6 @@ from ..protocol.events import (
     OperationCompleteEvent,
     ResourceAllocatedEvent,
 )
-from ..protocol.models import BenchmarkConfig
 from ..protocol.models import EndpointInfo
 from ..protocol.models import FleetDiscovery
 from ..protocol.models import ProviderListing
@@ -1719,42 +1718,7 @@ class TuiApp(App):
         tokenizer: str = "gpt2",
         output_dir: str | None = None,
     ) -> None:
-        if row.backend is None:
-            self.notify("Choose a Launchpad-managed app to benchmark.", severity="error", timeout=6)
-            return
-        try:
-            concurrency_values = parse_concurrency_values(concurrency)
-        except ValueError as exc:
-            self.notify(str(exc), title="Invalid concurrency", severity="error", timeout=6)
-            return
-        config = benchmark_config_from_endpoint(
-            row,
-            backend=row.backend,
-            username=self._username,
-            app_name=row.name,
-            instance_name=row.instance_name,
-            concurrency=concurrency_values,
-            request_count=request_count,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-            tokenizer=tokenizer,
-            output_dir=output_dir,
-        )
-        monitor = MonitorScreen(title="Benchmark", deploy_backend=row.backend)
-        self.push_screen(self._track_operation(monitor, row.name or row.app_id or ""))
-        self.run_worker(
-            lambda: self._run_benchmark(config, monitor),
-            name="benchmark-worker",
-            thread=True,
-        )
-
-    def _run_benchmark(
-        self,
-        config: BenchmarkConfig,
-        monitor: MonitorScreen,
-    ):  # type: ignore[return]
-        for event in self._orchestrator.benchmark(config):
-            _dispatch_event(monitor, event)
+        self.notify(BENCHMARK_UNAVAILABLE_REASON, severity="warning", timeout=8)
 
     # ------------------------------------------------------------------
     # Manage: logs

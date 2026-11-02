@@ -33,6 +33,9 @@ DEFAULT_RANDOM_SEED = 42
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 300
 BENCHMARKS_DIR = SETTINGS_DIR / "benchmarks"
 SUMMARY_FILENAME = "benchmark_summary.json"
+BENCHMARK_UNAVAILABLE_REASON = (
+    "Benchmarking is temporarily unavailable while its dependencies receive security updates."
+)
 
 # AIPerf runs one artifact directory per concurrency; each directory holds a
 # warmup phase followed by the timed phase. Only the timed phase scores, so
