@@ -108,6 +108,7 @@ jobs:
         with:
           name: python-package-distributions
           path: dist/
+          retention-days: 1
 
   smoke-test:
     name: Distribution smoke tests
