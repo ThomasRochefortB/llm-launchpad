@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shlex
 import unittest
+from unittest.mock import patch
 
 from llm_launchpad.core import quick_deploy
 from llm_launchpad.core.quick_deploy import (
@@ -48,6 +49,16 @@ class QuickDeployConfigTests(unittest.TestCase):
         self.assertFalse(info.ready)
         self.assertIsNone(info.error)
         self.assertEqual(info.source_label, "Loading live catalog")
+
+    def test_disk_read_cannot_overwrite_a_newly_activated_catalog(self) -> None:
+        def read_old_snapshot() -> None:
+            # The refresh finishes while the picker is still reading the file.
+            activate_static_like_catalog()
+
+        with patch("llm_launchpad.core.quick_deploy_refresh.load_cached_quick_deploy_catalog",
+                   side_effect=read_old_snapshot):
+            self.assertTrue(get_quick_deploy_catalog_info().ready)
+            self.assertTrue(list_quick_deploy_profiles())
 
     def test_record_failure_marks_catalog_unavailable_when_empty(self) -> None:
         recorded = record_quick_deploy_catalog_failure("network unreachable")

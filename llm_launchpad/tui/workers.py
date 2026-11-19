@@ -238,14 +238,6 @@ class EndpointsFailed(Message):
         self.error = error
 
 
-class ModalUsernameLoaded(Message):
-    """The local Modal profile name was resolved after first paint."""
-
-    def __init__(self, username: str) -> None:
-        super().__init__()
-        self.username = username
-
-
 class ResourceAllocated(Message):
     """A billable resource exists before its endpoint is reachable."""
 

@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from ..core.job_store import JobRecord, JobStore
 
 import base64
+from functools import partial
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 import json
@@ -56,8 +57,10 @@ from ..core.prime_auth import get_prime_auth_status
 from ..core.prime_backend import PrimeBackend
 from ..core.provider_readiness import (
     ProviderReadiness,
-    check_all_provider_readiness,
-    invalidate_provider_readiness,
+    ProviderReadinessStage,
+    check_modal_readiness,
+    check_prime_readiness,
+    check_vast_readiness,
 )
 from ..core.vast_auth import resolve_vast_credentials
 from ..core.vast_deployment import VastDeploymentBackend
@@ -113,7 +116,6 @@ from .workers import (
     LlamaCppModelsLoaded,
     LlamaCppQuantsFailed,
     LlamaCppQuantsLoaded,
-    ModalUsernameLoaded,
     StorageFailed,
     StorageLoaded,
     VllmModelsFailed,
@@ -245,6 +247,8 @@ class TuiApp(App):
         # selection to the terminal. Saved preferences cannot capture the mouse.
         self.mouse_enabled = False
         self._ctrl_c_last_requested_at = 0.0
+        self._provider_readiness: dict[ComputeProvider, ProviderReadiness] = {}
+        self._readiness_pending: set[ComputeProvider] = set()
         self._orchestrator = Orchestrator()
         self._username: str = ""
         self._version: str = ""
@@ -502,7 +506,6 @@ class TuiApp(App):
         network; the setup screen and main menu both reflect checking,
         authenticated, and failed states.
         """
-        self._provider_readiness: tuple[ProviderReadiness, ...] = ()
         self._reconcile_durable_jobs()
         if not self._provider_is_configured():
             self.push_screen(SetupRequiredScreen())
@@ -638,88 +641,78 @@ class TuiApp(App):
             )
 
     def _provider_is_configured(self) -> bool:
-        """Whether any provider has local credentials worth verifying.
-
-        An installed Modal CLI alone is not configuration; Modal counts only
-        when its auth check passes locally. Prime and Vast count when a key is
-        present, even before live verification confirms it.
-        """
-        try:
-            modal_available = False
-            if ModalBackend.is_cli_available():
-                try:
-                    from ..core.modal_auth import get_modal_auth_status
-
-                    modal_available = bool(get_modal_auth_status().authenticated)
-                except Exception:
-                    modal_available = False
-            try:
-                prime_available = bool(get_prime_auth_status().authenticated)
-            except Exception:
-                prime_available = False
-            try:
-                vast_available = bool(resolve_vast_credentials().api_key)
-            except ValueError:
-                vast_available = False
-            except Exception:
-                vast_available = False
-            return bool(modal_available or prime_available or vast_available)
-        except Exception:
-            return False
+        """Modal needs verified auth. A local Prime or Vast key opens Home."""
+        return any(
+            row.verified or (
+                row.provider != ComputeProvider.MODAL and row.has_credentials
+            )
+            for row in self._provider_readiness.values()
+        )
 
     def provider_readiness_snapshot(self) -> tuple[ProviderReadiness, ...]:
-        """Return the latest async verification, or local-only states."""
-        if getattr(self, "_provider_readiness", ()):
-            return self._provider_readiness
-        try:
-            return check_all_provider_readiness(verify=False)
-        except Exception:
-            return ()
+        """Read only the results already delivered to the UI thread."""
+        return tuple(
+            self._provider_readiness[p] for p in ComputeProvider if p in self._provider_readiness
+        )
 
     def refresh_provider_readiness(self) -> None:
-        """Verify provider credentials without blocking first paint."""
-        try:
+        """Share one background check per provider across Setup and Home."""
+        for provider in ComputeProvider:
+            if provider in self._readiness_pending:
+                continue
+            self._provider_readiness.pop(provider, None)
+            self._readiness_pending.add(provider)
             self.run_worker(
-                self._run_provider_readiness_check,
-                name="provider-readiness-worker",
+                partial(self._run_provider_readiness_check, provider),
+                name=f"{provider.value}-readiness-worker",
                 thread=True,
             )
-        except Exception:
-            log_exception("Could not start provider readiness check")
 
-    def _run_provider_readiness_check(self) -> None:
+    def _run_provider_readiness_check(self, provider: ComputeProvider) -> None:
+        check = {
+            ComputeProvider.MODAL: check_modal_readiness,
+            ComputeProvider.PRIME: check_prime_readiness,
+            ComputeProvider.VAST: check_vast_readiness,
+        }[provider]
         try:
-            readiness = check_all_provider_readiness(verify=True, refresh=True)
-        except Exception:
-            log_exception("Provider readiness verification failed")
-            return
-        self.post_message(ProviderReadinessUpdated(readiness))
+            if provider != ComputeProvider.MODAL:
+                local = check(verify=False, refresh=True)
+                self.post_message(ProviderReadinessUpdated((local,)))
+                if not local.has_credentials:
+                    return
+            result = check(verify=True, refresh=True)
+        except Exception as exc:
+            log_exception(f"{provider.display_name} readiness check failed")
+            result = ProviderReadiness(provider, ProviderReadinessStage.UNREACHABLE, str(exc))
+        self.post_message(ProviderReadinessUpdated((result,)))
 
     def on_provider_readiness_updated(self, message: ProviderReadinessUpdated) -> None:
-        self._provider_readiness = message.readiness
-        # Someone authenticated in another terminal while Setup was open: the
-        # screen went on saying "None currently has credentials" beside a list
-        # reading "Authenticated" until they thought to press r.
-        if (
-            isinstance(self.screen, SetupRequiredScreen)
-            and any(row.verified for row in message.readiness)
-            and self._provider_is_configured()
-        ):
-            self.pop_screen()
-            self._enter_main_menu()
-            self.notify("Provider credentials found.", timeout=3)
+        # A provider may finish after quit has begun dismantling the screen stack.
+        if self._quitting or not self.screen_stack:
             return
+        for row in message.readiness:
+            self._provider_readiness[row.provider] = row
+            if row.stage != ProviderReadinessStage.CREDENTIALS_PRESENT:
+                self._readiness_pending.discard(row.provider)
+            if row.provider == ComputeProvider.MODAL and row.profile:
+                self._username = row.profile
+                for screen in self.screen_stack:
+                    if isinstance(screen, MainMenuScreen):
+                        screen.set_modal_username(row.profile)
+        if self.continue_from_setup():
+            return
+        readiness = self.provider_readiness_snapshot()
         for screen in list(self.screen_stack):
             updater = getattr(screen, "on_provider_readiness", None)
             if callable(updater):
                 try:
-                    updater(message.readiness)
+                    updater(readiness)
                 except Exception:
                     log_exception("Provider readiness update failed")
-        failed = [row for row in message.readiness if row.stage.value in {"auth_failed"}]
+        failed = [row for row in readiness if row.stage == ProviderReadinessStage.AUTH_FAILED]
         if failed and isinstance(self.screen, SetupRequiredScreen):
             return
-        if failed and not any(row.verified for row in message.readiness):
+        if failed and not self._readiness_pending and not any(row.verified for row in readiness):
             names = ", ".join(row.provider.display_name for row in failed)
             self.notify(
                 f"Provider authentication failed for {names}. Check Setup (r to re-check).",
@@ -728,45 +721,18 @@ class TuiApp(App):
             )
 
     def _enter_main_menu(self) -> None:
-        self.push_screen(MainMenuScreen(username="", version=self._version))
-        if ModalBackend.is_cli_available():
-            self.run_worker(
-                self._run_load_modal_username,
-                name="modal-username-worker",
-                thread=True,
-            )
+        self.push_screen(MainMenuScreen(username=self._username, version=self._version))
 
-    def recheck_provider_setup(self) -> bool:
-        """Re-run provider detection; enter the main menu when configured.
-
-        Returns whether the app entered the main menu. Called by the setup
-        screen's Re-check action after the user authenticates elsewhere.
-        """
-        try:
-            invalidate_provider_readiness()
-        except Exception:
-            pass
-        if not self._provider_is_configured():
-            self.refresh_provider_readiness()
+    def continue_from_setup(self) -> bool:
+        """Enter Home when Setup is visible and a provider is configured."""
+        if self._quitting or not self.screen_stack or not isinstance(self.screen, SetupRequiredScreen):
             return False
-        try:
-            if isinstance(self.screen, SetupRequiredScreen):
-                self.pop_screen()
-        except Exception:
-            pass
+        if not self._provider_is_configured():
+            return False
+        self.pop_screen()
         self._enter_main_menu()
-        self.refresh_provider_readiness()
+        self._warn_about_abandoned_deployments()
         return True
-
-    def _run_load_modal_username(self) -> None:
-        self.post_message(ModalUsernameLoaded(ModalBackend.get_username() or ""))
-
-    def on_modal_username_loaded(self, message: ModalUsernameLoaded) -> None:
-        self._username = message.username
-        for screen in self.screen_stack:
-            setter = getattr(screen, "set_modal_username", None)
-            if callable(setter):
-                setter(message.username)
 
     # ------------------------------------------------------------------
     # Actions called by screens
@@ -792,6 +758,7 @@ class TuiApp(App):
         self.push_screen(
             FastDeployScreen(
                 initial_model_id=last.model_id,
+                preferred_context=last.context_tokens,
                 preferred_placement=(last.provider, last.gpu_type, last.gpu_count),
             )
         )

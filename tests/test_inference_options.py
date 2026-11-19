@@ -213,7 +213,7 @@ class InferenceRecipeTests(unittest.TestCase):
         self.assertEqual(config.provider, ComputeProvider.MODAL)
         self.assertEqual(config.gpu_type, "L40S")
         self.assertEqual(config.app_name, "llamacpp-example")
-        self.assertIs(config.provider_options, plan.quote.provider_options)
+        self.assertEqual(config.provider_options.max_hourly_cost_usd, plan.quote.price_per_hour_usd)
 
     def test_vllm_recipe_builds_prime_config_without_gguf_fields(self) -> None:
         profile = QuickDeployProfile(
@@ -265,7 +265,7 @@ class InferenceRecipeTests(unittest.TestCase):
         self.assertEqual(
             config.provider_options,
             PrimeProviderOptions(
-                offer_id="h100",
+                offer_id="h100", max_hourly_cost_usd=plan.quote.price_per_hour_usd,
             ),
         )
 
@@ -303,7 +303,7 @@ class InferenceRecipeTests(unittest.TestCase):
         self.assertEqual(
             config.provider_options,
             PrimeProviderOptions(
-                offer_id="h100",
+                offer_id="h100", max_hourly_cost_usd=plan.quote.price_per_hour_usd,
             ),
         )
 

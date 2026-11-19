@@ -14,6 +14,7 @@ GGUF_METADATA_CHUNK_BYTES = 1024 * 1024
 GGUF_METADATA_MAX_BYTES = 32 * 1024 * 1024
 
 _GGUF_MAGIC = b"GGUF"
+_STRING_LENGTH = struct.Struct("<Q")
 _GGUF_SCALAR_SIZES = {
     0: 1,  # uint8
     1: 1,  # int8
@@ -298,7 +299,8 @@ def parse_gguf_serving_metadata(
     scalars: dict[str, int] = {}
     kv_by_layer: tuple[int, ...] = ()
     for suffix, field in suffixes.items():
-        value = values.get(f"{architecture}.{suffix}", values.get(suffix))
+        fallback = None if field == "nextn_predict_layers" else values.get(suffix)
+        value = values.get(f"{architecture}.{suffix}", fallback)
         if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
             if value > 0 or field in {"attention_head_count_kv", "nextn_predict_layers"}:
                 scalars[field] = value
@@ -431,13 +433,21 @@ def _read_value(
         if element_type == _GGUF_ARRAY:
             raise _InvalidGguf("Nested GGUF arrays are invalid")
         if element_type == _GGUF_STRING:
+            # Tokenizer arrays may contain hundreds of thousands of strings.
+            # Skip their bytes directly. Even empty strings need length words.
+            available = len(data)
+            if length * _STRING_LENGTH.size > available - offset:
+                raise _NeedMoreData
+            unpack_length = _STRING_LENGTH.unpack_from
             for _ in range(length):
-                _, offset = _read_string(
-                    data,
-                    offset,
-                    max_length=GGUF_METADATA_MAX_BYTES,
-                    decode=False,
-                )
+                if offset + 8 > available:
+                    raise _NeedMoreData
+                size, = unpack_length(data, offset)
+                if size > GGUF_METADATA_MAX_BYTES:
+                    raise _InvalidGguf("GGUF string exceeds the metadata inspection limit")
+                offset += 8 + size
+            if offset > available:
+                raise _NeedMoreData
             return None, offset
         size = _GGUF_SCALAR_SIZES.get(element_type)
         if size is None:

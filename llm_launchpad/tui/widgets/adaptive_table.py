@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Any
 from collections.abc import Callable, Iterable
 
+from rich.console import JustifyMethod
+from rich.text import Text
 from textual.coordinate import Coordinate
 from textual.widgets import DataTable
 
@@ -14,6 +16,13 @@ from ..responsive import ViewportProfile, WidthMode
 
 CellFactory = Callable[[Any], object]
 RowKeyFactory = Callable[[Any], str]
+
+
+def _justified(column: AdaptiveColumn, value: object) -> object:
+    """Align a string cell as its column asks; other renderables pass through."""
+    if column.justify == "left" or not isinstance(value, str):
+        return value
+    return Text.from_markup(value, justify=column.justify)
 
 
 @dataclass(frozen=True)
@@ -30,6 +39,8 @@ class AdaptiveColumn:
     empty_values: frozenset[str] = frozenset()
     # Also hide it when every row says what another column already says.
     redundant: Callable[[Any], bool] | None = None
+    # Numbers read down a column only when their digits line up.
+    justify: JustifyMethod = "left"
 
     @classmethod
     def visible(
@@ -41,6 +52,7 @@ class AdaptiveColumn:
         width: int | None = None,
         hide_when_empty: bool = False,
         redundant: Callable[[Any], bool] | None = None,
+        justify: JustifyMethod = "left",
     ) -> AdaptiveColumn:
         return cls(
             key=key,
@@ -50,6 +62,7 @@ class AdaptiveColumn:
             width=width,
             empty_values=frozenset({"", "-"}) if hide_when_empty else frozenset(),
             redundant=redundant,
+            justify=justify,
         )
 
     def is_empty_for(self, rows: tuple[Any, ...]) -> bool:
@@ -139,13 +152,16 @@ class AdaptiveDataTable(DataTable[Any]):
         columns = self._visible_columns()
         self.clear(columns=True)
         for column in columns:
-            self.add_column(column.label, key=column.key, width=column.width)
+            label: str | Text = column.label
+            if column.justify != "left":
+                label = Text(column.label, justify=column.justify)
+            self.add_column(label, key=column.key, width=column.width)
 
         restored_row = 0
         for index, row in enumerate(self._adaptive_rows):
             key = self._row_key(row)
             self.add_row(
-                *(column.value(row) for column in columns),
+                *(_justified(column, column.value(row)) for column in columns),
                 key=key,
             )
             if key == highlighted_key:

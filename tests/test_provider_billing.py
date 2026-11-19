@@ -8,16 +8,20 @@ says "checking...", "not configured" and "unavailable" the same way.
 
 from __future__ import annotations
 
+import json
 import unittest
+from unittest.mock import MagicMock, patch
 
 from textual.content import Content
 
+from llm_launchpad.core.backend import ModalBackend
 from llm_launchpad.core.provider_billing import (
     PROVIDER_BILLING_ORDER,
     PROVIDER_SETUP_COMMANDS,
     BalanceKind,
     BillingStatus,
     ProviderBilling,
+    load_modal_billing,
     parse_modal_billing,
     parse_prime_billing,
     parse_vast_billing,
@@ -46,12 +50,12 @@ def _snapshot(size_bytes: int) -> StorageSnapshot:
 
 
 class ModalBillingParseTests(unittest.TestCase):
-    def test_summary_payload_yields_month_to_date_spend(self) -> None:
+    def test_legacy_summary_payload_yields_month_to_date_metered_usage(self) -> None:
         row = parse_modal_billing(
             {"summary": {"total_usd": 12.5, "gpu_cost_usd": 8.1, "period_end": "2026-02-18"}}
         )
         self.assertIs(row.status, BillingStatus.READY)
-        self.assertIs(row.kind, BalanceKind.SPEND_MTD)
+        self.assertIs(row.kind, BalanceKind.USAGE_MTD)
         self.assertEqual(row.amount_usd, 12.5)
         self.assertEqual([(c.label, c.amount_usd) for c in row.charges], [("gpu", 8.1)])
 
@@ -85,6 +89,81 @@ class ModalBillingParseTests(unittest.TestCase):
         row = parse_modal_billing("not-json")
         self.assertIsNone(row.amount_usd)
         self.assertTrue(row.notes)
+
+
+class ModalBillingLoadTests(unittest.TestCase):
+    @patch("llm_launchpad.core.backend.subprocess.run")
+    def test_workspace_summary_uses_billed_spend_and_shows_credits(self, run: MagicMock) -> None:
+        for billed, credit in (("2.50", "-3.25"), ("0E-8", "-0E-8")):
+            with self.subTest(billed=billed, credit=credit):
+                run.return_value.returncode = 0
+                run.return_value.stdout = json.dumps({
+                    "metered_cost": "18.11629483",
+                    "billed_cost": billed,
+                    "metered_cost_breakdown": {"volumes": "18.11629280"},
+                    "adjustments": {"credits": credit, "free_storage": "-18.11629280"},
+                })
+                row = load_modal_billing(authenticated=True)
+
+                self.assertEqual(
+                    run.call_args.args[0][-5:],
+                    ["billing", "summary", "--for", "this month", "--json"],
+                )
+                self.assertIs(row.kind, BalanceKind.SPEND_MTD)
+                self.assertEqual(row.amount_usd, float(billed))
+                compact = _plain(render_provider_billing([row], compact=True))
+                self.assertIn(f"${float(billed):.2f}  spent this month", compact)
+                self.assertNotIn("$18.12", compact)
+                rendered = render_provider_billing([row])
+                self.assertIn(f"credits used this month ${abs(float(credit)):.2f}", _plain(rendered))
+                self.assertIn("storage metered this month $18.12", _plain(rendered))
+                self.assertIn("Credit balance in Modal dashboard", _plain(rendered))
+                self.assertIn("https://modal.com/settings/usage", rendered)
+
+    def test_absent_credit_adjustment_stays_unknown(self) -> None:
+        with patch.object(
+            ModalBackend, "billing_summary_json",
+            return_value=({"metered_cost": "18.00", "adjustments": {"free_storage": "-18"}}, None),
+        ):
+            row = load_modal_billing(authenticated=True)
+
+        self.assertEqual(row.amount_usd, 18.0)
+        self.assertIs(row.kind, BalanceKind.USAGE_MTD)
+        self.assertIsNone(row.credits_applied_usd)
+
+    def test_storage_cost_uses_modal_volume_meter_and_allowance(self) -> None:
+        for adjustment, expected in (("-18.12", "$0.00"), ("-10", "$8.12"), (None, None)):
+            with self.subTest(adjustment=adjustment), patch.object(
+                ModalBackend,
+                "billing_summary_json",
+                return_value=({
+                    "metered_cost": "23.12",
+                    "metered_cost_breakdown": {"volumes": "18.12"},
+                    "adjustments": {"free_storage": adjustment, "credits": "-5"},
+                }, None),
+            ):
+                row = load_modal_billing(authenticated=True)
+                details = _plain(render_provider_billing([row]))
+                compact = _plain(render_provider_billing([row], compact=True))
+
+                self.assertIn("storage metered this month $18.12", details)
+                if expected is None:
+                    self.assertNotIn("storage after allowance", details)
+                    self.assertNotIn("storage", compact)
+                else:
+                    self.assertIn(f"storage after allowance {expected}", details)
+                    self.assertIn(f"storage {expected} this month", compact)
+
+    def test_report_still_loads_when_summary_is_unavailable(self) -> None:
+        with (
+            patch.object(ModalBackend, "billing_summary_json", return_value=(None, "Unavailable")),
+            patch.object(ModalBackend, "billing_report_json", return_value=([{"cost": "3.5"}], None)),
+        ):
+            row = load_modal_billing(authenticated=True)
+
+        self.assertEqual(row.amount_usd, 3.5)
+        self.assertIn("$3.50  metered this month", _plain(render_provider_billing([row], compact=True)))
+        self.assertIsNone(row.credits_applied_usd)
 
 
 class PrimeBillingParseTests(unittest.TestCase):
@@ -134,6 +213,9 @@ class VastBillingParseTests(unittest.TestCase):
             {"credit_usd": 0.0, "balance_usd": -4.25, "available_usd": -4.25}
         )
         self.assertEqual(row.owed_usd, 4.25)
+        compact = _plain(render_provider_billing([row], compact=True))
+        self.assertIn("balance", compact)
+        self.assertIn("owed $4.25", compact)
 
     def test_malformed_payloads_do_not_raise(self) -> None:
         for payload in (None, {}, {"available_usd": None}, "nonsense"):
@@ -148,7 +230,7 @@ class BillingPanelRenderTests(unittest.TestCase):
         rendered = _plain(
             render_provider_billing(
                 [
-                    parse_modal_billing({"summary": {"total_usd": 15.75}}),
+                    ProviderBilling.ready(ComputeProvider.MODAL, BalanceKind.SPEND_MTD, 15.75),
                     parse_prime_billing({"balance_usd": 142.0}),
                     parse_vast_billing({"available_usd": 18.5, "balance_usd": 0.0}),
                 ]
@@ -160,8 +242,21 @@ class BillingPanelRenderTests(unittest.TestCase):
             self.assertIn(figure, rendered)
         # Spend and balance are different things, and the row has to say which.
         self.assertIn("spent this month", rendered)
-        self.assertIn("balance", rendered)
-        self.assertIn("credit", rendered)
+        self.assertEqual(rendered.splitlines().count("  balance"), 2)
+
+    def test_compact_rows_keep_one_line_per_provider(self) -> None:
+        """Home shows the figure and its meaning; the breakdown is for Details."""
+        rows = [
+            ProviderBilling.ready(ComputeProvider.MODAL, BalanceKind.SPEND_MTD, 15.75),
+            parse_prime_billing({"balance_usd": 142.0}),
+            parse_vast_billing({"available_usd": 18.5, "balance_usd": 0.0}),
+        ]
+        compact = _plain(render_provider_billing(rows, compact=True))
+        self.assertEqual(len(compact.splitlines()), 3)
+        self.assertIn("spent this month", compact)
+        self.assertEqual(compact.count("  balance"), 2)
+        full = _plain(render_provider_billing(rows))
+        self.assertGreater(len(full.splitlines()), 3)
 
     def test_figures_line_up_in_one_column(self) -> None:
         """Three sections became one table; the amounts share a right edge."""
@@ -259,7 +354,7 @@ class BillingPanelRenderTests(unittest.TestCase):
         )
         self.assertIn("unavailable", rendered)
         self.assertIn("modal CLI not found", rendered)
-        self.assertIn("storage est. $", rendered)
+        self.assertIn("cache est. $", rendered)
         self.assertIn("1,400 GiB cached", rendered)
 
     def test_storage_estimate_reports_the_free_tier_it_is_measured_against(self) -> None:
@@ -269,8 +364,8 @@ class BillingPanelRenderTests(unittest.TestCase):
                 storage_snapshot=_snapshot(1026 * _GIB),
             )
         )
-        self.assertIn("$0.18/mo", rendered)
-        self.assertIn("2.00 GiB over 1 TiB free", rendered)
+        self.assertIn("cache est. $0.18/mo · 1 TiB free", rendered)
+        self.assertIn("2.00 GiB above free tier", rendered)
 
     def test_only_modal_carries_the_volume_estimate(self) -> None:
         """The free tier and rate are Modal Volume's, not every provider's."""

@@ -487,23 +487,19 @@ class ModalBackend:
     @staticmethod
     def billing_report_json() -> tuple[Any | None, str | None]:
         """Return billing report JSON and an optional error message."""
-        commands = [
-            ["modal", "billing", "report", "--for", "this month", "--json"],
-            ["modal", "workspace", "billing", "report", "--for", "this month", "--json"],
-        ]
+        return ModalBackend._billing_json("report", prefixes=((), ("workspace",)))
 
-        def _looks_like_unsupported_command(message: str) -> bool:
-            normalized = (message or "").lower()
-            return (
-                "no such command" in normalized
-                or "invalid choice" in normalized
-                or "unrecognized arguments" in normalized
-                or "usage: modal [options] command" in normalized
-            )
+    @staticmethod
+    def billing_summary_json() -> tuple[Any | None, str | None]:
+        """Return this billing cycle's workspace summary and an optional error."""
+        return ModalBackend._billing_json("summary", prefixes=((),))
 
-        last_error: str | None = None
-        unsupported_command_seen = False
-        for command in commands:
+    @staticmethod
+    def _billing_json(
+        operation: str, *, prefixes: tuple[tuple[str, ...], ...]
+    ) -> tuple[Any | None, str | None]:
+        for prefix in prefixes:
+            command = ["modal", *prefix, "billing", operation, "--for", "this month", "--json"]
             try:
                 result = subprocess.run(
                     ModalBackend._resolve_command(command),
@@ -513,7 +509,7 @@ class ModalBackend:
                     timeout=ModalBackend._CLI_TIMEOUT_SECONDS,
                 )
             except subprocess.TimeoutExpired:
-                return None, "Timed out while requesting billing report."
+                return None, f"Timed out while requesting billing {operation}."
             except FileNotFoundError:
                 return None, "Modal CLI not found in PATH."
             except Exception as exc:
@@ -523,25 +519,27 @@ class ModalBackend:
                 try:
                     return json.loads(result.stdout or "{}"), None
                 except Exception:
-                    return None, "Billing report returned invalid JSON."
+                    return None, f"Billing {operation} returned invalid JSON."
 
             stderr = (result.stderr or "").strip()
             stdout = (result.stdout or "").strip()
             details = stderr or stdout or f"Exit code {result.returncode}"
-            last_error = details
-            if _looks_like_unsupported_command(details):
-                unsupported_command_seen = True
-                continue
-            return None, details
+            if not any(
+                marker in details.lower()
+                for marker in (
+                    "no such command",
+                    "invalid choice",
+                    "unrecognized arguments",
+                    "usage: modal [options] command",
+                )
+            ):
+                return None, details
 
-        if unsupported_command_seen:
-            return (
-                None,
-                "Billing report command is unavailable in this Modal CLI version. "
-                "Upgrade Modal CLI and retry.",
-            )
-
-        return None, last_error or "Could not read billing report."
+        return (
+            None,
+            f"Billing {operation} command is unavailable in this Modal CLI version. "
+            "Upgrade Modal CLI and retry.",
+        )
 
     @staticmethod
     def list_volume(volume_name: str, path: str = "/") -> list[dict[str, Any]] | None:

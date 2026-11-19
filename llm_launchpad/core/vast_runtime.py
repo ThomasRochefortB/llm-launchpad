@@ -24,7 +24,7 @@ from .serving_runtime import (
 )
 
 VAST_RUNTIME_DIR = "/root/.llm-launchpad"
-# CUDA_VERSION in the bundled b10689 image's immutable OCI config. Require
+# CUDA_VERSION in the bundled b12464 image's immutable OCI config. Require
 # native driver support instead of assuming CUDA forward compatibility on
 # arbitrary marketplace GPUs: a paid run on a CUDA 12.2 RTX 3060 (offer
 # 45598047, 2026-09-11) served chat, tools and a 60s stream, but nvidia-smi

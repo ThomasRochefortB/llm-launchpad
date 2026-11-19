@@ -167,7 +167,7 @@ class PriceSeparationTests(unittest.TestCase):
         finding = revalidate_plan_price(plan, current_price_per_hour_usd=2.0)
         self.assertIsNotNone(finding)
         self.assertIsNone(revalidate_plan_price(plan, current_price_per_hour_usd=0.5))
-        self.assertIsNone(revalidate_plan_price(plan, current_price_per_hour_usd=None))
+        self.assertEqual(revalidate_plan_price(plan, current_price_per_hour_usd=None).code, "price-unknown")
 
     def test_request_round_trip_preserves_price(self) -> None:
         from llm_launchpad.core.quick_deploy import config_from_request

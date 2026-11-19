@@ -17,6 +17,7 @@ from ...core.inference_options import (
     COST_SCENARIO_WORKDAY,
     continuous_monthly_compute_cost,
     evaluate_quote_cost,
+    first_hour_cost_usd,
 )
 from ...core.quick_deploy import (
     QuickDeployProfile,
@@ -82,8 +83,12 @@ def _render_decision_facts(profile: QuickDeployProfile, plan: InferencePlan) -> 
         f"{f'{escape(plan.quote.region)} · ' if plan.quote.region else ''}"
         f"{escape(display_gpu_type(plan.quote.gpu_type))} x{plan.quote.gpu_count}\n"
         f"[dim]Context[/dim] {escape(format_context_length(profile.max_context_tokens))} · "
-        f"[bold]{escape(_plan_hourly_cost(plan))}[/bold] · "
-        f"{escape(_billing_label(plan.quote.billing_model))}\n"
+        f"[bold $money]{escape(_plan_hourly_cost(plan))}[/] · "
+        f"{escape(_billing_label(plan.quote.billing_model))}"
+        + (f" · ${total:.2f} first hour" if plan.quote.one_time_cost_usd and
+           (total := first_hour_cost_usd(plan.quote)) is not None else
+           " · first hour unknown" if plan.quote.one_time_cost_usd is None else "")
+        + "\n"
         f"[dim]Availability[/dim] {escape(_availability_label(plan))}"
         f"{_idle_shutdown_fact(plan)}"
     )
@@ -270,17 +275,15 @@ def _plan_continuous_monthly_cost(plan: InferencePlan) -> str:
 
 
 # Enter does not deploy, on purpose. That leaves the keyboard route stated only
-# in the footer -- which the fulfillment dropdown covers while it is open, and
-# which a phone terminal hides behind its on-screen keyboard entirely. So it is
-# said here, and kept short enough to survive a narrow viewport: this line is
-# one row high, so anything that does not fit is simply cut off.
+# in the footer -- which a phone terminal hides behind its on-screen keyboard.
+# So a narrow viewport says it beside the button; a wide one already shows the
+# same key in its footer, and saying it twice was noise.
 
 
 def deploy_key_hint(*, narrow: bool) -> str:
-    """Describe keyboard deployment for the current viewport."""
-    # One wording at every width: the sentence form said nothing more, and it
-    # wrapped to two lines in the column beside the button.
-    del narrow
+    """Describe keyboard deployment where the footer may be out of sight."""
+    if not narrow:
+        return ""
     return "[dim]ctrl+d deploys · or tab to Deploy[/dim]"
 
 
@@ -327,9 +330,8 @@ def _fulfillment_caution(plan: InferencePlan) -> str:
     if plan.quote.provider != ComputeProvider.VAST:
         return ""
     return (
-        "[$warning]Vast.ai serves through an SSH endpoint on this computer only. "
-        "The rental bills continuously; Stop destroys the instance and its disk. "
-        "Hourly prices include disk; traffic costs extra.[/$warning]"
+        "[$warning]Local SSH endpoint · bills until stopped · "
+        "Stop deletes the disk · traffic extra[/$warning]"
     )
 
 
@@ -402,44 +404,38 @@ class QuickDeployScreen(CopyEnabledScreen):
             id="quick-deploy-title",
         )
         # The decision and the button that commits it sit together above the
-        # scroll container, so neither can scroll away on a short terminal and
-        # nothing has to repeat the facts beside the button. The model names
-        # the card rather than opening its first line.
-        with Horizontal(id="quick-deploy-summary"):
+        # scroll container, so neither can scroll away on a short terminal.
+        # The model names the card rather than opening its first line.
+        with Vertical(id="quick-deploy-summary"):
             facts = Static(
                 _render_decision_facts(self.profile, self.plan),
                 id="quick-deploy-facts",
             )
             facts.border_title = _render_profile_label(self.profile)
             yield facts
-            with Vertical(id="quick-deploy-actions"):
+            caution = Static(_fulfillment_caution(self.plan), id="quick-vast-note")
+            caution.display = bool(_fulfillment_caution(self.plan))
+            yield caution
+            with Horizontal(id="quick-deploy-actions"):
                 yield Button("Deploy", id="quick-deploy-btn", variant="primary")
-                # Enter is deliberately not bound to Deploy (see on_mount),
-                # which leaves the keyboard route stated only in the footer --
-                # and the fulfillment dropdown paints over the footer while it
-                # is open, exactly when someone is looking for how to continue.
-                # Say it here instead, next to the button it refers to.
-                yield Static(self._deploy_key_hint(), id="quick-deploy-feedback")
-        with VerticalScroll(id="quick-deploy-layout"):
-            with Vertical(id="quick-deploy-profile-card"):
-                yield Button(
-                    "Technical details...",
-                    id="toggle-quick-details",
-                    variant="default",
+                # Enter is deliberately not bound to Deploy (see on_mount); on
+                # a phone the footer that says so is under the keyboard.
+                hint = self._deploy_key_hint()
+                yield Static(
+                    hint, id="quick-deploy-feedback", classes="" if hint else "hidden"
                 )
+        with VerticalScroll(id="quick-deploy-layout"):
+            with Vertical(id="quick-deploy-form"):
+                # One toggle for everything past the decision: the evidence
+                # behind it, the equivalent placements, and the tuning knobs.
+                yield Button("More options...", id="toggle-advanced-quick", variant="default")
                 yield Static(
                     _render_profile_details(self.profile, self.plan),
                     id="quick-deploy-profile-body",
+                    classes="quick-advanced",
                 )
-            with Vertical(id="quick-deploy-form"):
-                # With one placement there is no choice to make, and the line
-                # only restated the facts card; the label goes with it.
                 if len(self._alternative_plans) > 1:
-                    yield Static("Runs on", classes="form-label")
-                caution = Static(_fulfillment_caution(self.plan), id="quick-vast-note")
-                caution.display = bool(_fulfillment_caution(self.plan))
-                yield caution
-                if len(self._alternative_plans) > 1:
+                    yield Static("Runs on", classes="form-label quick-advanced")
                     yield Select(
                         options=[
                             (
@@ -451,8 +447,8 @@ class QuickDeployScreen(CopyEnabledScreen):
                         value=self.plan.quote.id,
                         allow_blank=False,
                         id="quick-fulfillment",
+                        classes="quick-advanced",
                     )
-                yield Button("Advanced options...", id="toggle-advanced-quick", variant="default")
                 if self.profile.speculative_decoding is not None:
                     # On by default and faster; a tuning knob, not a decision.
                     yield ToggleField(
@@ -549,7 +545,6 @@ class QuickDeployScreen(CopyEnabledScreen):
         for widget in self.query(".quick-advanced"):
             widget.add_class("hidden")
         self._sync_form_frame()
-        self.query_one("#quick-deploy-profile-body", Static).display = False
         self._sync_prime_option_visibility()
         # This screen is reached by pressing enter, and Deploy spends money the
         # moment it fires, so a second enter must not be able to rent a GPU.
@@ -566,9 +561,7 @@ class QuickDeployScreen(CopyEnabledScreen):
             None, "quick-deploy-layout", "quick-deploy-btn",
         }:
             return
-        target = next(iter(self.query("#toggle-quick-details")), None) or next(
-            iter(self.query("#quick-fulfillment")), None
-        ) or next(iter(self.query("#toggle-advanced-quick")), None)
+        target = next(iter(self.query("#toggle-advanced-quick")), None)
         if target is None:
             target = self.query_one("#quick-deploy-btn", Button)
         # Not scroll_visible: on a short terminal, scrolling the form control
@@ -577,17 +570,14 @@ class QuickDeployScreen(CopyEnabledScreen):
         target.focus(scroll_visible=False)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "toggle-quick-details":
-            body = self.query_one("#quick-deploy-profile-body", Static)
-            body.display = not body.display
-            toggle = self.query_one("#toggle-quick-details", Button)
-            toggle.label = "Hide technical details" if body.display else "Technical details..."
-            return
         if event.button.id == "toggle-advanced-quick":
             for widget in self.query(".quick-advanced"):
                 widget.toggle_class("hidden")
             self._sync_prime_option_visibility()
             self._sync_form_frame()
+            event.button.label = (
+                "More options..." if self._options_collapsed() else "Fewer options"
+            )
         elif event.button.id == "quick-deploy-btn":
             self._deploy()
 
@@ -662,11 +652,12 @@ class QuickDeployScreen(CopyEnabledScreen):
         With one placement and the options collapsed, the bordered box held a
         single button and read as an empty panel.
         """
-        collapsed = all(
+        self.query_one("#quick-deploy-form").set_class(self._options_collapsed(), "-bare")
+
+    def _options_collapsed(self) -> bool:
+        return all(
             widget.has_class("hidden") for widget in self.query(".quick-advanced")
         )
-        bare = collapsed and len(self._alternative_plans) <= 1
-        self.query_one("#quick-deploy-form").set_class(bare, "-bare")
 
     def _sync_prime_option_visibility(self) -> None:
         advanced_visible = any(
@@ -689,8 +680,10 @@ class QuickDeployScreen(CopyEnabledScreen):
     def refresh_keyboard_hints(self) -> None:
         """Re-render the keyboard hint for the current viewport."""
 
+        text = self._deploy_key_hint()
         for hint in self.query("#quick-deploy-feedback").results(Static):
-            hint.update(self._deploy_key_hint())
+            hint.update(text)
+            hint.set_class(not text, "hidden")
 
     def viewport_profile_changed(self, profile, previous) -> None:  # type: ignore[no-untyped-def]
         """Re-fit the hint when the terminal is resized."""
@@ -756,15 +749,15 @@ class QuickDeployScreen(CopyEnabledScreen):
 
         config = _config_for_plan(self.plan)
         approved_price = self.plan.quote.price_per_hour_usd
+        approved_total = first_hour_cost_usd(self.plan.quote)
         fallback_plans = [
             plan
             for plan in self._alternative_plans
             if plan.quote.id != self.plan.quote.id
             and plan.quote.price_per_hour_usd is not None
-            and (
-                approved_price is None
-                or plan.quote.price_per_hour_usd <= approved_price
-            )
+            and approved_price is not None and plan.quote.price_per_hour_usd <= approved_price
+            and approved_total is not None and (total := first_hour_cost_usd(plan.quote)) is not None
+            and total <= approved_total and plan.recipe.id == self.plan.recipe.id
             and (plan.assessment is None or plan.assessment.fits)
         ]
         config.fallback_configs = tuple(_config_for_plan(plan) for plan in fallback_plans)
@@ -784,6 +777,7 @@ class QuickDeployScreen(CopyEnabledScreen):
                     display_name=self.profile.display_name,
                     provider=quote.provider.value,
                     gpu_type=quote.gpu_type,
+                    context_tokens=self.plan.recipe.max_context_tokens,
                     gpu_count=quote.gpu_count,
                     price_per_hour_usd=quote.price_per_hour_usd,
                 )

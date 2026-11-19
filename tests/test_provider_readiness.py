@@ -4,7 +4,6 @@ import unittest
 from unittest.mock import patch
 
 from llm_launchpad.core.modal_auth import ModalAuthStatus
-from llm_launchpad.core.prime_auth import PrimeAuthStatus
 from llm_launchpad.core.provider_readiness import (
     ProviderReadinessStage,
     check_modal_readiness,
@@ -111,10 +110,10 @@ class ProviderReadinessTests(unittest.TestCase):
         with (
             patch("llm_launchpad.tui.app.ModalBackend.is_cli_available", return_value=True),
             patch(
-                "llm_launchpad.core.modal_auth.get_modal_auth_status",
+                "llm_launchpad.core.provider_readiness.get_modal_auth_status",
                 return_value=ModalAuthStatus(authenticated=False, error="not authenticated"),
             ),
-            patch("llm_launchpad.tui.app.get_prime_auth_status", return_value=PrimeAuthStatus(authenticated=False)),
-            patch("llm_launchpad.tui.app.resolve_vast_credentials", return_value=VastCredentials()),
         ):
-            self.assertFalse(app._provider_is_configured())
+            row = check_modal_readiness(refresh=True)
+        app._provider_readiness[row.provider] = row
+        self.assertFalse(app._provider_is_configured())

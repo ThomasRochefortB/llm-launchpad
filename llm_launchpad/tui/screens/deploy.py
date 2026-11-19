@@ -812,11 +812,11 @@ class LlamaCppDeployScreen(
         "vast-offer-llama",
         "gpu-type-llama",
         "gpu-count-llama",
+        "toggle-advanced-llama",
         "vision-mode",
         "projector-repo",
         "projector-revision",
         "projector-file",
-        "toggle-advanced-llama",
         "warmup",
         "revision",
         "prime-auto-disk-llama",
@@ -932,10 +932,10 @@ class LlamaCppDeployScreen(
                             )
                     yield Static("", id="llama-cost-preview")
 
-            yield VisionOptions(BackendType.LLAMACPP)
-
-            # Advanced options (collapsed by default)
+            # Advanced options (collapsed by default). Image input defaults to
+            # automatic, so its projector overrides ride here too.
             yield Button("Advanced options...", id="toggle-advanced-llama", variant="default")
+            yield VisionOptions(BackendType.LLAMACPP, classes="llama-advanced")
             yield ToggleField("Warm up after deploy", "warmup", default=True, classes="llama-advanced")
             yield FormField("HF revision (optional)", "revision", classes="llama-advanced")
             yield ToggleField(
@@ -1397,8 +1397,7 @@ class LlamaCppDeployScreen(
         _set_option_list(model_list, options)
 
         if message.models:
-            mode_label = "Most downloaded" if self._rank_mode == "downloads" else "Trending"
-            self._set_model_status(f"[dim]{mode_label} models loaded. Select one to prefill repo-id.[/dim]")
+            self._set_model_status("")
             self._focus_model_list_if_pending()
         else:
             self._set_model_status("[$warning]No matching GGUF text-generation models found.[/$warning]")
@@ -1639,7 +1638,11 @@ class LlamaCppDeployScreen(
             model_list.highlighted = 0
 
     def _set_model_status(self, text: str) -> None:
-        self.query_one("#llama-model-status", Static).update(text)
+        status = self.query_one("#llama-model-status", Static)
+        status.update(text)
+        # A loaded list explains itself; the line only speaks while loading
+        # or when something went wrong.
+        status.set_class(not text, "hidden")
 
 
     def _set_quant_status(self, text: str) -> None:
@@ -1665,11 +1668,11 @@ class LlamaCppDeployScreen(
             quant_preview = ", ".join(model.quantizations[:3]) if model.quantizations else "-"
             if len(model.quantizations) > 3:
                 quant_preview = f"{quant_preview}, ..."
-            label = _model_row(model.repo_id, f"quants={quant_preview}")
+            label = _model_row(model.repo_id, quant_preview)
             options.append(Option(label, id=f"model-{idx}"))
         _set_option_list(model_list, options)
         if self._ranked_models:
-            self._set_model_status("[dim]Select one to prefill repo-id.[/dim]")
+            self._set_model_status("")
             self._focus_model_list_if_pending()
         elif self._fall_back_to_downloads_ranking():
             return
@@ -1909,11 +1912,11 @@ class VllmDeployScreen(
         "vast-offer-vllm",
         "gpu-type-vllm",
         "gpu-count-vllm",
-        "n-gpu",
+        "toggle-advanced-vllm",
         "vision-mode",
         "image-limit",
         "mm-processor-kwargs",
-        "toggle-advanced-vllm",
+        "n-gpu",
         "model-revision",
         "prime-auto-disk",
         "prime-disk-id",
@@ -2018,25 +2021,25 @@ class VllmDeployScreen(
                             id="gpu-type-vllm",
                         )
                     with Vertical(id="gpu-count-group-vllm"):
-                        yield Static("GPUs attached", classes="form-label")
+                        yield Static("GPU count", classes="form-label")
                         yield Input(
                             value=str(DEFAULT_GPU_COUNT),
                             placeholder="1",
                             id="gpu-count-vllm",
                             type="integer",
                         )
-                yield FormField(
-                    "Tensor parallel size",
-                    "n-gpu",
-                    default="1",
-                    input_type="integer",
-                    hint="Shards one model across the attached GPUs "
-                    "(vLLM --tensor-parallel-size)",
-                    classes="gpu-config-tensor-field",
-                )
                 yield Static("", id="vllm-cost-preview")
-            yield VisionOptions(BackendType.VLLM)
             yield Button("Advanced options...", id="toggle-advanced-vllm", variant="default")
+            yield VisionOptions(BackendType.VLLM, classes="vllm-advanced")
+            # One model sharded across every attached GPU is the common case;
+            # this only overrides it.
+            yield FormField(
+                "Tensor parallel size (optional)",
+                "n-gpu",
+                input_type="integer",
+                hint="Blank shards across all attached GPUs",
+                classes="vllm-advanced",
+            )
             yield FormField(
                 "Model revision (optional)",
                 "model-revision",
@@ -2648,8 +2651,7 @@ class VllmDeployScreen(
         _set_option_list(model_list, options)
 
         if message.models:
-            mode_label = "Most downloaded" if self._rank_mode == "downloads" else "Trending"
-            self._set_model_status(f"[dim]{mode_label} models loaded. Select one to prefill Model name.[/dim]")
+            self._set_model_status("")
             self._focus_model_list_if_pending()
         else:
             self._set_model_status("[$warning]No matching text-generation models found.[/$warning]")
@@ -2704,7 +2706,9 @@ class VllmDeployScreen(
             model_list.highlighted = 0
 
     def _set_model_status(self, text: str) -> None:
-        self.query_one("#vllm-model-status", Static).update(text)
+        status = self.query_one("#vllm-model-status", Static)
+        status.update(text)
+        status.set_class(not text, "hidden")
 
 
     def _resolve_rank_mode(self, option_id: str) -> str | None:
@@ -2724,7 +2728,7 @@ class VllmDeployScreen(
         options = [Option(f"  {model.repo_id}", id=f"model-{idx}") for idx, model in enumerate(self._ranked_models)]
         _set_option_list(model_list, options)
         if self._ranked_models:
-            self._set_model_status("[dim]Select one to prefill Model name.[/dim]")
+            self._set_model_status("")
             self._focus_model_list_if_pending()
         elif self._fall_back_to_downloads_ranking():
             return
@@ -2774,6 +2778,8 @@ class VllmDeployScreen(
 
     def _current_tensor_parallel(self) -> int:
         raw = self.query_one("#n-gpu", Input).value.strip()
+        if not raw:
+            return max(1, parse_gpu_count(self.query_one("#gpu-count-vllm", Input).value, default=1))
         try:
             parsed = int(raw)
         except ValueError:
@@ -2945,7 +2951,7 @@ class VllmDeployScreen(
             return
         gpu_count = parse_gpu_count(self.query_one("#gpu-count-vllm", Input).value, default=0)
         if gpu_count <= 0:
-            self._reject("GPUs attached must be an integer >= 1.", "#gpu-count-vllm")
+            self._reject("GPU count must be an integer >= 1.", "#gpu-count-vllm")
             return
         config.gpu_type = gpu_type
         config.gpu_count = gpu_count
@@ -2980,7 +2986,7 @@ class VllmDeployScreen(
             config.n_gpu = config.gpu_count
         else:
             n_gpu_str = self.query_one("#n-gpu", Input).value.strip()
-            config.n_gpu = positive_int(n_gpu_str or "1")
+            config.n_gpu = positive_int(n_gpu_str or str(config.gpu_count))
             if config.n_gpu is None:
                 self._reject("Tensor parallel size must be an integer >= 1.", "#n-gpu")
                 return

@@ -94,6 +94,7 @@ class QuickDeployRefreshTests(unittest.TestCase):
             "llm_launchpad.core.quick_deploy_refresh.fetch_model_max_context",
             return_value=None,
         )
+        self.enterContext(patch("llm_launchpad.core.quick_deploy_refresh.list_llamacpp_candidates", return_value=[]))
         context_patch.start()
         self.addCleanup(context_patch.stop)
 
@@ -202,7 +203,7 @@ class QuickDeployRefreshTests(unittest.TestCase):
         self.assertEqual(compact_q4.aa_coding_score, 95)
         self.assertEqual(compact_q4.aa_intelligence_score, 95)
 
-    def test_live_catalog_caps_selection_at_model_limit(self) -> None:
+    def test_live_catalog_retains_verified_models_beyond_the_old_size_limit(self) -> None:
         candidates = tuple(
             _aa_candidate(f"Open Model {index} 8B", 8, 90 - index, rank=index)
             for index in range(1, 5)
@@ -239,10 +240,10 @@ class QuickDeployRefreshTests(unittest.TestCase):
 
         self.assertEqual(
             _ordered_unique_names(profiles),
-            ["Open Model 1 8B", "Open Model 2 8B"],
+            [c.name for c in candidates],
         )
 
-    def test_live_catalog_includes_overall_top_ten_and_each_size_shortlist(self) -> None:
+    def test_live_catalog_includes_all_verified_candidates(self) -> None:
         candidates: list[AAModelCandidate] = []
         rank = 1
         for parameter_count_b, prefix in (
@@ -292,19 +293,7 @@ class QuickDeployRefreshTests(unittest.TestCase):
 
         self.assertEqual(
             _ordered_unique_names(profiles),
-            [
-                "Compact Model 1 8B",
-                "Compact Model 2 8B",
-                "Compact Model 3 8B",
-                "Medium Model 1 70B",
-                "Medium Model 2 70B",
-                "Medium Model 3 70B",
-                "Large Model 1 300B",
-                "Large Model 2 300B",
-                "Large Model 3 300B",
-                "Compact Model 4 8B",
-                "Medium Model 4 70B",
-            ],
+            [c.name for c in candidates],
         )
 
     def test_live_catalog_keeps_size_buckets_beyond_global_rank_window(self) -> None:
@@ -356,11 +345,7 @@ class QuickDeployRefreshTests(unittest.TestCase):
             _info, profiles = build_live_quick_deploy_catalog()
 
         names = _ordered_unique_names(profiles)
-        self.assertEqual(len(names), 16)
-        self.assertEqual(names[:3], [f"Compact Model {index} 8B" for index in range(1, 4)])
-        self.assertEqual(names[3:6], [f"Medium Model {index} 70B" for index in range(1, 4)])
-        self.assertEqual(names[6:9], [f"Large Model {index} 300B" for index in range(1, 4)])
-        self.assertEqual(names[9:], [f"Compact Model {index} 8B" for index in range(4, 11)])
+        self.assertEqual(names, [c.name for c in candidates])
 
     def test_live_catalog_deduplicates_variants_sharing_a_gguf_repo(self) -> None:
         candidates = (
@@ -413,7 +398,7 @@ class QuickDeployRefreshTests(unittest.TestCase):
         )
         self.assertEqual(match_mock.call_count, 2)
 
-    def test_shortlist_skips_lower_ranked_models_in_filled_categories(self) -> None:
+    def test_discovery_keeps_lower_ranked_models_in_filled_categories(self) -> None:
         candidates = tuple(
             _aa_candidate(f"Compact Model {i} 8B", 8, 100 - i, rank=i)
             for i in range(1, 76)
@@ -434,12 +419,8 @@ class QuickDeployRefreshTests(unittest.TestCase):
             profiles = _profiles_from_aa_rankings(
                 candidates, [ModalGpuSpec("B200", 5)], model_limit=1, candidate_limit=80,
             )
-        self.assertEqual(_ordered_unique_names(profiles), [
-            "Compact Model 1 8B", "Medium Model 70B", "Large Model 300B",
-        ])
-        # One spare lookahead may already be running, but the long compact
-        # tail must not delay discovery of the other two categories.
-        self.assertLessEqual(match.call_count, 4)
+        self.assertEqual(_ordered_unique_names(profiles), [c.name for c in candidates])
+        self.assertEqual(match.call_count, len(candidates))
 
     def test_unknown_size_and_response_order_do_not_change_ranked_shortlist(self) -> None:
         candidates = (
@@ -473,10 +454,10 @@ class QuickDeployRefreshTests(unittest.TestCase):
             )
         self.assertTrue(runner_up_finished.is_set())
         self.assertEqual(_ordered_unique_names(profiles), [
-            "Compact Winner", "Unknown Winner", "Large Winner",
+            "Compact Winner", "Unknown Winner", "Medium Runner Up", "Large Winner",
         ])
 
-    def test_completed_shortlist_does_not_wait_for_unused_lookahead(self) -> None:
+    def test_discovery_finishes_scheduled_candidates_in_rank_order(self) -> None:
         candidates = tuple(
             _aa_candidate(name, size, 100 - i, rank=i)
             for i, (name, size) in enumerate([
@@ -514,9 +495,10 @@ class QuickDeployRefreshTests(unittest.TestCase):
                     model_limit=1, candidate_limit=80,
                 )
                 try:
+                    self.assertTrue(extra_started.wait(3))
+                    release_extra.set()
                     profiles = result.result(timeout=3)
-                    self.assertEqual(len(_ordered_unique_names(profiles)), 3)
-                    self.assertFalse(release_extra.is_set())
+                    self.assertEqual(_ordered_unique_names(profiles), [c.name for c in candidates])
                 finally:
                     release_extra.set()
                     resolver.shutdown(wait=True)
@@ -573,7 +555,7 @@ class QuickDeployRefreshTests(unittest.TestCase):
         ):
             info, profiles = build_live_quick_deploy_catalog(model_limit=1)
 
-        list_models.assert_called_once_with(mode="trending", limit=8)
+        list_models.assert_called_once_with(mode="trending", limit=12)
         self.assertIn("Hugging Face trending", info.source_label)
         self.assertEqual({profile.repo_id for profile in profiles}, {models[0].repo_id})
         self.assertEqual({profile.max_context_tokens for profile in profiles}, {65_536})
@@ -1323,7 +1305,8 @@ class CatalogRetentionTests(unittest.TestCase):
 
             assert retained is not None
             info, profiles = retained
-            self.assertEqual(len(profiles), 2)
+            self.assertEqual(len(profiles), 42)
+            self.assertIn("aa-glm", {p.aa_model_id for p in profiles})
             self.assertIn("GLM 5.3 Flash", info.error or "")
             self.assertIn("rate limiting", info.error or "")
 

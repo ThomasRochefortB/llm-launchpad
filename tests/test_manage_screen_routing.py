@@ -453,6 +453,27 @@ class ManageScreenStoppedFilterTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual([row.name for row in screen._rows], ["broken-app"])
 
+    async def test_an_empty_fleet_hides_the_table_and_offers_deploy(self) -> None:
+        app = _TestApp()
+        deploys: list[bool] = []
+        app.action_push_deploy = lambda: deploys.append(True)  # type: ignore[attr-defined]
+
+        async with app.run_test() as pilot:
+            app.push_screen(ManageScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, ManageScreen)
+
+            status = str(screen.query_one("#manage-status", Static).renderable)
+            self.assertIn("No endpoints running", status)
+            self.assertIn("d to deploy", status)
+            self.assertTrue(
+                screen.query_one("#manage-endpoint-table", AdaptiveDataTable).has_class("hidden")
+            )
+            await pilot.press("d")
+            await pilot.pause()
+            self.assertEqual(deploys, [True])
+
     async def test_an_all_stopped_fleet_says_so_instead_of_looking_empty(self) -> None:
         app = _TestApp()
         app.instances = [_endpoint("old-app", "ap-old", state="stopped")]
@@ -465,5 +486,5 @@ class ManageScreenStoppedFilterTests(unittest.IsolatedAsyncioTestCase):
 
             status = str(screen.query_one("#manage-status", Static).renderable)
             self.assertIn("Nothing running", status)
-            self.assertIn("press a to show", status)
+            self.assertIn("a to show", status)
             self.assertNotIn("No endpoints running", status)

@@ -83,6 +83,7 @@ def _prime_offer(
 
 class ComputeAvailabilityTests(unittest.TestCase):
     def setUp(self) -> None:
+        self.enterContext(patch("llm_launchpad.core.compute_availability.check_modal_readiness", return_value=SimpleNamespace(verified=True)))
         from llm_launchpad.core.vast_auth import VastCredentials
 
         patcher = patch(
@@ -109,7 +110,7 @@ class ComputeAvailabilityTests(unittest.TestCase):
         self.assertEqual(snapshot.providers, (ComputeProvider.PRIME,))
         self.assertIn("provider down", snapshot.errors[0])
 
-    def test_load_uses_public_modal_catalog_without_token_preflight(self) -> None:
+    def test_load_uses_public_modal_catalog_with_verified_provider(self) -> None:
         with patch(
             "llm_launchpad.core.compute_availability.resolve_modal_cli_path",
             return_value="/usr/bin/modal",

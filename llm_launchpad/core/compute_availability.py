@@ -46,7 +46,8 @@ from .llamacpp_planner import (
     tuning_for_gpu_memory,
 )
 from .modal_cli import resolve_modal_cli_path
-from .modal_gpu import ModalGpuSpec, fetch_modal_gpu_catalog
+from .modal_gpu import MODAL_GPU_MEMORY_GB, ModalGpuSpec, fetch_modal_gpu_catalog, modal_gpu_count_limit, modal_gpu_supports_fast_deploy
+from .provider_readiness import check_modal_readiness
 from .prime_auth import get_prime_auth_status
 from .prime_backend import (
     PrimeBackend,
@@ -60,22 +61,6 @@ from .quick_deploy import QuickDeployProfile, quick_deploy_recipe
 from .vast_auth import VastCredentials, resolve_vast_credentials
 from .vast_backend import VastBackend
 
-_MODAL_GPU_COUNT_MAX = 8
-_GPU_MEMORY_GB: dict[str, float] = {
-    "T4": 16.0,
-    "L4": 24.0,
-    "A10": 24.0,
-    "A100": 40.0,
-    "A100-40GB": 40.0,
-    "A100-80GB": 80.0,
-    "L40S": 48.0,
-    "RTX-PRO-6000": 96.0,
-    "H100": 80.0,
-    "H100!": 80.0,
-    "H200": 141.0,
-    "B200": 180.0,
-    "B200+": 180.0,
-}
 # How long every provider fetch together may hold the screen. Each of these
 # calls has its own request timeout, but they were awaited with none: one
 # catalog that never answered left Fast Deploy on "loading" with no deadline
@@ -124,14 +109,12 @@ class _ProviderFetch:
         return self._value, None
 
 
-def load_compute_availability() -> ComputeAvailabilitySnapshot:
+def load_compute_availability(*, force_refresh: bool = False) -> ComputeAvailabilitySnapshot:
     """Fetch connected providers concurrently and return one aggregated view."""
 
     errors: list[str] = []
     include_modal = False
     include_prime = False
-    # GPU types and prices come from public Modal pages. Avoid a live token
-    # subprocess here; deployment preflight remains responsible for auth.
     include_modal = resolve_modal_cli_path() is not None
     try:
         include_prime = get_prime_auth_status().authenticated
@@ -156,7 +139,8 @@ def load_compute_availability() -> ComputeAvailabilitySnapshot:
     # promises. Each fetch still has its own request timeout underneath.
     fetches: list[tuple[str, _ProviderFetch]] = []
     if include_modal:
-        fetches.append(("Modal catalog", _ProviderFetch(fetch_modal_gpu_catalog)))
+        fetches.append(("Modal catalog", _ProviderFetch(lambda: fetch_modal_gpu_catalog(force_refresh=force_refresh))))
+        fetches.append(("Modal authentication", _ProviderFetch(lambda: check_modal_readiness(refresh=force_refresh))))
     if include_prime:
         fetches.append(("Prime availability", _ProviderFetch(PrimeBackend().list_offers)))
     if vast_credentials.api_key:
@@ -176,7 +160,17 @@ def load_compute_availability() -> ComputeAvailabilitySnapshot:
         if error is not None:
             errors.append(f"{label} {error}")
         results[label] = value
-    modal_catalog = results.get("Modal catalog") or ()
+    if include_modal:
+        readiness = results.get("Modal authentication")
+        include_modal = bool(readiness and readiness.verified)
+        if readiness and not include_modal:
+            errors.append(f"Modal {readiness.display}")
+    modal_catalog = (results.get("Modal catalog") or ()) if include_modal else ()
+    if modal_catalog and not any(spec.price_per_hour_usd is not None for spec in modal_catalog):
+        errors.append("Modal GPU rates could not be read.")
+    elif any(spec.stale_since is not None for spec in modal_catalog):
+        oldest = min(spec.stale_since for spec in modal_catalog if spec.stale_since is not None)
+        errors.append(f"Modal pricing refresh failed. Cached rates are {max(0, int(time.monotonic() - oldest)) // 60} min old.")
     prime_offers = results.get("Prime availability") or ()
     vast_offers = results.get("Vast availability") or ()
 
@@ -187,6 +181,7 @@ def load_compute_availability() -> ComputeAvailabilitySnapshot:
         for provider, included in (
             (ComputeProvider.MODAL, include_modal),
             (ComputeProvider.PRIME, include_prime),
+            (ComputeProvider.VAST, bool(vast_credentials.api_key)),
         )
         if included
     )
@@ -368,7 +363,11 @@ def assessed_plans_for_compute_profile(
     del workload
     recipe = quick_deploy_recipe(profile)
     required_vram_gb = profile_required_vram_gb(profile)
-    if recipe.required_vram_gb is None and required_vram_gb > 0:
+    if not math.isfinite(required_vram_gb) or required_vram_gb <= 0:
+        if rejected is not None:
+            rejected.append("Model memory requirements are unknown.")
+        return (), ()
+    if recipe.required_vram_gb is None:
         recipe = replace(recipe, required_vram_gb=required_vram_gb)
     # The topology picker and the assessment below have to agree on how much
     # memory the plan needs. If the picker sized on the formula while the
@@ -389,6 +388,10 @@ def assessed_plans_for_compute_profile(
     plans: list[InferencePlan] = []
     evaluated: list[PlacementAssessment] = []
     for placement in configuration.placements:
+        if placement.provider == ComputeProvider.MODAL and not modal_gpu_supports_fast_deploy(placement.gpu_type):
+            if rejected is not None:
+                rejected.append(f"{placement.gpu_type} can allocate a B300, which requires a CUDA 13.1-compatible runtime.")
+            continue
         if placement.is_spot or recipe.backend not in placement.supported_backends:
             if rejected is not None:
                 if placement.is_spot:
@@ -545,7 +548,7 @@ def _modal_placements(catalog: Sequence[ModalGpuSpec]) -> list[ComputePlacement]
                 gpu_type=gpu_type,
                 gpu_memory_gb=memory_gb,
                 gpu_count_min=1,
-                gpu_count_max=_MODAL_GPU_COUNT_MAX,
+                gpu_count_max=modal_gpu_count_limit(gpu_type),
                 price_per_hour_usd=spec.price_per_hour_usd,
                 billing_model=BillingModel.SCALE_TO_ZERO,
                 availability=QuoteAvailability.UNKNOWN,
@@ -602,8 +605,8 @@ def _prime_placements(offers: Sequence[ComputeOffer]) -> list[ComputePlacement]:
 
 
 def _modal_gpu_memory_gb(gpu_type: str) -> float | None:
-    if gpu_type in _GPU_MEMORY_GB:
-        return _GPU_MEMORY_GB[gpu_type]
+    if gpu_type in MODAL_GPU_MEMORY_GB:
+        return MODAL_GPU_MEMORY_GB[gpu_type]
     normalized = re.sub(r"[^A-Z0-9]+", "-", gpu_type.upper()).strip("-")
     match = re.search(r"(?:^|-)(\d{1,3})GB(?:-|$)", normalized)
     return float(match.group(1)) if match is not None else None

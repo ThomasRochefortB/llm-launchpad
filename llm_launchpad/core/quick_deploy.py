@@ -5,12 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import hashlib
 import shlex
+from threading import Lock
 from collections.abc import Sequence
 
 from ..protocol.enums import (
     BackendType,
     ComputeProvider,
     OperationIntent,
+    QuoteAvailability,
     ServingObjective,
     VisionMode,
 )
@@ -21,6 +23,8 @@ from ..protocol.models import (
     InferencePlan,
     InferenceRecipe,
     LlamacppRequestOptions,
+    ModalProviderOptions,
+    PrimeProviderOptions,
     MemoryEstimate,
     RuntimeTuning,
     ServingRequirements,
@@ -28,6 +32,8 @@ from ..protocol.models import (
     VllmRequestOptions,
     WorkloadProfile,
 )
+from .gguf_metadata import GgufServingMetadata
+from .hf_models import GgufQuantMetadata
 from .inference_options import (
     COST_SCENARIO_WORKDAY,
     InferenceProviderAdapter,
@@ -40,6 +46,9 @@ from .inference_options import (
 from .naming import build_deployment_name, infer_instance_from_app_name, slugify_instance_name
 from .llamacpp_planner import (
     tuning_for_architecture,
+    estimate_memory,
+    attention_head_count,
+    tuning_for_attention_scratch,
     assess_memory_placement,
     compile_server_args,
     tuning_for_gpu_memory,
@@ -83,6 +92,10 @@ class QuickDeployProfile:
     serving_requirements: ServingRequirements | None = None
     runtime_tuning: RuntimeTuning | None = None
     memory_estimate: MemoryEstimate | None = None
+    serving_metadata: GgufServingMetadata | None = None
+    context_known: bool = True
+    parameter_count_b: float | None = None
+    active_parameter_count_b: float | None = None
 
 
 @dataclass(frozen=True)
@@ -117,6 +130,7 @@ _PENDING_CATALOG_INFO = QuickDeployCatalogInfo(
     ready=False,
 )
 _EMPTY_PROFILES: tuple[QuickDeployProfile, ...] = ()
+_CATALOG_LOCK = Lock()
 _CATALOG_CACHE: tuple[QuickDeployCatalogInfo, tuple[QuickDeployProfile, ...]] | None = None
 
 
@@ -147,50 +161,54 @@ def activate_quick_deploy_catalog(
 
     global _CATALOG_CACHE
     catalog = (info, tuple(profiles))
-    if not catalog[1]:
+    if not catalog[1] and not info.exclusions:
         raise ValueError("Cannot activate an empty quick-deploy catalog")
-    _CATALOG_CACHE = catalog
+    with _CATALOG_LOCK:
+        _CATALOG_CACHE = catalog
     return catalog
 
 
 def _load_quick_deploy_catalog() -> tuple[QuickDeployCatalogInfo, tuple[QuickDeployProfile, ...]]:
     global _CATALOG_CACHE
-    if _CATALOG_CACHE is not None:
-        return _CATALOG_CACHE
+    with _CATALOG_LOCK:
+        if _CATALOG_CACHE is not None:
+            return _CATALOG_CACHE
     try:
         from .quick_deploy_refresh import load_cached_quick_deploy_catalog
 
         cached = load_cached_quick_deploy_catalog()
     except Exception:
         cached = None
-    if cached is not None:
-        _CATALOG_CACHE = cached
+    # A live refresh can publish while the picker is reading the disk snapshot.
+    with _CATALOG_LOCK:
+        if _CATALOG_CACHE is None:
+            _CATALOG_CACHE = cached or (_PENDING_CATALOG_INFO, _EMPTY_PROFILES)
         return _CATALOG_CACHE
-    _CATALOG_CACHE = (_PENDING_CATALOG_INFO, _EMPTY_PROFILES)
-    return _CATALOG_CACHE
 
 
 def record_quick_deploy_catalog_failure(error: str) -> bool:
     """Record a live catalog failure; keeps any existing live catalog."""
 
     global _CATALOG_CACHE
-    if _CATALOG_CACHE is not None and _CATALOG_CACHE[1]:
-        return False
-    detail = error.strip() or "The live model catalog could not be reached."
-    _CATALOG_CACHE = (
-        QuickDeployCatalogInfo(
-            source_label="Live catalog unavailable",
-            ready=False,
-            error=detail,
-        ),
-        _EMPTY_PROFILES,
-    )
+    with _CATALOG_LOCK:
+        if _CATALOG_CACHE is not None and _CATALOG_CACHE[1]:
+            return False
+        detail = error.strip() or "The live model catalog could not be reached."
+        _CATALOG_CACHE = (
+            QuickDeployCatalogInfo(
+                source_label="Live catalog unavailable",
+                ready=False,
+                error=detail,
+            ),
+            _EMPTY_PROFILES,
+        )
     return True
 
 
 def _reset_quick_deploy_catalog_cache() -> None:
     global _CATALOG_CACHE
-    _CATALOG_CACHE = None
+    with _CATALOG_LOCK:
+        _CATALOG_CACHE = None
 
 
 def format_hourly_cost(value: float) -> str:
@@ -333,10 +351,41 @@ def list_quick_deploy_models(
             model.quality_rank is None,
             model.quality_rank if model.quality_rank is not None else 10**9,
             -(model.quality_score or 0.0),
-            model.display_name.casefold(),
+            model.display_name.casefold() if model.quality_score is not None else "",
         )
     )
     return tuple(models)
+
+
+def model_for_context(model: QuickDeployModel, tokens: int) -> QuickDeployModel | None:
+    """Replan an explicit context using the GGUF layout and original weight size."""
+    if tokens == model.max_context_tokens:
+        return model
+    if tokens <= 0 or tokens > model.max_context_tokens:
+        return None
+    profiles: list[QuickDeployProfile] = []
+    for profile in model.profiles:
+        layout = profile.serving_metadata
+        req, tuning, memory = profile.serving_requirements, profile.runtime_tuning, profile.memory_estimate
+        if not layout or not req or not tuning or not memory or tokens >= req.context_tokens:
+            continue
+        metadata = GgufQuantMetadata([], {}, serving_metadata=layout, **{
+            name: getattr(layout, name) for name in (
+                "architecture", "block_count", "embedding_length", "attention_head_count",
+                "attention_head_count_kv", "attention_key_length", "attention_value_length",
+            )
+        })
+        req = replace(req, context_tokens=tokens)
+        tuning = tuning_for_attention_scratch(tuning, context_tokens=tokens, attention_head_count=attention_head_count(metadata))
+        memory = estimate_memory(metadata, weights_gb=memory.weights_gb, requirements=req, tuning=tuning)
+        if memory.source == "conservative-fallback":
+            continue
+        profiles.append(replace(profile, serving_requirements=req, runtime_tuning=tuning,
+                                memory_estimate=memory, required_vram_gb=memory.total_gb,
+                                max_context_tokens=tokens, server_args=compile_server_args(req, tuning)))
+    if not profiles:
+        return None
+    return replace(model, profiles=tuple(profiles), recipes=list_quick_deploy_recipes(profiles), max_context_tokens=tokens)
 
 
 def resolve_quick_deploy_plans(
@@ -389,6 +438,8 @@ def resolve_quick_deploy_plans(
 def plan_is_eligible(plan: InferencePlan) -> bool:
     """Return whether a plan may be offered as a Fast Deploy placement."""
 
+    if plan.quote.availability == QuoteAvailability.UNAVAILABLE:
+        return False
     assessment = plan.assessment
     if assessment is None:
         return True
@@ -836,6 +887,13 @@ def build_quick_deploy_config(
     config.provider_options = plan.quote.provider_options if plan is not None else None
     if plan is not None and plan.quote.price_per_hour_usd is not None:
         config.price_per_hour_usd = plan.quote.price_per_hour_usd
+        if provider == ComputeProvider.MODAL:
+            config.provider_options = ModalProviderOptions(max_hourly_cost_usd=config.price_per_hour_usd)
+        elif provider == ComputeProvider.PRIME:
+            options = config.provider_options
+            if not isinstance(options, PrimeProviderOptions):
+                options = PrimeProviderOptions(offer_id=plan.quote.provider_reference, region=plan.quote.region)
+            config.provider_options = replace(options, max_hourly_cost_usd=config.price_per_hour_usd)
     config.preload = True
     config.do_deploy = True
     # Certified Fast Deploy endpoints must pass runtime attestation and a

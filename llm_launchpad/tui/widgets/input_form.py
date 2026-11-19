@@ -99,12 +99,12 @@ class FormField(Vertical):
 
 
 class ToggleField(Horizontal):
-    """A labelled boolean toggle: label, switch, and the state in words.
+    """A labelled boolean toggle: label, switch, and -- in monochrome -- the state.
 
-    The switch alone distinguishes on from off by colour, which the monochrome
-    theme and the low-colour terminals it exists for both flatten. The state
-    word carries the same information without relying on hue, and laying the
-    row out horizontally keeps a settings form two rows shorter per toggle.
+    The switch's knob sits left for off and right for on, so position already
+    says the state in colour themes. The monochrome theme flattens the knob's
+    colour too, so there the state word is shown beside it. Laying the row out
+    horizontally keeps a settings form two rows shorter per toggle.
     """
 
     DEFAULT_CSS = """
@@ -151,6 +151,10 @@ class ToggleField(Horizontal):
 
     def on_mount(self) -> None:
         self.set_class(self._default, "-on")
+        # The switch's knob position already says on or off; the word is for
+        # the monochrome theme, where the knob's colour is flattened away.
+        monochrome = getattr(getattr(self.app, "_monochrome_filter", None), "enabled", False)
+        self.query_one(".toggle-state", Static).set_class(not monochrome, "hidden")
 
     def on_switch_changed(self, event: Switch.Changed) -> None:
         """Keep the state word in step. The event still reaches the screen."""

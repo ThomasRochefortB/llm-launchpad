@@ -214,9 +214,9 @@ it:
 ```bash
 podman build --format docker \
   -f llm_launchpad/data/vast_llamacpp_ssh.dockerfile \
-  -t ghcr.io/<owner>/llm-launchpad-llamacpp:b10689 .
-podman push ghcr.io/<owner>/llm-launchpad-llamacpp:b10689
-skopeo inspect docker://ghcr.io/<owner>/llm-launchpad-llamacpp:b10689 | jq -r .Digest
+  -t ghcr.io/<owner>/llm-launchpad-llamacpp:b12464 .
+podman push ghcr.io/<owner>/llm-launchpad-llamacpp:b12464
+skopeo inspect docker://ghcr.io/<owner>/llm-launchpad-llamacpp:b12464 | jq -r .Digest
 ```
 
 Then add a `llamacpp` entry to `llm_launchpad/data/vast_runtime.json` beside the

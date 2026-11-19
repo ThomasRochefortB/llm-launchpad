@@ -53,6 +53,7 @@ class AAModelCandidate:
     parameter_count_b: float | None = None
     max_context_tokens: int | None = None
     huggingface_url: str | None = None
+    active_parameter_count_b: float | None = None
 
 @dataclass(frozen=True)
 class ArtificialAnalysisAuthStatus:
@@ -132,6 +133,9 @@ def normalize_aa_model_candidates(payload: Any) -> tuple[AAModelCandidate, ...]:
             intelligence_score=intelligence_score,
             rank=0,
             parameter_count_b=_extract_parameter_count_b(row),
+            active_parameter_count_b=_parameter_value_in_billions(
+                row["parameters"].get("active") if isinstance(row.get("parameters"), dict) else row.get("parameters_active")
+            ),
             max_context_tokens=_extract_context_tokens(row),
             huggingface_url=clean_string(row.get("huggingface_url")) or None,
         )
@@ -470,7 +474,7 @@ def _size_bucket_for_parameters(parameter_count_b: float | None) -> ModelSizeBuc
     return "large"
 
 def _model_key(value: str) -> str:
-    cleaned = re.sub(r"\([^)]*\)", "", value.casefold())
+    cleaned = re.sub(r"\(([^)]*)\)", lambda match: match[1] if re.search(r"\d{3,}", match[1]) else "", value.casefold())
     cleaned = re.sub(r"(?i)gguf", "", cleaned)
     return re.sub(r"[^a-z0-9]+", "", cleaned)
 

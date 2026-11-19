@@ -26,7 +26,7 @@ from ..deploy_log_summary import (
     classify_summary_kind,
     summary_progress_parts,
 )
-from ..visual import SUCCESS_STYLE, WARNING_STYLE, labelled_rows_markup, tag
+from ..visual import WARNING_STYLE, labelled_rows_markup, tag
 from ..widgets.deployment_progress import DeploymentProgressWidget
 from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
@@ -136,7 +136,7 @@ class MonitorScreen(CopyEnabledScreen):
         Binding("n", "next_search_match", "Next match", show=False),
         Binding("shift+n", "previous_search_match", "Previous match", show=False),
         Binding("v", "toggle_log_view", "Raw/Summary", show=True),
-        Binding("ctrl+l", "clear_log", "Clear log", show=True),
+        Binding("ctrl+l", "clear_log", "Clear log", show=False),
         Binding("enter", "submit_or_finish", "Done", show=True, priority=True),
         Binding("u", "copy_base_url", "Copy URL", show=True),
         Binding("k", "copy_api_key", "Copy key", show=False),
@@ -161,6 +161,12 @@ class MonitorScreen(CopyEnabledScreen):
         if self._done and action in {
             "page_up_log", "page_down_log", "resume_follow", "clear_log",
         }:
+            return False
+        # Paging a log that fits on screen, or following one already followed,
+        # does nothing; the footer drops those keys until they would.
+        if action in {"page_up_log", "page_down_log"} and not self._log_overflows:
+            return False
+        if action == "resume_follow" and self._following:
             return False
         if not self._done and action in {"submit_or_finish", "copy_base_url"}:
             # The result card is hidden until completion; advertising Done and
@@ -188,6 +194,7 @@ class MonitorScreen(CopyEnabledScreen):
         self._last_summary_state_detail = ""
         self._last_error_message = ""
         self._following = True
+        self._log_overflows = False
         self._unseen_lines = 0
         self._line_count = 0
         self._search_query = ""
@@ -217,19 +224,21 @@ class MonitorScreen(CopyEnabledScreen):
     def compose(self) -> ComposeResult:
         with Vertical(id="monitor-layout"):
             yield StatusHeader(id="monitor-status-header")
+            yield DeploymentProgressWidget(self._progress)
+            # The outcome card mounts on demand via _mount_outcome_card, above
+            # the log toolbar: only one of connection/result/failure ever
+            # exists, because each reserves up to 65% of the height and all
+            # three mounted at once overflow short terminals even while hidden.
+            # The toolbar heads the log pane: the progress panel above already
+            # names the operation, so the toolbar only describes the log.
             with Horizontal(id="monitor-toolbar"):
                 yield Static(self._title_markup(), id="monitor-title")
                 yield Static(self._view_status_markup(), id="monitor-view-status")
-            yield DeploymentProgressWidget(self._progress)
             yield Input(
                 placeholder="Search logs; Enter closes, n/N navigates",
                 id="monitor-search",
                 classes="hidden",
             )
-            # The outcome card mounts on demand via _mount_outcome_card: only
-            # one of connection/result/failure ever exists, because each
-            # reserves up to 65% of the height and all three mounted at once
-            # overflow short terminals even while hidden.
             yield LogViewer(id="monitor-log-viewer")
         yield FittedFooter()
 
@@ -259,7 +268,7 @@ class MonitorScreen(CopyEnabledScreen):
         except Exception:
             pass
         try:
-            viewer = self.query_one("#monitor-log-viewer", LogViewer)
+            toolbar = self.query_one("#monitor-toolbar", Horizontal)
             layout = self.query_one("#monitor-layout", Vertical)
         except Exception:
             return
@@ -272,7 +281,7 @@ class MonitorScreen(CopyEnabledScreen):
             card = VerticalScroll(id="failure-card")
         else:
             return
-        layout.mount(card, before=viewer)
+        layout.mount(card, before=toolbar)
         if card_id == "connection-card":
             card.mount(
                 Static("[bold]Connection[/]", id="connection-card-title"),
@@ -283,7 +292,6 @@ class MonitorScreen(CopyEnabledScreen):
             actions.mount(
                 Button("Copy URL", id="copy-url-btn"),
                 Button("Copy API key", id="copy-key-btn"),
-                Button("Copy all", id="copy-all-btn"),
                 Button("Manage endpoint", id="connection-manage-btn"),
                 Button("Done", id="connection-done-btn", variant="primary"),
             )
@@ -320,19 +328,19 @@ class MonitorScreen(CopyEnabledScreen):
         return self._title
 
     def _title_markup(self) -> str:
-        """Render a compact operation title."""
-        return f"[bold]{escape(self._title)}[/]"
+        """Label the log pane; the progress panel names the operation."""
+        return "[dim]Log[/]"
 
     def _view_status_markup(self) -> str:
-        """Render live follow and line-count state for the log viewport."""
+        """Render line count, and the follow state only once it is paused."""
         line_label = "line" if self._line_count == 1 else "lines"
         if self._following:
-            state = tag("FOLLOWING", SUCCESS_STYLE)
+            state = ""
         else:
             new_label = "line" if self._unseen_lines == 1 else "lines"
             state = (
                 f"{tag('PAUSED', WARNING_STYLE)}  "
-                f"[$warning]{self._unseen_lines} new {new_label}[/]"
+                f"[$warning]{self._unseen_lines} new {new_label}[/]  "
             )
         search = ""
         if self._search_query:
@@ -342,8 +350,8 @@ class MonitorScreen(CopyEnabledScreen):
                 f"{self._search_current}/{self._search_total}[/dim]"
             )
         return (
-            f"{state}  [dim]· {self._line_count} {line_label} · "
-            f"{self._view_mode.upper()}[/dim]{search}"
+            f"{state}[dim]{self._line_count} {line_label} · "
+            f"{self._view_mode}[/dim]{search}"
         )
 
     @property
@@ -547,7 +555,7 @@ class MonitorScreen(CopyEnabledScreen):
             self.status_header.report_failure()
         self._append_log_line("")
         if message.success:
-            self._append_log_line(f"Operation complete ({message.operation.value}).")
+            # The progress panel already reads Complete; no closing log line.
             self._show_result_card(message)
         else:
             self._append_log_line(f"Operation failed (exit code {message.exit_code}).")
@@ -705,9 +713,17 @@ class MonitorScreen(CopyEnabledScreen):
 
     def on_log_viewer_status_changed(self, message: LogViewer.StatusChanged) -> None:
         """Keep compact monitor chrome synchronized with the log viewport."""
+        overflows = self._log_overflows
+        following = self._following
         self._following = message.following
         self._unseen_lines = message.unseen_lines
         self._line_count = message.line_count
+        try:
+            self._log_overflows = self.log_viewer.log_widget.max_scroll_y > 0
+        except Exception:
+            self._log_overflows = True
+        if (overflows, following) != (self._log_overflows, self._following):
+            self.refresh_bindings()
         self.query_one("#monitor-view-status", Static).update(
             self._view_status_markup()
         )
@@ -790,6 +806,13 @@ class MonitorScreen(CopyEnabledScreen):
     def action_copy_api_key(self) -> None:
         self._copy_connection_field("api_key", empty_message="No API key to copy")
 
+    def action_copy_text(self) -> None:
+        """Copy a selection, or the connection details once the endpoint is up."""
+        if self._connection_payload is not None and not self._selected_text_for_copy():
+            self.action_copy_connection()
+            return
+        super().action_copy_text()
+
     def action_copy_connection(self) -> None:
         payload = self._connection_payload
         if payload is None:
@@ -807,8 +830,6 @@ class MonitorScreen(CopyEnabledScreen):
             self.action_copy_base_url()
         elif event.button.id == "copy-key-btn":
             self.action_copy_api_key()
-        elif event.button.id == "copy-all-btn":
-            self.action_copy_connection()
         elif event.button.id == "connection-manage-btn":
             self.action_open_manage()
         elif event.button.id == "connection-done-btn":
@@ -907,6 +928,7 @@ class MonitorScreen(CopyEnabledScreen):
         self._summary_log_lines = []
         self._summary_items = []
         self._following = True
+        self._log_overflows = False
         self._unseen_lines = 0
         self._line_count = 0
         self._result_rows = []
