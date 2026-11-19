@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import replace
+
 from rich.markup import escape
 
 from ..format import format_free_tier, format_gib, format_money
@@ -25,7 +28,6 @@ from ...protocol.models import StorageSnapshot, StoredModelInfo
 from ..navigation import (
     first_enabled_option_index,
     is_focusable_for_navigation,
-    move_focus_across_option_lists,
     move_focus_across_widgets,
 )
 from ..workers import PrimeDisksFailed, PrimeDisksLoaded, StorageFailed, StorageLoaded
@@ -52,6 +54,29 @@ def _model_label(row: StoredModelInfo) -> str:
     if row.incomplete:
         return f"{row.model_id} (INCOMPLETE)"
     return row.model_id
+
+
+# A model cached at several quants is one row per quant, so each can be deleted
+# on its own; the name is written once and the rows under it only say what
+# differs. Keyed by row identity for the table currently shown.
+_CONTINUATION_MARK = "  └"
+
+
+def _grouped_model_label(continuations: set[str]) -> Callable[[StoredModelInfo], str]:
+    def label(row: StoredModelInfo) -> str:
+        if _storage_row_key(row) in continuations:
+            return _CONTINUATION_MARK + (" (INCOMPLETE)" if row.incomplete else "")
+        return _model_label(row)
+
+    return label
+
+
+def _short_revision(row: StoredModelInfo) -> str:
+    """A commit hash is only ever compared, and seven characters do that."""
+    revision = row.revision or ""
+    if len(revision) == 40 and all(char in "0123456789abcdef" for char in revision):
+        return revision[:7]
+    return revision or "-"
 
 
 def _storage_row_key(row: StoredModelInfo) -> str:
@@ -91,7 +116,7 @@ _STORAGE_COLUMNS = (
     AdaptiveColumn.visible(
         "revision",
         "revision",
-        lambda row: row.revision or "-",
+        _short_revision,
         _WIDE,
     ),
     AdaptiveColumn.visible(
@@ -106,6 +131,7 @@ _STORAGE_COLUMNS = (
         "files",
         lambda row: str(row.file_count),
         _WIDE,
+        justify="right",
     ),
     AdaptiveColumn.visible(
         "size",
@@ -114,6 +140,7 @@ _STORAGE_COLUMNS = (
         _WIDE,
         _STANDARD,
         _COMPACT,
+        justify="right",
     ),
     AdaptiveColumn.visible(
         "cost",
@@ -122,6 +149,7 @@ _STORAGE_COLUMNS = (
         _WIDE,
         _STANDARD,
         _COMPACT,
+        justify="right",
     ),
     AdaptiveColumn.visible(
         "summary",
@@ -133,6 +161,15 @@ _STORAGE_COLUMNS = (
         _MINIMAL,
     ),
 )
+
+
+def _storage_columns(continuations: set[str]) -> tuple[AdaptiveColumn, ...]:
+    """The inventory columns, with repeated model names grouped."""
+    grouped = _grouped_model_label(continuations)
+    return tuple(
+        replace(column, value=grouped) if column.key == "model" else column
+        for column in _STORAGE_COLUMNS
+    )
 
 
 def _current_row_key(table: AdaptiveDataTable) -> str | None:
@@ -162,15 +199,14 @@ class StorageScreen(CopyEnabledScreen):
         Binding("escape", "pop_screen", "Back", show=True),
         Binding("r", "refresh_storage", "Refresh", show=True),
         Binding("p", "predownload_selected", "Pre-download", show=True),
+        Binding("n", "toggle_predownload_form", "New download", show=True),
         Binding("x", "delete_selected_model", "Delete", show=True),
-        Binding("/", "focus_model_filter", "Filter", show=True),
+        Binding("/", "focus_model_filter", "Filter", show=False),
     ]
     NAVIGATION_ORDER = (
         "storage-provider-filter",
-        "storage-backend-filter",
-        "storage-table",
         "storage-filter",
-        "storage-predownload-toggle",
+        "storage-table",
         "storage-model-id",
         "storage-model-backend",
         "storage-model-quant",
@@ -181,12 +217,13 @@ class StorageScreen(CopyEnabledScreen):
     def __init__(self, initial_backend: BackendType | None = None) -> None:
         super().__init__()
         self._initial_backend = initial_backend
-        self._table_filter = ""
         self._selected_provider = ComputeProvider.MODAL
         self._prime_disks: list[object] = []
         self._prime_error: str | None = None
         self._selected_prime_disk_id: str | None = None
         self._predownload_expanded = False
+        self._continuations: set[str] = set()
+        self._table_filter = initial_backend.value if initial_backend else ""
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="storage-scroll", classes="screen-scroll"):
@@ -208,33 +245,22 @@ class StorageScreen(CopyEnabledScreen):
                         allow_blank=False,
                         id="storage-provider-filter",
                     )
+                # One text filter covers the model and backend columns; a
+                # separate backend dropdown restated the table's first column.
                 with Vertical(id="storage-backend-group"):
-                    yield Static("[bold]Backend[/bold]")
-                    yield Select(
-                        options=[
-                            ("All backends", "all"),
-                            ("llama.cpp", "llamacpp"),
-                            ("vLLM", "vllm"),
-                        ],
-                        value="all",
-                        allow_blank=False,
-                        id="storage-backend-filter",
+                    yield Static("[bold]Filter[/bold]")
+                    yield Input(
+                        value=self._initial_backend.value if self._initial_backend else "",
+                        placeholder="model or backend",
+                        id="storage-filter",
                     )
-            yield Input(
-                placeholder="Filter models (type to filter)",
-                id="storage-filter",
-            )
             yield AdaptiveDataTable(id="storage-table", fit_to_rows=True)
             # A table showing only its header cannot say whether nothing is
             # cached, the filter excluded everything, or the refresh failed.
             yield Static("", id="storage-empty", classes="hidden")
-            # The footer names the p and x keys already; what it cannot say is
-            # that they act on whichever row is selected here. The button
-            # shares the row so it is not the first thing pushed off an 80x24
-            # screen.
-            with Horizontal(id="storage-hint-row"):
-                yield Static("", id="storage-hint")
-                yield Button("Pre-download a model...", id="storage-predownload-toggle")
+            # Only Prime's and Vast's inventory limits are news; the footer
+            # carries the keys.
+            yield Static("", id="storage-hint", classes="hidden")
             with Vertical(id="storage-predownload-form"):
                 yield Static("[bold]Pre-download a model[/bold]")
                 yield Input(
@@ -263,7 +289,6 @@ class StorageScreen(CopyEnabledScreen):
 
     def on_mount(self) -> None:
         self._snapshot = StorageSnapshot(llamacpp_models=[], vllm_models=[])
-        self._selected_filter: BackendType | None = self._initial_backend
         self._rows_by_key: dict[str, StoredModelInfo] = {}
         self._selected_model: StoredModelInfo | None = None
         self._was_suspended = False
@@ -274,14 +299,12 @@ class StorageScreen(CopyEnabledScreen):
         table.cursor_type = "row"
         table.zebra_stripes = True
         table.configure(
-            _STORAGE_COLUMNS,
+            _storage_columns(self._continuations),
             row_key=_storage_row_key,
             profile=self.viewport_profile,
         )
         if self._initial_backend is not None:
             self.query_one("#storage-model-backend", Select).value = self._initial_backend.value
-            backend_filter = self.query_one("#storage-backend-filter", Select)
-            backend_filter.value = self._initial_backend.value
         self._sync_predownload_visibility()
         self._render_scope()
         self.call_after_refresh(self._focus_first_visible_navigation_target)
@@ -300,9 +323,9 @@ class StorageScreen(CopyEnabledScreen):
         lead = f"{escape(note[:1].upper() + note[1:])}. " if note else ""
         try:
             self.query_one("#storage-provider-label", Static).update("[bold]Provider[/bold]")
-            self.query_one("#storage-hint", Static).update(
-                f"[dim]{lead}p and x act on the selected row.[/dim]"
-            )
+            hint = self.query_one("#storage-hint", Static)
+            hint.update(f"[dim]{lead.strip()}[/dim]" if lead else "")
+            hint.set_class(not lead, "hidden")
         except Exception:
             pass
 
@@ -329,16 +352,6 @@ class StorageScreen(CopyEnabledScreen):
         table.set_viewport_profile(profile)
 
     def on_select_changed(self, event: Select.Changed) -> None:
-        if event.select.id == "storage-backend-filter":
-            value = str(event.value or "").strip().lower()
-            if value == "llamacpp":
-                self._selected_filter = BackendType.LLAMACPP
-            elif value == "vllm":
-                self._selected_filter = BackendType.VLLM
-            else:
-                self._selected_filter = None
-            self._render_table()
-            return
         if event.select.id != "storage-provider-filter":
             return
         value = str(event.value or "").strip().lower()
@@ -508,11 +521,18 @@ class StorageScreen(CopyEnabledScreen):
             self._render_empty_state(rows)
             return
         rows = self._snapshot.llamacpp_models + self._snapshot.vllm_models
-        if self._selected_filter is not None:
-            rows = [row for row in rows if row.backend == self._selected_filter]
         query = self._table_filter.strip().casefold()
         if query:
-            rows = [row for row in rows if query in row.model_id.casefold()]
+            rows = [
+                row for row in rows
+                if query in row.model_id.casefold() or query in row.backend.value
+            ]
+        self._continuations.clear()
+        self._continuations.update(
+            _storage_row_key(row)
+            for previous, row in zip(rows, rows[1:], strict=False)
+            if (previous.backend, previous.model_id) == (row.backend, row.model_id)
+        )
         self._rows_by_key = {_storage_row_key(row): row for row in rows}
         if (
             self._selected_model is not None
@@ -560,8 +580,8 @@ class StorageScreen(CopyEnabledScreen):
             message = "[dim]No cached model matches the current filter.[/dim]"
         else:
             message = (
-                "[dim]No models cached yet. Pre-download one below, or deploy "
-                "a model and it will be cached for you.[/dim]"
+                "[dim]No models cached yet · n to pre-download one, or deploy "
+                "and it is cached for you[/dim]"
             )
         empty.update(message)
         empty.remove_class("hidden")
@@ -634,12 +654,6 @@ class StorageScreen(CopyEnabledScreen):
         )
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "storage-predownload-toggle":
-            self._predownload_expanded = not self._predownload_expanded
-            self._sync_predownload_visibility()
-            if self._predownload_expanded:
-                self.query_one("#storage-model-id", Input).focus()
-            return
         if event.button.id == "storage-predownload-btn":
             self.action_predownload_selected()
 
@@ -652,14 +666,9 @@ class StorageScreen(CopyEnabledScreen):
         """
         try:
             form = self.query_one("#storage-predownload-form")
-            toggle = self.query_one("#storage-predownload-toggle", Button)
         except NoMatches:
             return
         form.display = self._predownload_expanded
-        toggle.label = (
-            "Hide pre-download form" if self._predownload_expanded
-            else "Pre-download a model..."
-        )
 
     def action_toggle_predownload_form(self) -> None:
         """Expand the pre-download form; pre-download acts on typed values."""
@@ -711,14 +720,10 @@ class StorageScreen(CopyEnabledScreen):
         self.app.pop_screen()
 
     def action_navigate_option_list_down(self) -> None:
-        if move_focus_across_option_lists(
-            self,
-            ("storage-backend-filter",),
-            direction=1,
-            is_focusable=_is_focusable_for_arrow_navigation,
-        ):
-            return
         focused = self.focused
+        if isinstance(focused, OptionList):
+            # An open dropdown keeps its arrow keys.
+            raise SkipAction()
         if isinstance(focused, DataTable) and focused.row_count > 0 and focused.cursor_row < focused.row_count - 1:
             raise SkipAction()
         if move_focus_across_widgets(
@@ -732,14 +737,10 @@ class StorageScreen(CopyEnabledScreen):
         raise SkipAction()
 
     def action_navigate_option_list_up(self) -> None:
-        if move_focus_across_option_lists(
-            self,
-            ("storage-backend-filter",),
-            direction=-1,
-            is_focusable=_is_focusable_for_arrow_navigation,
-        ):
-            return
         focused = self.focused
+        if isinstance(focused, OptionList):
+            # An open dropdown keeps its arrow keys.
+            raise SkipAction()
         if isinstance(focused, DataTable) and focused.row_count > 0 and focused.cursor_row > 0:
             raise SkipAction()
         if move_focus_across_widgets(

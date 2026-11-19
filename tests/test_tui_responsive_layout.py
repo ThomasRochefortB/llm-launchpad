@@ -14,8 +14,9 @@ from textual.widgets import Footer, Input, OptionList, Static
 from textual.widgets._footer import FooterKey
 
 from llm_launchpad.core.compute_availability import aggregate_compute_availability
-from llm_launchpad.protocol.enums import BackendType, OperationType
-from llm_launchpad.protocol.models import EndpointInfo
+from llm_launchpad.core.provider_billing import BalanceKind, ProviderBilling
+from llm_launchpad.protocol.enums import BackendType, ComputeProvider, OperationType
+from llm_launchpad.protocol.models import EndpointInfo, StorageSnapshot, StoredModelInfo
 from llm_launchpad.tui.app import TuiApp
 from llm_launchpad.tui.responsive import HeightMode, ViewportProfile, WidthMode
 from llm_launchpad.tui.screens.deploy import (
@@ -24,7 +25,7 @@ from llm_launchpad.tui.screens.deploy import (
     VllmDeployScreen,
 )
 from llm_launchpad.tui.screens.fast_deploy import FastDeployScreen
-from llm_launchpad.tui.screens.main_menu import MainMenuScreen
+from llm_launchpad.tui.screens.main_menu import MainMenuScreen, ProviderBillingLoaded
 from llm_launchpad.tui.screens.manage import (
     BenchmarkOptionsScreen,
     ConnectionInfoScreen,
@@ -143,42 +144,85 @@ class ResponsiveLayoutTests(unittest.IsolatedAsyncioTestCase):
                     self.assertGreater(keys[0].region.width, 0)
                     self.assertEqual(keys[0].region.y, footer.region.bottom - 1)
 
-    async def test_main_menu_hides_secondary_content_when_space_is_constrained(self) -> None:
+    async def test_main_menu_keeps_billing_visible_when_the_side_column_hides(self) -> None:
         from llm_launchpad.tui.screens.main_menu import HomeDetailsScreen
 
         screen = MainMenuScreen(username="alice", version="1.0")
         app = _ScreenApp(screen)
 
-        with patch.object(MainMenuScreen, "on_mount", lambda self: None):
+        with (
+            patch.object(MainMenuScreen, "on_mount", lambda self: None),
+            patch.object(MainMenuScreen, "_refresh_provider_billing") as refresh_billing,
+            patch.object(app, "cached_storage_snapshot", create=True, return_value=None) as cached,
+        ):
             async with app.run_test(size=(140, 45)) as pilot:
                 await pilot.pause()
+                screen._show_deployments([])
                 side_column = screen.query_one("#main-menu-side-column")
-                banner = screen.query_one("#banner-text")
+                billing_summary = screen.query_one("#compact-billing-summary", Static)
+                actions = screen.query_one("#action-list")
                 self.assertTrue(side_column.display)
-                self.assertTrue(banner.display)
+                self.assertFalse(billing_summary.display)
 
                 await pilot.resize_terminal(100, 30)
                 await pilot.pause()
                 self.assertFalse(side_column.display)
                 self.assertTrue(screen.query_one("#auth-status-block").display)
-                self.assertTrue(screen.query_one("#action-list").display)
-                # The compact summary stays visible when panels hide.
+                self.assertTrue(actions.display)
                 self.assertTrue(screen.query_one("#fleet-summary-line").display)
+                self.assertTrue(billing_summary.display)
+                self.assertIn("Modal", str(billing_summary.content))
 
                 screen.action_toggle_details()
                 await pilot.pause()
                 self.assertIsInstance(app.screen, HomeDetailsScreen)
+                billing = app.screen.query_one("#home-details-billing", Static)
+                self.assertIn("checking", str(billing.content))
+                modal_billing = ProviderBilling.ready(
+                    ComputeProvider.MODAL, BalanceKind.SPEND_MTD, 3.25, credits_applied_usd=3.25,
+                )
+                screen.post_message(ProviderBillingLoaded(row=modal_billing))
+                await pilot.pause()
+                self.assertIn("credits used this month $3.25", str(billing.content))
+
+                cached.return_value = StorageSnapshot(
+                    llamacpp_models=[StoredModelInfo(
+                        backend=BackendType.LLAMACPP,
+                        model_id="alice/cached-model",
+                        size_bytes=1026 * 1024**3,
+                    )],
+                    vllm_models=[],
+                )
+                screen._refresh_billing_panels()
+                refresh_billing.assert_called_once_with()
+                self.assertIn("cache est. $0.18/mo · 1 TiB free", str(billing.content))
+
+                cached.return_value = StorageSnapshot(llamacpp_models=[], vllm_models=[])
                 await pilot.press("escape")
                 await pilot.pause()
                 self.assertIs(app.screen, screen)
+                self.assertIn("$3.25", str(billing_summary.content))
+                self.assertIn("cache est. $0.00/mo · 1 TiB free", str(billing_summary.content))
 
-                await pilot.resize_terminal(50, 35)
-                await pilot.pause()
-                self.assertFalse(banner.display)
+                for size in ((80, 24), (80, 22), (50, 35), (40, 12), (120, 16), (200, 15)):
+                    with self.subTest(size=size):
+                        await pilot.resize_terminal(*size)
+                        await pilot.pause()
+                        self.assertFalse(side_column.display)
+                        self.assertTrue(billing_summary.display)
+                        self.assertGreater(billing_summary.region.height, 0)
+                        self.assertTrue(
+                            screen.find_widget(billing_summary).clip.contains_region(billing_summary.region)
+                        )
+                        self.assertFalse(actions.region.intersection(billing_summary.region))
 
-                await pilot.resize_terminal(120, 16)
+                await pilot.resize_terminal(140, 45)
                 await pilot.pause()
-                self.assertFalse(side_column.display)
+                self.assertTrue(side_column.display)
+                self.assertFalse(billing_summary.display)
+                wide_billing = str(screen.query_one("#billing-report-body", Static).content)
+                self.assertIn("$3.25", wide_billing)
+                self.assertIn("cache est. $0.00/mo · 1 TiB free", wide_billing)
 
     async def test_navigation_main_menu_fits_supported_viewports(self) -> None:
         await self._assert_screen_fits_supported_viewports(
@@ -417,6 +461,7 @@ class ResponsiveLayoutTests(unittest.IsolatedAsyncioTestCase):
                 header = screen.query_one("#compact-menu-header", Static)
                 help_text = screen.query_one("#compact-menu-help", Static)
                 summary = screen.query_one("#fleet-summary-line", Static)
+                billing_summary = screen.query_one("#compact-billing-summary", Static)
                 auth = screen.query_one("#auth-status-block", Static)
                 footer = screen.query_one(Footer)
 
@@ -427,7 +472,8 @@ class ResponsiveLayoutTests(unittest.IsolatedAsyncioTestCase):
                 # (the on-screen keyboard open) gives them up.
                 self.assertTrue(footer.display)
                 self.assertLessEqual(summary.region.y - help_text.region.bottom, 2)
-                self.assertLessEqual(auth.region.y - summary.region.bottom, 2)
+                self.assertLessEqual(billing_summary.region.y - summary.region.bottom, 2)
+                self.assertLessEqual(auth.region.y - billing_summary.region.bottom, 2)
                 self.assertLess(auth.region.y, screen.region.height // 2)
 
                 await pilot.resize_terminal(55, 18)

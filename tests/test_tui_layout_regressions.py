@@ -28,7 +28,11 @@ from llm_launchpad.tui.app import TuiApp
 from llm_launchpad.tui.screens import fast_deploy as fast_deploy_module
 from llm_launchpad.tui.screens import main_menu as main_menu_module
 from llm_launchpad.tui.screens.main_menu import MainMenuScreen
-from llm_launchpad.tui.screens.monitor import _connection_card_markup, _result_card_markup
+from llm_launchpad.tui.screens.monitor import (
+    MonitorScreen,
+    _connection_card_markup,
+    _result_card_markup,
+)
 from llm_launchpad.tui.screens.settings import SettingsScreen
 from llm_launchpad.tui.screens.storage import StorageScreen
 from llm_launchpad.tui.widgets.adaptive_table import AdaptiveDataTable
@@ -230,6 +234,12 @@ class FooterFitTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
         return screen
 
+    async def _monitor(self, pilot, app) -> MonitorScreen:
+        screen = MonitorScreen(title="Logs")
+        app.push_screen(screen)
+        await pilot.pause()
+        return screen
+
     async def test_no_hint_is_rendered_half_way_through(self) -> None:
         for width in (80, 100, 120, 140, 200):
             with self.subTest(width=width):
@@ -246,8 +256,10 @@ class FooterFitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_dropped_hints_are_declared_rather_than_silently_cut(self) -> None:
         app = _ReviewApp()
-        async with app.run_test(size=(60, 24)) as pilot:
-            await self._menu(pilot, app)
+        # Home now shows few enough hints to fit; the log monitor still
+        # carries more than 40 columns hold.
+        async with app.run_test(size=(40, 24)) as pilot:
+            await self._monitor(pilot, app)
             rendered = "\n".join(_rendered_lines(app))
             self.assertIn("more (?)", rendered)
             # The shortcut that opens the full list must itself survive.
@@ -296,14 +308,14 @@ class FooterFitTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_widening_the_terminal_restores_the_dropped_hints(self) -> None:
         app = _ReviewApp()
-        async with app.run_test(size=(60, 24)) as pilot:
-            await self._menu(pilot, app)
-            self.assertNotIn("i Details", "\n".join(_rendered_lines(app)))
+        async with app.run_test(size=(40, 24)) as pilot:
+            await self._monitor(pilot, app)
+            self.assertNotIn("v Raw/Summary", "\n".join(_rendered_lines(app)))
 
             await pilot.resize_terminal(200, 30)
             await pilot.pause()
             await pilot.pause()
-            self.assertIn("i Details", "\n".join(_rendered_lines(app)))
+            self.assertIn("v Raw/Summary", "\n".join(_rendered_lines(app)))
 
 
 def _quick_deploy_model(*, mtp: bool) -> "QuickDeployModel":
@@ -654,9 +666,12 @@ class ToggleFieldTests(unittest.IsolatedAsyncioTestCase):
     monochrome theme -- and the terminals it exists for -- flatten."""
 
     async def test_the_state_is_readable_without_colour(self) -> None:
+        from types import SimpleNamespace
+
         from textual.widgets import Switch
 
         app = _StyledApp()
+        app._monochrome_filter = SimpleNamespace(enabled=True)  # type: ignore[attr-defined]
         async with app.run_test(size=(100, 40)) as pilot:
             screen = SettingsScreen()
             app.push_screen(screen)
@@ -665,6 +680,17 @@ class ToggleFieldTests(unittest.IsolatedAsyncioTestCase):
             state = str(field.query_one(".toggle-state", Static).render()).strip()
             self.assertIn(state, {"On", "Off"})
             self.assertIn(state, "\n".join(_rendered_lines(app)))
+
+    async def test_colour_themes_leave_the_state_to_the_switch(self) -> None:
+        from textual.widgets import Switch
+
+        app = _StyledApp()
+        async with app.run_test(size=(100, 40)) as pilot:
+            screen = SettingsScreen()
+            app.push_screen(screen)
+            await pilot.pause()
+            field = screen.query_one("#confirm-quit", Switch).parent
+            self.assertFalse(field.query_one(".toggle-state", Static).display)
 
     async def test_the_state_word_follows_the_switch(self) -> None:
         from textual.widgets import Switch
@@ -820,7 +846,7 @@ class FastDeployHeaderTests(unittest.IsolatedAsyncioTestCase):
 
         row = _model_option(unscored)
         self.assertNotIn("unranked", row)
-        self.assertIn("from", row)
+        self.assertIn("price n/a", row)
         self.assertIn("score", _model_option(scored))
 
 

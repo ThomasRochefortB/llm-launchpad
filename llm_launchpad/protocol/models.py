@@ -29,6 +29,8 @@ from .enums import (
 class ModalProviderOptions:
     """Modal-specific deployment options kept behind the provider boundary."""
 
+    max_hourly_cost_usd: float | None = None
+
 
 @dataclass(frozen=True)
 class PrimeProviderOptions:
@@ -40,6 +42,7 @@ class PrimeProviderOptions:
     keep_failed_resource: bool = False
     allow_insecure_http: bool = False
     auto_disk: bool = True
+    max_hourly_cost_usd: float | None = None
 
 
 @dataclass(frozen=True)
@@ -54,6 +57,8 @@ class VastProviderOptions:
     # can promise without a lookup. An integer is a shape the user approved,
     # and a rental that no longer matches it is refused like a price increase.
     gpu_count: int | None = None
+    max_first_hour_cost_usd: float | None = None
+    download_gb: float = 0.0
 
 
 ProviderOptions = ModalProviderOptions | PrimeProviderOptions | VastProviderOptions

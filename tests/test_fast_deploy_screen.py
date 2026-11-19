@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 from types import SimpleNamespace
 import threading
@@ -193,7 +194,7 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
         _qd._reset_quick_deploy_catalog_cache()
         self._availability_patch = patch(
             "llm_launchpad.tui.screens.fast_deploy.load_compute_availability",
-            return_value=aggregate_compute_availability(),
+            return_value=aggregate_compute_availability(modal_catalog=[ModalGpuSpec("H100", 4.0)]),
         )
         self._availability_patch.start()
 
@@ -203,6 +204,48 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
         self._availability_patch.stop()
         _qd._reset_quick_deploy_catalog_cache()
 
+    async def test_compare_resize_and_refresh_keep_the_quote_or_require_a_new_choice(self) -> None:
+        model = _model((_profile("small", required_vram_gb=8),))
+        specs = [ModalGpuSpec("L4", 0.8), ModalGpuSpec("H100", 3.0), ModalGpuSpec("B200", 5.0)]
+        snapshot = aggregate_compute_availability(modal_catalog=specs)
+        with (
+            patch("llm_launchpad.tui.screens.fast_deploy.list_quick_deploy_models", return_value=(model,)),
+            patch("llm_launchpad.tui.screens.fast_deploy.load_compute_availability", return_value=snapshot) as load,
+            patch.object(FastDeployScreen, "_tiers_for", side_effect=lambda rows: (
+                ServingTier(ECONOMY, "Economy", rows[0].plan),
+                ServingTier(BALANCED, "Balanced", rows[-1].plan, is_recommended=True),
+            ) if len(rows) > 1 else ()),
+        ):
+            app = _StyledApp()
+            async with app.run_test(size=(80, 24)) as pilot:
+                screen = FastDeployScreen()
+                await app.push_screen(screen)
+                await pilot.pause()
+                await pilot.press("enter")
+                choices = screen.query_one("#fast-deploy-list", OptionList)
+                recommended = choices.highlighted_option.id
+                await pilot.press("a", "enter")
+                self.assertEqual(app.quick_deploy_calls[-1][0].quote.id, recommended)
+                await pilot.press("home", "down")
+                selected = choices.highlighted_option.id
+                self.assertNotEqual(recommended, selected)
+                await pilot.press("a")
+                self.assertEqual(choices.highlighted_option.id, selected)
+                await pilot.resize_terminal(140, 45)
+                await pilot.press("r")
+                await pilot.pause()
+                self.assertEqual(choices.highlighted_option.id, selected)
+                load.return_value = aggregate_compute_availability(modal_catalog=specs[:1])
+                await pilot.press("r")
+                await pilot.pause()
+                self.assertIsNone(choices.highlighted)
+                self.assertIn("no longer listed", str(screen.query_one("#fast-deploy-detail", Static).content))
+                await pilot.resize_terminal(80, 24)
+                await pilot.press("enter")
+                self.assertEqual(len(app.quick_deploy_calls), 1)
+                await pilot.press("down", "enter")
+                self.assertEqual(len(app.quick_deploy_calls), 2)
+                self.assertNotEqual(app.quick_deploy_calls[-1][0].quote.id, selected)
 
     async def test_no_price_is_quoted_until_live_placements_answer(self) -> None:
         """The catalog estimate is Modal's list rate, priced at build time.
@@ -260,8 +303,7 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                     with self.subTest(row=row):
                         self.assertNotIn("pricing", row)
 
-    async def test_a_failed_pricing_load_falls_back_to_the_catalog_estimate(self) -> None:
-        # An estimate beats a blank column once there is nothing better coming.
+    async def test_a_failed_pricing_load_leaves_price_unknown(self) -> None:
         model = _model((_profile("available", required_vram_gb=8.0),))
         info = QuickDeployCatalogInfo(source_label="test")
 
@@ -287,7 +329,7 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                     Content.from_markup(str(option_list.get_option_at_index(index).prompt)).plain
                     for index in range(option_list.option_count)
                 ]
-                self.assertTrue(any("$" in row for row in rendered))
+                self.assertFalse(any("$" in row for row in rendered))
                 for row in rendered:
                     with self.subTest(row=row):
                         self.assertNotIn("pricing", row)
@@ -318,7 +360,7 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIs(app.screen, original)
                 self.assertEqual(original._highlighted_model_id(), model.id)
 
-    async def test_size_sections_preserve_rank_and_keyboard_selection_across_resize(self) -> None:
+    async def test_catalog_preserves_rank_and_keyboard_selection_across_resize(self) -> None:
         # Catalog rank order deliberately interleaves sizes and differs from name order.
         models = tuple(
             _model((replace(_profile(name, required_vram_gb=8.0), model_size_label=size),))
@@ -343,9 +385,9 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 options = screen.query_one("#fast-deploy-list", OptionList)
                 self.assertEqual(
                     [options.get_option_at_index(i).id for i in range(options.option_count)],
-                    [None, "z-small", "a-small", None, "medium", None, "large", None, "unknown"],
+                    ["large", "z-small", "medium", "a-small", "unknown"],
                 )
-                self.assertEqual(screen._highlighted_model_id(), "z-small")
+                self.assertEqual(screen._highlighted_model_id(), "large")
                 await pilot.press("down", "down")
                 self.assertEqual(screen._highlighted_model_id(), "medium")
                 self.assertIn("Medium", str(screen.query_one("#fast-deploy-detail", Static).content))
@@ -357,14 +399,6 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(screen._highlighted_model_id(), "medium")
                         if size == (40, 12):
                             self.assertGreaterEqual(options.scroll_y, 0)
-                        for index, heading in (
-                            (0, "Small · ≤40B"), (3, "Medium · >40–150B"),
-                            (5, "Large · >150B"), (7, "Size unknown"),
-                        ):
-                            option = options.get_option_at_index(index)
-                            self.assertTrue(option.disabled)
-                            self.assertIn(heading, str(option.prompt))
-
                 with patch.object(screen, "_choose") as choose:
                     await pilot.press("enter")
                     choose.assert_called_once_with("medium")
@@ -391,13 +425,12 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 screen = app.screen
                 assert isinstance(screen, FastDeployScreen)
-                await pilot.press("v")
                 options = screen.query_one("#fast-deploy-list", OptionList)
                 self.assertEqual(
                     [options.get_option_at_index(i).id for i in range(options.option_count)],
-                    [None, *(model.id for model in models[:10])],
+                    [model.id for model in models[:10]],
                 )
-                self.assertIn("all sizes", str(options.get_option_at_index(0).prompt))
+                self.assertTrue(screen._show_top_models)
                 await pilot.press("down")
                 selected = screen._highlighted_model_id()
                 await pilot.resize_terminal(80, 24)
@@ -425,13 +458,11 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 screen = app.screen
                 assert isinstance(screen, FastDeployScreen)
-                await pilot.press("v")
                 self.assertEqual([model.id for model in screen._visible_models()], ["high", "low"])
                 search = screen.query_one("#fast-deploy-model-search", Input)
                 search.value = "unranked"
                 await pilot.pause()
-                self.assertEqual(screen._visible_models(), ())
-                self.assertIn("No AA-scored", str(screen.query_one(OptionList).get_option_at_index(0).prompt))
+                self.assertEqual([model.id for model in screen._visible_models()], ["unranked"])
                 search.value = "low"
                 await pilot.pause()
                 self.assertEqual([model.id for model in screen._visible_models()], ["low"])
@@ -458,18 +489,58 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(search.value, "med")
                 self.assertIs(screen.focused, search)
                 options = screen.query_one("#fast-deploy-list", OptionList)
-                self.assertEqual(options.option_count, 2)
+                self.assertEqual(options.option_count, 1)
                 self.assertIn("Medium", str(options.get_option_at_index(0).prompt))
                 self.assertEqual(screen._highlighted_model_id(), "medium")
 
                 search.value = ""
                 await pilot.pause()
-                self.assertEqual(options.option_count, 4)
+                self.assertEqual(options.option_count, 2)
                 self.assertEqual(screen._highlighted_model_id(), "medium")
                 search.value = "no-match"
                 await pilot.pause()
                 self.assertEqual(options.option_count, 1)
                 self.assertTrue(options.get_option_at_index(0).disabled)
+
+    async def test_search_browses_every_match_and_returns_to_the_chosen_model(self) -> None:
+        models = tuple(
+            _model((replace(
+                _profile(f"model-{i}", required_vram_gb=8, display_name=f"Reasoning {i}"),
+                model_size_label="Small",
+            ),))
+            for i in range(5)
+        )
+        with patch("llm_launchpad.tui.screens.fast_deploy.list_quick_deploy_models", return_value=models):
+            app = _StyledApp()
+            async with app.run_test(size=(80, 24)) as pilot:
+                app.push_screen(FastDeployScreen())
+                await pilot.pause()
+                screen = app.screen
+                assert isinstance(screen, FastDeployScreen)
+                self.assertEqual(len(screen._visible_models()), 5)
+                search = screen.query_one(Input)
+                await pilot.press("/", *"acme", "slash", *"model", "space", *"reason")
+                self.assertEqual(search.value, "acme/model reason")
+                self.assertEqual(screen._visible_models(), models)
+                await pilot.press("down")
+                self.assertIs(screen.focused, screen.query_one(OptionList))
+                await pilot.press("end")
+                self.assertEqual(screen._highlighted_model_id(), "model-4")
+                await pilot.press("/", "enter")
+                self.assertEqual(screen._selected_model, models[-1])
+                await pilot.press("escape")
+                self.assertEqual(screen._phase, "models")
+                self.assertEqual(screen._highlighted_model_id(), "model-4")
+                self.assertEqual(search.value, "acme/model reason")
+
+                search.focus()
+                await pilot.press("z", "enter")
+                self.assertEqual(screen._phase, "models")
+                self.assertIs(screen.focused, search)
+                await pilot.press("escape")
+                self.assertEqual(search.value, "")
+                self.assertEqual(len(screen._visible_models()), 5)
+                self.assertIs(screen.focused, screen.query_one(OptionList))
 
     async def test_model_list_renders_catalog_models(self) -> None:
         model = _model((_profile("test-model", required_vram_gb=100.0),))
@@ -486,10 +557,12 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 assert isinstance(screen, FastDeployScreen)
                 option_list = screen.query_one("#fast-deploy-list", OptionList)
                 self.assertEqual(option_list.option_count, 1)
-                prompt = str(option_list.get_option_at_index(0).prompt)
+                prompt = Content.from_markup(
+                    str(option_list.get_option_at_index(0).prompt)
+                ).plain
                 self.assertIn("Test Model", prompt)
                 self.assertIn("score 12.5", prompt)
-                self.assertIn("from ~$4.00/hr", prompt)
+                self.assertIn("from ~$8.00/hr", prompt)
 
     async def test_infra_rows_sorted_cheapest_first_and_routes_selection(self) -> None:
         model = _model((_profile("fits", required_vram_gb=100.0),))
@@ -514,6 +587,7 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 screen.on_fast_deploy_availability_loaded(
                     FastDeployAvailabilityLoaded(snapshot)
                 )
+                await screen.workers.wait_for_complete()
                 await pilot.pause()
 
                 option_list = screen.query_one("#fast-deploy-list", OptionList)
@@ -561,6 +635,7 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 screen.on_fast_deploy_availability_loaded(
                     FastDeployAvailabilityLoaded(snapshot)
                 )
+                await screen.workers.wait_for_complete()
                 await pilot.pause()
 
                 status = str(screen.query_one("#fast-deploy-status", Static).content)
@@ -596,6 +671,7 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 screen.on_fast_deploy_availability_loaded(
                     FastDeployAvailabilityLoaded(snapshot)
                 )
+                await screen.workers.wait_for_complete()
                 await pilot.pause()
 
                 self.assertEqual(screen._phase, "infra")
@@ -603,7 +679,7 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(screen.check_action("show_excluded_models", ()))
                 self.assertTrue(screen.check_action("toggle_all_placements", ()))
 
-    async def test_availability_failure_renders_catalog_estimates(self) -> None:
+    async def test_availability_failure_cannot_authorize_a_cached_placement(self) -> None:
         model = _model((_profile("too-large", required_vram_gb=200.0),))
         app = _TestApp()
         with patch(
@@ -625,19 +701,12 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 option_list = screen.query_one("#fast-deploy-list", OptionList)
                 self.assertEqual(option_list.option_count, 1)
                 prompt = str(option_list.get_option_at_index(0).prompt)
-                self.assertIn("H100x1", prompt)
-                detail = str(screen.query_one("#fast-deploy-detail", Static).content)
-                self.assertIn("catalog estimate", detail)
-                status = str(screen.query_one("#fast-deploy-status", Static).renderable)
-                self.assertIn("availability unavailable", status)
-                self.assertIn("provider down", status)
-
+                self.assertIn("No current placement", prompt)
+                self.assertTrue(option_list.get_option_at_index(0).disabled)
+                self.assertIn("provider down", str(screen.query_one("#fast-deploy-detail", Static).content))
                 await pilot.press("enter")
                 await pilot.pause()
-
-        self.assertEqual(len(app.quick_deploy_calls), 1)
-        selected, alternatives = app.quick_deploy_calls[0]
-        self.assertEqual(alternatives, (selected,))
+        self.assertEqual(app.quick_deploy_calls, [])
 
     async def test_prime_only_no_fit_does_not_route_catalog_fallback_to_modal(self) -> None:
         model = _model((_profile("too-large", required_vram_gb=200.0),))
@@ -661,6 +730,7 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 screen.on_fast_deploy_availability_loaded(
                     FastDeployAvailabilityLoaded(snapshot)
                 )
+                await screen.workers.wait_for_complete()
                 await pilot.pause()
 
                 await pilot.press("enter")
@@ -668,7 +738,7 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(app.quick_deploy_calls, [])
 
-    async def test_no_fit_snapshot_falls_back_to_catalog_estimates(self) -> None:
+    async def test_no_fit_snapshot_shows_the_placement_blocker(self) -> None:
         model = _model((_profile("too-large", required_vram_gb=200.0),))
         snapshot = aggregate_compute_availability(
             modal_catalog=[ModalGpuSpec("T4", price_per_hour_usd=0.5)]
@@ -688,12 +758,14 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 screen.on_fast_deploy_availability_loaded(
                     FastDeployAvailabilityLoaded(snapshot)
                 )
+                await screen.workers.wait_for_complete()
                 await pilot.pause()
 
                 option_list = screen.query_one("#fast-deploy-list", OptionList)
                 self.assertEqual(option_list.option_count, 1)
                 status = str(screen.query_one("#fast-deploy-status", Static).renderable)
-                self.assertIn("No connected placement fits", status)
+                self.assertIn("refresh offers", status)
+                self.assertIn("No priced placement fits", str(screen.query_one("#fast-deploy-detail", Static).content))
 
     async def test_shared_recipe_profiles_do_not_duplicate_option_ids(self) -> None:
         model = _shared_recipe_model()
@@ -730,6 +802,7 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 screen.on_fast_deploy_availability_loaded(
                     FastDeployAvailabilityLoaded(snapshot)
                 )
+                await screen.workers.wait_for_complete()
                 await pilot.pause()
 
                 option_list = screen.query_one("#fast-deploy-list", OptionList)
@@ -782,6 +855,86 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             {plan.quote.region for plan in rows[0].alternative_plans},
             {"US", "IN"},
         )
+
+    async def test_search_and_refresh_stay_responsive_during_placement_pricing(self) -> None:
+        model = _model((_profile("fits", required_vram_gb=20),))
+        old = aggregate_compute_availability(modal_catalog=[ModalGpuSpec("L4", 9.0)])
+        new = aggregate_compute_availability(modal_catalog=[ModalGpuSpec("L4", 1.0)])
+        started, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+        def price(model, snapshot, **kwargs):
+            if snapshot is old:
+                started.set()
+                try:
+                    if not release.wait(5):
+                        raise TimeoutError("Search never responded while pricing was in progress")
+                    return infra_rows_for_model(model, snapshot, **kwargs)
+                finally:
+                    finished.set()
+            return infra_rows_for_model(model, snapshot, **kwargs)
+
+        path = "llm_launchpad.tui.screens.fast_deploy"
+        app = _StyledApp()
+        with (
+            patch(f"{path}.list_quick_deploy_models", return_value=(model,)),
+            patch(f"{path}.load_compute_availability", side_effect=(old, new)),
+            patch(f"{path}.infra_rows_for_model", side_effect=price),
+        ):
+            async with app.run_test(size=(80, 24)) as pilot:
+                screen = FastDeployScreen()
+                await app.push_screen(screen)
+                try:
+                    self.assertTrue(await asyncio.to_thread(started.wait, 2))
+                    await pilot.press("/", "f", "i", "t")
+                    self.assertEqual(screen.query_one(Input).value, "fit")
+                    self.assertFalse(finished.is_set())
+                    await pilot.press("down", "r")
+                    await screen.workers.wait_for_complete()
+                    await pilot.pause()
+                    options = screen.query_one(OptionList)
+                    self.assertIn("$1.00/hr", str(options.get_option_at_index(0).prompt))
+                finally:
+                    release.set()
+                self.assertTrue(await asyncio.to_thread(finished.wait, 2))
+                await pilot.pause()
+                self.assertIn("$1.00/hr", str(options.get_option_at_index(0).prompt))
+                self.assertEqual(screen.query_one(Input).value, "fit")
+
+    async def test_back_still_works_while_pricing_shorter_contexts(self) -> None:
+        from llm_launchpad.tui.screens.fast_deploy import _price_shorter_contexts
+
+        model = _model((_profile("fits", required_vram_gb=20),))
+        started, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+        def shorter(model, snapshot):
+            started.set()
+            try:
+                if not release.wait(5):
+                    raise TimeoutError("Back never responded while pricing shorter contexts")
+                return _price_shorter_contexts(model, snapshot)
+            finally:
+                finished.set()
+
+        path = "llm_launchpad.tui.screens.fast_deploy"
+        app = _StyledApp()
+        with (
+            patch(f"{path}.list_quick_deploy_models", return_value=(model,)),
+            patch(f"{path}._price_shorter_contexts", side_effect=shorter),
+        ):
+            async with app.run_test(size=(80, 24)) as pilot:
+                screen = FastDeployScreen(initial_model_id=model.id)
+                await app.push_screen(screen)
+                try:
+                    self.assertTrue(await asyncio.to_thread(started.wait, 2))
+                    await pilot.press("escape", "/")
+                    self.assertEqual(screen._phase, "models")
+                    self.assertIs(screen.focused, screen.query_one(Input))
+                    self.assertFalse(finished.is_set())
+                finally:
+                    release.set()
+                self.assertTrue(await asyncio.to_thread(finished.wait, 2))
+                await pilot.pause()
+                self.assertEqual(screen._phase, "models")
 
     async def test_escape_during_load_returns_to_models_and_ignores_stale_result(
         self,
@@ -862,8 +1015,8 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 assert isinstance(screen, FastDeployScreen)
                 option_list = screen.query_one("#fast-deploy-list", OptionList)
                 self.assertEqual(option_list.option_count, 1)
-                # The catalog's provenance is the subtitle's job; the status
-                # line counts what is currently listed.
+                # A non-live catalog names its provenance in the subtitle; the
+                # status line counts what is currently listed.
                 self.assertIn(
                     "Bundled catalog",
                     str(screen.query_one("#fast-deploy-subtitle", Static).renderable),
@@ -879,10 +1032,11 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
                 option_list = screen.query_one("#fast-deploy-list", OptionList)
                 self.assertEqual(option_list.option_count, 2)
-                self.assertIn(
-                    "Live AAI rankings",
-                    str(screen.query_one("#fast-deploy-subtitle", Static).renderable),
-                )
+                # The live catalog is the normal case and needs no provenance
+                # line; the subtitle hides rather than restating it.
+                subtitle = screen.query_one("#fast-deploy-subtitle", Static)
+                self.assertNotIn("Live AAI rankings", str(subtitle.renderable))
+                self.assertTrue(subtitle.has_class("hidden"))
 
     async def test_layout_css_gives_the_model_list_flexible_height(self) -> None:
         model = _model((_profile("fits", required_vram_gb=100.0),))
@@ -950,6 +1104,7 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 screen.on_fast_deploy_availability_loaded(
                     FastDeployAvailabilityLoaded(snapshot, purpose="filter")
                 )
+                await screen.workers.wait_for_complete()
                 await pilot.pause()
                 screen._gpu_filter = gpu_type
                 screen._render_model_list()
@@ -960,7 +1115,7 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                     option_list.get_option_at_index(index).id
                     for index in range(option_list.option_count)
                 ]
-                self.assertEqual(ids, [None, "small-fit"])
+                self.assertEqual(ids, ["small-fit"])
                 self.assertIn("Small", str(option_list.get_option_at_index(0).prompt))
                 self.assertEqual(screen._highlighted_model_id(), "small-fit")
                 status = str(screen.query_one("#fast-deploy-status", Static).renderable)
@@ -984,19 +1139,20 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 assert isinstance(screen, FastDeployScreen)
                 option_list = screen.query_one("#fast-deploy-list", OptionList)
                 self.assertIn(
-                    "from ~$4.00/hr",
-                    str(option_list.get_option_at_index(0).prompt),
+                    "from ~$8.00/hr",
+                    Content.from_markup(str(option_list.get_option_at_index(0).prompt)).plain,
                 )
 
                 screen.on_fast_deploy_availability_loaded(
                     FastDeployAvailabilityLoaded(snapshot, purpose="filter")
                 )
+                await screen.workers.wait_for_complete()
                 await pilot.pause()
 
                 option_list = screen.query_one("#fast-deploy-list", OptionList)
                 self.assertIn(
                     "from ~$6.00/hr",
-                    str(option_list.get_option_at_index(0).prompt),
+                    Content.from_markup(str(option_list.get_option_at_index(0).prompt)).plain,
                 )
 
     async def test_infra_rows_use_canonical_gpu_labels(self) -> None:
@@ -1039,6 +1195,7 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 screen.on_fast_deploy_availability_loaded(
                     FastDeployAvailabilityLoaded(snapshot)
                 )
+                await screen.workers.wait_for_complete()
                 await pilot.pause()
 
                 option_list = screen.query_one("#fast-deploy-list", OptionList)
@@ -1052,7 +1209,7 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("H100!", joined)
                 self.assertNotIn("A6000_48GB", joined)
                 subtitle = str(screen.query_one("#fast-deploy-subtitle", Static).renderable)
-                self.assertIn("Pick infrastructure", subtitle)
+                self.assertNotIn("Pick infrastructure", subtitle)
 
     async def test_gpu_filter_without_matching_infra_does_not_show_other_gpus(
         self,
@@ -1077,6 +1234,7 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 screen.on_fast_deploy_availability_loaded(
                     FastDeployAvailabilityLoaded(snapshot)
                 )
+                await screen.workers.wait_for_complete()
                 await pilot.pause()
 
                 option_list = screen.query_one("#fast-deploy-list", OptionList)
@@ -1087,11 +1245,14 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("No live placements on B200 180GB", status)
 
     async def test_compact_viewport_keeps_model_list_usable(self) -> None:
-        model = _model((_profile("fits", required_vram_gb=100.0),))
+        models = tuple(
+            _model((replace(_profile(f"model-{i}", required_vram_gb=8), model_size_label=size),))
+            for i, size in enumerate(["Small"] * 3 + ["Medium"] * 3 + ["Large"] * 3)
+        )
         app = _StyledApp()
         with patch(
             "llm_launchpad.tui.screens.fast_deploy.list_quick_deploy_models",
-            return_value=(model,),
+            return_value=models,
         ):
             async with app.run_test(size=(80, 24)) as pilot:
                 app.push_screen(FastDeployScreen())
@@ -1100,12 +1261,26 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 screen = app.screen
                 assert isinstance(screen, FastDeployScreen)
                 option_list = screen.query_one("#fast-deploy-list", OptionList)
-                self.assertGreaterEqual(option_list.size.height, option_list.option_count)
+                search = screen.query_one("#fast-deploy-model-search", Input)
+                gpu = screen.query_one("#fast-deploy-gpu-filter")
+                self.assertEqual(search.region.y, gpu.region.y)
+                visible_rows = [
+                    option_list.render_line(y).text for y in range(option_list.scrollable_content_region.height)
+                ]
+                self.assertGreaterEqual(sum("Model " in row for row in visible_rows), 6)
 
                 await pilot.press("/")
-                search = screen.query_one("#fast-deploy-model-search", Input)
                 self.assertTrue(search.display)
                 self.assertIs(screen.focused, search)
+
+                await pilot.resize_terminal(51, 35)
+                await pilot.pause()
+                self.assertLessEqual(search.region.bottom, gpu.region.y)
+                await pilot.resize_terminal(40, 12)
+                await pilot.pause()
+                self.assertEqual(search.region.height, 1)
+                rows = [option_list.render_line(y).text for y in range(option_list.scrollable_content_region.height)]
+                self.assertGreaterEqual(sum("Model " in row for row in rows), 2)
 
 
     async def test_a_phone_in_portrait_keeps_the_list_and_its_detail(self) -> None:
@@ -1434,9 +1609,11 @@ class DeployKeyHintTests(unittest.TestCase):
         # step two cannot rent a GPU. The footer says so, but the fulfillment
         # dropdown paints over the footer while open, and a phone terminal
         # hides the footer behind its on-screen keyboard for good.
-        wide = Content.from_markup(deploy_key_hint(narrow=False)).plain
-        self.assertIn("ctrl+d", wide)
-        self.assertIn("Deploy", wide)
+        narrow = Content.from_markup(deploy_key_hint(narrow=True)).plain
+        self.assertIn("ctrl+d", narrow)
+        self.assertIn("Deploy", narrow)
+        # A wide terminal shows the same key in its footer.
+        self.assertEqual(deploy_key_hint(narrow=False), "")
 
     def test_the_hint_fits_a_phone_viewport(self) -> None:
         from llm_launchpad.tui.screens.quick_deploy import deploy_key_hint
@@ -1450,13 +1627,9 @@ class DeployKeyHintTests(unittest.TestCase):
     def test_it_describes_keyboard_navigation_without_a_mouse_toggle(self) -> None:
         from llm_launchpad.tui.screens.quick_deploy import deploy_key_hint
 
-        for narrow in (True, False):
-            with self.subTest(narrow=narrow):
-                text = Content.from_markup(
-                    deploy_key_hint(narrow=narrow)
-                ).plain
-                self.assertNotIn("ctrl+t", text)
-                self.assertIn("tab to Deploy", text)
+        text = Content.from_markup(deploy_key_hint(narrow=True)).plain
+        self.assertNotIn("ctrl+t", text)
+        self.assertIn("tab to Deploy", text)
 
     def test_enter_is_not_bound_to_deploy(self) -> None:
         from llm_launchpad.tui.screens.quick_deploy import QuickDeployScreen

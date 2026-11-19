@@ -125,9 +125,10 @@ class VastModelComparisonTests(unittest.TestCase):
             aggregate_compute_availability(modal_catalog=[ModalGpuSpec("L4", price_per_hour_usd=0.8)]),
             vast_offers=(vast_offer(),), vast_configured=True,
         )
-        self.assertEqual(_model_cost_label(model, snapshot), "~$0.42/hr")
+        self.assertEqual(_model_cost_label(model, snapshot), "~$0.42/hr · $0.44 first hour")
         options = _gpu_filter_options(snapshot)
-        self.assertIn("Vast.ai", options[1][0])
+        self.assertIn(("RTX 4090 24GB", "RTX 4090 24GB"), options)
+        self.assertFalse(any("$" in label for label, _ in options))
         self.assertTrue(_model_fits_gpu_type(model, snapshot, "RTX 4090 24GB"))
         self.assertFalse(_model_fits_gpu_type(comparison_model(total=50), snapshot, "RTX 4090 24GB"))
         self.assertEqual(_model_cost_label(model, snapshot, "L4 24GB"), "~$0.80/hr")
@@ -140,7 +141,7 @@ class VastModelComparisonTests(unittest.TestCase):
 
     def test_vast_only_model_price_does_not_fall_back_to_unconnected_modal(self) -> None:
         snapshot = replace(aggregate_compute_availability(), providers=(), vast_offers=(vast_offer(dph_base=5, dph_total=5.02),))
-        self.assertEqual(_model_cost_label(comparison_model(), snapshot), "~$5.02/hr")
+        self.assertEqual(_model_cost_label(comparison_model(), snapshot), "~$5.02/hr · $5.04 first hour")
 
     def test_full_context_reserve_uses_actual_memory_not_cli_display_gb(self) -> None:
         # 24576 MiB is 24 GiB, not the CLI's display value of 24.576.
@@ -312,13 +313,14 @@ class VastAvailabilityTests(unittest.TestCase):
     def setUp(self) -> None:
         for patcher in (
             patch("llm_launchpad.core.compute_availability.resolve_modal_cli_path", return_value="modal"),
+            patch("llm_launchpad.core.compute_availability.check_modal_readiness", return_value=SimpleNamespace(verified=True)),
             patch("llm_launchpad.core.compute_availability.get_prime_auth_status", return_value=SimpleNamespace(authenticated=False)),
             patch("llm_launchpad.core.compute_availability.fetch_modal_gpu_catalog", return_value=[ModalGpuSpec("L4", price_per_hour_usd=0.8)]),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def test_loads_vast_alongside_modal_without_enabling_vast_deploy_routes(self) -> None:
+    def test_loads_both_connected_providers_with_all_vast_bundle_sizes(self) -> None:
         offer = vast_offer()
         with patch("llm_launchpad.core.compute_availability.resolve_vast_credentials", return_value=VastCredentials("key", "stored")), patch(
             "llm_launchpad.core.compute_availability.VastBackend.list_offers", return_value=[offer]
@@ -326,7 +328,7 @@ class VastAvailabilityTests(unittest.TestCase):
             snapshot = load_compute_availability()
         self.assertEqual(snapshot.vast_offers, (offer,))
         self.assertTrue(snapshot.vast_configured)
-        self.assertEqual(snapshot.providers, (ComputeProvider.MODAL,))
+        self.assertEqual(snapshot.providers, (ComputeProvider.MODAL, ComputeProvider.VAST))
         self.assertIsNone(search.call_args.args[0].gpu_count)
 
     def test_vast_failure_keeps_modal_results_and_reports_partial_availability(self) -> None:

@@ -20,6 +20,10 @@ _HINT_PADDING_CELLS = 3
 _OVERFLOW_TEMPLATE = "+{count} more (?)"
 
 
+def _sentence_case(text: str) -> str:
+    return text[:1].upper() + text[1:]
+
+
 def _hint_width(key_display: str, description: str) -> int:
     return cell_len(key_display) + cell_len(description) + _HINT_PADDING_CELLS
 
@@ -119,7 +123,7 @@ class FittedFooter(Footer):
             # The palette hint docks right and is laid out outside the grid, so
             # its width is unavailable to everything else.
             binding, _enabled, _tooltip = palette_binding
-            budget -= _hint_width(self.app.get_key_display(binding), binding.description) + 1
+            budget -= _hint_width(self.app.get_key_display(binding), _sentence_case(binding.description)) + 1
 
         shown, hidden = self._fit(
             self._prioritize(list(action_to_bindings.values())), budget
@@ -149,7 +153,8 @@ class FittedFooter(Footer):
             yield FooterKey(
                 binding.key,
                 self.app.get_key_display(binding),
-                binding.description,
+                # Textual names it "palette"; every other hint is capitalised.
+                _sentence_case(binding.description),
                 binding.action,
                 classes="-command-palette",
                 disabled=not enabled,

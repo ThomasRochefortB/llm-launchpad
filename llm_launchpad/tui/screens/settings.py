@@ -84,8 +84,9 @@ class SettingsScreen(CopyEnabledScreen):
 
         with Vertical(id="settings-layout"):
             with VerticalScroll(id="settings-scroll", classes="screen-scroll"):
+                # The title heads the screen like every other one, not the card.
+                yield Static(screen_title("Settings"), id="settings-title")
                 with Vertical(id="settings-form"):
-                    yield Static(screen_title("Settings"), id="settings-title")
                     yield Static("[bold]Deployment[/bold]", classes="settings-section")
                     yield FormField(
                         "Modal idle timeout before scale-down",
@@ -129,7 +130,7 @@ class SettingsScreen(CopyEnabledScreen):
                         hint="e.g. 1h, 30m or off · deleting also removes cached weights",
                     )
                     yield ToggleField(
-                        "Let Prime pods stop themselves (stores your Prime API key on the pod)",
+                        "Prime pods self-stop (stores API key on pod)",
                         "prime-self-terminate",
                         default=settings.prime_self_terminate,
                     )
@@ -138,14 +139,17 @@ class SettingsScreen(CopyEnabledScreen):
                         classes="form-hint",
                     )
                     yield Button("Vast.ai rentals", id="vast-preview-btn")
-            with Horizontal(id="settings-actions"):
-                yield Button("Save", id="save-btn", variant="primary")
-                yield Static(
-                    f"[$warning]{escape(self._load_error)} Using defaults.[/$warning]"
-                    if self._load_error
-                    else "",
-                    id="save-feedback",
-                )
+                    # Save ends the form it saves; ctrl+s works from anywhere.
+                    yield Button("Save", id="save-btn", variant="primary")
+            # Feedback stays outside the scroll so a rejection is never
+            # scrolled away, and the bar only appears when it has news.
+            feedback = (
+                f"[$warning]{escape(self._load_error)} Using defaults.[/$warning]"
+                if self._load_error
+                else ""
+            )
+            with Horizontal(id="settings-actions", classes="" if feedback else "hidden"):
+                yield Static(feedback, id="save-feedback")
         yield FittedFooter()
 
     def on_mount(self) -> None:
@@ -199,6 +203,10 @@ class SettingsScreen(CopyEnabledScreen):
         except Exception:
             return
         feedback.update(markup)
+        try:
+            self.query_one("#settings-actions").set_class(not markup, "hidden")
+        except Exception:
+            pass
 
     def action_save(self) -> None:
         self._save()

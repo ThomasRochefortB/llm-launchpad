@@ -14,6 +14,7 @@ from .coerce import optional_str, positive_int
 from .diagnostics import log_debug
 from .gguf_metadata import (
     GgufMtpCapability,
+    GgufMtpStatus,
     GgufServingMetadata,
     fetch_gguf_mtp_capability,
     fetch_gguf_serving_metadata,
@@ -672,22 +673,25 @@ def fetch_gguf_quant_metadata(
             raise page_failure
         weight_size_error = str(page_failure)
 
-    mtp = (
-        fetch_gguf_mtp_capability(
-            normalized_repo,
-            siblings,
-            revision=revision_key or None,
-            quant=mtp_quant,
+    # A complete serving header already contains the target file's NextN count.
+    # Keep the same revision and quant key when sharing it with the MTP pass.
+    mtp = None
+    if serving_metadata is not None and serving_metadata.architecture and serving_metadata.source_file:
+        layers = serving_metadata.nextn_predict_layers
+        mtp = GgufMtpCapability(
+            status=GgufMtpStatus.SUPPORTED if layers > 0 else GgufMtpStatus.UNSUPPORTED,
+            nextn_predict_layers=layers, source_file=serving_metadata.source_file,
         )
-        if inspect_mtp
-        else None
-    )
+    elif inspect_mtp:
+        mtp = fetch_gguf_mtp_capability(
+            normalized_repo, siblings, revision=revision_key or None, quant=mtp_quant,
+        )
 
     metadata = GgufQuantMetadata(
         quantizations=list(quantizations),
         vram_gb_by_quant=dict(vram_gb_by_quant),
         architecture=architecture,
-        mtp=mtp,
+        mtp=mtp if inspect_mtp else None,
         context_length=context_length,
         block_count=block_count,
         embedding_length=embedding_length,
@@ -703,6 +707,9 @@ def fetch_gguf_quant_metadata(
         # request would otherwise answer for this repository for the whole
         # cache window, including the retries meant to recover from it.
         _GGUF_QUANT_METADATA_CACHE[cache_key] = (now, metadata)
+        if inspect_serving and not inspect_mtp and mtp is not None:
+            mtp_key = (normalized_repo, revision_key, quant_key, True, True)
+            _GGUF_QUANT_METADATA_CACHE[mtp_key] = (now, replace(metadata, mtp=mtp))
     return GgufQuantMetadata(
         quantizations=list(metadata.quantizations),
         vram_gb_by_quant=dict(metadata.vram_gb_by_quant),

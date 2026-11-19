@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
 import unittest
 from unittest.mock import patch
 
 from textual.app import App
 from textual.binding import Binding
-from textual.widgets import DataTable, Input, OptionList, Static
+from textual.widgets import DataTable, Input, OptionList
 
 from llm_launchpad.protocol.models import LaunchpadSettings
 from llm_launchpad.tui.screens.copy_enabled import CopyEnabledScreen
@@ -22,56 +24,81 @@ from tests.test_fast_deploy_screen import _StyledApp, _model, _profile
 from tests.test_storage_screen import _TestApp
 
 
-class _SetupApp(App[None]):
-    def __init__(self, *, configured: bool) -> None:
-        super().__init__()
-        self._configured = configured
-        self.menu_entered = False
-
-    def _provider_is_configured(self) -> bool:
-        return self._configured
-
-    def recheck_provider_setup(self) -> bool:
-        if not self._provider_is_configured():
-            return False
-        try:
-            if isinstance(self.screen, SetupRequiredScreen):
-                self.pop_screen()
-        except Exception:
-            pass
-        self.menu_entered = True
-        return True
-
-
 class SetupRequiredScreenTests(unittest.IsolatedAsyncioTestCase):
-    async def test_recheck_enters_main_menu_when_provider_available(self) -> None:
-        app = _SetupApp(configured=True)
-        async with app.run_test() as pilot:
-            app.push_screen(SetupRequiredScreen())
-            await pilot.pause()
+    async def test_a_prime_key_opens_home_while_modal_is_still_checking(self) -> None:
+        from llm_launchpad.core.provider_readiness import ProviderReadiness, ProviderReadinessStage
+        from llm_launchpad.protocol.enums import ComputeProvider
+        from llm_launchpad.tui.app import TuiApp
+        from llm_launchpad.tui.screens.main_menu import MainMenuScreen
 
-            screen = app.screen
-            assert isinstance(screen, SetupRequiredScreen)
-            screen.action_recheck()
-            await pilot.pause()
+        release = threading.Event()
 
-        self.assertTrue(app.menu_entered)
+        def slow_modal(**_kwargs: bool) -> ProviderReadiness:
+            release.wait(5)
+            return ProviderReadiness(ComputeProvider.MODAL, ProviderReadinessStage.UNREACHABLE)
 
-    async def test_recheck_stays_on_setup_when_still_unauthenticated(self) -> None:
-        app = _SetupApp(configured=False)
-        async with app.run_test() as pilot:
-            app.push_screen(SetupRequiredScreen())
-            await pilot.pause()
+        prime = ComputeProvider.PRIME
+        with (
+            patch("llm_launchpad.tui.app.check_modal_readiness", side_effect=slow_modal),
+            patch("llm_launchpad.tui.app.check_prime_readiness", side_effect=[
+                ProviderReadiness(prime, ProviderReadinessStage.CREDENTIALS_PRESENT),
+                ProviderReadiness(prime, ProviderReadinessStage.READY),
+            ]),
+        ):
+            app = TuiApp()
+            async with app.run_test() as pilot:
+                try:
+                    async with asyncio.timeout(3):
+                        while not isinstance(app.screen, MainMenuScreen):
+                            await pilot.pause(0.02)
+                    self.assertIn(ComputeProvider.MODAL, app._readiness_pending)
+                    self.assertIn(prime, {row.provider for row in app.provider_readiness_snapshot()})
+                finally:
+                    release.set()
 
-            screen = app.screen
-            assert isinstance(screen, SetupRequiredScreen)
-            screen.action_recheck()
-            await pilot.pause()
+    async def test_recheck_enters_home_after_auth_without_repeating_a_pending_probe(self) -> None:
+        from llm_launchpad.core.modal_auth import ModalAuthStatus
+        from llm_launchpad.tui.app import TuiApp
+        from llm_launchpad.tui.screens.main_menu import MainMenuScreen
 
-            self.assertFalse(app.menu_entered)
-            self.assertIsInstance(app.screen, SetupRequiredScreen)
-            feedback = str(screen.query_one("#setup-required-feedback", Static).content)
-            self.assertIn("Still no provider with credentials", feedback)
+        app = TuiApp()
+        release = threading.Event()
+
+        def slow_auth() -> ModalAuthStatus:
+            release.wait(5)
+            return ModalAuthStatus(authenticated=True, profile="test-profile")
+
+        with (
+            patch("llm_launchpad.core.provider_readiness.get_modal_auth_status",
+                  return_value=ModalAuthStatus(False)) as auth,
+            patch("llm_launchpad.core.provider_readiness.ModalBackend.is_cli_available", return_value=True),
+            patch.object(MainMenuScreen, "_refresh_modal_auth_status") as home_probe,
+        ):
+            async with app.run_test() as pilot:
+                async with asyncio.timeout(5):
+                    while len(app.provider_readiness_snapshot()) < 3:
+                        await pilot.pause(0.02)
+                self.assertIsInstance(app.screen, SetupRequiredScreen)
+                self.assertEqual(auth.call_count, 1)
+                auth.side_effect = slow_auth
+                try:
+                    await pilot.press("r", "r", "?")
+                    self.assertIsInstance(app.screen, HelpOverlayScreen)
+                    self.assertEqual(auth.call_count, 2)
+                    release.set()
+                    async with asyncio.timeout(5):
+                        while not any(row.verified for row in app.provider_readiness_snapshot()):
+                            await pilot.pause(0.02)
+                    self.assertIsInstance(app.screen, HelpOverlayScreen)
+                    await pilot.press("escape")
+                    await pilot.pause()
+                    self.assertIsInstance(app.screen, MainMenuScreen)
+                    self.assertEqual(app.screen.username, "test-profile")
+                    self.assertEqual(len(app.screen_stack), 2)
+                    home_probe.assert_not_called()
+                    self.assertEqual(auth.call_count, 2)
+                finally:
+                    release.set()
 
 
 class _BindingProbeScreen(CopyEnabledScreen):
@@ -152,6 +179,13 @@ class LaunchpadSettingsFieldsTests(unittest.TestCase):
 
 class QuickDeploySearchTests(unittest.IsolatedAsyncioTestCase):
     async def test_search_input_filters_model_list(self) -> None:
+        from llm_launchpad.core.compute_availability import aggregate_compute_availability
+        from llm_launchpad.core.modal_gpu import ModalGpuSpec
+
+        self.enterContext(patch(
+            "llm_launchpad.tui.screens.fast_deploy.load_compute_availability",
+            return_value=aggregate_compute_availability(modal_catalog=[ModalGpuSpec("L4", 0.8)]),
+        ))
         alpha = _model((_profile("Alpha-Model", required_vram_gb=8.0),))
         beta = _model((_profile("Beta-Model", required_vram_gb=8.0),))
         app = _StyledApp()

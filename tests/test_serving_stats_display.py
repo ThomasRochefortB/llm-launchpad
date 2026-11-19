@@ -335,7 +335,7 @@ class ManageScreenReadsItsOwnTrafficTests(unittest.IsolatedAsyncioTestCase):
                 table = screen.query_one("#manage-endpoint-table", AdaptiveDataTable)
                 self.assertIn("served", table.visible_column_keys)
                 served = table.get_cell_at(Coordinate(0, table.visible_column_keys.index("served")))
-                self.assertEqual(served, "4.6K")
+                self.assertEqual(str(served), "4.6K")
                 detail = screen.query_one("#manage-selection-detail", Static)
                 self.assertIn("4.6K tokens served", str(detail.renderable))
 
@@ -435,7 +435,7 @@ class ManageScreenReadsItsOwnTrafficTests(unittest.IsolatedAsyncioTestCase):
                 await screen.workers.wait_for_complete()
                 await pilot.pause()
                 column = table.visible_column_keys.index("throughput")
-                self.assertEqual(table.get_cell_at(Coordinate(0, column)), "0 tok/s")
+                self.assertEqual(str(table.get_cell_at(Coordinate(0, column))), "0 tok/s")
 
     async def test_the_traffic_timer_stops_while_the_screen_is_away(self) -> None:
         from textual.app import App

@@ -7,7 +7,7 @@ stored API key must not be reported as verified before a live check.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 import time
 
@@ -51,6 +51,7 @@ class ProviderReadiness:
     detail: str = ""
     hint: str | None = None
     checked_at_epoch: float = 0.0
+    profile: str | None = None
 
     @property
     def has_credentials(self) -> bool:
@@ -87,13 +88,7 @@ def _cached(provider: ComputeProvider, verify: bool) -> ProviderReadiness | None
 
 
 def _store(provider: ComputeProvider, verify: bool, readiness: ProviderReadiness) -> ProviderReadiness:
-    stamped = ProviderReadiness(
-        provider=readiness.provider,
-        stage=readiness.stage,
-        detail=readiness.detail,
-        hint=readiness.hint,
-        checked_at_epoch=time.time(),
-    )
+    stamped = replace(readiness, checked_at_epoch=time.time())
     _readiness_cache[(provider.value, verify)] = (stamped.checked_at_epoch, stamped)
     return stamped
 
@@ -205,6 +200,7 @@ def check_modal_readiness(*, verify: bool = True, refresh: bool = False) -> Prov
                 provider=ComputeProvider.MODAL,
                 stage=ProviderReadinessStage.READY,
                 detail=detail,
+                profile=status.profile,
             ),
         )
     message = status.error or "not authenticated"

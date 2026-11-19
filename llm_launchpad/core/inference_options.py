@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass, replace
 import re
 from typing import Protocol
@@ -437,7 +439,7 @@ def first_hour_cost_usd(quote: ProviderQuote) -> float | None:
     a cheaper host saves.
     """
     price, once = quote.price_per_hour_usd, quote.one_time_cost_usd
-    if price is None or once is None:
+    if price is None or once is None or not math.isfinite(price) or not math.isfinite(once) or price <= 0 or once < 0:
         return None
     return price * COMPARISON_RENT_HOURS + once
 

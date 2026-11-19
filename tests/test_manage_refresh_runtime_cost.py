@@ -78,7 +78,7 @@ class StaleRefreshTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             status = screen.query_one("#manage-status", Static)
             self.assertIn("Refreshing", str(status.renderable))
-            self.assertNotIn("Fleet refreshed", str(status.renderable))
+            self.assertIn("cached", str(status.renderable))
 
             # The live pass clears the refreshing state.
             screen.post_message(EndpointsLoaded(rows=[row], is_stale=False))
@@ -86,7 +86,8 @@ class StaleRefreshTests(unittest.IsolatedAsyncioTestCase):
             await screen.workers.wait_for_complete()
             await pilot.pause()
             status = screen.query_one("#manage-status", Static)
-            self.assertIn("Fleet refreshed", str(status.renderable))
+            self.assertNotIn("Refreshing", str(status.renderable))
+            self.assertIn("1 endpoint", str(status.renderable))
 
     async def test_failed_refresh_clears_refreshing_state(self) -> None:
         from textual.app import App
@@ -186,7 +187,7 @@ class ExplicitLiveFetchTests(unittest.IsolatedAsyncioTestCase):
                 await screen.workers.wait_for_complete()
                 await pilot.pause()
             served = table.get_cell_at(Coordinate(0, table.visible_column_keys.index("served")))
-            self.assertEqual(served, "4.6K")
+            self.assertEqual(str(served), "4.6K")
             self.assertIsNone(cached.live_metrics_error)
             self.assertIsNotNone(cached.live_metrics_checked_at)
 

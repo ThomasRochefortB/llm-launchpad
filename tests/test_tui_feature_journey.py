@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 
 from textual.widgets import Button, Input, OptionList, Select
 
+from llm_launchpad.core.modal_gpu import ModalGpuSpec
 from llm_launchpad.core.compute_availability import aggregate_compute_availability
 from llm_launchpad.core.hf_models import GgufQuantMetadata
 from llm_launchpad.protocol.enums import BackendType, DeploymentState, OperationType
@@ -70,7 +71,7 @@ class TuiFeatureJourneyTests(unittest.IsolatedAsyncioTestCase):
         ))
         self.patches.enter_context(patch(
             "llm_launchpad.tui.screens.fast_deploy.load_compute_availability",
-            return_value=aggregate_compute_availability(),
+            return_value=aggregate_compute_availability(modal_catalog=[ModalGpuSpec("RTX-PRO-6000", 3.03)]),
         ))
         activate_static_like_catalog()
         # Durable deploys run in detached worker processes in production,

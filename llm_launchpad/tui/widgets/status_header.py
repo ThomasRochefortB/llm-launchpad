@@ -41,8 +41,6 @@ class StatusHeader(Static):
         # `state: deploying`, describing work that had stopped.
         state_key = FAILED_STATE if self.failed else self.state
         state_text = f"{self.state} (failed)" if self.failed else self.state
-        compact = self.screen.has_class("viewport-compact")
-        short = self.screen.has_class("viewport-short")
         # Muted field names, bold values, and the state as a tag in its own
         # colour, so the eye finds the one field that changes first.
         marker, style = _STATE_MARKERS.get(state_key, ("?", "dim"))
@@ -50,14 +48,13 @@ class StatusHeader(Static):
         state_markup = (
             tag(state, style) if style.startswith("$") else f"[bold]{escape(state)}[/]"
         )
+        # Operation and detail are the progress panel's to say; repeating them
+        # here put "Warming up" on screen three times, and the operation name
+        # went stale when a deploy's warmup phase finished.
         parts = [
             f"[dim]backend[/] [bold]{escape(self.backend)}[/]",
             f"  [dim]state[/] {state_markup}",
         ]
-        if not compact and self.operation and self.operation != "--":
-            parts.append(f"  [dim]op[/] [bold]{escape(self.operation)}[/]")
-        if not compact and not short and self.detail:
-            parts.append(f"  [dim]{escape(self.detail)}[/]")
         return " ".join(parts)
 
     def watch_state(self, state: str) -> None:

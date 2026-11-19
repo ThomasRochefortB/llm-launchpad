@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
+from html.parser import HTMLParser
 import threading
 import time
 
@@ -35,12 +36,40 @@ _VALID_GPU_RE: Final[re.Pattern[str]] = re.compile(
 )
 _HTML_TAG_RE: Final[re.Pattern[str]] = re.compile(r"<[^>]+>")
 _PRICING_ROW_RE: Final[re.Pattern[str]] = re.compile(
-    r"(NVIDIA\s+[A-Z0-9 ,+!-]+?)\s+\$([0-9]+(?:\.[0-9]+)?)\s*/\s*(SEC(?:OND)?|HR|HOUR)\b",
+    r"(NVIDIA\s+[A-Z0-9 ,+!-]+?)\s+\$\s*([0-9]+(?:\.[0-9]+)?)\s*/\s*(SEC(?:OND)?|HR|HOUR)\b",
     re.IGNORECASE,
 )
 _WHITESPACE_RE: Final[re.Pattern[str]] = re.compile(r"\s+")
 _SECONDS_PER_HOUR: Final[float] = 3600.0
 _CATALOG_CACHE_TTL_SECONDS: Final[float] = 600.0
+
+
+MODAL_GPU_MEMORY_GB: dict[str, float] = {
+    "T4": 16.0,
+    "L4": 24.0,
+    "A10": 24.0,
+    "A100": 40.0,
+    "A100-40GB": 40.0,
+    "A100-80GB": 80.0,
+    "L40S": 48.0,
+    "RTX-PRO-6000": 96.0,
+    "H100": 80.0,
+    "H100!": 80.0,
+    "H200": 141.0,
+    "B200": 180.0,
+    "B200+": 180.0,
+    "B300": 288.0,
+}
+
+
+def modal_gpu_supports_fast_deploy(gpu_type: str) -> bool:
+    """The pinned runtimes do not guarantee the CUDA 13.1 required for a B300."""
+    return gpu_type.upper() not in {"B300", "B200+"}
+
+
+def modal_gpu_count_limit(gpu_type: str) -> int:
+    """Maximum cards per Modal container for a known GPU type."""
+    return 4 if gpu_type.upper() == "A10" else 8
 
 
 @dataclass(frozen=True)
@@ -49,6 +78,7 @@ class ModalGpuSpec:
 
     value: str
     price_per_hour_usd: float | None = None
+    stale_since: float | None = field(default=None, compare=False)
 
 
 @dataclass
@@ -125,21 +155,14 @@ def fetch_modal_gpu_catalog(
                 timeout=timeout,
             )
         )
-        if stale_catalog is not None:
+        if cached is not None:
             stale_prices = {
-                item.value: item.price_per_hour_usd
-                for item in stale_catalog
+                item.value: replace(item, stale_since=item.stale_since or cached[0])
+                for item in cached[1]
                 if item.price_per_hour_usd is not None
             }
             catalog = tuple(
-                ModalGpuSpec(
-                    value=item.value,
-                    price_per_hour_usd=(
-                        item.price_per_hour_usd
-                        if item.price_per_hour_usd is not None
-                        else stale_prices.get(item.value)
-                    ),
-                )
+                stale_prices.get(item.value, item) if item.price_per_hour_usd is None else item
                 for item in catalog
             )
     except BaseException as exc:
@@ -149,7 +172,8 @@ def fetch_modal_gpu_catalog(
         if stale_catalog is None or is_shutting_down():
             flight.error = exc
             raise
-        catalog = stale_catalog
+        assert cached is not None
+        catalog = tuple(replace(item, stale_since=item.stale_since or cached[0]) for item in stale_catalog)
     finally:
         with _CATALOG_LOCK:
             if flight.error is None and "catalog" in locals():
@@ -229,9 +253,33 @@ def _parse_modal_gpu_types(page_text: str) -> list[str]:
     return parsed
 
 
+class _PriceText(HTMLParser):
+    """Read accessible price text, ignoring duplicate animated digits."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.parts: list[str] = []
+        self.hidden_spans = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "span" and (self.hidden_spans or dict(attrs).get("aria-hidden") == "true"):
+            self.hidden_spans += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "span" and self.hidden_spans:
+            self.hidden_spans -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self.hidden_spans:
+            self.parts.append(data)
+
+
 def _parse_modal_gpu_pricing(page_text: str) -> dict[str, float]:
     """Parse base hourly Modal GPU pricing from the pricing page."""
-    content = _normalize_whitespace(_strip_html_tags(_slice_gpu_pricing_section(page_text)))
+    parser = _PriceText()
+    parser.feed(_slice_gpu_pricing_section(page_text))
+    parser.close()
+    content = _normalize_whitespace(" ".join(parser.parts))
     pricing: dict[str, float] = {}
     for raw_name, raw_price, raw_unit in _PRICING_ROW_RE.findall(content):
         token = _normalize_pricing_gpu_token(raw_name)
@@ -290,6 +338,7 @@ def _normalize_pricing_gpu_token(value: str) -> str | None:
     if normalized.startswith("NVIDIA "):
         normalized = normalized[len("NVIDIA ") :].strip()
 
+    normalized = {"H100 SXM5": "H100", "H200 SXM": "H200"}.get(normalized, normalized)
     a100_match = re.fullmatch(r"([A-Z0-9]+),\s*(\d+)\s*GB", normalized)
     if a100_match is not None:
         return f"{a100_match.group(1)}-{a100_match.group(2)}GB"

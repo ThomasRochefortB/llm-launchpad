@@ -29,6 +29,7 @@ from ..protocol.enums import ComputeProvider
 from ..protocol.models import StorageSnapshot
 from .format import clip, format_free_tier, format_gib, format_money
 from .markers import provider_marker
+from .visual import MONEY_STYLE
 
 # An error is bounded rather than made to fit: the panel is 56 columns and caps
 # at half the side column, so an unbounded provider message would reflow into a
@@ -38,6 +39,8 @@ _ERROR_WIDTH = 72
 # Two spaces between the widest provider name and the figures, so the column of
 # amounts lines up without depending on how wide the panel happens to be.
 _COLUMN_GAP = 2
+
+_MODAL_USAGE_BILLING_URL = "https://modal.com/settings/usage"
 
 _STATUS_MARKUP: dict[BillingStatus, str] = {
     BillingStatus.LOADING: "[dim]checking...[/dim]",
@@ -61,13 +64,14 @@ def storage_estimate_lines(snapshot: StorageSnapshot | None) -> tuple[str, ...]:
     if snapshot is None:
         return ()
     estimate = estimate_monthly_storage_cost(snapshot)
+    allowance = format_free_tier(MODAL_VOLUME_FREE_TIER_GIB_MONTH)
     return (
-        f"storage est. {format_money(estimate.estimated_monthly_cost_usd)}/mo",
+        f"cache est. {format_money(estimate.estimated_monthly_cost_usd)}/mo · {allowance} free",
         (
-            f"{format_gib(estimate.total_gib_month)} cached, "
-            f"{format_gib(estimate.billable_gib_month)} over "
-            f"{format_free_tier(MODAL_VOLUME_FREE_TIER_GIB_MONTH)} free"
+            f"{format_gib(estimate.total_gib_month)} cached · "
+            f"{format_gib(estimate.billable_gib_month)} above free tier"
         ),
+        "assumes full workspace storage allowance",
     )
 
 
@@ -80,7 +84,7 @@ def _headline(row: ProviderBilling, spinner: str = "") -> tuple[str, str]:
         if row.amount_usd is None:
             return "[dim]unknown[/dim]", "unknown"
         amount = format_money(row.amount_usd)
-        return f"[bold]{amount}[/bold]", amount
+        return f"[bold {MONEY_STYLE}]{amount}[/]", amount
     return _STATUS_MARKUP[row.status], _STATUS_PLAIN[row.status]
 
 
@@ -107,7 +111,7 @@ def _summary_fragments(row: ProviderBilling) -> list[str]:
 
 
 def _detail_lines(
-    row: ProviderBilling, storage_snapshot: StorageSnapshot | None
+    row: ProviderBilling, storage_estimate: tuple[str, ...]
 ) -> list[str]:
     """Return the dim lines under one figure, each short enough not to wrap.
 
@@ -121,12 +125,18 @@ def _detail_lines(
     if summary:
         lines.append(" · ".join(summary))
     lines.extend(escape(note) for note in row.notes)
+    if row.storage is not None:
+        lines.append(f"storage metered this month {format_money(row.storage.metered_usd)}")
+        if row.storage.after_allowance_usd is not None:
+            lines.append(f"storage after allowance {format_money(row.storage.after_allowance_usd)}")
     if row.provider is ComputeProvider.MODAL:
-        # Cached models are a standing cost of their own rather than a
-        # component of this month's bill, so they keep their own lines instead
-        # of being run together with a total -- or with the error that replaced
-        # it.
-        lines.extend(storage_estimate_lines(storage_snapshot))
+        if row.credits_applied_usd is not None:
+            lines.append(f"credits used this month {format_money(row.credits_applied_usd)}")
+        if row.status is BillingStatus.READY:
+            lines.append(
+                f"[underline link='{_MODAL_USAGE_BILLING_URL}']Credit balance in Modal dashboard[/]"
+            )
+        lines.extend(storage_estimate)
     return lines
 
 
@@ -135,11 +145,12 @@ def render_provider_billing(
     *,
     storage_snapshot: StorageSnapshot | None = None,
     spinner: str = "",
+    compact: bool = False,
 ) -> str:
     """Render every provider's billing row into the shared panel body.
 
     ``spinner`` is the current frame for rows still loading; without one they
-    read "checking...".
+    read "checking...". ``compact`` shows provider totals and storage on Home.
     """
     if not rows:
         return "[dim]No providers configured.[/dim]"
@@ -154,14 +165,27 @@ def render_provider_billing(
     # end; padding to the content keeps the figures in one column at any width.
     name_width = max(cell_len(name) for name in names) + _COLUMN_GAP
     value_width = max(cell_len(plain) for _, plain in headlines)
+    storage_estimate = storage_estimate_lines(storage_snapshot)
 
     lines: list[str] = []
     for row, name, (headline_markup, headline_plain) in zip(rows, names, headlines, strict=True):
         name_pad = " " * (name_width - cell_len(name))
         value_pad = " " * (value_width - cell_len(headline_plain))
-        lines.append(f"{name}{name_pad}{value_pad}{headline_markup}")
+        line = f"{name}{name_pad}{value_pad}{headline_markup}"
+        if compact:
+            if row.status is BillingStatus.READY and row.kind is not None:
+                line += f"  [dim]{row.kind.label}[/dim]"
+            if row.owed_usd is not None:
+                line += f"  [$warning]owed {format_money(row.owed_usd)}[/$warning]"
+            lines.append(line)
+            if row.provider is ComputeProvider.MODAL and storage_estimate:
+                lines.append(f"[dim]  {storage_estimate[0]}[/dim]")
+            elif row.storage is not None and row.storage.after_allowance_usd is not None:
+                lines.append(f"[dim]  storage {format_money(row.storage.after_allowance_usd)} this month[/dim]")
+            continue
+        lines.append(line)
 
         lines.extend(
-            f"[dim]  {detail}[/dim]" for detail in _detail_lines(row, storage_snapshot)
+            f"[dim]  {detail}[/dim]" for detail in _detail_lines(row, storage_estimate)
         )
     return "\n".join(lines)

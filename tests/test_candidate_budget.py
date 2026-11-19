@@ -12,6 +12,7 @@ from huggingface_hub.errors import HfHubHTTPError
 
 from llm_launchpad.core.artificial_analysis import AAModelCandidate
 from llm_launchpad.core.quick_deploy_refresh import (
+    DEFAULT_CANDIDATE_LIMIT,
     _aa_candidate_window,
     _deduped_candidates,
     _resolve_aa_model,
@@ -57,7 +58,7 @@ class DedupBeforeBudgetTests(unittest.TestCase):
         self.assertIn("Open Weights Model", {candidate.name for candidate in window})
 
     def test_the_budget_still_bounds_the_work(self) -> None:
-        # Known-size candidates are bounded by their own bucket's budget.
+        # The explicit limit bounds discovery even when every candidate is the same size.
         ranking = [
             _candidate(f"Model {index}", index + 1, parameter_count_b=27.0)
             for index in range(200)
@@ -68,14 +69,10 @@ class DedupBeforeBudgetTests(unittest.TestCase):
         self.assertEqual(len(window), 80)
 
     def test_an_unstated_size_is_reachable_as_deep_as_any_bucket(self) -> None:
-        # A candidate of unknown size could land in any bucket, so it must not
-        # be reachable only a third as deep as one that states its size. Muse
-        # Glimmer is a 30B open model with a GGUF repository whose feed row is
-        # named "Muse Glimmer (high)"; under a single bucket-sized pool it sat
-        # outside the window while models a hundred places below were checked.
+        # The default reaches equally far for known and unknown parameter counts.
         ranking = [_candidate(f"Model {index}", index + 1) for index in range(400)]
 
-        window = _aa_candidate_window(_deduped_candidates(ranking), 80)
+        window = _aa_candidate_window(_deduped_candidates(ranking), DEFAULT_CANDIDATE_LIMIT)
 
         self.assertEqual(len(window), 240)
 
@@ -85,7 +82,7 @@ class DedupBeforeBudgetTests(unittest.TestCase):
         # Hugging Face quota and silently shortened the shortlist.
         ranking = [_candidate(f"Model {index}", index + 1) for index in range(2000)]
 
-        window = _aa_candidate_window(_deduped_candidates(ranking), 80)
+        window = _aa_candidate_window(_deduped_candidates(ranking), DEFAULT_CANDIDATE_LIMIT)
 
         self.assertEqual(len(window), 240)
 

@@ -1,4 +1,5 @@
 from __future__ import annotations
+from dataclasses import replace
 
 from pathlib import Path
 import os
@@ -127,6 +128,14 @@ class PrimeOfferTests(unittest.TestCase):
     def test_exact_offer_selection_can_choose_an_explicit_offer(self) -> None:
         row = parse_prime_offer(_offer_payload())
         self.assertIs(select_prime_offer([row], offer_id=row.id), row)
+
+    def test_exact_offer_must_still_be_within_the_approved_price(self) -> None:
+        row = parse_prime_offer(_offer_payload())
+        self.assertIs(select_prime_offer([row], offer_id=row.id, max_hourly_cost_usd=1.9), row)
+        with self.assertRaisesRegex(ValueError, "approved cap"):
+            select_prime_offer([row], offer_id=row.id, max_hourly_cost_usd=1.8)
+        with self.assertRaisesRegex(ValueError, "verified"):
+            select_prime_offer([replace(row, price_per_hour=None)], offer_id=row.id, max_hourly_cost_usd=2)
 
     def test_out_of_stock_offer_is_not_deployable(self) -> None:
         row = parse_prime_offer(_offer_payload(stockStatus="out_of_stock"))

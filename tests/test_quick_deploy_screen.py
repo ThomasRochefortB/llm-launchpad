@@ -219,7 +219,7 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             # it must not be the thing a second enter lands on.
             self.assertFalse(screen.query_one("#quick-deploy-btn", Button).has_focus)
             self.assertTrue(
-                screen.query_one("#toggle-quick-details", Button).has_focus
+                screen.query_one("#toggle-advanced-quick", Button).has_focus
             )
 
     async def test_supported_profile_shows_default_on_mtp_toggle_and_can_disable_it(self) -> None:
@@ -256,9 +256,9 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
             screen = app.screen
             assert isinstance(screen, QuickDeployScreen)
-            card = screen.query_one("#quick-deploy-profile-card")
+            facts = screen.query_one("#quick-deploy-facts")
             button = screen.query_one("#quick-deploy-btn", Button)
-            self.assertGreaterEqual(card.region.y, 0)
+            self.assertGreaterEqual(facts.region.y, 0)
             self.assertLessEqual(button.region.bottom, 24)
             self.assertFalse(button.has_focus)
 
@@ -446,6 +446,7 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 offer_id="abc123",
                 region="CA",
                 disk_id="disk-1",
+                max_hourly_cost_usd=8.0,
                 keep_failed_resource=True,
                 allow_insecure_http=True,
             ),
@@ -501,7 +502,7 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             screen.query_one("#quick-fulfillment", Select).value = vast_plan.quote.id
             await pilot.pause()
             self.assertTrue(note.display)
-            self.assertIn("SSH endpoint on this computer only", str(note.content))
+            self.assertIn("Local SSH endpoint", str(note.content))
 
             screen.query_one("#quick-fulfillment", Select).value = modal_plan.quote.id
             await pilot.pause()
@@ -618,7 +619,7 @@ class ArrowNavigationTests(unittest.IsolatedAsyncioTestCase):
             app.push_screen(self._screen_with_alternatives())
             await pilot.pause()
             await pilot.pause()
-            self.assertEqual(getattr(app.focused, "id", None), "toggle-quick-details")
+            self.assertEqual(getattr(app.focused, "id", None), "toggle-advanced-quick")
 
             reached = []
             for _ in range(3):
@@ -666,8 +667,8 @@ class ArrowNavigationTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("up")
             await pilot.pause()
 
-            self.assertEqual(getattr(app.focused, "id", None), "toggle-quick-details")
-            self.assertNotEqual(forward, "toggle-quick-details")
+            self.assertEqual(getattr(app.focused, "id", None), "toggle-advanced-quick")
+            self.assertNotEqual(forward, "toggle-advanced-quick")
 
     async def test_collapsed_advanced_controls_are_skipped(self) -> None:
         app = _StyledApp()
@@ -682,16 +683,11 @@ class ArrowNavigationTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 cycle.append(getattr(app.focused, "id", None))
 
-            # Four stops, twice round: technical details, fulfillment, Deploy
-            # and advanced toggle; nothing hidden joins the rotation.
+            # Two stops: Deploy and the options toggle; the placement choice
+            # and everything else collapsed stays out of the rotation.
             self.assertEqual(
                 set(cycle),
-                {
-                    "toggle-quick-details",
-                    "quick-fulfillment",
-                    "toggle-advanced-quick",
-                    "quick-deploy-btn",
-                },
+                {"toggle-advanced-quick", "quick-deploy-btn"},
             )
             self.assertNotIn("quick-instance-name", cycle)
 
@@ -704,7 +700,7 @@ class ArrowNavigationTests(unittest.IsolatedAsyncioTestCase):
             assert isinstance(screen, QuickDeployScreen)
             body = screen.query_one("#quick-deploy-profile-body", Static)
             self.assertFalse(body.display)
-            screen.query_one("#toggle-quick-details", Button).press()
+            screen.query_one("#toggle-advanced-quick", Button).press()
             await pilot.pause()
             self.assertTrue(body.display)
             self.assertIn("unsloth/Kimi-K2.5-GGUF", str(body.content))

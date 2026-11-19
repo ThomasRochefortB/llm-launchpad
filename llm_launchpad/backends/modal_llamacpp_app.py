@@ -135,9 +135,9 @@ HF_XET_HIGH_PERFORMANCE_DEFAULT = _read_bool_env("HF_XET_HIGH_PERFORMANCE", True
 LLAMA_CPP_IMAGE_REF = (
     os.environ.get(
         "LLAMA_CPP_IMAGE_REF",
-        "ghcr.io/ggml-org/llama.cpp:server-cuda-b10689",
+        "ghcr.io/ggml-org/llama.cpp:server-cuda-b12464",
     ).strip()
-    or "ghcr.io/ggml-org/llama.cpp:server-cuda-b10689"
+    or "ghcr.io/ggml-org/llama.cpp:server-cuda-b12464"
 )
 LLAMA_CPP_IMAGE_NO_CACHE = _read_optional_bool_env("LLAMA_CPP_IMAGE_NO_CACHE")
 # Prefer cached image layers by default. Set LLAMA_CPP_IMAGE_NO_CACHE=true (or LLAMA_CPP_IMAGE_FORCE_BUILD=true)

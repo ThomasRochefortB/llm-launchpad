@@ -13,6 +13,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+from .coerce import optional_float, positive_int
 from .config import SETTINGS_DIR
 
 LAST_LAUNCH_PATH = SETTINGS_DIR / "last_launch.json"
@@ -27,6 +28,7 @@ class LastLaunch:
     gpu_count: int
     price_per_hour_usd: float | None = None
     launched_at: float = 0.0
+    context_tokens: int | None = None
 
 
 def save_last_launch(launch: LastLaunch, path: Path | None = None) -> None:
@@ -49,17 +51,17 @@ def load_last_launch(path: Path | None = None) -> LastLaunch | None:
     display_name = str(raw.get("display_name") or "").strip()
     if not model_id or not display_name:
         return None
-    price = raw.get("price_per_hour_usd")
     try:
         gpu_count = max(1, int(raw.get("gpu_count") or 1))
     except (TypeError, ValueError):
         gpu_count = 1
     return LastLaunch(
+        context_tokens=positive_int(raw.get("context_tokens")),
         model_id=model_id,
         display_name=display_name,
         provider=str(raw.get("provider") or ""),
         gpu_type=str(raw.get("gpu_type") or ""),
         gpu_count=gpu_count,
-        price_per_hour_usd=float(price) if isinstance(price, (int, float)) else None,
-        launched_at=float(raw.get("launched_at") or 0.0),
+        price_per_hour_usd=optional_float(raw.get("price_per_hour_usd")),
+        launched_at=optional_float(raw.get("launched_at")) or 0.0,
     )

@@ -671,6 +671,21 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.deployed_config.gpu_count, 4)
             self.assertEqual(app.deployed_config.n_gpu, 2)
 
+    async def test_blank_tensor_parallel_shards_across_every_attached_gpu(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(VllmDeployScreen())
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, VllmDeployScreen)
+            screen.query_one("#gpu-count-vllm", Input).value = "4"
+            screen.query_one("#model-name", Input).value = "Qwen/Qwen3-0.6B"
+            screen._do_deploy()
+
+            self.assertIsNotNone(app.deployed_config)
+            self.assertEqual(app.deployed_config.n_gpu, 4)
+
     async def test_sharding_across_more_gpus_than_allocated_is_refused(self) -> None:
         """GPU_CONFIG sizes the container and N_GPU becomes the shard count.
 
@@ -979,7 +994,8 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("CPU_NODE", " ".join(labels))
                 self.assertIn("~73.5 GB requirement", status)
                 self.assertNotIn("HTTP-only", status)
-                self.assertEqual(screen.query_one("#n-gpu", Input).value, "1")
+                # Blank tensor parallelism shards across every attached GPU.
+                self.assertEqual(screen.query_one("#n-gpu", Input).value, "")
 
                 screen._do_deploy()
 

@@ -211,10 +211,10 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("first line", content)
             self.assertIn("stderr | stderr line", content)
             title = screen.query_one("#monitor-title", Static)
-            self.assertIn("Logs", str(title.content))
             self.assertNotIn("MOUSE", str(title.content))
             view_status = screen.query_one("#monitor-view-status", Static)
-            self.assertIn("FOLLOWING", str(view_status.content))
+            # Following is the normal state and goes unsaid.
+            self.assertNotIn("PAUSED", str(view_status.content))
             self.assertIn("2 lines", str(view_status.content))
 
     async def test_title_has_no_input_mode_badge(self) -> None:
@@ -227,7 +227,9 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             screen = app.screen
             assert isinstance(screen, MonitorScreen)
             title = screen.query_one("#monitor-title", Static)
-            self.assertEqual(str(title.content), "[bold]Logs[/]")
+            # The toolbar heads the log pane; the progress panel names the
+            # operation, so the title is not repeated here.
+            self.assertEqual(str(title.content), "[dim]Log[/]")
 
     async def test_title_shows_paused_follow_state_and_unseen_lines(self) -> None:
         app = _TestApp()
@@ -254,7 +256,7 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
 
             screen.action_resume_follow()
             await pilot.pause()
-            self.assertIn("FOLLOWING", str(view_status.content))
+            self.assertNotIn("PAUSED", str(view_status.content))
             self.assertNotIn("new line", str(view_status.content))
 
     async def test_log_lines_strip_ansi_escape_sequences(self) -> None:
@@ -289,7 +291,7 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             self.assertEqual(screen.log_viewer.log_widget.line_count, 0)
             view_status = screen.query_one("#monitor-view-status", Static)
-            self.assertIn("FOLLOWING", str(view_status.content))
+            self.assertNotIn("PAUSED", str(view_status.content))
             self.assertIn("0 lines", str(view_status.content))
 
     async def test_operation_messages_render_without_markup(self) -> None:
@@ -436,7 +438,7 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             raw_content = "\n".join(screen.log_viewer.log_widget.lines)
             self.assertIn("unclassified backend chatter", raw_content)
-            self.assertIn("RAW", str(screen.query_one("#monitor-view-status", Static).content))
+            self.assertIn("raw", str(screen.query_one("#monitor-view-status", Static).content))
 
             screen.action_toggle_log_view()
             await pilot.pause()

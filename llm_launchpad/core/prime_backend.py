@@ -18,6 +18,7 @@ import requests
 
 from ..protocol.enums import BackendType, ComputeProvider, QuoteAvailability
 from ..protocol.models import ComputeOffer, DeploymentConfig, EndpointInfo
+from .deployment_preflight import price_cap_finding
 from .deploy_log_summary import is_error_like
 from .config import SETTINGS_DIR
 from .coerce import optional_float
@@ -626,6 +627,7 @@ def select_prime_offer(
     gpu_count: int | None = None,
     region: str | None = None,
     required_vram_gb: float | None = None,
+    max_hourly_cost_usd: float | None = None,
     required_image: str = PRIME_DEFAULT_BOOTSTRAP_IMAGE,
 ) -> ComputeOffer:
     """Select an exact offer or the cheapest secure on-demand matching offer."""
@@ -661,12 +663,15 @@ def select_prime_offer(
             raise ValueError(f"Prime offer {offer_id} is not secure_cloud.")
         if _is_prime_offer_unavailable(match.stock_status):
             raise ValueError(f"Prime offer {offer_id} is unavailable.")
+        if finding := price_cap_finding(max_hourly_cost_usd, match.price_per_hour):
+            raise ValueError(finding.message)
         return match
 
     matches = [
         row
         for row in rows
         if is_prime_gpu_offer(row) and supports_prime_image(row, required_image)
+        and price_cap_finding(max_hourly_cost_usd, row.price_per_hour) is None
     ]
     matches = [row for row in matches if not row.is_spot and not row.is_variable_price]
     matches = [row for row in matches if (row.security or "").casefold() == "secure_cloud"]

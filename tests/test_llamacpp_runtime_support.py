@@ -22,9 +22,12 @@ class LlamaCppRuntimeSupportTests(unittest.TestCase):
         manifest = load_llamacpp_support_manifest()
 
         self.assertEqual(manifest.image_ref, DEFAULT_LLAMACPP_IMAGE_REF)
-        self.assertEqual(manifest.runtime_build, "b10689")
+        self.assertEqual(manifest.runtime_build, "b12464")
         self.assertIn("qwen35", manifest.architectures)
         self.assertIn("glm-dsa", manifest.architectures)
+        self.assertTrue({"glm5-next", "deepseek41", "inkling2"} <= manifest.architectures)
+        self.assertIn("glm5-next", manifest.mtp_architectures)
+        self.assertNotIn("deepseek41", manifest.mtp_architectures)
         self.assertNotIn("glm5next", manifest.architectures)
         self.assertTrue(manifest.mtp_support_known)
         self.assertIn("qwen35", manifest.mtp_architectures)
@@ -51,7 +54,7 @@ class LlamaCppRuntimeSupportTests(unittest.TestCase):
 
         self.assertEqual(decision.status, RuntimeCompatibility.UNSUPPORTED)
         self.assertFalse(decision.is_supported)
-        self.assertIn("b10689", decision.message)
+        self.assertIn("b12464", decision.message)
 
     def test_evaluator_treats_custom_image_as_unknown(self) -> None:
         decision = evaluate_llamacpp_architecture(

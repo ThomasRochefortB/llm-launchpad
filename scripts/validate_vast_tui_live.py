@@ -65,7 +65,7 @@ async def validate(args: argparse.Namespace) -> int:
     profiles = tuple(_profiles_for_quant(
         repo_id="Qwen/Qwen3-0.6B-GGUF", display_name="Qwen3 0.6B (live validation)",
         slug_hint="vast-live", context_tokens=metadata.context_length, quant="Q8_0", metadata=metadata,
-        modal_gpu_catalog=modal, llamacpp_runtime_id="llama.cpp-b10689-cuda12",
+        modal_gpu_catalog=modal, llamacpp_runtime_id="llama.cpp-b12464-cuda12",
     ))
     model = QuickDeployModel(
         id="vast-live-qwen3", display_name="Qwen3 0.6B (live validation)",

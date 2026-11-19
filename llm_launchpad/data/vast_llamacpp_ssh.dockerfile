@@ -18,7 +18,7 @@
 #
 # Keep the base digest in sync with llamacpp_runtime_support.json, and the
 # published digest in sync with the llamacpp entry of vast_runtime.json.
-FROM ghcr.io/ggml-org/llama.cpp@sha256:e52c610406cd18714902d1ca3bffadebca4a2a8370faaba8a5be5cc5d5203921
+FROM ghcr.io/ggml-org/llama.cpp@sha256:ae96e52f8b2106ea82bad786ee2d08bb9b0a8c93403df9c27ae1bf065a118089
 RUN apt-get update \
     && apt-get install -y --no-install-recommends openssh-server \
     && mkdir -p /run/sshd \
