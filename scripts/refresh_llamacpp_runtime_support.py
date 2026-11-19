@@ -20,9 +20,9 @@ from llm_launchpad.core.runtime_support import (
 )
 
 
-DEFAULT_SOURCE_REVISION = "57291f2644af8c9df0dd8d44395881c5bdcf0ecd"
-DEFAULT_IMAGE_DIGEST = "sha256:e52c610406cd18714902d1ca3bffadebca4a2a8370faaba8a5be5cc5d5203921"
-DEFAULT_RUNTIME_BUILD = "b10689"
+DEFAULT_SOURCE_REVISION = "d3c3e242c16b8cbf51400fad410cd69b22d64f35"
+DEFAULT_IMAGE_DIGEST = "sha256:ae96e52f8b2106ea82bad786ee2d08bb9b0a8c93403df9c27ae1bf065a118089"
+DEFAULT_RUNTIME_BUILD = "b12464"
 DEFAULT_OUTPUT = (
     Path(__file__).resolve().parents[1]
     / "llm_launchpad"

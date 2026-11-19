@@ -14,7 +14,7 @@ from collections.abc import Iterable
 from .coerce import positive_int
 
 
-DEFAULT_LLAMACPP_IMAGE_REF = "ghcr.io/ggml-org/llama.cpp:server-cuda-b10689"
+DEFAULT_LLAMACPP_IMAGE_REF = "ghcr.io/ggml-org/llama.cpp:server-cuda-b12464"
 LLAMACPP_SUPPORT_MANIFEST_FILENAME = "llamacpp_runtime_support.json"
 
 # Draft length requested whenever MTP is resolved without an explicit ask. The
@@ -99,10 +99,14 @@ def extract_llamacpp_mtp_architectures(
     }
     supported: set[str] = set()
     for source in model_sources:
-        if (
-            "LLM_KV_NEXTN_PREDICT_LAYERS" not in source
-            or "LLM_GRAPH_TYPE_DECODER_MTP" not in source
-        ):
+        # Newer releases read the NextN count centrally. A graph dispatch
+        # that throws (as on DeepSeek 4.1) does not implement native MTP.
+        dispatches_mtp = re.search(
+            r"LLM_GRAPH_TYPE_DECODER_MTP\s*\)\s*\{\s*return std::make_unique<graph_mtp>",
+            source,
+        )
+        legacy_mtp = "LLM_KV_NEXTN_PREDICT_LAYERS" in source and "LLM_GRAPH_TYPE_DECODER_MTP" in source
+        if not (dispatches_mtp or legacy_mtp):
             continue
         for symbol in _MODEL_SYMBOL_RE.findall(source):
             architecture = architecture_by_symbol.get(

@@ -275,6 +275,7 @@ def _select_kwargs(
 ) -> dict[str, Any]:
     return {
         "offer_id": options.offer_id,
+        "max_hourly_cost_usd": options.max_hourly_cost_usd,
         "gpu_type": config.gpu_type,
         "gpu_count": config.gpu_count,
         "region": options.region,

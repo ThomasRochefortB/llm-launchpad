@@ -480,7 +480,7 @@ def estimate_memory(
         else 0.0
     )
     reserve_gb = reserve_per_device * count
-    hybrid = metadata.architecture in {"kimi-k3", "kimi-linear", "glm5next"}
+    hybrid = metadata.architecture in {"kimi-k3", "kimi-linear", "glm5next", "glm5-next"}
     source = "gguf-hybrid-metadata" if hybrid else "gguf-metadata"
     nextn = metadata.serving_metadata.nextn_predict_layers if metadata.serving_metadata else 0
     layer_count = (metadata.block_count - nextn) if metadata.block_count else None
@@ -1194,7 +1194,7 @@ def _kv_cache_gb(
     weights_gb: float,
 ) -> tuple[float, bool]:
     layout = metadata.serving_metadata
-    hybrid = metadata.architecture in {"kimi-k3", "kimi-linear", "glm5next"}
+    hybrid = metadata.architecture in {"kimi-k3", "kimi-linear", "glm5next", "glm5-next"}
     if hybrid:
         estimate = _hybrid_cache_gb(metadata, context_tokens, tuning)
         if estimate is not None:
@@ -1264,7 +1264,7 @@ def _hybrid_cache_gb(
     # Cache dimensions in GGUF already describe the compressed latent, not
     # the expanded query-head projections. Zero heads identify recurrent layers.
     cache_bytes = sum(trunk) * layout.attention_key_length * context_tokens * _cache_bytes(tuning.cache_type_k)
-    if metadata.architecture == "glm5next":
+    if metadata.architecture in {"glm5next", "glm5-next"}:
         if not layout.indexer_key_length or not layout.indexer_kpool:
             return None
         # Full per-token key, compressor gate, and pooled key. The indexer is

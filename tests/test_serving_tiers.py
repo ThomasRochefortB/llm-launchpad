@@ -55,7 +55,7 @@ def _plan(
     fits: bool = True,
     gpu_resident: bool = True,
     measured: bool = False,
-    quant: str | None = None,
+    quant: str | None = "Q4_K_M",
 ) -> InferencePlan:
     recipe = InferenceRecipe(
         id="recipe",
@@ -128,7 +128,7 @@ class ServingTierTests(unittest.TestCase):
 
         recommended = [tier for tier in tiers if tier.is_recommended]
         self.assertEqual(len(recommended), 1)
-        self.assertEqual(recommended[0].key, BALANCED)
+        self.assertEqual(recommended[0].key, ECONOMY)
 
     def test_a_placement_that_cannot_hold_full_context_is_never_offered(self) -> None:
         plans = self._frontier()
@@ -179,13 +179,13 @@ class ServingTierTests(unittest.TestCase):
         tiers = serving_tiers(self._frontier())
         by_key = {tier.key: tier for tier in tiers}
 
-        self.assertIsNone(by_key[BALANCED].tradeoff)
-        self.assertIn("slower", by_key[ECONOMY].tradeoff or "")
-        self.assertIn("cheaper", by_key[ECONOMY].tradeoff or "")
+        self.assertIsNone(by_key[ECONOMY].tradeoff)
+        self.assertIn("faster", by_key[BALANCED].tradeoff or "")
+        self.assertIn("the price", by_key[BALANCED].tradeoff or "")
         self.assertIn("faster", by_key[FASTEST].tradeoff or "")
         self.assertIn("the price", by_key[FASTEST].tradeoff or "")
         # Both axes are always named, so nothing is silently favourable.
-        for key in (ECONOMY, FASTEST):
+        for key in (BALANCED, FASTEST):
             self.assertEqual((by_key[key].tradeoff or "").count(","), 1)
 
     def test_evidence_reports_whether_numbers_were_measured(self) -> None:
@@ -219,8 +219,8 @@ class ServingTierTests(unittest.TestCase):
         by_id = {tier.plan.quote.id: tier for tier in tiers}
 
         self.assertIn("barely-cheaper", by_id)
-        self.assertIn("slower", by_id["barely-cheaper"].tradeoff or "")
-        self.assertIn("no cheaper", by_id["barely-cheaper"].tradeoff or "")
+        self.assertIn("faster", by_id["value"].tradeoff or "")
+        self.assertIn("1.1% more", by_id["value"].tradeoff or "")
 
     def test_a_flank_that_is_barely_faster_is_still_offered(self) -> None:
         plans = [
@@ -261,6 +261,7 @@ class EstimatedTopologyTierTests(unittest.TestCase):
             id="recipe",
             model_key="model",
             display_name="Model",
+            quant="Q4_K_M",
             backend=BackendType.LLAMACPP,
             model_id="org/model",
         )
@@ -368,9 +369,9 @@ class QuantQualityFloorTests(unittest.TestCase):
         ]
 
         tiers = serving_tiers(plans)
-        note = reduced_quality_note(tiers)
+        note = reduced_quality_plan_note(plans)
 
-        self.assertTrue(tiers)
+        self.assertEqual(tiers, ())
         self.assertIsNotNone(note)
         self.assertIn("2-bit", note or "")
         self.assertIn("4-bit baseline", note or "")
@@ -436,7 +437,7 @@ class MergedRoleTests(unittest.TestCase):
         self.assertEqual(tiers[ECONOMY].also, (FASTEST,))
         tradeoff = tiers[ECONOMY].tradeoff or ""
         self.assertIn("also the fastest", tradeoff)
-        self.assertIn("cheaper", tradeoff)
+        self.assertIn("the price", tiers[BALANCED].tradeoff or "")
 
     def test_being_the_best_value_is_left_to_the_recommendation_marker(self) -> None:
         # Cheapest and best value in one placement. "also the best value" and

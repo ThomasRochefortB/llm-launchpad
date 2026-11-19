@@ -432,6 +432,7 @@ _ENDPOINT_COLUMNS = (
         _endpoint_throughput,
         _WIDE,
         hide_when_empty=True,
+        justify="right",
     ),
     AdaptiveColumn.visible(
         "served",
@@ -439,6 +440,7 @@ _ENDPOINT_COLUMNS = (
         _endpoint_tokens_served,
         _WIDE,
         hide_when_empty=True,
+        justify="right",
     ),
     AdaptiveColumn.visible(
         "run",
@@ -446,6 +448,7 @@ _ENDPOINT_COLUMNS = (
         _endpoint_run_time,
         _WIDE,
         hide_when_empty=True,
+        justify="right",
     ),
     AdaptiveColumn.visible(
         "cost",
@@ -453,6 +456,7 @@ _ENDPOINT_COLUMNS = (
         _endpoint_cost,
         _WIDE,
         hide_when_empty=True,
+        justify="right",
     ),
     AdaptiveColumn.visible(
         "app",
@@ -482,6 +486,7 @@ class ManageScreen(CopyEnabledScreen):
         Binding("r", "refresh_endpoints", "Refresh", show=True),
         Binding("enter", "open_actions", "Actions", show=True),
         Binding("a", "toggle_stopped", "Stopped", show=True),
+        Binding("d", "deploy", "Deploy", show=True),
         Binding("l", "logs_selected", "Logs", show=False),
         Binding("u", "copy_base_url", "Copy URL", show=False),
         Binding("s", "status_selected", "Status", show=False),
@@ -521,7 +526,7 @@ class ManageScreen(CopyEnabledScreen):
         if action in {
             "refresh_endpoints", "open_actions", "toggle_stopped", "logs_selected",
             "copy_base_url", "status_selected", "benchmark_selected", "stop_selected",
-            "fetch_live_selected",
+            "fetch_live_selected", "deploy",
         }:
             return self.query_one("#manage-tabs", TabbedContent).active == "manage-endpoints"
         return super().check_action(action, parameters)
@@ -709,6 +714,12 @@ class ManageScreen(CopyEnabledScreen):
         self._rows_by_key = {_endpoint_key(row): row for row in self._rows}
         table = self.query_one("#manage-endpoint-table", AdaptiveDataTable)
         table.set_rows(self._rows)
+        # An empty table is a header row saying nothing; the status line
+        # carries the empty state on its own.
+        table.set_class(not self._rows, "hidden")
+        self.query_one("#manage-selection-detail", Static).set_class(
+            not self._rows, "hidden"
+        )
 
         if not self._rows:
             self._selected_key = None
@@ -716,11 +727,11 @@ class ManageScreen(CopyEnabledScreen):
             # invite a second deployment of something that is already running.
             if hidden:
                 summary = (
-                    f"[dim]Nothing running.[/dim]  {hidden} stopped "
-                    f"{'endpoint' if hidden == 1 else 'endpoints'} hidden; press a to show."
+                    f"Nothing running [dim]· {hidden} stopped hidden · "
+                    "a to show · d to deploy[/dim]"
                 )
             elif not self._outage_lines:
-                summary = "[$warning]No endpoints running.[/$warning]  Press esc then d to deploy one, or r to refresh."
+                summary = "No endpoints running [dim]· d to deploy[/dim]"
             else:
                 summary = "[$warning]No endpoints could be listed.[/$warning]  Press r to retry."
             self.query_one("#manage-status", Static).update(
@@ -741,21 +752,22 @@ class ManageScreen(CopyEnabledScreen):
             )
         else:
             summary = (
-                f"[$success]Fleet refreshed[/$success] [dim]· {len(self._rows)} {noun}[/dim]"
+                f"[dim]{len(self._rows)} {noun}[/dim]"
                 if not self._outage_lines
                 else f"[$warning]Fleet partly refreshed[/$warning] [dim]· {len(self._rows)} {noun}[/dim]"
             )
         if hidden:
-            summary += (
-                f"  [dim]{hidden} stopped hidden; press a to show.[/dim]"
-            )
+            summary += f" [dim]· {hidden} stopped hidden (a)[/dim]"
         elif self._show_stopped:
-            summary += "  [dim]Including stopped; press a to hide.[/dim]"
+            summary += " [dim]· including stopped (a)[/dim]"
         self.query_one("#manage-status", Static).update(
             "\n".join([summary, *self._outage_lines])
         )
         self._move_cursor_to_selected()
         self._update_selection_detail()
+
+    def action_deploy(self) -> None:
+        self.app.action_push_deploy()
 
     def on_endpoints_failed(self, message: EndpointsFailed) -> None:
         self._fleet_refresh_inflight = False

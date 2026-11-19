@@ -304,6 +304,8 @@ class VastDeploymentBackend:
             offer = self.api.get_offer(options.offer_id, VastOfferQuery(
                 gpu_type=config.gpu_type, gpu_count=options.gpu_count, disk_gb=options.disk_gb,
             ))
+            if options.gpu_count is not None and offer.gpu_count != options.gpu_count:
+                raise ValueError("The selected Vast GPU count has changed. Refresh offers.")
             if options.machine_id and offer.machine_id != options.machine_id:
                 raise ValueError("The selected Vast machine has changed. Refresh offers.")
             if offer.cuda_max_good is None or offer.cuda_max_good < runtime.min_cuda_version:
@@ -314,8 +316,16 @@ class VastDeploymentBackend:
                     f"{runtime.min_compute_capability} the pinned runtime was built for."
                 )
             price = offer.costs.total_per_hour_usd
-            if price is None or price > options.max_hourly_cost_usd + 1e-9:
+            if price is None or not math.isfinite(price) or price <= 0 or price > options.max_hourly_cost_usd + 1e-9:
                 raise ValueError("The Vast hourly total is unknown or exceeds the approved price. Refresh offers.")
+            if options.max_first_hour_cost_usd is not None:
+                from .vast_comparison import vast_first_hour_cost_usd
+                from .deployment_preflight import price_cap_finding
+
+                first_hour = vast_first_hour_cost_usd(offer.costs, options.download_gb)
+                if finding := price_cap_finding(options.max_first_hour_cost_usd, first_hour):
+                    raise ValueError(f"Vast first-hour total: {finding.message}")
+            config.price_per_hour_usd = price
             config.gpu_count = offer.gpu_count
             assessment = config.placement_assessment
             required = (

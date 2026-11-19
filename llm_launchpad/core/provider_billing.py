@@ -35,6 +35,7 @@ class BalanceKind(str, Enum):
     """What the headline figure means, since providers do not agree."""
 
     SPEND_MTD = "spend_mtd"
+    USAGE_MTD = "usage_mtd"
     BALANCE = "balance"
     CREDIT = "credit"
 
@@ -43,8 +44,9 @@ class BalanceKind(str, Enum):
         """Return the phrase that tells a reader which way the money runs."""
         return {
             BalanceKind.SPEND_MTD: "spent this month",
+            BalanceKind.USAGE_MTD: "metered this month",
             BalanceKind.BALANCE: "balance",
-            BalanceKind.CREDIT: "credit",
+            BalanceKind.CREDIT: "balance",
         }[self]
 
 
@@ -74,6 +76,14 @@ class BillingCharge:
 
 
 @dataclass(frozen=True)
+class StorageBilling:
+    """Workspace storage charges accrued during the current billing cycle."""
+
+    metered_usd: float
+    after_allowance_usd: float | None
+
+
+@dataclass(frozen=True)
 class ProviderBilling:
     """Everything one provider can say about its own billing, uniformly.
 
@@ -92,6 +102,8 @@ class ProviderBilling:
     owed_usd: float | None = None
     setup_command: str | None = None
     error: str | None = None
+    credits_applied_usd: float | None = None
+    storage: StorageBilling | None = None
 
     @classmethod
     def loading(cls, provider: ComputeProvider) -> ProviderBilling:
@@ -123,6 +135,8 @@ class ProviderBilling:
         charges: tuple[BillingCharge, ...] = (),
         notes: tuple[str, ...] = (),
         owed_usd: float | None = None,
+        credits_applied_usd: float | None = None,
+        storage: StorageBilling | None = None,
     ) -> ProviderBilling:
         return cls(
             provider=provider,
@@ -132,7 +146,10 @@ class ProviderBilling:
             charges=charges,
             notes=notes,
             owed_usd=owed_usd,
+            credits_applied_usd=credits_applied_usd,
+            storage=storage,
         )
+
 
 def money_float(value: Any) -> float | None:
     """Coerce a billing figure that may arrive as ``"$1,234.50"`` text."""
@@ -185,7 +202,7 @@ _MODAL_GPU_KEYS = ("summary.gpu_cost_usd", "totals.gpu_cost_usd", "gpu_cost_usd"
 
 
 def parse_modal_billing(payload: Any) -> ProviderBilling:
-    """Read month-to-date workspace spend from any shape the CLI returns."""
+    """Read month-to-date metered usage from the fallback billing report."""
     normalized = _unwrap(payload)
 
     if isinstance(normalized, list):
@@ -199,19 +216,18 @@ def parse_modal_billing(payload: Any) -> ProviderBilling:
             if cost is not None:
                 total += cost
                 has_total = True
-        # An empty report is a real answer -- nothing has billed yet -- while a
-        # populated report with no readable cost column is not.
+        # An empty report has zero metered usage for its reporting interval.
         if not rows:
             return ProviderBilling.ready(
-                ComputeProvider.MODAL, BalanceKind.SPEND_MTD, 0.0
+                ComputeProvider.MODAL, BalanceKind.USAGE_MTD, 0.0
             )
         if has_total:
             return ProviderBilling.ready(
-                ComputeProvider.MODAL, BalanceKind.SPEND_MTD, total
+                ComputeProvider.MODAL, BalanceKind.USAGE_MTD, total
             )
         return ProviderBilling.ready(
             ComputeProvider.MODAL,
-            BalanceKind.SPEND_MTD,
+            BalanceKind.USAGE_MTD,
             None,
             notes=("no cost column in billing report",),
         )
@@ -219,7 +235,7 @@ def parse_modal_billing(payload: Any) -> ProviderBilling:
     if not isinstance(normalized, dict):
         return ProviderBilling.ready(
             ComputeProvider.MODAL,
-            BalanceKind.SPEND_MTD,
+            BalanceKind.USAGE_MTD,
             None,
             notes=("unreadable billing report; check `modal billing report --json`",),
         )
@@ -230,10 +246,39 @@ def parse_modal_billing(payload: Any) -> ProviderBilling:
     notes = () if total is not None else ("no total in billing report",)
     return ProviderBilling.ready(
         ComputeProvider.MODAL,
-        BalanceKind.SPEND_MTD,
+        BalanceKind.USAGE_MTD,
         total,
         charges=charges,
         notes=notes,
+    )
+
+
+def _parse_modal_billing_summary(payload: Any) -> ProviderBilling | None:
+    """Read billed spend, storage charges and credits for the billing cycle."""
+    billed = _first_money(payload, ("billed_cost",))
+    metered = _first_money(payload, ("metered_cost",))
+    if billed is None and metered is None:
+        return None
+
+    credit_adjustment = _first_money(payload, ("adjustments.credits",))
+    volume_cost = _first_money(payload, ("metered_cost_breakdown.volumes",))
+    storage = None
+    if volume_cost is not None and volume_cost >= 0:
+        free_storage_adjustment = _first_money(payload, ("adjustments.free_storage",))
+        storage = StorageBilling(
+            metered_usd=volume_cost,
+            after_allowance_usd=(
+                max(0.0, volume_cost + free_storage_adjustment)
+                if free_storage_adjustment is not None
+                else None
+            ),
+        )
+    return ProviderBilling.ready(
+        ComputeProvider.MODAL,
+        BalanceKind.SPEND_MTD if billed is not None else BalanceKind.USAGE_MTD,
+        billed if billed is not None else metered,
+        credits_applied_usd=max(0.0, -credit_adjustment) if credit_adjustment is not None else None,
+        storage=storage,
     )
 
 
@@ -302,12 +347,16 @@ def parse_vast_billing(payload: Any) -> ProviderBilling:
 
 
 def load_modal_billing(*, authenticated: bool | None = None) -> ProviderBilling:
-    """Fetch Modal's month-to-date spend, or say what stands in the way."""
+    """Fetch billed spend and applied credits, with a metered usage fallback."""
     if authenticated is False:
         return ProviderBilling.unconfigured(ComputeProvider.MODAL)
     from .backend import ModalBackend
 
     try:
+        summary, _ = ModalBackend.billing_summary_json()
+        row = _parse_modal_billing_summary(summary)
+        if row is not None:
+            return row
         payload, error = ModalBackend.billing_report_json()
     except Exception as exc:  # pragma: no cover - defensive around the CLI
         return ProviderBilling.failed(ComputeProvider.MODAL, str(exc))

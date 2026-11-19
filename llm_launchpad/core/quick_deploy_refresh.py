@@ -28,7 +28,7 @@ from .artificial_analysis import (
 from .artificial_analysis_auth import resolve_artificial_analysis_api_key
 from .coerce import clean_string
 from .diagnostics import log_debug
-from .gguf_metadata import GgufMtpStatus
+from .gguf_metadata import GgufMtpStatus, GgufServingMetadata
 from .hf_models import (
     GgufQuantMetadata,
     HubModelPageUnavailable,
@@ -37,7 +37,7 @@ from .hf_models import (
     fetch_model_max_context,
     list_llamacpp_candidates,
 )
-from .modal_gpu import ModalGpuSpec, fetch_modal_gpu_catalog
+from .modal_gpu import MODAL_GPU_MEMORY_GB as _GPU_MEMORY_GB, ModalGpuSpec, fetch_modal_gpu_catalog, modal_gpu_count_limit, modal_gpu_supports_fast_deploy
 from .hf_budget import (
     DEFAULT_BUDGET,
     METADATA_REQUEST_COST,
@@ -57,7 +57,6 @@ from .llamacpp_planner import (
     per_device_requirements,
     tuning_for_architecture,
     tuning_for_attention_scratch,
-    ubatch_for_attention_scratch,
     compile_server_args,
     estimate_memory,
     serving_requirements,
@@ -79,9 +78,9 @@ from ..protocol.models import (
 
 DEFAULT_MODEL_LIMIT = 3
 DEFAULT_OVERALL_MODEL_LIMIT = 10
-DEFAULT_CANDIDATE_LIMIT = 80
+DEFAULT_CANDIDATE_LIMIT = 240
 _AA_RESOLUTION_WORKERS = 24
-_FALLBACK_TRENDING_LIMIT = 8
+_FALLBACK_TRENDING_LIMIT = 12
 _HF_SEARCH_WORKERS = 4
 _HF_SEARCH_LIMIT = 10
 _HF_SEARCH_TIMEOUT_SECONDS = 10.0
@@ -158,8 +157,7 @@ def _quick_deploy_catalog_cache_path() -> Path:
 
 
 QUICK_DEPLOY_CATALOG_CACHE_TTL = timedelta(hours=6)
-QUICK_DEPLOY_CATALOG_CACHE_SCHEMA_VERSION = 11
-_MODEL_SIZE_BUCKETS: tuple[ModelSizeBucket, ...] = ("compact", "medium", "large")
+QUICK_DEPLOY_CATALOG_CACHE_SCHEMA_VERSION = 13
 _MODEL_SIZE_LABELS: dict[ModelSizeBucket, str] = {
     "compact": "Compact ≤40B",
     "medium": "Medium 40–150B",
@@ -192,21 +190,6 @@ _FALLBACK_GPU_PRICE_PER_HOUR = {
     "B200": 6.2496,
     "B200+": 6.2496,
 }
-_GPU_MEMORY_GB = {
-    "T4": 16.0,
-    "L4": 24.0,
-    "A10": 24.0,
-    "A100": 40.0,
-    "A100-40GB": 40.0,
-    "A100-80GB": 80.0,
-    "L40S": 48.0,
-    "RTX-PRO-6000": 96.0,
-    "H100": 80.0,
-    "H100!": 80.0,
-    "H200": 141.0,
-    "B200": 180.0,
-    "B200+": 180.0,
-}
 _RESOURCE_TIER_LABELS = {
     "cheap": "$",
     "rtx-pro": "$$",
@@ -232,7 +215,7 @@ class _GpuSelection:
 class _ResolvedAAModel:
     candidate: AAModelCandidate
     repo_id: str
-    size_bucket: ModelSizeBucket
+    size_bucket: ModelSizeBucket | None
     profiles: tuple[QuickDeployProfile, ...]
 
 
@@ -270,6 +253,17 @@ def build_live_quick_deploy_catalog(
             exclusions=exclusions,
         )
         if profiles:
+            try:
+                _, trending = _build_trending_fallback_catalog(
+                    model_limit=_FALLBACK_TRENDING_LIMIT, modal_gpu_catalog=modal_gpu_catalog,
+                    has_live_modal_pricing=has_live_modal_pricing,
+                    exclusions=exclusions,
+                    skip_repos={p.repo_id.casefold() for p in profiles} | {row.repo_id.casefold() for row in exclusions},
+                )
+            except Exception as exc:
+                log_debug(f"Trending discovery unavailable: {exc}")
+                trending = ()
+            profiles = _with_unique_ids([*profiles, *trending])
             tier_suffix = f", {rankings.tier} tier" if rankings.tier else ""
             info = QuickDeployCatalogInfo(
                 source_label=(
@@ -287,16 +281,28 @@ def build_live_quick_deploy_catalog(
             )
             retained = _retained_catalog_for(profiles, exclusions)
             if retained is not None:
+                _write_quick_deploy_catalog_cache(*retained)
                 return retained
             _write_quick_deploy_catalog_cache(info, profiles)
             return (info, profiles)
 
-    fallback = _build_trending_fallback_catalog(
-        model_limit=normalized_model_limit,
-        modal_gpu_catalog=modal_gpu_catalog,
-        has_live_modal_pricing=has_live_modal_pricing,
-    )
-    fallback = (replace(fallback[0], exclusions=tuple(exclusions)), fallback[1])
+    try:
+        fallback = _build_trending_fallback_catalog(
+            model_limit=max(normalized_model_limit, overall_model_limit),
+            modal_gpu_catalog=modal_gpu_catalog,
+            has_live_modal_pricing=has_live_modal_pricing,
+            exclusions=exclusions,
+        )
+    except RuntimeError:
+        if not exclusions:
+            raise
+        retained = _retained_catalog_for((), exclusions)
+        fallback = retained or (QuickDeployCatalogInfo(
+            source_label="Model availability", generated_at=_utc_now_iso(),
+            exclusions=tuple(exclusions), is_live=True,
+        ), ())
+    else:
+        fallback = (replace(fallback[0], exclusions=tuple(exclusions)), fallback[1])
     _write_quick_deploy_catalog_cache(fallback[0], fallback[1])
     return fallback
 
@@ -349,7 +355,15 @@ def _retained_catalog_for(
         )
     else:
         return None
-    return (replace(previous_info, error=reason), previous_profiles)
+    by_id = {row.model_id: row for row in previous_info.exclusions}
+    by_id.update((row.model_id, row) for row in exclusions)
+    verified = {p.aa_model_id for p in profiles}
+    blocked = {row.model_id for row in exclusions if not row.unchecked}
+    kept = tuple(p for p in previous_profiles if p.aa_model_id not in blocked)
+    by_id = {key: row for key, row in by_id.items() if key not in verified}
+    new_ids = {p.id for p in profiles}
+    combined = _with_unique_ids([*profiles, *(p for p in kept if p.id not in new_ids)])
+    return replace(previous_info, error=reason, exclusions=tuple(by_id.values())), combined
 
 
 def _models_lost_to_unchecked(
@@ -450,6 +464,10 @@ def _quick_deploy_profile_to_dict(profile: QuickDeployProfile) -> dict[str, Any]
         "aa_intelligence_score": profile.aa_intelligence_score,
         "aa_rank": profile.aa_rank,
         "model_size_label": profile.model_size_label,
+        "context_known": profile.context_known,
+        "parameter_count_b": profile.parameter_count_b,
+        "active_parameter_count_b": profile.active_parameter_count_b,
+        "serving_metadata": asdict(profile.serving_metadata) if profile.serving_metadata else None,
         "backend": profile.backend.value,
         "model_name": profile.model_name,
         "gguf_architecture": profile.gguf_architecture,
@@ -546,8 +564,19 @@ def _quick_deploy_profile_from_dict(payload: Any) -> QuickDeployProfile | None:
         speculative_decoding=speculative,
     )
     memory = _memory_estimate_from_dict(payload.get("memory_estimate"))
+    layout = payload.get("serving_metadata")
     try:
+        if isinstance(layout, dict):
+            fields: dict[str, Any] = dict(layout)
+            fields["attention_head_count_kv_by_layer"] = tuple(fields.get("attention_head_count_kv_by_layer") or ())
+            layout = GgufServingMetadata(**fields)
+        else:
+            layout = None
         return QuickDeployProfile(
+            serving_metadata=layout,
+            context_known=payload.get("context_known") is not False,
+            parameter_count_b=float(payload["parameter_count_b"]) if payload.get("parameter_count_b") else None,
+            active_parameter_count_b=float(payload["active_parameter_count_b"]) if payload.get("active_parameter_count_b") else None,
             id=str(payload.get("id") or ""),
             display_name=str(payload.get("display_name") or ""),
             repo_id=str(payload.get("repo_id") or ""),
@@ -761,7 +790,7 @@ def _read_quick_deploy_catalog_cache(
         and profile.id
         and profile.repo_id
     )
-    if not profiles:
+    if not profiles and not info.exclusions:
         return None
     if not info.ready:
         info = replace(info, ready=True, error=None)
@@ -805,35 +834,22 @@ def _profiles_from_aa_rankings(
     hub_request_budget: int = DEFAULT_BUDGET,
     overall_model_limit: int = 0,
 ) -> tuple[QuickDeployProfile, ...]:
-    """Select the union of overall and per-size shortlists of deployable models."""
-
-    # Deduplicate variants of the same model *before* the candidate window, so
-    # a budget of N admits N distinct models rather than N benchmark rows. The
-    # feed lists one row per reasoning-effort setting -- Claude Fable 5.1 alone
-    # occupies five -- and the window used to spend its budget on those rows.
-    # The unknown-size pool starved first, because effort variants cluster at
-    # the top of the ranking where nearly every model is API-only: the pool ran
-    # out at rank 83, and open-weight models below it with real GGUF
-    # repositories were never inspected and never recorded as excluded, so
-    # nothing on screen distinguished them from models that had been rejected.
-    #
-    # Deduplicating first also keeps the original reason this step exists:
-    # _resolve_aa_model caches by model key, but the check-then-act on the
-    # shared dict races, so two variants with the same key can both miss the
-    # cache and issue duplicate HF lookups (flaky call counts under xdist).
-    # Resolving one representative per key keeps behavior identical -- the
-    # loser would be dropped by seen_repos anyway -- and the representative is
-    # the highest-ranked variant, which is the one the shortlist wants.
-    deduped_window = list(_aa_candidate_window(_deduped_candidates(candidates), candidate_limit))
-    selected_by_bucket: dict[ModelSizeBucket, list[_ResolvedAAModel]] = {
-        bucket: [] for bucket in _MODEL_SIZE_BUCKETS
-    }
-    selected_overall: list[_ResolvedAAModel] = []
-    seen_repos: set[str] = set()
-    repo_by_model_key: dict[str, str] = {}
-    # Remembered match results make most candidates free, which is what lets
-    # the window be swept at all; the budget is the backstop for the rest.
+    """Discover ranked repositories within a request budget, independent of display categories."""
+    candidates = _deduped_candidates(candidates)
     match_store = RepoMatchStore.load()
+    known = []
+    unknown = []
+    for candidate in candidates:
+        match = match_store.get(_model_key(candidate.name) or _model_key(candidate.slug))
+        if match is not None and match.repo_id:
+            known.append(candidate)
+        elif match is None:
+            unknown.append(candidate)
+    # Recheck identified open weights before spending requests on speculative matches.
+    window = known + list(_aa_candidate_window(unknown, candidate_limit))
+    seen_repos: set[str] = set()
+    profiles: list[QuickDeployProfile] = []
+    repo_by_model_key: dict[str, str] = {}
     budget = HubRequestBudget(hub_request_budget)
     try:
         from huggingface_hub import HfApi
@@ -842,21 +858,8 @@ def _profiles_from_aa_rankings(
     except Exception:
         shared_hf_api = None
 
-    # Keep a bounded lookahead, then consume results in benchmark order. A
-    # faster response must never displace a higher-ranked eligible model.
-    # Skip a full category only after the overall shortlist is also full.
-    # Otherwise a fourth large model could outrank every smaller model.
-    remaining = iter(deduped_window)
+    remaining = iter(window)
     pending: deque[tuple[AAModelCandidate, Future[_ResolvedAAModel | None], list[CatalogExclusion]]] = deque()
-
-    def category_full(candidate: AAModelCandidate) -> bool:
-        bucket = _size_bucket_for_parameters(candidate.parameter_count_b)
-        return (
-            len(selected_overall) >= overall_model_limit
-            and bucket is not None
-            and len(selected_by_bucket[bucket]) >= model_limit
-        )
-
     executor = ThreadPoolExecutor(max_workers=_AA_RESOLUTION_WORKERS)
 
     def fill_pending() -> None:
@@ -868,8 +871,6 @@ def _profiles_from_aa_rankings(
             candidate = next(remaining, None)
             if candidate is None:
                 break
-            if category_full(candidate):
-                continue
             # Workers own their diagnostics. Cancelled/unused lookahead must
             # not mutate an already-published catalog after this call returns.
             reasons: list[CatalogExclusion] = []
@@ -889,30 +890,12 @@ def _profiles_from_aa_rankings(
         fill_pending()
         while pending:
             candidate, future, reasons = pending.popleft()
-            if category_full(candidate):
-                future.cancel()
-                fill_pending()
-                continue
             resolved = future.result()
             if exclusions is not None:
                 exclusions.extend(reasons)
             if resolved is not None and resolved.repo_id and resolved.repo_id not in seen_repos:
                 seen_repos.add(resolved.repo_id)
-                in_overall = len(selected_overall) < overall_model_limit
-                if in_overall:
-                    selected_overall.append(resolved)
-                bucket_models = selected_by_bucket[resolved.size_bucket]
-                if len(bucket_models) < model_limit:
-                    bucket_models.append(resolved)
-                elif not in_overall:
-                    _record_exclusion(
-                        exclusions, candidate, resolved.repo_id,
-                        f"Outside the top {model_limit} {_MODEL_SIZE_LABELS[resolved.size_bucket]} recommendations.",
-                    )
-            if len(selected_overall) >= overall_model_limit and all(
-                len(models) >= model_limit for models in selected_by_bucket.values()
-            ):
-                break
+                profiles.extend(resolved.profiles)
             fill_pending()
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
@@ -920,14 +903,11 @@ def _profiles_from_aa_rankings(
         # cut short; that is what makes the next one reach further.
         match_store.save()
 
-    profiles: list[QuickDeployProfile] = []
-    for bucket in _MODEL_SIZE_BUCKETS:
-        for resolved in selected_by_bucket[bucket]:
-            profiles.extend(resolved.profiles)
-    included_repos = {profile.repo_id for profile in profiles}
-    for resolved in selected_overall:
-        if resolved.repo_id not in included_repos:
-            profiles.extend(resolved.profiles)
+    for candidate in remaining:
+        match = match_store.get(_model_key(candidate.name) or _model_key(candidate.slug))
+        _record_exclusion(exclusions, candidate, (match.repo_id if match else "") or "",
+                          UNCHECKED_BUDGET_REASON, unchecked=True)
+    profiles.sort(key=lambda profile: profile.aa_rank or 10**9)
     return _with_unique_ids(profiles)
 
 
@@ -957,40 +937,8 @@ def _aa_candidate_window(
     candidates: Sequence[AAModelCandidate],
     candidate_limit: int,
 ) -> tuple[AAModelCandidate, ...]:
-    """Keep a ranked candidate budget for every known size bucket.
-
-    Candidates whose size the feed does not state share one pool, because
-    until their weights are inspected they could belong to any bucket. Pass
-    a deduplicated ranking: the budget counts candidates, so variants of one
-    model would otherwise consume several slots each.
-    """
-
-    candidates_by_bucket: dict[ModelSizeBucket, list[AAModelCandidate]] = {
-        bucket: [] for bucket in _MODEL_SIZE_BUCKETS
-    }
-    # A candidate of unknown size competes in every bucket until its weights
-    # are read, so it gets every bucket's budget rather than one bucket's
-    # worth. Widening this once before was a mistake: the discovery loop only
-    # stops early when every bucket holds a full shortlist, so a bucket that
-    # cannot fill made it sweep the whole window and exhaust Hugging Face's
-    # quota, and throttled lookups then dropped models silently. The sweep is
-    # now bounded by a request budget and most of it is answered from
-    # remembered match results, so depth costs requests only the first time.
-    unknown_size_candidates: list[AAModelCandidate] = []
-    selected_ids: set[int] = set()
-    for candidate in candidates:
-        bucket = _size_bucket_for_parameters(candidate.parameter_count_b)
-        if bucket is None:
-            if len(unknown_size_candidates) < candidate_limit * len(_MODEL_SIZE_BUCKETS):
-                unknown_size_candidates.append(candidate)
-                selected_ids.add(id(candidate))
-            continue
-        bucket_candidates = candidates_by_bucket[bucket]
-        if len(bucket_candidates) < candidate_limit:
-            bucket_candidates.append(candidate)
-            selected_ids.add(id(candidate))
-
-    return tuple(candidate for candidate in candidates if id(candidate) in selected_ids)
+    """Bound discovery by distinct ranked candidates, independently of size."""
+    return tuple(candidates[:max(0, candidate_limit)])
 
 
 def _resolve_aa_model(
@@ -1093,9 +1041,6 @@ def _build_resolved_aa_model(
     size_bucket = _size_bucket_for_parameters(candidate.parameter_count_b)
     if size_bucket is None:
         size_bucket = _size_bucket_from_gguf_metadata(metadata)
-    if size_bucket is None:
-        _record_exclusion(exclusions, candidate, repo_id, "Model size could not be determined from the available metadata.")
-        return None
     compatibility = evaluate_llamacpp_architecture(metadata.architecture)
     if not compatibility.is_supported:
         _record_exclusion(exclusions, candidate, repo_id, compatibility.message)
@@ -1175,8 +1120,12 @@ def _build_trending_fallback_catalog(
     model_limit: int,
     modal_gpu_catalog: Sequence[ModalGpuSpec],
     has_live_modal_pricing: bool,
+    skip_repos: set[str] | None = None,
+    exclusions: list[CatalogExclusion] | None = None,
 ) -> tuple[QuickDeployCatalogInfo, tuple[QuickDeployProfile, ...]]:
     models = list_llamacpp_candidates(mode="trending", limit=_FALLBACK_TRENDING_LIMIT)
+    if skip_repos:
+        models = [m for m in models if m.repo_id.casefold() not in skip_repos]
     if not models:
         raise RuntimeError(
             "Neither Artificial Analysis rankings nor Hugging Face trending models "
@@ -1192,17 +1141,27 @@ def _build_trending_fallback_catalog(
         for metadata_future in as_completed(metadata_futures):
             model = metadata_futures[metadata_future]
             metadata = metadata_future.result()
+            reason = ""
             if metadata is None:
+                reason = "Hugging Face serving metadata could not be read. Refresh the catalog to retry."
+            else:
+                compatibility = evaluate_llamacpp_architecture(metadata.architecture)
+                if not compatibility.is_supported:
+                    reason = compatibility.message
+            if reason:
+                if exclusions is not None:
+                    exclusions.append(CatalogExclusion(model.repo_id, _display_name(model.repo_id), model.repo_id,
+                                                       reason, unchecked=metadata is None))
                 continue
             group = _profiles_for_model(
                 model,
                 modal_gpu_catalog,
                 metadata=metadata,
                 skip_context_lookup=True,
+                prefer_mtp=not skip_repos,
             )
             if group:
                 profiles_by_repo[model.repo_id] = group
-    _attach_profile_context_lengths(profiles_by_repo, max_workers=8)
 
     profiles: list[QuickDeployProfile] = []
     selected_models = 0
@@ -1227,6 +1186,7 @@ def _build_trending_fallback_catalog(
             "Model metadata sourced from Hugging Face; GPU pricing sourced from Modal."
         ),
         is_live=True,
+        is_fallback=True,
     )
     return (info, tuple(profiles))
 
@@ -1322,8 +1282,9 @@ def _find_unsloth_gguf_match(
         attempted += 1
         try:
             row = hf_api.model_info(repo_id=repo_id, timeout=_HF_SEARCH_TIMEOUT_SECONDS)
-        except Exception:
-            failed += 1
+        except Exception as exc:
+            if getattr(getattr(exc, "response", None), "status_code", None) != 404:
+                failed += 1
             continue
         resolved_repo_id = _repo_id_from_hf_row(row) or repo_id
         if (
@@ -1477,12 +1438,7 @@ def _list_unsloth_gguf_search(hf_api: Any, search: str) -> list[Any]:
     except TypeError:
         # Older huggingface_hub releases lack author/expand; retry unscoped.
         fallback = {"search": search, "limit": _HF_SEARCH_LIMIT}
-        try:
-            return list(hf_api.list_models(**fallback))
-        except Exception:
-            return []
-    except Exception:
-        return []
+        return list(hf_api.list_models(**fallback))
 
 
 def _has_strong_unsloth_gguf_match(
@@ -1533,7 +1489,17 @@ def _aa_hf_match_score(candidate: AAModelCandidate, repo_id: str) -> float:
             )
         ),
     }
-    repo_key = _model_key(_repo_model_name(repo_id))
+    repo_name = _repo_model_name(repo_id)
+    # A fuzzy name match must never substitute an older release for the requested one.
+    release_pattern = r"(?i)v(\d+(?:\.\d+)*)"
+    requested = re.findall(release_pattern, candidate.name)
+    offered = re.findall(release_pattern, repo_name)
+    if requested and offered and requested != offered:
+        return 0.0
+    releases = re.findall(r"(?i)(?:v|[- ])(\d+(?:\.\d+)+)(?![\d.])", candidate.name)
+    if releases and any(not re.search(rf"(?<!\d){re.escape(version)}(?![.\d])", repo_name) for version in releases):
+        return 0.0
+    repo_key = _model_key(repo_name)
     scores: list[float] = []
     for candidate_key in candidate_keys:
         if not candidate_key:
@@ -1569,104 +1535,18 @@ def _fetch_modal_gpu_catalog_or_fallback() -> tuple[tuple[ModalGpuSpec, ...], bo
         catalog = tuple(fetch_modal_gpu_catalog())
     except Exception:
         return ((), False)
-    return (catalog, any(spec.price_per_hour_usd is not None for spec in catalog))
+    return (catalog, any(spec.price_per_hour_usd is not None and spec.stale_since is None for spec in catalog))
 
 
 def _safe_fetch_gguf_metadata(repo_id: str) -> GgufQuantMetadata | None:
-    """Fetch GGUF metadata without MTP inspection or context lookups."""
-
+    """Resolve the native context before sizing any trending-model profiles."""
     try:
-        return fetch_gguf_quant_metadata(
-            repo_id, inspect_serving=True, require_weight_sizes=True
-        )
+        metadata = fetch_gguf_quant_metadata(repo_id, inspect_serving=True, require_weight_sizes=True)
     except Exception:
         return None
-
-
-def _attach_profile_context_lengths(
-    profiles_by_repo: dict[str, list[QuickDeployProfile]],
-    *,
-    max_workers: int = 8,
-) -> None:
-    """Fill per-repo context lengths after profiles are selectable.
-
-    Only upgrades rows still carrying the conservative default; AA rows
-    already know their context window and are left untouched.
-    """
-
-    pending = [
-        repo_id
-        for repo_id, group in profiles_by_repo.items()
-        if group and all(profile.max_context_tokens == DEFAULT_CONTEXT_TOKENS for profile in group)
-    ]
-    if not pending:
-        return
-    context_by_repo: dict[str, int | None] = {}
-    with ThreadPoolExecutor(max_workers=min(max_workers, len(pending))) as executor:
-        futures = {
-            executor.submit(_safe_fetch_model_max_context, repo_id): repo_id
-            for repo_id in pending
-        }
-        for future in as_completed(futures):
-            context_by_repo[futures[future]] = future.result()
-    for repo_id, context_tokens in context_by_repo.items():
-        if context_tokens is None:
-            continue
-        upgraded_group: list[QuickDeployProfile] = []
-        for profile in profiles_by_repo[repo_id]:
-            requirements = (
-                replace(profile.serving_requirements, context_tokens=context_tokens)
-                if profile.serving_requirements is not None
-                else serving_requirements(context_tokens)
-            )
-            tuning = profile.runtime_tuning or tuning_for_objective(
-                requirements.objective,
-                speculative_decoding=profile.speculative_decoding,
-            )
-            memory = profile.memory_estimate
-            if memory is not None:
-                old_context = max(1, profile.max_context_tokens)
-                scale = context_tokens / old_context
-                kv_cache_gb = memory.kv_cache_gb * scale
-                # A graph built without flash attention reserves scores for the
-                # whole context, so this term follows the window just as the
-                # cache does -- and the physical batch it was chosen against
-                # has to be re-chosen with it, or a longer window silently
-                # scales a batch that no longer fits.
-                scratch_gb = memory.attention_scratch_gb * scale
-                if scratch_gb > 0:
-                    per_token_gb = scratch_gb / max(1, tuning.ubatch_size)
-                    ubatch = ubatch_for_attention_scratch(
-                        per_token_gb, max_ubatch=tuning.ubatch_size
-                    )
-                    scratch_gb = per_token_gb * ubatch
-                    tuning = replace(tuning, ubatch_size=ubatch)
-                memory = replace(
-                    memory,
-                    kv_cache_gb=round(kv_cache_gb, 3),
-                    attention_scratch_gb=round(scratch_gb, 3),
-                    total_gb=round(
-                        memory.weights_gb
-                        + kv_cache_gb
-                        + memory.compute_gb
-                        + scratch_gb
-                        + memory.speculative_gb
-                        + memory.reserve_gb,
-                        3,
-                    ),
-                )
-            upgraded_group.append(
-                replace(
-                    profile,
-                    max_context_tokens=context_tokens,
-                    server_args=compile_server_args(requirements, tuning),
-                    required_vram_gb=(memory.total_gb if memory is not None else profile.required_vram_gb),
-                    serving_requirements=requirements,
-                    runtime_tuning=tuning,
-                    memory_estimate=memory,
-                )
-            )
-        profiles_by_repo[repo_id] = upgraded_group
+    if metadata.context_length is None and metadata.vram_gb_by_quant:
+        return replace(metadata, context_length=_safe_fetch_model_max_context(repo_id))
+    return metadata
 
 
 def _safe_fetch_model_max_context(repo_id: str) -> int | None:
@@ -1871,6 +1751,12 @@ def _profiles_for_model(
     slug_hint = slugify_instance_name(display_name)
     profiles: list[QuickDeployProfile] = []
     unplaced: list[QuickDeployProfile] = []
+    layout = metadata.serving_metadata or GgufServingMetadata(
+        architecture=metadata.architecture, context_length=max_context_tokens,
+        block_count=metadata.block_count, embedding_length=metadata.embedding_length,
+        attention_head_count=metadata.attention_head_count, attention_head_count_kv=metadata.attention_head_count_kv,
+        attention_key_length=metadata.attention_key_length, attention_value_length=metadata.attention_value_length,
+    )
     for quant in quants:
         built = _profiles_for_quant(
             repo_id=model.repo_id,
@@ -1888,6 +1774,11 @@ def _profiles_for_model(
             include_unplaced=True,
         )
         for profile in built:
+            profile = replace(
+                profile, context_known=max_context_tokens is not None, serving_metadata=layout,
+                parameter_count_b=aa_candidate.parameter_count_b if aa_candidate else None,
+                active_parameter_count_b=aa_candidate.active_parameter_count_b if aa_candidate else None,
+            )
             (profiles if profile.gpu_count > 0 else unplaced).append(profile)
     # An unplaced recipe is still a recipe: keep at most one per quant so Prime
     # and Vast matching can evaluate it, without duplicating placed profiles.
@@ -1993,7 +1884,7 @@ def _profiles_for_quant(
         requirements=requirements,
         tuning=runtime_tuning,
     )
-    if metadata.architecture in {"kimi-k3", "kimi-linear", "glm5next"} and memory_estimate.source == "conservative-fallback":
+    if metadata.architecture in {"kimi-k3", "kimi-linear", "glm5next", "glm5-next"} and memory_estimate.source == "conservative-fallback":
         if rejected is not None:
             rejected.append("Hybrid attention memory layout is incomplete; GPU fit cannot be verified. Refresh model metadata to retry.")
         return []
@@ -2272,7 +2163,7 @@ def _select_gpu_shape(
         memory_gb = _GPU_MEMORY_GB.get(candidate_gpu)
         if memory_gb is None:
             continue
-        for gpu_count in range(1, 9):
+        for gpu_count in range(1, modal_gpu_count_limit(candidate_gpu) + 1):
             reserve_per_gpu = max(2.0, memory_gb * 0.05)
             # The busiest device is the one that has to fit, and layers are
             # indivisible, so an uneven split is sized on its larger half.
@@ -2313,17 +2204,14 @@ def _available_gpu_types(
 ) -> list[str]:
     """Return catalog GPU shapes that can actually back a priced profile.
 
-    Entries without a known VRAM size (e.g. future ``B300`` shapes) or
-    without a usable hourly price (e.g. unpriced ``H100!``/``H200`` rows)
-    are skipped: offering them produces profiles whose cost math silently
-    falls back to RTX pricing and whose fulfillment lands on ``price n/a``
-    placements.
+    Only known prices, supported runtimes, and known memory capacities can form a profile.
     """
     prices = _live_price_by_gpu(modal_gpu_catalog)
     values = [
         entry.value.strip()
         for entry in modal_gpu_catalog
         if entry.value.strip()
+        and modal_gpu_supports_fast_deploy(entry.value)
         and _GPU_MEMORY_GB.get(entry.value.strip()) is not None
         and (prices.get(entry.value.strip()) or 0) > 0
     ]

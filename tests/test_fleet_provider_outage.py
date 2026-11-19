@@ -17,7 +17,7 @@ from llm_launchpad.protocol.models import EndpointInfo, FleetDiscovery, Provider
 from llm_launchpad.tui.app import TuiApp
 from llm_launchpad.tui.fleet_status import provider_outage_lines, retained_providers
 from llm_launchpad.tui.format import format_age
-from llm_launchpad.tui.screens.main_menu import _render_deployment_status
+from llm_launchpad.tui.screens.main_menu import MainMenuScreen, _render_deployment_status
 from llm_launchpad.tui.screens.manage import ManageScreen
 from llm_launchpad.tui.widgets.adaptive_table import AdaptiveDataTable
 from llm_launchpad.tui.workers import EndpointsLoaded
@@ -295,6 +295,40 @@ class _OutageApp(App[None]):
         )
 
 
+class HomeScreenOutageTests(unittest.IsolatedAsyncioTestCase):
+    async def test_compact_home_only_offers_deploy_after_confirmed_empty_listing(self) -> None:
+        app = App()
+        modal, vast = ComputeProvider.MODAL, ComputeProvider.VAST
+        cached = _endpoint("old", provider=vast)
+        live = _endpoint("current", provider=modal)
+        with (
+            patch.object(MainMenuScreen, "on_mount", lambda self: None),
+            patch("llm_launchpad.tui.screens.main_menu._annotate_runtime_statuses"),
+        ):
+            async with app.run_test(size=(80, 24)) as pilot:
+                screen = MainMenuScreen()
+                await app.push_screen(screen)
+                summary = screen.query_one("#fleet-summary-line", Static)
+                for listing, visible, expected in (
+                    ((ProviderListing(vast, error="timed out"),), [], "Fleet status unknown"),
+                    ((ProviderListing(vast, (cached,), error="timed out"),), [cached], "Fleet status unknown"),
+                    ((ProviderListing(modal, (live,)), ProviderListing(vast, (cached,), error="timed out")),
+                     [live, cached], "1 endpoint"),
+                ):
+                    screen.post_message(EndpointsLoaded(visible, discovery=FleetDiscovery(listing)))
+                    await pilot.pause()
+                    self.assertIn(expected, str(summary.content))
+                    self.assertIn("Vast.ai unavailable", str(summary.content))
+                    self.assertNotIn("Deploy to start", str(summary.content))
+                screen.post_message(EndpointsLoaded([], discovery=FleetDiscovery((ProviderListing(modal),))))
+                await pilot.pause()
+                self.assertIn("No active endpoints", str(summary.content))
+                self.assertIn("Deploy to start", str(summary.content))
+                screen.post_message(EndpointsLoaded([], discovery=FleetDiscovery()))
+                await pilot.pause()
+                self.assertIn("No provider listing available", str(summary.content))
+
+
 class ManageScreenOutageTests(unittest.IsolatedAsyncioTestCase):
     async def test_retained_rows_stay_actionable_and_are_marked_stale(self) -> None:
         row = _endpoint("vllm-qwen3")
@@ -368,7 +402,8 @@ class ManageScreenOutageTests(unittest.IsolatedAsyncioTestCase):
             status = str(screen.query_one("#manage-status", Static).content)
             detail = str(screen.query_one("#manage-selection-detail", Static).content)
 
-            self.assertIn("Fleet refreshed", status)
+            self.assertIn("1 endpoint", status)
+            self.assertNotIn("partly", status)
             self.assertNotIn("unavailable", status)
             self.assertNotIn("may be out of date", detail)
 

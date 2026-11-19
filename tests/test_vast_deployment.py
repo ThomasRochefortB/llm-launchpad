@@ -275,6 +275,17 @@ class VastLifecycleTests(unittest.TestCase):
         self.assertTrue(event.success, event.detail)
         self.api.create_instance.assert_called_once()
 
+    def test_transfer_price_increase_blocks_rental_even_with_unchanged_hourly_price(self) -> None:
+        options = self.config.provider_options
+        assert isinstance(options, VastProviderOptions)
+        self.config.provider_options = replace(options, max_first_hour_cost_usd=0.50, download_gb=10)
+        offer = vast_offer()
+        self.api.get_offer.return_value = replace(offer, costs=replace(offer.costs, download_per_gb_usd=0.50))
+        event = self.deploy()
+        self.assertFalse(event.success)
+        self.assertIn("first-hour total", event.detail)
+        self.api.create_instance.assert_not_called()
+
     def test_changed_machine_or_insufficient_memory_cannot_rent(self) -> None:
         self.api.get_offer.return_value = vast_offer(machine_id=43)
         self.assertFalse(self.deploy().success)

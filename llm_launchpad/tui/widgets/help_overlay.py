@@ -11,8 +11,9 @@ from textual.widgets import Static
 
 from .fitted_footer import FittedFooter
 
-# Wide enough for `ctrl+shift+c`-sized chords; longer key lists wrap.
-_MAX_KEY_WIDTH = 16
+# Wide enough for a key and its shifted chord (`ctrl+v, ctrl+shift+v`), so
+# the two-key rows do not wrap; longer key lists still do.
+_MAX_KEY_WIDTH = 20
 _MAX_KEYS_PER_ROW = 2
 
 # Textual names some keys after the character rather than the key cap.
@@ -307,7 +308,9 @@ class HelpOverlayScreen(ModalScreen):
                             key_cell = Static(escape(key), classes="help-key")
                             key_cell.styles.width = key_width
                             yield key_cell
-                            yield Static(escape(label), classes="help-label")
+                            yield Static(
+                                escape(label[:1].upper() + label[1:]), classes="help-label"
+                            )
                 yield Static(
                     "Tab moves between controls · select and copy text with "
                     "your terminal (in tmux, usually Shift+drag)",

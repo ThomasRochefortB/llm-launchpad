@@ -606,7 +606,7 @@ def test_a_provider_that_never_answers_is_dropped_not_deferred() -> None:
     release = _threading.Event()
     running = _threading.Event()
 
-    def _hung_catalog():  # type: ignore[no-untyped-def]
+    def _hung_catalog(**_kwargs):  # type: ignore[no-untyped-def]
         running.set()
         release.wait(timeout=30)
         return []
@@ -616,6 +616,7 @@ def test_a_provider_that_never_answers_is_dropped_not_deferred() -> None:
             patch.object(availability, "COMPUTE_AVAILABILITY_TIMEOUT_SECONDS", 0.2),
             patch.object(availability, "resolve_modal_cli_path", return_value="/usr/bin/modal"),
             patch.object(availability, "fetch_modal_gpu_catalog", _hung_catalog),
+            patch.object(availability, "check_modal_readiness"),
             patch.object(availability, "get_prime_auth_status", side_effect=Exception("skip")),
             patch.object(availability, "resolve_vast_credentials", side_effect=ValueError("skip")),
         ):

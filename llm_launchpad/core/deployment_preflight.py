@@ -14,6 +14,7 @@ Three stages, one entrypoint:
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import math
 
 from ..protocol.enums import (
     BackendType,
@@ -347,21 +348,20 @@ def revalidate_plan_price(
     cap: float | None = None
     if plan.serving_requirements is not None:
         cap = plan.serving_requirements.max_hourly_cost_usd
-    if cap is None or current_price_per_hour_usd is None:
+    return price_cap_finding(cap, current_price_per_hour_usd)
+
+
+def price_cap_finding(cap: float | None, current: float | None) -> PreflightFinding | None:
+    """Validate a refreshed provider charge against the user's approved amount."""
+    if cap is None:
         return None
-    try:
-        if float(current_price_per_hour_usd) <= float(cap) + 1e-9:
-            return None
-    except (TypeError, ValueError):
+    if current is None or not math.isfinite(current) or current <= 0:
+        return PreflightFinding("price-unknown", "Current price could not be verified. Refresh offers before provisioning.")
+    if math.isfinite(cap) and current <= cap + 1e-9:
         return None
-    return PreflightFinding(
-        code="price-cap-exceeded",
-        message=(
-            f"Current price ${current_price_per_hour_usd:.2f}/h exceeds the "
-            f"approved cap of ${cap:.2f}/h. Re-approve before provisioning."
-        ),
-        fields=("price_per_hour_usd",),
-    )
+    return PreflightFinding("price-cap-exceeded",
+                            f"Current price ${current:.4f} exceeds the approved cap of ${cap:.4f}. Refresh offers.",
+                            fields=("price_per_hour_usd",))
 
 
 def preflight_request(

@@ -16,16 +16,24 @@ its estimated VRAM requirement plus safety headroom.
 
 ## Artificial Analysis ranking
 
-When the TUI opens, it builds the Deploy catalog in the background. With an
+When the TUI opens, it loads the cached Deploy catalog and builds a new one in the background when needed. With an
 Artificial Analysis API key configured (`ARTIFICIAL_ANALYSIS_API_KEY` or
-`llm-launchpad aai-auth login`), it selects the top three deployable
-open-weight models in each of three size bands (Compact ≤40B, Medium
-40–150B, and Large >150B), plus the top ten overall, ranked by the Artificial
-Analysis Intelligence Index. Press **v** in the model picker to switch between
-**By size** and **Top 10 by AA score · all sizes**. The overall view has no
-per-size quota; search and GPU filters still apply. It shows up to ten scored
-models from the accessible catalog, with fewer rows when fewer qualify.
-Unranked trending models remain available in the size view.
+`llm-launchpad aai-auth login`), the opening view shows up to ten models ranked by the Artificial
+Analysis Intelligence Index. Each needs a priced placement for the model’s full
+context at a verified quantization of at least four bits. Discovery keeps models
+across all sizes. **v** opens the wider catalog, including unranked models.
+
+Press **/** to search names and repositories across the catalog. Spaces,
+hyphens, and punctuation are optional. Unavailable and unchecked matches show
+the reason in the detail pane. **↓** moves focus to the results and **Enter**
+opens placements or the availability explanation. **Esc** returns to the search.
+
+Economy compares an hour of GPU rental plus known one-time charges, including
+weight transfer. Equal first-hour prices favor higher precision and then fewer
+GPUs. The selected shape determines the hourly price shown on every step.
+When a shorter context unlocks a placement or lowers the first-hour cost, press
+**c** on Placement to cycle between full context and eligible 32,768- or
+8,192-token options. The planner recomputes memory from the model’s GGUF layout.
 
 Hugging Face verifies matching GGUF weights and memory requirements,
 while Modal supplies current GPU availability and pricing. GGUF
@@ -52,14 +60,21 @@ Artificial Analysis responses are cached for 24 hours under
 `llm-launchpad aai-auth login` under `~/.llm_launchpad/`. A one-way key
 fingerprint lets the TUI reuse a recent successful validation safely. The
 authentication footer shows the AAI status and account tier alongside Modal,
-Prime Intellect, and Hugging Face. Modal prices and Hugging Face GGUF metadata
-are still refreshed on each launch. Free AAI keys are supported, with model
+Prime Intellect, and Hugging Face. The TUI reuses a complete ranked catalog for six hours. Stale, partial, or
+fallback catalogs appear immediately while discovery retries in the background.
+Opening Deploy still fetches provider availability and prices independently. Free AAI keys are supported, with model
 size inferred when the free response omits parameter counts. Without a key or
 cached AAI response, startup falls back to Hugging Face trending GGUF models.
 If that also fails the Deploy screen shows a clear unavailable state that
 points to Custom deploy.
 
 ## llama.cpp runtime support
+
+The default CUDA 12 server is pinned to upstream build **b12464**. Its registry includes
+DeepSeek V4.1 Flash (`deepseek41`), current GLM-5.3-Flash (`glm5-next`), and
+Inkling 2 (`inkling2`). Older GLM files declaring `glm5next` still use their
+dedicated source build. Upgrading from b10689 rebuilds the cached catalog
+so its runtime IDs and exclusion reasons match the new server.
 
 Launchpad verifies GGUF `general.architecture` compatibility before every
 deploy, on Modal and Prime alike:

@@ -1,23 +1,4 @@
-"""Reduce a placement frontier to the few choices a person can actually make.
-
-Step two of Fast Deploy used to be a hardware menu: L40S x2, A100-80GB x1,
-RTX-PRO-6000 x1. Nobody knows whether they want two L40S. Everybody knows
-whether they want cheap or fast, so the frontier is collapsed to at most three
-named points and the hardware becomes a detail.
-
-Every tier serves the model's full context on GPU at the same bit width. Tiers
-move price and speed; they never quietly reduce what the model can do, which is
-what lets a cheap option exist without reopening the silent-degradation
-question.
-
-Weights are held to that same promise. Price and speed both improve as the
-quantization shrinks, so a frontier spanning two bit widths hands every tier to
-the smaller one -- 2-bit weights chosen on the user's behalf, sometimes on the
-identical GPU the 4-bit weights would have used. The frontier is therefore
-explored at one quality level: the best the connected placements can serve. A
-smaller quantization is offered beside it only when it buys a real discount,
-and only with its bit width named.
-"""
+"""Compare fitting GPU placements by first-hour cost, quality and throughput."""
 
 from __future__ import annotations
 
@@ -32,7 +13,7 @@ from .quant_quality import (
     QUALITY_FLOOR_BITS,
     is_reduced_quality,
     quant_quality_label,
-    serving_quality_bits,
+    quant_bits,
 )
 from .quick_deploy import plan_is_eligible
 
@@ -225,7 +206,7 @@ def _describe_tradeoff(
             # Naming the absent benefit is the point: an option that is much
             # slower and no cheaper should read as the bad deal it is, rather
             # than being quietly dropped from the list.
-            price_text = "no cheaper"
+            price_text = f"{abs(ratio - 1):.1%} {'more' if ratio > 1 else 'less'}" if ratio != 1 else "same price"
     parts = [text for text in (speed_text, price_text) if text]
     return ", ".join(parts) if parts else None
 
@@ -245,19 +226,25 @@ def _evidence_classes_match(left: InferencePlan, right: InferencePlan) -> bool:
 def _quality_partition(
     plans: Sequence[InferencePlan],
 ) -> tuple[list[InferencePlan], list[InferencePlan]]:
-    """Split a frontier into the best bit width available and everything below.
-
-    Grouping is by width rather than by label: Q4_K_M and UD-Q4_K_XL are one
-    quality level with two spellings, and splitting them would strand half the
-    frontier.
-    """
-
-    best = max(serving_quality_bits(plan.recipe.quant) for plan in plans)
-    primary = [
-        plan for plan in plans if serving_quality_bits(plan.recipe.quant) == best
-    ]
-    lower = [plan for plan in plans if serving_quality_bits(plan.recipe.quant) < best]
+    primary = [p for p in plans if (quant_bits(p.recipe.quant) or 0) >= QUALITY_FLOOR_BITS]
+    lower = [p for p in plans if is_reduced_quality(p.recipe.quant)]
     return primary, lower
+
+
+def economy_sort_key(plan: InferencePlan) -> tuple[float, int, int, str]:
+    """Order comparable offers by first-hour cost with deterministic ties."""
+    cost = first_hour_cost_usd(plan.quote)
+    return (
+        cost if cost is not None else float("inf"),
+        -(quant_bits(plan.recipe.quant) or 0), plan.quote.gpu_count, plan.quote.id,
+    )
+
+
+def economy_plan(plans: Sequence[InferencePlan]) -> InferencePlan | None:
+    """Pick the cheapest priced, eligible placement with verified 4-bit or better weights."""
+    eligible, _ = _quality_partition(plans)
+    return min((p for p in eligible if plan_is_eligible(p) and first_hour_cost_usd(p.quote) is not None),
+               key=economy_sort_key, default=None)
 
 
 def _frontier_tiers(
@@ -266,12 +253,7 @@ def _frontier_tiers(
 ) -> tuple[tuple[ServingTier, ...], InferencePlan]:
     """Name the cheapest, best-value and fastest points at one quality level."""
 
-    priced = [plan for plan in plans if _comparison_price(plan) is not None]
-    cheapest = (
-        min(priced, key=lambda plan: _comparison_price(plan) or 0.0)
-        if priced
-        else plans[0]
-    )
+    cheapest = min(plans, key=economy_sort_key)
     fastest = max(plans, key=lambda plan: _throughput(plan, objective))
     balanced = max(
         plans,
@@ -308,19 +290,19 @@ def _frontier_tiers(
         plan = plan_by_quote[quote_id]
         primary, *extra = keys
         clause = _also_clause(extra)
-        detail = _describe_tradeoff(plan, balanced, objective)
+        detail = _describe_tradeoff(plan, cheapest, objective)
         parts = [text for text in (clause, detail) if text]
         tiers.append(
             ServingTier(
                 key=primary,
                 label=_TIER_LABELS[primary],
                 plan=plan,
-                is_recommended=quote_id == balanced.quote.id,
+                is_recommended=quote_id == cheapest.quote.id,
                 tradeoff=" · ".join(parts) if parts else None,
                 also=tuple(extra),
             )
         )
-    return tuple(tiers), balanced
+    return tuple(tiers), cheapest
 
 
 def _saver_tier(
@@ -435,27 +417,20 @@ def serving_tiers(
     plans: Sequence[InferencePlan],
     objective: ServingObjective = ServingObjective.GENERAL_PURPOSE,
 ) -> tuple[ServingTier, ...]:
-    """Pick the cheapest, best-value and fastest placements from a frontier.
-
-    The frontier is first narrowed to the best bit width the connected
-    placements can serve, so the three tiers differ in price and speed alone.
-    A smaller quantization follows as a fourth, labelled option when it is
-    materially cheaper.
-
-    Returns fewer than three tiers when one placement wins more than one role.
-    Manufacturing variety would undermine the point of showing the flanks,
-    which is to make the recommended choice checkable rather than trusted.
-    """
+    """Compare priced placements at four bits or better and label any lower-quality saver."""
 
     eligible = [plan for plan in plans if plan_is_eligible(plan)]
     if not eligible:
         return ()
 
     primary, lower = _quality_partition(eligible)
-    tiers, balanced = _frontier_tiers(primary, objective)
-    saver = _saver_tier(primary, lower, balanced, objective)
+    primary = [plan for plan in primary if _comparison_price(plan) is not None]
+    if not primary:
+        return ()
+    tiers, cheapest = _frontier_tiers(primary, objective)
+    saver = _saver_tier(primary, lower, cheapest, objective)
     if saver:
-        tiers = _scoped_against_saver(tiers, saver[0], balanced, objective)
+        tiers = _scoped_against_saver(tiers, saver[0], cheapest, objective)
     return tiers + saver
 
 
@@ -496,5 +471,4 @@ def reduced_quality_plan_note(plans: Sequence[InferencePlan]) -> str | None:
     eligible = [plan for plan in plans if plan_is_eligible(plan)]
     if not eligible:
         return None
-    primary, _ = _quality_partition(eligible)
-    return _quality_floor_note([plan.recipe.quant for plan in primary])
+    return _quality_floor_note([plan.recipe.quant for plan in eligible])

@@ -65,6 +65,9 @@ from .diagnostics import log_exception
 from .operation_events import fail_operation
 from .gguf_metadata import GgufMtpStatus
 from .hf_models import fetch_gguf_quant_metadata
+from .deployment_preflight import price_cap_finding
+from .modal_gpu import fetch_modal_gpu_catalog
+from ..protocol.models import ModalProviderOptions
 from .modal_auth import get_modal_auth_status
 from .llamacpp_planner import compile_server_args_string, tuning_for_objective, tuning_for_architecture
 from .naming import legacy_app_name
@@ -521,6 +524,20 @@ class Orchestrator:
 
     def deploy_modal_only(self, config: DeploymentConfig) -> EventStream:
         """Execute the Modal-specific deploy step (adapter entrypoint)."""
+        options = config.provider_options
+        if config.do_deploy and isinstance(options, ModalProviderOptions) and options.max_hourly_cost_usd is not None:
+            try:
+                rates = fetch_modal_gpu_catalog(force_refresh=True)
+                unit = next((r.price_per_hour_usd for r in rates if r.value == config.gpu_type and r.stale_since is None), None)
+                current = unit * (config.gpu_count or 1) if unit is not None else None
+                finding = price_cap_finding(options.max_hourly_cost_usd, current)
+            except Exception as exc:
+                yield from fail_operation(OperationType.DEPLOY, f"Could not verify the Modal GPU rate: {exc}")
+                return
+            if finding:
+                yield from fail_operation(OperationType.DEPLOY, finding.message)
+                return
+            config.price_per_hour_usd = current
         if config.do_deploy and config.backend != BackendType.VLLM and not config.function_slug:
             config.function_slug = random_function_slug()
         if config.backend == BackendType.VLLM and config.do_deploy:
@@ -990,6 +1007,7 @@ class Orchestrator:
                 config,
                 required_image=launch.offer_image,
             )
+            config.price_per_hour_usd = offer.price_per_hour
             bind_prime_disk(config, disk_id)
             options = prime_provider_options(config)
             price = (

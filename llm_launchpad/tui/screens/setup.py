@@ -8,6 +8,8 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, Static
 
+from ...core.provider_readiness import ProviderReadiness
+from ...protocol.enums import ComputeProvider
 from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
 from ..visual import screen_title
@@ -30,8 +32,7 @@ class SetupRequiredScreen(CopyEnabledScreen):
             with VerticalScroll(id="setup-required-scroll", classes="screen-scroll"):
                 yield Static(screen_title("Compute provider required"))
                 yield Static(
-                    "llm-launchpad deploys inference endpoints through at least one "
-                    "compute provider. None currently has credentials.\n",
+                    "Connect a compute provider to deploy inference endpoints.\n",
                     id="setup-required-intro",
                 )
                 yield Static("[dim]Checking provider credentials…[/dim]", id="setup-readiness-status")
@@ -79,7 +80,13 @@ class SetupRequiredScreen(CopyEnabledScreen):
         )
         self._render_readiness(self._local_readiness())
 
-    def _local_readiness(self) -> tuple[object, ...]:
+    def on_screen_resume(self) -> None:
+        # A check can finish while Help or the Vast setup form covers Setup.
+        resume = getattr(self.app, "continue_from_setup", None)
+        if callable(resume):
+            self.call_after_refresh(resume)
+
+    def _local_readiness(self) -> tuple[ProviderReadiness, ...]:
         snapshot = getattr(self.app, "provider_readiness_snapshot", None)
         if callable(snapshot):
             try:
@@ -88,11 +95,11 @@ class SetupRequiredScreen(CopyEnabledScreen):
                 return ()
         return ()
 
-    def on_provider_readiness(self, readiness: tuple[object, ...]) -> None:
+    def on_provider_readiness(self, readiness: tuple[ProviderReadiness, ...]) -> None:
         """Update installed/checking/authenticated/failed without re-mounting."""
         self._render_readiness(readiness)
 
-    def _render_readiness(self, readiness: tuple[object, ...]) -> None:
+    def _render_readiness(self, readiness: tuple[ProviderReadiness, ...]) -> None:
         try:
             status = self.query_one("#setup-readiness-status", Static)
         except Exception:
@@ -101,11 +108,12 @@ class SetupRequiredScreen(CopyEnabledScreen):
             status.update("[dim]Checking provider credentials…[/dim]")
             return
         lines = []
-        for row in readiness:
-            provider = getattr(row, "provider", None)
-            name = getattr(provider, "display_name", str(provider))
-            stage = getattr(getattr(row, "stage", None), "display_name", str(getattr(row, "stage", "")))
-            detail = str(getattr(row, "detail", "") or "")
+        by_provider = {row.provider: row for row in readiness}
+        for provider in ComputeProvider:
+            name = provider.display_name
+            row = by_provider.get(provider)
+            stage = row.stage.display_name if row else "Checking"
+            detail = row.detail if row else ""
             color = {
                 "Authenticated": "$success",
                 "Checking": "$warning",
@@ -141,23 +149,12 @@ class SetupRequiredScreen(CopyEnabledScreen):
         )
 
     def action_recheck(self) -> None:
-        """Re-run provider detection and enter the TUI when configured."""
-        rechecker = getattr(self.app, "recheck_provider_setup", None)
-        entered = bool(callable(rechecker) and rechecker())
-        if entered:
-            return
+        """Request another background pass and display its latest results."""
         refresher = getattr(self.app, "refresh_provider_readiness", None)
         if callable(refresher):
-            try:
-                refresher()
-            except Exception:
-                pass
+            refresher()
         self._render_readiness(self._local_readiness())
-        self.query_one("#setup-required-feedback", Static).update(
-            "[$warning]Still no provider with credentials.[/$warning] "
-            f"Run {_MODAL_COMMAND}, {_PRIME_COMMAND}, or {_VAST_COMMAND}, "
-            "then re-check."
-        )
+        self.query_one("#setup-required-feedback", Static).update("")
 
     async def action_quit_app(self) -> None:
         quit_action = getattr(self.app, "action_request_quit", None)

@@ -237,6 +237,33 @@ class HFModelsTests(unittest.TestCase):
         self.assertNotIn("Q5_K_M", first.vram_gb_by_quant)
         self.assertEqual(calls, [("Qwen/Qwen3-Coder-Next-GGUF", None)])
 
+    def test_mtp_enrichment_reuses_the_same_quant_and_revision_serving_header(self) -> None:
+        header = hf_models.GgufServingMetadata(
+            architecture="qwen35", nextn_predict_layers=1, source_file="model-Q4_K_M.gguf"
+        )
+        row = SimpleNamespace(siblings=[SimpleNamespace(rfilename=header.source_file)], gguf={})
+        with (
+            patch.object(hf_models, "_call_model_info", return_value=row) as model_info,
+            patch.object(hf_models, "_fetch_gguf_quantization_data_from_model_page", return_value=None),
+            patch.object(hf_models, "fetch_gguf_serving_metadata", return_value=header) as read_header,
+            patch.object(hf_models, "fetch_gguf_mtp_capability") as probe,
+        ):
+            def read(revision: str, inspect_mtp: bool):
+                return hf_models.fetch_gguf_quant_metadata(
+                    "test/header-reuse", revision, inspect_serving=True, inspect_mtp=inspect_mtp,
+                )
+
+            self.assertIsNone(read("v1", False).mtp)
+            evidence = read("v1", True).mtp
+            assert evidence is not None
+            self.assertEqual(evidence.nextn_predict_layers, 1)
+            self.assertEqual(evidence.source_file, header.source_file)
+            model_info.assert_called_once()
+            read_header.assert_called_once()
+            read("v2", True)
+            self.assertEqual(read_header.call_count, 2)
+            probe.assert_not_called()
+
     def test_parse_memory_to_gb_supports_gb_tb_and_bytes(self) -> None:
         self.assertAlmostEqual(hf_models._parse_memory_to_gb("4.66 GB") or 0, 4.66, places=2)
         self.assertAlmostEqual(hf_models._parse_memory_to_gb("1.5 TB") or 0, 1500.0, places=1)

@@ -28,7 +28,8 @@ def vast_first_hour_cost_usd(costs: OfferCostBreakdown, download_gb: float) -> f
     of transfer outweighed the rent it saved several times over.
     """
     hourly, per_gb = costs.total_per_hour_usd, costs.download_per_gb_usd
-    if hourly is None or per_gb is None:
+    if (hourly is None or not math.isfinite(hourly) or hourly <= 0 or per_gb is None
+            or not math.isfinite(per_gb) or per_gb < 0 or not math.isfinite(download_gb) or download_gb < 0):
         return None
     return hourly * COMPARISON_RENT_HOURS + per_gb * download_gb
 
@@ -58,7 +59,7 @@ def vast_offer_is_rentable(offer: VastOffer) -> bool:
     price = offer.costs.total_per_hour_usd
     return (
         _vast_offer_meets_runtime_floors(offer)
-        and price is not None and price > 0
+        and price is not None and math.isfinite(price) and price > 0
     )
 
 
@@ -85,9 +86,8 @@ def vast_plan_for_offer(row: VastModelOffer, profile: QuickDeployProfile) -> Inf
     manifest = load_llamacpp_support_manifest(profile.gguf_architecture)
     # An architecture Launchpad can only build has no pinned image to rent, so
     # no offer can serve it however capable the hardware is.
-    if manifest.build_recipe or not vast_offer_is_rentable(row.offer):
+    if manifest.build_recipe or not vast_offer_is_rentable(row.offer) or price is None or not math.isfinite(price) or price <= 0:
         return None
-    assert price is not None
     quote = ProviderQuote(
         id=row.id.replace(":comparison:", ":deploy:"), recipe_id=row.recipe.id,
         # Modal and Prime quotes carry this, and the deploy screen resolves a
@@ -100,7 +100,9 @@ def vast_plan_for_offer(row: VastModelOffer, profile: QuickDeployProfile) -> Inf
         availability=QuoteAvailability.AVAILABLE, region=row.offer.location,
         security="datacenter" if row.offer.datacenter else "verified marketplace",
         provider_options=VastProviderOptions(
-            row.offer.id, row.disk_gb, price, row.offer.machine_id, row.offer.gpu_count
+            row.offer.id, row.disk_gb, price, row.offer.machine_id, row.offer.gpu_count,
+            max_first_hour_cost_usd=vast_first_hour_cost_usd(row.costs, row.download_gb),
+            download_gb=row.download_gb,
         ),
         is_estimate=True,
         one_time_cost_usd=(
@@ -194,7 +196,7 @@ def vast_offers_for_model(
             shape = (offer.gpu_type, offer.gpu_count, offer.gpu_memory_gib)
             existing = grouped.get(shape)
             if existing is None or (
-                _cost_rank(costs, memory.weights_gb) < _cost_rank(existing[2], memory.weights_gb)
+                (_cost_rank(costs, memory.weights_gb), offer.id) < (_cost_rank(existing[2], memory.weights_gb), existing[0].id)
             ):
                 grouped[shape] = (offer, disk, costs)
         for offer, disk, costs in grouped.values():
@@ -223,9 +225,10 @@ def vast_offers_for_model(
                 offer=offer, gpu_label=vast_gpu_label(offer), disk_gb=disk,
                 costs=costs, assessment=assessment, download_gb=memory.weights_gb,
             ))
-    return tuple(
-        sorted(result, key=lambda row: _vast_row_sort_key(row, _cached_startup_history()))
-    )
+    if not result:
+        return ()
+    history = _cached_startup_history()
+    return tuple(sorted(result, key=lambda row: _vast_row_sort_key(row, history)))
 
 
 def _cached_startup_history() -> dict[str, Any] | None:

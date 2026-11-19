@@ -42,6 +42,9 @@ LAUNCHPAD_THEMES = (
         error="#ff6b6b",
         dark=True,
         luminosity_spread=0.1,
+        # Prices get a hue of their own so they stand apart from the green
+        # used for focus and success.
+        variables={"money": "#8ccfff"},
     ),
     Theme(
         name="launchpad-light",
@@ -60,6 +63,7 @@ LAUNCHPAD_THEMES = (
         error="#cf222e",
         dark=False,
         luminosity_spread=0.1,
+        variables={"money": "#0b5cad"},
     ),
     Theme(
         name="launchpad-high-contrast",
@@ -77,6 +81,7 @@ LAUNCHPAD_THEMES = (
         dark=True,
         luminosity_spread=0.2,
         text_alpha=1.0,
+        variables={"money": "#00e5ff"},
     ),
     Theme(
         name="launchpad-monochrome",
@@ -94,6 +99,7 @@ LAUNCHPAD_THEMES = (
         dark=True,
         luminosity_spread=0.12,
         text_alpha=1.0,
+        variables={"money": "#ffffff"},
     ),
 )
 
@@ -126,6 +132,14 @@ SUCCESS_STYLE = "$success"
 WARNING_STYLE = "$warning"
 ERROR_STYLE = "$error"
 MUTED_STYLE = "dim"
+#: Prices and balances. A theme variable of this project's own, defined on
+#: every Launchpad theme; under any other theme it falls back to plain text.
+MONEY_STYLE = "$money"
+
+
+def money(text: str) -> str:
+    """Wrap an already-escaped price in the money style."""
+    return f"[{MONEY_STYLE}]{text}[/]"
 
 #: Status markers paired with a semantic style. Color is never the only
 #: signal: every marker is a distinct shape so monochrome terminals stay usable.
