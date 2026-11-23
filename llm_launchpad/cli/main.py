@@ -182,20 +182,10 @@ def _preflight(
 
 
 def _ensure_tui_runtime() -> None:
-    """Fail fast with visible CLI errors before handing off to Textual."""
+    """Require a terminal before handing off to Textual."""
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         typer.echo(
             "Error: llm-launchpad TUI requires an interactive terminal (TTY).",
-            err=True,
-        )
-        raise typer.Exit(code=1)
-    if (
-        not ModalBackend.is_cli_available()
-        and not get_prime_auth_status().authenticated
-        and not resolve_vast_credentials().api_key
-    ):
-        typer.echo(
-            "Error: no compute provider is configured. Run `modal setup`, `prime login`, or `llm-launchpad vast-auth login`.",
             err=True,
         )
         raise typer.Exit(code=1)
@@ -858,6 +848,9 @@ def deploy(
     revision: str | None = typer.Option(None, help="llama.cpp HF revision (Modal only)"),
     server_args: str | None = typer.Option(None, help="Additional llama-server arguments"),
     n_gpu_layers: int | None = typer.Option(None, help="llama.cpp GPU layers (default: auto)"),
+    dspark: bool = typer.Option(False, "--dspark", help="Attach a DSpark draft to a Modal llama.cpp deployment"),
+    dspark_repo: str | None = typer.Option(None, help="Hugging Face DSpark draft repository override"),
+    dspark_file: str | None = typer.Option(None, help="Exact DSpark draft GGUF filename"),
     mtp: bool = typer.Option(
         True,
         "--mtp/--no-mtp",
@@ -974,6 +967,9 @@ def deploy(
         server_args=server_args,
         n_gpu_layers=n_gpu_layers,
         allow_speculative_decoding=mtp,
+        dspark=dspark,
+        dspark_repo=dspark_repo,
+        dspark_file=dspark_file,
         model_name=model_name,
         model_revision=model_revision,
         served_model_name=served_model_name,

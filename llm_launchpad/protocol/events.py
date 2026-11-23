@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
-from .enums import DeploymentState, OperationType
+from .enums import BackendType, ComputeProvider, DeploymentState, OperationIntent, OperationType
 from .models import EndpointInfo
 
 
@@ -34,6 +34,20 @@ class StateChangeEvent(BaseEvent):
     current: DeploymentState = DeploymentState.IDLE
     operation: OperationType | None = None
     detail: str = ""
+    timeout_seconds: int | None = None
+
+
+@dataclass(frozen=True)
+class DeploymentAttemptStartedEvent(BaseEvent):
+    """The serving placement and steps requested for this attempt."""
+
+    attempt: int = 1
+    provider: ComputeProvider = ComputeProvider.MODAL
+    backend: BackendType | None = None
+    intent: OperationIntent = OperationIntent.SERVE
+    warmup: bool = True
+    gpu_type: str | None = None
+    gpu_count: int | None = None
 
 
 @dataclass(frozen=True)

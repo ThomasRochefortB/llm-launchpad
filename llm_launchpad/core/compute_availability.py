@@ -7,7 +7,8 @@ import math
 import threading
 import time
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
+from queue import Empty, SimpleQueue
 from typing import Any
 
 from ..protocol.enums import (
@@ -28,7 +29,6 @@ from ..protocol.models import (
     PrimeProviderOptions,
     ProviderQuote,
     WorkloadProfile,
-    VastOffer,
     VastOfferQuery,
 )
 from .inference_options import (
@@ -61,61 +61,19 @@ from .quick_deploy import QuickDeployProfile, quick_deploy_recipe
 from .vast_auth import VastCredentials, resolve_vast_credentials
 from .vast_backend import VastBackend
 
-# How long every provider fetch together may hold the screen. Each of these
-# calls has its own request timeout, but they were awaited with none: one
-# catalog that never answered left Fast Deploy on "loading" with no deadline
-# and no way back, which is indistinguishable from a hung client. Availability
-# is a comparison across providers, so a slow one should cost its own row, not
-# the whole screen -- whatever has not arrived is reported unavailable and the
-# rest is still shown.
+# Shared deadline for provider lookups that have yet to report back.
 COMPUTE_AVAILABILITY_TIMEOUT_SECONDS = 45.0
 
 
-class _ProviderFetch:
-    """One provider lookup on a daemon thread, collected against a deadline.
-
-    The thread is never joined past the deadline: an unanswered provider costs
-    its own row and nothing else, and it cannot outlive the interpreter.
-    """
-
-    def __init__(self, call: Any, *args: Any) -> None:
-        self._call = call
-        self._args = args
-        self._value: Any = None
-        self._error: BaseException | None = None
-        self._done = threading.Event()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-
-    def _run(self) -> None:
-        try:
-            self._value = self._call(*self._args)
-        except BaseException as exc:  # reported as this provider's own error
-            self._error = exc
-        finally:
-            self._done.set()
-
-    def start(self) -> None:
-        self._thread.start()
-
-    def collect(self, deadline: float) -> tuple[Any, str | None]:
-        """Return (value, error phrase); the phrase is None on success."""
-        if not self._done.wait(timeout=max(0.0, deadline - time.monotonic())):
-            return None, (
-                "did not answer within "
-                f"{int(COMPUTE_AVAILABILITY_TIMEOUT_SECONDS)}s"
-            )
-        if self._error is not None:
-            return None, f"unavailable: {self._error}"
-        return self._value, None
-
-
-def load_compute_availability(*, force_refresh: bool = False) -> ComputeAvailabilitySnapshot:
-    """Fetch connected providers concurrently and return one aggregated view."""
-
+def load_compute_availability(
+    *,
+    force_refresh: bool = False,
+    on_partial: Callable[[ComputeAvailabilitySnapshot, tuple[ComputeProvider, ...]], None] | None = None,
+) -> ComputeAvailabilitySnapshot:
+    """Return the final snapshot and optionally publish completed providers as they arrive."""
     errors: list[str] = []
-    include_modal = False
-    include_prime = False
     include_modal = resolve_modal_cli_path() is not None
+    include_prime = False
     try:
         include_prime = get_prime_auth_status().authenticated
     except Exception as exc:
@@ -125,74 +83,92 @@ def load_compute_availability(*, force_refresh: bool = False) -> ComputeAvailabi
         vast_credentials = resolve_vast_credentials()
     except ValueError as exc:
         errors.append(f"Vast key unavailable: {exc}")
+    include_vast = bool(vast_credentials.api_key)
 
-    modal_catalog: Sequence[ModalGpuSpec] = ()
-    prime_offers: Sequence[ComputeOffer] = ()
-    vast_offers: Sequence[VastOffer] = ()
-    deadline = time.monotonic() + COMPUTE_AVAILABILITY_TIMEOUT_SECONDS
-
-    # Daemon threads, not a pool. A ThreadPoolExecutor's workers are joined by
-    # the interpreter at exit whatever shutdown() was told, so a provider that
-    # never answers was not abandoned at all -- it was deferred to quitting
-    # time, where it holds the process open with no interface left to explain
-    # why. A daemon thread is genuinely dropped, which is what this budget
-    # promises. Each fetch still has its own request timeout underneath.
-    fetches: list[tuple[str, _ProviderFetch]] = []
+    requests: dict[str, tuple[ComputeProvider, Callable[[], Any]]] = {}
     if include_modal:
-        fetches.append(("Modal catalog", _ProviderFetch(lambda: fetch_modal_gpu_catalog(force_refresh=force_refresh))))
-        fetches.append(("Modal authentication", _ProviderFetch(lambda: check_modal_readiness(refresh=force_refresh))))
-    if include_prime:
-        fetches.append(("Prime availability", _ProviderFetch(PrimeBackend().list_offers)))
-    if vast_credentials.api_key:
-        fetches.append((
-            "Vast availability",
-            _ProviderFetch(
-                VastBackend(vast_credentials).list_offers,
-                VastOfferQuery(gpu_count=None, limit=500),
-            ),
-        ))
-    for _, fetch in fetches:
-        fetch.start()
-
-    results: dict[str, Any] = {}
-    for label, fetch in fetches:
-        value, error = fetch.collect(deadline)
-        if error is not None:
-            errors.append(f"{label} {error}")
-        results[label] = value
-    if include_modal:
-        readiness = results.get("Modal authentication")
-        include_modal = bool(readiness and readiness.verified)
-        if readiness and not include_modal:
-            errors.append(f"Modal {readiness.display}")
-    modal_catalog = (results.get("Modal catalog") or ()) if include_modal else ()
-    if modal_catalog and not any(spec.price_per_hour_usd is not None for spec in modal_catalog):
-        errors.append("Modal GPU rates could not be read.")
-    elif any(spec.stale_since is not None for spec in modal_catalog):
-        oldest = min(spec.stale_since for spec in modal_catalog if spec.stale_since is not None)
-        errors.append(f"Modal pricing refresh failed. Cached rates are {max(0, int(time.monotonic() - oldest)) // 60} min old.")
-    prime_offers = results.get("Prime availability") or ()
-    vast_offers = results.get("Vast availability") or ()
-
-    if not include_modal and not include_prime and not vast_credentials.api_key and not errors:
-        errors.append("Connect a compute provider to load availability.")
-    providers = tuple(
-        provider
-        for provider, included in (
-            (ComputeProvider.MODAL, include_modal),
-            (ComputeProvider.PRIME, include_prime),
-            (ComputeProvider.VAST, bool(vast_credentials.api_key)),
+        requests["Modal catalog"] = (
+            ComputeProvider.MODAL, lambda: fetch_modal_gpu_catalog(force_refresh=force_refresh)
         )
-        if included
-    )
-    snapshot = aggregate_compute_availability(
-        modal_catalog=modal_catalog,
-        prime_offers=prime_offers,
-    )
-    return replace(
-        snapshot, errors=tuple(errors), providers=providers,
-        vast_offers=tuple(vast_offers), vast_configured=bool(vast_credentials.api_key),
-    )
+        requests["Modal authentication"] = (
+            ComputeProvider.MODAL, lambda: check_modal_readiness(refresh=force_refresh)
+        )
+    if include_prime:
+        requests["Prime availability"] = (ComputeProvider.PRIME, PrimeBackend().list_offers)
+    if include_vast:
+        requests["Vast availability"] = (
+            ComputeProvider.VAST,
+            lambda: VastBackend(vast_credentials).list_offers(VastOfferQuery(gpu_count=None, limit=500)),
+        )
+
+    completed: SimpleQueue[tuple[str, Any, str | None]] = SimpleQueue()
+    results: dict[str, Any] = {}
+    remaining = {label: provider for label, (provider, _) in requests.items()}
+
+    def fetch(label: str, call: Callable[[], Any]) -> None:
+        try:
+            completed.put((label, call(), None))
+        except BaseException as exc:
+            completed.put((label, None, f"{label} unavailable: {exc}"))
+
+    def snapshot(*, final: bool = False) -> ComputeAvailabilitySnapshot:
+        readiness = results.get("Modal authentication")
+        modal_ready = "Modal catalog" not in remaining and bool(readiness and readiness.verified)
+        modal_catalog = (results.get("Modal catalog") or ()) if modal_ready else ()
+        notes = errors.copy()
+        if readiness and not readiness.verified:
+            notes.append(f"Modal {readiness.display}")
+        if modal_catalog and not any(spec.price_per_hour_usd is not None for spec in modal_catalog):
+            notes.append("Modal GPU rates could not be read.")
+        elif any(spec.stale_since is not None for spec in modal_catalog):
+            oldest = min(spec.stale_since for spec in modal_catalog if spec.stale_since is not None)
+            age_minutes = max(0, int(time.monotonic() - oldest)) // 60
+            notes.append(f"Modal pricing refresh failed. Cached rates are {age_minutes} min old.")
+        if final and not modal_ready and not include_prime and not include_vast and not notes:
+            notes.append("Connect a compute provider to load availability.")
+        providers = tuple(
+            provider
+            for provider, included in (
+                (ComputeProvider.MODAL, modal_ready),
+                (ComputeProvider.PRIME, include_prime and "Prime availability" not in remaining),
+                (ComputeProvider.VAST, include_vast and "Vast availability" not in remaining),
+            )
+            if included
+        )
+        return replace(
+            aggregate_compute_availability(
+                modal_catalog=modal_catalog,
+                prime_offers=results.get("Prime availability") or (),
+            ),
+            errors=tuple(notes),
+            providers=providers,
+            vast_offers=tuple(results.get("Vast availability") or ()),
+            vast_configured=include_vast,
+        )
+
+    # Daemon fetches keep an unresponsive provider from holding the process
+    # open. Modal's pricing and authentication must both settle before its
+    # offers can be shown.
+    deadline = time.monotonic() + COMPUTE_AVAILABILITY_TIMEOUT_SECONDS
+    for label, (_, call) in requests.items():
+        threading.Thread(target=fetch, args=(label, call), daemon=True).start()
+
+    while remaining:
+        try:
+            label, value, error = completed.get(timeout=max(0.0, deadline - time.monotonic()))
+        except Empty:
+            for label in remaining:
+                errors.append(f"{label} did not answer within {int(COMPUTE_AVAILABILITY_TIMEOUT_SECONDS)}s")
+            remaining.clear()
+            break
+        provider = remaining.pop(label)
+        results[label] = value
+        if error:
+            errors.append(error)
+        pending = tuple(dict.fromkeys(remaining.values()))
+        if on_partial is not None and pending and provider not in pending:
+            on_partial(snapshot(), pending)
+    return snapshot(final=True)
 
 
 def aggregate_compute_availability(

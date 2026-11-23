@@ -574,6 +574,9 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             for widget in screen.query(".llama-advanced"):
                 widget.remove_class("hidden")
             screen.query_one("#server-args", Input).value = "--ctx-size 65536"
+            screen.query_one("#dspark-llama", Switch).value = True
+            screen.query_one("#dspark-repo-llama", Input).value = "org/draft-GGUF"
+            screen.query_one("#dspark-file-llama", Input).value = "dspark-model-Q8_0.gguf"
             screen.query_one("#host-input", Input).value = "0.0.0.0"
             screen.query_one("#port-input", Input).value = "8088"
             screen.query_one("#n-gpu-layers", Input).value = "99"
@@ -589,6 +592,9 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app.deployed_config.quant, "Q4_K_M")
         self.assertEqual(app.deployed_config.revision, "main")
         self.assertEqual(app.deployed_config.server_args, "--ctx-size 65536")
+        self.assertTrue(app.deployed_config.dspark)
+        self.assertEqual(app.deployed_config.dspark_repo, "org/draft-GGUF")
+        self.assertEqual(app.deployed_config.dspark_file, "dspark-model-Q8_0.gguf")
         self.assertEqual(app.deployed_config.host, "0.0.0.0")
         self.assertEqual(app.deployed_config.port, 8088)
         self.assertEqual(app.deployed_config.n_gpu_layers, 99)

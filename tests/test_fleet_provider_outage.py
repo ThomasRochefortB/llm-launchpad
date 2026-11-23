@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from textual.app import App
-from textual.widgets import Static
+from textual.widgets import OptionList, Static
 
 from llm_launchpad.core.backend import ModalCliError, ModalListAppsResult
 from llm_launchpad.core.prime_auth import PrimeAuthStatus
@@ -359,7 +359,9 @@ class ManageScreenOutageTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("may be out of date", detail)
             # Actions stay offered: stopping a rental that is still billing must
             # not require the provider listing to recover first.
-            self.assertIn("stop", detail)
+            await pilot.press("enter")
+            actions = app.screen.query_one("#manage-actions", OptionList)
+            self.assertIn("stop", [option.id for option in actions.options])
 
     async def test_empty_fleet_with_an_outage_does_not_claim_there_is_nothing(self) -> None:
         discovery = FleetDiscovery(

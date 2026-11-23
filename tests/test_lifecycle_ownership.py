@@ -296,9 +296,6 @@ class ResourceTargetingTests(unittest.TestCase):
         self.assertFalse(target.stoppable)
 
     def test_lifecycle_has_no_job_runner_dependency(self) -> None:
-        import sys
-
-        self.assertNotIn("llm_launchpad.core.job_runner", sys.modules.get("llm_launchpad.core.deployment_lifecycle", "").__class__.__module__ if False else "")
         import llm_launchpad.core.deployment_lifecycle as lifecycle
 
         source_path = lifecycle.__file__ or ""

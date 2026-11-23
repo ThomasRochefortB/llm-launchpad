@@ -84,10 +84,19 @@ class RelaunchScreenTests(unittest.IsolatedAsyncioTestCase):
                         preferred_placement=("modal", gpu, 1),
                     )
                 )
-                for _ in range(10):
+                # The infra phase appears before the async pricing worker has
+                # painted the real rows; wait until the highlight resolves to
+                # an actual row.
+                for _ in range(50):
                     await pilot.pause()
                     screen = app.screen
-                    if isinstance(screen, FastDeployScreen) and screen._phase == "infra":
+                    if not isinstance(screen, FastDeployScreen) or screen._phase != "infra":
+                        continue
+                    option_list = screen.query_one("#fast-deploy-list", OptionList)
+                    if not option_list.options:
+                        continue
+                    highlighted = option_list.get_option_at_index(option_list.highlighted or 0)
+                    if str(highlighted.id) in screen._infra_rows:
                         break
                 screen = app.screen
                 assert isinstance(screen, FastDeployScreen)

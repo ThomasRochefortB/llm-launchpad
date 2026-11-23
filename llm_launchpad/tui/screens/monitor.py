@@ -17,10 +17,12 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, Input, Static
 
+from ...core.deploy_log_summary import is_startup_phase_line
+from ...core.quick_deploy import intent_from_legacy_flags
 from ...protocol.enums import BackendType, DeploymentState, OperationType
+from ...protocol.models import DeploymentConfig
 from ..deployment_progress import DeploymentProgress
 from ..deploy_log_summary import (
-    SUMMARY_SPINNER_FRAMES,
     DeployLogSummarizer,
     beautify_summary_line,
     classify_summary_kind,
@@ -34,6 +36,7 @@ from ..widgets.log_viewer import LogViewer, prune_retained_items
 from ..widgets.status_header import StatusHeader
 from ..workers import (
     ConnectionSummaryReady,
+    DeploymentAttemptStarted,
     EndpointAvailable,
     LogMessage,
     OperationDone,
@@ -47,6 +50,14 @@ _ANSI_ESCAPE_RE = re.compile(r"\x1B\[[0-?]*[ -/]*[@-~]")
 
 def _strip_ansi(text: str) -> str:
     return _ANSI_ESCAPE_RE.sub("", text or "")
+
+
+def _hide_summary_line(line: str) -> bool:
+    return (
+        line in ("Waiting for readiness", "Publishing endpoint", "Preparing model cache", "Endpoint published")
+        or line.startswith("Waiting for GPU scheduling")
+        or is_startup_phase_line(line)
+    )
 
 
 # The same three keys leave this screen whatever finished on it. Three
@@ -136,6 +147,7 @@ class MonitorScreen(CopyEnabledScreen):
         Binding("n", "next_search_match", "Next match", show=False),
         Binding("shift+n", "previous_search_match", "Previous match", show=False),
         Binding("v", "toggle_log_view", "Raw/Summary", show=True),
+        Binding("l", "toggle_result_logs", "Logs", show=True),
         Binding("ctrl+l", "clear_log", "Clear log", show=False),
         Binding("enter", "submit_or_finish", "Done", show=True, priority=True),
         Binding("u", "copy_base_url", "Copy URL", show=True),
@@ -158,9 +170,13 @@ class MonitorScreen(CopyEnabledScreen):
         done, Done/Copy URL/Copy take precedence over log navigation, which
         remains reachable by shortcut and help.
         """
-        if self._done and action in {
-            "page_up_log", "page_down_log", "resume_follow", "clear_log",
-        }:
+        if action == "toggle_result_logs":
+            return self.has_class("connection-ready")
+        if (
+            self._done
+            and action in {"page_up_log", "page_down_log", "resume_follow", "clear_log"}
+            and (not self.has_class("connection-ready") or self.has_class("logs-collapsed"))
+        ):
             return False
         # Paging a log that fits on screen, or following one already followed,
         # does nothing; the footer drops those keys until they would.
@@ -183,6 +199,7 @@ class MonitorScreen(CopyEnabledScreen):
         deploy_backend: BackendType | None = None,
         summarize_backend_logs: bool = False,
         show_debug_logs: bool = True,
+        deployment_config: DeploymentConfig | None = None,
     ) -> None:
         super().__init__()
         self._title = title
@@ -207,19 +224,28 @@ class MonitorScreen(CopyEnabledScreen):
         self._result_title = "Check complete"
         self._failure_rows: list[tuple[str, str]] = []
         self._failure_title = "Operation failed"
-        self._progress = DeploymentProgress()
+        self._progress = DeploymentProgress(backend=deploy_backend)
+        if deployment_config is not None:
+            self._progress.provider = deployment_config.provider
+            self._progress.intent = intent_from_legacy_flags(
+                do_deploy=deployment_config.do_deploy,
+                run_smoke=deployment_config.run_smoke,
+                preload=deployment_config.preload,
+            )
+            self._progress.warmup = deployment_config.do_warmup and deployment_config.do_deploy
+            self._progress.gpu_type = deployment_config.gpu_type
+            self._progress.gpu_count = deployment_config.gpu_count
         self._progress.start(None, title)
         self._progress_tick_timer = None
         self._deploy_summarizer = (
             DeployLogSummarizer(deploy_backend)
-            if deploy_backend is not None and summarize_backend_logs and not show_debug_logs
+            if deploy_backend is not None and summarize_backend_logs
             else None
         )
-        self._view_mode = "summary" if self._deploy_summarizer is not None else "raw"
+        self._view_mode = "summary" if self._deploy_summarizer is not None and not show_debug_logs else "raw"
         self._raw_log_lines: list[str] = []
         self._summary_log_lines: list[str] = []
         self._summary_items: list[_SummaryRow] = []
-        self._spinner_index = 0
 
     def compose(self) -> ComposeResult:
         with Vertical(id="monitor-layout"):
@@ -296,6 +322,7 @@ class MonitorScreen(CopyEnabledScreen):
                 Button("Done", id="connection-done-btn", variant="primary"),
             )
             self._fill_connection_card()
+            self.query_one("#connection-done-btn", Button).focus()
         elif card_id == "result-card":
             card.mount(
                 Static("[bold]Result[/]", id="result-card-title"),
@@ -329,7 +356,7 @@ class MonitorScreen(CopyEnabledScreen):
 
     def _title_markup(self) -> str:
         """Label the log pane; the progress panel names the operation."""
-        return "[dim]Log[/]"
+        return "[dim]Details[/]" if self._view_mode == "summary" else "[dim]Log[/]"
 
     def _view_status_markup(self) -> str:
         """Render line count, and the follow state only once it is paused."""
@@ -386,9 +413,7 @@ class MonitorScreen(CopyEnabledScreen):
             self._ensure_progress_operation(OperationType.DEPLOY)
             self._progress.on_state(DeploymentState.QUEUED, "Preparing deployment")
             self._refresh_progress()
-            self._append_log_line("Preparing deployment", summary=True, raw=False)
             self._last_summary_state_detail = "Preparing deployment"
-            self.set_interval(0.25, self._tick_summary_spinner)
 
     def _ensure_progress_operation(self, operation: OperationType | None) -> None:
         """Adopt the operation once the event stream names it.
@@ -442,8 +467,8 @@ class MonitorScreen(CopyEnabledScreen):
         prefix = "stderr | " if message.stream == "stderr" else ""
         cleaned = _strip_ansi(message.line)
         self._capture_result_lines(cleaned)
-        if message.is_milestone and cleaned.strip():
-            self._progress.on_milestone(cleaned.strip())
+        if cleaned.startswith(("Certification failed; cleaning up", "Cancelled; cleaning up")):
+            self._progress.on_milestone(cleaned, message.timestamp)
             self._refresh_progress()
         raw_line = (
             message.line
@@ -460,14 +485,25 @@ class MonitorScreen(CopyEnabledScreen):
             for line in self._deploy_summarizer.transform(cleaned, self._current_operation):
                 stripped = _strip_ansi(line).strip()
                 if stripped:
-                    self._progress.on_milestone(stripped)
+                    self._progress.on_milestone(stripped, message.timestamp)
                     self._refresh_progress()
+                if _hide_summary_line(stripped):
+                    continue
                 self._append_log_line(
-                    f"{prefix}{line}" if prefix else line,
+                    f"{prefix}{line}",
                     summary=True,
                     raw=False,
                 )
             return
+
+    def on_deployment_attempt_started(self, message: DeploymentAttemptStarted) -> None:
+        self._ensure_progress_operation(OperationType.DEPLOY)
+        self._progress.on_attempt_started(message.event)
+        self._last_error_message = ""
+        self._last_summary_state_detail = ""
+        if self._deploy_summarizer is not None:
+            self._deploy_summarizer.reset()
+        self._refresh_progress()
 
     def on_state_changed(self, message: StateChanged) -> None:
         if message.operation is not None:
@@ -479,7 +515,13 @@ class MonitorScreen(CopyEnabledScreen):
             detail=message.detail,
         )
         detail = _strip_ansi(message.detail).strip()
-        self._progress.on_state(message.state, detail)
+        self._progress.on_state(
+            message.state,
+            detail,
+            operation=message.operation,
+            timestamp=message.timestamp,
+            timeout_seconds=message.timeout_seconds,
+        )
         self._refresh_progress()
         if (
             self._summary_mode_enabled
@@ -491,12 +533,11 @@ class MonitorScreen(CopyEnabledScreen):
             for line in self._deploy_summarizer.transform_state(
                 detail, self._current_operation
             ):
-                self._append_log_line(line, summary=True, raw=False)
+                if not _hide_summary_line(line):
+                    self._append_log_line(line, summary=True, raw=False)
 
-    def on_resource_allocated(self, message: ResourceAllocated) -> None:
-        self._progress.on_resource_allocated(
-            f"Resource allocated ({message.app_id})" if message.app_id else "Resource allocated"
-        )
+    def on_resource_allocated(self, _message: ResourceAllocated) -> None:
+        self._progress.on_resource_allocated()
         self._refresh_progress()
 
     def on_endpoint_available(self, message: EndpointAvailable) -> None:
@@ -506,7 +547,7 @@ class MonitorScreen(CopyEnabledScreen):
 
     def on_connection_summary_ready(self, message: ConnectionSummaryReady) -> None:
         self._connection_payload = dict(message.payload)
-        self._progress.on_connection_ready("Endpoint verified")
+        self._progress.on_endpoint_available()
         self._refresh_progress()
         if self._success:
             self._show_connection_card()
@@ -529,17 +570,28 @@ class MonitorScreen(CopyEnabledScreen):
     }
 
     def on_operation_done(self, message: OperationDone) -> None:
+        detail = _strip_ansi(message.detail or "").strip()
+        if message.phase_only:
+            self._progress.on_phase_done(
+                message.operation, message.success, detail, message.timestamp
+            )
+            if not message.success and detail and detail != self._last_error_message:
+                self._last_error_message = detail
+                self._append_log_line(f"Error: {detail}")
+            self._refresh_progress()
+            return
         self._done = True
         self._success = message.success
         self._ensure_progress_operation(message.operation)
         self._current_operation = message.operation
-        detail = _strip_ansi(message.detail or "").strip()
         resource_status = self._progress.resource_status
         if message.success and resource_status == "none":
             resource_status = "allocated"
         if not message.success and resource_status == "none":
             resource_status = "unknown"
-        self._progress.on_done(message.success, detail, resource_status=resource_status)
+        self._progress.on_done(
+            message.success, detail, resource_status=resource_status, timestamp=message.timestamp
+        )
         self._refresh_progress()
         self.refresh_bindings()
         if message.success:
@@ -662,6 +714,8 @@ class MonitorScreen(CopyEnabledScreen):
             return "Resource was retained. Stop it in Manage if it is no longer needed."
         if status == "failed":
             return "Cleanup did not confirm. Check Manage for unresolved resources."
+        if status == "stopped":
+            return "The resource was stopped."
         return "Check Manage for the current resource state."
 
     def _failure_next_steps(self, operation: OperationType) -> str:
@@ -766,6 +820,10 @@ class MonitorScreen(CopyEnabledScreen):
         payload = self._connection_payload
         if payload is None:
             return
+        if not self.has_class("connection-ready"):
+            self.add_class("connection-ready", "logs-collapsed")
+            self.query_one("#monitor-search", Input).display = False
+            self.refresh_bindings()
         card = self._mount_outcome_card("connection-card")
         if card is not None:
             self._fill_connection_card()
@@ -776,15 +834,11 @@ class MonitorScreen(CopyEnabledScreen):
         if payload is None:
             return
         try:
-            self.query_one("#connection-card-title", Static).update(
-                "[bold]Endpoint ready[/]"
-            )
             self.query_one("#connection-card-body", Static).update(
                 _connection_card_markup(payload)
             )
             has_key = bool((payload.get("api_key") or "").strip())
             self.query_one("#copy-key-btn", Button).display = has_key
-            self.query_one("#connection-done-btn", Button).focus()
         except Exception:
             pass
 
@@ -899,6 +953,8 @@ class MonitorScreen(CopyEnabledScreen):
         self.log_viewer.resume_following()
 
     def action_search_logs(self) -> None:
+        self.remove_class("logs-collapsed")
+        self.refresh_bindings()
         search = self.query_one("#monitor-search", Input)
         search.display = True
         search.focus()
@@ -909,7 +965,20 @@ class MonitorScreen(CopyEnabledScreen):
     def action_previous_search_match(self) -> None:
         self.log_viewer.next_match(-1)
 
+    def action_toggle_result_logs(self) -> None:
+        """Show retained logs, or return focus to the deployment result."""
+        if self.has_class("logs-collapsed"):
+            self.remove_class("logs-collapsed")
+            self.log_viewer.log_widget.focus()
+        else:
+            self.add_class("logs-collapsed")
+            self.query_one("#monitor-search", Input).display = False
+            self.query_one("#connection-done-btn", Button).focus()
+        self.refresh_bindings()
+
     def action_toggle_log_view(self) -> None:
+        if self.has_class("logs-collapsed"):
+            self.action_toggle_result_logs()
         if not self._summary_mode_enabled:
             self.notify("Raw log view is already active.", timeout=2)
             return
@@ -918,6 +987,7 @@ class MonitorScreen(CopyEnabledScreen):
             self._refresh_summary_view()
         else:
             self.log_viewer.replace_lines(self._raw_log_lines)
+        self.query_one("#monitor-title", Static).update(self._title_markup())
         self.query_one("#monitor-view-status", Static).update(
             self._view_status_markup()
         )
@@ -939,15 +1009,6 @@ class MonitorScreen(CopyEnabledScreen):
         self.query_one("#monitor-view-status", Static).update(
             self._view_status_markup()
         )
-
-    def _tick_summary_spinner(self) -> None:
-        """Advance the in-progress spinner without adding log lines."""
-        if self._done or self._view_mode != "summary":
-            return
-        if self._active_in_progress_index() is None:
-            return
-        self._spinner_index = (self._spinner_index + 1) % len(SUMMARY_SPINNER_FRAMES)
-        self._refresh_summary_view()
 
     def _ingest_summary_line(self, line: str) -> None:
         """Store a summary milestone, replacing percent updates in place."""
@@ -976,49 +1037,13 @@ class MonitorScreen(CopyEnabledScreen):
                 return index
         return None
 
-    def _active_in_progress_index(self) -> int | None:
-        """Return the step still running, so something on screen is moving.
-
-        This used to take the last step-or-done row and spin it only if it was
-        a step, which assumes the two alternate. They do not: a Prime deploy
-        polls the tunnel and the runtime together, so "Secure endpoint
-        connected" lands while the container image is still being built. The
-        spinner then vanished and every row took a tick, leaving a build that
-        had twenty minutes to run looking like a finished deploy.
-
-        The last step is the one to mark. It can briefly sit on a step that
-        has just finished, in the gap before the next one starts -- that reads
-        as "still working", which is true, where a static screen does not.
-        """
-
-        if self._done:
-            return None
-        return self._last_summary_step_index()
-
     def _rendered_summary_lines(self) -> list[str]:
-        active_index = self._active_in_progress_index()
-        last_step_index = self._last_summary_step_index()
-        spinner = SUMMARY_SPINNER_FRAMES[self._spinner_index]
         lines: list[str] = []
-        for index, item in enumerate(self._summary_items):
+        for item in self._summary_items:
             if item.kind == "blank" or not item.text:
                 lines.append("")
                 continue
-            if item.kind == "error":
-                mark = "✗"
-            elif item.kind == "info":
-                mark = "·"
-            elif index == active_index:
-                mark = spinner
-            elif (
-                self._done
-                and not self._success
-                and item.kind == "step"
-                and index == last_step_index
-            ):
-                mark = "·"
-            else:
-                mark = "✓"
+            mark = {"error": "✗", "done": "✓"}.get(item.kind, "·")
             lines.append(f"{mark} {item.text}")
         return lines
 

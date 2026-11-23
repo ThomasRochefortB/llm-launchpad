@@ -41,7 +41,7 @@ class DeploymentProgressTests(unittest.TestCase):
         progress.on_state(DeploymentState.QUEUED, "Queued")
         progress.on_state(DeploymentState.DEPLOYING, "Building image")
         self.assertEqual(
-            progress.stage_states, ["done", "done", "active", "pending", "pending"]
+            progress.stage_states, ["done", "active", "pending", "pending", "pending", "pending"]
         )
         self.assertEqual(progress.active_stage(), "Prepare")
 
@@ -51,8 +51,8 @@ class DeploymentProgressTests(unittest.TestCase):
         progress.start(OperationType.DEPLOY, "Deploy test")
         progress.on_endpoint_available()
         self.assertTrue(progress.endpoint_known)
-        self.assertEqual(progress.active_stage(), "Load")
-        self.assertEqual(progress.stage_states[4], "pending")
+        self.assertEqual(progress.active_stage(), "Checks")
+        self.assertEqual(progress.stage_states[-1], "pending")
 
     def test_fallback_attempt_resets_stages_and_counts_attempt(self) -> None:
         progress = DeploymentProgress()
@@ -62,7 +62,7 @@ class DeploymentProgressTests(unittest.TestCase):
         progress.on_state(DeploymentState.QUEUED, "Trying fallback")
         self.assertEqual(progress.attempt, 2)
         self.assertEqual(
-            progress.stage_states, ["active", "pending", "pending", "pending", "pending"]
+            progress.stage_states, ["active", "pending", "pending", "pending", "pending", "pending"]
         )
 
     def test_quiet_explanation_never_invents_a_percentage(self) -> None:
@@ -151,7 +151,7 @@ class MonitorProgressScreenTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
             app.push_screen(monitor)
             await pilot.pause()
-            self.assertEqual(monitor._progress.active_stage(), "Load")
+            self.assertEqual(monitor._progress.headline, "Waiting for server response")
 
     async def test_resource_and_endpoint_events_advance_progress(self) -> None:
         app = App[None]()

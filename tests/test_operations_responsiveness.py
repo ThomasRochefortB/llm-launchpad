@@ -40,12 +40,14 @@ def record(job_id: str) -> SimpleNamespace:
 
 class OperationsResponsivenessTests(unittest.IsolatedAsyncioTestCase):
     async def test_manage_jobs_reopen_cancel_and_keep_endpoint_actions_scoped(self) -> None:
+        list_jobs = Mock(return_value=[record("saved")])
+
         class ManageApp(App):
             CSS_PATH = TuiApp.CSS_PATH
             deployment_jobs = {}
 
             def _get_job_store(self) -> object:
-                return SimpleNamespace(list_jobs=lambda: [record("saved")])
+                return SimpleNamespace(list_jobs=list_jobs)
 
             def on_mount(self) -> None:
                 self.push_screen(ManageScreen())
@@ -59,6 +61,9 @@ class OperationsResponsivenessTests(unittest.IsolatedAsyncioTestCase):
                 screen = app.screen
                 assert isinstance(screen, ManageScreen)
                 self.assertTrue(screen.check_action("stop_selected", ()))
+                panel = screen.query_one(DeploymentJobsPanel)
+                self.assertIsNone(panel._poll_timer)
+                list_jobs.assert_not_called()
 
                 # The old global shortcut opens Jobs in this same Manage screen.
                 stack_size = len(app.screen_stack)
@@ -66,6 +71,8 @@ class OperationsResponsivenessTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertEqual(len(app.screen_stack), stack_size)
                 self.assertEqual(screen.query_one(TabbedContent).active, "manage-jobs")
+                self.assertIsNotNone(panel._poll_timer)
+                list_jobs.assert_called_once_with()
                 self.assertFalse(screen.check_action("stop_selected", ()))
                 self.assertFalse(screen.check_action("open_actions", ()))
                 self.assertIs(app.focused, screen.query_one("#deployment-jobs", OptionList))
@@ -76,13 +83,16 @@ class OperationsResponsivenessTests(unittest.IsolatedAsyncioTestCase):
                 app.reopen_persistent_deployment.assert_called_once_with("saved")
                 await pilot.press("x")
                 self.assertIsInstance(app.screen, PersistentCancelDeploymentScreen)
+                self.assertIsNone(panel._poll_timer)
                 await pilot.press("escape")
                 self.assertIs(app.screen, screen)
+                self.assertIsNotNone(panel._poll_timer)
 
                 screen.query_one(TabbedContent).active = "manage-endpoints"
                 await pilot.pause()
                 self.assertTrue(screen.check_action("stop_selected", ()))
                 self.assertEqual(app.focused.id, "manage-endpoint-table")
+                self.assertIsNone(panel._poll_timer)
 
     async def test_slow_refresh_keeps_input_live_and_coalesces_reconciliation(self) -> None:
         started = threading.Event()

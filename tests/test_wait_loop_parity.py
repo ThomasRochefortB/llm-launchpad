@@ -37,9 +37,11 @@ BOUNDED_SILENT = {
     ("orchestrator.py", "_await_prime_public_endpoint"): 120,
 }
 # Not poll-until-ready at all: these wait a known interval before retrying, so
-# there is no unknown remaining time to report on.
+# there is no unknown remaining time to report on. (The warmup backoff sleep
+# sits in `run`, after the nested log-drain helpers, so discovery names the
+# last def it passes.)
 BACKOFF_SLEEPS = {
-    ("warmup.py", "run"),
+    ("warmup.py", "live_logs"),
 }
 
 _POLL_LOOP_RE = re.compile(r"^\s*while time\.(?:monotonic|time)\(\) < ", re.MULTILINE)

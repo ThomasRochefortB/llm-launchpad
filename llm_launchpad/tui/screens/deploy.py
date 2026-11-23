@@ -825,6 +825,9 @@ class LlamaCppDeployScreen(
         "prime-keep-failed-llama",
         "vast-disk-llama",
         "server-args",
+        "dspark-llama",
+        "dspark-repo-llama",
+        "dspark-file-llama",
         "host-input",
         "port-input",
         "n-gpu-layers",
@@ -971,6 +974,16 @@ class LlamaCppDeployScreen(
                 classes="llama-advanced vast-only",
             )
             yield Static("Runtime", classes="form-group-heading llama-advanced")
+            yield ToggleField(
+                "Enable DSpark speculative decoding", "dspark-llama", default=False,
+                classes="llama-advanced modal-only",
+            )
+            yield FormField(
+                "DSpark draft repo (optional)", "dspark-repo-llama", classes="llama-advanced modal-only",
+            )
+            yield FormField(
+                "DSpark draft file (optional)", "dspark-file-llama", classes="llama-advanced modal-only",
+            )
             yield FormField(
                 "Server args",
                 "server-args",
@@ -1225,6 +1238,7 @@ class LlamaCppDeployScreen(
         _disable_with_reason(self, "#revision", revision_reason)
         advanced_visible = not self.query_one("#warmup").has_class("hidden")
         for provider_class, provider in (
+            (".modal-only", ComputeProvider.MODAL),
             (".prime-only", ComputeProvider.PRIME),
             (".vast-only", ComputeProvider.VAST),
         ):
@@ -1578,6 +1592,11 @@ class LlamaCppDeployScreen(
         # silently discard options the user entered before collapsing it.
         sa = self.query_one("#server-args", Input).value.strip()
         config.server_args = sa or None
+        if self._provider == ComputeProvider.MODAL:
+            config.dspark = self.query_one("#dspark-llama", Switch).value
+            if config.dspark:
+                config.dspark_repo = self.query_one("#dspark-repo-llama", Input).value.strip() or None
+                config.dspark_file = self.query_one("#dspark-file-llama", Input).value.strip() or None
         h = self.query_one("#host-input", Input).value.strip()
         config.host = h or None
         p = self.query_one("#port-input", Input).value.strip()

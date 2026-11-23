@@ -38,7 +38,6 @@ JOB_DB_PATH = _default_job_db_path()
 # provider calls (via a heartbeat thread). Past this, a live pid is trusted
 # but flagged; a dead pid is interrupted.
 HEARTBEAT_TIMEOUT_SECONDS = 120.0
-_SCHEMA_VERSION = 1
 
 
 class JobStatus:
@@ -82,6 +81,7 @@ class JobRecord:
     cleanup_error: str | None = None
     event_count: int = 0
     undecodable: str | None = None
+    updated_at: float = 0.0
 
     @property
     def active(self) -> bool:
@@ -141,6 +141,7 @@ def _undecodable_job_record(row: sqlite3.Row, event_count: int) -> JobRecord:
         cleanup_error=row["cleanup_error"],
         event_count=event_count,
         undecodable="Job payload could not be decoded; kept for recovery.",
+        updated_at=row["updated_at"],
     )
 
 
@@ -275,6 +276,7 @@ class JobStore:
             resource_app_id=row["resource_app_id"],
             cleanup_error=row["cleanup_error"],
             event_count=int((count["n"] if count else 0) or 0),
+            updated_at=row["updated_at"],
         )
 
     def list_jobs(self, *, include_terminal: bool = True, limit: int = 200) -> list[JobRecord]:

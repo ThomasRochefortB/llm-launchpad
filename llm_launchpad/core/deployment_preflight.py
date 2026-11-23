@@ -15,7 +15,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import math
+import shlex
+from pathlib import PurePosixPath
 
+from ..gguf_files import is_dspark_gguf, is_target_gguf
 from ..protocol.enums import (
     BackendType,
     ComputeProvider,
@@ -25,6 +28,7 @@ from ..protocol.enums import (
 from ..protocol.models import (
     DeploymentConfig,
     DeploymentRequest,
+    DSparkDraft,
     ResolvedDeploymentPlan,
 )
 from .providers import capabilities
@@ -67,6 +71,23 @@ def validate_request(request: DeploymentRequest) -> tuple[PreflightFinding, ...]
     findings: list[PreflightFinding] = []
     caps = capabilities(request.provider)
     provider_name = request.provider.display_name
+
+    llama = request.llamacpp
+    if llama.dspark or llama.dspark_repo or llama.dspark_file:
+        if request.provider != ComputeProvider.MODAL or request.backend != BackendType.LLAMACPP:
+            findings.append(PreflightFinding("dspark-provider", "DSpark requires Modal with llama.cpp."))
+        elif (
+            not (llama.repo_id or "").strip()
+            or not (llama.quant or "").strip()
+            or request.serving_requirements is not None
+        ):
+            findings.append(PreflightFinding(
+                "dspark-target", "DSpark requires a Hugging Face target repo and quantization in Advanced Deploy.",
+            ))
+        elif llama.dspark_repo and not llama.dspark_file:
+            findings.append(PreflightFinding(
+                "dspark-file", "Select an exact DSpark draft filename when using a separate draft repository.",
+            ))
 
     if request.backend not in caps.backends:
         findings.append(
@@ -334,6 +355,59 @@ def plan_from_request(
         output_tokens_per_month=resolved_request.output_tokens_per_month,
         price_per_hour_usd=resolved_request.price_per_hour_usd,
     )
+
+
+def resolve_dspark_draft(config: DeploymentConfig) -> DSparkDraft:
+    """Pin the matching draft and check the joint weight budget before allocation."""
+    from huggingface_hub import HfApi
+
+    from .modal_gpu import MODAL_GPU_MEMORY_GB
+
+    # A managed draft cannot share llama.cpp's draft arguments with a manual one.
+    draft_flags = {
+        "-md", "-hfd", "-hfrd", "--model-draft", "--hf-repo-draft", "--spec-type",
+        "-ngld", "--gpu-layers-draft", "--n-gpu-layers-draft", "-devd", "--device-draft",
+    }
+    args = shlex.split(config.server_args or "")
+    if any(arg.split("=", 1)[0] in draft_flags or arg.startswith("--spec-draft-") for arg in args):
+        raise ValueError("Remove the manual speculative decoding arguments before enabling DSpark.")
+
+    api = HfApi()
+    target_repo = (config.repo_id or "").strip()
+    target = api.model_info(target_repo, revision=config.revision, files_metadata=True, timeout=10)
+    draft_repo = (config.dspark_repo or "").strip() or target_repo
+    draft = target if draft_repo.casefold() == target_repo.casefold() else api.model_info(
+        draft_repo, files_metadata=True, timeout=10,
+    )
+    candidates = {
+        f.rfilename: f.size for f in draft.siblings or [] if is_dspark_gguf(f.rfilename)
+    }
+    filename = (config.dspark_file or "").strip()
+    if not filename:
+        preferred = [name for name in candidates if "q8_0" in name.casefold()]
+        choices = preferred or list(candidates)
+        if len(choices) != 1:
+            detail = ", ".join(sorted(choices)) or "none"
+            raise ValueError(f"Select an exact DSpark draft filename. Found: {detail}")
+        filename = choices[0]
+    size = candidates.get(filename)
+    path = PurePosixPath(filename)
+    if size is None or size <= 0 or path.is_absolute() or ".." in path.parts or not draft.sha or not target.sha:
+        raise ValueError("The DSpark draft must be a named GGUF with a known size in the selected repository.")
+
+    quant = (config.quant or "").casefold()
+    weights = [
+        f.size for f in target.siblings or []
+        if is_target_gguf(f.rfilename) and quant in PurePosixPath(f.rfilename).name.casefold()
+    ]
+    if not weights or any(weight is None or weight <= 0 for weight in weights):
+        raise ValueError("Could not verify the selected main GGUF weight size for DSpark.")
+    minimum_gb = max(sum(weight or 0 for weight in weights) / 1e9, config.required_vram_gb or 0) + size / 1e9
+    capacity_gb = MODAL_GPU_MEMORY_GB.get((config.gpu_type or "").upper())
+    if capacity_gb is not None and minimum_gb > capacity_gb * (config.gpu_count or 1):
+        raise ValueError(f"The main model and DSpark draft need at least {minimum_gb:.1f} GB before runtime overhead.")
+    config.revision = target.sha
+    return DSparkDraft(draft_repo, draft.sha, filename, size)
 
 
 def revalidate_plan_price(

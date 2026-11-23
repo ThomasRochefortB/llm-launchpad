@@ -98,15 +98,6 @@ def clear_provider_readiness_cache() -> None:
     _readiness_cache.clear()
 
 
-def invalidate_provider_readiness(provider: ComputeProvider | None = None) -> None:
-    """Drop cached readiness for one provider, or all when omitted."""
-    if provider is None:
-        clear_provider_readiness_cache()
-        return
-    for key in [key for key in _readiness_cache if key[0] == provider.value]:
-        _readiness_cache.pop(key, None)
-
-
 def _is_network_failure(message: str) -> bool:
     lowered = (message or "").casefold()
     return any(
@@ -420,17 +411,6 @@ def _vast_backend_for(credentials: VastCredentials) -> Any:
     from .vast_backend import VastBackend
 
     return VastBackend(credentials=credentials)
-
-
-def check_all_provider_readiness(
-    *, verify: bool = True, refresh: bool = False
-) -> tuple[ProviderReadiness, ...]:
-    """Return Modal, Prime, and Vast readiness in a stable order."""
-    return (
-        check_modal_readiness(verify=verify, refresh=refresh),
-        check_prime_readiness(verify=verify, refresh=refresh),
-        check_vast_readiness(verify=verify, refresh=refresh),
-    )
 
 
 def has_provider_credentials(*, refresh: bool = False) -> bool:

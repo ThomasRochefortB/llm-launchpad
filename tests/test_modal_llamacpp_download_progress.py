@@ -84,6 +84,22 @@ class LlamacppDownloadProgressTests(unittest.TestCase):
             self.assertEqual(size_bytes, 24)
             self.assertEqual(file_count, 2)
 
+    def test_draft_only_quant_cannot_be_selected_from_a_cached_snapshot(self) -> None:
+        from fnmatch import fnmatchcase
+
+        draft = "DSpark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf"
+        target = "DeepSeek-V4.1-Flash-1017-UD-Q8_K_XL.gguf"
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshot = Path(tmp)
+            (snapshot / draft).touch()
+            (snapshot / target).touch()
+            self.assertEqual(modal_llamacpp_app._snapshot_gguf_candidates(snapshot, "Q8_0"), [])
+            self.assertEqual(modal_llamacpp_app._snapshot_gguf_candidates(snapshot, None), [snapshot / target])
+
+        patterns = modal_llamacpp_app.auxiliary_gguf_ignore_patterns()
+        self.assertTrue(any(fnmatchcase(draft, pattern) for pattern in patterns))
+        self.assertFalse(any(fnmatchcase(target, pattern) for pattern in patterns))
+
     def test_resolve_model_entrypoint_prefers_first_split_shard(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             hub_dir = Path(tmp) / "hub"

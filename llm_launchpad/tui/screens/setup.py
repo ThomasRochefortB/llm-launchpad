@@ -8,15 +8,17 @@ from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, Static
 
-from ...core.provider_readiness import ProviderReadiness
+from ...core.provider_readiness import ProviderReadiness, ProviderReadinessStage
 from ...protocol.enums import ComputeProvider
 from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
 from ..visual import screen_title
 
-_MODAL_COMMAND = "modal setup"
-_PRIME_COMMAND = "prime login"
-_VAST_COMMAND = "llm-launchpad vast-auth login"
+_SETUP_COMMANDS = {
+    ComputeProvider.MODAL: "modal setup",
+    ComputeProvider.PRIME: "prime login",
+    ComputeProvider.VAST: "llm-launchpad vast-auth login",
+}
 
 
 class SetupRequiredScreen(CopyEnabledScreen):
@@ -31,42 +33,24 @@ class SetupRequiredScreen(CopyEnabledScreen):
         with Vertical(id="setup-required-root"):
             with VerticalScroll(id="setup-required-scroll", classes="screen-scroll"):
                 yield Static(screen_title("Compute provider required"))
-                yield Static(
-                    "Connect a compute provider to deploy inference endpoints.\n",
-                    id="setup-required-intro",
-                )
-                yield Static("[dim]Checking provider credentials…[/dim]", id="setup-readiness-status")
-                yield Static(
-                    "[bold]Option 1 · Modal[/bold]\n"
-                    "[dim]Install the CLI, then authenticate:[/dim]\n"
-                    f"  {_MODAL_COMMAND}",
-                    classes="setup-option",
-                )
-                yield Static(
-                    "[bold]Option 2 · Prime Intellect[/bold]\n"
-                    "[dim]Authenticate from your terminal:[/dim]\n"
-                    f"  {_PRIME_COMMAND}",
-                    classes="setup-option",
-                )
-                yield Static(
-                    "[bold]Option 3 · Vast.ai[/bold]\n"
-                    "[dim]Save a marketplace API key, here or in your terminal:[/dim]\n"
-                    f"  {_VAST_COMMAND}",
-                    classes="setup-option",
-                )
-                yield Static(
-                    "[dim]Authenticate in another terminal, then press "
-                    "[bold]r[/bold] to re-check. Quit with esc.[/dim]",
-                    id="setup-required-hint",
-                )
-                yield Static("", id="setup-required-feedback")
-                yield Button("Set up Vast.ai key", id="setup-vast-preview-btn")
+                yield Static("Connect a provider, then press r to re-check.", id="setup-required-intro")
+                for provider, command in _SETUP_COMMANDS.items():
+                    with Horizontal(classes="setup-option"):
+                        yield Static(
+                            self._provider_setup_text(provider, command),
+                            id=f"setup-status-{provider.value}",
+                            classes="setup-provider-status",
+                        )
+                        yield Button(
+                            "Copy",
+                            id=f"setup-copy-{provider.value}-btn",
+                            classes="setup-copy-command",
+                        )
                 with Horizontal(id="setup-required-actions"):
                     yield Button("Re-check", id="setup-recheck-btn", variant="primary")
-                    yield Button("Copy Modal", id="setup-copy-modal-btn")
-                    yield Button("Copy Prime", id="setup-copy-prime-btn")
-                    yield Button("Copy Vast", id="setup-copy-vast-btn")
-                    yield Button("Quit", id="setup-quit-btn", variant="error")
+                    yield Button("Vast.ai key", id="setup-vast-preview-btn")
+                    yield Button("Quit", id="setup-quit-btn")
+                yield Static("", id="setup-required-feedback")
         yield FittedFooter()
 
     def on_mount(self) -> None:
@@ -99,48 +83,44 @@ class SetupRequiredScreen(CopyEnabledScreen):
         """Update installed/checking/authenticated/failed without re-mounting."""
         self._render_readiness(readiness)
 
+    @staticmethod
+    def _provider_setup_text(
+        provider: ComputeProvider, command: str, row: ProviderReadiness | None = None,
+    ) -> str:
+        stage = row.stage if row is not None else ProviderReadinessStage.CREDENTIALS_PRESENT
+        style = {
+            ProviderReadinessStage.READY: "$success",
+            ProviderReadinessStage.AUTH_FAILED: "$error",
+            ProviderReadinessStage.UNREACHABLE: "$warning",
+        }.get(stage, "dim")
+        detail = f" · {escape(row.detail)}" if row is not None and row.detail else ""
+        return (
+            f"[bold]{escape(provider.display_name)}[/] · [{style}]{escape(stage.display_name)}[/]"
+            f"{detail}\n{escape(command)}"
+        )
+
     def _render_readiness(self, readiness: tuple[ProviderReadiness, ...]) -> None:
-        try:
-            status = self.query_one("#setup-readiness-status", Static)
-        except Exception:
-            return
-        if not readiness:
-            status.update("[dim]Checking provider credentials…[/dim]")
-            return
-        lines = []
         by_provider = {row.provider: row for row in readiness}
-        for provider in ComputeProvider:
-            name = provider.display_name
-            row = by_provider.get(provider)
-            stage = row.stage.display_name if row else "Checking"
-            detail = row.detail if row else ""
-            color = {
-                "Authenticated": "$success",
-                "Checking": "$warning",
-                "Not configured": "dim",
-                "Not installed": "dim",
-                "Authentication failed": "$error",
-                "Verification unavailable": "$warning",
-            }.get(stage, "")
-            label = f"[{color}]{escape(stage)}[/]" if color else escape(stage)
-            lines.append(f"• {escape(str(name))}: {label}" + (f" — {escape(detail)}" if detail else ""))
-        status.update("\n".join(lines))
+        for provider, command in _SETUP_COMMANDS.items():
+            self.query_one(f"#setup-status-{provider.value}", Static).update(
+                self._provider_setup_text(provider, command, by_provider.get(provider))
+            )
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "setup-recheck-btn":
+        button_id = event.button.id
+        if button_id == "setup-recheck-btn":
             self.action_recheck()
-        elif event.button.id == "setup-copy-modal-btn":
-            self._copy_command(_MODAL_COMMAND)
-        elif event.button.id == "setup-copy-prime-btn":
-            self._copy_command(_PRIME_COMMAND)
-        elif event.button.id == "setup-copy-vast-btn":
-            self._copy_command(_VAST_COMMAND)
-        elif event.button.id == "setup-quit-btn":
+        elif button_id == "setup-quit-btn":
             await self.action_quit_app()
-        elif event.button.id == "setup-vast-preview-btn":
+        elif button_id == "setup-vast-preview-btn":
             from .vast import VastPreviewScreen
 
             self.app.push_screen(VastPreviewScreen())
+        else:
+            for provider, command in _SETUP_COMMANDS.items():
+                if button_id == f"setup-copy-{provider.value}-btn":
+                    self._copy_command(command)
+                    break
 
     def _copy_command(self, command: str) -> None:
         self.app.copy_to_clipboard(command)

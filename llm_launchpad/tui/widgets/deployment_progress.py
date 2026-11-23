@@ -29,10 +29,6 @@ def _stage_chip(label: str, state: str) -> str:
 _STAGE_SEPARATOR = " [dim]›[/] "
 
 
-# Detail text that only repeats the title's own status word.
-_SAID_BY_TITLE = frozenset({"complete", "completed", "done", "working"})
-
-
 class DeploymentProgressWidget(Vertical):
     """Compact lifecycle summary: stages, elapsed time, and current detail."""
 
@@ -49,10 +45,13 @@ class DeploymentProgressWidget(Vertical):
         height: auto;
         text-wrap: wrap;
     }
-    #deploy-progress-stages {
+    #deploy-progress-stages, #deploy-progress-next {
         height: auto;
         text-wrap: wrap;
         color: $text;
+    }
+    #deploy-progress-next {
+        display: none;
     }
     #deploy-progress-detail {
         height: auto;
@@ -73,6 +72,7 @@ class DeploymentProgressWidget(Vertical):
     def compose(self) -> ComposeResult:
         yield Static("", id="deploy-progress-title")
         yield Static("", id="deploy-progress-stages")
+        yield Static("", id="deploy-progress-next")
         yield Static("", id="deploy-progress-detail")
         yield Static("", id="deploy-progress-hint")
 
@@ -82,44 +82,49 @@ class DeploymentProgressWidget(Vertical):
         try:
             title = self.query_one("#deploy-progress-title", Static)
             stages = self.query_one("#deploy-progress-stages", Static)
+            next_stage = self.query_one("#deploy-progress-next", Static)
             detail = self.query_one("#deploy-progress-detail", Static)
             hint = self.query_one("#deploy-progress-hint", Static)
         except Exception:
             return
         elapsed = format_elapsed(progress.elapsed_seconds())
-        if progress.done:
-            status = "[$success]Complete[/]" if progress.success else "[$error]Failed[/]"
-        else:
-            status = "[bold $primary]Running[/]"
         attempt = f"  [dim]attempt {progress.attempt}[/]" if progress.attempt > 1 else ""
-        title.update(f"[bold]{escape(progress.title)}[/]  {status}  [dim]{elapsed} elapsed[/]{attempt}")
+        style = "$success" if progress.success else "$error" if progress.done else "$primary"
+        if not progress.done and progress.headline.startswith(("Waiting for", "Cleaning up")):
+            style = "$warning"
+        time_label = f"{elapsed} elapsed"
+        if not progress.done and len(progress.stages) > 1:
+            time_label = f"{format_elapsed(progress.stage_elapsed_seconds())} in step"
+        title.update(
+            f"[dim]{escape(progress.title)}[/]  [bold {style}]{escape(progress.headline)}[/]"
+            f"  [dim]{time_label}[/]{attempt}"
+        )
         # A one-stage operation (status, logs) has nothing to chart: its single
         # chip only restated the title beside it.
         # A class rather than `display`: an inline style would override the
         # stylesheet rules that hide these rows on small viewports.
         stages.set_class(len(progress.stages) <= 1, "hidden")
-        if progress.stages:
-            chips = _STAGE_SEPARATOR.join(
-                _stage_chip(label, state)
-                for label, state in zip(progress.stages, progress.stage_states, strict=False)
-            )
-        else:
-            chips = ""
-        stages.update(chips)
-        current = progress.current_detail.strip() or "Working"
-        quiet = progress.quiet_explanation()
-        if quiet and not progress.done:
-            since = format_elapsed(progress.seconds_since_progress())
-            detail.update(f"{escape(current)}\n[dim]Last progress {since} ago. {escape(quiet)}[/]")
-        elif progress.error and not progress.success:
-            detail.update(f"[$error]{escape(progress.error)}[/]")
-        else:
-            detail.update(f"[dim]{escape(current)}[/]")
-        # "Complete" under a title that already says Complete says nothing.
-        detail.set_class(
-            progress.done and progress.success and current.casefold() in _SAID_BY_TITLE,
-            "hidden",
-        )
+        stages.update(_STAGE_SEPARATOR.join(
+            _stage_chip(label, state)
+            for label, state in zip(progress.stages, progress.stage_states, strict=True)
+        ))
+        following = progress.next_stage() if not progress.done else ""
+        next_stage.set_class(not following, "hidden")
+        next_stage.update(f"[dim]Next[/]  {escape(following)}")
+        current = progress.current_detail or progress.quiet_explanation()
+        detail_markup = escape(current)
+        if progress.done:
+            detail_markup = f"[$error]{escape(progress.error)}[/]" if not progress.success else ""
+        elif progress.percent is not None:
+            filled = progress.percent // 10
+            bar = f"[$primary]{'━' * filled}[/][dim]{'─' * (10 - filled)}[/]"
+            detail_markup = f"{bar}  {progress.percent}%  {detail_markup}".rstrip()
+        timeout = progress.warmup_seconds_remaining()
+        if timeout is not None and not progress.done:
+            limit = f"Warmup timeout in {format_elapsed(timeout)}"
+            detail_markup = f"{detail_markup}  ·  {limit}" if detail_markup else limit
+        detail.update(detail_markup)
+        detail.set_class(not detail_markup, "hidden")
         # Finished, the footer and the outcome card name the way out; while
         # running, the hint carries what the footer cannot: leaving is safe.
         hint.set_class(progress.done, "hidden")

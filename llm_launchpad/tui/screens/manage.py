@@ -19,8 +19,9 @@ from ...core.vision_probe import image_test_command
 from ...protocol.enums import ComputeProvider, VisionVerification
 from ...protocol.models import EndpointInfo, ServingSnapshot, VisionCapabilities
 from ...core.deployment_states import is_terminal_deployment_state
-from ..connection import endpoint_connection_payload, resolve_openai_base_url
+from ..connection import endpoint_connection_payload
 from ..format import (
+    clip,
     format_age,
     format_cost,
     format_duration,
@@ -298,27 +299,6 @@ def _live_metrics_label(row: EndpointInfo) -> str:
     return "  Fetch live metrics"
 
 
-# The Manage screen's single-key shortcuts for each endpoint action, in the
-# order the selection detail lists them.
-_ACTION_KEYS = (
-    ("status", "s"),
-    ("logs", "l"),
-    ("benchmark", "b"),
-    ("live-metrics", "f"),
-    ("connection", "u"),
-    ("stop", "x"),
-)
-_ACTION_KEY_LABELS = (
-    ("enter", "all actions"),
-    ("s", "status"),
-    ("l", "logs"),
-    ("b", "benchmark"),
-    ("f", "live metrics"),
-    ("u", "copy URL"),
-    ("x", "stop"),
-)
-
-
 def _endpoint_model(row: EndpointInfo) -> str:
     return (row.served_model_name or row.model_name or "-").strip() or "-"
 
@@ -484,7 +464,7 @@ class ManageScreen(CopyEnabledScreen):
     BINDINGS = [
         Binding("escape", "pop_screen", "Back", show=True),
         Binding("r", "refresh_endpoints", "Refresh", show=True),
-        Binding("enter", "open_actions", "Actions", show=True),
+        Binding("enter", "open_actions", "Actions", show=True, priority=True),
         Binding("a", "toggle_stopped", "Stopped", show=True),
         Binding("d", "deploy", "Deploy", show=True),
         Binding("l", "logs_selected", "Logs", show=False),
@@ -517,14 +497,17 @@ class ManageScreen(CopyEnabledScreen):
         if event.tabbed_content.id != "manage-tabs":
             return
         self.refresh_bindings()
+        self.query_one(DeploymentJobsPanel).set_active(event.pane.id == "manage-jobs")
         if event.pane.id == "manage-jobs":
             self.query_one("#deployment-jobs", OptionList).focus()
         else:
             self.query_one("#manage-endpoint-table", AdaptiveDataTable).focus()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action == "open_actions":
+            return self.focused is not None and self.focused.id == "manage-endpoint-table"
         if action in {
-            "refresh_endpoints", "open_actions", "toggle_stopped", "logs_selected",
+            "refresh_endpoints", "toggle_stopped", "logs_selected",
             "copy_base_url", "status_selected", "benchmark_selected", "stop_selected",
             "fetch_live_selected", "deploy",
         }:
@@ -582,6 +565,7 @@ class ManageScreen(CopyEnabledScreen):
 
     def on_screen_suspend(self, _: events.ScreenSuspend) -> None:
         self._was_suspended = True
+        self.query_one(DeploymentJobsPanel).set_active(False)
         # Nothing on a screen nobody is looking at is worth a request, least
         # of all one that can wake a container that had scaled to zero.
         if self._traffic_refresh_timer is not None:
@@ -597,6 +581,8 @@ class ManageScreen(CopyEnabledScreen):
             self._clock_refresh_timer.resume()
         if self._was_suspended:
             self._was_suspended = False
+            show_jobs = self.query_one("#manage-tabs", TabbedContent).active == "manage-jobs"
+            self.query_one(DeploymentJobsPanel).set_active(show_jobs)
             self.call_after_refresh(self._refresh_if_current)
 
     def on_endpoints_loaded(self, message: EndpointsLoaded) -> None:
@@ -897,33 +883,18 @@ class ManageScreen(CopyEnabledScreen):
         if row is None:
             detail.update("[dim]No endpoint selected.[/dim]")
             return
-        actions = _available_actions(row)
-        # Keys, not a comma list of action names: the list read as prose and
-        # said nothing about how to reach any of them.
-        action_keys = ["enter", *(
-            key
-            for action, key in _ACTION_KEYS
-            if action in actions
-        )]
-        key_labels = dict(_ACTION_KEY_LABELS)
-        action_hints = "  ".join(
-            f"[bold $accent]{key}[/] [dim]{key_labels[key]}[/dim]" for key in action_keys
-        )
-        base_url, _derived = resolve_openai_base_url(row, username=self._modal_username())
-        url_line = f"\n[dim]Base URL:[/dim] {escape(base_url)}" if base_url else ""
-        stale_line = (
-            f"\n[$warning]{escape(row.provider.display_name)} did not answer the last refresh;"
-            " this state may be out of date.[/$warning]"
-            if row.provider.value in self._retained_providers
-            else ""
-        )
-        detail.update(
-            f"[bold]{escape(_endpoint_name(row))}[/bold]  "
-            f"[dim]{escape(_endpoint_host(row))}[/dim]\n"
-            f"{deployment_and_health_line(row)}"
-            f"{url_line}{stale_line}{_serving_detail_lines(row)}\n\n"
-            f"{action_hints}"
-        )
+        health = deployment_and_health_line(row)
+        totals = row.serving.total_tokens if row.serving is not None else 0
+        if totals > 0:
+            health += f" · {format_token_count(totals)} tokens served"
+        notices = []
+        if row.provider.value in self._retained_providers:
+            notices.append(f"{row.provider.display_name} state may be out of date")
+        if row.live_metrics_error:
+            notices.append(clip(row.live_metrics_error, 64))
+        warning = f"\n[$warning]{escape(' · '.join(notices))}[/]" if notices else ""
+        detail.update(f"{health}{warning}")
+
 
 
 class EndpointActionsScreen(CopyEnabledScreen):
@@ -979,6 +950,10 @@ class EndpointActionsScreen(CopyEnabledScreen):
                     if action in _available_actions(self.endpoint)
                 ),
                 id="manage-actions",
+            )
+            yield Static(
+                _serving_detail_lines(self.endpoint).lstrip("\n"),
+                id="manage-action-metrics",
             )
         yield FittedFooter()
 

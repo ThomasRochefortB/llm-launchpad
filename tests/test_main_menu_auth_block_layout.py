@@ -6,6 +6,8 @@ from unittest.mock import patch
 
 from textual.widgets import Footer, Static
 
+from llm_launchpad.core.provider_readiness import ProviderReadiness, ProviderReadinessStage
+from llm_launchpad.protocol.enums import ComputeProvider
 from llm_launchpad.tui import app as tui_app_module
 from llm_launchpad.tui.app import TuiApp
 from llm_launchpad.tui.screens.main_menu import MainMenuScreen
@@ -21,7 +23,7 @@ class _ThemedTuiApp(TuiApp):
 
 
 class MainMenuAuthBlockLayoutTests(unittest.IsolatedAsyncioTestCase):
-    async def test_auth_status_block_stays_above_footer_with_theme(self) -> None:
+    async def test_home_shows_only_a_single_actionable_provider_line(self) -> None:
         app = _ThemedTuiApp()
         with (
             patch.object(MainMenuScreen, "_refresh_modal_auth_status", lambda self: None),
@@ -38,20 +40,20 @@ class MainMenuAuthBlockLayoutTests(unittest.IsolatedAsyncioTestCase):
                 screen = app.screen
                 assert isinstance(screen, MainMenuScreen)
                 block = screen.query_one("#auth-status-block", Static)
-                footer = screen.query_one(Footer)
-                self.assertLess(
-                    block.region.y + block.region.height,
-                    footer.region.y,
-                    "auth status block must render fully above the footer",
-                )
+                self.assertFalse(block.display)
+                screen.on_provider_readiness((
+                    ProviderReadiness(ComputeProvider.MODAL, ProviderReadinessStage.READY),
+                    ProviderReadiness(ComputeProvider.PRIME, ProviderReadinessStage.AUTH_FAILED),
+                    ProviderReadiness(ComputeProvider.VAST, ProviderReadinessStage.MISSING_CREDENTIALS),
+                ))
+                await pilot.pause()
+
+                self.assertEqual(block.region.height, 1)
+                self.assertLess(block.region.bottom, screen.query_one(Footer).region.y)
                 text = str(block.content)
-                for provider in (
-                    "Modal",
-                    "Prime Intellect",
-                    "Hugging Face",
-                    "Artificial Analysis",
-                ):
-                    self.assertIn(provider, text)
+                self.assertIn("Check Prime Intellect", text)
+                self.assertNotIn("Modal", text)
+                self.assertNotIn("Vast.ai", text)
 
 
 if __name__ == "__main__":

@@ -423,6 +423,33 @@ class HFModelsTests(unittest.TestCase):
         self.assertAlmostEqual(metadata.vram_gb_by_quant["Q4_1"], 472.704, places=2)
         self.assertAlmostEqual(metadata.vram_gb_by_quant["Q8_0"], 801.345, places=2)
 
+    def test_fetch_quant_metadata_excludes_dspark_draft_from_serving_options(self) -> None:
+        info = SimpleNamespace(
+            siblings=[
+                SimpleNamespace(rfilename="UD-Q4_K_XL/model-UD-Q4_K_XL-00001-of-00002.gguf"),
+                SimpleNamespace(rfilename="dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf"),
+            ],
+            gguf={},
+        )
+        for label in ("DSPARK Q8_0", "Q8_0"):
+            with self.subTest(label=label):
+                page = (
+                    "<h3>Hardware compatibility</h3>"
+                    "<p>UD-Q4_K_XL</p><p>501 GB</p>"
+                    f"<p>{label}</p><p>7.98 GB</p>"
+                    "<h2>Inference Providers</h2>"
+                )
+                with (
+                    patch("huggingface_hub.HfApi.model_info", return_value=info),
+                    patch("requests.get", return_value=SimpleNamespace(status_code=200, text=page)),
+                ):
+                    metadata = hf_models.fetch_gguf_quant_metadata(
+                        "unsloth/DeepSeek-V4.1-Flash-1017-GGUF", force_refresh=True,
+                    )
+
+                self.assertEqual(metadata.quantizations, ["UD-Q4_K_XL"])
+                self.assertEqual(metadata.vram_gb_by_quant, {"UD-Q4_K_XL": 501.0})
+
     def test_fetch_vllm_memory_breakdown_uses_hf_config(self) -> None:
         calls: list[tuple[str, str | None]] = []
 

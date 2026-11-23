@@ -6,6 +6,7 @@ as Textual messages to the app/screen.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from textual.message import Message
@@ -14,6 +15,7 @@ from ..core.hf_models import ModelCandidate
 from ..protocol.enums import DeploymentState, OperationType
 from ..protocol.events import (
     BaseEvent,
+    DeploymentAttemptStartedEvent,
     EndpointAvailableEvent,
     ErrorEvent,
     LogEvent,
@@ -41,11 +43,13 @@ class LogMessage(Message):
         line: str,
         stream: str = "stdout",
         is_milestone: bool = False,
+        timestamp: datetime | None = None,
     ) -> None:
         super().__init__()
         self.line = line
         self.stream = stream
         self.is_milestone = is_milestone
+        self.timestamp = timestamp
 
 
 class StateChanged(Message):
@@ -56,11 +60,23 @@ class StateChanged(Message):
         state: DeploymentState,
         operation: OperationType | None = None,
         detail: str = "",
+        timestamp: datetime | None = None,
+        timeout_seconds: int | None = None,
     ) -> None:
         super().__init__()
         self.state = state
         self.operation = operation
         self.detail = detail
+        self.timestamp = timestamp
+        self.timeout_seconds = timeout_seconds
+
+
+class DeploymentAttemptStarted(Message):
+    """The active placement changed."""
+
+    def __init__(self, event: DeploymentAttemptStartedEvent) -> None:
+        super().__init__()
+        self.event = event
 
 
 class OperationDone(Message):
@@ -73,6 +89,9 @@ class OperationDone(Message):
         exit_code: int = 0,
         detail: str = "",
         data: object = None,
+        *,
+        phase_only: bool = False,
+        timestamp: datetime | None = None,
     ) -> None:
         super().__init__()
         self.operation = operation
@@ -80,6 +99,8 @@ class OperationDone(Message):
         self.exit_code = exit_code
         self.detail = detail
         self.data = data
+        self.phase_only = phase_only
+        self.timestamp = timestamp
 
 
 class OperationError(Message):
@@ -259,7 +280,7 @@ class EndpointAvailable(Message):
 # -----------------------------------------------------------------------
 
 
-def _dispatch_event(app_or_widget: object, event: BaseEvent) -> None:
+def _dispatch_event(app_or_widget: object, event: BaseEvent, *, phase_only: bool = False) -> None:
     """Convert a protocol event into a Textual message and post it."""
     poster = getattr(app_or_widget, "post_message", None)
     if poster is None:
@@ -271,10 +292,19 @@ def _dispatch_event(app_or_widget: object, event: BaseEvent) -> None:
                 line=event.line,
                 stream=event.stream,
                 is_milestone=event.is_milestone,
+                timestamp=event.timestamp,
             )
         )
     elif isinstance(event, StateChangeEvent):
-        poster(StateChanged(state=event.current, operation=event.operation, detail=event.detail))
+        poster(StateChanged(
+            state=event.current,
+            operation=event.operation,
+            detail=event.detail,
+            timestamp=event.timestamp,
+            timeout_seconds=event.timeout_seconds,
+        ))
+    elif isinstance(event, DeploymentAttemptStartedEvent):
+        poster(DeploymentAttemptStarted(event))
     elif isinstance(event, ResourceAllocatedEvent):
         poster(ResourceAllocated(app_id=event.app_id))
     elif isinstance(event, EndpointAvailableEvent):
@@ -287,6 +317,8 @@ def _dispatch_event(app_or_widget: object, event: BaseEvent) -> None:
                 exit_code=event.exit_code,
                 detail=event.detail,
                 data=event.data,
+                phase_only=phase_only,
+                timestamp=event.timestamp,
             )
         )
     elif isinstance(event, ErrorEvent):

@@ -35,31 +35,23 @@ class CliMainHelperTests(unittest.TestCase):
                 cli_main._ensure_tui_runtime()
         self.assertEqual(ctx.exception.exit_code, 1)
 
-    def test_ensure_tui_runtime_requires_configured_provider(self) -> None:
+    def test_tui_hands_provider_setup_to_the_interactive_app(self) -> None:
         with (
             patch("llm_launchpad.cli.main.sys.stdin.isatty", return_value=True),
             patch("llm_launchpad.cli.main.sys.stdout.isatty", return_value=True),
-            patch("llm_launchpad.cli.main.ModalBackend.is_cli_available", return_value=False),
-            patch(
-                "llm_launchpad.cli.main.get_prime_auth_status",
-                return_value=SimpleNamespace(authenticated=False),
-            ),
+            patch.object(cli_main.ModalBackend, "is_cli_available", return_value=False) as modal,
+            patch.object(cli_main.ModalBackend, "terminate_all"),
+            patch.object(cli_main, "get_prime_auth_status", return_value=SimpleNamespace(authenticated=False)) as prime,
+            patch.object(cli_main, "resolve_vast_credentials") as vast,
+            patch("llm_launchpad.tui.app.TuiApp") as tui_app,
         ):
-            with self.assertRaises(cli_main.typer.Exit) as ctx:
-                cli_main._ensure_tui_runtime()
-        self.assertEqual(ctx.exception.exit_code, 1)
+            tui_app.return_value.return_code = 0
+            cli_main.tui()
 
-    def test_ensure_tui_runtime_accepts_prime_without_modal_cli(self) -> None:
-        with (
-            patch("llm_launchpad.cli.main.sys.stdin.isatty", return_value=True),
-            patch("llm_launchpad.cli.main.sys.stdout.isatty", return_value=True),
-            patch("llm_launchpad.cli.main.ModalBackend.is_cli_available", return_value=False),
-            patch(
-                "llm_launchpad.cli.main.get_prime_auth_status",
-                return_value=SimpleNamespace(authenticated=True),
-            ),
-        ):
-            cli_main._ensure_tui_runtime()
+        tui_app.return_value.run.assert_called_once_with(mouse=False)
+        modal.assert_not_called()
+        prime.assert_not_called()
+        vast.assert_not_called()
 
     def test_resolve_deploy_target_prefers_explicit_app_name(self) -> None:
         instance, app_name = cli_main._resolve_deploy_target(

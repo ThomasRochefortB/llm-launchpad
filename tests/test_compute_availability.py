@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 import time
 import unittest
 from types import SimpleNamespace
@@ -21,7 +22,7 @@ from llm_launchpad.core.modal_gpu import ModalGpuSpec
 from llm_launchpad.core.prime_backend import PrimeBackend, preferred_prime_offer_image
 from llm_launchpad.core.quick_deploy import QuickDeployProfile
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider
-from llm_launchpad.protocol.models import ComputeOffer, PrimeProviderOptions
+from llm_launchpad.protocol.models import ComputeAvailabilitySnapshot, ComputeOffer, PrimeProviderOptions
 
 
 def _profile(
@@ -126,6 +127,36 @@ class ComputeAvailabilityTests(unittest.TestCase):
         self.assertEqual(snapshot.providers, (ComputeProvider.MODAL,))
         self.assertEqual(snapshot.configurations[0].gpu_type, "H100 80GB")
 
+    def test_partial_snapshot_publishes_fast_provider_while_modal_is_pending(self) -> None:
+        release_modal = threading.Event()
+        updates = []
+
+        def modal_catalog(**_kwargs: object) -> list[ModalGpuSpec]:
+            if not release_modal.wait(2):
+                raise TimeoutError("The Prime result was never published")
+            return [ModalGpuSpec("H100", price_per_hour_usd=3.95)]
+
+        def on_partial(snapshot: ComputeAvailabilitySnapshot, pending: tuple[ComputeProvider, ...]) -> None:
+            updates.append((snapshot, pending))
+            release_modal.set()
+
+        module = "llm_launchpad.core.compute_availability"
+        with (
+            patch(f"{module}.resolve_modal_cli_path", return_value="/usr/bin/modal"),
+            patch(f"{module}.get_prime_auth_status", return_value=SimpleNamespace(authenticated=True)),
+            patch(f"{module}.fetch_modal_gpu_catalog", side_effect=modal_catalog),
+            patch.object(PrimeBackend, "list_offers", return_value=[_prime_offer()]),
+        ):
+            final = load_compute_availability(on_partial=on_partial)
+
+        self.assertEqual(len(updates), 1)
+        partial, pending = updates[0]
+        self.assertEqual(partial.providers, (ComputeProvider.PRIME,))
+        self.assertEqual(pending, (ComputeProvider.MODAL,))
+        self.assertTrue(partial.configurations)
+        self.assertEqual(final.providers, (ComputeProvider.MODAL, ComputeProvider.PRIME))
+        self.assertFalse(final.errors)
+
     def test_a_provider_that_never_answers_cannot_hold_the_whole_screen(self) -> None:
         """One stalled catalog used to leave Fast Deploy on "loading" forever.
 
@@ -134,8 +165,6 @@ class ComputeAvailabilityTests(unittest.TestCase):
         loading phase for 300s and was killed rather than recovering. The
         other providers' rows are still real, so they are still shown.
         """
-        import threading
-
         release = threading.Event()
         self.addCleanup(release.set)
 

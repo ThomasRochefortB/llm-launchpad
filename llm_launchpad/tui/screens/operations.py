@@ -5,10 +5,12 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from rich.markup import escape
+from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
+from textual.timer import Timer
 from textual.widgets import Button, OptionList, Static
 from textual.widgets.option_list import Option
 
@@ -49,6 +51,8 @@ class DeploymentJobsPanel(VerticalScroll):
         self._refresh_inflight = False
         self._reconcile_pending = False
         self._refresh_error = ""
+        self._poll_timer: Timer | None = None
+        self._reconcile_timer: Timer | None = None
 
     def compose(self) -> ComposeResult:
         yield OptionList(id="deployment-jobs")
@@ -61,12 +65,23 @@ class DeploymentJobsPanel(VerticalScroll):
             "[dim]No deployments yet. Start one from Deploy.[/dim]"
         )
         self._sync_empty_state(False)
-        self._refresh_jobs(reconcile=True)
-        self.set_interval(0.5, self._refresh_jobs)
-        self.set_interval(
-            self._RECONCILE_INTERVAL_SECONDS,
-            lambda: self._refresh_jobs(reconcile=True),
-        )
+
+    def set_active(self, active: bool) -> None:
+        """Poll while the Jobs tab is visible and refresh as it opens."""
+        if active and self._poll_timer is None:
+            self._poll_timer = self.set_interval(0.5, self._refresh_jobs)
+            self._reconcile_timer = self.set_interval(
+                self._RECONCILE_INTERVAL_SECONDS,
+                lambda: self._refresh_jobs(reconcile=True),
+            )
+            self._refresh_jobs(reconcile=True)
+        elif not active and self._poll_timer is not None:
+            self._poll_timer.stop()
+            if self._reconcile_timer is not None:
+                self._reconcile_timer.stop()
+            self._poll_timer = None
+            self._reconcile_timer = None
+            self._reconcile_pending = False
 
     # Reconciliation reads every active job out of SQLite and adopts journal
     # entries, writing as it goes. That is startup work, not repaint work, so
@@ -121,7 +136,7 @@ class DeploymentJobsPanel(VerticalScroll):
         else:
             self._refresh_error = message.error or "Unknown error"
         self._render_jobs()
-        if self._reconcile_pending:
+        if self._reconcile_pending and self._poll_timer is not None:
             self._refresh_jobs()
 
     def _render_jobs(self) -> None:
@@ -230,7 +245,15 @@ class OperationsScreen(CopyEnabledScreen):
         yield FittedFooter()
 
     def on_mount(self) -> None:
+        self.query_one(DeploymentJobsPanel).set_active(True)
         self.query_one("#deployment-jobs", OptionList).focus()
+
+    def on_screen_suspend(self, _: events.ScreenSuspend) -> None:
+        self.query_one(DeploymentJobsPanel).set_active(False)
+
+    def on_screen_resume(self, _: events.ScreenResume) -> None:
+        if self.is_mounted:
+            self.query_one(DeploymentJobsPanel).set_active(True)
 
     def action_go_back(self) -> None:
         self.app.pop_screen()

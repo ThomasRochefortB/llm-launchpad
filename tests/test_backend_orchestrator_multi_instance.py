@@ -151,10 +151,7 @@ class OrchestratorMultiInstanceTests(unittest.TestCase):
 
         def _fake_run_streaming(command: list[str], env=None):  # type: ignore[no-untyped-def]
             captured.append(command)
-            if False:
-                yield None
-            return
-            yield  # pragma: no cover
+            yield from ()
 
         with patch("llm_launchpad.core.backend.ModalBackend.logs_follow_args", return_value=[]):
             with patch("llm_launchpad.core.backend.ModalBackend.run_streaming", side_effect=_fake_run_streaming):
@@ -168,10 +165,7 @@ class OrchestratorMultiInstanceTests(unittest.TestCase):
 
         def _fake_run_streaming(command: list[str], env=None):  # type: ignore[no-untyped-def]
             captured.append(command)
-            if False:
-                yield None
-            return
-            yield  # pragma: no cover
+            yield from ()
 
         with patch("llm_launchpad.core.backend.ModalBackend.logs_follow_args", return_value=[]):
             with patch("llm_launchpad.core.backend.ModalBackend.run_streaming", side_effect=_fake_run_streaming):
@@ -212,10 +206,7 @@ class OrchestratorMultiInstanceTests(unittest.TestCase):
 
         def _fake_run_streaming(command: list[str], env=None):  # type: ignore[no-untyped-def]
             captured.append(command)
-            if False:
-                yield None
-            return
-            yield  # pragma: no cover
+            yield from ()
 
         with patch("llm_launchpad.core.backend.ModalBackend.run_streaming", side_effect=_fake_run_streaming):
             events = list(orch.stop_app(BackendType.VLLM, app_name="vllm-qwen2-5"))
@@ -229,10 +220,7 @@ class OrchestratorMultiInstanceTests(unittest.TestCase):
 
         def _fake_run_streaming(command: list[str], env=None):  # type: ignore[no-untyped-def]
             captured.append(command)
-            if False:
-                yield None
-            return
-            yield  # pragma: no cover
+            yield from ()
 
         with patch("llm_launchpad.core.backend.ModalBackend.run_streaming", side_effect=_fake_run_streaming):
             list(orch.stop_app(BackendType.VLLM, app_name="vllm-qwen2-5", app_id="ap-123"))

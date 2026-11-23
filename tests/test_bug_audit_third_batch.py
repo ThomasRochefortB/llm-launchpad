@@ -753,18 +753,15 @@ class InfraSortBasisTests(unittest.IsolatedAsyncioTestCase):
                 screen.on_fast_deploy_availability_loaded(
                     FastDeployAvailabilityLoaded(snapshot)
                 )
+                await screen.workers.wait_for_complete()
                 await pilot.pause()
                 status = str(screen.query_one("#fast-deploy-status", Static).renderable)
+                detail = str(screen.query_one("#fast-deploy-detail", Static).renderable)
 
-        # Placements sort on their assessment, which the status already calls
-        # "best full-context throughput first". A second line asserting they
-        # were sorted by a monthly cost contradicted it, and the rows visibly
-        # disagreed with whichever line named a price.
         assert "Sorted by" not in status
-        # The scenario the per-row monthly figure is computed under is still
-        # named, because that number means nothing without its assumptions.
-        assert "Workday 8h" in status
-        assert "storage separate" in status
+        assert "Workday 8h" not in status
+        assert "Workday 8h" in detail
+        assert "storage separate" in detail
 
 
 def test_no_helper_claims_to_name_a_cost_ordering() -> None:

@@ -222,6 +222,85 @@ class WarmupTerminalFailureTests(unittest.TestCase):
         self._warmup_stack = contextlib.ExitStack()
         self.addCleanup(self._warmup_stack.close)
 
+    def test_draft_context_crash_during_backoff_ends_warmup(self) -> None:
+        from itertools import count
+        from unittest.mock import Mock
+
+        post = Mock(return_value=_Response(503, "still warming"))
+        _hermetic_warmup(self, types.SimpleNamespace(post=post))
+        tail = Mock()
+        tail.may_attach.return_value = False
+        tail.attach.return_value = iter(())
+        tail.drain.side_effect = [
+            iter([LogEvent(line="dflash requires ctx_other to be set (this warning is normal during memory fitting)")]),
+            iter([LogEvent(line="srv  server_run_i: exiting due to model loading error")]),
+            iter(()),
+        ]
+        ticks = count(step=0.1)
+        with (
+            patch("llm_launchpad.core.warmup._ModalLogTail", return_value=tail),
+            patch("llm_launchpad.core.warmup.time.time", side_effect=lambda: next(ticks)),
+        ):
+            events = list(Orchestrator().warmup(
+                backend=BackendType.LLAMACPP,
+                server_url="https://example.modal.run",
+                app_name="llp-lc-test",
+            ))
+
+        post.assert_called_once()
+        result = next(e for e in events if isinstance(e, OperationCompleteEvent))
+        self.assertFalse(result.success)
+        self.assertIn("Choose a main-model quantization", result.detail)
+
+    def test_dspark_context_load_error_ends_warmup_without_fit_warning(self) -> None:
+        post = unittest.mock.Mock(return_value=_Response(503, "still warming"))
+        _hermetic_warmup(self, types.SimpleNamespace(post=post))
+        with patch("llm_launchpad.core.warmup._ModalLogTail") as tail_type:
+            tail = tail_type.return_value
+            tail.may_attach.return_value = False
+            tail.attach.return_value = iter(())
+            tail.drain.return_value = iter([
+                LogEvent(line=(
+                    "0.04.202.907 E srv    load_model: failed to create_context with model "
+                    "'/root/.cache/huggingface/hub/models--unsloth--DeepSeek-V4.1-Flash-1017-GGUF/"
+                    "snapshots/dfcee0ec8d6b874c6663eca0fc55d90ab32534c8/"
+                    "dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf'"
+                )),
+            ])
+            events = list(Orchestrator().warmup(
+                backend=BackendType.LLAMACPP,
+                server_url="https://example.modal.run",
+                app_name="llp-lc-test",
+            ))
+
+        post.assert_not_called()
+        tail.stop.assert_called_once()
+        result = next(e for e in events if isinstance(e, OperationCompleteEvent))
+        self.assertFalse(result.success)
+        self.assertIn("Choose a main-model quantization", result.detail)
+
+    def test_warmup_does_not_mistake_configured_dspark_for_main_weights(self) -> None:
+        post = unittest.mock.Mock(return_value=_Response(200, '{"choices": []}'))
+        _hermetic_warmup(self, types.SimpleNamespace(post=post))
+        with patch("llm_launchpad.core.warmup._ModalLogTail") as tail_type:
+            tail = tail_type.return_value
+            tail.attach.return_value = iter(())
+            tail.may_attach.return_value = False
+            tail.drain.return_value = iter([
+                LogEvent(line="using DSpark draft file: /models/dspark-test.gguf"),
+                LogEvent(line="dflash requires ctx_other to be set (this warning is normal during memory fitting)"),
+                LogEvent(line="srv  server_run_i: exiting due to model loading error"),
+            ])
+            events = list(Orchestrator().warmup(
+                backend=BackendType.LLAMACPP,
+                server_url="https://example.modal.run",
+                app_name="llp-lc-test",
+            ))
+
+        post.assert_called_once()
+        result = next(e for e in events if isinstance(e, OperationCompleteEvent))
+        self.assertTrue(result.success)
+
     def test_rejected_serving_plan_ends_warmup_without_waiting_for_the_timeout(self) -> None:
         crash = (
             "Runner failed with exception: RuntimeError('llama.cpp rejected the "

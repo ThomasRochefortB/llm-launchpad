@@ -79,6 +79,18 @@ class ModalLlamaCppAppTests(unittest.TestCase):
         index = command.index("--n-gpu-layers")
         self.assertEqual(command[index + 1], "42")
 
+    def test_dspark_reserves_draft_weights_in_device_fit_margins(self) -> None:
+        from llm_launchpad.backends import modal_llamacpp_app
+
+        size = 600 * 1024**2 + 1
+        self.assertEqual(modal_llamacpp_app._dspark_fit_args([], size), ["--fit-target", "1625"])
+        args = ["--ctx-size", "2048", "--fit-target=2048,3072"]
+        self.assertEqual(
+            modal_llamacpp_app._dspark_fit_args(args, size),
+            ["--ctx-size", "2048", "--fit-target", "2649,3673"],
+        )
+        self.assertEqual(args[-1], "--fit-target=2048,3072")
+
     def test_gguf_weight_paths_returns_entrypoint_for_unsplit_file(self) -> None:
         from llm_launchpad.backends import modal_llamacpp_app
 

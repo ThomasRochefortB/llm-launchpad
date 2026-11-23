@@ -23,6 +23,7 @@ from ..protocol.enums import (
 )
 from ..protocol.events import (
     BaseEvent,
+    DeploymentAttemptStartedEvent,
     EndpointAvailableEvent,
     ErrorEvent,
     LogEvent,
@@ -185,7 +186,7 @@ def run_lifecycle(
         except Exception:
             pass
         outcome, _ = _run_single_attempt(
-            orchestrator, attempt, opts=opts, hooks=hooks
+            orchestrator, attempt, attempt_number=index + 1, opts=opts, hooks=hooks
         )
         outcomes.append(outcome)
         try:
@@ -281,6 +282,7 @@ def _run_single_attempt(
     orchestrator: Any,
     attempt: LifecycleAttempt,
     *,
+    attempt_number: int,
     opts: LifecycleOptions,
     hooks: LifecycleCallbacks,
 ) -> tuple[DeploymentAttemptOutcome, DeploymentConfig]:
@@ -289,6 +291,21 @@ def _run_single_attempt(
 
     config = effective_config_for_attempt(attempt)
     intent = _intent_for_attempt(attempt)
+    warmup_follows = (
+        intent == OperationIntent.SERVE
+        and opts.warmup_enabled and config.do_warmup and config.do_deploy
+    )
+    hooks.on_event(
+        DeploymentAttemptStartedEvent(
+            attempt=attempt_number,
+            provider=config.provider,
+            backend=config.backend,
+            intent=intent,
+            warmup=warmup_follows,
+            gpu_type=config.gpu_type,
+            gpu_count=config.gpu_count,
+        )
+    )
     phase_timer = StartupPhaseTimer()
     phase_timer.deploy_started()
     observed_url: str | None = None
@@ -413,7 +430,6 @@ def _run_single_attempt(
     # a live, billable resource without its generated bearer key. When warmup
     # follows, this is the pre-certification save; the verified URL publishes
     # again after warmup succeeds.
-    warmup_follows = bool(opts.warmup_enabled and config.do_warmup and config.do_deploy)
     if intent == OperationIntent.PRELOAD:
         # Preload-only work has no serving endpoint to certify; deploy success
         # is the terminal state. Do not invoke warmup.
@@ -797,11 +813,6 @@ def _run_warmup(
     )
 
 
-def warmup_events_emitted(seen: bool) -> bool:
-    """Whether a warmup stream yielded any event at all (legacy helper)."""
-    return seen
-
-
 def _finalize_failed_attempt(
     orchestrator: Any,
     hooks: LifecycleCallbacks,
@@ -960,5 +971,4 @@ __all__ = [
     "LifecycleOptions",
     "WarmupOutcome",
     "run_lifecycle",
-    "warmup_events_emitted",
 ]

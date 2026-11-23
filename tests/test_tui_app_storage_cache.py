@@ -368,7 +368,7 @@ class TuiAppStorageCacheTests(unittest.TestCase):
 
         self.assertEqual(warmup_urls, [created_prod_url])
 
-    def test_run_deploy_suppresses_intermediate_deploy_completion_when_warmup_follows(self) -> None:
+    def test_run_deploy_keeps_the_monitor_active_until_the_full_job_completes(self) -> None:
         app = TuiApp()
         app._username = "alice"
         app._orchestrator = type(
@@ -399,22 +399,14 @@ class TuiAppStorageCacheTests(unittest.TestCase):
         with patch("llm_launchpad.tui.app._dispatch_event", return_value=None) as dispatch:
             app._run_deploy(config, monitor=object())
 
-        dispatched_events = [call.args[1] for call in dispatch.call_args_list]
-        self.assertFalse(
-            any(
-                isinstance(event, OperationCompleteEvent)
-                and event.operation == OperationType.DEPLOY
-                and event.success
-                for event in dispatched_events
-            )
-        )
-        self.assertTrue(
-            any(
-                isinstance(event, OperationCompleteEvent)
-                and event.operation == OperationType.WARMUP
-                and event.success
-                for event in dispatched_events
-            )
+        completions = [
+            (call.args[1].operation, call.kwargs.get("phase_only", False))
+            for call in dispatch.call_args_list
+            if isinstance(call.args[1], OperationCompleteEvent) and call.args[1].success
+        ]
+        self.assertEqual(
+            completions,
+            [(OperationType.DEPLOY, True), (OperationType.WARMUP, True), (OperationType.DEPLOY, False)],
         )
 
     def test_run_deploy_emits_connection_summary_on_warmup_success(self) -> None:

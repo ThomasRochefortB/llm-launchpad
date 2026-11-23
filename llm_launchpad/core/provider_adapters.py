@@ -362,11 +362,6 @@ def stop_with_orchestrator(
     return ProviderCleanup(disposition=CleanupDisposition.FAILED, detail=detail)
 
 
-def stop_resource(resource: ProviderResource) -> ProviderCleanup:
-    """Stop one resource through its provider adapter (no orchestrator)."""
-    return provider_adapter(resource.provider).stop(resource)
-
-
 def _stop_consequence(provider: ComputeProvider) -> tuple[str, bool]:
     if provider == ComputeProvider.PRIME:
         return "Prime cache disk is kept and remains billable.", True
@@ -391,6 +386,5 @@ __all__ = [
     "listing_adapter",
     "provider_adapter",
     "rollback_from_event",
-    "stop_resource",
     "stop_with_orchestrator",
 ]

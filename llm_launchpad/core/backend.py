@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 import json
 import os
 import re
@@ -325,6 +326,8 @@ class ModalBackend:
         if config.vision is not None:
             from .vision import vision_to_dict
             args += ["--vision-json", json.dumps(vision_to_dict(config.vision))]
+        if config.dspark_draft is not None:
+            args += ["--dspark-json", json.dumps(asdict(config.dspark_draft))]
         if config.preload:
             args += ["--preload"]
         else:
@@ -379,6 +382,23 @@ class ModalBackend:
         except Exception:
             log_exception("Could not probe `modal app logs` for a follow flag")
         return []
+
+    @classmethod
+    def recent_system_logs(cls, app_name: str, started_at: float) -> list[str]:
+        """Fetch the app's system logs since the given Unix timestamp."""
+        since = datetime.fromtimestamp(started_at, tz=timezone.utc).isoformat()
+        try:
+            result = subprocess.run(
+                cls._resolve_command(
+                    ["modal", "app", "logs", app_name, "--source", "system", "--since", since]
+                ),
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return []
+        return result.stdout.splitlines() if result.returncode == 0 else []
 
     # ------------------------------------------------------------------
     # App listing

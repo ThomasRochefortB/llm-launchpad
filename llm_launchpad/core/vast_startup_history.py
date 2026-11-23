@@ -4,8 +4,8 @@ Advertised ``inet_down`` bandwidth is a poor predictor of how long a rental
 takes to reach SSH and then a healthy endpoint: host-side image pulls, Vast
 provisioning, and SSH-server installation dominate, and none of them scale
 with the advertised link. This module records per-machine outcomes of real
-deploys in local state and ranks candidate offers by measured startup time,
-falling back to price when no machine has evidence yet.
+deploys in local state. Callers use ``machine_startup_stats`` to prefer a host
+with a recent successful startup when the cost ranking is otherwise a tie.
 """
 
 from __future__ import annotations
@@ -17,7 +17,6 @@ import tempfile
 import time
 from typing import Any
 
-from ..protocol.models import VastOffer
 from .config import SETTINGS_DIR
 
 VAST_STARTUP_HISTORY_PATH = SETTINGS_DIR / "vast" / "startup_history.json"
@@ -75,32 +74,6 @@ def machine_startup_stats(
         }
     except (TypeError, ValueError):
         return None
-
-
-def rank_vast_offers_by_startup(
-    offers: list[VastOffer],
-    history: dict[str, Any] | None,
-) -> list[VastOffer]:
-    """Order offers by measured startup time, then price, then offer id.
-
-    Machines with a recent successful observation sort first by their measured
-    rental-to-healthy time; everything else keeps its existing relative order
-    (callers pass price-sorted lists, which is preserved as the tiebreaker).
-    """
-    indexed = list(enumerate(offers))
-    keyed = []
-    for index, offer in indexed:
-        stats = machine_startup_stats(history, offer.machine_id or "")
-        keyed.append(
-            (
-                0 if stats is not None else 1,
-                stats["healthy_seconds"] if stats is not None else 0.0,
-                index,
-                offer,
-            )
-        )
-    keyed.sort(key=lambda row: (row[0], row[1], row[2]))
-    return [offer for _, _, _, offer in keyed]
 
 
 def load_vast_startup_history(path: Path | None = None) -> dict[str, Any]:
@@ -168,36 +141,11 @@ def record_vast_startup(
         return
 
 
-def startup_evidence_summary(history: dict[str, Any] | None) -> dict[str, Any]:
-    """Return the JSON-serializable history for debugging and tests."""
-    if not isinstance(history, dict):
-        return {}
-    return {key: value for key, value in history.items() if isinstance(value, list)}
-
-
-def fast_machine_ids(
-    history: dict[str, Any] | None, *, limit: int = 10
-) -> list[str]:
-    """Return machine ids with the fastest recent successful startups."""
-    if not history:
-        return []
-    scored: list[tuple[float, str]] = []
-    for machine_id in history:
-        stats = machine_startup_stats(history, machine_id)
-        if stats is not None:
-            scored.append((stats["healthy_seconds"], machine_id))
-    scored.sort()
-    return [machine_id for _, machine_id in scored[: max(0, limit)]]
-
-
 __all__ = [
     "HISTORY_MAX_AGE_SECONDS",
     "MAX_OBSERVATIONS_PER_MACHINE",
     "VAST_STARTUP_HISTORY_PATH",
-    "fast_machine_ids",
     "load_vast_startup_history",
     "machine_startup_stats",
-    "rank_vast_offers_by_startup",
     "record_vast_startup",
-    "startup_evidence_summary",
 ]
