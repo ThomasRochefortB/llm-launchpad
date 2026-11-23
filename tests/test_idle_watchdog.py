@@ -95,21 +95,21 @@ def _wait(predicate, timeout: float) -> bool:  # type: ignore[no-untyped-def]
 
 def test_activity_keeps_it_alive_and_silence_destroys_it(tmp_path: Path) -> None:
     runtime = _Runtime()
-    process, marker = _start(tmp_path, runtime, idle=3)
+    process, marker = _start(tmp_path, runtime, idle=1)
     try:
-        for _ in range(5):
+        for _ in range(3):
             runtime.tokens += 10
             time.sleep(1)
         assert not marker.exists(), "destroyed while tokens were moving"
         runtime.running = 1  # a long prefill moves no counter
-        time.sleep(4)
+        time.sleep(2)
         assert not marker.exists(), "destroyed during an in-flight request"
         runtime.running = 0
-        assert _wait(marker.exists, 8), "idle rental was never destroyed"
+        assert _wait(marker.exists, 5), "idle rental was never destroyed"
         assert process.wait(timeout=5) == 0
         assert runtime.authorized[0] == "Bearer secret"
         healthy, last_active, idle = (tmp_path / "idle-watchdog.state").read_text().split()
-        assert (healthy, idle) == ("1", "3")
+        assert (healthy, idle) == ("1", "1")
     finally:
         process.kill()
         runtime.server.shutdown()
@@ -120,7 +120,7 @@ def test_a_runtime_that_never_serves_is_destroyed_after_the_grace(tmp_path: Path
     runtime.up = False
     process, marker = _start(tmp_path, runtime, idle=3600, grace=2)
     try:
-        assert _wait(marker.exists, 8)
+        assert _wait(marker.exists, 5)
         output = process.communicate(timeout=5)[0]
         assert "never started serving" in output
     finally:
@@ -134,11 +134,11 @@ def test_the_idle_clock_starts_when_serving_starts(tmp_path: Path) -> None:
     runtime.up = False
     process, marker = _start(tmp_path, runtime, idle=3)
     try:
-        time.sleep(4)
+        time.sleep(2)
         runtime.up = True
         time.sleep(2)
         assert not marker.exists()
-        assert _wait(marker.exists, 8)
+        assert _wait(marker.exists, 5)
     finally:
         process.kill()
         runtime.server.shutdown()
