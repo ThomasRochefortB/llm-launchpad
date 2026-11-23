@@ -1063,7 +1063,17 @@ class VastLifecycleTests(unittest.TestCase):
         self.ssh.run.side_effect = None
         self.ssh.run.return_value = f"{self.gpu_inventory}\nBYTES 0\nRUNTIME 0\n"
 
-        with patch("llm_launchpad.core.vast_deployment.endpoint_healthy", return_value=False), patch(
+        clock = {"now": 0.0}
+
+        def healthy(*_: object) -> bool:
+            # Each poll carries the wait one second forward, so the deadline
+            # is reached in fake time rather than a real three-second spin.
+            clock["now"] += 1
+            return False
+
+        with patch("llm_launchpad.core.vast_deployment.endpoint_healthy", healthy), patch(
+            "llm_launchpad.core.vast_deployment.time.monotonic", lambda: clock["now"],
+        ), patch(
             "llm_launchpad.core.vast_deployment.VAST_STARTUP_HEARTBEAT_SECONDS", 0
         ), patch("llm_launchpad.core.vast_deployment.VAST_SERVE_DEADLINE_SECONDS", 3):
             event = self.deploy()
