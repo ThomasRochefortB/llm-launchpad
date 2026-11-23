@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Weekly live canary: deploy, chat, and stop the smallest model on each provider.
+"""Local live canary: deploy, chat, and stop the smallest model on each provider.
 
 Three regressions this year passed the whole test suite and broke real
 deployments -- every Prime and Vast llama.cpp deploy for days after 623ba8b,
@@ -14,9 +14,9 @@ Spend is bounded three ways: the smallest GGUF on the cheapest GPU, a hard
 wall-clock limit per provider, and a 30-minute idle shutdown on the rental
 itself as the backstop if this process dies before ``stop`` runs.
 
-Pass ``--live`` to authorize billable resources. Providers whose credentials
-are missing are reported as skipped rather than failed, so the scheduled job
-works with whichever providers the repository has secrets for.
+Pass ``--live`` locally to authorize billable resources. GitHub Actions runs
+are refused so CI cannot rent compute. Providers whose credentials are missing
+are reported as skipped rather than failed.
 """
 
 from __future__ import annotations
@@ -38,9 +38,8 @@ MODEL_QUANT = "Q4_K_M"
 # A backstop, not the plan: `stop` normally ends the rental within minutes.
 IDLE_SHUTDOWN = "30m"
 PROVIDERS = ("modal", "prime", "vast")
-# The report is uploaded as a CI artifact, so nothing credential-shaped leaves
-# this process: provider keys from the environment, bearer tokens, and the
-# endpoint key the deploy summary prints.
+# Keep credentials out of the report: provider keys from the environment,
+# bearer tokens, and the endpoint key the deploy summary prints.
 _SECRET_ENV = ("MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET", "PRIME_API_KEY", "VAST_API_KEY", "HF_TOKEN")
 _API_KEY_LINE = re.compile(r"(api[ _-]?key\s*[:=]\s*)\S+", re.IGNORECASE)
 
@@ -179,6 +178,8 @@ def main() -> int:
     args = parser.parse_args()
     if not args.live:
         parser.error("Pass --live to authorize billable deployments.")
+    if os.getenv("GITHUB_ACTIONS") == "true":
+        parser.error("Billable canary deployments are disabled in GitHub Actions. Run locally instead.")
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M")
     results = [
         run_provider(provider, run_id=run_id, max_hourly_cost=args.max_hourly_cost, max_minutes=args.max_minutes)
