@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -18,6 +20,39 @@ _spec.loader.exec_module(canary)
 
 
 class CanaryTests(unittest.TestCase):
+    def test_github_actions_cannot_authorize_billable_deployments(self) -> None:
+        with patch.dict(os.environ, {"GITHUB_ACTIONS": "true"}), \
+                patch.object(sys, "argv", ["canary_live.py", "--live"]), \
+                patch.object(sys, "stderr", new_callable=io.StringIO) as stderr, \
+                patch.object(canary, "run_provider") as run, \
+                self.assertRaises(SystemExit) as error:
+            canary.main()
+        self.assertEqual(error.exception.code, 2)
+        self.assertIn("disabled in GitHub Actions", stderr.getvalue())
+        run.assert_not_called()
+
+    def test_local_run_requires_explicit_authorization(self) -> None:
+        with patch.dict(os.environ, {"GITHUB_ACTIONS": "false"}), \
+                patch.object(sys, "argv", ["canary_live.py"]), \
+                patch.object(sys, "stderr", new_callable=io.StringIO), \
+                patch.object(canary, "run_provider") as run, \
+                self.assertRaises(SystemExit) as error:
+            canary.main()
+        self.assertEqual(error.exception.code, 2)
+        run.assert_not_called()
+
+    def test_explicit_local_run_can_still_write_a_report(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.json"
+            with patch.dict(os.environ, {"GITHUB_ACTIONS": "false"}), \
+                    patch.object(sys, "argv", ["canary_live.py", "--live", "--provider", "vast", "--report", str(report)]), \
+                    patch.object(canary, "run_provider", return_value=canary.ProviderResult("vast", status="passed")) as run, \
+                    patch.object(sys, "stdout", new_callable=io.StringIO):
+                result = canary.main()
+            self.assertEqual(result, 0)
+            self.assertTrue(report.is_file())
+            run.assert_called_once()
+
     def test_a_provider_without_credentials_is_skipped_not_failed(self) -> None:
         with patch.object(canary, "_credentials_present", return_value="no Prime API key"), \
                 patch.object(canary, "_run") as run:
