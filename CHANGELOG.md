@@ -7,6 +7,9 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- Remove the billable live canary workflow and reject live canary execution in GitHub Actions. Keep live deployments as an explicitly authorized local check, and expire CI build artifacts after one day.
+
 ## [1.1.2] - 2026-11-02
 
 ### Fixed
