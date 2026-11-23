@@ -86,8 +86,10 @@ class FastDeployAvailabilityLoaded(Message):
         *,
         request_id: int | None = None,
         purpose: str = "infra",
+        pending_providers: tuple[ComputeProvider, ...] = (),
     ) -> None:
         super().__init__()
+        self.pending_providers = pending_providers
         self.snapshot = snapshot
         self.request_id = request_id
         self.purpose = purpose
@@ -110,6 +112,7 @@ class FastDeployAvailabilityFailed(Message):
 
 
 _CUSTOM_DEPLOY_OPTION_ID = "fast-deploy-open-custom-deploy"
+_SEARCH_ALL_GPUS_ID = "fast-deploy-search-all-gpus"
 
 
 @dataclass(frozen=True)
@@ -524,7 +527,8 @@ def _tier_option(
     """
 
     marker = "[$primary]*[/]" if tier.is_recommended else " "
-    price = _quote_price_label(tier.plan.quote)
+    quote = tier.plan.quote
+    price = _format_price(quote.price_per_hour_usd, estimate=quote.is_estimate)
     speed = tier.output_tokens_per_second
     speed_text = f"~{speed:.0f} tok/s" if speed > 0 else "speed n/a"
     # A merged role now occupies the tradeoff column on the recommended row,
@@ -563,11 +567,7 @@ def _tier_option(
 def _infra_option(row: _InfraRow, width_mode: WidthMode = WidthMode.WIDE) -> str:
     quote = row.plan.quote
     gpu = _infra_gpu_label(row)
-    price = _quote_price_label(quote)
-    monthly = _scenario_monthly_label(row.plan)
-    extra = ""
-    if len(row.alternative_plans) > 1:
-        extra = f" · {len(row.alternative_plans)} placements"
+    price = _format_price(quote.price_per_hour_usd, estimate=quote.is_estimate)
     quant = _quant_markup(row.profile)
     provider = escape(quote.provider.display_name)
     if width_mode == WidthMode.MINIMAL:
@@ -575,16 +575,17 @@ def _infra_option(row: _InfraRow, width_mode: WidthMode = WidthMode.WIDE) -> str
             f"  {escape(clip(gpu, 14))} x{quote.gpu_count} "
             f"{quant} [dim]{provider}[/dim] {money(price)}"
         )
-    if width_mode == WidthMode.COMPACT:
+    if width_mode in (WidthMode.COMPACT, WidthMode.STANDARD):
+        gpu_width = 16 if width_mode == WidthMode.COMPACT else 24
         return (
-            f"  {escape(clip(gpu, 16)):<16} x{quote.gpu_count:<2} "
+            f"  {escape(clip(gpu, gpu_width)):<{gpu_width}} x{quote.gpu_count:<2} "
             f"{quant} {provider} {money(price)}"
         )
     return (
         f"  {escape(gpu):<20} x{quote.gpu_count:<2} "
         f"{quant} {provider} "
         f"{_availability_label(row.configuration)}  "
-        f"{money(price)} [dim]· {monthly}{extra}[/dim]"
+        f"{money(price)}"
     )
 
 
@@ -592,7 +593,8 @@ def _infra_detail(row: _InfraRow) -> str:
     quote = row.plan.quote
     gpu = _infra_gpu_label(row)
     monthly = _scenario_monthly_label(row.plan)
-    region = (quote.region or "").strip() or "provider-managed regions"
+    region = escape((quote.region or "").strip() or "provider-managed regions")
+    basis = escape(_plan_cost_evaluation(row.plan).basis_label())
     performance = ""
     if row.plan.assessment is not None:
         single = max(
@@ -626,7 +628,8 @@ def _infra_detail(row: _InfraRow) -> str:
         f"[bold]{escape(gpu)}[/bold] x{quote.gpu_count}  "
         f"{escape(quote.provider.display_name)} · {_quant_markup(row.profile)}\n"
         f"[dim]{performance}{monthly}{f' · {once}' if once else ''} · {region} · "
-        f"{_availability_label(row.configuration)}[/dim]"
+        f"{_availability_label(row.configuration)}[/dim]\n"
+        f"[dim]{basis} · storage separate[/dim]"
     )
 
 
@@ -771,10 +774,16 @@ class FastDeployScreen(CopyEnabledScreen):
             return
         self._phase_name = value
         if self.is_mounted:
+            self.set_class(value == "infra", "placement-step")
+            self.set_class(value == "loading", "placement-loading")
             self.refresh_bindings()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         """Hide and disable the keys that do not apply to the current step."""
+        if action == "choose_selected" and (
+            self._phase == "loading" or (self._phase == "infra" and not self._infra_rows)
+        ):
+            return False
         editing_search = getattr(self.focused, "id", None) == "fast-deploy-model-search"
         if action == "cycle_context" and (self._snapshot is None or (len(self._contexts) < 2 and self._context_tokens in (None, *self._contexts))):
             return False
@@ -807,6 +816,7 @@ class FastDeployScreen(CopyEnabledScreen):
         self._prices: dict[str, _ModelPrices] = {}
         self._shorter_contexts: dict[str, tuple[_ModelPrices, ...]] = {}
         self._fetch_pending = False
+        self._pending_providers: tuple[ComputeProvider, ...] = ()
         self._pricing_error: str | None = None
         self._preferred_placement = preferred_placement
         self._placement_id: str | None = None
@@ -995,6 +1005,9 @@ class FastDeployScreen(CopyEnabledScreen):
         if self._phase == "loading":
             return
         if self._phase == "models":
+            if option_id == _SEARCH_ALL_GPUS_ID:
+                self.query_one("#fast-deploy-gpu-filter", Select).value = "any"
+                return
             if option_id in self._blocked:
                 self.app.push_screen(CatalogExclusionsScreen((self._blocked[option_id],)))
                 return
@@ -1032,6 +1045,9 @@ class FastDeployScreen(CopyEnabledScreen):
         model = self._model_by_id.get(option_id)
         if model is None or self._availability_inflight:
             return
+        # Opening a model leaves the building state; the initial-model path
+        # never renders the model list that would otherwise stop the spinner.
+        self._catalog_building = False
         self._selected_model = model
         self._placement_id = None
         # Hide the whole group: hiding only the input left its "Search" label
@@ -1042,27 +1058,31 @@ class FastDeployScreen(CopyEnabledScreen):
         self.query_one("#fast-deploy-title", Static).update(
             screen_title("Deploy", model.display_name, steps=DEPLOY_STEPS, current=1)
         )
-        self.query_one("#fast-deploy-status", Static).update(
-            "[dim]Checking live infrastructure across connected sources...[/dim]"
-        )
-        option_list = self.query_one("#fast-deploy-list", OptionList)
-        replace_options(option_list, 
-            [Option("  Checking live infrastructure...", disabled=True)]
-        )
-        self.query_one("#fast-deploy-detail", Static).update("")
-        option_list.focus()
-        self._phase = "loading"
-        if self._fetch_pending:
-            return
+        self._show_placement_loading()
+        self.query_one("#fast-deploy-list", OptionList).focus()
         if self._snapshot is not None:
             self._prepare_prices(self._snapshot)
-        else:
+        elif not self._fetch_pending:
             self._load_availability(purpose="infra")
+
+    def _offer_wait_label(self) -> str:
+        providers = ", ".join(provider.display_name for provider in self._pending_providers)
+        return f"Checking offers: {providers}…" if providers else "Checking live offers…"
+
+    def _show_placement_loading(self) -> None:
+        self._phase = "loading"
+        self._infra_rows = {}
+        replace_options(self.query_one("#fast-deploy-list", OptionList), [])
+        self.query_one("#fast-deploy-detail", Static).update("")
+        status = self._offer_wait_label() if self._fetch_pending or self._snapshot is None else "Pricing placements…"
+        self.query_one("#fast-deploy-status", Static).update(f"[dim]{status}[/dim]")
 
     def _load_availability(self, *, purpose: str, force_refresh: bool = False) -> None:
         self._availability_request_id += 1
         request_id = self._availability_request_id
         self._fetch_pending = True
+        self._pending_providers = ()
+        self._snapshot = None
         self._pricing_error = None
         self._pricing_pending = True
         self._availability_inflight = purpose == "infra"
@@ -1077,8 +1097,19 @@ class FastDeployScreen(CopyEnabledScreen):
         )
 
     def _run_load_availability(self, request_id: int, *, purpose: str = "infra", force_refresh: bool = False) -> None:
+        def publish(
+            snapshot: ComputeAvailabilitySnapshot,
+            pending: tuple[ComputeProvider, ...] = (),
+        ) -> None:
+            self.post_message(FastDeployAvailabilityLoaded(
+                snapshot,
+                request_id=request_id,
+                purpose=purpose,
+                pending_providers=pending,
+            ))
+
         try:
-            snapshot = load_compute_availability(force_refresh=True) if force_refresh else load_compute_availability()
+            snapshot = load_compute_availability(force_refresh=force_refresh, on_partial=publish)
         except Exception as exc:
             self.post_message(
                 FastDeployAvailabilityFailed(
@@ -1088,18 +1119,13 @@ class FastDeployScreen(CopyEnabledScreen):
                 )
             )
             return
-        self.post_message(
-            FastDeployAvailabilityLoaded(
-                snapshot,
-                request_id=request_id,
-                purpose=purpose,
-            )
-        )
+        publish(snapshot)
 
     def on_fast_deploy_availability_loaded(self, message: FastDeployAvailabilityLoaded) -> None:
         if message.request_id is not None and message.request_id != self._availability_request_id:
             return
-        self._fetch_pending = False
+        self._pending_providers = message.pending_providers
+        self._fetch_pending = bool(message.pending_providers)
         self._pricing_error = None
         if self._snapshot is not message.snapshot:
             self._gpu_choices = _gpu_filter_options(message.snapshot)
@@ -1107,12 +1133,15 @@ class FastDeployScreen(CopyEnabledScreen):
             self._shorter_contexts.clear()
         self._snapshot = message.snapshot
         self._populate_gpu_filter()
+        if self._phase == "loading" and self._fetch_pending:
+            self._show_placement_loading()
         self._prepare_prices(message.snapshot)
 
     def on_fast_deploy_availability_failed(self, message: FastDeployAvailabilityFailed) -> None:
         if message.request_id is not None and message.request_id != self._availability_request_id:
             return
         self._fetch_pending = False
+        self._pending_providers = ()
         self.workers.cancel_group(self, "fast-deploy-prices")
         self._show_pricing_error(message.error)
 
@@ -1205,12 +1234,8 @@ class FastDeployScreen(CopyEnabledScreen):
             self._load_availability(purpose="filter", force_refresh=True)
         elif self._selected_model is not None:
             self._remember_highlighted_placement()
-            self._phase = "loading"
-            self._infra_rows = {}
-            replace_options(self.query_one("#fast-deploy-list", OptionList), [
-                Option("  Refreshing infrastructure…", disabled=True),
-            ])
             self._load_availability(purpose="infra", force_refresh=True)
+            self._show_placement_loading()
         self.query_one("#fast-deploy-status", Static).update("[dim]Refreshing live offers…[/dim]")
 
     def _render_infra_from_snapshot(
@@ -1220,7 +1245,9 @@ class FastDeployScreen(CopyEnabledScreen):
     ) -> None:
         self._remember_highlighted_placement()
         full = model
-        prices = self._prices[full.id]
+        prices = self._prices.get(full.id)
+        if prices is None or full.id not in self._shorter_contexts:
+            return
         full_plan = prices.best_by_gpu.get(self._gpu_filter)
         full_cost = first_hour_cost_usd(full_plan.quote) if full_plan else None
         self._contexts = [full.max_context_tokens]
@@ -1247,6 +1274,9 @@ class FastDeployScreen(CopyEnabledScreen):
         selector.set_class(not show_context, "hidden")
         self.refresh_bindings()
         if self._context_tokens and self._context_tokens not in self._contexts:
+            if self._fetch_pending:
+                self._show_placement_loading()
+                return
             self._render_unavailable_placement("The previously chosen context has no priced placement. Press c to select full context.")
             return
         if self._placement_id is not None:
@@ -1255,6 +1285,9 @@ class FastDeployScreen(CopyEnabledScreen):
         rows = _filter_infra_rows(all_rows, self._gpu_filter)
         self._populate_gpu_filter(prices)
         if not rows:
+            if self._fetch_pending:
+                self._show_placement_loading()
+                return
             if all_rows and self._gpu_filter not in {"", "any"}:
                 self._render_empty_gpu_filter()
                 return
@@ -1262,9 +1295,10 @@ class FastDeployScreen(CopyEnabledScreen):
                 " ".join(("No priced placement fits at this context.", *dict.fromkeys(excluded[:2]), *snapshot.errors)),
             )
             return
+        self._infra_rows = {row.plan.quote.id: row for row in rows}
         self._phase = "infra"
         self._availability_inflight = False
-        self._infra_rows = {row.plan.quote.id: row for row in rows}
+        self.refresh_bindings()
         width_mode = self.viewport_profile.width_mode
         option_list = self.query_one("#fast-deploy-list", OptionList)
         tiers = () if self._show_all_placements else self._tiers_for(rows)
@@ -1308,13 +1342,8 @@ class FastDeployScreen(CopyEnabledScreen):
         prefix = "Full " if model is full and any(p.context_known for p in model.profiles) else ""
         context = prefix + escape(format_context_length(model.max_context_tokens))
         hidden = f" · {len(excluded)} hidden" if excluded else ""
-        if tiers:
-            status = f"[dim]{context}{hidden} · a: compare all {len(rows)}[/dim]"
-        else:
-            status = (
-                f"[dim]{len(rows)} placement{'s' if len(rows) != 1 else ''} · "
-                f"{context}{hidden} · a: tiers[/dim]"
-            )
+        count = f"{len(rows)} placement{'s' if len(rows) != 1 else ''}"
+        status = f"[dim]{count} · {context}{hidden}[/dim]"
         # Item four of the quality floor: a model that only fits below it is
         # still worth offering, but never without saying why.
         quality_note = (
@@ -1326,23 +1355,15 @@ class FastDeployScreen(CopyEnabledScreen):
             status += " [dim]· c context[/dim]"
         if quality_note:
             status += f"\n[$warning]{escape(quality_note)}[/$warning]"
-        # Hourly and 24/7 are what a deployment bills; the monthly figure on
-        # each row is an explicit scenario. It is not what the list is ordered
-        # by -- placements sort on their assessment, which the line above
-        # already calls "best full-context throughput first" -- so claiming a
-        # cost ordering here put two contradictory statements about the same
-        # list three lines apart, and the rows visibly disagreed with the one
-        # that named a price.
-        if self._gpu_filter not in {"", "any"}:
+        if self._gpu_filter != "any":
             status += f" [dim]· GPU {escape(self._gpu_filter)}[/dim]"
-        if not tiers:
-            # Only the full list carries a "/mo" column, and that number means
-            # nothing without the scenario it was computed under.
-            status += (
-                f"\n[dim]{escape(_plan_cost_evaluation(rows[0].plan).basis_label())}"
-                " · storage separate[/dim]"
-            )
-        if snapshot.vast_configured and not any(row.plan.quote.provider == ComputeProvider.VAST for row in rows):
+        if self._fetch_pending:
+            status += f"\n[dim]{escape(self._offer_wait_label())}[/dim]"
+        if (
+            snapshot.vast_configured
+            and ComputeProvider.VAST not in self._pending_providers
+            and not any(row.plan.quote.provider == ComputeProvider.VAST for row in rows)
+        ):
             # Unrentable offers are no longer listed, so this line is the only
             # thing distinguishing "Vast has nothing for you" from "Vast is
             # misconfigured".
@@ -1352,7 +1373,8 @@ class FastDeployScreen(CopyEnabledScreen):
                 "; ".join(snapshot.errors)
             )
         self.query_one("#fast-deploy-status", Static).update(status)
-        option_list.focus()
+        if self.focused is None:
+            option_list.focus()
 
     def _take_preferred_index(self, plans: Sequence[InferencePlan], *, default: int) -> int:
         """Index of the relaunch shape among ``plans``; applies only once."""
@@ -1386,8 +1408,8 @@ class FastDeployScreen(CopyEnabledScreen):
             else:
                 options.highlighted = None
                 self.query_one("#fast-deploy-detail", Static).update(
-                    "[$warning]Previous placement is no longer listed. "
-                    "Use ↑/↓ to choose another.[/]"
+                    "[dim]Checking the previous placement…[/]" if self._fetch_pending
+                    else "[$warning]Previous placement is no longer listed. Use ↑/↓ to choose another.[/]"
                 )
                 return None
         if index < 0:
@@ -1401,6 +1423,7 @@ class FastDeployScreen(CopyEnabledScreen):
         self._phase = "infra"
         self._availability_inflight = False
         self._infra_rows = {}
+        self.refresh_bindings()
         gpu = escape(self._gpu_filter)
         option_list = self.query_one("#fast-deploy-list", OptionList)
         replace_options(option_list, 
@@ -1418,6 +1441,7 @@ class FastDeployScreen(CopyEnabledScreen):
         self._phase = "infra"
         self._infra_rows = {}
         self._availability_inflight = False
+        self.refresh_bindings()
         options = self.query_one("#fast-deploy-list", OptionList)
         replace_options(options, [Option("  No current placement", disabled=True)])
         self.query_one("#fast-deploy-detail", Static).update(escape(reason or "Live pricing unavailable."))
@@ -1490,7 +1514,7 @@ class FastDeployScreen(CopyEnabledScreen):
                 self._initial_model_id = None
                 self._preferred_placement = None
             self._render_model_list(preferred_id=preferred_id or self._highlighted_model_id())
-            if self._snapshot is not None and not self._fetch_pending:
+            if self._snapshot is not None:
                 self._prepare_prices(self._snapshot)
 
         self.run_worker(apply, group="fast-deploy-catalog", exclusive=True)
@@ -1501,8 +1525,8 @@ class FastDeployScreen(CopyEnabledScreen):
         terms = self._model_search.casefold().split()
         if terms:
             visible = tuple(model for model in visible if _model_matches_query(model, terms))
-        if not terms and self._gpu_filter != "any" and self._snapshot is not None:
-            visible = tuple(m for m in visible if m.id not in self._prices or self._gpu_filter in self._prices[m.id].best_by_gpu)
+        if self._gpu_filter != "any":
+            visible = tuple(model for model in visible if self._best(model) is not None)
         if terms or not self._show_top_models:
             return visible
         scored = any(m.quality_score is not None for m in self._models)
@@ -1566,7 +1590,7 @@ class FastDeployScreen(CopyEnabledScreen):
             model_indices[model.id] = len(options)
             options.append(Option(_model_option(model, self.viewport_profile.width_mode, cost_label=cost), id=model.id))
         self._blocked = {}
-        if terms or not self._show_top_models:
+        if self._gpu_filter == "any" and (terms or not self._show_top_models):
             for row in self._catalog_info.exclusions:
                 if not _names_match((row.display_name, row.repo_id, row.model_id), terms):
                     continue
@@ -1589,7 +1613,7 @@ class FastDeployScreen(CopyEnabledScreen):
                 hint = "Try fewer words or edit the repository name."
             elif self._gpu_filter != "any":
                 prompt = f"No catalog models fit {escape(self._gpu_filter)}"
-                hint = "Press g and choose Any GPU to broaden the list."
+                hint = "Search all GPUs or press g to choose another GPU."
             elif self._show_top_models:
                 prompt = "No ready models at full context"
                 hint = "Press v or / to browse the catalog and check other contexts."
@@ -1598,7 +1622,12 @@ class FastDeployScreen(CopyEnabledScreen):
                 hint = ""
             options.append(Option(f"  {prompt}", disabled=True))
             self.query_one("#fast-deploy-detail", Static).update(hint)
+        show_all_gpus = self._gpu_filter != "any" and (terms or not model_indices)
+        if show_all_gpus:
+            options.append(Option("  Search all GPUs", id=_SEARCH_ALL_GPUS_ID))
         replace_options(option_list, options)
+        if show_all_gpus and not model_indices:
+            option_list.highlighted = len(options) - 1
         if model_indices:
             selected_id = preferred_id if preferred_id in model_indices else next(iter(model_indices))
             option_list.highlighted = model_indices[selected_id]
@@ -1616,8 +1645,8 @@ class FastDeployScreen(CopyEnabledScreen):
             view_label = "Top 10 by AA score"
         else:
             view_label = "Trending" if self._catalog_info.is_fallback else "Unranked"
-        if self._show_top_models and not terms:
-            view_label += " · ready" if self._snapshot is not None and not self._pricing_pending else " · checking placements"
+        if self._show_top_models and not terms and not (self._fetch_pending or self._pricing_pending):
+            view_label += " · ready" if self._snapshot is not None else ""
         total = len(model_indices)
         count_label = f"{total} model{'s' if total != 1 else ''}"
         filter_note = ""
@@ -1634,8 +1663,9 @@ class FastDeployScreen(CopyEnabledScreen):
             + ("\n[$warning]Partial results: " + escape("; ".join(self._snapshot.errors)) + "[/$warning]"
                if self._snapshot is not None and self._snapshot.errors else "")
             + (f"\n[$warning]{escape(self._pricing_error)}[/$warning]" if self._pricing_error else "")
-            + ("\n[dim]Pricing live placements…[/dim]"
-               if self._pricing_pending else "")
+            + (f"\n[dim]{escape(self._offer_wait_label())}[/dim]" if self._pending_providers
+               else "\n[dim]Pricing live placements…[/dim]"
+               if self._fetch_pending or self._pricing_pending else "")
             # A build that stopped early still publishes what it found. Saying
             # so is the difference between "nothing better exists" and "we ran
             # out of requests before we could look". Every way of not looking
@@ -1660,8 +1690,8 @@ class FastDeployScreen(CopyEnabledScreen):
         current = self._gpu_filter
         values = {value for _label, value in options}
         if current not in values:
-            if self._selected_model is not None:
-                # A disappeared offer must not silently switch the user's GPU.
+            if self._selected_model is not None or self._fetch_pending:
+                # Partial updates may not include the user's GPU yet.
                 options.append((current, current))
             else:
                 current = "any"

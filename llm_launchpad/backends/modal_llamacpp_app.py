@@ -17,6 +17,8 @@ from uuid import uuid4
 
 import modal
 
+from llm_launchpad.gguf_files import auxiliary_gguf_ignore_patterns, is_dspark_gguf, is_target_gguf
+
 
 # --- App configuration
 APP_NAME = os.environ.get("MODAL_APP_NAME", "llamacpp-server").strip() or "llamacpp-server"
@@ -332,11 +334,9 @@ def _fetch_expected_gguf_sizes(
     expected: dict[str, int] = {}
     for sibling in info.siblings or []:
         repo_path = str(getattr(sibling, "rfilename", "") or "").strip()
-        if not repo_path:
+        if not is_target_gguf(repo_path):
             continue
         filename = Path(repo_path).name
-        if Path(filename).suffix.casefold() != ".gguf":
-            continue
         if allow_patterns and not _matches_any_pattern(filename, allow_patterns):
             continue
         size = getattr(sibling, "size", None)
@@ -424,9 +424,7 @@ def _matched_snapshot_gguf_candidates(snapshot_dir: Path, allow_patterns: list[s
     for path in snapshot_dir.glob("**/*"):
         if not path.is_file():
             continue
-        if path.suffix.casefold() != ".gguf":
-            continue
-        if any(marker in path.name.casefold() for marker in ("mmproj", "imatrix", "draft", "eagle")):
+        if not is_target_gguf(path.relative_to(snapshot_dir).as_posix()):
             continue
         if allow_patterns and not _matches_any_pattern(path.name, allow_patterns):
             continue
@@ -523,19 +521,7 @@ def _gguf_allow_patterns(quant: str | None) -> list[str]:
 
 
 def _snapshot_gguf_candidates(snapshot_dir: Path, quant: str | None) -> list[Path]:
-    quant_folded = quant.casefold() if quant else None
-    candidates: list[Path] = []
-    for path in snapshot_dir.glob("**/*"):
-        if not path.is_file():
-            continue
-        if path.suffix.casefold() != ".gguf":
-            continue
-        if any(marker in path.name.casefold() for marker in ("mmproj", "imatrix", "draft", "eagle")):
-            continue
-        if quant_folded and quant_folded not in path.name.casefold():
-            continue
-        candidates.append(path)
-    return candidates
+    return _matched_snapshot_gguf_candidates(snapshot_dir, _gguf_allow_patterns(quant))
 
 
 def _raise_missing_gguf_match(
@@ -546,7 +532,7 @@ def _raise_missing_gguf_match(
     patterns = ", ".join(repr(pat) for pat in allow_patterns) if allow_patterns else "'*.gguf'"
     revision_text = f", revision={revision}" if revision else ""
     raise RuntimeError(
-        "No GGUF files matched the requested repo/quant for llama.cpp "
+        "No target-model GGUF files matched the requested repo/quant for llama.cpp "
         f"(repo_id={repo_id!r}, patterns=[{patterns}]{revision_text}). "
         "Use a GGUF repo and the correct quant name, or omit the quant filter."
     )
@@ -1087,6 +1073,7 @@ def _snapshot_download_with_keepalive(
         "revision": revision,
         "cache_dir": cache_dir,
         "allow_patterns": allow_patterns,
+        "ignore_patterns": auxiliary_gguf_ignore_patterns(),
         "max_workers": max_workers,
         "force_download": force_download,
     }
@@ -1100,6 +1087,7 @@ def _snapshot_download_with_keepalive(
         "revision=cfg.get('revision'),"
         "cache_dir=cfg['cache_dir'],"
         "allow_patterns=cfg['allow_patterns'],"
+        "ignore_patterns=cfg['ignore_patterns'],"
         "max_workers=cfg.get('max_workers', 8),"
         "force_download=cfg.get('force_download', False)"
         ")\n"
@@ -1324,11 +1312,12 @@ def _estimate_incomplete_blob_size(repo_id: str) -> tuple[int, int]:
     return total_bytes, file_count
 
 
-def _download_projector_file(
+def _download_exact_gguf(
     *,
     repo_id: str,
     revision: str | None,
     filename: str,
+    label: str,
     force_download: bool = False,
 ) -> str:
     """Download one file in a fresh process so transport env applies.
@@ -1347,7 +1336,7 @@ def _download_projector_file(
     worker_code = (
         "import json, os, sys\n"
         "from huggingface_hub import hf_hub_download\n"
-        "cfg = json.loads(os.environ['LLM_LAUNCHPAD_PROJECTOR_CFG'])\n"
+        "cfg = json.loads(os.environ['LLM_LAUNCHPAD_EXACT_GGUF_CFG'])\n"
         "try:\n"
         "    path = hf_hub_download("
         "repo_id=cfg['repo_id'],"
@@ -1365,7 +1354,7 @@ def _download_projector_file(
     def _attempt_env(*, disable_xet: bool) -> dict[str, str]:
         env = {
             **os.environ,
-            "LLM_LAUNCHPAD_PROJECTOR_CFG": json.dumps(payload),
+            "LLM_LAUNCHPAD_EXACT_GGUF_CFG": json.dumps(payload),
         }
         if disable_xet:
             env["HF_HUB_DISABLE_XET"] = "1"
@@ -1389,7 +1378,7 @@ def _download_projector_file(
         return completed.returncode, (completed.stdout or "").strip(), completed.stderr or ""
 
     env = _attempt_env(disable_xet=False)
-    print(f"🦙 downloading projector with transport={_describe_transport_env(env)}")
+    print(f"🦙 downloading {label} with transport={_describe_transport_env(env)}")
     returncode, stdout, stderr = _run(env)
     if returncode == 0 and stdout.splitlines():
         return stdout.splitlines()[-1].strip()
@@ -1397,37 +1386,50 @@ def _download_projector_file(
     last_line = stderr.strip().splitlines()[-1] if stderr.strip() else "unknown"
     if failure_kind is not None:
         raise RuntimeError(
-            f"Projector download failed ({failure_kind}): {last_line}"
+            f"{label} download failed ({failure_kind}): {last_line}"
         )
     if not _env_value_is_true(env.get("HF_HUB_DISABLE_XET")):
-        print("🦙 projector download failed over Xet; retrying once with HF_HUB_DISABLE_XET=1")
+        print(f"🦙 {label} download failed over Xet; retrying once with HF_HUB_DISABLE_XET=1")
         fallback_code, fallback_out, fallback_err = _run(_attempt_env(disable_xet=True))
         if fallback_code == 0 and fallback_out.splitlines():
             return fallback_out.splitlines()[-1].strip()
         fallback_last = fallback_err.strip().splitlines()[-1] if fallback_err.strip() else "unknown"
         raise RuntimeError(
-            f"Projector download failed with exit code {fallback_code} "
+            f"{label} download failed with exit code {fallback_code} "
             f"after retrying with HF_HUB_DISABLE_XET=1. Last error: {fallback_last}"
         )
-    raise RuntimeError(f"Projector download failed with exit code {returncode}. Last error: {last_line}")
+    raise RuntimeError(f"{label} download failed with exit code {returncode}. Last error: {last_line}")
+
+
+def _cache_exact_gguf(artifact: dict[str, Any], label: str) -> str:
+    repo, revision, filename = artifact["repo_id"], artifact["revision"], artifact["filename"]
+    with _acquire_download_lease(repo, revision, [filename]):
+        path = Path(_download_exact_gguf(repo_id=repo, revision=revision, filename=filename, label=label))
+        expected = artifact.get("size_bytes")
+        if expected and path.stat().st_size != expected:
+            path = Path(_download_exact_gguf(repo_id=repo, revision=revision, filename=filename, label=label, force_download=True))
+        if path.stat().st_size == 0 or (expected and path.stat().st_size != expected):
+            raise RuntimeError(f"{label} download has an unexpected size.")
+        with path.open("rb") as handle:
+            if handle.read(4) != b"GGUF":
+                raise RuntimeError(f"Downloaded {label} is not a GGUF file.")
+        model_cache.commit()
+        return str(path)
 
 
 @app.function(image=download_image, volumes={cache_dir: model_cache}, timeout=PREDOWNLOAD_TIMEOUT_MINUTES * MINUTES)
 def download_projector(artifact: dict[str, Any]) -> str:
     """Cache an exact projector revision independently of the model quant."""
-    repo, revision, filename = artifact["repo_id"], artifact["revision"], artifact["filename"]
-    with _acquire_download_lease(repo, revision, [filename]):
-        path = Path(_download_projector_file(repo_id=repo, revision=revision, filename=filename))
-        expected = artifact.get("size_bytes")
-        if expected and path.stat().st_size != expected:
-            path = Path(_download_projector_file(repo_id=repo, revision=revision, filename=filename, force_download=True))
-        if path.stat().st_size == 0 or (expected and path.stat().st_size != expected):
-            raise RuntimeError("Projector download has an unexpected size.")
-        with path.open("rb") as handle:
-            if handle.read(4) != b"GGUF":
-                raise RuntimeError("Downloaded projector is not a GGUF file.")
-        model_cache.commit()
-        return str(path)
+    return _cache_exact_gguf(artifact, "Projector")
+
+
+@app.function(image=download_image, volumes={cache_dir: model_cache}, timeout=PREDOWNLOAD_TIMEOUT_MINUTES * MINUTES)
+def download_dspark(artifact: dict[str, Any]) -> str:
+    """Cache a pinned DSpark draft independently of the main-model weights."""
+    filename = artifact["filename"]
+    if not is_dspark_gguf(filename) or Path(filename).is_absolute() or ".." in Path(filename).parts:
+        raise ValueError("DSpark draft must identify a GGUF in the selected revision.")
+    return _cache_exact_gguf(artifact, "DSpark draft")
 
 
 @app.function(
@@ -1624,6 +1626,22 @@ def _fit_relevant_args(server_args: list[str]) -> list[str]:
     return result
 
 
+def _dspark_fit_args(server_args: list[str], size_bytes: int) -> list[str]:
+    """Reserve the draft weights even when llama.cpp cannot measure its context."""
+    draft_mib = (size_bytes + 1024**2 - 1) // (1024**2)
+    args = list(server_args)
+    for index in range(len(args) - 1, -1, -1):
+        flag, separator, value = args[index].partition("=")
+        if flag in {"-fitt", "--fit-target"}:
+            target = value if separator else args[index + 1]
+            margins = ",".join(str(int(margin) + draft_mib) for margin in target.split(","))
+            args[index:index + (1 if separator else 2)] = ["--fit-target", margins]
+            return args
+    # llama.cpp's default margin is 1024 MiB on every device. The draft's
+    # largest per-device weight allocation is bounded by its total size.
+    return [*args, "--fit-target", str(1024 + draft_mib)]
+
+
 def _llama_server_runtime_env(server_bin: str) -> tuple[dict[str, str], str | None]:
     """Prepare env/cwd so official docker image shared libs resolve under Modal."""
     env = dict(os.environ)
@@ -1744,6 +1762,11 @@ def serve():
         print(f"🦙 using llama-server cwd: {server_cwd}")
 
     server_args = extra_server_args or DEFAULT_SERVER_ARGS
+    draft_path: str | None = None
+    if draft := cfg.get("dspark"):
+        draft_path = download_dspark.remote(draft)
+        print(f"🦙 using DSpark draft file: {draft_path}")
+        server_args = _dspark_fit_args(server_args, draft["size_bytes"])
     vision = cfg.get("vision") or {}
     projector_path: str | None = None
     if vision.get("enabled"):
@@ -1751,12 +1774,15 @@ def serve():
         if not projector:
             raise RuntimeError("Vision enabled without a resolved projector.")
         projector_path = download_projector.remote(projector)
+    if projector_path or draft_path:
         model_cache.reload()
 
     if WARM_VOLUME:
         warm_paths: list[Path | str] = [*_gguf_weight_paths(model_path)]
         if projector_path:
             warm_paths.append(projector_path)
+        if draft_path:
+            warm_paths.append(draft_path)
         marker_path: Path | None = None
         if _hub_snapshot_name(model_path) is not None or model_repo_id:
             marker_path = _hydration_marker_path(
@@ -1864,6 +1890,8 @@ def serve():
         command += ["--mmproj", projector_path]
     elif cfg.get("vision") is not None:
         command += ["--no-mmproj"]
+    if draft_path:
+        command += ["--spec-type", "draft-dspark", "--spec-draft-model", draft_path, "--spec-draft-ngl", "all"]
     command += server_args
 
     print("🦙 starting llama-server:")
@@ -1919,6 +1947,7 @@ def main(
     n_gpu_layers: int | None = None,
     serving_fingerprint: str | None = None,
     vision_json: str | None = None,
+    dspark_json: str | None = None,
     deploy: bool = False,
 ):
     """Configure, optionally preload weights, and optionally deploy the server.
@@ -1955,6 +1984,7 @@ def main(
         cfg.get("quant"),
     )
     cfg["vision"] = json.loads(vision_json) if vision_json else None
+    cfg["dspark"] = json.loads(dspark_json) if dspark_json else None
     cfg["host"] = host
     cfg["port"] = int(port)
     cfg["n_gpu_layers"] = n_gpu_layers if n_gpu_layers is not None else None
@@ -1971,6 +2001,8 @@ def main(
 
     if preload and (cfg.get("vision") or {}).get("projector"):
         download_projector.remote(cfg["vision"]["projector"])
+    if preload and cfg.get("dspark"):
+        download_dspark.remote(cfg["dspark"])
     if preload:
         allow_patterns = _gguf_allow_patterns(cfg.get("quant"))
         matches = download_model.remote(cfg["repo_id"], allow_patterns, cfg.get("revision"))

@@ -3,13 +3,16 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from llm_launchpad.core.job_runner import run_job
 from llm_launchpad.core.job_store import JobStatus, JobStore
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider, OperationType
 from llm_launchpad.protocol.events import LogEvent, OperationCompleteEvent, ResourceAllocatedEvent
 from llm_launchpad.protocol.models import DeploymentConfig
+from llm_launchpad.tui.app import TuiApp
+from llm_launchpad.tui.deployment_jobs import DeploymentJob
+from llm_launchpad.tui.workers import OperationDone
 
 
 def _config(name: str = "durable-app", *, do_warmup: bool = False) -> DeploymentConfig:
@@ -26,6 +29,33 @@ class DurableJobStoreTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.store = JobStore(Path(self.tmp.name) / "jobs.db")
+
+    def test_terminal_tail_replays_phase_results_before_finishing_the_monitor(self) -> None:
+        config = _config(do_warmup=True)
+        record = self.store.create_job(config)
+        self.store.append_event(record.id, OperationCompleteEvent(operation=OperationType.DEPLOY))
+        self.store.append_event(record.id, OperationCompleteEvent(operation=OperationType.WARMUP))
+        self.store.finish_job(record.id, JobStatus.SUCCEEDED, "Finished — open result")
+        monitor = Mock()
+        app = TuiApp()
+        job = DeploymentJob(id="replayed", config=config, monitor=monitor, persistent_id=record.id)
+        with (
+            patch.object(app, "_get_job_store", return_value=self.store),
+            patch.object(app, "_sync_finished_job"),
+            patch("llm_launchpad.core.runtime_health.record_explicit_health"),
+        ):
+            app._tail_persistent_job(job)
+
+        results = [
+            (message.operation, message.phase_only)
+            for call in monitor.post_message.call_args_list
+            if isinstance(message := call.args[0], OperationDone)
+        ]
+        self.assertEqual(results, [
+            (OperationType.DEPLOY, True),
+            (OperationType.WARMUP, True),
+            (OperationType.DEPLOY, False),
+        ])
 
     def tearDown(self) -> None:
         self.tmp.cleanup()

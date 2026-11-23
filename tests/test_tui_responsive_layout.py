@@ -10,7 +10,7 @@ from textual.containers import VerticalScroll
 from textual.geometry import Size
 from textual.screen import Screen
 from textual.widget import Widget
-from textual.widgets import Footer, Input, OptionList, Static
+from textual.widgets import Button, Footer, Input, OptionList, Static
 from textual.widgets._footer import FooterKey
 
 from llm_launchpad.core.compute_availability import aggregate_compute_availability
@@ -144,38 +144,27 @@ class ResponsiveLayoutTests(unittest.IsolatedAsyncioTestCase):
                     self.assertGreater(keys[0].region.width, 0)
                     self.assertEqual(keys[0].region.y, footer.region.bottom - 1)
 
-    async def test_main_menu_keeps_billing_visible_when_the_side_column_hides(self) -> None:
+    async def test_home_details_load_billing_and_home_keeps_only_the_fleet_summary(self) -> None:
         from llm_launchpad.tui.screens.main_menu import HomeDetailsScreen
 
         screen = MainMenuScreen(username="alice", version="1.0")
         app = _ScreenApp(screen)
-
         with (
             patch.object(MainMenuScreen, "on_mount", lambda self: None),
             patch.object(MainMenuScreen, "_refresh_provider_billing") as refresh_billing,
             patch.object(app, "cached_storage_snapshot", create=True, return_value=None) as cached,
         ):
-            async with app.run_test(size=(140, 45)) as pilot:
+            async with app.run_test(size=(80, 24)) as pilot:
                 await pilot.pause()
                 screen._show_deployments([])
-                side_column = screen.query_one("#main-menu-side-column")
-                billing_summary = screen.query_one("#compact-billing-summary", Static)
-                actions = screen.query_one("#action-list")
-                self.assertTrue(side_column.display)
-                self.assertFalse(billing_summary.display)
-
-                await pilot.resize_terminal(100, 30)
-                await pilot.pause()
-                self.assertFalse(side_column.display)
-                self.assertTrue(screen.query_one("#auth-status-block").display)
-                self.assertTrue(actions.display)
-                self.assertTrue(screen.query_one("#fleet-summary-line").display)
-                self.assertTrue(billing_summary.display)
-                self.assertIn("Modal", str(billing_summary.content))
+                summary = screen.query_one("#fleet-summary-line", Static)
+                self.assertIn("No active endpoints", str(summary.content))
+                refresh_billing.assert_not_called()
 
                 screen.action_toggle_details()
                 await pilot.pause()
                 self.assertIsInstance(app.screen, HomeDetailsScreen)
+                refresh_billing.assert_called_once_with()
                 billing = app.screen.query_one("#home-details-billing", Static)
                 self.assertIn("checking", str(billing.content))
                 modal_billing = ProviderBilling.ready(
@@ -193,36 +182,16 @@ class ResponsiveLayoutTests(unittest.IsolatedAsyncioTestCase):
                     )],
                     vllm_models=[],
                 )
-                screen._refresh_billing_panels()
-                refresh_billing.assert_called_once_with()
+                screen._sync_storage_snapshot()
                 self.assertIn("cache est. $0.18/mo · 1 TiB free", str(billing.content))
 
-                cached.return_value = StorageSnapshot(llamacpp_models=[], vllm_models=[])
                 await pilot.press("escape")
-                await pilot.pause()
-                self.assertIs(app.screen, screen)
-                self.assertIn("$3.25", str(billing_summary.content))
-                self.assertIn("cache est. $0.00/mo · 1 TiB free", str(billing_summary.content))
-
-                for size in ((80, 24), (80, 22), (50, 35), (40, 12), (120, 16), (200, 15)):
+                for size in ((80, 24), (50, 35), (40, 12), (140, 45)):
                     with self.subTest(size=size):
                         await pilot.resize_terminal(*size)
-                        await pilot.pause()
-                        self.assertFalse(side_column.display)
-                        self.assertTrue(billing_summary.display)
-                        self.assertGreater(billing_summary.region.height, 0)
-                        self.assertTrue(
-                            screen.find_widget(billing_summary).clip.contains_region(billing_summary.region)
-                        )
-                        self.assertFalse(actions.region.intersection(billing_summary.region))
-
-                await pilot.resize_terminal(140, 45)
-                await pilot.pause()
-                self.assertTrue(side_column.display)
-                self.assertFalse(billing_summary.display)
-                wide_billing = str(screen.query_one("#billing-report-body", Static).content)
-                self.assertIn("$3.25", wide_billing)
-                self.assertIn("cache est. $0.00/mo · 1 TiB free", wide_billing)
+                        self.assertTrue(summary.display)
+                        self.assertFalse(screen.query("#home-details-billing"))
+                        self.assertTrue(screen.find_widget(summary).clip.contains_region(summary.region))
 
     async def test_navigation_main_menu_fits_supported_viewports(self) -> None:
         await self._assert_screen_fits_supported_viewports(
@@ -292,12 +261,29 @@ class ResponsiveLayoutTests(unittest.IsolatedAsyncioTestCase):
                 }))
                 self.post_message(OperationDone(OperationType.DEPLOY, success=True))
 
-        # The 40x12 floor keeps a 3-row log viewport under a 10-row stack of
-        # header + toolbar + progress + card; that last row is the floor's
-        # documented tradeoff, not a regression (the card scrolls internally).
-        await self._assert_screen_fits_supported_viewports(
-            CompletedMonitor(), exclude_sizes={(40, 12)}
-        )
+        await self._assert_screen_fits_supported_viewports(CompletedMonitor())
+
+        screen = CompletedMonitor()
+        app = _ScreenApp(screen)
+        async with app.run_test(size=(80, 24)) as pilot:
+            await pilot.pause()
+            card = screen.query_one("#connection-card", VerticalScroll)
+            body = screen.query_one("#connection-card-body", Static)
+            for widget in (body, *card.query(Button)):
+                self.assertTrue(widget.display)
+                self.assertTrue(screen.find_widget(widget).clip.contains_region(widget.region))
+            self.assertIn("org/example", str(body.content))
+            self.assertEqual(screen.focused.id, "connection-done-btn")
+            self.assertFalse(screen.log_viewer.display)
+            stages = screen.query_one("#deploy-progress-stages", Static)
+            self.assertFalse(stages.display)
+
+            await pilot.press("l")
+            self.assertTrue(screen.log_viewer.display)
+            self.assertIs(screen.focused, screen.log_viewer.log_widget)
+            await pilot.press("l")
+            self.assertFalse(screen.log_viewer.display)
+            self.assertEqual(screen.focused.id, "connection-done-btn")
 
     async def test_setup_fits_supported_viewports(self) -> None:
         await self._assert_screen_fits_supported_viewports(SetupRequiredScreen())
@@ -459,22 +445,17 @@ class ResponsiveLayoutTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
 
                 header = screen.query_one("#compact-menu-header", Static)
-                help_text = screen.query_one("#compact-menu-help", Static)
                 summary = screen.query_one("#fleet-summary-line", Static)
-                billing_summary = screen.query_one("#compact-billing-summary", Static)
-                auth = screen.query_one("#auth-status-block", Static)
                 footer = screen.query_one(Footer)
 
                 self.assertTrue(header.display)
-                self.assertTrue(help_text.display)
                 self.assertTrue(summary.display)
                 # A tall phone has the rows for the key hints; only a short one
                 # (the on-screen keyboard open) gives them up.
                 self.assertTrue(footer.display)
-                self.assertLessEqual(summary.region.y - help_text.region.bottom, 2)
-                self.assertLessEqual(billing_summary.region.y - summary.region.bottom, 2)
-                self.assertLessEqual(auth.region.y - billing_summary.region.bottom, 2)
-                self.assertLess(auth.region.y, screen.region.height // 2)
+                actions = screen.query_one("#action-list", OptionList)
+                self.assertLessEqual(summary.region.y - actions.region.bottom, 2)
+                self.assertLess(summary.region.y, screen.region.height // 2)
 
                 await pilot.resize_terminal(55, 18)
                 await pilot.pause()

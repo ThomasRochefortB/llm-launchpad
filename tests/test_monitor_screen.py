@@ -8,8 +8,8 @@ from textual.app import App
 from textual.screen import Screen
 from textual.widgets import Button, Input, Log, Static
 
-from llm_launchpad.protocol.enums import BackendType, DeploymentState, OperationType
-from llm_launchpad.tui.deploy_log_summary import SUMMARY_SPINNER_FRAMES
+from llm_launchpad.protocol.enums import BackendType, ComputeProvider, DeploymentState, OperationType
+from llm_launchpad.protocol.models import DeploymentConfig
 from llm_launchpad.tui.screens.monitor import MonitorScreen, _connection_copy_text
 from llm_launchpad.tui.widgets.log_viewer import (
     MAX_RETAINED_LOG_LINES,
@@ -391,7 +391,7 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             await pilot.pause()
 
             content = "\n".join(screen.log_viewer.log_widget.lines)
-            self.assertIn("Preparing deployment", content)
+            self.assertIn("Start server", str(screen.query_one("#deploy-progress-stages", Static).render()))
             self.assertIn("warming", content)
             self.assertIn("Starting server", content)
             self.assertNotIn("vLLM API server version", content)
@@ -816,22 +816,14 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             downloading = [line for line in lines if "Downloading model" in line]
             self.assertEqual(len(downloading), 1)
             self.assertIn("(32%)", downloading[0])
-            self.assertTrue(
-                downloading[0].startswith(tuple(f"{frame} " for frame in SUMMARY_SPINNER_FRAMES))
-            )
-            preparing = [line for line in lines if "Preparing deployment" in line]
-            self.assertEqual(preparing, ["✓ Preparing deployment"])
+            self.assertTrue(downloading[0].startswith("· "))
+            detail = str(screen.query_one("#deploy-progress-detail", Static).render())
+            self.assertIn("━━━", detail)
+            self.assertIn("32%", detail)
+            self.assertNotIn("Preparing deployment", "\n".join(lines))
             self.assertIn("✓ Machine ready", lines)
 
-    async def test_a_concurrent_done_milestone_does_not_freeze_the_spinner(self) -> None:
-        """A Prime deploy polls the tunnel and the runtime at the same time.
-
-        "Secure endpoint connected" therefore arrives while the container
-        image is still being built. The spinner was chosen by taking the last
-        step-or-done row and marking it only if it was a step, so that done
-        milestone removed the spinner entirely: every row took a tick and a
-        build with twenty minutes left to run looked like a finished deploy.
-        """
+    async def test_tunnel_readiness_does_not_complete_the_concurrent_image_build(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:
             app.push_screen(
@@ -840,6 +832,7 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
                     deploy_backend=BackendType.LLAMACPP,
                     summarize_backend_logs=True,
                     show_debug_logs=False,
+                    deployment_config=DeploymentConfig(provider=ComputeProvider.PRIME),
                 )
             )
             await pilot.pause()
@@ -857,10 +850,9 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             lines = list(screen.log_viewer.log_widget.lines)
             building = [line for line in lines if "Building container image" in line]
             self.assertEqual(len(building), 1)
-            self.assertTrue(
-                building[0].startswith(tuple(f"{frame} " for frame in SUMMARY_SPINNER_FRAMES)),
-                building,
-            )
+            self.assertTrue(building[0].startswith("· "))
+            title = str(screen.query_one("#deploy-progress-title", Static).render())
+            self.assertIn("Building container image", title)
             # The tunnel really is connected; only the build is still running.
             self.assertIn("✓ Secure endpoint connected", lines)
 

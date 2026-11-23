@@ -241,9 +241,6 @@ class JobsApp(TuiApp):
     def on_mount(self) -> None:
         self.push_screen(Screen())
 
-    def _deploy_endpoint_url(self, config: DeploymentConfig, observed_url: str | None) -> str | None:
-        return observed_url
-
 
 async def wait_until(predicate) -> None:
     async with asyncio.timeout(5):

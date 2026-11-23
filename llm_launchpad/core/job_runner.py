@@ -26,7 +26,6 @@ from ..protocol.events import (
 )
 from ..protocol.models import DeploymentConfig, EndpointInfo
 from .diagnostics import log_exception
-from .resource_targeting import NAME_ADDRESSABLE_PROVIDERS as _NAME_ADDRESSABLE_PROVIDERS_UNUSED  # noqa: F401  (compat re-export)
 
 if TYPE_CHECKING:
     from .job_store import JobStore
@@ -415,16 +414,6 @@ def _run_attempt_phases(
         outcome.failure_detail if outcome and outcome.failure_detail
         else "Deployment failed."
     )
-
-
-# Providers whose teardown is addressed by name. `modal app stop` takes the app
-# name, and a Vast destroy resolves its rental from the record it persisted
-# under that name -- so for these the name is the handle and no allocation
-# event has to arrive first. Prime is the exception: termination genuinely
-# needs a pod id, and it emits one the moment the pod exists.
-# Canonical addressing lives in core.resource_targeting; the name below stays
-# importable for backwards compatibility while callers migrate.
-_NAME_ADDRESSABLE_PROVIDERS = _NAME_ADDRESSABLE_PROVIDERS_UNUSED
 
 
 def _stop_target(

@@ -56,7 +56,10 @@ _DONE_MILESTONES = {
     "Server is ready!",
     "Endpoint published",
     "Model cached",
+    "Cached weights read",
+    "Model loaded",
     "Machine ready",
+    "Server listening",
     "Runtime ready",
     "Secure endpoint connected",
     "GPU allocated",
@@ -413,6 +416,8 @@ class DeployLogSummarizer:
             return self._emit_once("Waiting for readiness")
         if text.startswith("Waiting for GPU scheduling"):
             return [text]
+        if text.startswith(("Verifying tool calling", "Verifying image input", "Tool calling verified")):
+            return self._emit_once(text)
         if text in {"GPU allocated; continuing readiness probe.", "GPU allocated; continuing readiness probe"}:
             return self._emit_once("GPU allocated")
         if text == "Server is ready!":
@@ -668,6 +673,8 @@ class DeployLogSummarizer:
         return None
 
     def _map_llamacpp_line(self, text: str) -> str | None:
+        if "dflash requires ctx_other to be set (this warning is normal during memory fitting)" in text:
+            return "Warning: Draft context unavailable during memory fitting"
         if "cache hit:" in text:
             return "Loading cached model"
         if "cache miss" in text or "acquired download lease" in text:
@@ -684,6 +691,10 @@ class DeployLogSummarizer:
             return None
         if "using model file:" in text:
             return "Loading cached model"
+        if "volume warm in progress" in text or ("warming " in text and " volume file(s)" in text):
+            return "Reading cached weights"
+        if "volume warm complete:" in text:
+            return "Cached weights read"
         if "starting llama-server:" in text:
             return "Starting server"
         if text.startswith("ggml_cuda_init:") or text.startswith("load_backend:"):
@@ -702,6 +713,8 @@ class DeployLogSummarizer:
             return "Warming up model"
         if text.startswith("main: model loaded"):
             return "Model loaded"
+        if text.startswith("main: server is listening"):
+            return "Server listening"
         return None
 
     def _map_vllm_line(self, text: str) -> str | None:

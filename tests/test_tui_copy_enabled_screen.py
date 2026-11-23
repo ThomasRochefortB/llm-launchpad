@@ -71,11 +71,6 @@ class _InputFallbackScreen(CopyEnabledScreen):
         self.query_one("#copy-input", Input).focus()
 
 
-class _NoCopyFallbackScreen(CopyEnabledScreen):
-    def compose(self) -> ComposeResult:
-        yield Static("Nothing focusable/copyable here")
-
-
 class _CopyTestApp(App[None]):
     pass
 

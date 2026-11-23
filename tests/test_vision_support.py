@@ -770,6 +770,8 @@ class ProjectorDiscoveryTests(unittest.TestCase):
             _sibling("mmproj-Q8_0.gguf"),
             _sibling("imatrix-Q4_K_M.gguf"),
             _sibling("draft-Q4_0.gguf"),
+            _sibling("dspark-DeepSeek-V4.1-Flash-1017-Q8_0.gguf"),
+            _sibling("engram/DeepSeek-V4.1-Flash-1017-Q5_K.gguf"),
         ]
         self.assertEqual(hf_models._extract_gguf_quantizations(siblings), ["Q4_K_M"])
 

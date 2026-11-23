@@ -157,7 +157,8 @@ def _quick_deploy_catalog_cache_path() -> Path:
 
 
 QUICK_DEPLOY_CATALOG_CACHE_TTL = timedelta(hours=6)
-QUICK_DEPLOY_CATALOG_CACHE_SCHEMA_VERSION = 13
+# Older profiles could treat auxiliary GGUFs as main-model weights.
+QUICK_DEPLOY_CATALOG_CACHE_SCHEMA_VERSION = 14
 _MODEL_SIZE_LABELS: dict[ModelSizeBucket, str] = {
     "compact": "Compact ≤40B",
     "medium": "Medium 40–150B",

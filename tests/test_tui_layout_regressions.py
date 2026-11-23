@@ -755,7 +755,14 @@ class SetupScreenTests(unittest.IsolatedAsyncioTestCase):
                         "\n".join(rendered[:3]),
                         f"the screen opened scrolled past its title at {size}",
                     )
-                    self.assertIn("Option 1", "\n".join(rendered))
+                    for provider, command in (
+                        ("Modal", "modal setup"),
+                        ("Prime Intellect", "prime login"),
+                        ("Vast.ai", "llm-launchpad vast-auth login"),
+                    ):
+                        status = next(index for index, row in enumerate(rendered) if f"{provider} · Checking" in row)
+                        self.assertIn("Copy", rendered[status])
+                        self.assertIn(command, rendered[status + 1])
 
     async def test_the_recheck_button_still_takes_focus(self) -> None:
         from llm_launchpad.tui.screens.setup import SetupRequiredScreen
@@ -901,12 +908,10 @@ class MainMenuFitTests(unittest.IsolatedAsyncioTestCase):
             }
             self.assertEqual("Manage", prompts["manage"].strip())
 
-    async def test_the_status_panel_uses_the_column_instead_of_scrolling(self) -> None:
-        """It was capped at 14 rows and scrolled its own content while the
-        rows directly beneath it stayed blank."""
+    async def test_full_fleet_details_are_available_from_home(self) -> None:
         from llm_launchpad.protocol.enums import BackendType, ComputeProvider
         from llm_launchpad.protocol.models import EndpointInfo
-        from llm_launchpad.tui.screens.main_menu import _render_deployment_status
+        from llm_launchpad.tui.screens.main_menu import HomeDetailsScreen
 
         rows = [
             EndpointInfo(
@@ -921,15 +926,14 @@ class MainMenuFitTests(unittest.IsolatedAsyncioTestCase):
         app = _StyledApp()
         async with app.run_test(size=(140, 45)) as pilot:
             screen = await self._menu(pilot, app, (140, 45))
-            screen.query_one("#deployment-status-body", Static).update(
-                _render_deployment_status(rows, username="review")
-            )
+            screen._show_deployments(rows)
             await pilot.pause()
-            panel = screen.query_one("#deployment-status-panel")
-            self.assertGreater(panel.region.height, 14)
+            self.assertNotIn("llp-modal-a", "\n".join(_rendered_lines(app)))
+            await pilot.press("i")
+            self.assertIsInstance(app.screen, HomeDetailsScreen)
             rendered = "\n".join(_rendered_lines(app))
-            for instance in ("a", "b"):
-                self.assertIn(f"llp-{'modal' if instance == 'a' else 'prime'}-{instance}", rendered)
+            self.assertIn("llp-modal-a", rendered)
+            self.assertIn("llp-prime-b", rendered)
 
 
 if __name__ == "__main__":

@@ -9,6 +9,8 @@ import struct
 from typing import Any
 from urllib.parse import quote
 
+from ..gguf_files import is_target_gguf
+
 
 GGUF_METADATA_CHUNK_BYTES = 1024 * 1024
 GGUF_METADATA_MAX_BYTES = 32 * 1024 * 1024
@@ -31,7 +33,6 @@ _GGUF_SCALAR_SIZES = {
 _GGUF_STRING = 8
 _GGUF_ARRAY = 9
 _CONTENT_RANGE_RE = re.compile(r"^bytes\s+(\d+)-(\d+)/(?:\d+|\*)$", re.IGNORECASE)
-_AUXILIARY_GGUF_MARKERS = ("mmproj", "imatrix", "dspark", "draft", "eagle")
 
 
 class GgufMtpStatus(str, Enum):
@@ -97,13 +98,7 @@ def select_target_gguf_file(siblings: Any, quant: str | None = None) -> str | No
             filename = str(sibling.get("rfilename", "") or "").strip()
         else:
             filename = str(getattr(sibling, "rfilename", "") or "").strip()
-        if not filename or not filename.casefold().endswith(".gguf"):
-            continue
-        lowered = filename.casefold()
-        path_parts = tuple(part for part in lowered.split("/") if part)
-        if any(marker in lowered for marker in _AUXILIARY_GGUF_MARKERS):
-            continue
-        if any(part == "mtp" or part.startswith("mtp-") for part in path_parts):
+        if not is_target_gguf(filename):
             continue
         candidates.append(filename)
     if not candidates:

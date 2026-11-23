@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
 from dataclasses import replace
 from types import SimpleNamespace
 import threading
@@ -10,7 +11,7 @@ from unittest.mock import patch
 from rich.cells import cell_len
 from textual.content import Content
 from textual.app import App
-from textual.widgets import Input, OptionList, Static
+from textual.widgets import Input, OptionList, Select, Static
 
 from llm_launchpad.core import quick_deploy
 from llm_launchpad.core.compute_availability import aggregate_compute_availability
@@ -247,6 +248,61 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(app.quick_deploy_calls), 2)
                 self.assertNotEqual(app.quick_deploy_calls[-1][0].quote.id, selected)
 
+    async def test_partial_placement_is_selectable_and_stays_highlighted(self) -> None:
+        model = _model((_profile("fits", required_vram_gb=8.0),))
+        modal_catalog = [ModalGpuSpec("L4", price_per_hour_usd=0.8)]
+        initial = aggregate_compute_availability(modal_catalog=modal_catalog)
+        final = aggregate_compute_availability(
+            modal_catalog=modal_catalog + [ModalGpuSpec("B200", price_per_hour_usd=0.5)],
+        )
+        release_first = threading.Event()
+        release_last = threading.Event()
+
+        def load(
+            *, force_refresh: bool,
+            on_partial: Callable[[ComputeAvailabilitySnapshot, tuple[ComputeProvider, ...]], None],
+        ) -> ComputeAvailabilitySnapshot:
+            release_first.wait(5)
+            on_partial(initial, (ComputeProvider.PRIME,))
+            release_last.wait(5)
+            return final
+
+        app = _StyledApp()
+        with (
+            patch("llm_launchpad.tui.screens.fast_deploy.list_quick_deploy_models", return_value=(model,)),
+            patch("llm_launchpad.tui.screens.fast_deploy.load_compute_availability", side_effect=load),
+        ):
+            async with app.run_test(size=(80, 24)) as pilot:
+                try:
+                    screen = FastDeployScreen()
+                    await app.push_screen(screen)
+                    await pilot.press("enter")
+                    self.assertFalse(screen.check_action("choose_selected", ()))
+
+                    release_first.set()
+                    for _ in range(80):
+                        await pilot.pause()
+                        if screen._phase == "infra":
+                            break
+                    self.assertTrue(screen._fetch_pending)
+                    self.assertTrue(screen.check_action("choose_selected", ()))
+                    status = screen.query_one("#fast-deploy-status", Static)
+                    self.assertIn("Checking offers: Prime Intellect", str(status.content))
+                    options = screen.query_one("#fast-deploy-list", OptionList)
+                    selected = options.highlighted_option.id
+                    await pilot.press("enter")
+                    self.assertEqual(app.quick_deploy_calls[-1][0].quote.id, selected)
+
+                    release_last.set()
+                    await screen.workers.wait_for_complete()
+                    await pilot.pause()
+                    self.assertFalse(screen._fetch_pending)
+                    self.assertEqual(options.highlighted_option.id, selected)
+                    self.assertNotIn("Checking offers", str(status.content))
+                finally:
+                    release_first.set()
+                    release_last.set()
+
     async def test_no_price_is_quoted_until_live_placements_answer(self) -> None:
         """The catalog estimate is Modal's list rate, priced at build time.
 
@@ -259,7 +315,7 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
         info = QuickDeployCatalogInfo(source_label="test")
         released = threading.Event()
 
-        def _slow_availability() -> ComputeAvailabilitySnapshot:
+        def _slow_availability(**_kwargs: object) -> ComputeAvailabilitySnapshot:
             released.wait(5)
             return aggregate_compute_availability()
 
@@ -307,7 +363,7 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
         model = _model((_profile("available", required_vram_gb=8.0),))
         info = QuickDeployCatalogInfo(source_label="test")
 
-        def _broken_availability() -> ComputeAvailabilitySnapshot:
+        def _broken_availability(**_kwargs: object) -> ComputeAvailabilitySnapshot:
             raise RuntimeError("no providers reachable")
 
         app = _StyledApp()
@@ -611,12 +667,7 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(alternatives), 2)
         self.assertEqual(alternatives[0].quote.id, selected.quote.id)
 
-    async def test_infra_status_states_what_the_monthly_column_measures(self) -> None:
-        """Every "/mo" here is a workload estimate, not wall-clock.
-
-        Unqualified, a provisioned rental's figure reads as the cost of
-        leaving it up, which is roughly three times larger.
-        """
+    async def test_selected_placement_explains_its_monthly_estimate(self) -> None:
         model = _model((_profile("fits", required_vram_gb=100.0),))
         snapshot = aggregate_compute_availability(
             modal_catalog=[ModalGpuSpec("H100", price_per_hour_usd=4.0)]
@@ -638,9 +689,12 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 await screen.workers.wait_for_complete()
                 await pilot.pause()
 
-                status = str(screen.query_one("#fast-deploy-status", Static).content)
-                self.assertIn(f"'{COST_SCENARIO_WORKDAY.display_name}'", status)
-                self.assertIn("idle timeout", status)
+                detail = str(screen.query_one("#fast-deploy-detail", Static).content)
+                choices = screen.query_one("#fast-deploy-list", OptionList)
+                self.assertIn("/mo", detail)
+                self.assertIn(f"'{COST_SCENARIO_WORKDAY.display_name}'", detail)
+                self.assertIn("idle timeout", detail)
+                self.assertNotIn("/mo", str(choices.highlighted_option.prompt))
 
     async def test_step_one_and_step_two_advertise_only_their_own_keys(self) -> None:
         """Search and the exclusions list belong to step one, compare-all to step two.
@@ -946,7 +1000,7 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
         started = threading.Event()
         release = threading.Event()
 
-        def fake_load() -> object:
+        def fake_load(**_kwargs: object) -> object:
             started.set()
             release.wait(timeout=5)
             return snapshot
@@ -1091,24 +1145,21 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(gpu_type, option_values)
 
         app = _TestApp()
-        with patch(
-            "llm_launchpad.tui.screens.fast_deploy.list_quick_deploy_models",
-            return_value=(small, huge),
+        with (
+            patch("llm_launchpad.tui.screens.fast_deploy.list_quick_deploy_models", return_value=(small, huge)),
+            patch("llm_launchpad.tui.screens.fast_deploy.load_compute_availability", return_value=snapshot),
         ):
             async with app.run_test() as pilot:
-                app.push_screen(FastDeployScreen())
+                screen = FastDeployScreen()
+                await app.push_screen(screen)
+                for _ in range(80):
+                    await pilot.pause()
+                    if len(screen._prices) == 2 and not screen._pricing_pending:
+                        break
+                selector = screen.query_one("#fast-deploy-gpu-filter", Select)
+                selector.value = gpu_type
                 await pilot.pause()
-
-                screen = app.screen
-                assert isinstance(screen, FastDeployScreen)
-                screen.on_fast_deploy_availability_loaded(
-                    FastDeployAvailabilityLoaded(snapshot, purpose="filter")
-                )
-                await screen.workers.wait_for_complete()
-                await pilot.pause()
-                screen._gpu_filter = gpu_type
-                screen._render_model_list()
-                await pilot.pause()
+                self.assertEqual(screen._gpu_filter, gpu_type)
 
                 option_list = screen.query_one("#fast-deploy-list", OptionList)
                 ids = [
@@ -1120,6 +1171,14 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(screen._highlighted_model_id(), "small-fit")
                 status = str(screen.query_one("#fast-deploy-status", Static).renderable)
                 self.assertIn(gpu_type, status)
+
+                await pilot.press("/", "h", "u", "g", "e")
+                self.assertEqual(screen._gpu_filter, gpu_type)
+                self.assertNotIn("huge-fit", [row.id for row in option_list.options])
+                self.assertIn("Search all GPUs", str(option_list.highlighted_option.prompt))
+                await pilot.press("enter")
+                self.assertEqual(selector.value, "any")
+                self.assertIn("huge-fit", [row.id for row in option_list.options])
 
     async def test_model_list_uses_live_cheapest_price_when_snapshot_loaded(self) -> None:
         model = _model((_profile("fits", required_vram_gb=100.0),))

@@ -20,6 +20,7 @@ import os
 import threading
 import time
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
@@ -161,26 +162,6 @@ def _tmux_passthrough_sequence(text: str) -> str:
 
 def _screen_passthrough_sequence(text: str) -> str:
     return f"\x1bP{_osc_52_sequence(text)}\x1b\\"
-
-
-def _defers_completion_footer(
-    event: OperationCompleteEvent,
-    *,
-    config: DeploymentConfig,
-    will_run_warmup: bool,
-) -> bool:
-    """Whether this completion is not the end of the user's operation.
-
-    The footer says "Operation complete/failed" and offers to return, which is
-    wrong while the same monitor session carries on: a successful
-    deploy that warmup follows, and a failed deploy that a fallback placement
-    answers. The failure reason is already on screen as its own error line.
-    """
-    if event.operation != OperationType.DEPLOY:
-        return False
-    if event.success:
-        return will_run_warmup
-    return bool(config.fallback_configs)
 
 
 class AbandonedDeploymentsChecked(Message):
@@ -923,6 +904,7 @@ class TuiApp(App):
             deploy_backend=config.backend,
             summarize_backend_logs=True,
             show_debug_logs=config.show_debug_logs,
+            deployment_config=config,
         )
         job = DeploymentJob(
             id=f"deploy-{uuid4().hex}", config=config, monitor=monitor, persistent_id=persistent.id
@@ -990,13 +972,16 @@ class TuiApp(App):
             if record is None:
                 break
             try:
+                record = store.get_job(job.persistent_id)
+                if record is None:
+                    return
                 events = store.get_events(job.persistent_id, after_seq=job.last_seen_seq)
             except Exception:
                 break
             for stored in events:
                 job.last_seen_seq = max(job.last_seen_seq, stored.seq)
                 try:
-                    dispatch(job.monitor, stored.event)
+                    dispatch(job.monitor, stored.event, phase_only=True)
                 except Exception:
                     pass
                 if isinstance(stored.event, EndpointAvailableEvent):
@@ -1033,9 +1018,12 @@ class TuiApp(App):
             if record.cancel_requested:
                 job.cancel_requested.set()
             if record.terminal:
+                if events and job.last_seen_seq < record.event_count:
+                    continue
                 with self._deployment_lock:
                     job.accepting_cancellation = False
                     job.finished.set()
+                self._finish_persistent_monitor(job, record)
                 if record.status == "succeeded":
                     self._post_connection_card_for_record(job, record, store)
                     self._sync_finished_job(job, record)
@@ -1073,6 +1061,7 @@ class TuiApp(App):
             deploy_backend=record.config.backend,
             summarize_backend_logs=True,
             show_debug_logs=record.config.show_debug_logs,
+            deployment_config=record.config,
         )
         job = DeploymentJob(
             id=f"deploy-{uuid4().hex}",
@@ -1082,13 +1071,13 @@ class TuiApp(App):
             outcome=record.outcome,
         )
         try:
-            stored_events = store.get_events(persistent_id)
+            stored_events = store.get_events(persistent_id, limit=max(5000, record.event_count))
         except Exception:
             stored_events = []
         for stored in stored_events:
             job.last_seen_seq = max(job.last_seen_seq, stored.seq)
             try:
-                dispatch(monitor, stored.event)
+                dispatch(monitor, stored.event, phase_only=True)
             except Exception:
                 pass
         if record.terminal:
@@ -1103,15 +1092,26 @@ class TuiApp(App):
                 name=f"{job.id}-tail",
                 thread=True,
             )
-        elif record.status == "succeeded":
-            # Finished while the TUI was closed: restore the connection card
-            # and sync once, off the UI thread.
-            self._post_connection_card_for_record(job, record, store)
-            self.run_worker(
-                lambda: self._sync_finished_job(job, record),
-                name=f"{job.id}-sync",
-                thread=True,
-            )
+        else:
+            self._finish_persistent_monitor(job, record)
+            if record.status == "succeeded":
+                self._post_connection_card_for_record(job, record, store)
+                self.run_worker(
+                    lambda: self._sync_finished_job(job, record),
+                    name=f"{job.id}-sync",
+                    thread=True,
+                )
+
+    def _finish_persistent_monitor(self, job: DeploymentJob, record: JobRecord) -> None:
+        """Finish only after the durable job has published its final outcome."""
+        success = record.status == "succeeded"
+        detail = record.outcome.removeprefix("Failed — check resource in Manage.").strip()
+        _dispatch_event(job.monitor, OperationCompleteEvent(
+            operation=OperationType.DEPLOY,
+            success=success,
+            detail="" if success else detail,
+            timestamp=datetime.fromtimestamp(record.updated_at) if record.updated_at else datetime.now(),
+        ))
 
     def _post_connection_card_for_record(self, job: DeploymentJob, record: JobRecord, store: JobStore) -> None:
         """Restore the connection card (copy buttons, Done-home) from a durable result."""
@@ -1390,11 +1390,7 @@ class TuiApp(App):
                     self._invalidate_endpoint_snapshot()
                 if event.success and isinstance(event.data, EndpointInfo):
                     deployed_endpoint = event.data
-                if _defers_completion_footer(
-                    event, config=config, will_run_warmup=will_run_warmup
-                ):
-                    return
-            _dispatch_event(monitor, event)
+            _dispatch_event(monitor, event, phase_only=True)
 
         def _on_credentials(
             saved: DeploymentConfig, url: str | None, endpoint: EndpointInfo | None
@@ -1497,6 +1493,15 @@ class TuiApp(App):
                 on_credentials=_on_credentials,
             ),
         )
+        last_outcome = result.attempts[-1] if result.attempts else None
+        _dispatch_event(monitor, OperationCompleteEvent(
+            operation=OperationType.DEPLOY,
+            success=result.succeeded,
+            exit_code=(last_outcome.failure_exit_code or 0) if last_outcome else 0,
+            detail="" if result.succeeded else (
+                last_outcome.failure_detail if last_outcome and last_outcome.failure_detail else result.outcome
+            ),
+        ))
         if not result.succeeded and result.attempts:
             last = result.attempts[-1]
             if last.retry_allowed and len(result.attempts) < len(attempts):

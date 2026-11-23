@@ -10,6 +10,7 @@ import time
 from dataclasses import dataclass, replace
 from typing import Any, Literal
 
+from ..gguf_files import is_target_gguf
 from .coerce import optional_str, positive_int
 from .diagnostics import log_debug
 from .gguf_metadata import (
@@ -115,7 +116,7 @@ _QUANT_PATTERN = re.compile(
     r"(?i)(?<![a-z0-9])((?:UD[-_])?(?:IQ[1-4]_(?:XXS|XS|S|M|NL)|Q[2-8]_(?:K(?:_[MSXL]+)?|0|1)))(?![a-z0-9])"
 )
 _HARDWARE_QUANT_LABEL_RE = re.compile(
-    r"(?i)(?<![a-z0-9])((?:UD[-_])?(?:IQ[1-4]_(?:XXS|XS|S|M|NL)|Q[2-8]_(?:K(?:_[MSXL]+)?|0|1))|MXFP4(?:_MOE)?|BF16|F16)(?![a-z0-9])"
+    r"(?i)(?<![a-z0-9])((?:DSPARK\s+)?(?:(?:UD[-_])?(?:IQ[1-4]_(?:XXS|XS|S|M|NL)|Q[2-8]_(?:K(?:_[MSXL]+)?|0|1))|MXFP4(?:_MOE)?|BF16|F16))(?![a-z0-9])"
 )
 _MEMORY_PATTERN = re.compile(r"(?i)^\s*([0-9]+(?:\.[0-9]+)?)\s*([KMGTP]?I?B)?\s*$")
 _MEMORY_SEARCH_PATTERN = re.compile(r"(?i)([0-9]+(?:\.[0-9]+)?)\s*([KMGTP]?I?B)")
@@ -657,6 +658,17 @@ def fetch_gguf_quant_metadata(
     except HubModelPageUnavailable as exc:
         page_failure = exc
     page_quantizations, page_vram_gb_by_quant = _extract_quantizations_and_vram_from_quantization_data(page_quant_data)
+    # Model-page and Hub API tables can include quant labels from add-ons.
+    target_quants: set[str] = set()
+    auxiliary_quants: set[str] = set()
+    for filename in _gguf_filenames(siblings):
+        labels = target_quants if is_target_gguf(filename) else auxiliary_quants
+        labels.update(_normalize_quant_label(label) for label in _HARDWARE_QUANT_LABEL_RE.findall(filename))
+    auxiliary_only = auxiliary_quants - target_quants
+    page_quantizations = [quant for quant in page_quantizations if quant not in auxiliary_only]
+    for quant in auxiliary_only:
+        page_vram_gb_by_quant.pop(quant, None)
+        vram_gb_by_quant.pop(quant, None)
     if page_quantizations:
         quantizations = page_quantizations
     if page_vram_gb_by_quant:
@@ -801,15 +813,17 @@ def _has_tag(tags: Any, expected: str) -> bool:
     return expected in lowered
 
 
-def _extract_gguf_quantizations(siblings: Any) -> list[str]:
+def _gguf_filenames(siblings: Any) -> list[str]:
     if not isinstance(siblings, list):
         return []
+    filenames = [str(getattr(sibling, "rfilename", "")).strip() for sibling in siblings]
+    return [filename for filename in filenames if filename.casefold().endswith(".gguf")]
+
+
+def _extract_gguf_quantizations(siblings: Any) -> list[str]:
     detected: set[str] = set()
-    for sibling in siblings:
-        filename = str(getattr(sibling, "rfilename", "")).strip()
-        if not filename or not filename.lower().endswith(".gguf"):
-            continue
-        if any(marker in filename.casefold() for marker in ("mmproj", "imatrix", "draft", "eagle")):
+    for filename in _gguf_filenames(siblings):
+        if not is_target_gguf(filename):
             continue
         for match in _QUANT_PATTERN.findall(filename):
             detected.add(_normalize_quant_label(match))
@@ -1010,7 +1024,7 @@ def _extract_quantizations_and_vram_from_quantization_data(quantization_data: An
             if not isinstance(variant, dict):
                 continue
             label = _normalize_quant_label(variant.get("label"))
-            if not label:
+            if not label or label.startswith("DSPARK "):
                 continue
             if label not in seen:
                 seen.add(label)

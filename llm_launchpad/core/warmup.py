@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any
 from collections.abc import Generator
 from urllib.parse import urlsplit
 
+from ..gguf_files import is_target_gguf
 from ..protocol.enums import (
     BackendType,
     ComputeProvider,
@@ -68,6 +69,14 @@ _MODAL_GPU_WAIT_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _MODAL_RELAX_RE = re.compile(r"Relaxing requirements \((?P<requirements>[^)]+)\)", flags=re.IGNORECASE)
+_LLAMACPP_CONTEXT_LOAD_FAILURE_RE = re.compile(
+    r"\bsrv\s+load_model:\s+failed to create_context with model ['\"](?P<path>.+?\.gguf)['\"]",
+    re.IGNORECASE,
+)
+_LLAMACPP_AUXILIARY_MODEL_FAILURE = (
+    "llama.cpp could not load the selected GGUF as the main model. "
+    "Choose a main-model quantization."
+)
 
 # A serving plan the placement cannot hold is rejected identically on every
 # container restart, so waiting out the readiness timeout only replays the same
@@ -75,6 +84,7 @@ _MODAL_RELAX_RE = re.compile(r"Relaxing requirements \((?P<requirements>[^)]+)\)
 # llama.cpp's, which names the guard it aborted at rather than the cause.
 _TERMINAL_STARTUP_MARKERS = (
     "llama.cpp rejected the full-context GPU-only serving plan",
+    "No target-model GGUF files matched the requested repo/quant for llama.cpp",
 )
 
 
@@ -223,6 +233,14 @@ def modal_gpu_scheduling_hint(response_text: str) -> str | None:
     if not parts:
         return "Waiting for GPU scheduling"
     return f"Waiting for GPU scheduling ({', '.join(parts)})"
+
+
+def _recent_modal_scheduling_hint(app_name: str, started_at: float) -> str | None:
+    """Read scheduling messages that the live log stream may have missed."""
+    for line in reversed(ModalBackend.recent_system_logs(app_name, started_at)):
+        if hint := modal_gpu_scheduling_hint(line):
+            return hint
+    return None
 
 
 def probe_response_is_ready(backend: BackendType, status_code: int, body: str) -> tuple[bool, str | None]:
@@ -671,10 +689,12 @@ class WarmupRunner:
         price_per_hour_usd: float | None = None,
     ) -> EventStream:
         """Probe endpoint readiness and optionally tail logs."""
+        start = time.time()
         yield StateChangeEvent(
             current=DeploymentState.WARMING_UP,
             operation=OperationType.WARMUP,
             detail=f"Probing {server_url}",
+            timeout_seconds=timeout,
         )
 
         is_vllm = backend == BackendType.VLLM
@@ -724,11 +744,56 @@ class WarmupRunner:
         headers = {"Content-Type": "application/json"}
         if api_key:
             headers["Authorization"] = f"Bearer {api_key}"
-        start = time.time()
         backoff = 2.0
         max_backoff = 30.0
         last_err: str | None = None
         last_scheduling_hint: str | None = None
+        next_system_log_check = start + 20
+        unrecoverable: str | None = None
+        draft_context_error = False
+        managed_dspark = False
+
+        def report_scheduling(hint: str | None) -> EventStream:
+            nonlocal last_scheduling_hint
+            if hint and hint != last_scheduling_hint:
+                last_scheduling_hint = hint
+                yield StateChangeEvent(
+                    current=DeploymentState.QUEUED,
+                    operation=OperationType.WARMUP,
+                    detail=hint,
+                )
+                yield LogEvent(line=hint, operation=OperationType.WARMUP)
+
+        def live_logs() -> EventStream:
+            nonlocal unrecoverable, draft_context_error, managed_dspark
+            for event in log_tail.drain():
+                line = event.line
+                if tail_modal_logs:
+                    yield from report_scheduling(modal_gpu_scheduling_hint(line))
+                yield event
+                if backend == BackendType.LLAMACPP:
+                    managed_dspark |= "using DSpark draft file:" in line or "--spec-type draft-dspark" in line
+                    draft_context_error |= "dflash requires ctx_other to be set" in line
+                    failed_load = _LLAMACPP_CONTEXT_LOAD_FAILURE_RE.search(line)
+                    if (
+                        failed_load and not is_target_gguf(failed_load["path"].rsplit("/", 1)[-1])
+                    ) or (
+                        draft_context_error and not managed_dspark and "exiting due to model loading error" in line
+                    ):
+                        unrecoverable = _LLAMACPP_AUXILIARY_MODEL_FAILURE
+                if unrecoverable is None:
+                    unrecoverable = terminal_startup_failure(line)
+                measured = calibration.observe(line)
+                if measured is not None:
+                    yield LogEvent(
+                        line=(
+                            "Recorded llama.cpp's own measurement: "
+                            f"{measured.graph_gb:.1f} GB of graph memory per GPU "
+                            f"(measured on {measured.gpu_count}x {measured.gpu_type})."
+                        ),
+                        operation=OperationType.WARMUP,
+                    )
+
         while True:
             # Exit promptly if the app is shutting down.
             if is_shutting_down():
@@ -744,29 +809,14 @@ class WarmupRunner:
 
             # Drain log lines delivered by the reader thread, watching for a
             # startup failure that every restart will reproduce.
-            unrecoverable: str | None = None
-            for event in log_tail.drain():
-                yield event
-                line = getattr(event, "line", "")
-                measured = calibration.observe(line)
-                if measured is not None:
-                    yield LogEvent(
-                        line=(
-                            "Recorded llama.cpp's own measurement: "
-                            f"{measured.graph_gb:.1f} GB of graph memory per GPU"
-                            f" (measured on {measured.gpu_count}x {measured.gpu_type})."
-                        ),
-                        operation=OperationType.WARMUP,
-                    )
-                if unrecoverable is None:
-                    unrecoverable = terminal_startup_failure(line)
+            yield from live_logs()
             if unrecoverable is not None:
                 log_tail.stop("on unrecoverable startup failure")
                 yield from fail_operation(
                     OperationType.WARMUP,
                     unrecoverable,
                     recoverable=False,
-                    detail="",
+                    detail=unrecoverable,
                 )
                 return
 
@@ -854,27 +904,8 @@ class WarmupRunner:
                     last_err = f"HTTP {resp.status_code} (not ready): {readiness_reason}; body={body[:200]}"
                 else:
                     last_err = f"HTTP {resp.status_code}: {body[:200]}"
-                scheduling_hint = modal_gpu_scheduling_hint(body)
-                if scheduling_hint:
-                    if scheduling_hint != last_scheduling_hint:
-                        yield StateChangeEvent(
-                            current=DeploymentState.QUEUED,
-                            operation=OperationType.WARMUP,
-                            detail=scheduling_hint,
-                        )
-                        yield LogEvent(line=scheduling_hint, operation=OperationType.WARMUP)
-                        last_scheduling_hint = scheduling_hint
-                elif last_scheduling_hint is not None:
-                    yield StateChangeEvent(
-                        current=DeploymentState.WARMING_UP,
-                        operation=OperationType.WARMUP,
-                        detail="GPU allocated; continuing readiness probe",
-                    )
-                    yield LogEvent(
-                        line="GPU allocated; continuing readiness probe.",
-                        operation=OperationType.WARMUP,
-                    )
-                    last_scheduling_hint = None
+                if provider == ComputeProvider.MODAL:
+                    yield from report_scheduling(modal_gpu_scheduling_hint(body))
                 if (
                     tail_logs
                     and provider == ComputeProvider.PRIME
@@ -892,6 +923,10 @@ class WarmupRunner:
             except Exception as exc:
                 last_err = str(exc)
 
+            if tail_modal_logs and last_scheduling_hint is None and time.time() >= next_system_log_check:
+                yield from report_scheduling(_recent_modal_scheduling_hint(target_app_name, start))
+                next_system_log_check = time.time() + 30
+
             # Sleep in small increments, draining the log queue between
             # each chunk so that lines appear in the TUI promptly.
             sleep_end = time.time() + backoff
@@ -901,7 +936,9 @@ class WarmupRunner:
                 chunk = min(0.5, sleep_end - time.time())
                 if chunk > 0:
                     shutdown_event().wait(timeout=chunk)
-                yield from log_tail.drain()
+                yield from live_logs()
+                if unrecoverable is not None:
+                    break
             backoff = min(max_backoff, backoff * 1.5)
 
 

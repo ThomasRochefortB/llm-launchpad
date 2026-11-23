@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+from itertools import count
 import types
 import unittest
 from unittest.mock import patch
 
 from llm_launchpad.core.orchestrator import Orchestrator
-from llm_launchpad.core.warmup import fetch_historical_logs
+from llm_launchpad.core.warmup import WarmupRunner, fetch_historical_logs
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider, DeploymentState, OperationType
 from llm_launchpad.protocol.events import ErrorEvent, LogEvent, OperationCompleteEvent, StateChangeEvent
 
@@ -365,6 +366,36 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
                 for e in events
             )
         )
+
+    def test_warmup_uses_modal_system_logs_when_probes_do_not_report_capacity(self) -> None:
+        responses = iter([_Response(503, "starting")] * 2 + [_Response(200, "ok")])
+        requests = types.SimpleNamespace(get=lambda *_args, **_kwargs: next(responses))
+        timer = count(step=10)
+        system_log = "Function 'serve' is waiting to be scheduled on a GPU_L4 worker."
+        with (
+            patch.dict("sys.modules", {"requests": requests}),
+            patch("llm_launchpad.core.warmup._ModalLogTail") as tail,
+            patch("llm_launchpad.core.warmup.time.time", side_effect=lambda: next(timer)),
+            patch("llm_launchpad.core.warmup.ModalBackend.test_curl_command", return_value="curl ok"),
+            patch("llm_launchpad.core.backend.subprocess.run") as run,
+        ):
+            tail.return_value.may_attach.return_value = False
+            run.return_value = types.SimpleNamespace(returncode=0, stdout=system_log)
+            events = list(WarmupRunner().run(
+                backend=BackendType.VLLM,
+                server_url="https://example.modal.run",
+                app_name="vllm-test",
+                timeout=180,
+            ))
+
+        run.assert_called_once()
+        self.assertEqual(run.call_args.args[0][-4:-1], ["--source", "system", "--since"])
+        status = [e for e in events if isinstance(e, StateChangeEvent)]
+        self.assertEqual(
+            [e.current for e in status],
+            [DeploymentState.WARMING_UP, DeploymentState.QUEUED, DeploymentState.HEALTHY],
+        )
+        self.assertIn("GPU_L4", status[1].detail)
 
     def test_warmup_prime_skips_modal_log_tail_and_fallback(self) -> None:
         """Prime warmups must never launch Modal log tailing or its fallback."""

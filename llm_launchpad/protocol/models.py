@@ -148,6 +148,16 @@ class ProjectorArtifact:
     size_bytes: int | None = None
 
 
+@dataclass(frozen=True)
+class DSparkDraft:
+    """A revision-pinned draft GGUF for a llama.cpp serving model."""
+
+    repo_id: str
+    revision: str
+    filename: str
+    size_bytes: int
+
+
 @dataclass
 class VisionCapabilities:
     """Model evidence and effective deployment image input state."""
@@ -524,6 +534,10 @@ class DeploymentConfig:
     # treats None as "decide from the GGUF and the pinned runtime" so MTP is on
     # wherever it is supported, and this flag is the only way to say no.
     allow_speculative_decoding: bool = True
+    dspark: bool = False
+    dspark_repo: str | None = None
+    dspark_file: str | None = None
+    dspark_draft: DSparkDraft | None = None
     serving_requirements: ServingRequirements | None = None
     runtime_tuning: RuntimeTuning | None = None
     placement_assessment: PlacementAssessment | None = None
@@ -602,6 +616,9 @@ class LlamacppRequestOptions:
     llamacpp_runtime_id: str | None = None
     speculative_decoding: SpeculativeDecodingConfig | None = None
     allow_speculative_decoding: bool = True
+    dspark: bool = False
+    dspark_repo: str | None = None
+    dspark_file: str | None = None
 
 
 @dataclass(frozen=True)

@@ -211,11 +211,6 @@ def _reset_quick_deploy_catalog_cache() -> None:
         _CATALOG_CACHE = None
 
 
-def format_hourly_cost(value: float) -> str:
-    """Render approximate hourly pricing for UI copy."""
-    return f"~${value:.2f}/hr"
-
-
 def format_context_length(value: int) -> str:
     """Render a token context length for UI copy."""
     return f"{value:,} ctx"
@@ -677,6 +672,9 @@ def request_from_config(config: DeploymentConfig) -> DeploymentRequest:
             llamacpp_runtime_id=config.llamacpp_runtime_id,
             speculative_decoding=config.speculative_decoding,
             allow_speculative_decoding=config.allow_speculative_decoding,
+            dspark=config.dspark,
+            dspark_repo=config.dspark_repo,
+            dspark_file=config.dspark_file,
         ),
         vllm=VllmRequestOptions(
             model_name=config.model_name,
@@ -735,6 +733,9 @@ def config_from_request(
     config.llamacpp_runtime_id = llamacpp.llamacpp_runtime_id
     config.speculative_decoding = llamacpp.speculative_decoding
     config.allow_speculative_decoding = llamacpp.allow_speculative_decoding
+    config.dspark = llamacpp.dspark
+    config.dspark_repo = llamacpp.dspark_repo
+    config.dspark_file = llamacpp.dspark_file
     vllm = request.vllm
     config.model_name = vllm.model_name
     config.model_revision = vllm.model_revision

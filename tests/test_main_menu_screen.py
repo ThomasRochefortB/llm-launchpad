@@ -337,18 +337,11 @@ class ProviderBillingWiringTests(unittest.TestCase):
             screen._apply_auth_to_billing(ComputeProvider.PRIME, False)
         self.assertEqual(screen._provider_billing[ComputeProvider.PRIME].amount_usd, 12.0)
 
-    def test_authenticating_starts_a_read_once_the_deferred_pass_has_begun(self) -> None:
+    def test_authentication_refreshes_billing_only_through_the_details_guard(self) -> None:
         screen = self._screen()
-        with patch.object(screen, "_refresh_provider_billing") as refresh:
+        with patch.object(screen, "_refresh_billing_panels") as refresh:
             screen._apply_auth_to_billing(ComputeProvider.PRIME, True)
         refresh.assert_called_once_with()
-
-    def test_auth_before_first_paint_does_not_jump_the_deferred_pass(self) -> None:
-        """Billing stays deferred so the first paint is not held up by it."""
-        screen = MainMenuScreen(username="alice")
-        with patch.object(screen, "_refresh_provider_billing") as refresh:
-            screen._apply_auth_to_billing(ComputeProvider.PRIME, True)
-        refresh.assert_not_called()
 
     def test_a_settled_pass_lets_the_next_one_start(self) -> None:
         screen = self._screen()

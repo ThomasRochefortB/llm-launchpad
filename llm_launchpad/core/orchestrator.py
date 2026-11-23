@@ -372,7 +372,7 @@ class Orchestrator:
 
     def deploy(self, config: DeploymentConfig) -> EventStream:
         """Run a full deploy workflow (optional preload + deploy + warmup)."""
-        from .deployment_preflight import preflight_config
+        from .deployment_preflight import preflight_config, resolve_dspark_draft
 
         preflight = preflight_config(config)
         blocking = [finding for finding in preflight.findings if finding.blocking]
@@ -440,7 +440,21 @@ class Orchestrator:
                     line=f"Compatibility preflight warning: {detail} Continuing unverified.",
                     operation=OperationType.DEPLOY,
                 )
-            yield from self._prepare_llamacpp_speculative_decoding(config)
+            if config.dspark or config.dspark_repo or config.dspark_file:
+                try:
+                    config.dspark_draft = resolve_dspark_draft(config)
+                except Exception as exc:
+                    yield from fail_operation(
+                        OperationType.DEPLOY, f"DSpark preflight failed: {exc}", exit_code=2, recoverable=False,
+                    )
+                    return
+                config.speculative_decoding = None
+                yield LogEvent(
+                    line=f"DSpark draft: {config.dspark_draft.filename} ({config.dspark_draft.size_bytes / 1e9:.2f} GB).",
+                    operation=OperationType.DEPLOY,
+                )
+            else:
+                yield from self._prepare_llamacpp_speculative_decoding(config)
             if config.serving_requirements is not None:
                 if (
                     config.placement_assessment is not None

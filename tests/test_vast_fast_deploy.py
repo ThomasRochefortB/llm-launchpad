@@ -14,19 +14,16 @@ from llm_launchpad.core.vast_auth import VastCredentials
 from llm_launchpad.core.vast_backend import VastApiError, parse_vast_offer, vast_offer_search_payload
 from llm_launchpad.core.quick_deploy import quick_deploy_profile_for_plan
 from llm_launchpad.core.vast_comparison import (
-    _vast_row_sort_key,
     vast_offers_for_model,
     vast_plan_for_offer,
 )
 from llm_launchpad.core.vast_startup_history import (
     machine_startup_stats,
-    rank_vast_offers_by_startup,
     record_vast_startup,
 )
 
 
 from llm_launchpad.core.serving_tiers import serving_tiers
-from llm_launchpad.core.vast_comparison import vast_offers_for_model as _comparison_rows
 from llm_launchpad.protocol.enums import ComputeProvider, ServingObjective
 from llm_launchpad.protocol.models import MemoryEstimate, RuntimeTuning, ServingRequirements, VastOffer, VastOfferQuery
 from llm_launchpad.tui.screens.fast_deploy import (
@@ -35,11 +32,6 @@ from llm_launchpad.tui.screens.fast_deploy import (
 )
 from tests.test_fast_deploy_screen import _model, _profile, _StyledApp
 from tests.test_vast_backend import offer_payload
-
-
-def _rows_with_history(offers: tuple, history: dict) -> list:
-    rows = list(_comparison_rows(comparison_model(), offers))
-    return sorted(rows, key=lambda row: _vast_row_sort_key(row, history))
 
 
 def comparison_model(*, weights: float = 8, total: float = 14) -> QuickDeployModel:
@@ -256,25 +248,6 @@ class VastModelComparisonTests(unittest.TestCase):
         keyed = sorted(rows, key=lambda row: sort_key(row, history))
         self.assertEqual([row.offer.id for row in keyed], ["1002", "1001"])
 
-    def test_same_price_row_prefers_measured_fast_host(self) -> None:
-        import time
-
-        cheap_fast = vast_offer(id=1001, machine_id=42)
-        cheap_slow = vast_offer(id=1002, machine_id=43)
-        history = {
-            "43": [
-                {
-                    "observed_at_epoch": time.time(),
-                    "offer_id": "1002",
-                    "ssh_seconds": 120.0,
-                    "healthy_seconds": 300.0,
-                    "failed": False,
-                }
-            ]
-        }
-        ranked = rank_vast_offers_by_startup([cheap_fast, cheap_slow], history)
-        self.assertEqual([offer.id for offer in ranked], ["1002", "1001"])
-
     def test_failed_machine_loses_its_evidence(self) -> None:
         import json
         import tempfile
@@ -299,14 +272,6 @@ class VastModelComparisonTests(unittest.TestCase):
             )
             history = json.loads(history_path.read_text())
         self.assertIsNone(machine_startup_stats(history, "m-1"))
-
-    def test_offer_ranking_keeps_price_order_without_evidence(self) -> None:
-        cheap = vast_offer(id=1001, machine_id=42, dph_total=0.2)
-        pricey = vast_offer(id=1002, machine_id=43, dph_total=0.4)
-        self.assertEqual(
-            [offer.id for offer in rank_vast_offers_by_startup([pricey, cheap], {})],
-            ["1002", "1001"],
-        )
 
 
 class VastAvailabilityTests(unittest.TestCase):

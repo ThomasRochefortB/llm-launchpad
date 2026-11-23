@@ -1069,6 +1069,10 @@ class QuickDeployRefreshTests(unittest.TestCase):
             ):
                 self.assertEqual(load_cached_quick_deploy_catalog(), cached)
 
+            envelope["schema_version"] = 13
+            cache_path.write_text(json.dumps(envelope), encoding="utf-8")
+            self.assertIsNone(_read_quick_deploy_catalog_cache(cache_path))
+
 
 class _HubStatusError(Exception):
     def __init__(self, status_code: int) -> None:

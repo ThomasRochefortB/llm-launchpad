@@ -118,23 +118,6 @@ def revision_refusal(provider: ComputeProvider, backend: BackendType) -> str | N
     )
 
 
-def connected_providers(
-    *,
-    modal_available: bool,
-    prime_authenticated: bool,
-    vast_configured: bool,
-) -> tuple[ComputeProvider, ...]:
-    """List providers with usable credentials, in stable presentation order."""
-    connected = []
-    if modal_available:
-        connected.append(ComputeProvider.MODAL)
-    if prime_authenticated:
-        connected.append(ComputeProvider.PRIME)
-    if vast_configured:
-        connected.append(ComputeProvider.VAST)
-    return tuple(connected)
-
-
 def deployment_lister(provider: ComputeProvider) -> Callable[[], list[EndpointInfo] | None]:
     """Return the callable that lists one provider's deployments.
 
