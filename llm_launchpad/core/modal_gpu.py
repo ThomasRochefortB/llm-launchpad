@@ -67,9 +67,26 @@ def modal_gpu_supports_fast_deploy(gpu_type: str) -> bool:
     return gpu_type.upper() not in {"B300", "B200+"}
 
 
+# Modal's GPU guide documents up to 8 GPUs per container for B300, B200, H200,
+# H100, A100, L4, T4, and L40S, and up to 4 for A10. RTX-PRO-6000 is omitted
+# from the 8-GPU list and 8-GPU requests stall waiting for scheduling capacity.
+_MODAL_FOUR_GPU_MAX: Final[frozenset[str]] = frozenset({"A10", "RTX-PRO-6000"})
+
+# Modal schedules multi-GPU containers on power-of-two slices of 4- and 8-GPU
+# hosts; non-power-of-two requests (3, 5, 6, 7) are accepted at deploy time
+# but stall indefinitely in the scheduler.
+_MODAL_GPU_COUNT_LADDER: Final[tuple[int, ...]] = (1, 2, 4, 8)
+
+
 def modal_gpu_count_limit(gpu_type: str) -> int:
     """Maximum cards per Modal container for a known GPU type."""
-    return 4 if gpu_type.upper() == "A10" else 8
+    return 4 if gpu_type.upper() in _MODAL_FOUR_GPU_MAX else 8
+
+
+def modal_gpu_count_options(gpu_type: str) -> tuple[int, ...]:
+    """Supported card counts per Modal container for a known GPU type."""
+    limit = modal_gpu_count_limit(gpu_type)
+    return tuple(count for count in _MODAL_GPU_COUNT_LADDER if count <= limit)
 
 
 @dataclass(frozen=True)

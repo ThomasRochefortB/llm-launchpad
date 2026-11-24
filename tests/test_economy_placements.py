@@ -55,6 +55,60 @@ def test_modal_a10_capacity_is_limited_to_four_cards():
     assert _select_gpu_shape("Q4_K_M", 120, [ModalGpuSpec("A10", 1)]) is None
 
 
+def test_modal_rtx_pro_6000_is_limited_to_four_cards_and_fewer_gpus_wins_close_cost():
+    snapshot = aggregate_compute_availability(modal_catalog=[ModalGpuSpec("RTX-PRO-6000", 3.0312)])
+    placement, = snapshot.configurations[0].placements
+    assert placement.gpu_count_max == 4
+    from llm_launchpad.core.quick_deploy_refresh import _select_gpu_shape
+
+    # 8x RTX-PRO-6000 is not offered; 4x B200 is selected instead.
+    assert _select_gpu_shape("UD-Q4_K_XL", 604.0, [ModalGpuSpec("RTX-PRO-6000", 3.0312)]) is None
+    selected = _select_gpu_shape(
+        "UD-Q4_K_XL",
+        604.0,
+        [ModalGpuSpec("RTX-PRO-6000", 3.0312), ModalGpuSpec("B200", 6.2496)],
+    )
+    assert selected is not None
+    assert (selected.gpu_type, selected.gpu_count) == ("B200", 4)
+
+    # Even among 8-card-capable GPUs, a 4-GPU shape within 5% of an 8-GPU
+    # shape's hourly price wins to avoid multi-GPU scheduling stalls.
+    close_cost = _select_gpu_shape(
+        "Q4_K_M",
+        250.0,
+        [ModalGpuSpec("A100-80GB", 2.0), ModalGpuSpec("B200", 4.15)],
+    )
+    assert close_cost is not None
+    assert (close_cost.gpu_type, close_cost.gpu_count) == ("B200", 2)
+
+
+def test_modal_gpu_count_options_uses_power_of_two_slices():
+    from llm_launchpad.core.modal_gpu import modal_gpu_count_options
+    from llm_launchpad.core.quick_deploy_refresh import _select_gpu_shape
+
+    assert modal_gpu_count_options("A100-80GB") == (1, 2, 4, 8)
+    assert modal_gpu_count_options("H200") == (1, 2, 4, 8)
+    assert modal_gpu_count_options("RTX-PRO-6000") == (1, 2, 4)
+    assert modal_gpu_count_options("A10") == (1, 2, 4)
+
+    # A 336 GiB model + 17.07 GiB per-device graph used to pick 6x A100-80GB
+    # ($14.99/hr), which stalls on Modal's scheduler. Power-of-two slicing
+    # skips 6x A100-80GB and picks 4x H200 ($18.16/hr) over 8x A100-80GB ($19.99/hr).
+    selected = _select_gpu_shape(
+        "UD-IQ1_M",
+        352.97,
+        [
+            ModalGpuSpec("A100-80GB", 2.4984),
+            ModalGpuSpec("H200", 4.5396),
+            ModalGpuSpec("B200", 6.2496),
+        ],
+        per_device_overhead_gb=17.074,
+        layer_count=40,
+    )
+    assert selected is not None
+    assert (selected.gpu_type, selected.gpu_count) == ("H200", 4)
+
+
 def test_changed_or_stale_modal_bundle_is_refused_before_deploy():
     config = DeploymentConfig(backend=BackendType.LLAMACPP, gpu_type="A10", gpu_count=2,
                               provider_options=ModalProviderOptions(2.0), do_deploy=True)

@@ -37,7 +37,7 @@ from .hf_models import (
     fetch_model_max_context,
     list_llamacpp_candidates,
 )
-from .modal_gpu import MODAL_GPU_MEMORY_GB as _GPU_MEMORY_GB, ModalGpuSpec, fetch_modal_gpu_catalog, modal_gpu_count_limit, modal_gpu_supports_fast_deploy
+from .modal_gpu import MODAL_GPU_MEMORY_GB as _GPU_MEMORY_GB, ModalGpuSpec, fetch_modal_gpu_catalog, modal_gpu_count_options, modal_gpu_supports_fast_deploy
 from .hf_budget import (
     DEFAULT_BUDGET,
     METADATA_REQUEST_COST,
@@ -2164,7 +2164,7 @@ def _select_gpu_shape(
         memory_gb = _GPU_MEMORY_GB.get(candidate_gpu)
         if memory_gb is None:
             continue
-        for gpu_count in range(1, modal_gpu_count_limit(candidate_gpu) + 1):
+        for gpu_count in modal_gpu_count_options(candidate_gpu):
             reserve_per_gpu = max(2.0, memory_gb * 0.05)
             # The busiest device is the one that has to fit, and layers are
             # indivisible, so an uneven split is sized on its larger half.
@@ -2188,7 +2188,16 @@ def _select_gpu_shape(
             break
     if not candidates:
         return None
-    cost, gpu_count, _negative_memory, selected_gpu = min(candidates)
+    min_cost = min(cost for cost, _count, _neg_mem, _gpu in candidates)
+    # Within a 5% hourly-cost margin (matching serving_tiers._MEANINGFUL_MARGIN),
+    # prefer fewer GPUs per container: Modal multi-GPU scheduling wait times
+    # grow sharply past 4 cards, so an 8-GPU shape should not beat a 4-GPU one
+    # for a negligible discount.
+    comparable = [item for item in candidates if item[0] <= min_cost * 1.05]
+    cost, gpu_count, _negative_memory, selected_gpu = min(
+        comparable,
+        key=lambda item: (item[1], item[0], item[2], item[3]),
+    )
     return _GpuSelection(
         quant=quant,
         gpu_type=selected_gpu,

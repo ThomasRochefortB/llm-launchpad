@@ -144,6 +144,7 @@ def _run_claimed_job(job_id: str, store: JobStore, pid: int) -> int:
     worker_resource: str | None = initial_resource
     worker_url: str | None = None
     worker_endpoint: EndpointInfo | None = None
+    worker_config: DeploymentConfig | None = None
     worker_index: int = 0
 
     def _on_event(event: BaseEvent) -> None:
@@ -166,7 +167,8 @@ def _run_claimed_job(job_id: str, store: JobStore, pid: int) -> int:
         url: str | None,
         endpoint: EndpointInfo | None,
     ) -> None:
-        nonlocal worker_url, worker_endpoint
+        nonlocal worker_url, worker_endpoint, worker_config
+        worker_config = saved_config
         if endpoint is not None:
             worker_endpoint = endpoint
             if endpoint.web_url:
@@ -179,13 +181,14 @@ def _run_claimed_job(job_id: str, store: JobStore, pid: int) -> int:
             pass
 
     def _on_attempt_start(index: int, attempt_config: DeploymentConfig) -> None:
-        nonlocal worker_index, worker_resource, worker_url, worker_endpoint
+        nonlocal worker_index, worker_resource, worker_url, worker_endpoint, worker_config
         worker_index = index
         # A previous attempt's resource must not leak into the next one.
         if index > 0:
             worker_resource = None
             worker_url = None
             worker_endpoint = None
+            worker_config = None
             try:
                 store.update_config(job_id, attempt_config)
                 store.append_event(
@@ -257,7 +260,7 @@ def _run_claimed_job(job_id: str, store: JobStore, pid: int) -> int:
     resource_app_id: str | None = worker_resource
     observed_url: str | None = worker_url
     current_index: int = worker_index
-    current = attempt_configs[min(current_index, len(attempt_configs) - 1)]
+    current = worker_config or attempt_configs[min(current_index, len(attempt_configs) - 1)]
     outcome = result.attempts[-1] if result.attempts else None
     if outcome is not None and outcome.disposition == AttemptDisposition.CANCELLED:
         _finish_cancelled_from_lifecycle(job_id, store, current, outcome)
@@ -299,10 +302,18 @@ def _run_claimed_job(job_id: str, store: JobStore, pid: int) -> int:
             store.update_config(job_id, current)
         except Exception:
             pass
+    from ..protocol.enums import CleanupDisposition
+
+    if outcome is not None and outcome.cleanup == CleanupDisposition.CONFIRMED:
+        outcome_text = f"Failed — resource stopped. {failure_detail}".strip()
+    else:
+        outcome_text = f"Failed — check resource in Manage. {failure_detail}".strip()
     store.finish_job(
-        job_id, JobStatus.FAILED, f"Failed — check resource in Manage. {failure_detail}".strip(),
+        job_id, JobStatus.FAILED, outcome_text,
     )
-    if not resource_app_id:
+    if not resource_app_id or (
+        outcome is not None and outcome.cleanup == CleanupDisposition.CONFIRMED
+    ):
         _clear_journal(current)
     return 0
 
@@ -331,6 +342,7 @@ def _run_attempt_phases(
 
     observed_url: str | None = None
     observed_endpoint: EndpointInfo | None = None
+    observed_config: DeploymentConfig = config
 
     def _on_event(event: BaseEvent) -> None:
         store.append_event(job_id, event)
@@ -346,7 +358,8 @@ def _run_attempt_phases(
         url: str | None,
         endpoint: EndpointInfo | None,
     ) -> None:
-        nonlocal observed_url, observed_endpoint
+        nonlocal observed_url, observed_endpoint, observed_config
+        observed_config = saved_config
         # The authoritative endpoint wins over incidental URLs: prefer the
         # last endpoint object with a URL, and persist warmup replacements.
         if endpoint is not None:
@@ -386,14 +399,14 @@ def _run_attempt_phases(
         raise _WorkerCancelled
     if result.succeeded:
         try:
-            store.update_config(job_id, config)
+            store.update_config(job_id, observed_config)
         except Exception:
             pass
         if observed_url:
-            _emit_connection_summary(store, job_id, config, observed_url)
+            _emit_connection_summary(store, job_id, observed_config, observed_url)
         store.finish_job(
             job_id, JobStatus.SUCCEEDED, "Finished — open result",
-            result={"url": observed_url, "app_name": config.app_name},
+            result={"url": observed_url, "app_name": observed_config.app_name},
         )
         return resource_app_id, None
     if outcome is not None and outcome.disposition == AttemptDisposition.RETAINED:

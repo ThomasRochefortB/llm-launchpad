@@ -193,13 +193,14 @@ class QuickDeployRefreshTests(unittest.TestCase):
             and profile.quant == "UD-Q4_K_XL"
             and profile.resource_tier == "cheap"
         )
-        self.assertEqual(compact_q4.gpu_type, "L4")
         # Fast Deploy sizes the full KV cache and compute workspace, not only
-        # the GGUF weight file, so this 30 GB profile needs three 24 GB L4s.
-        self.assertEqual(compact_q4.gpu_count, 3)
+        # the GGUF weight file. On Modal's power-of-two card ladder, 4x L4
+        # ($2.00/hr) ties 1x RTX-PRO-6000 ($2.00/hr) and the single card wins.
+        self.assertEqual(compact_q4.gpu_type, "RTX-PRO-6000")
+        self.assertEqual(compact_q4.gpu_count, 1)
         self.assertIsNotNone(compact_q4.memory_estimate)
         self.assertGreater(compact_q4.required_vram_gb or 0, 30.0)
-        self.assertEqual(compact_q4.approx_cost_per_hour_usd, 1.5)
+        self.assertEqual(compact_q4.approx_cost_per_hour_usd, 2.0)
         self.assertEqual(compact_q4.aa_coding_score, 95)
         self.assertEqual(compact_q4.aa_intelligence_score, 95)
 

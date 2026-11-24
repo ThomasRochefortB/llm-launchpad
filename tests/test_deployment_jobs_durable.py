@@ -201,3 +201,154 @@ class DurableJobStoreTests(unittest.TestCase):
         updated = self.store.get_job(record.id)
         assert updated is not None
         self.assertEqual(updated.status, JobStatus.INTERRUPTED)
+
+    def test_failed_terminal_tail_sets_nonzero_exit_code_and_strips_stopped_prefix(self) -> None:
+        config = _config(do_warmup=True)
+        record = self.store.create_job(config)
+        self.store.append_event(record.id, OperationCompleteEvent(operation=OperationType.DEPLOY))
+        self.store.append_event(
+            record.id,
+            OperationCompleteEvent(
+                operation=OperationType.WARMUP,
+                success=False,
+                exit_code=1,
+                detail="Timed out after 1800s (Waiting for GPU scheduling (GPU_RTX_PRO_6000)).",
+            ),
+        )
+        self.store.append_event(record.id, OperationCompleteEvent(operation=OperationType.STOP, success=True))
+        self.store.finish_job(
+            record.id,
+            JobStatus.FAILED,
+            "Failed — resource stopped. Timed out after 1800s (Waiting for GPU scheduling (GPU_RTX_PRO_6000)).",
+        )
+        monitor = Mock()
+        app = TuiApp()
+        job = DeploymentJob(id="failed-job", config=config, monitor=monitor, persistent_id=record.id)
+        with patch.object(app, "_get_job_store", return_value=self.store):
+            app._tail_persistent_job(job)
+
+        done_messages = [
+            message
+            for call in monitor.post_message.call_args_list
+            if isinstance(message := call.args[0], OperationDone)
+        ]
+        self.assertEqual(
+            [(m.operation, m.success, m.phase_only) for m in done_messages],
+            [
+                (OperationType.DEPLOY, True, True),
+                (OperationType.WARMUP, False, True),
+                (OperationType.STOP, True, True),
+                (OperationType.DEPLOY, False, False),
+            ],
+        )
+        terminal = done_messages[-1]
+        self.assertEqual(terminal.exit_code, 1)
+        self.assertEqual(
+            terminal.detail,
+            "Timed out after 1800s (Waiting for GPU scheduling (GPU_RTX_PRO_6000)).",
+        )
+
+    def test_run_job_marks_confirmed_cleanup_as_resource_stopped(self) -> None:
+        from llm_launchpad.protocol.models import EndpointInfo
+
+        record = self.store.create_job(_config("timeout-app", do_warmup=True))
+        endpoint = EndpointInfo(name="timeout-app", app_id="ap-1", web_url="https://example.test/ap-1")
+
+        with patch("llm_launchpad.core.job_runner._orchestrator") as factory:
+            factory.return_value.deploy.return_value = iter([
+                OperationCompleteEvent(operation=OperationType.DEPLOY, success=True, data=endpoint)
+            ])
+            factory.return_value.warmup.return_value = iter([
+                OperationCompleteEvent(
+                    operation=OperationType.WARMUP,
+                    success=False,
+                    exit_code=1,
+                    detail="Timed out after 1800s (Waiting for GPU scheduling (GPU_RTX_PRO_6000)).",
+                )
+            ])
+            factory.return_value.stop_app.return_value = iter([
+                OperationCompleteEvent(operation=OperationType.STOP, success=True)
+            ])
+            run_job(record.id, self.store)
+
+        updated = self.store.get_job(record.id)
+        assert updated is not None
+        self.assertEqual(updated.status, JobStatus.FAILED)
+        self.assertTrue(updated.outcome.startswith("Failed — resource stopped."))
+        self.assertIn("Waiting for GPU scheduling (GPU_RTX_PRO_6000)", updated.outcome)
+
+    def test_run_job_persists_effective_reasoning_and_tool_calling_for_opencode_sync(self) -> None:
+        from llm_launchpad.core.tool_call_probe import TOOL_CALLING_FAILED, ToolCallProbeResult
+        from llm_launchpad.protocol.models import EndpointInfo, ReasoningCapabilities
+
+        config = DeploymentConfig(
+            backend=BackendType.LLAMACPP,
+            provider=ComputeProvider.MODAL,
+            repo_id="unsloth/DeepSeek-V4.1-Flash-1017-GGUF",
+            quant="UD-Q4_K_XL",
+            app_name="llamacpp-ds41-sync",
+            do_deploy=True,
+            do_warmup=True,
+        )
+        record = self.store.create_job(config)
+        endpoint = EndpointInfo(
+            name="llamacpp-ds41-sync",
+            app_id="ap-ds41",
+            web_url="https://example.test/ds41",
+        )
+        reasoning = ReasoningCapabilities(
+            profile_id="hf-ds41",
+            canonical_model_id="unsloth/DeepSeek-V4.1-Flash-1017-GGUF",
+            model_revision="a" * 40,
+            efforts=("none", "thinking"),
+            default_effort="thinking",
+            source_repo="deepseek-ai/DeepSeek-V4.1-Flash-1017",
+            source_revision="b" * 40,
+            source_path="chat_template.jinja",
+            request_option_path="chat_template_kwargs.reasoning_effort",
+            enable_thinking=True,
+            interleaved_field="reasoning_content",
+        )
+
+        def deploy(effective_cfg: DeploymentConfig):
+            effective_cfg.reasoning = reasoning
+            yield OperationCompleteEvent(operation=OperationType.DEPLOY, success=True, data=endpoint)
+
+        def warmup(*_args: object, **_kwargs: object):
+            yield OperationCompleteEvent(
+                operation=OperationType.WARMUP,
+                success=True,
+                data={"url": endpoint.web_url},
+            )
+
+        with (
+            patch("llm_launchpad.core.job_runner._orchestrator") as factory,
+            patch(
+                "llm_launchpad.core.tool_call_probe.verify_tool_calling",
+                return_value=ToolCallProbeResult(TOOL_CALLING_FAILED, "answered in text"),
+            ),
+        ):
+            factory.return_value.deploy.side_effect = deploy
+            factory.return_value.warmup.side_effect = warmup
+            code = run_job(record.id, self.store)
+
+        self.assertEqual(code, 0)
+        updated = self.store.get_job(record.id)
+        assert updated is not None
+        self.assertEqual(updated.status, JobStatus.SUCCEEDED)
+        self.assertEqual(updated.config.reasoning, reasoning)
+        self.assertEqual(updated.config.tool_calling, TOOL_CALLING_FAILED)
+
+        app = TuiApp()
+        job = DeploymentJob(id="ds41-sync", config=config, monitor=Mock(), persistent_id=record.id)
+        with (
+            patch.object(app, "_get_job_store", return_value=self.store),
+            patch.object(app, "_visible_rows_and_prune_scope", return_value=([], ())),
+            patch.object(app, "_sync_opencode") as sync_opencode,
+        ):
+            app._sync_finished_job(job, updated)
+
+        sync_opencode.assert_called_once()
+        synced_config = sync_opencode.call_args.kwargs["target_config"]
+        self.assertEqual(synced_config.reasoning, reasoning)
+        self.assertEqual(synced_config.tool_calling, TOOL_CALLING_FAILED)

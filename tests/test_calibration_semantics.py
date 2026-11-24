@@ -108,6 +108,85 @@ class StreamingCalibrationTests(unittest.TestCase):
 
         self.assertFalse(accepted)
 
+    def test_cold_first_request_runs_as_untimed_warmup_before_budget(self) -> None:
+        from unittest.mock import patch
+
+        calls: list[dict[str, object]] = []
+        clock = {"now": 0.0}
+
+        def _fake_request(_requests, **kwargs):  # noqa: ANN001, ANN003, ANN202
+            calls.append(kwargs)
+            if len(calls) == 1:
+                # Simulate an 85s cold first-request JIT / mmap fault; this must
+                # happen before the calibration budget clock begins.
+                clock["now"] += 85.0
+                return {
+                    "completion_tokens": 64.0,
+                    "actual_prompt_tokens": 256.0,
+                    "latency": 85.0,
+                    "ttft": 60.0,
+                    "prompt_tps": 4.2,
+                    "output_tps": 2.5,
+                }
+            clock["now"] += 2.0
+            return {
+                "completion_tokens": 128.0,
+                "actual_prompt_tokens": float(kwargs["prompt_tokens"]),
+                "latency": 2.0,
+                "ttft": 0.5,
+                "prompt_tps": 500.0,
+                "output_tps": 60.0,
+            }
+
+        with (
+            patch.object(warmup, "_streaming_calibration_request", side_effect=_fake_request),
+            patch("llm_launchpad.core.warmup.time.monotonic", side_effect=lambda: clock["now"]),
+        ):
+            points = warmup._calibrate_endpoint(
+                types.SimpleNamespace(),
+                server_url="https://example.modal.run",
+                model="default",
+                headers={},
+                parallel_slots=4,
+                price_per_hour_usd=25.0,
+                budget_seconds=90.0,
+            )
+
+        self.assertEqual(calls[0]["prompt_seed"], -1)
+        self.assertGreaterEqual(len(points), 2)
+        self.assertTrue(all((p.output_tokens_per_second or 0.0) >= 60.0 for p in points))
+
+    def test_acceptance_counts_warmed_per_stream_speed_at_higher_concurrency(self) -> None:
+        from llm_launchpad.protocol.enums import ServingObjective
+        from llm_launchpad.protocol.models import PerformancePoint
+
+        accepted, _ = warmup._calibration_is_acceptable(
+            (
+                PerformancePoint(
+                    prompt_tokens=512,
+                    output_tokens=128,
+                    concurrency=1,
+                    output_tokens_per_second=6.2,
+                    error_rate=0.0,
+                    measured=True,
+                    actual_output_tokens=128,
+                    sample_count=1,
+                ),
+                PerformancePoint(
+                    prompt_tokens=512,
+                    output_tokens=128,
+                    concurrency=2,
+                    output_tokens_per_second=26.7,
+                    error_rate=0.0,
+                    measured=True,
+                    actual_output_tokens=256,
+                    sample_count=2,
+                ),
+            ),
+            ServingObjective.GENERAL_PURPOSE,
+        )
+        self.assertTrue(accepted)
+
 
 if __name__ == "__main__":
     unittest.main()

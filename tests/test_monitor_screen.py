@@ -990,3 +990,65 @@ class MonitorLaunchBackendTests(unittest.IsolatedAsyncioTestCase):
                         screen = app.screen
                         assert isinstance(screen, MonitorScreen)
                         self.assertEqual(screen._deploy_backend, expected)
+
+    async def test_summary_mode_keeps_gpu_scheduling_wait_and_reports_stopped_resource_after_cleanup(
+        self,
+    ) -> None:
+        app = _TestApp()
+        async with app.run_test(size=(105, 30)) as pilot:
+            screen = MonitorScreen(
+                title="Deploy",
+                deploy_backend=BackendType.LLAMACPP,
+                summarize_backend_logs=True,
+                show_debug_logs=False,
+                deployment_config=DeploymentConfig(
+                    backend=BackendType.LLAMACPP,
+                    provider=ComputeProvider.MODAL,
+                    gpu_type="RTX-PRO-6000",
+                    gpu_count=8,
+                    do_deploy=True,
+                    do_warmup=True,
+                ),
+            )
+            app.push_screen(screen)
+            await pilot.pause()
+
+            screen.on_operation_done(
+                OperationDone(OperationType.DEPLOY, True, 0, "", phase_only=True)
+            )
+            screen.on_state_changed(
+                StateChanged(
+                    DeploymentState.QUEUED,
+                    OperationType.WARMUP,
+                    "Waiting for GPU scheduling (GPU_RTX_PRO_6000)",
+                )
+            )
+            screen.on_log_message(LogMessage("Waiting for GPU scheduling (GPU_RTX_PRO_6000)"))
+            timeout_detail = (
+                "Timed out after 1800s (Waiting for GPU scheduling (GPU_RTX_PRO_6000)). "
+                "Last error: Read timed out."
+            )
+            screen.on_operation_error(OperationError(timeout_detail))
+            screen.on_operation_done(
+                OperationDone(OperationType.WARMUP, False, 1, timeout_detail, phase_only=True)
+            )
+            screen.on_log_message(
+                LogMessage("Certification failed; cleaning up failed Modal deployment.")
+            )
+            screen.on_operation_done(
+                OperationDone(OperationType.STOP, True, 0, "Stopped.", phase_only=True)
+            )
+            screen.on_operation_done(
+                OperationDone(OperationType.DEPLOY, False, 1, timeout_detail, phase_only=False)
+            )
+            await pilot.pause()
+            await pilot.pause()
+
+            log_content = "\n".join(screen.log_viewer.log_widget.lines)
+            self.assertIn("Waiting for GPU scheduling (GPU_RTX_PRO_6000)", log_content)
+            self.assertIn("Operation failed (exit code 1).", log_content)
+            self.assertNotIn("exit code 0", log_content)
+            card_body = str(screen.query_one("#failure-card-body", Static).render())
+            self.assertIn("Timed out after 1800s", card_body)
+            self.assertIn("Stopped.", card_body)
+            self.assertNotIn("Allocated; may still be running", card_body)

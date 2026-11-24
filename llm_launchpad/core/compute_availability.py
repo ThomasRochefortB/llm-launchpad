@@ -46,7 +46,14 @@ from .llamacpp_planner import (
     tuning_for_gpu_memory,
 )
 from .modal_cli import resolve_modal_cli_path
-from .modal_gpu import MODAL_GPU_MEMORY_GB, ModalGpuSpec, fetch_modal_gpu_catalog, modal_gpu_count_limit, modal_gpu_supports_fast_deploy
+from .modal_gpu import (
+    MODAL_GPU_MEMORY_GB,
+    ModalGpuSpec,
+    fetch_modal_gpu_catalog,
+    modal_gpu_count_limit,
+    modal_gpu_count_options,
+    modal_gpu_supports_fast_deploy,
+)
 from .provider_readiness import check_modal_readiness
 from .prime_auth import get_prime_auth_status
 from .prime_backend import (
@@ -595,7 +602,16 @@ def _placement_gpu_count(
     memory_estimate: object | None = None,
     calibration: MemoryCalibration | None = None,
 ) -> int | None:
-    count = placement.gpu_count_min
+    if placement.provider == ComputeProvider.MODAL:
+        candidates = tuple(
+            candidate
+            for candidate in modal_gpu_count_options(placement.gpu_type)
+            if placement.gpu_count_min <= candidate <= placement.gpu_count_max
+        )
+    else:
+        candidates = tuple(range(placement.gpu_count_min, placement.gpu_count_max + 1))
+    if not candidates:
+        return None
     if memory_estimate is not None:
         total_gb = float(getattr(memory_estimate, "total_gb", 0.0)) - float(
             getattr(memory_estimate, "reserve_gb", 0.0)
@@ -611,7 +627,7 @@ def _placement_gpu_count(
         shardable_gb = max(0.0, total_gb - per_device_graph * base_count)
         layer_count = getattr(memory_estimate, "total_layer_count", None)
         capacity = device_capacity_bytes(placement.gpu_memory_gb)
-        for candidate in range(count, placement.gpu_count_max + 1):
+        for candidate in candidates:
             reserve_per_gpu = max(2.0, placement.gpu_memory_gb * 0.05)
             # Layers are indivisible: size on the device that ends up with the
             # remainder, not on the average.
@@ -636,13 +652,12 @@ def _placement_gpu_count(
                 return candidate
         return None
     if required_vram_gb > 0:
-        count = max(
-            count,
+        needed = max(
+            placement.gpu_count_min,
             math.ceil(required_vram_gb * 1.05 / placement.gpu_memory_gb),
         )
-    if count > placement.gpu_count_max:
-        return None
-    return count
+        return next((candidate for candidate in candidates if candidate >= needed), None)
+    return candidates[0]
 
 
 def _placement_sort_key(row: ComputePlacement) -> tuple[int, int, float, str]:

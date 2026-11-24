@@ -55,7 +55,6 @@ def _strip_ansi(text: str) -> str:
 def _hide_summary_line(line: str) -> bool:
     return (
         line in ("Waiting for readiness", "Publishing endpoint", "Preparing model cache", "Endpoint published")
-        or line.startswith("Waiting for GPU scheduling")
         or is_startup_phase_line(line)
     )
 

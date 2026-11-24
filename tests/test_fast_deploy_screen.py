@@ -625,7 +625,7 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
         snapshot = aggregate_compute_availability(
             modal_catalog=[
                 ModalGpuSpec("H100", price_per_hour_usd=4.0),
-                ModalGpuSpec("L40S", price_per_hour_usd=2.0),
+                ModalGpuSpec("L40S", price_per_hour_usd=1.5),
             ]
         )
         app = _TestApp()
@@ -660,7 +660,7 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(app.quick_deploy_calls), 1)
         selected, alternatives = app.quick_deploy_calls[0]
-        self.assertEqual(selected.quote.gpu_count, 3)
+        self.assertEqual(selected.quote.gpu_count, 4)
         self.assertEqual(selected.quote.gpu_type, "L40S")
         # Equivalent placements travel to confirmation as a bounded retry
         # ladder; Fast Deploy never retries above the user's selected price.
@@ -1186,7 +1186,7 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
     async def test_model_list_uses_live_cheapest_price_when_snapshot_loaded(self) -> None:
         model = _model((_profile("fits", required_vram_gb=100.0),))
         snapshot = aggregate_compute_availability(
-            modal_catalog=[ModalGpuSpec("L40S", price_per_hour_usd=2.0)]
+            modal_catalog=[ModalGpuSpec("L40S", price_per_hour_usd=1.5)]
         )
         app = _TestApp()
         with patch(

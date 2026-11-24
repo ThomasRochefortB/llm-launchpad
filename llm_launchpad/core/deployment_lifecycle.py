@@ -227,11 +227,15 @@ def run_lifecycle(
         index += 1
     last = outcomes[-1] if outcomes else None
     detail = (last.failure_detail if last and last.failure_detail else "Deployment failed.").strip()
+    if last is not None and last.cleanup == CleanupDisposition.CONFIRMED:
+        outcome_text = f"Failed — resource stopped. {detail}".strip()
+    else:
+        outcome_text = f"Failed — check resource in Manage. {detail}".strip()
     return DeploymentResult(
         succeeded=False,
         app_name=attempt_list[0].config.app_name if attempt_list else None,
         attempts=tuple(outcomes),
-        outcome=f"Failed — check resource in Manage. {detail}".strip(),
+        outcome=outcome_text,
     )
 
 
@@ -270,6 +274,8 @@ def effective_config_for_attempt(attempt: LifecycleAttempt) -> DeploymentConfig:
     config.idle_shutdown_seconds = attempt.config.idle_shutdown_seconds
     config.max_concurrent_sequences = attempt.config.max_concurrent_sequences
     config.tool_calling = attempt.config.tool_calling
+    config.dspark_draft = attempt.config.dspark_draft
+    config.engram_table = attempt.config.engram_table
     config.provider_options = plan.provider_options or attempt.config.provider_options
     config.fallback_configs = attempt.config.fallback_configs
     config.retry_allowed = attempt.config.retry_allowed
@@ -858,11 +864,28 @@ def _finalize_failed_attempt(
         ),
         backend=config.backend,
     )
-    if cleanup.disposition != CleanupDisposition.CONFIRMED:
+    if cleanup.disposition == CleanupDisposition.CONFIRMED:
+        hooks.on_event(
+            OperationCompleteEvent(
+                operation=OperationType.STOP,
+                success=True,
+                detail=cleanup.detail or f"Stopped {resource_label}.",
+            )
+        )
+    else:
+        stop_detail = cleanup.detail or "Stop did not confirm."
         hooks.on_event(
             LogEvent(
-                line=f"Cleanup after failed certification failed: {cleanup.detail or 'Stop did not confirm.'}",
+                line=f"Cleanup after failed certification failed: {stop_detail}",
                 operation=OperationType.WARMUP,
+            )
+        )
+        hooks.on_event(
+            OperationCompleteEvent(
+                operation=OperationType.STOP,
+                success=False,
+                exit_code=1,
+                detail=stop_detail,
             )
         )
     return cleanup
