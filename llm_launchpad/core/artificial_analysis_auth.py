@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from contextlib import closing
 from pathlib import Path
 
 import keyring
@@ -43,6 +44,27 @@ def _credential_store() -> KeyringBackend:
     raise RuntimeError(_STORE_ERROR)
 
 
+def _ensure_store_usable(store: KeyringBackend) -> None:
+    """Raise instead of letting a locked store prompt on the machine.
+
+    Secret Service stores ask for an interactive unlock before any read or
+    write; with no one at the keyboard (SSH, tmux, CI) that blocks forever,
+    so surface ``_STORE_ERROR`` up front.
+    """
+    if type(store).__module__ != "keyring.backends.SecretService":
+        return
+    import secretstorage
+
+    with closing(secretstorage.dbus_init()) as bus:
+        try:
+            collection = secretstorage.Collection(bus)
+        except Exception:
+            # No default collection yet; nothing is stored to protect.
+            return
+        if collection.is_locked():
+            raise RuntimeError(_STORE_ERROR)
+
+
 def _remove_legacy_credentials(path: Path) -> None:
     """Remove both the old JSON file and an interrupted writer's temporary file."""
     path.unlink(missing_ok=True)
@@ -62,6 +84,7 @@ def load_saved_artificial_analysis_api_key(path: Path | None = None) -> str:
     legacy_path = path or AAI_AUTH_PATH
     try:
         store = _credential_store()
+        _ensure_store_usable(store)
         saved = store.get_password(_SERVICE, _ACCOUNT)
         if saved:
             _remove_legacy_credentials(legacy_path)
@@ -88,6 +111,7 @@ def save_artificial_analysis_api_key(api_key: str, path: Path | None = None) -> 
         raise ValueError("An Artificial Analysis API key is required")
     try:
         store = _credential_store()
+        _ensure_store_usable(store)
         store.set_password(_SERVICE, _ACCOUNT, normalized_key)
         if store.get_password(_SERVICE, _ACCOUNT) != normalized_key:
             raise RuntimeError(_STORE_ERROR)
@@ -103,6 +127,7 @@ def clear_artificial_analysis_api_key(path: Path | None = None) -> bool:
     removed = False
     try:
         store = _credential_store()
+        _ensure_store_usable(store)
         if store.get_password(_SERVICE, _ACCOUNT) is not None:
             store.delete_password(_SERVICE, _ACCOUNT)
             removed = True

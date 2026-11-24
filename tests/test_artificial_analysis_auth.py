@@ -8,6 +8,8 @@ from unittest.mock import MagicMock, patch
 
 import hashlib
 import json
+import sys
+import types
 
 from llm_launchpad.core import artificial_analysis_auth as auth
 
@@ -328,6 +330,70 @@ class SecureCredentialBackendTests(unittest.TestCase):
             patch.object(ChainerBackend, "backends", [plaintext, secure]),
         ):
             self.assertIs(auth._credential_store(), secure)
+
+
+class LockedStoreTests(unittest.TestCase):
+    """A locked OS store must fail fast instead of prompting forever."""
+
+    def _secret_service_store(self) -> object:
+        backend = type("Keyring", (), {"__module__": "keyring.backends.SecretService"})()
+        backend.get_password = MagicMock(return_value=None)
+        backend.set_password = MagicMock()
+        backend.delete_password = MagicMock()
+        return backend
+
+    def _fake_secret_storage(self, *, locked: bool) -> tuple[patch, MagicMock]:
+        fake_module = types.ModuleType("secretstorage")
+        collection = MagicMock()
+        collection.is_locked.return_value = locked
+        fake_module.dbus_init = MagicMock(return_value=MagicMock())
+        fake_module.Collection = MagicMock(return_value=collection)
+        return patch.dict(sys.modules, {"secretstorage": fake_module}), collection
+
+    def test_locked_store_load_returns_empty_without_prompt(self) -> None:
+        store = self._secret_service_store()
+        with patch.object(auth, "_credential_store", return_value=store):
+            fake_storage, _ = self._fake_secret_storage(locked=True)
+            with fake_storage, TemporaryDirectory() as directory:
+                path = Path(directory) / "aa.json"
+                path.write_text(json.dumps({"api_key": "legacy-key"}))
+                self.assertEqual(load_saved_artificial_analysis_api_key(path), "")
+                self.assertTrue(path.exists())
+        store.get_password.assert_not_called()
+
+    def test_locked_store_save_and_clear_surface_store_error(self) -> None:
+        store = self._secret_service_store()
+        with patch.object(auth, "_credential_store", return_value=store):
+            fake_storage, _ = self._fake_secret_storage(locked=True)
+            with fake_storage:
+                with self.assertRaises(RuntimeError) as saved:
+                    save_artificial_analysis_api_key("secret-key")
+                self.assertEqual(str(saved.exception), auth._STORE_ERROR)
+                with self.assertRaises(RuntimeError) as cleared:
+                    clear_artificial_analysis_api_key()
+                self.assertEqual(str(cleared.exception), auth._STORE_ERROR)
+        store.set_password.assert_not_called()
+        store.delete_password.assert_not_called()
+
+    def test_unlocked_store_is_read_normally(self) -> None:
+        store = self._secret_service_store()
+        store.get_password.return_value = "stored-key"
+        with patch.object(auth, "_credential_store", return_value=store):
+            fake_storage, collection = self._fake_secret_storage(locked=False)
+            with fake_storage, TemporaryDirectory() as directory:
+                path = Path(directory) / "aa.json"
+                self.assertEqual(load_saved_artificial_analysis_api_key(path), "stored-key")
+        collection.is_locked.assert_called_once()
+
+    def test_missing_default_collection_does_not_block_load(self) -> None:
+        store = self._secret_service_store()
+        with patch.object(auth, "_credential_store", return_value=store):
+            fake_storage, collection = self._fake_secret_storage(locked=False)
+            collection.side_effect = Exception("no default collection")
+            with fake_storage, TemporaryDirectory() as directory:
+                path = Path(directory) / "aa.json"
+                self.assertEqual(load_saved_artificial_analysis_api_key(path), "")
+        store.get_password.assert_called_once()
 
 
 if __name__ == "__main__":
