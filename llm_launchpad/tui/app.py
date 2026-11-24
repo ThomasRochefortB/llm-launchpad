@@ -1524,7 +1524,10 @@ class TuiApp(App):
             # record; a confirmed stop clears it like any other resolution.
             if result.succeeded:
                 self._finish_in_flight(config, resolved=True)
-            elif result.attempts and all(
+            elif any(
+                attempt.disposition == AttemptDisposition.CANCELLED
+                for attempt in result.attempts
+            ) and all(
                 attempt.cleanup == CleanupDisposition.FAILED
                 or attempt.cleanup_error
                 for attempt in result.attempts

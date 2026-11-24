@@ -165,6 +165,19 @@ class DeploymentTrackingTests(unittest.TestCase):
         self.assertEqual([entry.app_name for entry in load_in_flight()], ["keep-record"])
         self.assertIn("cleanup failed", job.outcome)
 
+    def test_plain_failure_clears_this_jobs_own_recovery_record(self) -> None:
+        # A failed deploy with no cancellation must resolve like any other
+        # completion, not poison the endpoint until Manage is opened.
+        app = TuiApp()
+        job = DeploymentJob("job", config("plain-fail"), MonitorScreen())
+        app.deployment_jobs[job.id] = job
+        with patch.object(app._orchestrator, "deploy", return_value=iter([
+            OperationCompleteEvent(operation=OperationType.DEPLOY, success=False),
+        ])):
+            app._run_deployment_job(job)
+        self.assertEqual(load_in_flight(), ())
+        self.assertTrue(job.finished.is_set())
+
     def test_cancel_during_warmup_stops_the_allocated_pod(self) -> None:
         app = TuiApp()
         current = config("warming", ComputeProvider.PRIME)
