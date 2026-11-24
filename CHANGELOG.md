@@ -7,8 +7,23 @@ and this project follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-24
+
+### Added
+- Fast Deploy catalog search (`/`): search model names and repositories across the entire catalog with unavailable/unchecked reasons shown in the detail pane, plus **v** to toggle between the top-10 ranked view and the wider catalog.
+- Placement context cycling (`c`): cycle between full context and eligible 32,768- or 8,192-token options when a shorter context unlocks a placement or lowers first-hour cost.
+
 ### Changed
+- Updated the default CUDA 12 llama.cpp runtime to upstream build `b12464`, adding support for DeepSeek V4.1 Flash (`deepseek41`), current GLM-5.3-Flash (`glm5-next`), and Inkling 2 (`inkling2`) while keeping older `glm5next` files on their dedicated build.
+- Simplified the Home screen and Fast Deploy opening view, refined Economy placement tie-breaking (preferring higher precision and fewer GPUs on equal first-hour cost), and polished TUI layout and rendering performance (1-row borderless pill buttons, 100-column narrow breakpoint, Screen/Global Help overlay sections, deduplicated footer recomposes, and batched screen class updates).
+- Updated dependencies (`prime` 0.20.0, `typer` 0.28.0, `filelock` 4.2.9, `pytest` 9.2.0, `ruff` 0.17.4) and CI actions (`setup-uv` 10.4.0, CodeQL).
 - Remove the billable live canary workflow and reject live canary execution in GitHub Actions. Keep live deployments as an explicitly authorized local check, and expire CI build artifacts after one day.
+
+### Fixed
+- Fail fast when the OS credential store is locked during Artificial Analysis credential lookups.
+- Treat infinite price caps as unlimited in deployment preflight validation.
+- Clear in-flight deployment records on plain deploy failure and restore monitor log navigation after failed operations.
+- Keep DSpark draft files out of main-model selection, and ensure durable phase-only log tails update progress while the Jobs tab polls.
 
 ## [1.1.2] - 2026-11-02
 
