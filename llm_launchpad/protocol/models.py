@@ -79,6 +79,8 @@ class LaunchpadSettings:
     # Prime has no instance-scoped key, so a pod can only delete itself if the
     # user agrees to place their Prime API key on it.
     prime_self_terminate: bool = False
+    # Emit a terminal/desktop alert when a deployment finishes or fails.
+    notify_on_complete: bool = True
 
     def to_env(self) -> dict[str, str]:
         """Derive Modal environment variables from settings."""
@@ -96,6 +98,7 @@ class LaunchpadSettings:
             "confirm_quit": self.confirm_quit,
             "rental_idle_shutdown": self.rental_idle_shutdown,
             "prime_self_terminate": self.prime_self_terminate,
+            "notify_on_complete": self.notify_on_complete,
         }
 
     @classmethod
@@ -103,6 +106,8 @@ class LaunchpadSettings:
         raw_value = data.get("SCALEDOWN_WINDOW", data.get("scaledown_window", 1800))
         raw_mouse = data.get("tui_mouse")
         mouse = raw_mouse if isinstance(raw_mouse, bool) else None
+        raw_notify = data.get("notify_on_complete")
+        notify_on_complete = raw_notify if isinstance(raw_notify, bool) else True
         return cls(
             scaledown_window=int(raw_value),
             tui_theme=str(data.get("tui_theme", "launchpad-dark")),
@@ -111,6 +116,7 @@ class LaunchpadSettings:
             confirm_quit=bool(data.get("confirm_quit", True)),
             rental_idle_shutdown=_non_negative_int(data.get("rental_idle_shutdown"), 3600),
             prime_self_terminate=data.get("prime_self_terminate") is True,
+            notify_on_complete=notify_on_complete,
         )
 
 

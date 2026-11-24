@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import os
 import shutil
 import subprocess
@@ -110,3 +111,20 @@ def read_system_clipboard() -> str | None:
             continue
         return result.stdout
     return None
+
+
+def osc_52_sequence(text: str) -> str:
+    """Build an OSC 52 terminal clipboard escape sequence."""
+    payload = base64.b64encode(text.encode("utf-8")).decode("ascii")
+    return f"\x1b]52;c;{payload}\a"
+
+
+def tmux_passthrough_sequence(text: str) -> str:
+    """Wrap an OSC 52 sequence in a tmux DCS passthrough envelope."""
+    osc = osc_52_sequence(text).replace("\x1b", "\x1b\x1b")
+    return f"\x1bPtmux;{osc}\x1b\\"
+
+
+def screen_passthrough_sequence(text: str) -> str:
+    """Wrap an OSC 52 sequence in a GNU screen DCS passthrough envelope."""
+    return f"\x1bP{osc_52_sequence(text)}\x1b\\"

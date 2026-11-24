@@ -85,6 +85,7 @@ def follow_job(job_id: str = typer.Argument(..., help="Job id from 'jobs list'."
     if job is None:
         typer.echo(f"Error: unknown job {job_id}", err=True)
         raise typer.Exit(code=1)
+    started_terminal = job.terminal
     seen = 0
     try:
         while True:
@@ -96,11 +97,37 @@ def follow_job(job_id: str = typer.Argument(..., help="Job id from 'jobs list'."
             if current is None or current.terminal:
                 if current is not None:
                     typer.echo(f"[{current.status}] {current.outcome}")
+                    if not started_terminal and current.status != "cancelled":
+                        _notify_followed_job(current)
                 return
             time.sleep(0.5)
     except KeyboardInterrupt:
         typer.echo("Stopped following; the job keeps running. Cancel with: llm-launchpad jobs cancel <id>")
         raise typer.Exit(code=130) from None
+
+
+def _notify_followed_job(job: object) -> None:
+    """Emit a terminal completion alert when a followed CLI job finishes."""
+    try:
+        from ..core.config import ConfigStore
+        from ..core.notifications import emit_terminal_notification, format_deployment_notification
+
+        if not ConfigStore().load().notify_on_complete:
+            return
+        config = getattr(job, "config", None)
+        status = str(getattr(job, "status", ""))
+        outcome = str(getattr(job, "outcome", ""))
+        if config is None:
+            return
+        success = status == "succeeded"
+        title, body = format_deployment_notification(
+            config,
+            success=success,
+            detail="" if success else outcome,
+        )
+        emit_terminal_notification(title, body)
+    except Exception:
+        pass
 
 
 @jobs_app.command("cancel")

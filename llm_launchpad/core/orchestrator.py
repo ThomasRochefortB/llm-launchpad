@@ -13,13 +13,10 @@ from ..protocol.models import VisionCapabilities
 from .shutdown import is_shutting_down, shutdown_event
 
 
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-import json
 import os
 from pathlib import Path
 import re
-import secrets
 import shlex
 import time
 from typing import Any
@@ -34,16 +31,14 @@ from ..protocol.enums import (
 )
 from ..protocol.events import (
     BaseEvent,
-    EndpointAvailableEvent,
     ErrorEvent,
     LogEvent,
     OperationCompleteEvent,
-    ResourceAllocatedEvent,
     StateChangeEvent,
 )
-from ..protocol.models import DeploymentConfig, EndpointInfo, LaunchpadSettings, SpeculativeDecodingConfig
+from ..protocol.models import DeploymentConfig, EndpointInfo, SpeculativeDecodingConfig
 from ..protocol.models import BenchmarkConcurrencyResult, BenchmarkConfig
-from ..protocol.models import PlacementAssessment, ServingRequirements, StoredModelInfo, StorageSnapshot
+from ..protocol.models import PlacementAssessment, ServingRequirements, StoredModelInfo
 
 from .benchmark import (
     BENCHMARK_UNAVAILABLE_REASON,
@@ -61,27 +56,21 @@ from .backend import ModalBackend
 from .config import ConfigStore
 from .deploy_log_summary import format_elapsed
 from .deployment_states import is_terminal_deployment_state
-from .diagnostics import log_exception
 from .operation_events import fail_operation
 from .gguf_metadata import GgufMtpStatus
 from .hf_models import fetch_gguf_quant_metadata
-from .deployment_preflight import price_cap_finding
 from .modal_gpu import fetch_modal_gpu_catalog
-from ..protocol.models import ModalProviderOptions
 from .modal_auth import get_modal_auth_status
 from .llamacpp_planner import compile_server_args_string, tuning_for_objective, tuning_for_architecture
 from .naming import legacy_app_name
-from .naming import utility_app_name
 from .naming import default_llamacpp_served_model_name
 from .naming import random_function_slug
-from .paths import MODAL_LLAMACPP_SCRIPT, MODAL_VLLM_SCRIPT
 from .prime_backend import (
-    PrimeApiError,
+    PrimeApiError as PrimeApiError,
     PrimeBackend,
     resolve_prime_launch_spec,
 )
-from .prime_disks import bind_prime_disk, resolve_prime_offer_and_disk
-from .provider_options import prime_provider_options
+from .prime_disks import resolve_prime_offer_and_disk
 from .vast_deployment import VastDeploymentBackend
 from .reasoning_profiles import discover_selected_model_reasoning
 from .runtime_support import (
@@ -370,21 +359,8 @@ class Orchestrator:
     # Deploy
     # ------------------------------------------------------------------
 
-    def deploy(self, config: DeploymentConfig) -> EventStream:
-        """Run a full deploy workflow (optional preload + deploy + warmup)."""
-        from .deployment_preflight import (
-            preflight_config,
-            resolve_dspark_draft,
-            resolve_engram_table,
-        )
-
-        preflight = preflight_config(config)
-        blocking = [finding for finding in preflight.findings if finding.blocking]
-        if blocking:
-            yield from fail_operation(
-                OperationType.DEPLOY, blocking[0].message, exit_code=2, recoverable=False
-            )
-            return
+    def _prepare_reasoning(self, config: DeploymentConfig) -> EventStream:
+        """Inspect and log reasoning capabilities for the selected model."""
         try:
             config.reasoning = discover_selected_model_reasoning(config)
         except Exception as exc:
@@ -409,155 +385,180 @@ class Orchestrator:
                 operation=OperationType.DEPLOY,
                 is_milestone=True,
             )
-        if config.backend == BackendType.LLAMACPP and not (config.served_model_name or "").strip():
+
+    def _prepare_llamacpp_deploy(self, config: DeploymentConfig) -> Generator[BaseEvent, None, bool]:
+        """Resolve llama.cpp compatibility, Engram, DSpark/MTP, and serving plan."""
+        from .deployment_preflight import resolve_dspark_draft, resolve_engram_table
+
+        if not (config.served_model_name or "").strip():
             config.served_model_name = default_llamacpp_served_model_name(
                 config.repo_id,
                 config.quant,
             )
-        if config.backend == BackendType.LLAMACPP:
-            compatibility, lookup_error = self._llamacpp_compatibility(config)
-            if compatibility.status == RuntimeCompatibility.UNSUPPORTED:
-                message = (
-                    f"Cannot deploy {config.repo_id or config.preset or 'this GGUF'}: "
-                    f"{compatibility.message} Select a GGUF whose general.architecture "
-                    "is present in llm_launchpad/data/llamacpp_runtime_support.json, "
-                    "or explicitly configure a llama.cpp image that supports this architecture."
-                )
+        compatibility, lookup_error = self._llamacpp_compatibility(config)
+        if compatibility.status == RuntimeCompatibility.UNSUPPORTED:
+            message = (
+                f"Cannot deploy {config.repo_id or config.preset or 'this GGUF'}: "
+                f"{compatibility.message} Select a GGUF whose general.architecture "
+                "is present in llm_launchpad/data/llamacpp_runtime_support.json, "
+                "or explicitly configure a llama.cpp image that supports this architecture."
+            )
+            yield from fail_operation(
+                OperationType.DEPLOY, message, exit_code=2, recoverable=False
+            )
+            return False
+        if compatibility.status == RuntimeCompatibility.SUPPORTED:
+            yield LogEvent(
+                line=f"Compatibility preflight: {compatibility.message}",
+                operation=OperationType.DEPLOY,
+                is_milestone=True,
+            )
+        else:
+            detail = compatibility.message
+            if lookup_error:
+                detail = f"{detail} Metadata lookup failed: {lookup_error}"
+            yield LogEvent(
+                line=f"Compatibility preflight warning: {detail} Continuing unverified.",
+                operation=OperationType.DEPLOY,
+            )
+
+        if config.engram_table is None:
+            try:
+                engram_table, engram_message = resolve_engram_table(config)
+            except ValueError as exc:
                 yield from fail_operation(
                     OperationType.DEPLOY,
-                    message,
+                    f"Engram preflight failed: {exc}",
                     exit_code=2,
                     recoverable=False,
                 )
-                return
-            if compatibility.status == RuntimeCompatibility.SUPPORTED:
-                yield LogEvent(
-                    line=f"Compatibility preflight: {compatibility.message}",
-                    operation=OperationType.DEPLOY,
-                    is_milestone=True,
-                )
-            else:
-                detail = compatibility.message
-                if lookup_error:
-                    detail = f"{detail} Metadata lookup failed: {lookup_error}"
-                yield LogEvent(
-                    line=f"Compatibility preflight warning: {detail} Continuing unverified.",
-                    operation=OperationType.DEPLOY,
-                )
-            if config.engram_table is None:
-                try:
-                    engram_table, engram_message = resolve_engram_table(config)
-                except ValueError as exc:
-                    yield from fail_operation(
-                        OperationType.DEPLOY,
-                        f"Engram preflight failed: {exc}",
-                        exit_code=2,
-                        recoverable=False,
-                    )
-                    return
-                except Exception as exc:
-                    yield LogEvent(
-                        line=(
-                            "Engram table preflight warning: could not inspect "
-                            f"per-layer embedding shards ({exc}). Continuing unverified."
-                        ),
-                        operation=OperationType.DEPLOY,
-                    )
-                else:
-                    if engram_table is not None:
-                        config.engram_table = engram_table
-                        if engram_message:
-                            yield LogEvent(
-                                line=engram_message,
-                                operation=OperationType.DEPLOY,
-                                is_milestone=True,
-                            )
-            if config.dspark or config.dspark_repo or config.dspark_file:
-                try:
-                    config.dspark_draft = resolve_dspark_draft(config)
-                except Exception as exc:
-                    yield from fail_operation(
-                        OperationType.DEPLOY, f"DSpark preflight failed: {exc}", exit_code=2, recoverable=False,
-                    )
-                    return
-                config.speculative_decoding = None
-                yield LogEvent(
-                    line=f"DSpark draft: {config.dspark_draft.filename} ({config.dspark_draft.size_bytes / 1e9:.2f} GB).",
-                    operation=OperationType.DEPLOY,
-                )
-            else:
-                yield from self._prepare_llamacpp_speculative_decoding(config)
-            if config.serving_requirements is not None:
-                if (
-                    config.placement_assessment is not None
-                    and (
-                        not config.placement_assessment.fits
-                        or not config.placement_assessment.gpu_resident
-                    )
-                ):
-                    message = (
-                        config.placement_assessment.rejection_reason
-                        or "The selected placement cannot keep the full-context plan on GPU."
-                    )
-                    yield from fail_operation(
-                        OperationType.DEPLOY,
-                        message,
-                        exit_code=2,
-                        recoverable=False,
-                    )
-                    return
-                tuning = config.runtime_tuning or tuning_for_objective(
-                    config.serving_requirements.objective,
-                    speculative_decoding=config.speculative_decoding,
-                )
-                tuning = replace(
-                    tuning,
-                    speculative_decoding=config.speculative_decoding,
-                )
-                tuning = tuning_for_architecture(tuning, config.gguf_architecture)
-                config.runtime_tuning = tuning
-                config.max_context_tokens = config.serving_requirements.context_tokens
-                config.server_args = compile_server_args_string(
-                    config.serving_requirements,
-                    tuning,
-                    extra_args=shlex.split(config.server_args or ""),
-                )
-                # Fast Deploy expresses the all-GPU invariant in canonical
-                # server args; keeping this unset avoids a conflicting legacy
-                # integer override in provider adapters.
-                config.n_gpu_layers = None
-                if config.placement_assessment is not None:
-                    config.required_vram_gb = config.placement_assessment.memory.total_gb
+                return False
+            except Exception as exc:
                 yield LogEvent(
                     line=(
-                        "Serving plan: full "
-                        f"{config.serving_requirements.context_tokens:,}-token context, "
-                        f"{tuning.parallel_slots} parallel slot(s), GPU-only placement."
+                        "Engram table preflight warning: could not inspect "
+                        f"per-layer embedding shards ({exc}). Continuing unverified."
                     ),
                     operation=OperationType.DEPLOY,
-                    is_milestone=True,
                 )
-            elif config.gguf_architecture == "glm5next" and compatibility.is_supported:
-                config.server_args = shlex.join([
-                    *shlex.split(config.server_args or ""), "--flash-attn", "off",
-                ])
+            else:
+                if engram_table is not None:
+                    config.engram_table = engram_table
+                    if engram_message:
+                        yield LogEvent(
+                            line=engram_message,
+                            operation=OperationType.DEPLOY,
+                            is_milestone=True,
+                        )
+
+        if config.dspark or config.dspark_repo or config.dspark_file:
+            try:
+                config.dspark_draft = resolve_dspark_draft(config)
+            except Exception as exc:
+                yield from fail_operation(
+                    OperationType.DEPLOY,
+                    f"DSpark preflight failed: {exc}",
+                    exit_code=2,
+                    recoverable=False,
+                )
+                return False
+            config.speculative_decoding = None
+            yield LogEvent(
+                line=f"DSpark draft: {config.dspark_draft.filename} ({config.dspark_draft.size_bytes / 1e9:.2f} GB).",
+                operation=OperationType.DEPLOY,
+            )
+        else:
+            yield from self._prepare_llamacpp_speculative_decoding(config)
+
+        if config.serving_requirements is not None:
+            if (
+                config.placement_assessment is not None
+                and (
+                    not config.placement_assessment.fits
+                    or not config.placement_assessment.gpu_resident
+                )
+            ):
+                message = (
+                    config.placement_assessment.rejection_reason
+                    or "The selected placement cannot keep the full-context plan on GPU."
+                )
+                yield from fail_operation(
+                    OperationType.DEPLOY, message, exit_code=2, recoverable=False
+                )
+                return False
+            tuning = config.runtime_tuning or tuning_for_objective(
+                config.serving_requirements.objective,
+                speculative_decoding=config.speculative_decoding,
+            )
+            tuning = replace(tuning, speculative_decoding=config.speculative_decoding)
+            tuning = tuning_for_architecture(tuning, config.gguf_architecture)
+            config.runtime_tuning = tuning
+            config.max_context_tokens = config.serving_requirements.context_tokens
+            config.server_args = compile_server_args_string(
+                config.serving_requirements,
+                tuning,
+                extra_args=shlex.split(config.server_args or ""),
+            )
+            config.n_gpu_layers = None
+            if config.placement_assessment is not None:
+                config.required_vram_gb = config.placement_assessment.memory.total_gb
+            yield LogEvent(
+                line=(
+                    "Serving plan: full "
+                    f"{config.serving_requirements.context_tokens:,}-token context, "
+                    f"{tuning.parallel_slots} parallel slot(s), GPU-only placement."
+                ),
+                operation=OperationType.DEPLOY,
+                is_milestone=True,
+            )
+        elif config.gguf_architecture == "glm5next" and compatibility.is_supported:
+            config.server_args = shlex.join([
+                *shlex.split(config.server_args or ""), "--flash-attn", "off",
+            ])
+        return True
+
+    def _prepare_vision(self, config: DeploymentConfig) -> Generator[BaseEvent, None, bool]:
+        """Validate vision configuration before provisioning compute."""
         from .vision import prepare_vision
+
         try:
             vision = prepare_vision(config)
         except (ValueError, OSError) as exc:
             yield from fail_operation(OperationType.DEPLOY, str(exc), exit_code=2)
-            return
-        yield LogEvent(line=f"Vision: {vision.message} Enabled: {vision.enabled}; verification: untested.", operation=OperationType.DEPLOY)
+            return False
+        yield LogEvent(
+            line=f"Vision: {vision.message} Enabled: {vision.enabled}; verification: untested.",
+            operation=OperationType.DEPLOY,
+        )
         if vision.enabled and config.serving_requirements is not None:
             yield from fail_operation(
                 OperationType.DEPLOY,
                 "Vision working memory is not calibrated for guaranteed-fit deployment. "
-                "Use manual Deploy, or select text-only mode.", exit_code=2,
+                "Use manual Deploy, or select text-only mode.",
+                exit_code=2,
+            )
+            return False
+        return True
+
+    def deploy(self, config: DeploymentConfig) -> EventStream:
+        """Run a full deploy workflow (preflight + preparation + provider deploy)."""
+        from .deployment_preflight import preflight_config
+
+        preflight = preflight_config(config)
+        blocking = [finding for finding in preflight.findings if finding.blocking]
+        if blocking:
+            yield from fail_operation(
+                OperationType.DEPLOY, blocking[0].message, exit_code=2, recoverable=False
             )
             return
-        # Provider-specific execution lives behind ProviderAdapter; this
-        # method owns only shared preparation (preflight, reasoning, tuning,
-        # vision) that applies before any provider allocates compute.
+        yield from self._prepare_reasoning(config)
+        if config.backend == BackendType.LLAMACPP and not (
+            yield from self._prepare_llamacpp_deploy(config)
+        ):
+            return
+        if not (yield from self._prepare_vision(config)):
+            return
+
         if config.provider == ComputeProvider.PRIME:
             yield from self.deploy_prime_only(config)
             return
@@ -569,40 +570,33 @@ class Orchestrator:
         yield from self.deploy_modal_only(config)
 
     def deploy_modal_only(self, config: DeploymentConfig) -> EventStream:
-        """Execute the Modal-specific deploy step (adapter entrypoint)."""
-        options = config.provider_options
-        if config.do_deploy and isinstance(options, ModalProviderOptions) and options.max_hourly_cost_usd is not None:
-            try:
-                rates = fetch_modal_gpu_catalog(force_refresh=True)
-                unit = next((r.price_per_hour_usd for r in rates if r.value == config.gpu_type and r.stale_since is None), None)
-                current = unit * (config.gpu_count or 1) if unit is not None else None
-                finding = price_cap_finding(options.max_hourly_cost_usd, current)
-            except Exception as exc:
-                yield from fail_operation(OperationType.DEPLOY, f"Could not verify the Modal GPU rate: {exc}")
-                return
-            if finding:
-                yield from fail_operation(OperationType.DEPLOY, finding.message)
-                return
-            config.price_per_hour_usd = current
-        if config.do_deploy and config.backend != BackendType.VLLM and not config.function_slug:
-            config.function_slug = random_function_slug()
-        if config.backend == BackendType.VLLM and config.do_deploy:
-            # A Modal web endpoint is reachable by anyone who learns its URL,
-            # so it gets the same minted bearer token Prime and Vast endpoints
-            # have always had rather than serving the account's GPU to the
-            # open internet.
-            config.endpoint_api_key = config.endpoint_api_key or secrets.token_urlsafe(32)
-        settings = self.config_store.load()
-        env = ModalBackend.build_full_env(settings, config)
+        """Execute the Modal-specific deploy step."""
+        from .modal_deployment import deploy_modal
 
-        if config.backend == BackendType.VLLM:
-            yield from self._deploy_vllm(config, env)
-        else:
-            yield from self._deploy_llamacpp(config, env)
+        yield from deploy_modal(
+            config,
+            config_store=self.config_store,
+            slug_factory=random_function_slug,
+            gpu_catalog_fetcher=fetch_modal_gpu_catalog,
+            vllm_deployer=self._deploy_vllm,
+            llamacpp_deployer=self._deploy_llamacpp,
+        )
+
+    def _prime_runner(self) -> Any:
+        from .prime_deployment import PrimeDeploymentRunner
+
+        return PrimeDeploymentRunner(
+            prime_backend=self.prime_backend,
+            config_store=getattr(self, "config_store", None),
+            launch_spec_resolver=resolve_prime_launch_spec,
+            offer_disk_resolver=resolve_prime_offer_and_disk,
+            shutdown_event_fn=shutdown_event,
+            monotonic_fn=time.monotonic,
+        )
 
     def deploy_prime_only(self, config: DeploymentConfig) -> EventStream:
-        """Execute the Prime-specific deploy step (adapter entrypoint)."""
-        yield from self._deploy_prime(config)
+        """Execute the Prime-specific deploy step."""
+        yield from self._prime_runner().deploy(config)
 
     def _llamacpp_compatibility(
         self,
@@ -766,59 +760,7 @@ class Orchestrator:
         self, pod_id: str, created: dict[str, Any]
     ) -> Generator[BaseEvent, None, dict[str, Any]]:
         """Poll until the Prime pod reports ACTIVE with SSH reachable."""
-        # Same shape as the runtime wait below: state lines are emitted only
-        # when the state text changes, and a pod can sit in one state for many
-        # minutes. Reported on an interval so the silence cannot be mistaken
-        # for a stall.
-        waiting_started = time.monotonic()
-        deadline = waiting_started + 1800
-        reported_at = waiting_started
-        last_state = ""
-        pod = created
-        while time.monotonic() < deadline:
-            pod = self.prime_backend.get_pod(pod_id)
-            state = str(pod.get("status") or "unknown").upper()
-            install = str(pod.get("installationStatus") or "").upper()
-            progress = pod.get("installationProgress")
-            state_detail = f"{state}/{install or '-'}"
-            if progress is not None:
-                state_detail += f" ({progress}%)"
-            if state_detail != last_state:
-                yield LogEvent(
-                    line=f"Prime pod state: {state_detail}",
-                    operation=OperationType.DEPLOY,
-                    is_milestone=True,
-                )
-                last_state = state_detail
-                reported_at = time.monotonic()
-            if state in {"ERROR", "TERMINATED"} or install == "FAILED":
-                failure = str(pod.get("installationFailure") or state_detail)
-                raise PrimeApiError(f"Prime pod provisioning failed: {failure}")
-            ssh_ready = bool(pod.get("sshConnection"))
-            if (
-                state == "ACTIVE"
-                and install in {"", "FINISHED"}
-                and ssh_ready
-            ):
-                break
-            if (
-                last_state
-                and time.monotonic() - reported_at >= _PRIME_PROGRESS_REPORT_SECONDS
-            ):
-                reported_at = time.monotonic()
-                elapsed = _format_elapsed(time.monotonic() - waiting_started)
-                yield LogEvent(
-                    line=f"Prime pod state: {last_state} (waiting {elapsed})",
-                    operation=OperationType.DEPLOY,
-                    is_milestone=True,
-                )
-            if shutdown_event().wait(timeout=5):
-                raise PrimeApiError("Prime deployment cancelled during provisioning.")
-        else:
-            raise PrimeApiError("Timed out waiting for the Prime pod to become active.")
-
-        return pod
-
+        return (yield from self._prime_runner().await_pod_active(pod_id, created))
 
     def _establish_prime_endpoint(
         self,
@@ -828,442 +770,41 @@ class Orchestrator:
         options: Any,
     ) -> Generator[BaseEvent, None, tuple[str, EndpointInfo | None]]:
         """Publish the pod's endpoint and wait for the runtime to serve it."""
-        endpoint = ""
-        announced: EndpointInfo | None = None
-        tunnel_id = ""
-        tunnel_ready = False
-        if options.allow_insecure_http:
-            endpoint = self.prime_backend.endpoint_url(
-                pod,
-                allow_insecure_http=True,
-                allow_direct_ip=True,
+        return (
+            yield from self._prime_runner().establish_endpoint(
+                config, pod, pod_id, options
             )
-            yield LogEvent(
-                line="Prime networking: direct HTTP fallback enabled",
-                operation=OperationType.DEPLOY,
-                is_milestone=True,
-            )
-            announced = _prime_endpoint_info(config, pod_id, endpoint)
-            yield LogEvent(
-                line=f"Prime endpoint URL ready: {endpoint}",
-                operation=OperationType.DEPLOY,
-                is_milestone=True,
-            )
-            yield EndpointAvailableEvent(
-                endpoint=announced,
-                operation=OperationType.DEPLOY,
-            )
-            tunnel_ready = True
-        else:
-            yield StateChangeEvent(
-                current=DeploymentState.DEPLOYING,
-                operation=OperationType.DEPLOY,
-                detail="Creating a secure Prime Tunnel endpoint",
-            )
-            tunnel = self.prime_backend.create_tunnel(
-                pod_id,
-                name=config.app_name or f"llm-launchpad-{pod_id}",
-            )
-            self.prime_backend.start_tunnel(pod, tunnel)
-            tunnel_id = tunnel.tunnel_id
-            endpoint = tunnel.url
-            tunnel_expiry = (
-                f"; registration expires {tunnel.expires_at}"
-                if tunnel.expires_at
-                else ""
-            )
-            yield LogEvent(
-                line=(
-                    f"Prime networking: secure tunnel {tunnel.tunnel_id}"
-                    f"{tunnel_expiry}"
-                ),
-                operation=OperationType.DEPLOY,
-                is_milestone=True,
-            )
-
-        runtime_ready = False
-        last_runtime_detail = ""
-        last_tunnel_detail = ""
-        # Lines are only emitted when the detail text changes, and the detail
-        # for a model download is a constant string whenever the pod cannot
-        # report an expected size. A 109 GB download then produced exactly one
-        # log line and minutes of silence, which reads as a hang on a screen
-        # that is billing by the hour. Vast already reports every 30s while it
-        # waits; this does the same for Prime.
-        waiting_started = time.monotonic()
-        reported_at = waiting_started
-        wait_deadline = waiting_started + 1800
-        while time.monotonic() < wait_deadline:
-            if not runtime_ready:
-                ready, failed, detail = self.prime_backend.bootstrap_runtime_status(pod)
-                if detail and detail != last_runtime_detail:
-                    yield LogEvent(
-                        line=f"Prime runtime: {detail}",
-                        operation=OperationType.DEPLOY,
-                        is_milestone=True,
-                    )
-                    last_runtime_detail = detail
-                    reported_at = time.monotonic()
-                if failed:
-                    raise PrimeApiError(f"Prime runtime bootstrap failed: {detail}")
-                if ready:
-                    runtime_ready = True
-            if not tunnel_ready:
-                ready, failed, detail = self.prime_backend.tunnel_runtime_status(
-                    pod,
-                    tunnel_id,
-                )
-                if detail and detail != last_tunnel_detail:
-                    yield LogEvent(
-                        line=f"Prime Tunnel: {detail}",
-                        operation=OperationType.DEPLOY,
-                        is_milestone=True,
-                    )
-                    last_tunnel_detail = detail
-                if failed:
-                    raise PrimeApiError(f"Prime Tunnel failed: {detail}")
-                if ready:
-                    tunnel_ready = True
-                    announced = _prime_endpoint_info(config, pod_id, endpoint)
-                    yield LogEvent(
-                        line=f"Prime endpoint URL ready: {endpoint}",
-                        operation=OperationType.DEPLOY,
-                        is_milestone=True,
-                    )
-                    yield EndpointAvailableEvent(
-                        endpoint=announced,
-                        operation=OperationType.DEPLOY,
-                    )
-            if runtime_ready and tunnel_ready:
-                break
-            if (
-                not runtime_ready
-                and last_runtime_detail
-                and time.monotonic() - reported_at >= _PRIME_PROGRESS_REPORT_SECONDS
-            ):
-                reported_at = time.monotonic()
-                elapsed = _format_elapsed(time.monotonic() - waiting_started)
-                yield LogEvent(
-                    line=f"Prime runtime: {last_runtime_detail} (waiting {elapsed})",
-                    operation=OperationType.DEPLOY,
-                    is_milestone=True,
-                )
-            if shutdown_event().wait(timeout=5):
-                raise PrimeApiError("Prime deployment cancelled during runtime startup.")
-        else:
-            if not runtime_ready:
-                raise PrimeApiError("Timed out waiting for the Prime runtime to load.")
-            raise PrimeApiError("Timed out waiting for Prime Tunnel to connect.")
-
-        return endpoint, announced
-
+        )
 
     def _await_prime_public_endpoint(self, endpoint: str, api_key: str) -> None:
-        """Block until the published URL answers, raising ``PrimeApiError`` on timeout.
-
-        ``_deploy_prime`` guarantees the key by generating one when absent.
-        """
-        public_deadline = time.monotonic() + 120
-        public_error = "endpoint did not respond"
-        while time.monotonic() < public_deadline:
-            public_ready, public_error = self.prime_backend.public_endpoint_ready(
-                endpoint,
-                api_key,
-            )
-            if public_ready:
-                break
-            if shutdown_event().wait(timeout=5):
-                raise PrimeApiError("Prime deployment cancelled during endpoint startup.")
-        else:
-            raise PrimeApiError(
-                "Prime runtime is healthy inside the pod, but its public endpoint "
-                f"is unreachable: {public_error}"
-            )
-
+        """Block until the published URL answers, raising ``PrimeApiError`` on timeout."""
+        self._prime_runner().await_public_endpoint(endpoint, api_key)
 
     def _cleanup_failed_prime_pod(
         self, pod_id: str, options: Any, message: str
     ) -> Generator[BaseEvent, None, tuple[str, dict[str, object] | None]]:
-        """Drain the failed pod's logs and release it.
-
-        Returns (final message, rollback report). The rollback report lets the
-        lifecycle decide retry eligibility without mutating caller state: a
-        confirmed rollback allows the next approved placement, anything else
-        blocks it to avoid double-billing.
-        """
-        rollback: dict[str, object] | None = None
-        if pod_id:
-            try:
-                for line in self.prime_backend.get_pod_logs(pod_id):
-                    yield LogEvent(line=line, operation=OperationType.DEPLOY)
-            except Exception:
-                log_exception(f"Could not read logs from failed Prime pod {pod_id}")
-            if options.keep_failed_resource:
-                yield LogEvent(
-                    line=f"Keeping failed Prime pod {pod_id}; billing may continue.",
-                    operation=OperationType.DEPLOY,
-                    is_milestone=True,
-                )
-                rollback = {"attempted": False, "confirmed": False, "detail": "kept for inspection"}
-            else:
-                try:
-                    self.prime_backend.delete_pod(pod_id)
-                    yield LogEvent(
-                        line=f"Terminated failed Prime pod {pod_id}.",
-                        operation=OperationType.DEPLOY,
-                        is_milestone=True,
-                    )
-                    rollback = {"attempted": True, "confirmed": True, "detail": ""}
-                except Exception as cleanup_exc:
-                    message = f"{message} Cleanup also failed: {cleanup_exc}"
-                    rollback = {"attempted": True, "confirmed": False, "detail": str(cleanup_exc)}
-        return message, rollback
+        """Drain the failed pod's logs and release it."""
+        return (
+            yield from self._prime_runner().cleanup_failed_pod(pod_id, options, message)
+        )
 
     def _deploy_prime(self, config: DeploymentConfig) -> EventStream:
         """Provision a Prime pod and resolve its public inference endpoint."""
-        options = prime_provider_options(config)
-        requirement_error = _prime_launch_requirement_error(config)
-        if requirement_error is None:
-            # The authoritative preflight owns these messages; the local check
-            # stays as a backstop so direct orchestrator callers keep the same
-            # wording when they bypass the gate.
-            from .deployment_preflight import preflight_config
-
-            findings = preflight_config(config).findings
-            blocking = [finding for finding in findings if finding.blocking]
-            if blocking:
-                requirement_error = blocking[0].message
-        if requirement_error:
-            yield from fail_operation(
-                OperationType.DEPLOY, requirement_error, exit_code=2, recoverable=False
-            )
-            return
-
-        config.endpoint_api_key = config.endpoint_api_key or secrets.token_urlsafe(32)
-        pod_id = ""
-        try:
-            launch = resolve_prime_launch_spec(config)
-            yield StateChangeEvent(
-                current=DeploymentState.QUEUED,
-                operation=OperationType.DEPLOY,
-                detail="Fetching Prime GPU availability",
-            )
-            offer, disk_id, disk_messages = resolve_prime_offer_and_disk(
-                self.prime_backend,
-                config,
-                required_image=launch.offer_image,
-            )
-            config.price_per_hour_usd = offer.price_per_hour
-            bind_prime_disk(config, disk_id)
-            options = prime_provider_options(config)
-            price = (
-                f"${offer.price_per_hour:.2f}/hr"
-                if offer.price_per_hour is not None
-                else "price unavailable"
-            )
-            yield LogEvent(
-                line=(
-                    f"Selected Prime offer {offer.id}: {offer.gpu_count}x {offer.gpu_type} "
-                    f"via {offer.provider_name} ({offer.country or offer.region or '-'}, {price})"
-                ),
-                operation=OperationType.DEPLOY,
-                is_milestone=True,
-            )
-            for line in disk_messages:
-                yield LogEvent(
-                    line=line,
-                    operation=OperationType.DEPLOY,
-                    is_milestone=True,
-                )
-            yield LogEvent(
-                line=f"Prime runtime: portable bootstrap on {launch.offer_image}",
-                operation=OperationType.DEPLOY,
-                is_milestone=True,
-            )
-            yield StateChangeEvent(
-                current=DeploymentState.DEPLOYING,
-                operation=OperationType.DEPLOY,
-                detail=f"Provisioning Prime pod {config.app_name or ''}".strip(),
-            )
-            created = self.prime_backend.create_pod(config, offer)
-            pod_id = str(created.get("id") or "").strip()
-            if not pod_id:
-                raise PrimeApiError("Prime did not return a pod ID.")
-            yield ResourceAllocatedEvent(app_id=pod_id)
-            yield LogEvent(
-                line=f"Prime pod created: {pod_id}",
-                operation=OperationType.DEPLOY,
-                is_milestone=True,
-            )
-
-            pod = yield from self._await_prime_pod_active(pod_id, created)
-
-            yield StateChangeEvent(
-                current=DeploymentState.DEPLOYING,
-                operation=OperationType.DEPLOY,
-                detail="Installing the portable Prime inference runtime",
-            )
-            self.prime_backend.start_bootstrap_runtime(config, pod)
-
-            endpoint, announced = yield from self._establish_prime_endpoint(
-                config, pod, pod_id, options
-            )
-
-            yield StateChangeEvent(
-                current=DeploymentState.DEPLOYING,
-                operation=OperationType.DEPLOY,
-                detail="Waiting for the public inference endpoint",
-            )
-            self._await_prime_public_endpoint(endpoint, config.endpoint_api_key or "")
-            yield from self._start_prime_idle_shutdown(config, pod, pod_id, endpoint)
-            info = announced or _prime_endpoint_info(config, pod_id, endpoint)
-            info.web_url = endpoint
-            info.state = "running"
-            yield LogEvent(
-                line=f"Prime endpoint: {endpoint}",
-                operation=OperationType.DEPLOY,
-                is_milestone=True,
-            )
-            yield OperationCompleteEvent(
-                operation=OperationType.DEPLOY,
-                success=True,
-                data=info,
-            )
-        except Exception as exc:
-            message, rollback = yield from self._cleanup_failed_prime_pod(
-                pod_id, options, str(exc)
-            )
-            yield from fail_operation(
-                OperationType.DEPLOY, message,
-                data={"rollback": rollback} if rollback is not None else None,
-            )
+        yield from self._prime_runner().deploy(config)
 
     def _deploy_vllm(
         self, config: DeploymentConfig, env: dict[str, str]
     ) -> EventStream:
-        if config.do_deploy:
-            cmd = ModalBackend.build_deploy_command(config.backend, app_name=config.app_name)
-            yield StateChangeEvent(
-                current=DeploymentState.DEPLOYING,
-                operation=OperationType.DEPLOY,
-                detail=" ".join(cmd),
-            )
-            yield LogEvent(line=f"Running: {' '.join(cmd)}")
-            if env:
-                yield LogEvent(line=f"  env: {', '.join(f'{k}={v}' for k, v in env.items())}")
-            yield from _tag_operation(
-                ModalBackend.run_streaming(cmd, env=env),
-                OperationType.DEPLOY,
-            )
-        elif config.run_smoke:
-            cmd = ["modal", "run", BackendType.VLLM.script]
-            yield StateChangeEvent(
-                current=DeploymentState.RUNNING,
-                operation=OperationType.SMOKE_TEST,
-                detail=" ".join(cmd),
-            )
-            yield LogEvent(line=f"Running: {' '.join(cmd)}")
-            yield from _tag_operation(
-                ModalBackend.run_streaming(cmd, env=env),
-                OperationType.SMOKE_TEST,
-            )
+        from .modal_deployment import _deploy_vllm
+
+        yield from _deploy_vllm(config, env)
 
     def _deploy_llamacpp(
         self, config: DeploymentConfig, env: dict[str, str]
     ) -> EventStream:
-        def _run_step(
-            cmd: list[str],
-            *,
-            state: DeploymentState,
-            emit_env: bool,
-        ) -> Generator[BaseEvent, None, tuple[bool, int, str]]:
-            yield StateChangeEvent(
-                current=state,
-                operation=OperationType.DEPLOY,
-                detail=" ".join(cmd),
-            )
-            yield LogEvent(line=f"Running: {' '.join(cmd)}")
-            if emit_env and env:
-                yield LogEvent(line=f"  env: {', '.join(f'{k}={v}' for k, v in env.items())}")
+        from .modal_deployment import _deploy_llamacpp
 
-            saw_completion = False
-            success = True
-            exit_code = 0
-            detail = ""
-            for event in ModalBackend.run_streaming(cmd, env=env):
-                if isinstance(event, OperationCompleteEvent):
-                    saw_completion = True
-                    success = event.success
-                    exit_code = event.exit_code
-                    detail = event.detail
-                    continue
-                if isinstance(event, ErrorEvent):
-                    yield ErrorEvent(
-                        message=event.message,
-                        operation=OperationType.DEPLOY,
-                        exit_code=event.exit_code,
-                        recoverable=event.recoverable,
-                    )
-                    return False, event.exit_code or 1, event.message
-                if isinstance(event, LogEvent):
-                    yield LogEvent(
-                        line=event.line,
-                        stream=event.stream,
-                        operation=OperationType.DEPLOY,
-                    )
-                    continue
-                yield event
-
-            if not saw_completion:
-                return False, 1, "Command finished without completion event."
-            return success, exit_code, detail
-
-        if not config.do_deploy:
-            cmd = ModalBackend.build_run_command(config)
-            ok, exit_code, detail = yield from _run_step(
-                cmd,
-                state=DeploymentState.RUNNING,
-                emit_env=True,
-            )
-            yield OperationCompleteEvent(
-                operation=OperationType.DEPLOY,
-                success=ok,
-                exit_code=exit_code,
-                detail=detail,
-            )
-            return
-
-        # Split llama.cpp flow into:
-        # 1) configure + optional preload (`modal run ...::main` without nested deploy)
-        # 2) explicit `modal deploy`
-        prep_config = replace(config, do_deploy=False)
-        prep_cmd = ModalBackend.build_run_command(prep_config)
-        prep_ok, prep_exit_code, prep_detail = yield from _run_step(
-            prep_cmd,
-            state=DeploymentState.DEPLOYING,
-            emit_env=True,
-        )
-        if not prep_ok:
-            yield OperationCompleteEvent(
-                operation=OperationType.DEPLOY,
-                success=False,
-                exit_code=prep_exit_code,
-                detail=prep_detail or "llama.cpp preparation step failed",
-            )
-            return
-
-        deploy_cmd = ModalBackend.build_deploy_command(config.backend, app_name=config.app_name)
-        deploy_ok, deploy_exit_code, deploy_detail = yield from _run_step(
-            deploy_cmd,
-            state=DeploymentState.DEPLOYING,
-            emit_env=False,
-        )
-        yield OperationCompleteEvent(
-            operation=OperationType.DEPLOY,
-            success=deploy_ok,
-            exit_code=deploy_exit_code,
-            detail=deploy_detail,
-        )
+        yield from _deploy_llamacpp(config, env)
 
     def _start_prime_idle_shutdown(
         self,
@@ -1273,64 +814,8 @@ class Orchestrator:
         endpoint: str,
     ) -> EventStream:
         """Arrange for an idle pod to be deleted: on the pod if allowed, else here."""
-        from .idle_watchdog import describe_idle_shutdown, resolve_idle_shutdown
-        from .local_watchdog import spawn_local_watchdog
-
-        try:
-            settings = self.config_store.load()
-        except Exception:
-            settings = LaunchpadSettings()
-        idle = resolve_idle_shutdown(config, settings)
-        if idle <= 0:
-            yield LogEvent(
-                line="Idle shutdown is off: this pod bills until you stop it.",
-                operation=OperationType.DEPLOY,
-            )
-            return
-        described = describe_idle_shutdown(idle)
-        self_terminate = settings.prime_self_terminate
-        if self_terminate:
-            try:
-                self.prime_backend.start_idle_watchdog(
-                    pod, pod_id, config.endpoint_api_key or "", idle
-                )
-            except Exception as exc:
-                log_exception("Failed to start the on-pod idle watchdog")
-                yield LogEvent(
-                    line=f"Could not start idle shutdown on the pod ({exc}); watching from this computer instead.",
-                    operation=OperationType.DEPLOY,
-                )
-            else:
-                yield LogEvent(
-                    line=f"Idle shutdown: {described} (runs on the pod).",
-                    operation=OperationType.DEPLOY,
-                    is_milestone=True,
-                )
-                return
-        try:
-            spawn_local_watchdog(
-                app_name=config.app_name or "",
-                backend=config.backend.value,
-                pod_id=pod_id,
-                endpoint_url=endpoint,
-                endpoint_api_key=config.endpoint_api_key or "",
-                idle_seconds=idle,
-            )
-        except Exception as exc:
-            log_exception("Failed to start the local idle watchdog")
-            yield LogEvent(
-                line=f"Warning: could not start idle shutdown ({exc}). This pod bills until you stop it.",
-                operation=OperationType.DEPLOY,
-                is_milestone=True,
-            )
-            return
-        yield LogEvent(
-            line=(
-                f"Idle shutdown: {described}, while this computer is awake. "
-                "To cover sleep too, allow Prime pods to stop themselves in Settings."
-            ),
-            operation=OperationType.DEPLOY,
-            is_milestone=True,
+        yield from self._prime_runner().start_idle_shutdown(
+            config, pod, pod_id, endpoint
         )
 
     # ------------------------------------------------------------------
@@ -1890,47 +1375,16 @@ class Orchestrator:
             )
 
     # ------------------------------------------------------------------
-    # Storage
+    # Storage (delegated to modal_storage)
     # ------------------------------------------------------------------
 
     def list_storage(self) -> EventStream:
         """List cached model artifacts for both backends."""
-        yield StateChangeEvent(
-            current=DeploymentState.RUNNING,
-            operation=OperationType.STORAGE_LIST,
-            detail="Scanning Modal volumes for cached models",
-        )
-        scan_started = time.perf_counter()
-        try:
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                llamacpp_future = executor.submit(self._list_llamacpp_models)
-                vllm_future = executor.submit(self._list_vllm_models)
-                snapshot = StorageSnapshot(
-                    llamacpp_models=llamacpp_future.result(),
-                    vllm_models=vllm_future.result(),
-                )
-        except Exception as exc:
-            yield from fail_operation(
-                OperationType.STORAGE_LIST,
-                f'Failed to list storage: {exc}',
-                detail=str(exc),
-            )
-            return
+        from .modal_storage import stream_list_storage
 
-        scan_elapsed_ms = int((time.perf_counter() - scan_started) * 1000)
-        yield LogEvent(
-            line=(
-                f"Storage snapshot: llama.cpp={len(snapshot.llamacpp_models)} models, "
-                f"vLLM={len(snapshot.vllm_models)} models, "
-                f"total={snapshot.total_models}, bytes={snapshot.total_size_bytes}, "
-                f"scan_ms={scan_elapsed_ms}"
-            ),
-            operation=OperationType.STORAGE_LIST,
-        )
-        yield OperationCompleteEvent(
-            operation=OperationType.STORAGE_LIST,
-            success=True,
-            data=snapshot,
+        yield from stream_list_storage(
+            llamacpp_volume=self._LLAMACPP_STORAGE_VOLUME,
+            vllm_volume=self._VLLM_STORAGE_VOLUME,
         )
 
     def predownload_model(
@@ -1941,335 +1395,45 @@ class Orchestrator:
         revision: str | None = None,
     ) -> EventStream:
         """Pre-download a model for a backend without deploying."""
-        if backend == BackendType.LLAMACPP:
-            script = MODAL_LLAMACPP_SCRIPT
-            entrypoint = "predownload_model"
-            args = ["--repo-id", model_id]
-            if quant:
-                args.extend(["--quant", quant])
-            if revision:
-                args.extend(["--revision", revision])
-        else:
-            script = MODAL_VLLM_SCRIPT
-            entrypoint = "predownload_model"
-            args = ["--repo-id", model_id]
-            if revision:
-                args.extend(["--revision", revision])
+        from .modal_storage import stream_predownload_model
 
-        cmd = ModalBackend.build_modal_entrypoint_command(script, entrypoint, args)
-        # `modal run` creates an app for the duration of the call. Without a
-        # name it takes the script default, which is the legacy app name, and
-        # the fleet then shows a stopped endpoint the user never deployed.
-        env = {"MODAL_APP_NAME": utility_app_name(backend)}
-        yield StateChangeEvent(
-            current=DeploymentState.RUNNING,
-            operation=OperationType.STORAGE_PREDOWNLOAD,
-            detail=" ".join(cmd),
+        yield from stream_predownload_model(
+            backend, model_id, quant=quant, revision=revision
         )
-        yield LogEvent(
-            line=f"Running: {' '.join(cmd)}",
-            operation=OperationType.STORAGE_PREDOWNLOAD,
-        )
-
-        for event in ModalBackend.run_modal_script_entrypoint(script, entrypoint, args=args, env=env):
-            if isinstance(event, OperationCompleteEvent):
-                yield OperationCompleteEvent(
-                    operation=OperationType.STORAGE_PREDOWNLOAD,
-                    success=event.success,
-                    exit_code=event.exit_code,
-                    detail=event.detail,
-                    data=event.data,
-                )
-            elif isinstance(event, ErrorEvent):
-                yield ErrorEvent(
-                    message=event.message,
-                    operation=OperationType.STORAGE_PREDOWNLOAD,
-                    exit_code=event.exit_code,
-                    recoverable=event.recoverable,
-                )
-            elif isinstance(event, LogEvent):
-                yield LogEvent(
-                    line=event.line,
-                    stream=event.stream,
-                    operation=OperationType.STORAGE_PREDOWNLOAD,
-                )
-            else:
-                yield event
 
     def delete_stored_model(self, model: StoredModelInfo) -> EventStream:
         """Delete cached storage artifacts for a selected model."""
-        targets = self._storage_delete_targets(model)
-        if not targets:
-            yield from fail_operation(
-                OperationType.STORAGE_DELETE,
-                f'No removable paths found for {model.model_id}',
-                detail='No paths resolved for deletion.',
-            )
-            return
+        from .modal_storage import stream_delete_stored_model
 
-        yield StateChangeEvent(
-            current=DeploymentState.RUNNING,
-            operation=OperationType.STORAGE_DELETE,
-            detail=f"Deleting {model.model_id}",
-        )
-        for volume_name, remote_path, recursive in targets:
-            yield LogEvent(
-                line=f"Deleting {remote_path} from {volume_name}",
-                operation=OperationType.STORAGE_DELETE,
-            )
-            for event in ModalBackend.run_volume_remove(volume_name, remote_path, recursive=recursive):
-                if isinstance(event, OperationCompleteEvent):
-                    if not event.success:
-                        yield OperationCompleteEvent(
-                            operation=OperationType.STORAGE_DELETE,
-                            success=False,
-                            exit_code=event.exit_code,
-                            detail=event.detail or f"Failed removing {remote_path}",
-                        )
-                        return
-                    continue
-                if isinstance(event, ErrorEvent):
-                    yield from fail_operation(
-                        OperationType.STORAGE_DELETE,
-                        event.message,
-                        exit_code=event.exit_code or 1,
-                        recoverable=event.recoverable,
-                        error_exit_code=event.exit_code,
-                    )
-                    return
-                if isinstance(event, LogEvent):
-                    yield LogEvent(
-                        line=event.line,
-                        stream=event.stream,
-                        operation=OperationType.STORAGE_DELETE,
-                    )
-                else:
-                    yield event
-
-        yield OperationCompleteEvent(
-            operation=OperationType.STORAGE_DELETE,
-            success=True,
-            detail=f"Deleted storage for {model.model_id}",
+        yield from stream_delete_stored_model(
+            model,
+            llamacpp_volume=self._LLAMACPP_STORAGE_VOLUME,
+            vllm_volume=self._VLLM_STORAGE_VOLUME,
         )
 
     def _list_llamacpp_models(self) -> list[StoredModelInfo]:
-        backend_rows = self._list_llamacpp_models_via_backend()
-        if backend_rows is not None:
-            return backend_rows
-        return self._list_llamacpp_models_from_volume()
+        from .modal_storage import list_llamacpp_models
+
+        return list_llamacpp_models(llamacpp_volume=self._LLAMACPP_STORAGE_VOLUME)
 
     def _list_llamacpp_models_via_backend(self) -> list[StoredModelInfo] | None:
-        captured = ModalBackend.run_modal_script_entrypoint_capture(
-            MODAL_LLAMACPP_SCRIPT,
-            "list_downloaded_models_json",
-            env={"MODAL_APP_NAME": utility_app_name(BackendType.LLAMACPP)},
+        from .modal_storage import list_llamacpp_models_via_backend
+
+        return list_llamacpp_models_via_backend(
+            llamacpp_volume=self._LLAMACPP_STORAGE_VOLUME
         )
-        if not captured:
-            return None
-        returncode, stdout, _stderr = captured
-        if returncode != 0 or not stdout.strip():
-            return None
-
-        lines = stdout.splitlines()
-        try:
-            start = lines.index(_LLAMACPP_STORAGE_JSON_BEGIN)
-            end = lines.index(_LLAMACPP_STORAGE_JSON_END, start + 1)
-        except ValueError:
-            return None
-        if end <= start + 1:
-            return []
-
-        payload_text = "\n".join(lines[start + 1 : end]).strip()
-        if not payload_text:
-            return []
-        try:
-            payload = json.loads(payload_text)
-        except Exception:
-            return None
-        if not isinstance(payload, list):
-            return None
-
-        rows: list[StoredModelInfo] = []
-        for item in payload:
-            if not isinstance(item, dict):
-                continue
-            model_id = str(item.get("model_id", "")).strip()
-            if not model_id:
-                continue
-            revision_raw = item.get("revision")
-            quant_raw = item.get("quant")
-            source_volume_raw = item.get("source_volume")
-            paths_raw = item.get("paths")
-            rows.append(
-                StoredModelInfo(
-                    backend=BackendType.LLAMACPP,
-                    model_id=model_id,
-                    revision=str(revision_raw).strip() if revision_raw not in (None, "") else None,
-                    quant=str(quant_raw).strip() if quant_raw not in (None, "") else None,
-                    size_bytes=max(0, int(item.get("size_bytes", 0) or 0)),
-                    file_count=max(0, int(item.get("file_count", 0) or 0)),
-                    source_volume=(
-                        str(source_volume_raw).strip()
-                        if source_volume_raw not in (None, "")
-                        else self._LLAMACPP_STORAGE_VOLUME
-                    ),
-                    paths=[str(p) for p in paths_raw if isinstance(p, str)]
-                    if isinstance(paths_raw, list)
-                    else [],
-                    incomplete=False,
-                )
-            )
-        return sorted(rows, key=lambda row: (row.model_id, row.revision or ""))
 
     def _list_llamacpp_models_from_volume(self) -> list[StoredModelInfo]:
-        grouped: dict[tuple[str, str | None], StoredModelInfo] = {}
-        blob_files: dict[str, set[str]] = {}
-        incomplete_blob_files: dict[str, set[str]] = {}
-        snapshot_gguf_sizes: dict[str, list[int]] = {}
-        hub_files = self._walk_volume_files(self._LLAMACPP_STORAGE_VOLUME, "/hub")
-        for row in hub_files:
-            path = str(row.get("path", "")).strip()
-            size = int(row.get("size_bytes", 0) or 0)
-            rel = path.removeprefix("/hub/").strip("/")
-            if not rel.startswith("models--"):
-                continue
-            if not row.get("is_file", False):
-                continue
-            parts = rel.split("/")
-            if len(parts) < 2:
-                continue
-            model_dir = parts[0]
-            encoded = model_dir[len("models--") :]
-            model_id = encoded.replace("--", "/")
-            lower_path = path.lower()
-            if "/blobs/" in lower_path:
-                blob_name = path.rsplit("/", 1)[-1].strip()
-                if blob_name.endswith(".incomplete"):
-                    final_blob_name = blob_name[: -len(".incomplete")]
-                    if final_blob_name:
-                        incomplete_blob_files.setdefault(model_id, set()).add(final_blob_name)
-                elif blob_name:
-                    blob_files.setdefault(model_id, set()).add(blob_name)
-            if not lower_path.endswith(".gguf"):
-                continue
-            snapshot_gguf_sizes.setdefault(model_id, []).append(size)
-            key = (model_id, None)
-            entry = grouped.get(key)
-            if entry is None:
-                entry = StoredModelInfo(
-                    backend=BackendType.LLAMACPP,
-                    model_id=model_id,
-                    revision=None,
-                    quant=None,
-                    size_bytes=0,
-                    file_count=0,
-                    source_volume=self._LLAMACPP_STORAGE_VOLUME,
-                    paths=[],
-                )
-                grouped[key] = entry
-            entry.size_bytes += size
-            entry.file_count += 1
-            if entry.paths is not None and path not in entry.paths:
-                entry.paths.append(path)
-            if entry.quant is None:
-                quant_match = _GGUF_QUANT_RE.search(path.upper())
-                if quant_match:
-                    entry.quant = quant_match.group(1).upper()
+        from .modal_storage import list_llamacpp_models_from_volume
 
-        for (model_id, _revision), entry in grouped.items():
-            known_blobs = blob_files.get(model_id, set())
-            pending_blobs = incomplete_blob_files.get(model_id, set())
-            unresolved_incomplete = any(blob_name not in known_blobs for blob_name in pending_blobs)
-            gguf_sizes = snapshot_gguf_sizes.get(model_id, [])
-            tiny_snapshot_without_blob = (
-                bool(gguf_sizes)
-                and all(size < _LLAMACPP_MIN_PLAUSIBLE_GGUF_BYTES for size in gguf_sizes)
-                and not known_blobs
-            )
-            if unresolved_incomplete or tiny_snapshot_without_blob:
-                entry.incomplete = True
-
-        return sorted(grouped.values(), key=lambda row: (row.model_id, row.revision or ""))
+        return list_llamacpp_models_from_volume(
+            llamacpp_volume=self._LLAMACPP_STORAGE_VOLUME
+        )
 
     def _list_vllm_models(self) -> list[StoredModelInfo]:
-        files = self._walk_volume_files(self._VLLM_STORAGE_VOLUME, "/hub")
-        grouped: dict[str, StoredModelInfo] = {}
-        blob_files: dict[str, set[str]] = {}
-        incomplete_blob_files: dict[str, set[str]] = {}
-        snapshot_file_counts: dict[str, int] = {}
-        ref_file_counts: dict[str, int] = {}
-        gguf_models: set[str] = set()
-        for row in files:
-            path = str(row.get("path", "")).strip()
-            size = int(row.get("size_bytes", 0) or 0)
-            rel = path.removeprefix("/hub/").strip("/")
-            if not rel.startswith("models--"):
-                continue
-            parts = rel.split("/")
-            if not parts:
-                continue
-            model_dir = parts[0]
-            encoded = model_dir[len("models--") :]
-            model_id = encoded.replace("--", "/")
-            entry = grouped.get(model_id)
-            if entry is None:
-                entry = StoredModelInfo(
-                    backend=BackendType.VLLM,
-                    model_id=model_id,
-                    revision=None,
-                    quant=None,
-                    size_bytes=0,
-                    file_count=0,
-                    source_volume=self._VLLM_STORAGE_VOLUME,
-                    paths=[],
-                )
-                grouped[model_id] = entry
-            if row.get("is_file", False):
-                entry.size_bytes += size
-                entry.file_count += 1
-                lower_path = path.lower()
-                if "/snapshots/" in lower_path:
-                    snapshot_file_counts[model_id] = snapshot_file_counts.get(model_id, 0) + 1
-                if "/refs/" in lower_path:
-                    ref_file_counts[model_id] = ref_file_counts.get(model_id, 0) + 1
-                if "/blobs/" in lower_path:
-                    blob_name = path.rsplit("/", 1)[-1].strip()
-                    if blob_name.endswith(".incomplete"):
-                        final_blob_name = blob_name[: -len(".incomplete")]
-                        if final_blob_name:
-                            incomplete_blob_files.setdefault(model_id, set()).add(final_blob_name)
-                    elif blob_name:
-                        blob_files.setdefault(model_id, set()).add(blob_name)
-                if lower_path.endswith(".gguf"):
-                    gguf_models.add(model_id)
-                if entry.paths is not None and path not in entry.paths:
-                    entry.paths.append(path)
+        from .modal_storage import list_vllm_models
 
-        for model_id in list(grouped.keys()):
-            if model_id in gguf_models:
-                del grouped[model_id]
-
-        if not grouped:
-            return []
-
-        for model_id, entry in grouped.items():
-            known_blobs = blob_files.get(model_id, set())
-            pending_blobs = incomplete_blob_files.get(model_id, set())
-            snapshot_count = snapshot_file_counts.get(model_id, 0)
-            ref_count = ref_file_counts.get(model_id, 0)
-            # Align with huggingface_hub cache semantics:
-            # incomplete blobs are resumable partial downloads, but once the
-            # final blob exists, download logic treats that file as complete.
-            # Keep stale orphan .incomplete blobs from old attempts from marking
-            # a model incomplete when a usable snapshot already exists.
-            unresolved_incomplete = any(blob_name not in known_blobs for blob_name in pending_blobs)
-            if unresolved_incomplete and snapshot_count == 0:
-                entry.incomplete = True
-            # Refs without snapshots indicate metadata without an accessible
-            # snapshot payload for this repo.
-            if ref_count > 0 and snapshot_count == 0:
-                entry.incomplete = True
-        return sorted(grouped.values(), key=lambda row: row.model_id)
+        return list_vllm_models(vllm_volume=self._VLLM_STORAGE_VOLUME)
 
     def _walk_volume_files(
         self,
@@ -2277,133 +1441,44 @@ class Orchestrator:
         root: str,
         recursive: bool = True,
     ) -> list[dict[str, Any]]:
-        pending = [root]
-        files: list[dict[str, Any]] = []
-        visited: set[str] = set()
-        while pending:
-            current = pending.pop()
-            if current in visited:
-                continue
-            visited.add(current)
-            rows = ModalBackend.list_volume(volume_name, current) or []
-            for row in rows:
-                path = self._volume_entry_path(current, row)
-                if not path:
-                    continue
-                is_dir = self._volume_entry_is_dir(row, path)
-                if is_dir:
-                    if path == current or not recursive:
-                        continue
-                    pending.append(path)
-                else:
-                    files.append(
-                        {
-                            "path": path,
-                            "size_bytes": Orchestrator._parse_size_bytes(
-                                Orchestrator._entry_value(
-                                    row, "size", "size_bytes", "bytes", "filesize"
-                                )
-                            ),
-                            "is_file": True,
-                        }
-                    )
-        return files
+        from .modal_storage import walk_volume_files
+
+        return walk_volume_files(volume_name, root, recursive=recursive)
 
     def _storage_delete_targets(
         self, model: StoredModelInfo
     ) -> list[tuple[str, str, bool]]:
-        targets: list[tuple[str, str, bool]] = []
-        if model.backend == BackendType.LLAMACPP:
-            encoded = model.model_id.replace("/", "--")
-            targets.append(
-                (
-                    model.source_volume or self._LLAMACPP_STORAGE_VOLUME,
-                    f"/hub/models--{encoded}",
-                    True,
-                )
-            )
-            return targets
+        from .modal_storage import storage_delete_targets
 
-        if model.backend == BackendType.VLLM:
-            encoded = model.model_id.replace("/", "--")
-            targets.append(
-                (
-                    model.source_volume or self._VLLM_STORAGE_VOLUME,
-                    f"/hub/models--{encoded}",
-                    True,
-                )
-            )
-        return targets
+        return storage_delete_targets(
+            model,
+            llamacpp_volume=self._LLAMACPP_STORAGE_VOLUME,
+            vllm_volume=self._VLLM_STORAGE_VOLUME,
+        )
 
     @staticmethod
     def _entry_value(row: dict[str, Any], *keys: str) -> Any:
-        """Case-insensitive lookup for JSON fields from Modal CLI."""
-        lowered = {str(key).strip().lower(): value for key, value in row.items()}
-        for key in keys:
-            needle = key.strip().lower()
-            if needle in lowered:
-                return lowered[needle]
-        return None
+        from .modal_storage import entry_value
+
+        return entry_value(row, *keys)
 
     @staticmethod
     def _volume_entry_path(parent: str, row: dict[str, Any]) -> str:
-        for key in ("path", "name", "file", "filename", "entry"):
-            value = Orchestrator._entry_value(row, key)
-            if isinstance(value, str) and value.strip():
-                candidate = value.strip()
-                if candidate.startswith("/"):
-                    return candidate
-                parent_clean = parent.strip("/")
-                if parent_clean and candidate.startswith(f"{parent_clean}/"):
-                    return f"/{candidate.lstrip('/')}"
-                if parent == "/" and candidate:
-                    return f"/{candidate.lstrip('/')}"
-                if parent.endswith("/"):
-                    return f"{parent}{candidate}"
-                return f"{parent}/{candidate}"
-        return ""
+        from .modal_storage import volume_entry_path
+
+        return volume_entry_path(parent, row)
 
     @staticmethod
     def _volume_entry_is_dir(row: dict[str, Any], path: str) -> bool:
-        is_dir = Orchestrator._entry_value(row, "is_dir", "isdir", "directory")
-        if isinstance(is_dir, bool):
-            return is_dir
-        entry_type = str(Orchestrator._entry_value(row, "type", "kind") or "").strip().lower()
-        if entry_type in {"dir", "directory", "folder"}:
-            return True
-        # With no explicit dir flag or type, a slash-terminated path is the signal.
-        return path.endswith("/")
+        from .modal_storage import volume_entry_is_dir
+
+        return volume_entry_is_dir(row, path)
 
     @staticmethod
     def _parse_size_bytes(value: Any) -> int:
-        if value is None:
-            return 0
-        if isinstance(value, (int, float)):
-            return int(value)
-        text = str(value).strip()
-        if not text:
-            return 0
-        clean = text.replace(",", "")
-        if clean.isdigit():
-            return int(clean)
-        match = _SIZE_TOKEN_RE.match(clean)
-        if not match:
-            return 0
-        number = float(match.group("num"))
-        unit = (match.group("unit") or "B").upper()
-        factors = {
-            "B": 1,
-            "KB": 1024,
-            "MB": 1024**2,
-            "GB": 1024**3,
-            "TB": 1024**4,
-            "KIB": 1024,
-            "MIB": 1024**2,
-            "GIB": 1024**3,
-            "TIB": 1024**4,
-        }
-        factor = factors.get(unit, 1)
-        return int(number * factor)
+        from .modal_storage import parse_size_bytes
+
+        return parse_size_bytes(value)
 
     # ------------------------------------------------------------------
     # Stop

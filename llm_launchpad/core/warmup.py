@@ -22,6 +22,7 @@ import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from collections.abc import Generator, Iterable
 from urllib.parse import urlsplit
@@ -435,90 +436,61 @@ class _ModalLogTail:
         return proc
 
 
-def _certify_serving_requirements(
+def _verify_runtime_context(
     requests_module: Any,
     *,
     backend: BackendType,
     server_url: str,
     headers: dict[str, str],
-    probe_model: str,
     serving_requirements: ServingRequirements,
-    placement_assessment: PlacementAssessment | None,
-    runtime_id: str | None,
-    phase_timer: StartupPhaseTimer | None = None,
-    price_per_hour_usd: float | None = None,
-    runtime_log_text: str = "",
-    app_name: str = "",
-) -> Generator[BaseEvent, None, RuntimeAttestation | None]:
-    """Verify full-context GPU residency and throughput for a ready endpoint.
+) -> Generator[BaseEvent, None, tuple[LlamacppRuntimeEvidence, int] | None]:
+    """Read ``/props`` for llama.cpp or accept vLLM's requested context."""
+    from .runtime_evidence import combine_runtime_evidence, runtime_props_evidence
 
-    Yields certification progress and, on failure, the events that end the
-    warmup. Returns the attestation, or ``None`` when certification failed and
-    the caller should stop.
+    runtime_evidence = combine_runtime_evidence()
+    if backend != BackendType.LLAMACPP:
+        return runtime_evidence, serving_requirements.context_tokens
 
-    Residency is read off the runtime, never off the plan: the effective
-    context comes from ``/props`` and the offload report from the server logs.
-    Evidence that *contradicts* residency fails the endpoint. Evidence that is
-    merely missing does not: the log stream is lossy -- Modal coalesced a
-    70-second burst covering the whole tensor-load phase, which is exactly
-    where llama.cpp prints its offload report -- and tearing down a server
-    that has loaded, answered ``/props`` and served a completion punishes the
-    user for a gap in someone else's telemetry. The retained logs are re-read
-    and an earlier certificate for this same placement is consulted before
-    residency is called unknown, and a certificate written without observation
-    is graded ``PREDICTED`` so it never passes for a measurement.
-    ``price_per_hour_usd`` is the placement's current quote price; the
-    requirements' ``max_hourly_cost_usd`` is a budget cap and must not stand
-    in for it.
-    """
-    yield StateChangeEvent(
-        current=DeploymentState.VERIFYING,
-        operation=OperationType.WARMUP,
-        detail="Verifying full-context GPU residency",
-    )
+    props_url = endpoint_root_url(server_url) + "/props"
+    try:
+        props_response = requests_module.get(
+            props_url,
+            headers=headers,
+            timeout=15,
+        )
+        props_response.raise_for_status()
+        runtime_evidence = combine_runtime_evidence(
+            runtime_evidence,
+            runtime_props_evidence(props_response.json()),
+        )
+        return runtime_evidence, runtime_evidence.effective_context_tokens or 0
+    except Exception as exc:
+        last_err = f"runtime property verification failed: {exc}"
+        yield from fail_operation(
+            OperationType.WARMUP,
+            f"Endpoint responded, but Launchpad could not verify its effective context: {exc}",
+            recoverable=False,
+            detail=last_err,
+        )
+        return None
+
+
+def _verify_gpu_residency(
+    *,
+    backend: BackendType,
+    serving_requirements: ServingRequirements,
+    placement_assessment: PlacementAssessment,
+    runtime_evidence: LlamacppRuntimeEvidence,
+    runtime_log_text: str,
+    app_name: str,
+) -> Generator[BaseEvent, None, tuple[LlamacppRuntimeEvidence, bool, EvidenceLevel | None] | None]:
+    """Check runtime offload logs/cache and reject contradicted GPU residency."""
     from .runtime_evidence import (
         combine_runtime_evidence,
         remembered_attestation_evidence,
         runtime_log_evidence,
-        runtime_props_evidence,
     )
 
-    runtime_evidence = combine_runtime_evidence()
-    effective_context = 0
-    if backend == BackendType.LLAMACPP:
-        props_url = endpoint_root_url(server_url) + "/props"
-        try:
-            props_response = requests_module.get(
-                props_url,
-                headers=headers,
-                timeout=15,
-            )
-            props_response.raise_for_status()
-            runtime_evidence = combine_runtime_evidence(
-                runtime_evidence,
-                runtime_props_evidence(props_response.json()),
-            )
-            effective_context = runtime_evidence.effective_context_tokens or 0
-        except Exception as exc:
-            last_err = f"runtime property verification failed: {exc}"
-            yield from fail_operation(
-                OperationType.WARMUP,
-                f'Endpoint responded, but Launchpad could not verify its effective context: {exc}',
-                recoverable=False,
-                detail=last_err,
-            )
-            return None
-    else:
-        effective_context = serving_requirements.context_tokens
-    if placement_assessment is None:
-        detail = "No placement assessment was supplied for runtime certification."
-        yield from fail_operation(
-            OperationType.WARMUP,
-            f'Runtime attestation failed: {detail}',
-            recoverable=False,
-            detail=detail,
-        )
-        return None
     if backend == BackendType.LLAMACPP and runtime_log_text.strip():
         runtime_evidence = combine_runtime_evidence(
             runtime_evidence,
@@ -546,8 +518,7 @@ def _certify_serving_requirements(
                     operation=OperationType.WARMUP,
                 )
         if observed_residency is False:
-            # This is the case worth failing on: the runtime said where the
-            # layers went, and some of them are not on the GPU.
+            # Fail when the runtime explicitly placed layers off GPU.
             detail = (
                 f"Requested {serving_requirements.context_tokens:,} context with "
                 f"GPU-only placement; the runtime reported "
@@ -556,7 +527,7 @@ def _certify_serving_requirements(
             )
             yield from fail_operation(
                 OperationType.WARMUP,
-                f'Runtime attestation failed: {detail}',
+                f"Runtime attestation failed: {detail}",
                 recoverable=False,
                 detail=detail,
             )
@@ -584,6 +555,68 @@ def _certify_serving_requirements(
             placement_assessment.gpu_resident
             and placement_assessment.tuning.gpu_layers.casefold() == "all"
         )
+    return runtime_evidence, gpu_resident, residency_evidence
+
+
+def _certify_serving_requirements(
+    requests_module: Any,
+    *,
+    backend: BackendType,
+    server_url: str,
+    headers: dict[str, str],
+    probe_model: str,
+    serving_requirements: ServingRequirements,
+    placement_assessment: PlacementAssessment | None,
+    runtime_id: str | None,
+    phase_timer: StartupPhaseTimer | None = None,
+    price_per_hour_usd: float | None = None,
+    runtime_log_text: str = "",
+    app_name: str = "",
+) -> Generator[BaseEvent, None, RuntimeAttestation | None]:
+    """Verify full-context GPU residency and throughput for a ready endpoint.
+
+    Yields certification progress and, on failure, the events that end the
+    warmup. Returns the attestation, or ``None`` when certification failed and
+    the caller should stop.
+    """
+    yield StateChangeEvent(
+        current=DeploymentState.VERIFYING,
+        operation=OperationType.WARMUP,
+        detail="Verifying full-context GPU residency",
+    )
+    context_result = yield from _verify_runtime_context(
+        requests_module,
+        backend=backend,
+        server_url=server_url,
+        headers=headers,
+        serving_requirements=serving_requirements,
+    )
+    if context_result is None:
+        return None
+    runtime_evidence, effective_context = context_result
+
+    if placement_assessment is None:
+        detail = "No placement assessment was supplied for runtime certification."
+        yield from fail_operation(
+            OperationType.WARMUP,
+            f"Runtime attestation failed: {detail}",
+            recoverable=False,
+            detail=detail,
+        )
+        return None
+
+    residency_result = yield from _verify_gpu_residency(
+        backend=backend,
+        serving_requirements=serving_requirements,
+        placement_assessment=placement_assessment,
+        runtime_evidence=runtime_evidence,
+        runtime_log_text=runtime_log_text,
+        app_name=app_name,
+    )
+    if residency_result is None:
+        return None
+    runtime_evidence, gpu_resident, residency_evidence = residency_result
+
     if (
         effective_context < serving_requirements.context_tokens
         or (serving_requirements.gpu_only and not gpu_resident)
@@ -595,13 +628,12 @@ def _certify_serving_requirements(
         )
         yield from fail_operation(
             OperationType.WARMUP,
-            f'Runtime attestation failed: {detail}',
+            f"Runtime attestation failed: {detail}",
             recoverable=False,
             detail=detail,
         )
         return None
 
-    performance: tuple[PerformancePoint, ...] = ()
     yield StateChangeEvent(
         current=DeploymentState.CALIBRATING,
         operation=OperationType.WARMUP,
@@ -612,11 +644,7 @@ def _certify_serving_requirements(
         server_url=server_url,
         model=probe_model,
         headers=headers,
-        parallel_slots=(
-            placement_assessment.tuning.parallel_slots
-            if placement_assessment is not None
-            else 1
-        ),
+        parallel_slots=placement_assessment.tuning.parallel_slots,
         price_per_hour_usd=price_per_hour_usd,
         budget_seconds=_CALIBRATION_BUDGET_SECONDS,
         phase_timer=phase_timer,
@@ -639,10 +667,35 @@ def _certify_serving_requirements(
         )
         return None
 
-    total_layers = max(
-        1,
-        placement_assessment.memory.total_layer_count or 0,
+    return (
+        yield from _record_certified_attestation(
+            backend=backend,
+            serving_requirements=serving_requirements,
+            placement_assessment=placement_assessment,
+            runtime_evidence=runtime_evidence,
+            effective_context=effective_context,
+            gpu_resident=gpu_resident,
+            residency_evidence=residency_evidence,
+            performance=performance,
+            runtime_id=runtime_id,
+        )
     )
+
+
+def _record_certified_attestation(
+    *,
+    backend: BackendType,
+    serving_requirements: ServingRequirements,
+    placement_assessment: PlacementAssessment,
+    runtime_evidence: LlamacppRuntimeEvidence,
+    effective_context: int,
+    gpu_resident: bool,
+    residency_evidence: EvidenceLevel | None,
+    performance: tuple[PerformancePoint, ...],
+    runtime_id: str | None,
+) -> Generator[BaseEvent, None, RuntimeAttestation]:
+    """Persist and announce a verified runtime attestation."""
+    total_layers = max(1, placement_assessment.memory.total_layer_count or 0)
     observed_gpu_layers = runtime_evidence.gpu_layers
     observed_total_layers = runtime_evidence.total_layers
     if backend == BackendType.LLAMACPP and observed_gpu_layers is not None:
@@ -670,26 +723,16 @@ def _certify_serving_requirements(
             operation=OperationType.WARMUP,
         )
     best_single = max(
-        (
-            point.output_tokens_per_second or 0.0
-            for point in performance
-            if point.concurrency == 1
-        ),
+        (point.output_tokens_per_second or 0.0 for point in performance if point.concurrency == 1),
         default=0.0,
     )
     best_aggregate = max(
-        (
-            point.aggregate_output_tokens_per_second or 0.0
-            for point in performance
-        ),
+        (point.aggregate_output_tokens_per_second or 0.0 for point in performance),
         default=0.0,
     )
     metric = ""
     if best_single > 0:
-        metric = (
-            f" · {best_single:.1f} tok/s single, "
-            f"{best_aggregate:.1f} tok/s aggregate"
-        )
+        metric = f" · {best_single:.1f} tok/s single, {best_aggregate:.1f} tok/s aggregate"
     yield LogEvent(
         line=(
             f"Configured {effective_context:,}-token context with "
@@ -702,8 +745,397 @@ def _certify_serving_requirements(
     return attestation
 
 
+@dataclass(frozen=True)
+class WarmupRequest:
+    """Typed parameters for one endpoint warmup and certification run."""
+
+    backend: BackendType
+    server_url: str
+    timeout: int = 1800
+    tail_logs: bool = True
+    app_name: str | None = None
+    served_model_name: str | None = None
+    provider: ComputeProvider = ComputeProvider.MODAL
+    api_key: str | None = None
+    pod_id: str | None = None
+    prime_backend: PrimeBackend | None = None
+    serving_requirements: ServingRequirements | None = None
+    placement_assessment: PlacementAssessment | None = None
+    runtime_id: str | None = None
+    vision: VisionCapabilities | None = None
+    phase_timer: StartupPhaseTimer | None = None
+    price_per_hour_usd: float | None = None
+
+
+class _WarmupSession:
+    """Stateful execution driver for one :class:`WarmupRequest`."""
+
+    _MAX_BACKOFF_SECONDS = 30.0
+
+    def __init__(self, request: WarmupRequest) -> None:
+        self.req = request
+        self.start = time.time()
+        self.is_vllm = request.backend == BackendType.VLLM
+        self.probe_url = status_probe_url(request.backend, request.server_url)
+        self.target_app_name = request.app_name or legacy_app_name(request.backend)
+        self.tail_modal_logs = request.tail_logs and request.provider == ComputeProvider.MODAL
+        self.calibration = FitCalibrationRecorder(request.placement_assessment)
+        self.log_tail = _ModalLogTail(self.target_app_name)
+        self.llama_probe_model = (request.served_model_name or "").strip() or "default"
+        self.payload = {
+            "model": self.llama_probe_model,
+            "prompt": "ping",
+            "max_tokens": 1,
+            "temperature": 0,
+        }
+        self.headers = {"Content-Type": "application/json"}
+        if request.api_key:
+            self.headers["Authorization"] = f"Bearer {request.api_key}"
+        self.last_err: str | None = None
+        self.last_scheduling_hint: str | None = None
+        self.next_system_log_check = self.start + 20
+        self.unrecoverable: str | None = None
+        self.draft_context_error = False
+        self.managed_dspark = False
+
+    def _timeout_message(self, detail: str | None) -> str:
+        if self.last_scheduling_hint:
+            return (
+                f"Timed out after {self.req.timeout}s "
+                f"({self.last_scheduling_hint}). Last error: {detail}"
+            )
+        return f"Timed out after {self.req.timeout}s. Last error: {detail}"
+
+    def _report_scheduling(self, hint: str | None) -> EventStream:
+        if hint and hint != self.last_scheduling_hint:
+            self.last_scheduling_hint = hint
+            yield StateChangeEvent(
+                current=DeploymentState.QUEUED,
+                operation=OperationType.WARMUP,
+                detail=hint,
+            )
+            yield LogEvent(line=hint, operation=OperationType.WARMUP)
+
+    def _drain_live_logs(self, events: Iterable[BaseEvent] | None = None) -> EventStream:
+        stream = events if events is not None else self.log_tail.drain()
+        for event in stream:
+            if not isinstance(event, LogEvent):
+                yield event
+                continue
+            line = event.line
+            if self.tail_modal_logs:
+                yield from self._report_scheduling(modal_gpu_scheduling_hint(line))
+            yield event
+            if self.req.backend == BackendType.LLAMACPP:
+                self.managed_dspark |= (
+                    "using DSpark draft file:" in line or "--spec-type draft-dspark" in line
+                )
+                self.draft_context_error |= "dflash requires ctx_other to be set" in line
+                failed_load = _LLAMACPP_CONTEXT_LOAD_FAILURE_RE.search(line)
+                if (
+                    failed_load
+                    and not is_target_gguf(failed_load["path"].rsplit("/", 1)[-1])
+                ) or (
+                    self.draft_context_error
+                    and not self.managed_dspark
+                    and "exiting due to model loading error" in line
+                ):
+                    self.unrecoverable = _LLAMACPP_AUXILIARY_MODEL_FAILURE
+            if self.unrecoverable is None:
+                self.unrecoverable = terminal_startup_failure(line)
+            measured = self.calibration.observe(line)
+            if measured is not None:
+                yield LogEvent(
+                    line=(
+                        "Recorded llama.cpp's own measurement: "
+                        f"{measured.graph_gb:.1f} GB of graph memory per GPU "
+                        f"(measured on {measured.gpu_count}x {measured.gpu_type})."
+                    ),
+                    operation=OperationType.WARMUP,
+                )
+
+    def _reattach_modal_logs_if_needed(self) -> EventStream:
+        if self.tail_modal_logs and self.log_tail.may_attach():
+            # Historical-fetch fallback: the live stream may miss the final
+            # output of a crashing container while Modal's persisted logs keep it.
+            yield from self._drain_live_logs(
+                fetch_historical_logs(self.target_app_name, self.log_tail.seen_lines)
+            )
+            yield from self.log_tail.attach()
+
+    def _fail_if_unrecoverable(self) -> Generator[BaseEvent, None, bool]:
+        if self.unrecoverable is None:
+            return False
+        self.log_tail.stop("on unrecoverable startup failure")
+        yield from fail_operation(
+            OperationType.WARMUP,
+            self.unrecoverable,
+            recoverable=False,
+            detail=self.unrecoverable,
+        )
+        return True
+
+    def _maybe_check_system_scheduling(self, now: float) -> EventStream:
+        if (
+            self.tail_modal_logs
+            and self.last_scheduling_hint is None
+            and now >= self.next_system_log_check
+        ):
+            yield from self._report_scheduling(
+                _recent_modal_scheduling_hint(self.target_app_name, self.start)
+            )
+            self.next_system_log_check = now + 30
+
+    def _send_probe(self, requests_module: Any, probe_timeout: float) -> Any:
+        if self.is_vllm:
+            return requests_module.get(
+                self.probe_url, headers=self.headers, timeout=probe_timeout
+            )
+        return requests_module.post(
+            self.probe_url,
+            headers=self.headers,
+            data=json.dumps(self.payload),
+            timeout=probe_timeout,
+        )
+
+    def _execute_probe(
+        self, requests_module: Any, probe_timeout: float
+    ) -> Generator[BaseEvent, None, tuple[Any, Exception | None, bool]]:
+        """Run one probe attempt, draining Modal logs while waiting."""
+        if self.req.provider != ComputeProvider.MODAL:
+            try:
+                return self._send_probe(requests_module, probe_timeout), None, False
+            except Exception as exc:
+                return None, exc, False
+
+        probe_queue = _start_probe_thread(
+            lambda t: self._send_probe(requests_module, t), probe_timeout
+        )
+        while True:
+            try:
+                probe_resp, probe_exc = probe_queue.get(timeout=0.5)
+                return probe_resp, probe_exc, False
+            except queue.Empty:
+                if is_shutting_down():
+                    self.log_tail.stop("on shutdown")
+                    return None, None, True
+                yield from self._reattach_modal_logs_if_needed()
+                yield from self._drain_live_logs()
+                if (yield from self._fail_if_unrecoverable()):
+                    return None, None, True
+                now = time.time()
+                if now - self.start > self.req.timeout:
+                    self.log_tail.stop("on timeout")
+                    yield from fail_operation(
+                        OperationType.WARMUP,
+                        self._timeout_message(
+                            self.last_err or f"Read timed out while probing {self.probe_url}"
+                        ),
+                    )
+                    return None, None, True
+                yield from self._maybe_check_system_scheduling(now)
+
+    def _handle_ready_endpoint(self, requests_module: Any) -> EventStream:
+        """Certify residency/vision, emit the curl hint, and finish healthy."""
+        self.log_tail.stop("after readiness")
+        if self.req.phase_timer is not None:
+            self.req.phase_timer.ready()
+        attestation = None
+        if self.req.serving_requirements is not None:
+            attestation = yield from _certify_serving_requirements(
+                requests_module,
+                backend=self.req.backend,
+                server_url=self.req.server_url,
+                headers=self.headers,
+                probe_model=self.llama_probe_model,
+                serving_requirements=self.req.serving_requirements,
+                placement_assessment=self.req.placement_assessment,
+                runtime_id=self.req.runtime_id,
+                phase_timer=self.req.phase_timer,
+                price_per_hour_usd=self.req.price_per_hour_usd,
+                runtime_log_text="\n".join(sorted(self.log_tail.seen_lines)),
+                app_name=self.target_app_name or "",
+            )
+            if attestation is None:
+                return
+
+        if self.req.vision is not None and self.req.vision.enabled:
+            yield LogEvent(
+                line="Verifying image input with a bundled PNG.",
+                operation=OperationType.WARMUP,
+            )
+            try:
+                verify_image_request(
+                    self.req.server_url,
+                    self.req.served_model_name,
+                    self.req.api_key,
+                    self.req.vision,
+                )
+            except Exception as exc:
+                yield from fail_operation(
+                    OperationType.WARMUP,
+                    f"Image verification failed: {exc}",
+                    data={VISION_PROBE_FAILED: True},
+                )
+                return
+            yield LogEvent(
+                line="Image request verified (not a visual accuracy benchmark).",
+                operation=OperationType.WARMUP,
+            )
+        yield LogEvent(line="Server is ready!")
+        if self.req.phase_timer is not None:
+            yield from self.req.phase_timer.finish_events()
+        curl_cmd = ModalBackend.test_curl_command(
+            self.req.backend,
+            self.req.server_url,
+            served_model_name=self.req.served_model_name,
+            api_key=self.req.api_key,
+        )
+        if self.req.api_key:
+            curl_cmd = curl_cmd.replace(self.req.api_key, "$LLM_LAUNCHPAD_API_KEY")
+        yield LogEvent(line=f"Test command:\n{curl_cmd}")
+        yield StateChangeEvent(
+            current=DeploymentState.HEALTHY, operation=OperationType.WARMUP
+        )
+        yield OperationCompleteEvent(
+            operation=OperationType.WARMUP,
+            success=True,
+            data={"url": self.req.server_url, "attestation": attestation},
+        )
+
+    def _handle_non_ready_response(self, status_code: int, body: str, readiness_reason: str | None) -> EventStream:
+        if 200 <= status_code < 300 and readiness_reason:
+            self.last_err = f"HTTP {status_code} (not ready): {readiness_reason}; body={body[:200]}"
+        else:
+            self.last_err = f"HTTP {status_code}: {body[:200]}"
+        if self.req.provider == ComputeProvider.MODAL:
+            yield from self._report_scheduling(modal_gpu_scheduling_hint(body))
+        if (
+            self.req.tail_logs
+            and self.req.provider == ComputeProvider.PRIME
+            and self.req.pod_id
+            and self.req.prime_backend is not None
+        ):
+            try:
+                lines = self.req.prime_backend.get_pod_logs(self.req.pod_id, tail=200)
+                for line in lines:
+                    if line not in self.log_tail.seen_lines:
+                        self.log_tail.seen_lines.add(line)
+                        yield LogEvent(line=line, operation=OperationType.WARMUP)
+            except Exception:
+                log_exception("Failed to fetch Prime pod logs during warmup")
+
+    def _sleep_between_probes(self, wait_seconds: float) -> EventStream:
+        sleep_end = time.time() + wait_seconds
+        while time.time() < sleep_end:
+            if is_shutting_down():
+                break
+            chunk = min(0.5, sleep_end - time.time())
+            if chunk > 0:
+                shutdown_event().wait(timeout=chunk)
+            yield from self._drain_live_logs()
+            if self.unrecoverable is not None:
+                break
+
+    def run(self) -> EventStream:
+        """Execute the readiness probe loop and certification steps."""
+        yield StateChangeEvent(
+            current=DeploymentState.WARMING_UP,
+            operation=OperationType.WARMUP,
+            detail=f"Probing {self.req.server_url}",
+            timeout_seconds=self.req.timeout,
+        )
+        yield LogEvent(line=f"Probing readiness at: {self.probe_url}")
+        url_error = endpoint_url_error(self.probe_url)
+        if url_error:
+            yield from fail_operation(
+                OperationType.WARMUP,
+                f"Invalid endpoint URL: {url_error}",
+                exit_code=2,
+                recoverable=False,
+            )
+            return
+
+        if self.tail_modal_logs:
+            yield from self.log_tail.attach()
+
+        try:
+            import requests
+        except ImportError:
+            yield from fail_operation(
+                OperationType.WARMUP,
+                "'requests' is required. Install with: pip install requests",
+                recoverable=False,
+            )
+            return
+
+        backoff = 2.0
+        while True:
+            if is_shutting_down():
+                self.log_tail.stop("on shutdown")
+                return
+
+            yield from self._reattach_modal_logs_if_needed()
+            yield from self._drain_live_logs()
+            if (yield from self._fail_if_unrecoverable()):
+                return
+
+            elapsed = time.time() - self.start
+            if elapsed > self.req.timeout:
+                self.log_tail.stop("on timeout")
+                yield from fail_operation(
+                    OperationType.WARMUP,
+                    self._timeout_message(self.last_err),
+                )
+                return
+
+            probe_timeout = _probe_timeout_seconds(
+                self.req.provider, self.req.timeout, elapsed
+            )
+            probe_resp, probe_exc, aborted = yield from self._execute_probe(
+                requests, probe_timeout
+            )
+            if aborted:
+                return
+
+            if probe_exc is not None:
+                self.last_err = str(probe_exc)
+            else:
+                try:
+                    body = probe_resp.text or ""
+                    ready_ok, readiness_reason = probe_response_is_ready(
+                        self.req.backend, probe_resp.status_code, body
+                    )
+                    if ready_ok:
+                        yield from self._handle_ready_endpoint(requests)
+                        return
+                    yield from self._handle_non_ready_response(
+                        probe_resp.status_code, body, readiness_reason
+                    )
+                except Exception as exc:
+                    self.last_err = str(exc)
+
+            yield from self._maybe_check_system_scheduling(time.time())
+
+            # Keep retry pauses short after a Modal cold-start timeout/connect
+            # error so Modal sees continuous demand until a container binds.
+            cold_modal_retry = (
+                self.req.provider == ComputeProvider.MODAL and probe_exc is not None
+            )
+            wait_seconds = (
+                _MODAL_COLD_RETRY_BACKOFF_SECONDS if cold_modal_retry else backoff
+            )
+            yield from self._sleep_between_probes(wait_seconds)
+            if not cold_modal_retry:
+                backoff = min(self._MAX_BACKOFF_SECONDS, backoff * 1.5)
+
+
 class WarmupRunner:
     """Probe endpoint readiness while optionally tailing Modal logs."""
+
+    def run_request(self, request: WarmupRequest) -> EventStream:
+        """Execute a typed :class:`WarmupRequest`."""
+        yield from _WarmupSession(request).run()
 
     def run(
         self,
@@ -725,324 +1157,26 @@ class WarmupRunner:
         price_per_hour_usd: float | None = None,
     ) -> EventStream:
         """Probe endpoint readiness and optionally tail logs."""
-        start = time.time()
-        yield StateChangeEvent(
-            current=DeploymentState.WARMING_UP,
-            operation=OperationType.WARMUP,
-            detail=f"Probing {server_url}",
-            timeout_seconds=timeout,
+        yield from self.run_request(
+            WarmupRequest(
+                backend=backend,
+                server_url=server_url,
+                timeout=timeout,
+                tail_logs=tail_logs,
+                app_name=app_name,
+                served_model_name=served_model_name,
+                provider=provider,
+                api_key=api_key,
+                pod_id=pod_id,
+                prime_backend=prime_backend,
+                serving_requirements=serving_requirements,
+                placement_assessment=placement_assessment,
+                runtime_id=runtime_id,
+                vision=vision,
+                phase_timer=phase_timer,
+                price_per_hour_usd=price_per_hour_usd,
+            )
         )
-
-        is_vllm = backend == BackendType.VLLM
-        probe_url = status_probe_url(backend, server_url)
-        yield LogEvent(line=f"Probing readiness at: {probe_url}")
-        url_error = endpoint_url_error(probe_url)
-        if url_error:
-            yield from fail_operation(
-                OperationType.WARMUP,
-                f'Invalid endpoint URL: {url_error}',
-                exit_code=2,
-                recoverable=False,
-            )
-            return
-
-        # llama.cpp states what it will allocate before every serve, whether
-        # or not it accepts the plan. The rejected runs are the valuable ones:
-        # they are exactly where the planner's formula was wrong. Recording
-        # both turns each deploy into evidence the next one plans from.
-        calibration = FitCalibrationRecorder(placement_assessment)
-
-        target_app_name = app_name or legacy_app_name(backend)
-        log_tail = _ModalLogTail(target_app_name)
-        tail_modal_logs = tail_logs and provider == ComputeProvider.MODAL
-        if tail_modal_logs:
-            yield from log_tail.attach()
-
-        try:
-            import requests
-        except ImportError:
-            yield from fail_operation(
-                OperationType.WARMUP,
-                "'requests' is required. Install with: pip install requests",
-                recoverable=False,
-            )
-            return
-
-        llama_probe_model = (served_model_name or "").strip() or "default"
-        payload = {
-            "model": llama_probe_model,
-            "prompt": "ping",
-            "max_tokens": 1,
-            "temperature": 0,
-        }
-        headers = {"Content-Type": "application/json"}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-        backoff = 2.0
-        max_backoff = 30.0
-        last_err: str | None = None
-        last_scheduling_hint: str | None = None
-        next_system_log_check = start + 20
-        unrecoverable: str | None = None
-        draft_context_error = False
-        managed_dspark = False
-
-        def _timeout_message(detail: str | None) -> str:
-            if last_scheduling_hint:
-                return f"Timed out after {timeout}s ({last_scheduling_hint}). Last error: {detail}"
-            return f"Timed out after {timeout}s. Last error: {detail}"
-
-        def _send_probe(probe_timeout: float) -> Any:
-            if is_vllm:
-                return requests.get(probe_url, headers=headers, timeout=probe_timeout)
-            return requests.post(
-                probe_url, headers=headers, data=json.dumps(payload), timeout=probe_timeout
-            )
-
-        def report_scheduling(hint: str | None) -> EventStream:
-            nonlocal last_scheduling_hint
-            if hint and hint != last_scheduling_hint:
-                last_scheduling_hint = hint
-                yield StateChangeEvent(
-                    current=DeploymentState.QUEUED,
-                    operation=OperationType.WARMUP,
-                    detail=hint,
-                )
-                yield LogEvent(line=hint, operation=OperationType.WARMUP)
-
-        def live_logs(events: Iterable[BaseEvent] | None = None) -> EventStream:
-            nonlocal unrecoverable, draft_context_error, managed_dspark
-            stream = events if events is not None else log_tail.drain()
-            for event in stream:
-                if not isinstance(event, LogEvent):
-                    yield event
-                    continue
-                line = event.line
-                if tail_modal_logs:
-                    yield from report_scheduling(modal_gpu_scheduling_hint(line))
-                yield event
-                if backend == BackendType.LLAMACPP:
-                    managed_dspark |= "using DSpark draft file:" in line or "--spec-type draft-dspark" in line
-                    draft_context_error |= "dflash requires ctx_other to be set" in line
-                    failed_load = _LLAMACPP_CONTEXT_LOAD_FAILURE_RE.search(line)
-                    if (
-                        failed_load and not is_target_gguf(failed_load["path"].rsplit("/", 1)[-1])
-                    ) or (
-                        draft_context_error and not managed_dspark and "exiting due to model loading error" in line
-                    ):
-                        unrecoverable = _LLAMACPP_AUXILIARY_MODEL_FAILURE
-                if unrecoverable is None:
-                    unrecoverable = terminal_startup_failure(line)
-                measured = calibration.observe(line)
-                if measured is not None:
-                    yield LogEvent(
-                        line=(
-                            "Recorded llama.cpp's own measurement: "
-                            f"{measured.graph_gb:.1f} GB of graph memory per GPU "
-                            f"(measured on {measured.gpu_count}x {measured.gpu_type})."
-                        ),
-                        operation=OperationType.WARMUP,
-                    )
-
-        while True:
-            # Exit promptly if the app is shutting down.
-            if is_shutting_down():
-                log_tail.stop("on shutdown")
-                return
-
-            if tail_modal_logs and log_tail.may_attach():
-                # Historical-fetch fallback: the live stream may miss the
-                # final output of a crashing container, while Modal's persisted
-                # logs still have it. Route through live_logs() so recovered
-                # crash lines still trigger immediate failure and fit tracking.
-                yield from live_logs(fetch_historical_logs(target_app_name, log_tail.seen_lines))
-                yield from log_tail.attach()
-
-            # Drain log lines delivered by the reader thread, watching for a
-            # startup failure that every restart will reproduce.
-            yield from live_logs()
-            if unrecoverable is not None:
-                log_tail.stop("on unrecoverable startup failure")
-                yield from fail_operation(
-                    OperationType.WARMUP,
-                    unrecoverable,
-                    recoverable=False,
-                    detail=unrecoverable,
-                )
-                return
-
-            elapsed = time.time() - start
-            if elapsed > timeout:
-                log_tail.stop("on timeout")
-                yield from fail_operation(
-                    OperationType.WARMUP,
-                    _timeout_message(last_err),
-                )
-                return
-
-            probe_timeout = _probe_timeout_seconds(provider, timeout, elapsed)
-            probe_resp: Any = None
-            probe_exc: Exception | None = None
-            if provider == ComputeProvider.MODAL:
-                probe_queue = _start_probe_thread(_send_probe, probe_timeout)
-                while True:
-                    try:
-                        probe_resp, probe_exc = probe_queue.get(timeout=0.5)
-                        break
-                    except queue.Empty:
-                        if is_shutting_down():
-                            log_tail.stop("on shutdown")
-                            return
-                        if tail_modal_logs and log_tail.may_attach():
-                            yield from live_logs(
-                                fetch_historical_logs(target_app_name, log_tail.seen_lines)
-                            )
-                            yield from log_tail.attach()
-                        yield from live_logs()
-                        if unrecoverable is not None:
-                            log_tail.stop("on unrecoverable startup failure")
-                            yield from fail_operation(
-                                OperationType.WARMUP,
-                                unrecoverable,
-                                recoverable=False,
-                                detail=unrecoverable,
-                            )
-                            return
-                        now = time.time()
-                        if now - start > timeout:
-                            log_tail.stop("on timeout")
-                            yield from fail_operation(
-                                OperationType.WARMUP,
-                                _timeout_message(
-                                    last_err or f"Read timed out while probing {probe_url}"
-                                ),
-                            )
-                            return
-                        if tail_modal_logs and last_scheduling_hint is None and now >= next_system_log_check:
-                            yield from report_scheduling(_recent_modal_scheduling_hint(target_app_name, start))
-                            next_system_log_check = now + 30
-            else:
-                try:
-                    probe_resp = _send_probe(probe_timeout)
-                except Exception as exc:
-                    probe_exc = exc
-
-            if probe_exc is not None:
-                last_err = str(probe_exc)
-            else:
-                try:
-                    resp = probe_resp
-                    body = resp.text or ""
-                    ready_ok, readiness_reason = probe_response_is_ready(
-                        backend, resp.status_code, body
-                    )
-                    if ready_ok:
-                        log_tail.stop("after readiness")
-                        if phase_timer is not None:
-                            phase_timer.ready()
-                        attestation = None
-                        if serving_requirements is not None:
-                            attestation = yield from _certify_serving_requirements(
-                                requests,
-                                backend=backend,
-                                server_url=server_url,
-                                headers=headers,
-                                probe_model=llama_probe_model,
-                                serving_requirements=serving_requirements,
-                                placement_assessment=placement_assessment,
-                                runtime_id=runtime_id,
-                                phase_timer=phase_timer,
-                                price_per_hour_usd=price_per_hour_usd,
-                                runtime_log_text="\n".join(sorted(log_tail.seen_lines)),
-                                app_name=target_app_name or "",
-                            )
-                            if attestation is None:
-                                return
-
-                        if vision is not None and vision.enabled:
-                            yield LogEvent(line="Verifying image input with a bundled PNG.", operation=OperationType.WARMUP)
-                            try:
-                                verify_image_request(server_url, served_model_name, api_key, vision)
-                            except Exception as exc:
-                                # The server is up and answered readiness, so this is
-                                # flagged for callers that would otherwise tear the
-                                # deployment down as a failed rollout.
-                                yield from fail_operation(
-                                    OperationType.WARMUP,
-                                    f"Image verification failed: {exc}",
-                                    data={VISION_PROBE_FAILED: True},
-                                )
-                                return
-                            yield LogEvent(line="Image request verified (not a visual accuracy benchmark).", operation=OperationType.WARMUP)
-                        yield LogEvent(line="Server is ready!")
-                        if phase_timer is not None:
-                            yield from phase_timer.finish_events()
-                        curl_cmd = ModalBackend.test_curl_command(
-                            backend,
-                            server_url,
-                            served_model_name=served_model_name,
-                            api_key=api_key,
-                        )
-                        if api_key:
-                            curl_cmd = curl_cmd.replace(api_key, "$LLM_LAUNCHPAD_API_KEY")
-                        yield LogEvent(line=f"Test command:\n{curl_cmd}")
-                        yield StateChangeEvent(
-                            current=DeploymentState.HEALTHY, operation=OperationType.WARMUP
-                        )
-                        yield OperationCompleteEvent(
-                            operation=OperationType.WARMUP,
-                            success=True,
-                            data={"url": server_url, "attestation": attestation},
-                        )
-                        return
-                    if 200 <= resp.status_code < 300 and readiness_reason:
-                        last_err = f"HTTP {resp.status_code} (not ready): {readiness_reason}; body={body[:200]}"
-                    else:
-                        last_err = f"HTTP {resp.status_code}: {body[:200]}"
-                    if provider == ComputeProvider.MODAL:
-                        yield from report_scheduling(modal_gpu_scheduling_hint(body))
-                    if (
-                        tail_logs
-                        and provider == ComputeProvider.PRIME
-                        and pod_id
-                        and prime_backend is not None
-                    ):
-                        try:
-                            lines = prime_backend.get_pod_logs(pod_id, tail=200)
-                            for line in lines:
-                                if line not in log_tail.seen_lines:
-                                    log_tail.seen_lines.add(line)
-                                    yield LogEvent(line=line, operation=OperationType.WARMUP)
-                        except Exception:
-                            log_exception("Failed to fetch Prime pod logs during warmup")
-                except Exception as exc:
-                    last_err = str(exc)
-
-            if tail_modal_logs and last_scheduling_hint is None and time.time() >= next_system_log_check:
-                yield from report_scheduling(_recent_modal_scheduling_hint(target_app_name, start))
-                next_system_log_check = time.time() + 30
-
-            # Keep retry pauses short after a Modal cold-start timeout/connect
-            # error so Modal sees continuous demand until a container binds;
-            # once HTTP responses (e.g. 503 while loading weights) arrive, use
-            # normal exponential backoff.
-            cold_modal_retry = provider == ComputeProvider.MODAL and probe_exc is not None
-            wait_seconds = _MODAL_COLD_RETRY_BACKOFF_SECONDS if cold_modal_retry else backoff
-
-            # Sleep in small increments, draining the log queue between
-            # each chunk so that lines appear in the TUI promptly.
-            sleep_end = time.time() + wait_seconds
-            while time.time() < sleep_end:
-                if is_shutting_down():
-                    break
-                chunk = min(0.5, sleep_end - time.time())
-                if chunk > 0:
-                    shutdown_event().wait(timeout=chunk)
-                yield from live_logs()
-                if unrecoverable is not None:
-                    break
-            if not cold_modal_retry:
-                backoff = min(max_backoff, backoff * 1.5)
 
 
 def _calibrate_endpoint(

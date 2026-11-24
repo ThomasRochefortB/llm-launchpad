@@ -19,7 +19,7 @@ from textual.widgets import Button, Input, Static
 
 from ...core.deploy_log_summary import is_startup_phase_line
 from ...core.quick_deploy import intent_from_legacy_flags
-from ...protocol.enums import BackendType, DeploymentState, OperationType
+from ...protocol.enums import BackendType, ComputeProvider, DeploymentState, OperationType
 from ...protocol.models import DeploymentConfig
 from ..deployment_progress import DeploymentProgress
 from ..deploy_log_summary import (
@@ -121,6 +121,19 @@ def _result_card_markup(rows: list[tuple[str, str]]) -> str:
     return labelled_rows_markup(_plain_rows(rows))
 
 
+def _is_pinned_marketplace_offer(config: DeploymentConfig) -> bool:
+    """Return True when a deploy is bound to one specific marketplace offer.
+
+    Replaying the same failed Vast rental or pinned Prime offer blindly usually
+    fails again or hits stale pricing; choosing another placement re-prices live.
+    """
+    if config.provider == ComputeProvider.VAST:
+        return True
+    if config.provider == ComputeProvider.PRIME:
+        return bool(getattr(config.provider_options, "offer_id", None))
+    return False
+
+
 class MonitorScreen(CopyEnabledScreen):
     """Full-screen operation monitor with streaming logs."""
 
@@ -152,6 +165,9 @@ class MonitorScreen(CopyEnabledScreen):
         Binding("l", "toggle_result_logs", "Logs", show=True),
         Binding("ctrl+l", "clear_log", "Clear log", show=False),
         Binding("enter", "submit_or_finish", "Done", show=True, priority=True),
+        Binding("r", "retry_deploy", "Retry", show=True),
+        Binding("p", "other_placement", "Other placement", show=True),
+        Binding("m", "open_manage", "Manage", show=False),
         Binding("u", "copy_base_url", "Copy URL", show=True),
         Binding("k", "copy_api_key", "Copy key", show=False),
     ]
@@ -165,6 +181,33 @@ class MonitorScreen(CopyEnabledScreen):
         OperationType.STOP: "Stop complete",
     }
 
+    def _resource_needs_check(self) -> bool:
+        """Return True when a failed operation may have left a live resource."""
+        return self._progress.resource_status in {"allocated", "retained", "failed"}
+
+    def _can_retry_deploy(self) -> bool:
+        """Return True when replaying the same deploy config is safe."""
+        config = self._deployment_config
+        return (
+            self._done
+            and not self._success
+            and self._failed_operation == OperationType.DEPLOY
+            and config is not None
+            and config.retry_allowed
+            and not self._resource_needs_check()
+            and not _is_pinned_marketplace_offer(config)
+        )
+
+    def _can_choose_other_placement(self) -> bool:
+        """Return True when the user can jump straight to picking another placement."""
+        return (
+            self._done
+            and not self._success
+            and self._failed_operation == OperationType.DEPLOY
+            and self._deployment_config is not None
+            and not self._resource_needs_check()
+        )
+
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         """Prioritize result actions once the operation finishes.
 
@@ -172,6 +215,12 @@ class MonitorScreen(CopyEnabledScreen):
         done, Done/Copy URL/Copy take precedence over log navigation, which
         remains reachable by shortcut and help.
         """
+        if action == "retry_deploy":
+            return self._can_retry_deploy()
+        if action == "other_placement":
+            return self._can_choose_other_placement()
+        if action == "open_manage":
+            return self._done and (self._connection_payload is not None or not self._success)
         if action == "toggle_result_logs":
             return self.has_class("connection-ready")
         if (
@@ -230,6 +279,8 @@ class MonitorScreen(CopyEnabledScreen):
         self._result_title = "Check complete"
         self._failure_rows: list[tuple[str, str]] = []
         self._failure_title = "Operation failed"
+        self._deployment_config = deployment_config
+        self._failed_operation: OperationType | None = None
         self._progress = DeploymentProgress(backend=deploy_backend)
         if deployment_config is not None:
             self._progress.provider = deployment_config.provider
@@ -349,6 +400,9 @@ class MonitorScreen(CopyEnabledScreen):
             actions = Horizontal(id="failure-card-actions")
             card.mount(actions)
             actions.mount(
+                Button("Retry", id="failure-retry-btn"),
+                Button("Other placement", id="failure-placement-btn"),
+                Button("Raw logs", id="failure-raw-logs-btn"),
                 Button("Copy error", id="failure-copy-btn"),
                 Button("Manage", id="failure-manage-btn"),
                 Button("Done", id="failure-done-btn", variant="primary"),
@@ -588,6 +642,7 @@ class MonitorScreen(CopyEnabledScreen):
             return
         self._done = True
         self._success = message.success
+        self._failed_operation = None if message.success else message.operation
         self._ensure_progress_operation(message.operation)
         self._current_operation = message.operation
         resource_status = self._progress.resource_status
@@ -623,14 +678,15 @@ class MonitorScreen(CopyEnabledScreen):
             # summarized deploy took four of the dozen lines the box has.
             if detail and detail != self._last_error_message:
                 self._append_log_line(f"Detail: {detail}")
-            if self._summary_mode_enabled:
+            if self._summary_mode_enabled and self._view_mode == "summary":
                 self._append_log_line(
-                    'Tip: re-run with "Show debug logs" enabled to see full backend logs.'
+                    "Tip: press v (or Raw logs) to inspect the full backend log."
                 )
-            # Not "enter to retry": enter pops this screen like esc and q do,
-            # and no retry path exists to offer.
+            # Not "enter to retry": enter pops this screen like esc and q do;
+            # safe recovery actions live on explicit keys (r / p).
             self._append_log_line(_RETURN_HINT)
             self._show_failure_card(message)
+            self.refresh_bindings()
             return
         # No return hint in the log on success: the progress panel above says
         # it, and a deploy followed by warmup printed it once per phase.
@@ -726,6 +782,17 @@ class MonitorScreen(CopyEnabledScreen):
 
     def _failure_next_steps(self, operation: OperationType) -> str:
         if operation == OperationType.DEPLOY:
+            if self._resource_needs_check():
+                return "Open Manage to verify or stop the resource before redeploying."
+            steps: list[str] = []
+            if self._can_retry_deploy():
+                steps.append("r to retry")
+            if self._can_choose_other_placement():
+                steps.append("p for another placement")
+            if self._summary_mode_enabled and self._view_mode == "summary":
+                steps.append("v for raw logs")
+            if steps:
+                return f"Press {', '.join(steps)} — or open Manage."
             return "Review the error, try another placement, or open Manage for logs."
         if operation == OperationType.WARMUP:
             return "Endpoint may still exist — verify in Manage or check logs."
@@ -748,6 +815,15 @@ class MonitorScreen(CopyEnabledScreen):
         if card is not None:
             self._fill_failure_card()
 
+    def _sync_failure_raw_logs_button(self) -> None:
+        """Keep the failure card's raw/summary toggle button synchronized."""
+        try:
+            raw_btn = self.query_one("#failure-raw-logs-btn", Button)
+        except Exception:
+            return
+        raw_btn.display = self._summary_mode_enabled
+        raw_btn.label = "Summary" if self._view_mode == "raw" else "Raw logs"
+
     def _fill_failure_card(self) -> None:
         """Fill a mounted failure card from retained rows (deferred mount)."""
         if not self._failure_rows:
@@ -759,6 +835,11 @@ class MonitorScreen(CopyEnabledScreen):
             self.query_one("#failure-card-body", Static).update(
                 _result_card_markup(self._failure_rows)
             )
+            self.query_one("#failure-retry-btn", Button).display = self._can_retry_deploy()
+            self.query_one("#failure-placement-btn", Button).display = (
+                self._can_choose_other_placement()
+            )
+            self._sync_failure_raw_logs_button()
             self.query_one("#failure-done-btn", Button).focus()
         except Exception:
             pass
@@ -898,12 +979,42 @@ class MonitorScreen(CopyEnabledScreen):
             self._copy_result()
         elif event.button.id == "result-done-btn":
             self.action_finish_success()
+        elif event.button.id == "failure-retry-btn":
+            self.action_retry_deploy()
+        elif event.button.id == "failure-placement-btn":
+            self.action_other_placement()
+        elif event.button.id == "failure-raw-logs-btn":
+            self.action_toggle_log_view()
+            self.log_viewer.log_widget.focus()
         elif event.button.id == "failure-copy-btn":
             self._copy_failure()
         elif event.button.id == "failure-manage-btn":
             self.action_open_manage()
         elif event.button.id == "failure-done-btn":
             self.action_finish_success()
+
+    def action_retry_deploy(self) -> None:
+        """Start a clean retry of the failed deployment when safe."""
+        if not self._can_retry_deploy() or self._deployment_config is None:
+            return
+        retrier = getattr(self.app, "retry_deployment", None)
+        if callable(retrier):
+            retrier(self._deployment_config)
+            return
+        beginner = getattr(self.app, "begin_deploy", None)
+        if callable(beginner):
+            self.app.pop_screen()
+            beginner(self._deployment_config)
+
+    def action_other_placement(self) -> None:
+        """Jump straight to picking another GPU/provider placement for this model."""
+        if not self._can_choose_other_placement() or self._deployment_config is None:
+            return
+        chooser = getattr(self.app, "choose_other_placement", None)
+        if callable(chooser):
+            chooser(self._deployment_config)
+            return
+        self.app.pop_screen()
 
     def action_submit_or_finish(self) -> None:
         """Let Enter activate focused buttons before applying the Done shortcut."""
@@ -997,6 +1108,7 @@ class MonitorScreen(CopyEnabledScreen):
         self.query_one("#monitor-view-status", Static).update(
             self._view_status_markup()
         )
+        self._sync_failure_raw_logs_button()
 
     def action_clear_log(self) -> None:
         self.log_viewer.clear()

@@ -776,9 +776,18 @@ VllmDeployScreen Select:disabled > SelectCurrent {
     padding: 1 0 0 0;
 }
 
-#connection-card-actions Button,
 #result-card-actions Button,
 #failure-card-actions Button {
+    width: auto;
+    min-width: 8;
+    height: 1;
+    min-height: 1;
+    padding: 0 2;
+    margin: 0 1 0 0;
+    border: none;
+}
+
+#connection-card-actions Button {
     margin: 0 1 0 0;
 }
 
@@ -902,6 +911,7 @@ DeploymentProgressWidget #deploy-progress-hint {
     margin: 0 0 1 0;
 }
 
+.viewport-compact #failure-card-actions,
 .viewport-minimal #connection-card-actions,
 .viewport-minimal #failure-card-actions,
 .viewport-minimal #result-card-actions {

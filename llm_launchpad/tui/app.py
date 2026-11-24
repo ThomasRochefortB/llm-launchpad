@@ -11,11 +11,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from ..core.job_store import JobRecord, JobStore
 
-import base64
 from functools import partial
 from collections.abc import Callable, Iterable
-from concurrent.futures import ThreadPoolExecutor
-import json
 import os
 import threading
 import time
@@ -34,9 +31,7 @@ from textual.widgets import Input, TextArea
 
 from ..core.backend import ModalBackend
 from ..core.benchmark import BENCHMARK_UNAVAILABLE_REASON
-from ..core.coerce import positive_int
 from ..core.config import ConfigStore, SETTINGS_DIR
-from ..core.deploy_events import EndpointUrlResolver
 from ..core.deploy_journal import (
     InFlightDeployment,
     clear_in_flight,
@@ -76,7 +71,7 @@ from ..core.opencode import (
     visible_launchpad_rows,
 )
 from ..core.orchestrator import Orchestrator
-from ..protocol.enums import AttemptDisposition, BackendType, CleanupDisposition, ComputeProvider, OperationType
+from ..protocol.enums import BackendType, ComputeProvider, OperationType
 from ..protocol.events import (
     BaseEvent,
     EndpointAvailableEvent,
@@ -103,7 +98,29 @@ from .screens.quick_deploy import QuickDeployScreen
 from .screens.setup import SetupRequiredScreen
 from .screens.storage import StorageScreen
 from .screens.settings import SettingsScreen
-from .clipboard import read_system_clipboard, write_system_clipboard
+from .clipboard import (
+    osc_52_sequence,
+    read_system_clipboard,
+    screen_passthrough_sequence as _screen_passthrough_sequence,
+    tmux_passthrough_sequence as _tmux_passthrough_sequence,
+    write_system_clipboard,
+)
+from .deploy_session import run_tui_deploy_lifecycle, tail_persistent_job
+from .fleet_discovery import (
+    listing_error_text,
+    query_configured_providers,
+    record_provider_listings,
+)
+from .storage_cache import (
+    load_persisted_deploy_connection_cache,
+    load_persisted_storage_snapshot,
+    persist_deploy_connection_cache,
+    persist_storage_snapshot,
+    storage_snapshot_from_dict,
+    storage_snapshot_to_dict,
+    stored_model_from_dict,
+    stored_model_to_dict,
+)
 from .visual import (
     LAUNCHPAD_THEMES,
     normalize_tui_density,
@@ -123,6 +140,9 @@ from .workers import (
     VllmModelsLoaded,
     _dispatch_event,
 )
+
+
+_osc_52_sequence = osc_52_sequence
 
 
 def _deploy_connection_summary_lines(config: DeploymentConfig, server_url: str) -> list[str]:
@@ -148,20 +168,6 @@ def _deploy_connection_card_payload(
     payload = dict(_deploy_connection_summary_payload(config, server_url))
     payload["api_key"] = config.endpoint_api_key or ""
     return payload
-
-
-def _osc_52_sequence(text: str) -> str:
-    payload = base64.b64encode(text.encode("utf-8")).decode("ascii")
-    return f"\x1b]52;c;{payload}\a"
-
-
-def _tmux_passthrough_sequence(text: str) -> str:
-    osc = _osc_52_sequence(text).replace("\x1b", "\x1b\x1b")
-    return f"\x1bPtmux;{osc}\x1b\\"
-
-
-def _screen_passthrough_sequence(text: str) -> str:
-    return f"\x1bP{_osc_52_sequence(text)}\x1b\\"
 
 
 class AbandonedDeploymentsChecked(Message):
@@ -220,6 +226,7 @@ class TuiApp(App):
         self.theme = normalize_tui_theme(visual_settings.tui_theme)
         self.tui_density = normalize_tui_density(visual_settings.tui_density)
         self._confirm_quit = visual_settings.confirm_quit
+        self._notify_on_complete = visual_settings.notify_on_complete
         self._monochrome_filter = Monochrome(
             enabled=self.theme == "launchpad-monochrome"
         )
@@ -744,6 +751,118 @@ class TuiApp(App):
             )
         )
 
+    @staticmethod
+    def _catalog_model_id_for_config(config: DeploymentConfig) -> str | None:
+        """Resolve a Fast Deploy catalog model key for ``config``, if any."""
+        from ..core.quick_deploy import list_quick_deploy_profiles, quick_deploy_model_key
+
+        repo = (config.repo_id or "").strip().casefold()
+        model_name = (config.model_name or "").strip().casefold()
+        if not repo and not model_name:
+            return None
+        for profile in list_quick_deploy_profiles():
+            if repo and (profile.repo_id or "").strip().casefold() == repo:
+                return quick_deploy_model_key(profile)
+            if model_name and (profile.model_name or "").strip().casefold() == model_name:
+                return quick_deploy_model_key(profile)
+        return None
+
+    def retry_deployment(self, config: DeploymentConfig) -> None:
+        """Start a clean retry of a failed deployment when no live resource remains."""
+        retry_config = replace(
+            config,
+            endpoint_api_key=None,
+            tool_calling=None,
+            retry_allowed=True,
+        )
+        if isinstance(self.screen, MonitorScreen):
+            self.pop_screen()
+        self.begin_deploy(retry_config)
+
+    def choose_other_placement(self, config: DeploymentConfig) -> None:
+        """Return straight to live placement selection for a failed deployment."""
+        from .screens.deploy import LlamaCppDeployScreen, VllmDeployScreen
+
+        model_id = self._catalog_model_id_for_config(config)
+        if model_id is not None:
+            self.pop_to_main_menu()
+            current_screen = self.screen
+            if isinstance(current_screen, MainMenuScreen):
+                current_screen.ensure_quick_deploy_catalog_refresh()
+            self.push_screen(
+                FastDeployScreen(
+                    initial_model_id=model_id,
+                    preferred_context=config.max_context_tokens,
+                )
+            )
+            return
+
+        # If the user just deployed from a custom deploy form, return directly to
+        # that form with all entered fields intact.
+        if len(self.screen_stack) >= 2 and isinstance(self.screen, MonitorScreen):
+            below = self.screen_stack[-2]
+            if isinstance(below, (LlamaCppDeployScreen, VllmDeployScreen, FastDeployScreen)):
+                self.pop_screen()
+                return
+            if (
+                isinstance(below, QuickDeployScreen)
+                and len(self.screen_stack) >= 3
+                and isinstance(self.screen_stack[-3], FastDeployScreen)
+            ):
+                self.pop_screen()
+                self.pop_screen()
+                return
+        self.pop_to_main_menu()
+        self.action_push_deploy()
+
+    def notify_deployment_finished(
+        self,
+        config: DeploymentConfig,
+        *,
+        success: bool,
+        detail: str = "",
+        monitor: MonitorScreen | None = None,
+    ) -> None:
+        """Emit terminal/desktop alerts and a background toast when a deploy ends."""
+        from ..core.notifications import (
+            emit_terminal_notification,
+            format_deployment_notification,
+            send_desktop_notification,
+        )
+
+        title, body = format_deployment_notification(config, success=success, detail=detail)
+
+        def _post_background_toast() -> None:
+            try:
+                if monitor is not None and self.screen is monitor:
+                    return
+                if success:
+                    self.notify(
+                        f"{body}. Open Manage → Jobs (Ctrl+O) for connection details.",
+                        timeout=8,
+                    )
+                else:
+                    self.notify(
+                        f"{body}. Open Manage → Jobs (Ctrl+O) to inspect or recover.",
+                        severity="error",
+                        timeout=10,
+                    )
+            except Exception:
+                pass
+
+        try:
+            self.call_from_thread(_post_background_toast)
+        except Exception:
+            _post_background_toast()
+
+        if not getattr(self, "_notify_on_complete", True):
+            return
+        driver = getattr(self, "_driver", None)
+        if driver is not None:
+            emit_terminal_notification(title, body, writer=driver)
+        if not getattr(self, "is_headless", False):
+            send_desktop_notification(title, body)
+
     def quick_deploy_catalog_updated(self) -> None:
         """Notify the active model picker that the shared catalog changed."""
         try:
@@ -953,99 +1072,7 @@ class TuiApp(App):
         """Forward durable events to this session's monitor; detach-safe."""
         from .workers import _dispatch_event as dispatch
 
-        if not job.persistent_id:
-            return
-        try:
-            store = self._get_job_store()
-        except Exception:
-            return
-        while True:
-            if self._quitting:
-                return
-            # Read status first: a worker can append its terminal event and
-            # finish between two reads. Once terminal is observed, fetching
-            # events afterwards guarantees its final messages are drained.
-            try:
-                record = store.get_job(job.persistent_id)
-            except Exception:
-                break
-            if record is None:
-                break
-            try:
-                record = store.get_job(job.persistent_id)
-                if record is None:
-                    return
-                events = store.get_events(job.persistent_id, after_seq=job.last_seen_seq)
-            except Exception:
-                break
-            for stored in events:
-                job.last_seen_seq = max(job.last_seen_seq, stored.seq)
-                if (
-                    isinstance(stored.event, OperationCompleteEvent)
-                    and not stored.event.success
-                    and stored.event.exit_code
-                ):
-                    job.last_failure_exit_code = stored.event.exit_code
-                try:
-                    dispatch(job.monitor, stored.event, phase_only=True)
-                except Exception:
-                    pass
-                if isinstance(stored.event, EndpointAvailableEvent):
-                    try:
-                        self._invalidate_endpoint_snapshot()
-                    except Exception:
-                        pass
-                # A certified warmup answered the runtime: remember it as the
-                # explicit health observation passive refreshes display. The
-                # detached worker cannot share memory with this process, so
-                # the tail records it here from the durable event log.
-                if (
-                    isinstance(stored.event, OperationCompleteEvent)
-                    and stored.event.operation == OperationType.WARMUP
-                    and stored.event.success
-                    and job.config.provider == ComputeProvider.MODAL
-                ):
-                    try:
-                        from ..core.runtime_health import record_explicit_health
-
-                        record_explicit_health(
-                            EndpointInfo(
-                                name=job.config.app_name or "",
-                                provider=ComputeProvider.MODAL,
-                                backend=job.config.backend,
-                            ),
-                            "healthy",
-                            None,
-                        )
-                    except Exception:
-                        pass
-            job.config = record.config
-            job.outcome = record.outcome or job.outcome
-            if record.cancel_requested:
-                job.cancel_requested.set()
-            if record.terminal:
-                if events and job.last_seen_seq < record.event_count:
-                    continue
-                with self._deployment_lock:
-                    job.accepting_cancellation = False
-                    job.finished.set()
-                self._finish_persistent_monitor(job, record)
-                if record.status == "succeeded":
-                    self._post_connection_card_for_record(job, record, store)
-                    self._sync_finished_job(job, record)
-                return
-            if job.cancel_requested.is_set():
-                # Mirror a session cancel into the durable flag exactly once.
-                try:
-                    store.request_cancel(job.persistent_id)
-                except Exception:
-                    pass
-            try:
-                import time as _time
-
-                _time.sleep(self._PERSISTENT_JOB_POLL_INTERVAL_SECONDS)
-            except Exception:
-                return
+        tail_persistent_job(self, job, dispatch=dispatch)
 
     def reopen_persistent_deployment(self, persistent_id: str) -> None:
         """Rebuild a monitor from retained events, live if the worker runs."""
@@ -1363,212 +1390,17 @@ class TuiApp(App):
                 # and the journal row for recovery from Manage.
                 pass
 
-    def _run_deploy_inner(self, config: DeploymentConfig, monitor: MonitorScreen) -> str | None:  # type: ignore[return]
+    def _run_deploy_inner(self, config: DeploymentConfig, monitor: MonitorScreen) -> str | None:
         """Consumed by run_worker in a thread; delegates to the shared lifecycle."""
-        from ..core.deployment_lifecycle import (
-            LifecycleAttempt,
-            LifecycleCallbacks,
-            LifecycleOptions,
-            run_lifecycle,
+        return run_tui_deploy_lifecycle(
+            self,
+            config,
+            monitor,
+            dispatch=_dispatch_event,
+            connection_summary_lines=_deploy_connection_summary_lines,
+            connection_card_payload=_deploy_connection_card_payload,
+            connection_summary_message=ConnectionSummaryReady,
         )
-
-        deployed_endpoint: EndpointInfo | None = None
-        url_resolver = EndpointUrlResolver()
-        will_run_warmup = bool(config.do_warmup and config.do_deploy)
-
-        def _emit_connection_summary(target_config: DeploymentConfig, url: str) -> None:
-            self._cache_deploy_connection_summary(target_config, url, deployed_endpoint)
-            for line in _deploy_connection_summary_lines(target_config, url):
-                _dispatch_event(monitor, LogEvent(line=line))
-            poster = getattr(monitor, "post_message", None)
-            if callable(poster):
-                poster(ConnectionSummaryReady(_deploy_connection_card_payload(target_config, url)))
-
-        def _sync_now(target_config: DeploymentConfig, url: str) -> None:
-            target_app_name = target_config.app_name or legacy_app_name(target_config.backend)
-            live_rows, prune_providers = self._visible_rows_and_prune_scope()
-            self._sync_opencode(
-                target_app_name=target_app_name,
-                target_url=url,
-                target_config=target_config,
-                current_rows=live_rows,
-                prune_providers=prune_providers,
-                monitor=monitor,
-                emit_skipped=True,
-            )
-
-        def _on_event(event: BaseEvent) -> None:
-            nonlocal deployed_endpoint
-            if isinstance(event, LogEvent):
-                url_resolver.observe(event)
-            elif isinstance(event, EndpointAvailableEvent):
-                deployed_endpoint = event.endpoint
-                self._invalidate_endpoint_snapshot()
-                url_resolver.observe(event)
-            elif isinstance(event, OperationCompleteEvent):
-                if event.operation == OperationType.DEPLOY:
-                    self._invalidate_endpoint_snapshot()
-                if event.success and isinstance(event.data, EndpointInfo):
-                    deployed_endpoint = event.data
-            _dispatch_event(monitor, event, phase_only=True)
-
-        def _on_credentials(
-            saved: DeploymentConfig, url: str | None, endpoint: EndpointInfo | None
-        ) -> None:
-            # Pre-certification save: persist the bearer key so a later warmup
-            # failure cannot strand a live resource, without publishing the
-            # unverified URL as a verified endpoint.
-            nonlocal deployed_endpoint
-            if endpoint is not None:
-                deployed_endpoint = endpoint
-                self._invalidate_endpoint_snapshot()
-            if url:
-                try:
-                    self._cache_deploy_connection_summary(saved, url, endpoint)
-                except Exception:
-                    pass
-
-        def _on_connection(
-            saved: DeploymentConfig, url: str | None, endpoint: EndpointInfo | None
-        ) -> None:
-            nonlocal deployed_endpoint
-            if endpoint is not None:
-                deployed_endpoint = endpoint
-                self._invalidate_endpoint_snapshot()
-            if url:
-                if (
-                    endpoint is not None
-                    and endpoint.web_url
-                    and config.provider == ComputeProvider.MODAL
-                ):
-                    try:
-                        from ..core.runtime_health import record_explicit_health
-
-                        record_explicit_health(endpoint, "healthy", None)
-                    except Exception:
-                        pass
-                # Publication is single-sourced here: after deploy when no
-                # warmup follows, and after warmup with the verified URL.
-                # Pre-certification credentials persist via on_credentials.
-                _emit_connection_summary(saved, url)
-                _sync_now(saved, url)
-
-        from ..core.deployment_preflight import lifecycle_attempts_for_configs
-
-        def _attempt_with_plan(target: DeploymentConfig) -> LifecycleAttempt:
-            specs = lifecycle_attempts_for_configs([target])
-            spec = specs[0]
-            return LifecycleAttempt(
-                config=target,
-                retry_allowed=target.retry_allowed,
-                plan=spec.plan,
-            )
-
-        attempts = [_attempt_with_plan(config)]
-        for fallback in config.fallback_configs:
-            if self._deployment_key(fallback) == self._deployment_key(config):
-                # Same target as the attempt that just ran (the Fast Deploy
-                # ladder reuses one app name across placements): allowed.
-                attempts.append(_attempt_with_plan(fallback))
-                continue
-            try:
-                self._begin_in_flight(fallback)
-            except RuntimeError:
-                # A fallback targeting another job's app must not run: it
-                # would overwrite the owner's journal entry and deploy into
-                # its target. Skip it instead of failing the whole ladder.
-                _dispatch_event(
-                    monitor,
-                    LogEvent(
-                        line=(
-                            f"Skipping fallback placement {fallback.app_name}: "
-                            "another deployment owns that target."
-                        ),
-                        operation=OperationType.DEPLOY,
-                    ),
-                )
-                continue
-            self._finish_in_flight(fallback, resolved=True)
-            attempts.append(_attempt_with_plan(fallback))
-        def _observe_and_forward(event: BaseEvent) -> None:
-            self._observe_lifecycle_event(config, monitor, event)
-            _on_event(event)
-
-        result = run_lifecycle(
-            self._orchestrator,
-            attempts,
-            options=LifecycleOptions(
-                warmup_timeout_seconds=1800,
-                tail_logs=True,
-                warmup_enabled=will_run_warmup,
-                modal_username=self._username,
-            ),
-            callbacks=LifecycleCallbacks(
-                on_event=_observe_and_forward,
-                is_cancelled=lambda: self._is_deploy_cancelled(monitor),
-                on_resource=lambda resource_id: self._record_lifecycle_resource(
-                    config, monitor, resource_id
-                ),
-                on_connection=_on_connection,
-                on_credentials=_on_credentials,
-            ),
-        )
-        last_outcome = result.attempts[-1] if result.attempts else None
-        _dispatch_event(monitor, OperationCompleteEvent(
-            operation=OperationType.DEPLOY,
-            success=result.succeeded,
-            exit_code=(
-                0
-                if result.succeeded
-                else ((last_outcome.failure_exit_code or 1) if last_outcome else 1)
-            ),
-            detail="" if result.succeeded else (
-                last_outcome.failure_detail if last_outcome and last_outcome.failure_detail else result.outcome
-            ),
-        ))
-        if not result.succeeded and result.attempts:
-            last = result.attempts[-1]
-            if last.retry_allowed and len(result.attempts) < len(attempts):
-                _dispatch_event(
-                    monitor,
-                    LogEvent(
-                        line="Trying an equivalent certified placement at or below "
-                        "the approved hourly price.",
-                        operation=OperationType.DEPLOY,
-                        is_milestone=True,
-                    ),
-                )
-        job = self._job_for_monitor(monitor)
-        if job is not None:
-            job.outcome = result.outcome or (
-                "Finished — open result" if result.succeeded
-                else "Failed — check resource in Manage"
-            )
-            # Cancellation cleanup that did not confirm keeps its recovery
-            # record; a confirmed stop clears it like any other resolution.
-            if result.succeeded:
-                self._finish_in_flight(config, resolved=True)
-            elif any(
-                attempt.disposition == AttemptDisposition.CANCELLED
-                for attempt in result.attempts
-            ) and all(
-                attempt.cleanup == CleanupDisposition.FAILED
-                or attempt.cleanup_error
-                for attempt in result.attempts
-                if attempt.disposition == AttemptDisposition.CANCELLED
-            ):
-                self._finish_in_flight(config, resolved=False)
-            elif result.attempts and any(
-                attempt.disposition == AttemptDisposition.CANCELLED
-                for attempt in result.attempts
-            ):
-                self._finish_in_flight(config, resolved=True)
-            elif not result.succeeded:
-                # A plain failure clears only this job's own entry: a skipped
-                # fallback never began, so its target's owner keeps theirs.
-                self._finish_in_flight(config, resolved=True)
-            return result.outcome
-        return result.outcome
 
     def _observe_lifecycle_event(
         self, config: DeploymentConfig, monitor: MonitorScreen, event: BaseEvent
@@ -1955,63 +1787,22 @@ class TuiApp(App):
             return self._last_fleet_discovery
 
     def discover_fleet(self) -> FleetDiscovery:
-        """List every configured provider, reporting each one's own outcome.
-
-        A provider that cannot be reached keeps the rows it last returned and
-        carries its error instead of silently shortening the fleet: a user who
-        sees a running deployment disappear redeploys it, and pays twice.
-        """
-        rows_by_provider: dict[ComputeProvider, list[EndpointInfo] | None] = {}
-        errors: dict[ComputeProvider, str] = {}
-
-        # An unconfigured provider is not an unavailable one, so it reports
-        # nothing rather than an error the user has no reason to act on.
+        """List every configured provider, reporting each one's own outcome."""
         modal_enabled = ModalBackend.is_cli_available()
         prime_enabled = get_prime_auth_status().authenticated
         try:
             vast_enabled = bool(resolve_vast_credentials().api_key)
         except ValueError:
             vast_enabled = False
-        configured = (
-            *((ComputeProvider.MODAL,) if modal_enabled else ()),
-            *((ComputeProvider.PRIME,) if prime_enabled else ()),
-            *((ComputeProvider.VAST,) if vast_enabled else ()),
+
+        configured, rows_by_provider, errors = query_configured_providers(
+            modal_enabled=modal_enabled,
+            prime_enabled=prime_enabled,
+            vast_enabled=vast_enabled,
+            modal_lister=ModalBackend.list_apps_result,
+            prime_lister=lambda: PrimeBackend().list_deployments(),
+            vast_lister=lambda: VastDeploymentBackend().list_deployments(),
         )
-
-        with ThreadPoolExecutor(max_workers=3) as executor:
-            modal_future = (
-                executor.submit(ModalBackend.list_apps_result) if modal_enabled else None
-            )
-            prime_future = (
-                executor.submit(PrimeBackend().list_deployments)
-                if prime_enabled
-                else None
-            )
-            vast_future = executor.submit(VastDeploymentBackend().list_deployments) if vast_enabled else None
-            if modal_future is not None:
-                try:
-                    modal_result = modal_future.result()
-                except Exception as exc:
-                    rows_by_provider[ComputeProvider.MODAL] = None
-                    errors[ComputeProvider.MODAL] = self._listing_error_text(
-                        ComputeProvider.MODAL, exc
-                    )
-                else:
-                    rows_by_provider[ComputeProvider.MODAL] = modal_result.rows
-                    if modal_result.error is not None:
-                        errors[ComputeProvider.MODAL] = modal_result.error.message
-            for provider, future in (
-                (ComputeProvider.PRIME, prime_future),
-                (ComputeProvider.VAST, vast_future),
-            ):
-                if future is None:
-                    continue
-                try:
-                    rows_by_provider[provider] = future.result()
-                except Exception as exc:
-                    rows_by_provider[provider] = None
-                    errors[provider] = self._listing_error_text(provider, exc)
-
         discovery = self._record_provider_listings(configured, rows_by_provider, errors)
         rows = discovery.rows
         self._merge_deploy_connection_cache(rows)
@@ -2025,9 +1816,7 @@ class TuiApp(App):
 
     @staticmethod
     def _listing_error_text(provider: ComputeProvider, exc: Exception) -> str:
-        log_exception(f"Could not list {provider.display_name} deployments")
-        text = str(exc).strip()
-        return text or f"{type(exc).__name__} while listing {provider.display_name}."
+        return listing_error_text(provider, exc)
 
     def _record_provider_listings(
         self,
@@ -2036,36 +1825,14 @@ class TuiApp(App):
         errors: dict[ComputeProvider, str],
     ) -> FleetDiscovery:
         """Turn one pass into listings, retaining rows a failed provider had."""
-        now = time.time()
-        listings: list[ProviderListing] = []
+        discovery = record_provider_listings(
+            self._provider_listing_lock,
+            self._provider_listings,
+            configured,
+            rows_by_provider,
+            errors,
+        )
         with self._provider_listing_lock:
-            # A provider the user signed out of keeps no rows: those endpoints
-            # are no longer this account's to report on.
-            for provider in tuple(self._provider_listings):
-                if provider not in configured:
-                    self._provider_listings.pop(provider, None)
-
-            for provider in configured:
-                rows = rows_by_provider.get(provider)
-                if rows is not None:
-                    listing = ProviderListing(
-                        provider=provider,
-                        rows=tuple(visible_launchpad_rows(rows)),
-                        retrieved_at_epoch=now,
-                    )
-                    self._provider_listings[provider] = listing
-                else:
-                    retained = self._provider_listings.get(provider)
-                    listing = ProviderListing(
-                        provider=provider,
-                        rows=tuple(replace(row) for row in retained.rows) if retained else (),
-                        error=errors.get(provider)
-                        or f"Could not read the {provider.display_name} deployment list.",
-                        retrieved_at_epoch=retained.retrieved_at_epoch if retained else None,
-                    )
-                listings.append(listing)
-
-            discovery = FleetDiscovery(listings=tuple(listings))
             self._last_fleet_discovery = discovery
         return discovery
 
@@ -2310,15 +2077,7 @@ class TuiApp(App):
             self.begin_prime_disks_refresh(receiver)
 
     def _persist_storage_snapshot(self, snapshot: StorageSnapshot) -> None:
-        payload = {
-            "cached_at_epoch": time.time(),
-            "snapshot": self._snapshot_to_dict(snapshot),
-        }
-        try:
-            self._storage_cache_path.parent.mkdir(parents=True, exist_ok=True)
-            self._storage_cache_path.write_text(json.dumps(payload))
-        except Exception:
-            log_exception("Failed to persist storage snapshot cache")
+        persist_storage_snapshot(self._storage_cache_path, snapshot)
 
     def _cache_deploy_connection_summary(
         self,
@@ -2338,38 +2097,18 @@ class TuiApp(App):
                 self._deploy_connection_cache_path
             )
         except Exception:
-            # Connection summaries are a convenience cache; a read-only home
-            # directory must not turn an otherwise successful deploy into a
-            # failed operation.
             log_exception("Failed to cache deploy connection summary")
             return
 
     def _persist_deploy_connection_cache(self) -> None:
-        payload = {"entries": self._deploy_connection_cache}
-        try:
-            self._deploy_connection_cache_path.parent.mkdir(parents=True, exist_ok=True)
-            self._deploy_connection_cache_path.write_text(json.dumps(payload))
-            os.chmod(self._deploy_connection_cache_path, 0o600)
-        except Exception:
-            log_exception("Failed to persist deploy connection cache")
+        persist_deploy_connection_cache(
+            self._deploy_connection_cache_path, self._deploy_connection_cache
+        )
 
     def _load_persisted_deploy_connection_cache(self) -> None:
-        try:
-            if not self._deploy_connection_cache_path.exists():
-                return
-            payload = json.loads(self._deploy_connection_cache_path.read_text())
-            entries = payload.get("entries")
-            if not isinstance(entries, dict):
-                return
-            normalized: dict[str, dict[str, object]] = {}
-            for key, value in entries.items():
-                app_name = str(key or "").strip()
-                if not app_name or not isinstance(value, dict):
-                    continue
-                normalized[app_name] = value
-            self._deploy_connection_cache = normalized
-        except Exception:
-            self._deploy_connection_cache = {}
+        self._deploy_connection_cache = load_persisted_deploy_connection_cache(
+            self._deploy_connection_cache_path
+        )
 
     def _merge_deploy_connection_cache(self, rows: list[EndpointInfo]) -> None:
         if not self._deploy_connection_cache:
@@ -2384,88 +2123,25 @@ class TuiApp(App):
         )
 
     def _load_persisted_storage_cache(self) -> None:
-        try:
-            if not self._storage_cache_path.exists():
-                return
-            payload = json.loads(self._storage_cache_path.read_text())
-            snapshot_payload = payload.get("snapshot")
-            if not isinstance(snapshot_payload, dict):
-                return
-            snapshot = self._snapshot_from_dict(snapshot_payload)
-            if snapshot is None:
-                return
-            self._storage_snapshot_cache = snapshot
-            self._storage_snapshot_cached_at_epoch = float(payload.get("cached_at_epoch", 0.0) or 0.0)
-        except Exception:
-            self._storage_snapshot_cache = None
-            self._storage_snapshot_cached_at_epoch = 0.0
+        snapshot, cached_at = load_persisted_storage_snapshot(self._storage_cache_path)
+        self._storage_snapshot_cache = snapshot
+        self._storage_snapshot_cached_at_epoch = cached_at
 
     @staticmethod
     def _model_to_dict(model: StoredModelInfo) -> dict[str, object]:
-        return {
-            "backend": model.backend.value,
-            "model_id": model.model_id,
-            "revision": model.revision,
-            "quant": model.quant,
-            "size_bytes": model.size_bytes,
-            "file_count": model.file_count,
-            "source_volume": model.source_volume,
-            "paths": model.paths or [],
-            "incomplete": model.incomplete,
-        }
+        return stored_model_to_dict(model)
 
     @staticmethod
     def _model_from_dict(payload: dict[str, object]) -> StoredModelInfo | None:
-        backend_raw = str(payload.get("backend", "")).strip().lower()
-        if backend_raw not in {"llamacpp", "vllm"}:
-            return None
-        paths_value = payload.get("paths")
-        if isinstance(paths_value, str):
-            paths = [paths_value] if paths_value.strip() else []
-        elif isinstance(paths_value, (list, tuple)):
-            paths = [str(path) for path in paths_value if str(path).strip()]
-        else:
-            paths = []
-        return StoredModelInfo(
-            backend=BackendType(backend_raw),
-            model_id=str(payload.get("model_id", "")).strip(),
-            revision=str(payload.get("revision")) if payload.get("revision") not in {None, ""} else None,
-            quant=str(payload.get("quant")) if payload.get("quant") not in {None, ""} else None,
-            size_bytes=positive_int(payload.get("size_bytes")) or 0,
-            file_count=positive_int(payload.get("file_count")) or 0,
-            source_volume=str(payload.get("source_volume", "") or ""),
-            paths=paths,
-            incomplete=bool(payload.get("incomplete", False)),
-        )
+        return stored_model_from_dict(payload)
 
     @classmethod
     def _snapshot_to_dict(cls, snapshot: StorageSnapshot) -> dict[str, object]:
-        return {
-            "llamacpp_models": [cls._model_to_dict(model) for model in snapshot.llamacpp_models],
-            "vllm_models": [cls._model_to_dict(model) for model in snapshot.vllm_models],
-        }
+        return storage_snapshot_to_dict(snapshot)
 
     @classmethod
     def _snapshot_from_dict(cls, payload: dict[str, object]) -> StorageSnapshot | None:
-        llamacpp_payload = payload.get("llamacpp_models")
-        vllm_payload = payload.get("vllm_models")
-        if not isinstance(llamacpp_payload, list) or not isinstance(vllm_payload, list):
-            return None
-        llamacpp_models: list[StoredModelInfo] = []
-        for row in llamacpp_payload:
-            if not isinstance(row, dict):
-                continue
-            model = cls._model_from_dict(row)
-            if model is not None:
-                llamacpp_models.append(model)
-        vllm_models: list[StoredModelInfo] = []
-        for row in vllm_payload:
-            if not isinstance(row, dict):
-                continue
-            model = cls._model_from_dict(row)
-            if model is not None:
-                vllm_models.append(model)
-        return StorageSnapshot(llamacpp_models=llamacpp_models, vllm_models=vllm_models)
+        return storage_snapshot_from_dict(payload)
 
     # ------------------------------------------------------------------
     # vLLM model discovery
