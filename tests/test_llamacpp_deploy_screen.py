@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from textual.app import App
 from textual.widgets import Button, Input, OptionList, Select, Static, Switch
@@ -534,30 +535,32 @@ class LlamaCppDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_repo_input_triggers_quant_lookup_when_not_in_ranked_cache(self) -> None:
         app = _TestApp()
-        async with app.run_test() as pilot:
-            app.push_screen(LlamaCppDeployScreen())
-            await pilot.pause()
-            screen = app.screen
-            assert isinstance(screen, LlamaCppDeployScreen)
-            screen.query_one("#repo-id", Input).value = "new-author/new-model-GGUF"
-            await pilot.pause(0.4)
-            self.assertEqual(app.quant_fetch_calls, [("new-author/new-model-GGUF", None)])
+        with patch("llm_launchpad.tui.screens.deploy._MODEL_LOOKUP_DEBOUNCE_SECONDS", 0.02):
+            async with app.run_test() as pilot:
+                app.push_screen(LlamaCppDeployScreen())
+                await pilot.pause()
+                screen = app.screen
+                assert isinstance(screen, LlamaCppDeployScreen)
+                screen.query_one("#repo-id", Input).value = "new-author/new-model-GGUF"
+                await pilot.pause(0.06)
+                self.assertEqual(app.quant_fetch_calls, [("new-author/new-model-GGUF", None)])
 
     async def test_repo_input_debounces_partial_metadata_lookups(self) -> None:
         app = _TestApp()
-        async with app.run_test() as pilot:
-            app.push_screen(LlamaCppDeployScreen())
-            await pilot.pause()
-            screen = app.screen
-            assert isinstance(screen, LlamaCppDeployScreen)
-            repo_input = screen.query_one("#repo-id", Input)
+        with patch("llm_launchpad.tui.screens.deploy._MODEL_LOOKUP_DEBOUNCE_SECONDS", 0.04):
+            async with app.run_test() as pilot:
+                app.push_screen(LlamaCppDeployScreen())
+                await pilot.pause()
+                screen = app.screen
+                assert isinstance(screen, LlamaCppDeployScreen)
+                repo_input = screen.query_one("#repo-id", Input)
 
-            for value in ("new", "new-author/", "new-author/new", "new-author/new-model-GGUF"):
-                repo_input.value = value
-                await pilot.pause(0.05)
-            await pilot.pause(0.4)
+                for value in ("new", "new-author/", "new-author/new", "new-author/new-model-GGUF"):
+                    repo_input.value = value
+                    await pilot.pause(0.005)
+                await pilot.pause(0.08)
 
-            self.assertEqual(app.quant_fetch_calls, [("new-author/new-model-GGUF", None)])
+                self.assertEqual(app.quant_fetch_calls, [("new-author/new-model-GGUF", None)])
 
     async def test_repo_quant_and_advanced_fields_map_into_config(self) -> None:
         app = _TestApp()

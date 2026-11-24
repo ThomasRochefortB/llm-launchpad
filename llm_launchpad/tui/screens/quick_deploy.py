@@ -71,6 +71,15 @@ def _summary_row(label: str, value: str) -> str:
     return f"[bold]{label}[/bold]{' ' * (_SUMMARY_LABEL_WIDTH - len(label))}{value}"
 
 
+def _short_context_label(tokens: int) -> str:
+    """Compact context label without duplicating the 'Context' field name."""
+    if tokens >= 1024 and tokens % 1024 == 0:
+        return f"{tokens // 1024}K"
+    if tokens >= 1000:
+        return f"{round(tokens / 1024)}K"
+    return format_context_length(tokens)
+
+
 def _render_decision_facts(profile: QuickDeployProfile, plan: InferencePlan) -> str:
     """Four facts for the deploy decision: compute, context, cost, availability.
 
@@ -82,7 +91,7 @@ def _render_decision_facts(profile: QuickDeployProfile, plan: InferencePlan) -> 
         f"[bold]{escape(plan.quote.provider.display_name)}[/bold] · "
         f"{f'{escape(plan.quote.region)} · ' if plan.quote.region else ''}"
         f"{escape(display_gpu_type(plan.quote.gpu_type))} x{plan.quote.gpu_count}\n"
-        f"[dim]Context[/dim] {escape(format_context_length(profile.max_context_tokens))} · "
+        f"[dim]Context[/dim] {escape(_short_context_label(profile.max_context_tokens))} · "
         f"[bold $money]{escape(_plan_hourly_cost(plan))}[/] · "
         f"{escape(_billing_label(plan.quote.billing_model))}"
         + (f" · ${total:.2f} first hour" if plan.quote.one_time_cost_usd and
@@ -113,7 +122,7 @@ def _idle_shutdown_fact(plan: InferencePlan) -> str:
         and plan.quote.provider == ComputeProvider.PRIME
         and not settings.prime_self_terminate
     ):
-        text += " while this computer is awake"
+        text += " (while awake)"
     style = "$warning" if settings.rental_idle_shutdown <= 0 else "dim"
     return f"\n[dim]Idle stop[/dim] [{style}]{escape(text)}[/{style}]"
 
@@ -213,7 +222,7 @@ def _show_placement_reference(reference: str, gpu_type: str) -> bool:
 def _billing_label(value: BillingModel) -> str:
     if value == BillingModel.SCALE_TO_ZERO:
         return "Scale to zero"
-    return "Provisioned resource"
+    return "Dedicated"
 
 
 def _availability_label(plan: InferencePlan) -> str:
@@ -426,14 +435,10 @@ class QuickDeployScreen(CopyEnabledScreen):
                 )
         with VerticalScroll(id="quick-deploy-layout"):
             with Vertical(id="quick-deploy-form"):
-                # One toggle for everything past the decision: the evidence
-                # behind it, the equivalent placements, and the tuning knobs.
+                # One toggle for everything past the decision: tuning knobs
+                # first so expanding reveals interactive controls immediately,
+                # followed by the technical details and monthly assumptions.
                 yield Button("More options...", id="toggle-advanced-quick", variant="default")
-                yield Static(
-                    _render_profile_details(self.profile, self.plan),
-                    id="quick-deploy-profile-body",
-                    classes="quick-advanced",
-                )
                 if len(self._alternative_plans) > 1:
                     yield Static("Runs on", classes="form-label quick-advanced")
                     yield Select(
@@ -485,13 +490,13 @@ class QuickDeployScreen(CopyEnabledScreen):
                 yield FormField(
                     "Instance name (optional)",
                     "quick-instance-name",
-                    hint="Leave blank to use the curated default slug hint.",
+                    hint="Blank uses the default slug.",
                     classes="quick-advanced",
                 )
                 yield FormField(
                     "App name override (optional)",
                     "quick-app-name",
-                    hint="Leave blank to use the selected provider's standard naming.",
+                    hint="Blank uses provider standard naming.",
                     classes="quick-advanced",
                 )
                 if self.plan.recipe.serving_requirements is None:
@@ -524,7 +529,7 @@ class QuickDeployScreen(CopyEnabledScreen):
                     yield FormField(
                         "Prime disk ID (optional)",
                         "quick-prime-disk-id",
-                        hint="Leave blank to auto-attach a persistent cache disk",
+                        hint="Blank auto-attaches a persistent cache disk.",
                         classes="quick-advanced quick-prime-only",
                     )
                     yield ToggleField(
@@ -539,6 +544,11 @@ class QuickDeployScreen(CopyEnabledScreen):
                         default=False,
                         classes="quick-advanced quick-prime-only",
                     )
+                yield Static(
+                    _render_profile_details(self.profile, self.plan),
+                    id="quick-deploy-profile-body",
+                    classes="quick-advanced",
+                )
         yield FittedFooter()
 
     def on_mount(self) -> None:
@@ -674,7 +684,7 @@ class QuickDeployScreen(CopyEnabledScreen):
 
     def _deploy_key_hint(self) -> str:
         return deploy_key_hint(
-            narrow=self.viewport_profile.narrow,
+            narrow=self.viewport_profile.compact,
         )
 
     def refresh_keyboard_hints(self) -> None:

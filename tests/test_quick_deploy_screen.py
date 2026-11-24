@@ -67,7 +67,7 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Kimi K2.5 [dim](UD-Q4_K_XL)[/dim]", card_title)
             # Decision facts stay above the fold; evidence lives in details.
             self.assertIn("RTX PRO 6000 96GB x5", facts)
-            self.assertIn("262,144 ctx", facts)
+            self.assertIn("256K", facts)
             self.assertIn("~$15.15/hr while billed", facts)
             self.assertIn("Scale to zero", facts)
             self.assertNotIn("Cheap but good", facts)
@@ -184,7 +184,7 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             details = str(screen.query_one("#quick-deploy-profile-body", Static).content)
             self.assertIn(_summary_row("Tier", "$$$ B200"), details)
             self.assertIn(_summary_row("VRAM", "141 GB required"), details)
-            self.assertIn("196,608", facts)
+            self.assertIn("192K", facts)
 
     async def test_deploy_uses_blank_override_defaults(self) -> None:
         app = _TestApp()

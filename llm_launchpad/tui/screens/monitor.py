@@ -78,9 +78,12 @@ def _connection_card_markup(payload: dict[str, str]) -> str:
     model_id = _field("model_id")
     display = _field("display_name")
     rows = [("Base URL", _field("base_url")), ("Model ID", model_id)]
-    # Usually the served name is the display name; only a different one earns
-    # a row of its own.
-    if display not in (model_id, "(unavailable)"):
+    # Usually the served name is the display name (or differs only by hyphens);
+    # only a genuinely distinct one earns a row of its own.
+    if (
+        display not in (model_id, "(unavailable)")
+        and display.replace("-", " ").casefold() != model_id.replace("-", " ").casefold()
+    ):
         rows.append(("Display", display))
     rows.append(("API key", (payload.get("api_key") or "").strip() or "none"))
     return labelled_rows_markup([*_plain_rows(rows), *_tool_calling_rows(payload)])
@@ -174,7 +177,14 @@ class MonitorScreen(CopyEnabledScreen):
             return self.has_class("connection-ready")
         if (
             self._done
-            and action in {"page_up_log", "page_down_log", "resume_follow", "clear_log"}
+            and action in {
+                "page_up_log",
+                "page_down_log",
+                "resume_follow",
+                "clear_log",
+                "search_logs",
+                "toggle_log_view",
+            }
             and self.has_class("logs-collapsed")
         ):
             return False
@@ -184,13 +194,10 @@ class MonitorScreen(CopyEnabledScreen):
             return False
         if action == "resume_follow" and self._following:
             return False
-        if not self._done and action in {"submit_or_finish", "copy_base_url"}:
-            # The result card is hidden until completion; advertising Done and
-            # Copy URL beforehand promises buttons that do not exist yet.
-            if action == "copy_base_url" and self._connection_payload is None:
-                return False
-            if action == "submit_or_finish":
-                return False
+        if action == "copy_base_url" and self._connection_payload is None:
+            return False
+        if not self._done and action == "submit_or_finish":
+            return False
         return super().check_action(action, parameters)
 
     def __init__(
@@ -707,37 +714,37 @@ class MonitorScreen(CopyEnabledScreen):
         """Describe the resource outcome without inventing cleanup results."""
         status = self._progress.resource_status
         if status == "allocated":
-            return "Resource was allocated; it may still be running. Check Manage before redeploying."
+            return "Allocated; may still be running — check Manage before redeploying."
         if status in ("unknown", "none"):
-            return "Resource state is unknown. Check Manage for stopped or retained resources."
+            return "State unknown — check Manage for retained resources."
         if status == "retained":
-            return "Resource was retained. Stop it in Manage if it is no longer needed."
+            return "Retained — stop it in Manage if no longer needed."
         if status == "failed":
-            return "Cleanup did not confirm. Check Manage for unresolved resources."
+            return "Cleanup unconfirmed — check Manage for unresolved resources."
         if status == "stopped":
-            return "The resource was stopped."
-        return "Check Manage for the current resource state."
+            return "Stopped."
+        return "Check Manage for current state."
 
     def _failure_next_steps(self, operation: OperationType) -> str:
         if operation == OperationType.DEPLOY:
-            return "Next: review the error, try another placement, or open Manage for logs."
+            return "Review the error, try another placement, or open Manage for logs."
         if operation == OperationType.WARMUP:
-            return "Next: the endpoint may still exist; verify in Manage or check logs."
+            return "Endpoint may still exist — verify in Manage or check logs."
         if operation == OperationType.STOP:
-            return "Next: check Manage; a failed stop can leave a billable resource."
-        return "Next: check Manage or review the logs above."
+            return "Check Manage; a failed stop can leave a billable resource."
+        return "Check Manage or review the logs below."
 
     def _show_failure_card(self, message: OperationDone) -> None:
         """Render a concise failure outcome with resource state and next actions."""
         detail = _strip_ansi(message.detail or "").strip() or self._last_error_message
         rows: list[tuple[str, str]] = [
-            ("Operation", message.operation.value),
             ("Error", detail or f"exit code {message.exit_code}"),
             ("Resource", self._failure_resource_line()),
             ("Next", self._failure_next_steps(message.operation)),
         ]
         self._failure_rows = rows
         self._failure_title = f"{message.operation.value.capitalize()} failed"
+        self.add_class("has-failure-card")
         card = self._mount_outcome_card("failure-card")
         if card is not None:
             self._fill_failure_card()

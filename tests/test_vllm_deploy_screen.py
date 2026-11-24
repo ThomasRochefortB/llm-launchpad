@@ -782,6 +782,10 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
         )
         with (
             patch(
+                "llm_launchpad.tui.screens.deploy._MODEL_LOOKUP_DEBOUNCE_SECONDS",
+                0.02,
+            ),
+            patch(
                 "llm_launchpad.tui.screens.deploy.fetch_vllm_memory_breakdown",
                 return_value=estimate,
             ),
@@ -798,7 +802,7 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 assert isinstance(screen, VllmDeployScreen)
                 screen.query_one("#model-name", Input).value = "Qwen/Qwen3-8B"
                 screen.query_one("#n-gpu", Input).value = "2"
-                await pilot.pause(0.4)
+                await pilot.pause(0.06)
 
                 text = str(screen.query_one("#vllm-vram-status", Static).content)
                 self.assertIn("Estimated VRAM", text)
@@ -821,6 +825,10 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
         )
         with (
             patch(
+                "llm_launchpad.tui.screens.deploy._MODEL_LOOKUP_DEBOUNCE_SECONDS",
+                0.02,
+            ),
+            patch(
                 "llm_launchpad.tui.screens.deploy.fetch_vllm_memory_breakdown",
                 return_value=estimate,
             ),
@@ -836,11 +844,11 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 screen = app.screen
                 assert isinstance(screen, VllmDeployScreen)
                 screen.query_one("#model-name", Input).value = "Qwen/Qwen3.8-27B"
-                await pilot.pause(0.4)
+                await pilot.pause(0.06)
                 self.assertIn("~132.0 GB total", str(screen.query_one("#vllm-vram-status", Static).content))
 
                 screen.query_one("#max-model-len", Input).value = "4096"
-                await pilot.pause(0.2)
+                await pilot.pause(0.05)
 
                 text = str(screen.query_one("#vllm-vram-status", Static).content)
                 # Half the context halves the cache: 90 + 10, plus 20% overhead.
@@ -854,7 +862,13 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_vllm_memory_status_handles_unavailable_estimate(self) -> None:
         app = _TestApp()
-        with patch("llm_launchpad.tui.screens.deploy.fetch_vllm_memory_breakdown", return_value=None):
+        with (
+            patch(
+                "llm_launchpad.tui.screens.deploy._MODEL_LOOKUP_DEBOUNCE_SECONDS",
+                0.02,
+            ),
+            patch("llm_launchpad.tui.screens.deploy.fetch_vllm_memory_breakdown", return_value=None),
+        ):
             async with app.run_test() as pilot:
                 app.push_screen(VllmDeployScreen())
                 await pilot.pause()
@@ -862,7 +876,7 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 screen = app.screen
                 assert isinstance(screen, VllmDeployScreen)
                 screen.query_one("#model-name", Input).value = "custom/model-no-metadata"
-                await pilot.pause(0.4)
+                await pilot.pause(0.06)
 
                 text = str(screen.query_one("#vllm-vram-status", Static).content)
                 self.assertIn("N/A", text)
@@ -876,10 +890,16 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             overhead_gb=2.0,
             context_tokens=8192,
         )
-        with patch(
-            "llm_launchpad.tui.screens.deploy.fetch_vllm_memory_breakdown",
-            return_value=estimate,
-        ) as fetch_memory:
+        with (
+            patch(
+                "llm_launchpad.tui.screens.deploy._MODEL_LOOKUP_DEBOUNCE_SECONDS",
+                0.04,
+            ),
+            patch(
+                "llm_launchpad.tui.screens.deploy.fetch_vllm_memory_breakdown",
+                return_value=estimate,
+            ) as fetch_memory,
+        ):
             async with app.run_test() as pilot:
                 app.push_screen(VllmDeployScreen())
                 await pilot.pause()
@@ -889,8 +909,8 @@ class VllmDeployScreenTests(unittest.IsolatedAsyncioTestCase):
 
                 for value in ("Qwe", "Qwen/", "Qwen/Qwen3", "Qwen/Qwen3-8B"):
                     model_input.value = value
-                    await pilot.pause(0.05)
-                await pilot.pause(0.4)
+                    await pilot.pause(0.005)
+                await pilot.pause(0.08)
 
                 fetch_memory.assert_called_once_with(
                     repo_id="Qwen/Qwen3-8B",
@@ -1054,6 +1074,10 @@ class VllmDeployFormPolishTests(unittest.IsolatedAsyncioTestCase):
         )
         with (
             patch(
+                "llm_launchpad.tui.screens.deploy._MODEL_LOOKUP_DEBOUNCE_SECONDS",
+                0.02,
+            ),
+            patch(
                 "llm_launchpad.tui.screens.deploy.fetch_vllm_memory_breakdown",
                 return_value=estimate,
             ),
@@ -1068,7 +1092,7 @@ class VllmDeployFormPolishTests(unittest.IsolatedAsyncioTestCase):
                 screen = app.screen
                 assert isinstance(screen, VllmDeployScreen)
                 screen.query_one("#model-name", Input).value = "acme/very-large"
-                await pilot.pause(0.4)
+                await pilot.pause(0.06)
 
                 self.assertEqual(screen.query_one("#vast-disk-vllm", Input).value, "")
                 # 240 GB of weights does not fit the flat 100 GB default.

@@ -160,7 +160,7 @@ def test_vast_watchdog_failure_is_a_warning_not_a_failed_deploy() -> None:
     ("provider", "settings", "expected"),
     [
         (ComputeProvider.VAST, LaunchpadSettings(), "deleted after 1h with no requests"),
-        (ComputeProvider.PRIME, LaunchpadSettings(), "while this computer is awake"),
+        (ComputeProvider.PRIME, LaunchpadSettings(), "(while awake)"),
         (ComputeProvider.PRIME, LaunchpadSettings(prime_self_terminate=True), "no requests["),
         (ComputeProvider.VAST, LaunchpadSettings(rental_idle_shutdown=0), "bills until you stop it"),
     ],

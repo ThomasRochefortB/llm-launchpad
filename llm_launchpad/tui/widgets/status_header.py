@@ -40,7 +40,8 @@ class StatusHeader(Static):
         # operation that exited non-zero used to leave this reading
         # `state: deploying`, describing work that had stopped.
         state_key = FAILED_STATE if self.failed else self.state
-        state_text = f"{self.state} (failed)" if self.failed else self.state
+        pretty_state = self.state.replace("_", " ")
+        state_text = f"{pretty_state} (failed)" if self.failed else pretty_state
         # Muted field names, bold values, and the state as a tag in its own
         # colour, so the eye finds the one field that changes first.
         marker, style = _STATE_MARKERS.get(state_key, ("?", "dim"))
@@ -48,11 +49,14 @@ class StatusHeader(Static):
         state_markup = (
             tag(state, style) if style.startswith("$") else f"[bold]{escape(state)}[/]"
         )
+        backend_label = {"llamacpp": "llama.cpp", "vllm": "vLLM"}.get(
+            self.backend, self.backend
+        )
         # Operation and detail are the progress panel's to say; repeating them
         # here put "Warming up" on screen three times, and the operation name
         # went stale when a deploy's warmup phase finished.
         parts = [
-            f"[dim]backend[/] [bold]{escape(self.backend)}[/]",
+            f"[dim]backend[/] [bold]{escape(backend_label)}[/]",
             f"  [dim]state[/] {state_markup}",
         ]
         return " ".join(parts)

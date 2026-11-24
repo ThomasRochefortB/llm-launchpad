@@ -250,13 +250,20 @@ class HelpOverlayScreen(ModalScreen):
         except Exception:
             effective = None
         if effective is not None:
-            # active_bindings already merges app + screen with priority, so a
-            # single contextual section stays truthful about what works now.
-            if effective:
-                sections.append(("Available now", effective))
+            # Separate screen-specific actions from universal app plumbing so
+            # screen shortcuts are immediately scannable at the top.
+            _global_labels = frozenset(
+                {"help", "copy", "paste", "palette", "quit", "copy selection, or quit"}
+            )
+            screen_rows = [row for row in effective if row[1].casefold() not in _global_labels]
+            global_rows = [row for row in effective if row[1].casefold() in _global_labels]
+            if screen_rows:
+                sections.append(("Screen", screen_rows))
             focused_hints = _focused_control_hints(screen)
             if focused_hints:
                 sections.append(("Focused control", focused_hints))
+            if global_rows:
+                sections.append(("Global", global_rows))
             if not sections:
                 # Mounted but no described bindings (e.g. minimum-size gate):
                 # fall back to class bindings so help is never empty.

@@ -94,6 +94,15 @@ class FittedFooter(Footer):
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self._fitted_width = 0
+        self._rendered_signature: tuple[object, ...] | None = None
+
+    async def bindings_changed(self, screen: Any) -> None:
+        """Recompose only when the visible fitted hints actually change."""
+        self._bindings_ready = True
+        if not screen.app.app_focus:
+            return
+        if self.is_attached and screen is self.screen:
+            await self._recompose_if_changed()
 
     async def on_resize(self) -> None:
         """Re-fit the hints when the terminal width changes.
@@ -106,12 +115,27 @@ class FittedFooter(Footer):
             return
         self._fitted_width = width
         if self._bindings_ready and self.is_mounted:
-            await self.recompose()
+            await self._recompose_if_changed()
 
-    def compose(self) -> ComposeResult:
-        if not self._bindings_ready:
+    async def watch_show_command_palette(self) -> None:
+        """Refit when the command-palette hint is toggled on or off."""
+        if self._bindings_ready and self.is_mounted:
+            await self._recompose_if_changed()
+
+    async def _recompose_if_changed(self) -> None:
+        _, _, _, signature = self._compute_layout()
+        if signature == self._rendered_signature:
             return
+        await self.recompose()
 
+    def _compute_layout(
+        self,
+    ) -> tuple[
+        list[tuple[Binding, bool, str]],
+        int,
+        tuple[Binding, bool, str] | None,
+        tuple[object, ...],
+    ]:
         action_to_bindings: defaultdict[str, list[tuple[Binding, bool, str]]]
         action_to_bindings = defaultdict(list)
         for _, binding, enabled, tooltip in self.screen.active_bindings.values():
@@ -124,31 +148,96 @@ class FittedFooter(Footer):
             # The palette hint docks right and is laid out outside the grid, so
             # its width is unavailable to everything else.
             binding, _enabled, _tooltip = palette_binding
-            budget -= _hint_width(self.app.get_key_display(binding), _sentence_case(binding.description)) + 1
+            budget -= (
+                _hint_width(
+                    self.app.get_key_display(binding),
+                    _sentence_case(binding.description),
+                )
+                + 1
+            )
 
         shown, hidden = self._fit(
             self._prioritize(list(action_to_bindings.values())), budget
         )
+        shown_sig = tuple(
+            (
+                binding.key,
+                self.app.get_key_display(binding),
+                binding.description,
+                binding.action,
+                not enabled,
+                tooltip,
+            )
+            for binding, enabled, tooltip in shown
+        )
+        palette_sig = (
+            (
+                palette_binding[0].key,
+                self.app.get_key_display(palette_binding[0]),
+                _sentence_case(palette_binding[0].description),
+                palette_binding[0].action,
+                not palette_binding[1],
+                palette_binding[2],
+            )
+            if palette_binding is not None
+            else None
+        )
+        return shown, hidden, palette_binding, (shown_sig, hidden, palette_sig)
+
+    def _make_footer_key(
+        self,
+        key: str,
+        key_display: str,
+        description: str,
+        action: str,
+        *,
+        classes: str = "",
+        disabled: bool = False,
+        tooltip: str = "",
+    ) -> FooterKey:
+        widget = FooterKey(
+            key,
+            key_display,
+            description,
+            action,
+            classes=classes,
+            disabled=disabled,
+            tooltip=tooltip,
+        )
+        # FooterKey defaults compact=True while Footer defaults compact=False,
+        # which otherwise toggles -compact twice (and reapplies CSS twice) per
+        # key on every mount.
+        widget.set_reactive(FooterKey.compact, self.compact)
+        return widget.data_bind(Footer.compact)
+
+    def compose(self) -> ComposeResult:
+        if not self._bindings_ready:
+            return
+
+        shown, hidden, palette_binding, signature = self._compute_layout()
+        self._rendered_signature = signature
+        if self.size.width:
+            self._fitted_width = self.size.width
 
         self.styles.grid_size_columns = len(shown) + (1 if hidden else 0)
         for binding, enabled, tooltip in shown:
-            yield FooterKey(
+            yield self._make_footer_key(
                 binding.key,
                 self.app.get_key_display(binding),
                 binding.description,
                 binding.action,
                 disabled=not enabled,
                 tooltip=tooltip,
-            ).data_bind(Footer.compact)
+            )
         if hidden:
-            yield FooterKey(
+            yield self._make_footer_key(
                 "question_mark",
                 "",
                 _OVERFLOW_TEMPLATE.format(count=hidden),
                 "show_help",
                 classes="-overflow",
                 tooltip="Press ? to see every shortcut for this screen",
-            ).data_bind(Footer.compact)
+            )
         if palette_binding is not None:
             binding, enabled, tooltip = palette_binding
             yield FooterKey(

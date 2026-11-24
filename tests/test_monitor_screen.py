@@ -119,7 +119,7 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             assert isinstance(screen, MonitorScreen)
             header = screen.query_one("#monitor-status-header", StatusHeader)
             self.assertEqual(header.backend, "llamacpp")
-            self.assertIn("llamacpp", header.render())
+            self.assertIn("llama.cpp", header.render())
 
     async def test_a_failed_operation_drops_the_stale_detail(self) -> None:
         # DeploymentState has no failed member, so the state it reached stands;

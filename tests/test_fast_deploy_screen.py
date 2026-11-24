@@ -731,6 +731,9 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(screen._phase, "infra")
                 self.assertFalse(screen.check_action("focus_model_search", ()))
                 self.assertFalse(screen.check_action("show_excluded_models", ()))
+                # Hidden when all placements are already shown (no tiers to toggle).
+                self.assertFalse(screen.check_action("toggle_all_placements", ()))
+                screen._has_tiers = True
                 self.assertTrue(screen.check_action("toggle_all_placements", ()))
 
     async def test_availability_failure_cannot_authorize_a_cached_placement(self) -> None:

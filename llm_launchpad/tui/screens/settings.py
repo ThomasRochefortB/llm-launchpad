@@ -84,63 +84,67 @@ class SettingsScreen(CopyEnabledScreen):
 
         with Vertical(id="settings-layout"):
             with VerticalScroll(id="settings-scroll", classes="screen-scroll"):
-                # The title heads the screen like every other one, not the card.
-                yield Static(screen_title("Settings"), id="settings-title")
-                with Vertical(id="settings-form"):
-                    yield Static("[bold]Deployment[/bold]", classes="settings-section")
-                    yield FormField(
-                        "Modal idle timeout before scale-down",
-                        "scaledown-window",
-                        default=format_scaledown_window(settings.scaledown_window),
-                        hint="e.g. 30m, 90s or 1800",
-                    )
-                    yield Static("[bold]Appearance[/bold]", classes="settings-section")
-                    with Horizontal(id="settings-appearance-row"):
-                        with Vertical(classes="settings-appearance-control"):
-                            yield Static("Theme", classes="form-label")
-                            yield Select(
-                                TUI_THEME_OPTIONS,
-                                value=normalize_tui_theme(settings.tui_theme),
-                                allow_blank=False,
-                                id="tui-theme",
-                            )
-                        with Vertical(classes="settings-appearance-control"):
-                            yield Static("Density", classes="form-label")
-                            yield Select(
-                                TUI_DENSITY_OPTIONS,
-                                value=normalize_tui_density(settings.tui_density),
-                                allow_blank=False,
-                                id="tui-density",
-                            )
-                    yield Static("[bold]Behavior[/bold]", classes="settings-section")
-                    yield ToggleField(
-                        "Require a second Ctrl+C to quit",
-                        "confirm-quit",
-                        default=settings.confirm_quit,
-                    )
-                    yield Static("[bold]Providers[/bold]", classes="settings-section")
-                    yield FormField(
-                        "Delete idle Vast and Prime rentals after",
-                        "rental-idle-shutdown",
-                        default=(
-                            format_scaledown_window(settings.rental_idle_shutdown)
-                            if settings.rental_idle_shutdown > 0
-                            else "off"
-                        ),
-                        hint="e.g. 1h, 30m or off · deleting also removes cached weights",
-                    )
-                    yield ToggleField(
-                        "Prime pods self-stop (stores API key on pod)",
-                        "prime-self-terminate",
-                        default=settings.prime_self_terminate,
-                    )
-                    yield Static(
-                        "[dim]Off: a Prime pod is only stopped while this computer is awake.[/dim]",
-                        classes="form-hint",
-                    )
-                    yield Button("Vast.ai rentals", id="vast-preview-btn")
-                    # Save ends the form it saves; ctrl+s works from anywhere.
-                    yield Button("Save", id="save-btn", variant="primary")
+                with Vertical(id="settings-container"):
+                    # The title heads the screen like every other one, aligned with the card.
+                    yield Static(screen_title("Settings"), id="settings-title")
+                    with Vertical(id="settings-form"):
+                        yield Static("[bold]Idle timeouts[/bold]", classes="settings-section")
+                        with Horizontal(id="settings-timeouts-row"):
+                            with Vertical(classes="settings-appearance-control"):
+                                yield FormField(
+                                    "Modal scale-down",
+                                    "scaledown-window",
+                                    default=format_scaledown_window(settings.scaledown_window),
+                                    hint="e.g. 30m, 90s or 1800",
+                                )
+                            with Vertical(classes="settings-appearance-control"):
+                                yield FormField(
+                                    "Delete idle Vast / Prime rentals",
+                                    "rental-idle-shutdown",
+                                    default=(
+                                        format_scaledown_window(settings.rental_idle_shutdown)
+                                        if settings.rental_idle_shutdown > 0
+                                        else "off"
+                                    ),
+                                    hint="e.g. 1h, 30m or off · removes cached weights",
+                                )
+                        yield Static("[bold]Appearance[/bold]", classes="settings-section")
+                        with Horizontal(id="settings-appearance-row"):
+                            with Vertical(classes="settings-appearance-control"):
+                                yield Static("Theme", classes="form-label")
+                                yield Select(
+                                    TUI_THEME_OPTIONS,
+                                    value=normalize_tui_theme(settings.tui_theme),
+                                    allow_blank=False,
+                                    id="tui-theme",
+                                )
+                            with Vertical(classes="settings-appearance-control"):
+                                yield Static("Density", classes="form-label")
+                                yield Select(
+                                    TUI_DENSITY_OPTIONS,
+                                    value=normalize_tui_density(settings.tui_density),
+                                    allow_blank=False,
+                                    id="tui-density",
+                                )
+                        yield Static("[bold]Behavior[/bold]", classes="settings-section")
+                        yield ToggleField(
+                            "Require a second Ctrl+C to quit",
+                            "confirm-quit",
+                            default=settings.confirm_quit,
+                        )
+                        yield ToggleField(
+                            "Prime pods self-stop (stores API key on pod)",
+                            "prime-self-terminate",
+                            default=settings.prime_self_terminate,
+                        )
+                        yield Static(
+                            "[dim]Off: a Prime pod is only stopped while this computer is awake.[/dim]",
+                            classes="form-hint",
+                        )
+                        with Horizontal(id="settings-form-actions"):
+                            # Save ends the form it saves; ctrl+s works from anywhere.
+                            yield Button("Save", id="save-btn", variant="primary")
+                            yield Button("Vast.ai rentals", id="vast-preview-btn")
             # Feedback stays outside the scroll so a rejection is never
             # scrolled away, and the bar only appears when it has news.
             feedback = (

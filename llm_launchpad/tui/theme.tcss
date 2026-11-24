@@ -79,6 +79,8 @@ StatusHeader {
 LogViewer {
     height: 1fr;
     border: round $foreground 20%;
+    border-title-color: $text-muted;
+    border-subtitle-color: $text-muted;
     background: $surface;
     padding: 0 1;
 }
@@ -224,18 +226,13 @@ Select {
 
 /* Neutral chrome for unfocused controls; only the focused control earns the
    primary border, so keyboard input always has exactly one bright target. */
-Button:focus,
 Select:focus > SelectCurrent {
-    background: $primary 15%;
+    border: tall $primary;
+    background: $surface-lighten-1;
 }
 
 Select > SelectCurrent {
     border: tall $foreground 25%;
-}
-
-Select:focus > SelectCurrent {
-    border: tall $primary;
-    background: $surface-lighten-1;
 }
 
 OptionList > .option-list--option-highlighted {
@@ -261,28 +258,13 @@ DataTable:focus > .datatable--cursor {
     text-style: bold;
 }
 
-/* `variant="error"` adds `-error`; this rule used to target `-danger`, which
-   nothing sets, so destructive buttons looked like every other button. */
-Button.-error {
-    border: round $error;
-    color: $error;
-    text-style: bold;
-}
-
-Button.-error:hover,
-Button.-error:focus {
-    background: $error;
-    color: $background;
-    border: round $error;
-}
-
 .dialog-scroll {
     align: center middle;
 }
 
 .dialog-panel {
     width: 100%;
-    max-width: 76;
+    max-width: 72;
     height: auto;
     padding: 1 2;
     border: round $foreground 20%;
@@ -292,6 +274,7 @@ Button.-error:focus {
 .dialog-title {
     color: $primary;
     text-style: bold;
+    margin-bottom: 1;
 }
 
 .dialog-actions {
@@ -320,37 +303,61 @@ Switch.-on > .switch--slider {
 
 /* ---- Buttons ---- */
 
+/* Compact 1-row borderless pills across every screen: avoids the double-halo
+   artifact of filled rounded borders and keeps action bars crisp and uniform. */
 Button {
-    min-width: 16;
+    width: auto;
+    min-width: 10;
+    height: 1;
+    min-height: 1;
+    padding: 0 2;
     background: $panel;
     color: $text;
-    border: round $foreground 30%;
+    border: none;
 }
 
 Button:hover {
-    background: $primary 15%;
-    border: round $primary;
+    background: $primary 20%;
+    color: $text;
+}
+
+Button:focus {
+    background: $primary 30%;
+    color: $primary;
+    text-style: bold;
 }
 
 Button.-primary {
     background: $primary;
     color: $button-color-foreground;
     text-style: bold;
-    border: round $primary;
+    border: none;
 }
 
-/* One focus treatment for every control: the primary border that Input,
-   Select, OptionList and DataTable also use. `$accent` drew a yellow ring in
-   High Contrast that no other control shared. */
-Button:focus {
-    text-style: bold;
-    border: round $primary;
+Button.-primary:hover {
+    background: $accent;
+    color: $button-color-foreground;
 }
 
-/* A primary button is already filled and bordered in the primary colour, so
-   focus shows as a light ring instead. */
 Button.-primary:focus {
-    border: round $foreground;
+    background: $accent;
+    color: $button-color-foreground;
+    text-style: bold underline;
+}
+
+/* `variant="error"` adds `-error`. */
+Button.-error {
+    background: $error 20%;
+    color: $error;
+    text-style: bold;
+    border: none;
+}
+
+Button.-error:hover,
+Button.-error:focus {
+    background: $error;
+    color: $background;
+    text-style: bold;
 }
 
 /* ---- Fast deploy flow ---- */
@@ -397,7 +404,6 @@ Button.-primary:focus {
    override below then stretches both together. */
 #fast-deploy-search-group {
     width: 1fr;
-    max-width: 72;
     height: auto;
     margin: 0 2 1 0;
 }
@@ -554,16 +560,13 @@ Button.-primary:focus {
 
 #quick-deploy-feedback {
     width: 1fr;
-    padding: 1 0 0 2;
+    height: auto;
+    padding: 0 0 0 2;
+    text-wrap: wrap;
 }
 
 .viewport-constrained #quick-deploy-actions {
     padding-top: 0;
-}
-
-#quick-deploy-feedback {
-    height: auto;
-    text-wrap: wrap;
 }
 
 #quick-fulfillment,
@@ -640,8 +643,8 @@ VllmDeployScreen Select:focus > SelectCurrent {
 
 LlamaCppDeployScreen .gpu-config-panel,
 VllmDeployScreen .gpu-config-panel {
-    border: round $foreground 20%;
-    background: $surface-lighten-1;
+    border: none;
+    background: transparent;
 }
 
 /* Section headings are separated from the field that follows them; bare
@@ -720,10 +723,10 @@ VllmDeployScreen Select:disabled > SelectCurrent {
 
 #monitor-toolbar {
     width: 100%;
-    height: 2;
+    height: 1;
     padding: 0 2;
-    background: $surface;
-    border-bottom: solid $foreground 15%;
+    background: transparent;
+    border-bottom: none;
 }
 
 #monitor-title {
@@ -783,6 +786,7 @@ VllmDeployScreen Select:disabled > SelectCurrent {
 MonitorScreen.connection-ready #monitor-status-header,
 MonitorScreen.connection-ready #deploy-progress-stages,
 MonitorScreen.connection-ready #deploy-progress-next,
+MonitorScreen.has-failure-card #deploy-progress-detail,
 MonitorScreen.logs-collapsed #monitor-toolbar,
 MonitorScreen.logs-collapsed #monitor-log-viewer {
     display: none;
@@ -796,28 +800,30 @@ MonitorScreen.connection-ready DeploymentProgressWidget {
 MonitorScreen.connection-ready #connection-card {
     max-height: 12;
     margin: 0 1;
-    padding: 0 1;
+    padding: 0 2;
 }
 
 MonitorScreen.connection-ready #connection-card-actions {
     layout: horizontal;
-    padding: 0;
+    padding: 1 0 0 0;
 }
 
 MonitorScreen.connection-ready #connection-card-actions Button {
-    width: 1fr;
-    min-width: 0;
+    width: auto;
+    min-width: 10;
     height: 1;
     min-height: 1;
-    padding: 0;
+    padding: 0 2;
     margin: 0 1 0 0;
     border: none;
 }
 
+MonitorScreen.connection-ready.viewport-compact #connection-card-actions,
 MonitorScreen.connection-ready.viewport-minimal #connection-card-actions {
     layout: grid;
     grid-size: 2;
     grid-rows: 1;
+    grid-gutter: 0 1;
 }
 
 MonitorScreen.connection-ready.viewport-shallow #connection-card {
@@ -862,55 +868,47 @@ DeploymentProgressWidget #deploy-progress-hint {
     padding: 0 1;
 }
 
-/* Rows are sized explicitly: left to the grid default, an auto-height grid
-   gave each row two cells, so every button lost its label row and drew as an
-   empty box. */
+/* Compact 1-row pill buttons sit in a single horizontal bar on desktop widths
+   and wrap into a tight 2-column grid only on compact/minimal viewports. */
 #connection-info-actions {
     width: 100%;
     height: auto;
-    layout: grid;
-    grid-size: 3;
-    grid-rows: 3;
-    grid-gutter: 1 1;
+    layout: horizontal;
     margin: 1 0 0 0;
 }
 
-.viewport-minimal #connection-info-actions Button {
-    margin: 0 0 1 0;
-}
-
-.viewport-narrow #connection-info-actions {
-    layout: grid;
-    grid-size: 2;
-    grid-rows: 3;
+#connection-info-actions Button {
+    min-width: 0;
+    padding: 0 1;
+    margin: 0 1 0 0;
 }
 
 .viewport-compact #connection-info-actions {
     layout: grid;
     grid-size: 2;
+    grid-rows: 1;
+    grid-gutter: 1 1;
 }
 
-.viewport-narrow #connection-card-actions,
-.viewport-narrow #failure-card-actions,
-.viewport-narrow #result-card-actions {
-    layout: grid;
-    grid-size: 2;
-    grid-rows: 3;
+.viewport-compact #connection-info-actions Button {
+    margin: 0;
 }
 
 .viewport-minimal #connection-info-actions {
     layout: vertical;
 }
 
-/* Narrow cards stack their action buttons vertically; on a 12-row terminal
-   five 3-row buttons alone overflow the viewport even inside a capped card.
-   Two columns keep every action reachable by keyboard without scrolling the
-   card off screen. This overrides the minimal vertical stacking above. */
+.viewport-minimal #connection-info-actions Button {
+    margin: 0 0 1 0;
+}
+
 .viewport-minimal #connection-card-actions,
 .viewport-minimal #failure-card-actions,
 .viewport-minimal #result-card-actions {
     layout: grid;
     grid-size: 2;
+    grid-rows: 1;
+    grid-gutter: 0 1;
 }
 
 /* ---- Manage screen ---- */
@@ -1022,6 +1020,16 @@ DeploymentProgressWidget #deploy-progress-hint {
     layout: vertical;
 }
 
+#setup-required-scroll {
+    align: center top;
+}
+
+#setup-required-content {
+    width: 100%;
+    max-width: 76;
+    height: auto;
+}
+
 #setup-required-intro {
     margin-bottom: 1;
 }
@@ -1038,6 +1046,7 @@ DeploymentProgressWidget #deploy-progress-hint {
 
 #setup-required-actions {
     height: auto;
+    margin-top: 1;
 }
 
 #setup-required-actions Button,
@@ -1057,6 +1066,16 @@ DeploymentProgressWidget #deploy-progress-hint {
    scrollable in the one direction that can reach them. */
 #settings-scroll {
     align: center top;
+}
+
+#settings-container {
+    width: 100%;
+    max-width: 88;
+    height: auto;
+}
+
+#settings-title {
+    margin-bottom: 1;
 }
 
 #storage-layout,
@@ -1186,7 +1205,8 @@ DeploymentProgressWidget #deploy-progress-hint {
     margin-bottom: 1;
 }
 
-#settings-appearance-row {
+#settings-appearance-row,
+#settings-timeouts-row {
     width: 100%;
     height: auto;
 }
@@ -1199,6 +1219,16 @@ DeploymentProgressWidget #deploy-progress-hint {
 
 .settings-appearance-control:last-child {
     margin-right: 0;
+}
+
+#settings-form-actions {
+    width: 100%;
+    height: auto;
+    margin-top: 1;
+}
+
+#settings-form-actions Button {
+    margin-right: 1;
 }
 
 #storage-predownload-actions {
@@ -1285,10 +1315,10 @@ DeploymentProgressWidget #deploy-progress-hint {
 .gpu-config-panel {
     width: 100%;
     height: auto;
-    margin: 0 0 1 0;
-    padding: 0 1;
-    border: round $foreground 20%;
-    background: $surface;
+    margin: 1 0 0 0;
+    padding: 0;
+    border: none;
+    background: transparent;
 }
 
 .gpu-config-main-row {
@@ -1475,7 +1505,8 @@ StatusHeader.state-error {
     layout: vertical;
 }
 
-.viewport-compact #settings-appearance-row {
+.viewport-compact #settings-appearance-row,
+.viewport-compact #settings-timeouts-row {
     layout: vertical;
 }
 

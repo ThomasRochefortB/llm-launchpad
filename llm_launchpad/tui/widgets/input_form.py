@@ -46,6 +46,7 @@ class FormField(Vertical):
         field_id: str,
         default: str = "",
         hint: str = "",
+        placeholder: str = "",
         password: bool = False,
         required: bool = False,
         input_type: Literal["integer", "number", "text"] = "text",
@@ -56,6 +57,7 @@ class FormField(Vertical):
         self._field_id = field_id
         self._default = default
         self._hint = hint
+        self._placeholder = placeholder
         self._password = password
         self._required = required
         self._input_type = input_type
@@ -63,7 +65,7 @@ class FormField(Vertical):
     def compose(self) -> ComposeResult:
         yield Static(self._label, classes="form-label")
         validators = [Length(minimum=1)] if self._required else []
-        placeholder = "" if self._hint else self._label
+        placeholder = self._placeholder or ("" if self._hint else self._label)
         yield Input(
             value=self._default,
             placeholder=placeholder,

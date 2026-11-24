@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import threading
@@ -68,7 +69,49 @@ class _Runtime:
         return f"http://127.0.0.1:{self.server.server_port}/metrics"
 
 
-def _start(tmp_path: Path, runtime: _Runtime, *, idle: int, grace: int = 3600) -> tuple[subprocess.Popen, Path]:
+def _install_fast_clock(tmp_path: Path, tick_seconds: float = 0.03) -> dict[str, str]:
+    """Give the real watchdog shell script a fast virtual clock via PATH.
+
+    ``date +%s`` reads a counter file and ``sleep N`` advances it by ``N``
+    after a brief real pause so the real POSIX sh + curl loop runs in
+    milliseconds instead of waiting real wall-clock seconds.
+    """
+    real_date = shutil.which("date") or "/usr/bin/date"
+    real_sleep = shutil.which("sleep") or "/usr/bin/sleep"
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    clock_file = tmp_path / "fake-clock"
+    clock_file.write_text("1000\n")
+
+    date_shim = bin_dir / "date"
+    date_shim.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "+%s" ]; then\n'
+        '  cat "$FAKE_CLOCK_FILE"\n'
+        "else\n"
+        f'  exec "{real_date}" "$@"\n'
+        "fi\n"
+    )
+    date_shim.chmod(0o755)
+
+    sleep_shim = bin_dir / "sleep"
+    sleep_shim.write_text(
+        "#!/bin/sh\n"
+        'now=$(cat "$FAKE_CLOCK_FILE")\n'
+        'echo $((now + $1)) > "$FAKE_CLOCK_FILE"\n'
+        f'exec "{real_sleep}" {tick_seconds}\n'
+    )
+    sleep_shim.chmod(0o755)
+
+    env = dict(os.environ)
+    env["PATH"] = f"{bin_dir}:{env.get('PATH', '/usr/bin:/bin')}"
+    env["FAKE_CLOCK_FILE"] = str(clock_file)
+    return env
+
+
+def _start(
+    tmp_path: Path, runtime: _Runtime, *, idle: int, grace: int = 3600
+) -> tuple[subprocess.Popen, Path]:
     marker = tmp_path / "destroyed"
     script = tmp_path / "watchdog.sh"
     script.write_text(watchdog_script(WatchdogSpec(
@@ -80,7 +123,14 @@ def _start(tmp_path: Path, runtime: _Runtime, *, idle: int, grace: int = 3600) -
         startup_grace_seconds=grace,
         poll_seconds=1,
     )))
-    process = _POPEN(["sh", str(script)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    env = _install_fast_clock(tmp_path)
+    process = _POPEN(
+        ["sh", str(script)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+    )
     return process, marker
 
 
@@ -89,27 +139,32 @@ def _wait(predicate, timeout: float) -> bool:  # type: ignore[no-untyped-def]
     while time.monotonic() < deadline:
         if predicate():
             return True
-        time.sleep(0.2)
+        time.sleep(0.02)
     return predicate()
+
+
+def _wait_polls(runtime: _Runtime, delta: int, timeout: float = 5.0) -> bool:
+    target = len(runtime.authorized) + delta
+    return _wait(lambda: len(runtime.authorized) >= target, timeout)
 
 
 def test_activity_keeps_it_alive_and_silence_destroys_it(tmp_path: Path) -> None:
     runtime = _Runtime()
-    process, marker = _start(tmp_path, runtime, idle=1)
+    process, marker = _start(tmp_path, runtime, idle=2)
     try:
         for _ in range(3):
             runtime.tokens += 10
-            time.sleep(1)
+            assert _wait_polls(runtime, 1)
         assert not marker.exists(), "destroyed while tokens were moving"
         runtime.running = 1  # a long prefill moves no counter
-        time.sleep(2)
+        assert _wait_polls(runtime, 3)
         assert not marker.exists(), "destroyed during an in-flight request"
         runtime.running = 0
         assert _wait(marker.exists, 5), "idle rental was never destroyed"
         assert process.wait(timeout=5) == 0
         assert runtime.authorized[0] == "Bearer secret"
         healthy, last_active, idle = (tmp_path / "idle-watchdog.state").read_text().split()
-        assert (healthy, idle) == ("1", "1")
+        assert (healthy, idle) == ("1", "2")
     finally:
         process.kill()
         runtime.server.shutdown()
@@ -134,9 +189,10 @@ def test_the_idle_clock_starts_when_serving_starts(tmp_path: Path) -> None:
     runtime.up = False
     process, marker = _start(tmp_path, runtime, idle=3)
     try:
-        time.sleep(2)
+        assert _wait_polls(runtime, 4)
+        assert not marker.exists()
         runtime.up = True
-        time.sleep(2)
+        assert _wait_polls(runtime, 2)
         assert not marker.exists()
         assert _wait(marker.exists, 5)
     finally:

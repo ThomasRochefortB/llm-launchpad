@@ -487,7 +487,7 @@ class ManageScreen(CopyEnabledScreen):
             with TabbedContent(initial=self._initial_tab, id="manage-tabs"):
                 with TabPane("Endpoints", id="manage-endpoints"):
                     yield Static("[dim]Loading endpoints…[/dim]", id="manage-status")
-                    yield AdaptiveDataTable(id="manage-endpoint-table")
+                    yield AdaptiveDataTable(id="manage-endpoint-table", fit_to_rows=True)
                     yield Static("", id="manage-selection-detail")
                 with TabPane("Jobs", id="manage-jobs"):
                     yield DeploymentJobsPanel()
@@ -908,7 +908,6 @@ class EndpointActionsScreen(CopyEnabledScreen):
         ("connection", "  Connection info"),
         ("status", "  Check status"),
         ("logs", "  View logs"),
-        ("benchmark", "  Run benchmark"),
         ("live-metrics", "  Fetch live metrics"),
         ("stop", "  Stop endpoint"),
     )
@@ -1031,12 +1030,12 @@ class ConnectionInfoScreen(CopyEnabledScreen):
             )
             yield Static("", id="connection-info-fields")
             with Horizontal(id="connection-info-actions"):
-                yield Button("Copy base URL", id="connection-copy-url")
-                yield Button("Copy model ID", id="connection-copy-model")
+                yield Button("Copy URL", id="connection-copy-url")
+                yield Button("Copy model", id="connection-copy-model")
                 yield Button("Copy API key", id="connection-copy-key")
-                yield Button("Copy image request", id="connection-copy-image")
-                yield Button("Copy curl example", id="connection-copy-curl")
-                yield Button("Copy client JSON", id="connection-copy-json")
+                yield Button("Copy image", id="connection-copy-image")
+                yield Button("Copy curl", id="connection-copy-curl")
+                yield Button("Copy JSON", id="connection-copy-json")
         yield FittedFooter()
 
     def on_mount(self) -> None:
@@ -1068,7 +1067,8 @@ class ConnectionInfoScreen(CopyEnabledScreen):
         if display_name and display_name != model_id:
             rows.append(("Display", display_name))
         rows.append(("API key", (payload.get("api_key") or "").strip() or "none"))
-        rows.append(("Images", _vision_summary(vision)))
+        if vision is not None:
+            rows.append(("Images", _vision_summary(vision)))
         return labelled_rows_markup([(label, escape(value)) for label, value in rows])
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
@@ -1334,9 +1334,11 @@ class StopConfirmScreen(CopyEnabledScreen):
     def compose(self) -> ComposeResult:
         with VerticalScroll(classes="screen-scroll dialog-scroll"):
             with Vertical(id="stop-confirm-dialog", classes="dialog-panel"):
-                yield Static("[bold $primary]Stop Endpoint[/]", classes="dialog-title")
                 yield Static(
-                    f"Stop [bold]{escape(_endpoint_name(self.endpoint))}[/bold]?\n"
+                    f"[bold $primary]Stop {escape(_endpoint_name(self.endpoint))}?[/]",
+                    classes="dialog-title",
+                )
+                yield Static(
                     f"[dim]{escape(self.endpoint.provider.value)}/{escape(_endpoint_backend(self.endpoint))} · "
                     f"{escape(self.endpoint.app_id or self.endpoint.name)}[/dim]"
                 )

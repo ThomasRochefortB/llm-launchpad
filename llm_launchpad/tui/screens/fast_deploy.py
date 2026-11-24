@@ -184,15 +184,25 @@ def _compact_quant_label(quant: str) -> str:
     )
 
 
-def _quant_markup(profile: QuickDeployProfile) -> str:
+def _quant_markup(profile: QuickDeployProfile, *, width: int = 0) -> str:
     quant = _compact_quant_label(profile.quant)
     if not quant:
-        return ""
+        return " " * width if width else ""
+    padded = f"{quant:<{width}}" if width else quant
     if is_reduced_quality(profile.quant):
         # Green here used to mark the smallest quantization, which read as a
         # recommendation for the row that quietly costs the most quality.
-        return f"[$warning]{escape(quant)}[/$warning]"
-    return f"[dim]{escape(quant)}[/dim]"
+        return f"[$warning]{escape(padded)}[/$warning]"
+    return f"[dim]{escape(padded)}[/dim]"
+
+
+def _short_context(tokens: int) -> str:
+    """Compact context label (e.g. 256K ctx instead of 262,144 ctx)."""
+    if tokens >= 1024 and tokens % 1024 == 0:
+        return f"{tokens // 1024}K ctx"
+    if tokens >= 1000:
+        return f"{round(tokens / 1024)}K ctx"
+    return format_context_length(tokens)
 
 
 # Marks a model whose GGUF carries native MTP heads the pinned runtime can
@@ -342,11 +352,6 @@ def _quant_options_label(model: QuickDeployModel) -> str:
 
 
 def _model_detail(model: QuickDeployModel) -> str:
-    score = (
-        f"AA score {_format_aa_index(model.quality_score)}"
-        if model.quality_score is not None
-        else "unranked"
-    )
     runtime_note = (
         "\n[dim]First launch builds a model-compatible runtime and may take longer.[/]"
         if load_llamacpp_support_manifest(model.profiles[0].gguf_architecture).build_recipe else ""
@@ -354,21 +359,26 @@ def _model_detail(model: QuickDeployModel) -> str:
     # Names the bolt in the list for the one model the reader has selected,
     # so the marker does not have to be guessed at from the rows alone.
     mtp_note = (
-        f" · {MTP_GLYPH} native MTP speculative decoding"
+        f" · {MTP_GLYPH} native MTP"
         if _model_supports_mtp(model)
         else ""
     )
     profile = model.profiles[0]
     sizes = [f"{n:g}B {label}" for n, label in ((profile.parameter_count_b, "total"),
              (profile.active_parameter_count_b, "active")) if n is not None]
-    parameters = " · " + " / ".join(sizes) if sizes else ""
+    meta_parts: list[str] = []
+    if model.quality_score is None:
+        meta_parts.append("unranked")
+    if sizes:
+        meta_parts.append(" / ".join(sizes))
+    meta_parts.append(_quant_options_label(model))
     repositories = ", ".join(dict.fromkeys(p.repo_id for p in model.profiles if p.repo_id))
     source_line = f"[dim]{escape(repositories)}[/dim]\n" if repositories else ""
     return (
         f"[bold]{escape(model.display_name)}[/bold]  "
-        f"{escape(format_context_length(model.max_context_tokens))}\n"
+        f"[dim]{escape(_short_context(model.max_context_tokens))}[/dim]\n"
         f"{source_line}"
-        f"[dim]{score}{parameters} · {_quant_options_label(model)}{mtp_note}[/dim]{runtime_note}"
+        f"[dim]{' · '.join(meta_parts)}{mtp_note}[/dim]{runtime_note}"
     )
 
 
@@ -568,33 +578,36 @@ def _infra_option(row: _InfraRow, width_mode: WidthMode = WidthMode.WIDE) -> str
     quote = row.plan.quote
     gpu = _infra_gpu_label(row)
     price = _format_price(quote.price_per_hour_usd, estimate=quote.is_estimate)
-    quant = _quant_markup(row.profile)
     provider = escape(quote.provider.display_name)
     if width_mode == WidthMode.MINIMAL:
+        quant = _quant_markup(row.profile)
         return (
             f"  {escape(clip(gpu, 14))} x{quote.gpu_count} "
             f"{quant} [dim]{provider}[/dim] {money(price)}"
         )
-    if width_mode in (WidthMode.COMPACT, WidthMode.STANDARD):
-        gpu_width = 16 if width_mode == WidthMode.COMPACT else 24
+    quant = _quant_markup(row.profile, width=5)
+    if width_mode == WidthMode.COMPACT:
         return (
-            f"  {escape(clip(gpu, gpu_width)):<{gpu_width}} x{quote.gpu_count:<2} "
-            f"{quant} {provider} {money(price)}"
+            f"  {escape(clip(gpu, 16)):<16} x{quote.gpu_count:<2} "
+            f"{quant} {provider:<15} {money(f'{price:>10}')}"
+        )
+    if width_mode == WidthMode.STANDARD:
+        return (
+            f"  {escape(clip(gpu, 22)):<22} x{quote.gpu_count:<2} "
+            f"{quant} {provider:<15} {money(f'{price:>10}')}"
         )
     return (
-        f"  {escape(gpu):<20} x{quote.gpu_count:<2} "
-        f"{quant} {provider} "
-        f"{_availability_label(row.configuration)}  "
-        f"{money(price)}"
+        f"  {escape(clip(gpu, 22)):<22} x{quote.gpu_count:<2} "
+        f"{quant} {provider:<15} {money(f'{price:>10}')}  "
+        f"{_availability_label(row.configuration)}"
     )
 
 
 def _infra_detail(row: _InfraRow) -> str:
     quote = row.plan.quote
-    gpu = _infra_gpu_label(row)
     monthly = _scenario_monthly_label(row.plan)
     region = escape((quote.region or "").strip() or "provider-managed regions")
-    basis = escape(_plan_cost_evaluation(row.plan).basis_label())
+    basis = escape(_plan_cost_evaluation(row.plan).basis_label().rstrip("."))
     performance = ""
     if row.plan.assessment is not None:
         single = max(
@@ -621,14 +634,11 @@ def _infra_detail(row: _InfraRow) -> str:
             performance = (
                 f"~{single:.0f} tok/s single · ~{aggregate:.0f} aggregate ({evidence}) · "
             )
-    # The hourly price is on the highlighted row already; the detail keeps the
-    # one-time charge, which only the tier note otherwise mentions.
     once = _one_time_label(quote)
     return (
-        f"[bold]{escape(gpu)}[/bold] x{quote.gpu_count}  "
-        f"{escape(quote.provider.display_name)} · {_quant_markup(row.profile)}\n"
-        f"[dim]{performance}{monthly}{f' · {once}' if once else ''} · {region} · "
-        f"{_availability_label(row.configuration)}[/dim]\n"
+        f"[bold]{escape(monthly)}[/bold]"
+        f"{f' · {escape(once)}' if once else ''}  "
+        f"[dim]{performance}{region} · {_availability_label(row.configuration)}[/dim]\n"
         f"[dim]{basis} · storage separate[/dim]"
     )
 
@@ -787,6 +797,8 @@ class FastDeployScreen(CopyEnabledScreen):
         editing_search = getattr(self.focused, "id", None) == "fast-deploy-model-search"
         if action == "cycle_context" and (self._snapshot is None or (len(self._contexts) < 2 and self._context_tokens in (None, *self._contexts))):
             return False
+        if action == "toggle_all_placements" and not self._show_all_placements and not self._has_tiers:
+            return False
         if action == "focus_model_results":
             return self._phase == "models" and editing_search
         if action == "focus_model_search" and editing_search:
@@ -824,6 +836,7 @@ class FastDeployScreen(CopyEnabledScreen):
         # detail view: picking between "two L40S" and "one A100" is a question
         # almost nobody can answer, while cheap-or-fast is one everybody can.
         self._show_all_placements = False
+        self._has_tiers = False
         self._catalog_info = QuickDeployCatalogInfo("Loading catalog", ready=False)
         self._models: tuple[QuickDeployModel, ...] = ()
         self._model_by_id: dict[str, QuickDeployModel] = {}
@@ -1302,6 +1315,8 @@ class FastDeployScreen(CopyEnabledScreen):
         width_mode = self.viewport_profile.width_mode
         option_list = self.query_one("#fast-deploy-list", OptionList)
         tiers = () if self._show_all_placements else self._tiers_for(rows)
+        self._has_tiers = bool(tiers)
+        self.refresh_bindings()
         if tiers:
             # A placement from Compare all can fall outside every named tier.
             if self._placement_id in self._infra_rows and all(
@@ -1440,6 +1455,7 @@ class FastDeployScreen(CopyEnabledScreen):
     def _render_unavailable_placement(self, reason: str) -> None:
         self._phase = "infra"
         self._infra_rows = {}
+        self._has_tiers = False
         self._availability_inflight = False
         self.refresh_bindings()
         options = self.query_one("#fast-deploy-list", OptionList)
@@ -1645,8 +1661,6 @@ class FastDeployScreen(CopyEnabledScreen):
             view_label = "Top 10 by AA score"
         else:
             view_label = "Trending" if self._catalog_info.is_fallback else "Unranked"
-        if self._show_top_models and not terms and not (self._fetch_pending or self._pricing_pending):
-            view_label += " · ready" if self._snapshot is not None else ""
         total = len(model_indices)
         count_label = f"{total} model{'s' if total != 1 else ''}"
         filter_note = ""
@@ -1737,6 +1751,7 @@ class FastDeployScreen(CopyEnabledScreen):
         if self._snapshot is not None:
             self._populate_gpu_filter()
         self._infra_rows = {}
+        self._has_tiers = False
         self._availability_inflight = False
         self.workers.cancel_group(self, "fast-deploy-prices")
         self._pricing_pending = self._fetch_pending or (
