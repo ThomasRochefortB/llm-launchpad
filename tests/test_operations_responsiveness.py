@@ -72,7 +72,10 @@ class OperationsResponsivenessTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(app.screen_stack), stack_size)
                 self.assertEqual(screen.query_one(TabbedContent).active, "manage-jobs")
                 self.assertIsNotNone(panel._poll_timer)
-                list_jobs.assert_called_once_with()
+                # The tab polls every half second, so a pause can refresh more
+                # than the opening read. Hidden, it must not have read at all.
+                self.assertGreaterEqual(list_jobs.call_count, 1)
+                list_jobs.assert_called_with()
                 self.assertFalse(screen.check_action("stop_selected", ()))
                 self.assertFalse(screen.check_action("open_actions", ()))
                 self.assertIs(app.focused, screen.query_one("#deployment-jobs", OptionList))

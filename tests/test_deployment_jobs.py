@@ -57,7 +57,7 @@ class DeploymentTrackingTests(unittest.TestCase):
         ), patch("llm_launchpad.tui.workers._dispatch_event") as dispatch, patch("time.sleep"):
             app._tail_persistent_job(job)
 
-        dispatch.assert_called_once_with(monitor, completion)
+        dispatch.assert_called_once_with(monitor, completion, phase_only=True)
         self.assertTrue(job.finished.is_set())
 
     def test_closing_one_modal_stream_terminates_only_its_client(self) -> None:
