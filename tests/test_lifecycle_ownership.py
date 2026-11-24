@@ -14,6 +14,7 @@ from llm_launchpad.core.deployment_lifecycle import (
 from llm_launchpad.core.deployment_preflight import (
     lifecycle_attempts_for_configs,
     plan_from_request,
+    price_cap_finding,
     revalidate_plan_price,
 )
 from llm_launchpad.core.quick_deploy import request_from_config
@@ -168,6 +169,19 @@ class PriceSeparationTests(unittest.TestCase):
         self.assertIsNotNone(finding)
         self.assertIsNone(revalidate_plan_price(plan, current_price_per_hour_usd=0.5))
         self.assertEqual(revalidate_plan_price(plan, current_price_per_hour_usd=None).code, "price-unknown")
+
+    def test_infinite_cap_means_unlimited(self) -> None:
+        # An infinite approved cap is the codebase idiom for "no budget limit";
+        # every finite refreshed price must pass, not read as an exceeded cap.
+        self.assertIsNone(price_cap_finding(float("inf"), 5.0))
+        request = request_from_config(
+            _modal_config(
+                serving_requirements=ServingRequirements(context_tokens=4096, max_hourly_cost_usd=float("inf")),
+                price_per_hour_usd=None,
+            )
+        )
+        plan = plan_from_request(request)
+        self.assertIsNone(revalidate_plan_price(plan, current_price_per_hour_usd=2.0))
 
     def test_request_round_trip_preserves_price(self) -> None:
         from llm_launchpad.core.quick_deploy import config_from_request

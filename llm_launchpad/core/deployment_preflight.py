@@ -431,7 +431,8 @@ def price_cap_finding(cap: float | None, current: float | None) -> PreflightFind
         return None
     if current is None or not math.isfinite(current) or current <= 0:
         return PreflightFinding("price-unknown", "Current price could not be verified. Refresh offers before provisioning.")
-    if math.isfinite(cap) and current <= cap + 1e-9:
+    # An infinite approved cap means unlimited, so no finiteness check here.
+    if current <= cap + 1e-9:
         return None
     return PreflightFinding("price-cap-exceeded",
                             f"Current price ${current:.4f} exceeds the approved cap of ${cap:.4f}. Refresh offers.",
