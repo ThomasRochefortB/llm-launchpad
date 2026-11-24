@@ -50,7 +50,7 @@ class HomeMenuTests(unittest.TestCase):
         self.assertTrue(all(tier[0][0] == "deploy" for tier in plain))
         tiers = _action_label_tiers(_launch())
         self.assertTrue(all(tier[0][0] == "relaunch" for tier in tiers))
-        self.assertIn("Fits · B200 180GB x1", tiers[0][0][1])
+        self.assertIn("Fits · 1x B200", tiers[0][0][1])
         self.assertEqual([len(tier) for tier in tiers], [len(tier) + 1 for tier in plain])
 
 

@@ -1037,7 +1037,7 @@ class TuiApp(App):
             try:
                 import time as _time
 
-                _time.sleep(0.4)
+                _time.sleep(self._PERSISTENT_JOB_POLL_INTERVAL_SECONDS)
             except Exception:
                 return
 
@@ -1167,6 +1167,7 @@ class TuiApp(App):
     # Enough to find today's status checks and benchmarks; each entry keeps a
     # monitor screen (and its log) alive, so the history is bounded.
     _OPERATION_HISTORY_LIMIT = 20
+    _PERSISTENT_JOB_POLL_INTERVAL_SECONDS = 0.4
 
     def _track_operation(self, monitor: MonitorScreen, subject: str) -> str:
         """Keep a non-deploy operation's monitor reachable from Operations.
@@ -1524,7 +1525,10 @@ class TuiApp(App):
             # record; a confirmed stop clears it like any other resolution.
             if result.succeeded:
                 self._finish_in_flight(config, resolved=True)
-            elif result.attempts and all(
+            elif any(
+                attempt.disposition == AttemptDisposition.CANCELLED
+                for attempt in result.attempts
+            ) and all(
                 attempt.cleanup == CleanupDisposition.FAILED
                 or attempt.cleanup_error
                 for attempt in result.attempts

@@ -197,9 +197,15 @@ def _stub_orchestrator_reasoning_discovery(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 @pytest.fixture(autouse=True)
+def _isolation_root(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """One temporary directory per test shared by all isolation fixtures."""
+    return tmp_path_factory.mktemp("iso")
+
+
+@pytest.fixture(autouse=True)
 def _isolate_opencode_config(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path_factory: pytest.TempPathFactory,
+    _isolation_root: Path,
 ) -> None:
     """Keep the suite out of the developer's own OpenCode configuration.
 
@@ -214,7 +220,7 @@ def _isolate_opencode_config(
 
     from llm_launchpad.core import opencode as opencode_module
 
-    root = tmp_path_factory.mktemp("opencode")
+    root = _isolation_root / "opencode"
     monkeypatch.setattr(opencode_module, "OPENCODE_CONFIG_PATH", root / "opencode.json")
     monkeypatch.setattr(
         opencode_module, "OPENCODE_JSONC_CONFIG_PATH", root / "opencode.jsonc"
@@ -227,7 +233,7 @@ def _isolate_opencode_config(
 @pytest.fixture(autouse=True)
 def _isolate_quick_deploy_catalog_cache(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path_factory: pytest.TempPathFactory,
+    _isolation_root: Path,
 ) -> None:
     """Keep catalog warm-start snapshots out of the real user settings dir.
 
@@ -248,7 +254,7 @@ def _isolate_quick_deploy_catalog_cache(
     monkeypatch.setattr(
         quick_deploy_refresh_module,
         "_quick_deploy_catalog_cache_path",
-        lambda: tmp_path_factory.mktemp("quick-deploy-catalog") / "catalog.json",
+        lambda: _isolation_root / "quick-deploy-catalog" / "catalog.json",
     )
 
     def _no_warm_catalog(*_args: object, **_kwargs: object) -> None:
@@ -269,37 +275,61 @@ def _isolate_quick_deploy_catalog_cache(
     quick_deploy_module._reset_quick_deploy_catalog_cache()
 
 
+_SETTINGS_PATH_MARKERS = (
+    "SETTINGS_DIR",
+    "LOG_DIR",
+    "LOG_FILE",
+    "AA_CACHE_PATH",
+    "CONNECTIONS_PATH",
+    "STORAGE_SNAPSHOT_PATH",
+    ".llm_launchpad",
+)
+
+
 def _discover_settings_paths() -> tuple[tuple[str, str, Path], ...]:
     """Find every module attribute that resolves into the real settings dir.
 
     Constants like ``CONNECTIONS_PATH`` are computed from ``SETTINGS_DIR`` at
     import time, so redirecting ``SETTINGS_DIR`` alone comes too late. Rather
     than maintain a hand-written list -- which was already incomplete the first
-    time it was written -- the modules are walked and every offending path is
-    rebased. New caches are covered automatically.
+    time it was written -- the package is scanned and every module that
+    references a settings path is imported and rebased. Skipping unrelated
+    modules (notably ``backends/`` and ``cli/main.py``) keeps worker startup
+    fast while ``test_settings_isolation`` still audits the full package walk.
     """
 
     import importlib
-    import pkgutil
 
     import llm_launchpad
     from llm_launchpad.core.config import SETTINGS_DIR
 
+    pkg_root = Path(llm_launchpad.__file__).resolve().parent
     found: list[tuple[str, str, Path]] = []
-    for info in pkgutil.walk_packages(
-        llm_launchpad.__path__, prefix=f"{llm_launchpad.__name__}."
-    ):
+    for py_file in sorted(pkg_root.rglob("*.py")):
+        rel = py_file.relative_to(pkg_root)
+        if rel.parts[0] == "backends":
+            continue
         try:
-            module = importlib.import_module(info.name)
+            source = py_file.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if not any(marker in source for marker in _SETTINGS_PATH_MARKERS):
+            continue
+        parts = list(rel.with_suffix("").parts)
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        module_name = ".".join(["llm_launchpad", *parts])
+        try:
+            module = importlib.import_module(module_name)
         except Exception:
             continue
         for name, value in vars(module).items():
             if not isinstance(value, Path):
                 continue
             if value == SETTINGS_DIR:
-                found.append((info.name, name, Path(".")))
+                found.append((module_name, name, Path(".")))
             elif SETTINGS_DIR in value.parents:
-                found.append((info.name, name, value.relative_to(SETTINGS_DIR)))
+                found.append((module_name, name, value.relative_to(SETTINGS_DIR)))
     return tuple(found)
 
 
@@ -309,7 +339,7 @@ _SETTINGS_PATHS = _discover_settings_paths()
 @pytest.fixture(autouse=True)
 def _isolate_user_settings(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path_factory: pytest.TempPathFactory,
+    _isolation_root: Path,
 ) -> Path:
     """Redirect every ~/.llm_launchpad path the suite can reach.
 
@@ -321,7 +351,7 @@ def _isolate_user_settings(
     and verified by ``test_settings_isolation``.
     """
 
-    root = tmp_path_factory.mktemp("launchpad-settings")
+    root = _isolation_root / "launchpad-settings"
     for module_name, attribute, relative in _SETTINGS_PATHS:
         monkeypatch.setattr(f"{module_name}.{attribute}", root / relative)
     return root
@@ -424,7 +454,7 @@ def _offline_provider_clis(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.fixture(autouse=True)
 def _isolate_prime_credentials(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path_factory: pytest.TempPathFactory,
+    _isolation_root: Path,
 ) -> None:
     """Keep Prime's own CLI config -- real API credentials -- out of the suite.
 
@@ -438,7 +468,7 @@ def _isolate_prime_credentials(
 
     from llm_launchpad.core import prime_auth
 
-    root = tmp_path_factory.mktemp("prime-config")
+    root = _isolation_root / "prime-config"
     monkeypatch.setattr(prime_auth, "PRIME_CONFIG_DIR", root)
     monkeypatch.setattr(prime_auth, "PRIME_CONFIG_PATH", root / "config.json")
     for name in (
@@ -483,6 +513,57 @@ def _stub_tool_call_probe(monkeypatch: pytest.MonkeyPatch) -> None:
         "llm_launchpad.core.tool_call_probe.verify_tool_calling",
         lambda *args, **kwargs: None,
     )
+
+
+_SLOW_TEST_FILES = frozenset(
+    {
+        "test_tui_feature_journey.py",
+        "test_tui_interaction_regressions.py",
+        "test_tui_responsive_layout.py",
+        "test_tui_layout_regressions.py",
+        "test_vllm_deploy_screen.py",
+        "test_llamacpp_deploy_screen.py",
+        "test_fast_deploy_screen.py",
+        "test_monitor_screen.py",
+        "test_quick_deploy_screen.py",
+        "test_storage_screen.py",
+        "test_tui_audit.py",
+        "test_manage_screen_routing.py",
+        "test_deployment_jobs.py",
+        "test_operation_history.py",
+        "test_operations_responsiveness.py",
+    }
+)
+
+
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Spread slow TUI tests evenly across collection order for xdist worksteal.
+
+    Alphabetical collection clusters ``test_tui_*`` and ``test_vllm_*`` at the
+    tail of the run, while moving all of them to the front clusters them onto
+    the first few workers. Interleaving slow tests uniformly across ``items``
+    gives every ``--dist worksteal`` worker a balanced initial slice.
+    """
+    slow = [item for item in items if item.path.name in _SLOW_TEST_FILES]
+    fast = [item for item in items if item.path.name not in _SLOW_TEST_FILES]
+    if not slow or not fast:
+        return
+    # Distribute slow items at evenly spaced slots across the combined sequence.
+    total = len(slow) + len(fast)
+    reordered: list[pytest.Item | None] = [None] * total
+    step = total / len(slow)
+    for idx, item in enumerate(slow):
+        reordered[int(idx * step)] = item
+    fast_iter = iter(fast)
+    items[:] = [item if item is not None else next(fast_iter) for item in reordered]
+
+
+@pytest.fixture(autouse=True)
+def _fast_persistent_job_poll_interval(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Poll inline durable deployment jobs quickly during UI tests."""
+    from llm_launchpad.tui.app import TuiApp
+
+    monkeypatch.setattr(TuiApp, "_PERSISTENT_JOB_POLL_INTERVAL_SECONDS", 0.1)
 
 
 @pytest.fixture(autouse=True)

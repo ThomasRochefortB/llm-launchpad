@@ -420,15 +420,19 @@ class StorageScreen(CopyEnabledScreen):
         # One line, and only the numbers: the instruction that used to trail it
         # wrapped the status onto a second row and repeated the hint below.
         # The free-tier arithmetic only matters once something is billable.
-        billable = (
-            f"· {format_gib(estimate.billable_gib_month)} billable past "
-            f"{format_free_tier(MODAL_VOLUME_FREE_TIER_GIB_MONTH)} free "
-            if estimate.billable_gib_month > 0
-            else ""
-        )
+        free_tier = format_free_tier(MODAL_VOLUME_FREE_TIER_GIB_MONTH)
+        if estimate.billable_gib_month > 0:
+            cost_detail = (
+                f"· {format_gib(estimate.billable_gib_month)} billable past "
+                f"{free_tier} free · est. {format_money(estimate.estimated_monthly_cost_usd)}/mo"
+            )
+        elif estimate.total_size_bytes > 0:
+            cost_detail = f"· est. {format_money(estimate.estimated_monthly_cost_usd)}/mo ({free_tier} free)"
+        else:
+            cost_detail = f"· est. {format_money(estimate.estimated_monthly_cost_usd)}/mo"
         self.query_one("#storage-status", Static).update(
             f"[$success]{_human_bytes(estimate.total_size_bytes)} cached[/$success] "
-            f"[dim]{billable}· est. {format_money(estimate.estimated_monthly_cost_usd)}/mo[/dim]"
+            f"[dim]{cost_detail}[/dim]"
         )
         should_refocus = self._initial_focus_pending
         self._initial_focus_pending = False

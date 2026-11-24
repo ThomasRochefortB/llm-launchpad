@@ -119,7 +119,7 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             assert isinstance(screen, MonitorScreen)
             header = screen.query_one("#monitor-status-header", StatusHeader)
             self.assertEqual(header.backend, "llamacpp")
-            self.assertIn("llamacpp", header.render())
+            self.assertIn("llama.cpp", header.render())
 
     async def test_a_failed_operation_drops_the_stale_detail(self) -> None:
         # DeploymentState has no failed member, so the state it reached stands;
@@ -706,6 +706,26 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
             )
             await pilot.pause()
             self.assertTrue(screen.check_action("submit_or_finish", ()))
+            self.assertFalse(screen.check_action("page_up_log", ()))
+
+    async def test_failed_operation_keeps_log_navigation_reachable(self) -> None:
+        # A failed operation shows no connection card, so the log pane stays
+        # visible; paging it must keep working until the user collapses it.
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(MonitorScreen(title="Deploy"))
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, MonitorScreen)
+            screen.on_operation_done(
+                OperationDone(operation=OperationType.DEPLOY, success=False, exit_code=1)
+            )
+            await pilot.pause()
+            self.assertFalse(screen.has_class("connection-ready"))
+            self.assertTrue(screen.check_action("clear_log", ()))
+            screen._log_overflows = True
+            self.assertTrue(screen.check_action("page_up_log", ()))
+            screen.add_class("logs-collapsed")
             self.assertFalse(screen.check_action("page_up_log", ()))
 
     async def test_connection_card_manage_button_routes_to_manage(self) -> None:

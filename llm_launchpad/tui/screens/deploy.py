@@ -862,7 +862,7 @@ class LlamaCppDeployScreen(
                 yield FormField(
                     "Hugging Face repo-id",
                     "repo-id",
-                    hint="e.g., Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
+                    placeholder="e.g., Qwen/Qwen2.5-Coder-7B-Instruct-GGUF",
                 )
                 yield FormField("Quant pattern", "quant", default="Q4_K_M")
                 yield Static("[dim]Quantizations: enter repo-id to detect GGUF variants[/dim]", id="llama-quant-status")
@@ -1065,14 +1065,16 @@ class LlamaCppDeployScreen(
         self._rank_mode_touched = False
         self._updating_rank_mode = False
         self._focus_model_list_when_loaded = False
+        initial_hidden: list[Widget] = []
         for list_id in ("#llama-model-list", "#llama-quant-list"):
-            self.query_one(list_id, OptionList).add_class("hidden")
-        for widget in self.query(".llama-advanced"):
-            widget.add_class("hidden")
-        for widget in self.query(".prime-only"):
-            widget.add_class("hidden")
-        for widget in self.query(".vast-only"):
-            widget.add_class("hidden")
+            widget = self.query_one(list_id, OptionList)
+            widget.add_class("hidden", update=False)
+            initial_hidden.append(widget)
+        for selector in (".llama-advanced", ".prime-only", ".vast-only"):
+            for widget in self.query(selector):
+                widget.add_class("hidden", update=False)
+                initial_hidden.append(widget)
+        self.app.stylesheet.update_nodes(initial_hidden)
         self.query_one("#llama-rank-mode", Select).value = "cached"
         self.query_one("#llama-rank-mode", Select).focus()
         self._refresh_gpu_types()
@@ -2225,13 +2227,13 @@ class VllmDeployScreen(
         self._rank_mode_touched = False
         self._updating_rank_mode = False
         self._focus_model_list_when_loaded = False
-        self.query_one("#vllm-model-list", OptionList).add_class("hidden")
-        for widget in self.query(".vllm-advanced"):
-            widget.add_class("hidden")
-        for widget in self.query(".prime-only"):
-            widget.add_class("hidden")
-        for widget in self.query(".vast-only"):
-            widget.add_class("hidden")
+        initial_hidden: list[Widget] = [self.query_one("#vllm-model-list", OptionList)]
+        initial_hidden[0].add_class("hidden", update=False)
+        for selector in (".vllm-advanced", ".prime-only", ".vast-only"):
+            for widget in self.query(selector):
+                widget.add_class("hidden", update=False)
+                initial_hidden.append(widget)
+        self.app.stylesheet.update_nodes(initial_hidden)
         self.query_one("#vllm-rank-mode", Select).value = "cached"
         self.query_one("#vllm-rank-mode", Select).focus()
         self._refresh_gpu_types()

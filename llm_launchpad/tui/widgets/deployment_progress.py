@@ -129,7 +129,7 @@ class DeploymentProgressWidget(Vertical):
         # running, the hint carries what the footer cannot: leaving is safe.
         hint.set_class(progress.done, "hidden")
         if not progress.done:
-            hint.update("[dim]Esc Back — deployment continues in the background[/]")
+            hint.update("[dim]Continues in background if you leave[/]")
 
     @property
     def progress(self) -> DeploymentProgress:

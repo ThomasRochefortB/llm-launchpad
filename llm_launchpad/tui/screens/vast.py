@@ -7,7 +7,7 @@ import os
 from rich.markup import escape
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.message import Message
 from textual.widgets import Button, DataTable, Input, Static, Switch
 
@@ -17,6 +17,7 @@ from ...core.vast_auth import (
 from ...core.vast_backend import VastApiError, VastBackend
 from ...protocol.models import VastOffer, VastOfferQuery
 from ..format import format_money
+from ..visual import screen_title
 from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
 
@@ -36,10 +37,17 @@ class VastPreviewScreen(CopyEnabledScreen):
     BINDINGS = [Binding("escape", "back", "Back", show=True)]
     DEFAULT_CSS = """
     VastPreviewScreen #vast-scroll { padding: 1 2; }
-    VastPreviewScreen Input { margin-bottom: 1; }
-    VastPreviewScreen .vast-actions { height: auto; }
-    VastPreviewScreen Button { margin-right: 1; }
-    VastPreviewScreen #vast-feedback { height: auto; min-height: 2; }
+    VastPreviewScreen #vast-title { margin-bottom: 1; }
+    VastPreviewScreen .vast-row { width: 100%; height: auto; margin-bottom: 1; }
+    VastPreviewScreen .vast-col { width: 1fr; height: auto; margin-right: 2; }
+    VastPreviewScreen .vast-col:last-child { margin-right: 0; }
+    VastPreviewScreen .vast-actions { height: auto; margin: 1 0; align: left middle; }
+    VastPreviewScreen .vast-actions Button { margin-right: 1; }
+    VastPreviewScreen .vast-inline-toggle { width: auto; height: 3; margin-right: 2; align: left middle; }
+    VastPreviewScreen .vast-inline-toggle Static { width: auto; height: 3; content-align: left middle; padding-right: 1; text-wrap: nowrap; }
+    VastPreviewScreen #vast-refresh { margin-top: 1; }
+    VastPreviewScreen #vast-feedback { height: auto; color: $text-muted; margin-bottom: 1; }
+    VastPreviewScreen #vast-disclaimer { height: auto; color: $text-muted; margin-top: 1; }
     """
 
     def __init__(self) -> None:
@@ -48,30 +56,39 @@ class VastPreviewScreen(CopyEnabledScreen):
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="vast-scroll"):
-            yield Static("[bold]Vast.ai rentals[/bold]")
-            yield Static("Browse verified, on-demand NVIDIA rentals. Use Deploy model to rent one.")
-            yield Static("API key (hidden; leave blank to use the configured key)")
-            yield Input(password=True, id="vast-key")
+            yield Static(
+                screen_title("Vast.ai rentals", "Browse verified on-demand offers"),
+                id="vast-title",
+            )
+            yield Static("API key [dim](blank uses configured key)[/dim]", classes="form-label")
+            yield Input(password=True, placeholder="Paste Vast API key", id="vast-key")
             with Horizontal(classes="vast-actions"):
                 yield Button("Validate / save key", id="vast-connect")
                 yield Button("Forget saved key", id="vast-forget")
-            yield Static("GPU name (optional, e.g. RTX 4090)")
-            yield Input(id="vast-gpu")
-            yield Static("Country code (optional, e.g. US)")
-            yield Input(id="vast-country")
-            yield Static("Disk allocation for pricing (GiB)")
-            yield Input("100", id="vast-disk", type="integer")
-            yield Static("Minimum reliability score (0–1; not an uptime guarantee)")
-            yield Input("0.99", id="vast-reliability", type="number")
-            yield Static("Datacenter only")
-            yield Switch(False, id="vast-datacenter")
-            yield Button("Refresh offers", id="vast-refresh", variant="primary")
+            with Horizontal(classes="vast-row"):
+                with Vertical(classes="vast-col"):
+                    yield Static("GPU name", classes="form-label")
+                    yield Input(placeholder="Optional, e.g. RTX 4090", id="vast-gpu")
+                with Vertical(classes="vast-col"):
+                    yield Static("Country code", classes="form-label")
+                    yield Input(placeholder="Optional, e.g. US", id="vast-country")
+                with Vertical(classes="vast-col"):
+                    yield Static("Disk (GiB)", classes="form-label")
+                    yield Input("100", id="vast-disk", type="integer")
+                with Vertical(classes="vast-col"):
+                    yield Static("Min reliability (0–1)", classes="form-label")
+                    yield Input("0.99", id="vast-reliability", type="number")
+            with Horizontal(classes="vast-actions"):
+                with Horizontal(classes="vast-inline-toggle"):
+                    yield Static("Datacenter only")
+                    yield Switch(False, id="vast-datacenter")
+                yield Button("Refresh offers", id="vast-refresh", variant="primary")
             yield Static("", id="vast-feedback")
             yield DataTable(id="vast-offers", cursor_type="row")
             yield Static(
-                "Single-GPU offers, up to 100 results. Hourly totals include the selected disk, "
-                "but exclude traffic. Downloads are charged; storage remains billable when stopped. "
-                "Unknown prices are not zero. Offers have not been checked against a model."
+                "Single-GPU offers (max 100) · Totals include disk, exclude traffic · "
+                "Storage bills while stopped · Use Deploy model to rent.",
+                id="vast-disclaimer",
             )
         yield FittedFooter()
 

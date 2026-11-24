@@ -28,6 +28,11 @@ from ..visual import DEFAULT_TUI_DENSITY, DEFAULT_TUI_THEME, TUI_THEME_OPTIONS
 if TYPE_CHECKING:
     from ..app import TuiApp
 
+_VISUAL_CLASS_NAMES = frozenset(
+    {*(f"theme-{theme_name}" for _, theme_name in TUI_THEME_OPTIONS), "density-compact"}
+)
+_MANAGED_VIEWPORT_CLASSES = frozenset(RESPONSIVE_CLASS_NAMES) | _VISUAL_CLASS_NAMES
+
 
 class CopyEnabledScreen(Screen):
     """Screen base class that provides consistent copy behavior."""
@@ -91,28 +96,36 @@ class CopyEnabledScreen(Screen):
         previous = self._viewport_profile
 
         if profile != previous:
-            active_classes = set(profile.class_names)
-            for class_name in RESPONSIVE_CLASS_NAMES:
-                self.set_class(class_name in active_classes, class_name)
+            desired_classes = (
+                (set(self.classes) - _MANAGED_VIEWPORT_CLASSES)
+                | set(profile.class_names)
+                | self._active_visual_classes()
+            )
+            self.set_classes(desired_classes)
             self._viewport_profile = profile
-            self._sync_visual_classes()
             self._sync_footer_hints(profile)
             self.refresh(repaint=True, layout=True)
             self.viewport_profile_changed(profile, previous)
 
+        overlay: Static | None
         try:
             overlay = self.query_one("#minimum-size-overlay", Static)
         except NoMatches:
-            overlay = Static("", id="minimum-size-overlay")
-            await self.mount(overlay)
+            if profile.too_small:
+                overlay = Static("", id="minimum-size-overlay")
+                await self.mount(overlay)
+            else:
+                overlay = None
 
-        overlay.update(
-            "[bold $primary]Terminal too small[/]\n"
-            f"Current: {size.width}×{size.height}  ·  "
-            f"Minimum: {MIN_TERMINAL_WIDTH}×{MIN_TERMINAL_HEIGHT}\n"
-            "[dim]Resize the terminal to continue.[/dim]"
-        )
-        overlay.display = profile.too_small
+        if overlay is not None:
+            if profile.too_small:
+                overlay.update(
+                    "[bold $primary]Terminal too small[/]\n"
+                    f"Current: {size.width}×{size.height}  ·  "
+                    f"Minimum: {MIN_TERMINAL_WIDTH}×{MIN_TERMINAL_HEIGHT}\n"
+                    "[dim]Resize the terminal to continue.[/dim]"
+                )
+            overlay.display = profile.too_small
 
         if profile.too_small:
             if self.focused is not None:
@@ -131,8 +144,10 @@ class CopyEnabledScreen(Screen):
         a narrow terminal the two run together. The palette stays reachable by
         its shortcut either way, so the hint is what gives way.
         """
+        show_palette = not profile.narrow
         for footer in self.query(Footer):
-            footer.show_command_palette = not profile.narrow
+            if footer.show_command_palette != show_palette:
+                footer.show_command_palette = show_palette
 
     @property
     def viewport_profile(self) -> ViewportProfile:
@@ -154,12 +169,21 @@ class CopyEnabledScreen(Screen):
         self._sync_visual_classes()
         self.refresh(repaint=True, layout=True)
 
-    def _sync_visual_classes(self) -> None:
+    def _active_visual_classes(self) -> set[str]:
         app_theme = str(getattr(self.app, "theme", DEFAULT_TUI_THEME))
-        for _, theme_name in TUI_THEME_OPTIONS:
-            self.set_class(app_theme == theme_name, f"theme-{theme_name}")
+        active = {
+            f"theme-{theme_name}"
+            for _, theme_name in TUI_THEME_OPTIONS
+            if app_theme == theme_name
+        }
         density = str(getattr(self.app, "tui_density", DEFAULT_TUI_DENSITY))
-        self.set_class(density == "compact", "density-compact")
+        if density == "compact":
+            active.add("density-compact")
+        return active
+
+    def _sync_visual_classes(self) -> None:
+        desired_classes = (set(self.classes) - _VISUAL_CLASS_NAMES) | self._active_visual_classes()
+        self.set_classes(desired_classes)
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         """Keep priority shortcuts behind the same minimum-size gate as input."""

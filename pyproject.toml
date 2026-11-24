@@ -82,7 +82,7 @@ dev = [
 ]
 
 [tool.pytest.ini_options]
-addopts = ["-n", "auto"]
+addopts = ["-n", "auto", "--maxprocesses=40", "--dist", "worksteal", "-p", "no:anyio"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 pythonpath = ["."]

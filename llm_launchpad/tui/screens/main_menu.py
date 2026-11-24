@@ -29,7 +29,6 @@ from textual.widgets import OptionList, Static
 from textual.widgets.option_list import Option
 
 from ...core.backend import ModalBackend
-from ...core.compute_availability import display_gpu_type
 from ...core.last_launch import LastLaunch, load_last_launch
 from ...core.serving_metrics import default_tracker, usage_key
 from ...core.hf_auth import HuggingFaceAuthStatus, get_huggingface_auth_status
@@ -544,7 +543,7 @@ def _friendly_count_line(rows: list[EndpointInfo]) -> list[str]:
         backend_parts.append(f"{backend_counts['llamacpp']} llama.cpp")
     if not backend_parts:
         backend_parts.append(f"{len(rows)} launchpad")
-    return [fleet_summary_line(rows), f"[dim]{' | '.join(backend_parts)}[/dim]", ""]
+    return [f"{fleet_summary_line(rows)}  [dim]· {' · '.join(backend_parts)}[/dim]", ""]
 
 
 def _wrap_url_for_panel(value: str, width: int = 44) -> list[str]:
@@ -663,26 +662,30 @@ def _render_deployment_status(
         backend_name = _backend_display_name(row.backend)
         app_lines.append(
             f"[bold]{escape(instance)}[/bold]  "
-            f"[dim]{escape(backend_name)} · {row.provider.value}[/dim]\n"
-            f"  {deployment_and_health_line(row)}"
+            f"[dim]{escape(backend_name)} · {row.provider.value}[/dim]  "
+            f"{deployment_and_health_line(row)}"
         )
-        traffic_line = _serving_panel_line(row)
-        if traffic_line:
-            app_lines.append(traffic_line)
-        passive_line = _passive_metrics_line(row)
-        if passive_line:
-            app_lines.append(passive_line)
+
         resource_label = _PROVIDER_RESOURCE_LABELS.get(
             row.provider, f"{row.provider.display_name} deployment"
         )
-        modal_app_line = f"[dim]{resource_label}:[/dim] {escape(row.name or '')}"
+        modal_app_line = f"  [dim]{resource_label}:[/dim] {escape(row.name or '')}"
         if (row.app_id or "").strip():
             modal_app_line += f" [dim]({escape(row.app_id)})[/dim]"
         app_lines.append(modal_app_line)
 
         model_id, display_name = endpoint_model_summary(row)
-        app_lines.append(f"[dim]Display name:[/dim] {escape(display_name or '')}")
-        app_lines.append(f"[dim]Model ID:[/dim] {escape(model_id or '')}")
+        model_line = f"  [dim]Model ID:[/dim] {escape(model_id or '')}"
+        if display_name and display_name != model_id:
+            model_line += f"  [dim]Display name:[/dim] {escape(display_name)}"
+        app_lines.append(model_line)
+
+        traffic_line = _serving_panel_line(row)
+        if traffic_line:
+            passive_line = _passive_metrics_line(row)
+            if passive_line:
+                traffic_line = f"{traffic_line} · [dim]Live metrics paused[/dim]"
+            app_lines.append(f"  {traffic_line}")
 
         base_url, _was_derived = resolve_openai_base_url(row, username=username)
         show_connection = _state_bucket(row.state) == "healthy" or bool((row.web_url or "").strip())
@@ -694,21 +697,18 @@ def _render_deployment_status(
                 host_url = base_root
 
             if show_connection:
-                app_lines.append(PANEL_SEPARATOR)
-                wrapped_url_lines = _wrap_url_for_panel(host_url)
-                if wrapped_url_lines:
-                    app_lines.append(f"  [dim]Base URL:[/dim] {escape(wrapped_url_lines[0])}")
-                    for line in wrapped_url_lines[1:]:
-                        app_lines.append(f"    {escape(line)}")
-                key_status = "stored locally" if row.endpoint_api_key else ""
-                app_lines.append(f"  [dim]API key[/dim] {key_status}")
+                key_status = "stored locally" if row.endpoint_api_key else "none"
+                app_lines.append(
+                    f"  [dim]Base URL:[/dim] {escape(host_url)}  "
+                    f"[dim]API key:[/dim] {key_status}"
+                )
             else:
-                app_lines.append("[dim]OpenAI URL will be available once the app is serving traffic.[/dim]")
+                app_lines.append("  [dim]OpenAI URL available once serving.[/dim]")
         else:
             if _state_bucket(row.state) in {"deploying", "queued"}:
-                app_lines.append("[dim]OpenAI URL unavailable while the app is still starting.[/dim]")
+                app_lines.append("  [dim]OpenAI URL unavailable while starting.[/dim]")
             else:
-                app_lines.append("[dim]OpenAI URL unavailable (provider has no web URL yet).[/dim]")
+                app_lines.append("  [dim]OpenAI URL unavailable.[/dim]")
 
         if index != len(display_rows) - 1:
             app_lines.append("")
@@ -748,12 +748,17 @@ _ACTION_LABEL_TIERS: tuple[_ActionLabels, ...] = (
 
 
 def _relaunch_labels(last: LastLaunch) -> tuple[tuple[str, str], ...]:
-    """One relaunch row per label tier, fullest first."""
-    shape = f"{display_gpu_type(last.gpu_type)} x{last.gpu_count}" if last.gpu_type else ""
-    name = clip(last.display_name, 30)
+    """One relaunch row per label tier, fullest first (sized to avoid wrapping)."""
+    prefix = "  Relaunch           "
+    shape = f"{last.gpu_count}x {last.gpu_type}" if last.gpu_type else ""
+    if shape:
+        max_name = max(10, 56 - len(prefix) - len(shape) - 3)
+        tier0 = f"{prefix}{clip(last.display_name, max_name)} · {shape}"
+    else:
+        tier0 = f"{prefix}{clip(last.display_name, 35)}"
     return (
-        ("relaunch", f"  Relaunch           {name}{f' · {shape}' if shape else ''}"),
-        ("relaunch", f"  Relaunch           {name}"),
+        ("relaunch", tier0),
+        ("relaunch", f"{prefix}{clip(last.display_name, 26)}"),
         ("relaunch", "  Relaunch last"),
     )
 
@@ -933,8 +938,16 @@ class MainMenuScreen(CopyEnabledScreen):
         # talk that decision back up into a padded two-column grid.
         tiers = _action_label_tiers(self._last_launch)
         self._action_label_ceiling = len(tiers) - 1 if profile.compact else 0
-        self._apply_action_labels(tiers[self._action_label_ceiling])
-        # Fit against the actual menu column after layout.
+        try:
+            action_list = self.query_one("#action-list", OptionList)
+            has_width = action_list.content_size.width > 0
+        except Exception:
+            has_width = False
+        if has_width:
+            self._fit_action_labels()
+        else:
+            self._apply_action_labels(tiers[self._action_label_ceiling])
+        # Re-fit after layout in case width changed on the same resize pass.
         self.call_after_refresh(self._fit_action_labels)
 
     def _fit_action_labels(self) -> None:

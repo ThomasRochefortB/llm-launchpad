@@ -73,16 +73,19 @@ class OperationHistoryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_the_history_is_bounded(self) -> None:
         app = _App()
-        async with app.run_test(size=(100, 30)) as pilot:
-            await pilot.pause()
-            for index in range(app._OPERATION_HISTORY_LIMIT + 5):
-                app.push_screen(app._track_operation(MonitorScreen(title="Logs"), f"e{index}"))
+        with patch.object(_App, "_OPERATION_HISTORY_LIMIT", 3):
+            async with app.run_test(size=(100, 30)) as pilot:
                 await pilot.pause()
-                app.pop_screen()
-            await pilot.pause()
-            self.assertEqual(len(app.operation_history), app._OPERATION_HISTORY_LIMIT)
-            subjects = [record.subject for record in app.operation_history.values()]
-            self.assertEqual(subjects[0], "e5")
+                for index in range(app._OPERATION_HISTORY_LIMIT + 5):
+                    app.push_screen(
+                        app._track_operation(MonitorScreen(title="Logs"), f"e{index}")
+                    )
+                    await pilot.pause()
+                    app.pop_screen()
+                await pilot.pause()
+                self.assertEqual(len(app.operation_history), app._OPERATION_HISTORY_LIMIT)
+                subjects = [record.subject for record in app.operation_history.values()]
+                self.assertEqual(subjects[0], "e5")
 
 
 if __name__ == "__main__":

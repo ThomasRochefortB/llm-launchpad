@@ -32,25 +32,26 @@ class SetupRequiredScreen(CopyEnabledScreen):
     def compose(self) -> ComposeResult:
         with Vertical(id="setup-required-root"):
             with VerticalScroll(id="setup-required-scroll", classes="screen-scroll"):
-                yield Static(screen_title("Compute provider required"))
-                yield Static("Connect a provider, then press r to re-check.", id="setup-required-intro")
-                for provider, command in _SETUP_COMMANDS.items():
-                    with Horizontal(classes="setup-option"):
-                        yield Static(
-                            self._provider_setup_text(provider, command),
-                            id=f"setup-status-{provider.value}",
-                            classes="setup-provider-status",
-                        )
-                        yield Button(
-                            "Copy",
-                            id=f"setup-copy-{provider.value}-btn",
-                            classes="setup-copy-command",
-                        )
-                with Horizontal(id="setup-required-actions"):
-                    yield Button("Re-check", id="setup-recheck-btn", variant="primary")
-                    yield Button("Vast.ai key", id="setup-vast-preview-btn")
-                    yield Button("Quit", id="setup-quit-btn")
-                yield Static("", id="setup-required-feedback")
+                with Vertical(id="setup-required-content"):
+                    yield Static(screen_title("Compute provider required"))
+                    yield Static("Connect a provider, then press r to re-check.", id="setup-required-intro")
+                    for provider, command in _SETUP_COMMANDS.items():
+                        with Horizontal(classes="setup-option"):
+                            yield Static(
+                                self._provider_setup_text(provider, command),
+                                id=f"setup-status-{provider.value}",
+                                classes="setup-provider-status",
+                            )
+                            yield Button(
+                                "Copy",
+                                id=f"setup-copy-{provider.value}-btn",
+                                classes="setup-copy-command",
+                            )
+                    with Horizontal(id="setup-required-actions"):
+                        yield Button("Re-check", id="setup-recheck-btn", variant="primary")
+                        yield Button("Vast.ai key", id="setup-vast-preview-btn")
+                        yield Button("Quit", id="setup-quit-btn")
+                    yield Static("", id="setup-required-feedback")
         yield FittedFooter()
 
     def on_mount(self) -> None:
