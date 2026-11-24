@@ -468,10 +468,16 @@ def _deploy_and_maybe_warmup(
     summarizer = None if debug_logs else DeployLogSummarizer(backend)
     published_url: str | None = None
     published_endpoint: EndpointInfo | None = None
+    published_config: DeploymentConfig = config
     synced_app: str | None = None
 
-    def _publish(url: str | None, endpoint: EndpointInfo | None) -> None:
-        nonlocal published_url, published_endpoint, synced_app
+    def _publish(
+        saved: DeploymentConfig,
+        url: str | None,
+        endpoint: EndpointInfo | None,
+    ) -> None:
+        nonlocal published_url, published_endpoint, published_config, synced_app
+        published_config = saved
         # The lifecycle owns endpoint resolution and warmup: only endpoint
         # objects and warmup replacements publish here. Log-scraped Modal
         # URLs seed nothing; the lifecycle already resolves the serving URL
@@ -484,20 +490,24 @@ def _deploy_and_maybe_warmup(
             published_url = url
         if published_url:
             save_connection(
-                config,
+                published_config,
                 published_endpoint
-                or EndpointInfo(name=config.app_name or "", backend=config.backend, web_url=published_url),
+                or EndpointInfo(
+                    name=published_config.app_name or "",
+                    backend=published_config.backend,
+                    web_url=published_url,
+                ),
             )
         if published_url and not do_warmup:
             _sync_opencode_cli(
-                target_app_name=config.app_name,
+                target_app_name=published_config.app_name,
                 target_url=published_url,
-                target_config=config,
-                current_rows=_load_visible_launchpad_rows(config.provider),
-                prune_providers=(config.provider,),
+                target_config=published_config,
+                current_rows=_load_visible_launchpad_rows(published_config.provider),
+                prune_providers=(published_config.provider,),
                 username=username,
             )
-            synced_app = config.app_name
+            synced_app = published_config.app_name
 
     def _on_event(event: BaseEvent) -> None:
         _print_event(event, summarizer=summarizer)
@@ -508,6 +518,8 @@ def _deploy_and_maybe_warmup(
     def _save_credentials(
         saved: DeploymentConfig, url: str | None, endpoint: EndpointInfo | None
     ) -> None:
+        nonlocal published_config
+        published_config = saved
         # Pre-certification save: persist the bearer key without publishing
         # the unverified URL or syncing OpenCode.
         target_url = (endpoint.web_url if endpoint and endpoint.web_url else None) or url
@@ -535,7 +547,7 @@ def _deploy_and_maybe_warmup(
         ),
         callbacks=LifecycleCallbacks(
             on_event=_on_event,
-            on_connection=lambda saved, url, endpoint: _publish(url, endpoint),
+            on_connection=_publish,
             on_credentials=_save_credentials,
         ),
     )
@@ -567,22 +579,22 @@ def _deploy_and_maybe_warmup(
             app_name=config.app_name,
             function_slug=config.function_slug,
         )
-    if published_url and synced_app != config.app_name:
+    if published_url and synced_app != published_config.app_name:
         endpoint = published_endpoint or EndpointInfo(
-            name=config.app_name or "",
-            backend=config.backend,
-            instance_name=config.instance_name,
-            provider=config.provider,
+            name=published_config.app_name or "",
+            backend=published_config.backend,
+            instance_name=published_config.instance_name,
+            provider=published_config.provider,
         )
         endpoint.web_url = published_url
-        endpoint.endpoint_api_key = config.endpoint_api_key
-        save_connection(config, endpoint)
+        endpoint.endpoint_api_key = published_config.endpoint_api_key
+        save_connection(published_config, endpoint)
         _sync_opencode_cli(
-            target_app_name=config.app_name,
+            target_app_name=published_config.app_name,
             target_url=published_url,
-            target_config=config,
-            current_rows=_load_visible_launchpad_rows(config.provider),
-            prune_providers=(config.provider,),
+            target_config=published_config,
+            current_rows=_load_visible_launchpad_rows(published_config.provider),
+            prune_providers=(published_config.provider,),
             username=username,
         )
 

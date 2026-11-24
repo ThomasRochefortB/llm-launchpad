@@ -18,7 +18,7 @@ import math
 import shlex
 from pathlib import PurePosixPath
 
-from ..gguf_files import is_dspark_gguf, is_target_gguf
+from ..gguf_files import is_dspark_gguf, is_engram_table_file, is_target_gguf
 from ..protocol.enums import (
     BackendType,
     ComputeProvider,
@@ -29,6 +29,7 @@ from ..protocol.models import (
     DeploymentConfig,
     DeploymentRequest,
     DSparkDraft,
+    EngramTable,
     ResolvedDeploymentPlan,
 )
 from .providers import capabilities
@@ -410,6 +411,165 @@ def resolve_dspark_draft(config: DeploymentConfig) -> DSparkDraft:
     return DSparkDraft(draft_repo, draft.sha, filename, size)
 
 
+def _has_manual_ple_args(server_args: str | None) -> bool:
+    """Return True when the caller explicitly passed --ple or --shard."""
+    text = (server_args or "").strip()
+    if not text:
+        return False
+    try:
+        tokens = shlex.split(text)
+    except ValueError:
+        return False
+    return any(
+        token in {"--ple", "--shard"}
+        or token.startswith("--ple=")
+        or token.startswith("--shard=")
+        for token in tokens
+    )
+
+
+def _engram_candidate_rank(filename: str, size_bytes: int) -> tuple[int, int, str]:
+    """Prefer highest-precision non-MXFP8 external Engram tables first."""
+    lowered = filename.casefold()
+    if "q6_k" in lowered:
+        tier = 0
+    elif "q5_k" in lowered:
+        tier = 1
+    elif "iq4_nl" in lowered:
+        tier = 2
+    else:
+        tier = 3
+    return (tier, -size_bytes, lowered)
+
+
+def resolve_engram_table(
+    config: DeploymentConfig,
+) -> tuple[EngramTable | None, str | None]:
+    """Detect MXFP8/F8_E4M3 Engram collisions and resolve a safe --ple table.
+
+    Upstream llama.cpp (b12233+) assigns GGML type 43 to F8_E4M3, whereas
+    Unsloth's PR #30817 DeepSeek-V4.1 MXFP8 Engram shards also wrote type 43
+    with block-scaled bytes. Loading those shards directly produces silent
+    word-salad output. When detected on ``deepseek41``, substitute a verified
+    non-MXFP8 external table from the same repository via ``--ple`` (or fail
+    preflight if none exists).
+    """
+    if config.backend != BackendType.LLAMACPP:
+        return None, None
+    if (config.gguf_architecture or "").strip().casefold() != "deepseek41":
+        return None, None
+    target_repo = (config.repo_id or "").strip()
+    quant = (config.quant or "").strip()
+    if not target_repo or not quant:
+        return None, None
+    if _has_manual_ple_args(config.server_args):
+        return None, None
+
+    from huggingface_hub import HfApi
+
+    from .gguf_metadata import fetch_gguf_ple_tensor_info
+
+    api = HfApi()
+    target = api.model_info(
+        target_repo,
+        revision=config.revision,
+        files_metadata=True,
+        timeout=15,
+    )
+    target_revision = (getattr(target, "sha", None) or config.revision or "").strip()
+    if not target_revision:
+        return None, None
+
+    quant_folded = quant.casefold()
+    siblings = list(target.siblings or [])
+    matched_shards: list[tuple[str, int | None]] = []
+    for sibling in siblings:
+        rfilename = str(getattr(sibling, "rfilename", "") or "").strip()
+        if not rfilename or not is_target_gguf(rfilename):
+            continue
+        if quant_folded not in PurePosixPath(rfilename).name.casefold():
+            continue
+        size = getattr(sibling, "size", None)
+        matched_shards.append((rfilename, size if isinstance(size, int) and size > 0 else None))
+    if not matched_shards:
+        return None, None
+
+    # The Engram table shard is by far the largest shard (~110-203 GB); check
+    # largest shards first (plus the last shard) so detection takes one tiny
+    # bounded range request in the common case.
+    by_size = sorted(
+        matched_shards,
+        key=lambda item: (item[1] or 0, item[0].casefold()),
+        reverse=True,
+    )
+    by_name = sorted(matched_shards, key=lambda item: item[0].casefold())
+    shards_to_probe: list[tuple[str, int | None]] = []
+    for candidate in (*by_size[:2], by_name[-1]):
+        if candidate not in shards_to_probe:
+            shards_to_probe.append(candidate)
+
+    broken_shard: str | None = None
+    for shard_name, shard_size in shards_to_probe:
+        ple_info = fetch_gguf_ple_tensor_info(
+            target_repo,
+            shard_name,
+            revision=target_revision,
+        )
+        if ple_info is None:
+            continue
+        if ple_info.is_mxfp8_type43_collision(shard_size):
+            broken_shard = shard_name
+        break
+
+    if broken_shard is None:
+        return None, None
+
+    external_candidates: list[tuple[str, int]] = []
+    for sibling in siblings:
+        rfilename = str(getattr(sibling, "rfilename", "") or "").strip()
+        size = getattr(sibling, "size", None)
+        if not rfilename or not is_engram_table_file(rfilename):
+            continue
+        if "mxfp8" in rfilename.casefold():
+            continue
+        if not isinstance(size, int) or size <= 0:
+            continue
+        path = PurePosixPath(rfilename)
+        if path.is_absolute() or ".." in path.parts:
+            continue
+        external_candidates.append((rfilename, size))
+
+    external_candidates.sort(key=lambda item: _engram_candidate_rank(item[0], item[1]))
+    for candidate_name, candidate_size in external_candidates:
+        ple_info = fetch_gguf_ple_tensor_info(
+            target_repo,
+            candidate_name,
+            revision=target_revision,
+        )
+        if ple_info is None or ple_info.is_mxfp8_type43_collision(candidate_size):
+            continue
+        artifact = EngramTable(
+            repo_id=target_repo,
+            revision=target_revision,
+            filename=candidate_name,
+            size_bytes=candidate_size,
+            replaced_shard=broken_shard,
+        )
+        message = (
+            f"Engram table preflight: {broken_shard} uses MXFP8 (GGML type 43), "
+            f"which llama.cpp misreads as F8_E4M3; substituting {candidate_name} "
+            f"({candidate_size / 1e9:.2f} GB) via --ple."
+        )
+        return artifact, message
+
+    raise ValueError(
+        f"{broken_shard} stores per_layer_token_embd.weight as MXFP8 (GGML type 43), "
+        "which upstream llama.cpp (b12233+) silently misreads as F8_E4M3 and outputs "
+        f"garbage, and no compatible non-MXFP8 external Engram table was found in {target_repo!r}. "
+        "Select a quant without an MXFP8 Engram table (for example UD-Q2_K_XL) or pass a compatible --ple file."
+    )
+
+
 def revalidate_plan_price(
     plan: ResolvedDeploymentPlan, *, current_price_per_hour_usd: float | None
 ) -> PreflightFinding | None:
@@ -549,6 +709,7 @@ __all__ = [
     "plan_from_request",
     "preflight_config",
     "preflight_request",
+    "resolve_engram_table",
     "resolve_request_identity",
     "revalidate_plan_price",
     "validate_request",

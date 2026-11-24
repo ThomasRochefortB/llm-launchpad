@@ -17,7 +17,12 @@ from uuid import uuid4
 
 import modal
 
-from llm_launchpad.gguf_files import auxiliary_gguf_ignore_patterns, is_dspark_gguf, is_target_gguf
+from llm_launchpad.gguf_files import (
+    auxiliary_gguf_ignore_patterns,
+    is_dspark_gguf,
+    is_engram_table_file,
+    is_target_gguf,
+)
 
 
 # --- App configuration
@@ -323,18 +328,59 @@ def _resolve_hub_snapshot_dir(repo_id: str, revision: str | None) -> Path | None
     return snapshots[0]
 
 
+def _normalize_excluded_files(exclude_files: Sequence[str] | None) -> set[str]:
+    if not exclude_files:
+        return set()
+    normalized: set[str] = set()
+    for raw in exclude_files:
+        item = str(raw or "").strip().casefold()
+        if not item:
+            continue
+        normalized.add(item)
+        normalized.add(Path(item).name.casefold())
+    return normalized
+
+
+def _is_excluded_gguf_path(path: str | Path, excluded: set[str]) -> bool:
+    if not excluded:
+        return False
+    text = path.as_posix().casefold() if isinstance(path, Path) else str(path).strip().casefold()
+    name = Path(text).name.casefold()
+    return text in excluded or name in excluded
+
+
+def _excluded_split_keys(exclude_files: Sequence[str] | None) -> set[tuple[str, int, int]]:
+    keys: set[tuple[str, int, int]] = set()
+    for raw in exclude_files or ():
+        name = Path(str(raw or "").strip()).name
+        match = _GGUF_SPLIT_RE.search(name)
+        if not match:
+            continue
+        try:
+            shard_index = int(match.group(1))
+            shard_total = int(match.group(2))
+        except ValueError:
+            continue
+        keys.add((name[: match.start()].casefold(), shard_index, shard_total))
+    return keys
+
+
 def _fetch_expected_gguf_sizes(
     repo_id: str,
     revision: str | None,
     allow_patterns: list[str],
+    exclude_files: Sequence[str] | None = None,
 ) -> dict[str, int]:
     from huggingface_hub import HfApi
 
+    excluded = _normalize_excluded_files(exclude_files)
     info = HfApi().repo_info(repo_id=repo_id, revision=revision, files_metadata=True)
     expected: dict[str, int] = {}
     for sibling in info.siblings or []:
         repo_path = str(getattr(sibling, "rfilename", "") or "").strip()
         if not is_target_gguf(repo_path):
+            continue
+        if _is_excluded_gguf_path(repo_path, excluded):
             continue
         filename = Path(repo_path).name
         if allow_patterns and not _matches_any_pattern(filename, allow_patterns):
@@ -349,19 +395,28 @@ def _validate_cached_gguf_matches(
     repo_id: str,
     revision: str | None,
     allow_patterns: list[str],
+    exclude_files: Sequence[str] | None = None,
 ) -> tuple[list[str], list[str]]:
     snapshot_dir = _resolve_hub_snapshot_dir(repo_id, revision)
     if snapshot_dir is None:
         return [], []
 
     matched_candidates = _matched_snapshot_gguf_candidates(snapshot_dir, allow_patterns)
-    complete_candidates, incomplete_groups = _partition_complete_gguf_candidates(matched_candidates)
+    complete_candidates, incomplete_groups = _partition_complete_gguf_candidates(
+        matched_candidates,
+        exclude_files=exclude_files,
+    )
     if not complete_candidates:
         if incomplete_groups:
             return [], [f"incomplete split groups: {_describe_incomplete_split_groups(incomplete_groups)}"]
         return [], []
 
-    expected_sizes = _fetch_expected_gguf_sizes(repo_id, revision, allow_patterns)
+    expected_sizes = _fetch_expected_gguf_sizes(
+        repo_id,
+        revision,
+        allow_patterns,
+        exclude_files=exclude_files,
+    )
     if not expected_sizes:
         return [], [f"could not resolve expected GGUF sizes for repo {repo_id!r}"]
 
@@ -434,9 +489,12 @@ def _matched_snapshot_gguf_candidates(snapshot_dir: Path, allow_patterns: list[s
 
 def _partition_complete_gguf_candidates(
     candidates: list[Path],
+    *,
+    exclude_files: Sequence[str] | None = None,
 ) -> tuple[list[Path], list[dict[str, Any]]]:
     complete: list[Path] = []
     split_groups: dict[tuple[str, str], dict[str, Any]] = {}
+    excluded_splits = _excluded_split_keys(exclude_files)
 
     for candidate in candidates:
         match = _GGUF_SPLIT_RE.search(candidate.name)
@@ -468,7 +526,13 @@ def _partition_complete_gguf_candidates(
     incomplete: list[dict[str, Any]] = []
     for group in split_groups.values():
         expected_total = int(group["expected_total"])
-        missing = [idx for idx in range(1, expected_total + 1) if idx not in group["indices"]]
+        prefix_folded = str(group["prefix"]).casefold()
+        missing = [
+            idx
+            for idx in range(1, expected_total + 1)
+            if idx not in group["indices"]
+            and (prefix_folded, idx, expected_total) not in excluded_splits
+        ]
         if not missing:
             complete.extend(group["paths"])
             continue
@@ -542,24 +606,30 @@ def _resolve_or_download_model_entrypoint(
     repo_id: str,
     revision: str | None,
     quant: str | None,
+    exclude_files: Sequence[str] | None = None,
 ) -> Path:
     """Resolve a cached GGUF path first; download only on cache miss."""
     try:
-        model_path = _resolve_model_entrypoint(repo_id, revision, quant)
+        model_path = _resolve_model_entrypoint(repo_id, revision, quant, exclude_files=exclude_files)
         print(f"🦙 cache hit: using cached GGUF for {repo_id}")
         return model_path
     except RuntimeError as exc:
         print(f"🦙 cache miss for requested model ({exc}); downloading...")
 
     allow_patterns = _gguf_allow_patterns(quant)
-    matches = download_model.remote(repo_id, allow_patterns, revision)
+    exclude_list = list(exclude_files) if exclude_files else None
+    matches = (
+        download_model.remote(repo_id, allow_patterns, revision, exclude_list)
+        if exclude_list
+        else download_model.remote(repo_id, allow_patterns, revision)
+    )
     if not matches:
         _raise_missing_gguf_match(repo_id, allow_patterns, revision)
     # The download happens in a separate Modal function with the shared Volume
     # mounted. Reload before re-resolving so this container sees the new snapshot
     # immediately instead of failing one startup cycle behind.
     model_cache.reload()
-    return _resolve_model_entrypoint(repo_id, revision, quant)
+    return _resolve_model_entrypoint(repo_id, revision, quant, exclude_files=exclude_files)
 
 
 def _extract_quant(path: str) -> str | None:
@@ -983,23 +1053,31 @@ def download_model(
     repo_id: str = REPO_ID,
     allow_patterns: list[str] | None = None,
     revision: str | None = None,
+    exclude_files: list[str] | None = None,
 ) -> list[str]:
     """Download model files from Hugging Face into a persistent Modal Volume.
 
     Returns a list of relative paths of GGUF files matching the quantization.
     """
-    return _download_model_files(repo_id, allow_patterns, revision)
+    return _download_model_files(repo_id, allow_patterns, revision, exclude_files=exclude_files)
 
 
 def _download_model_files(
     repo_id: str,
     allow_patterns: list[str] | None,
     revision: str | None,
+    *,
+    exclude_files: Sequence[str] | None = None,
 ) -> list[str]:
     if allow_patterns is None:
         allow_patterns = _gguf_allow_patterns(QUANT)
 
-    matches, validation_errors = _validate_cached_gguf_matches(repo_id, revision, allow_patterns)
+    matches, validation_errors = _validate_cached_gguf_matches(
+        repo_id,
+        revision,
+        allow_patterns,
+        exclude_files=exclude_files,
+    )
     if matches:
         print(f"🦙 cache hit: using existing GGUF entries for {repo_id}")
         print(f"🦙 found GGUF entries: {matches}")
@@ -1012,7 +1090,12 @@ def _download_model_files(
 
     with _acquire_download_lease(repo_id, revision, allow_patterns) as heartbeat_download_lease:
         model_cache.reload()
-        matches, validation_errors = _validate_cached_gguf_matches(repo_id, revision, allow_patterns)
+        matches, validation_errors = _validate_cached_gguf_matches(
+            repo_id,
+            revision,
+            allow_patterns,
+            exclude_files=exclude_files,
+        )
         if matches:
             print(f"🦙 cache filled while waiting for download lease; using cached GGUF for {repo_id}")
             print(f"🦙 found GGUF entries: {matches}")
@@ -1034,12 +1117,18 @@ def _download_model_files(
             allow_patterns=allow_patterns,
             force_download=force_download,
             heartbeat=heartbeat_download_lease,
+            exclude_files=exclude_files,
         )
 
         # Ensure other functions can see the writes before we quit
         model_cache.commit()
 
-        matches, validation_errors = _validate_cached_gguf_matches(repo_id, revision, allow_patterns)
+        matches, validation_errors = _validate_cached_gguf_matches(
+            repo_id,
+            revision,
+            allow_patterns,
+            exclude_files=exclude_files,
+        )
         if validation_errors:
             raise RuntimeError(
                 f"Downloaded GGUF cache validation failed for {repo_id!r}: {'; '.join(validation_errors)}"
@@ -1057,6 +1146,7 @@ def _snapshot_download_with_keepalive(
     max_workers: int = SNAPSHOT_MAX_WORKERS,
     force_download: bool = False,
     heartbeat: Callable[[], None] | None = None,
+    exclude_files: Sequence[str] | None = None,
 ) -> None:
     """Run snapshot_download in a subprocess and print periodic keepalives.
 
@@ -1064,16 +1154,31 @@ def _snapshot_download_with_keepalive(
     that are not auth/missing-repo/disk errors retry once over plain HTTP.
     """
     try:
-        expected_sizes = _fetch_expected_gguf_sizes(repo_id, revision, allow_patterns)
+        expected_sizes = _fetch_expected_gguf_sizes(
+            repo_id,
+            revision,
+            allow_patterns,
+            exclude_files=exclude_files,
+        )
     except Exception:
         expected_sizes = {}
     total_expected_bytes = sum(expected_sizes.values())
+    ignore_patterns = list(auxiliary_gguf_ignore_patterns())
+    for raw in exclude_files or ():
+        excluded_entry = str(raw or "").strip()
+        if not excluded_entry:
+            continue
+        if excluded_entry not in ignore_patterns:
+            ignore_patterns.append(excluded_entry)
+        basename = Path(excluded_entry).name
+        if basename and basename not in ignore_patterns:
+            ignore_patterns.append(f"*{basename}")
     payload = {
         "repo_id": repo_id,
         "revision": revision,
         "cache_dir": cache_dir,
         "allow_patterns": allow_patterns,
-        "ignore_patterns": auxiliary_gguf_ignore_patterns(),
+        "ignore_patterns": ignore_patterns,
         "max_workers": max_workers,
         "force_download": force_download,
     }
@@ -1319,6 +1424,8 @@ def _download_exact_gguf(
     filename: str,
     label: str,
     force_download: bool = False,
+    heartbeat: Callable[[], None] | None = None,
+    expected_bytes: int | None = None,
 ) -> str:
     """Download one file in a fresh process so transport env applies.
 
@@ -1369,13 +1476,44 @@ def _download_exact_gguf(
         return env
 
     def _run(env: dict[str, str]) -> tuple[int, str, str]:
-        completed = subprocess.run(
+        if heartbeat is None:
+            completed = subprocess.run(
+                [sys.executable, "-c", worker_code],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            return completed.returncode, (completed.stdout or "").strip(), completed.stderr or ""
+        process = subprocess.Popen(
             [sys.executable, "-c", worker_code],
             env=env,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
         )
-        return completed.returncode, (completed.stdout or "").strip(), completed.stderr or ""
+        started = time.time()
+        try:
+            while process.poll() is None:
+                elapsed = int(time.time() - started)
+                try:
+                    inflight_bytes, _ = _estimate_incomplete_blob_size(repo_id=repo_id)
+                except OSError:
+                    inflight_bytes = 0
+                progress_text = ""
+                if expected_bytes and expected_bytes > 0:
+                    pct = max(0, min(100, int((inflight_bytes * 100) / expected_bytes)))
+                    progress_text = f" size={inflight_bytes / (1024**3):.2f}GiB/{expected_bytes / (1024**3):.2f}GiB pct={pct}%"
+                print(
+                    f"🦙 {label} download in progress... "
+                    f"transport={_describe_transport_env(env)} elapsed={elapsed}s{progress_text}"
+                )
+                heartbeat()
+                time.sleep(20)
+            stdout_text, stderr_text = process.communicate(timeout=30)
+        finally:
+            if process.poll() is None:
+                process.kill()
+        return process.returncode, (stdout_text or "").strip(), stderr_text or ""
 
     env = _attempt_env(disable_xet=False)
     print(f"🦙 downloading {label} with transport={_describe_transport_env(env)}")
@@ -1401,13 +1539,38 @@ def _download_exact_gguf(
     raise RuntimeError(f"{label} download failed with exit code {returncode}. Last error: {last_line}")
 
 
-def _cache_exact_gguf(artifact: dict[str, Any], label: str) -> str:
+def _cache_exact_gguf(
+    artifact: dict[str, Any],
+    label: str,
+    *,
+    with_keepalive: bool = False,
+) -> str:
     repo, revision, filename = artifact["repo_id"], artifact["revision"], artifact["filename"]
-    with _acquire_download_lease(repo, revision, [filename]):
-        path = Path(_download_exact_gguf(repo_id=repo, revision=revision, filename=filename, label=label))
-        expected = artifact.get("size_bytes")
+    expected = artifact.get("size_bytes")
+    with _acquire_download_lease(repo, revision, [filename]) as heartbeat_download_lease:
+        hb = heartbeat_download_lease if with_keepalive else None
+        path = Path(
+            _download_exact_gguf(
+                repo_id=repo,
+                revision=revision,
+                filename=filename,
+                label=label,
+                heartbeat=hb,
+                expected_bytes=expected if isinstance(expected, int) else None,
+            )
+        )
         if expected and path.stat().st_size != expected:
-            path = Path(_download_exact_gguf(repo_id=repo, revision=revision, filename=filename, label=label, force_download=True))
+            path = Path(
+                _download_exact_gguf(
+                    repo_id=repo,
+                    revision=revision,
+                    filename=filename,
+                    label=label,
+                    force_download=True,
+                    heartbeat=hb,
+                    expected_bytes=expected if isinstance(expected, int) else None,
+                )
+            )
         if path.stat().st_size == 0 or (expected and path.stat().st_size != expected):
             raise RuntimeError(f"{label} download has an unexpected size.")
         with path.open("rb") as handle:
@@ -1430,6 +1593,20 @@ def download_dspark(artifact: dict[str, Any]) -> str:
     if not is_dspark_gguf(filename) or Path(filename).is_absolute() or ".." in Path(filename).parts:
         raise ValueError("DSpark draft must identify a GGUF in the selected revision.")
     return _cache_exact_gguf(artifact, "DSpark draft")
+
+
+@app.function(
+    image=download_image,
+    volumes={cache_dir: model_cache},
+    timeout=PREDOWNLOAD_TIMEOUT_MINUTES * MINUTES,
+    cpu=DOWNLOAD_CPU,
+)
+def download_engram(artifact: dict[str, Any]) -> str:
+    """Cache a pinned external Engram (--ple) GGUF table in the shared volume."""
+    filename = artifact["filename"]
+    if not is_engram_table_file(filename) or Path(filename).is_absolute() or ".." in Path(filename).parts:
+        raise ValueError("Engram table must identify an external Engram GGUF in the selected revision.")
+    return _cache_exact_gguf(artifact, "Engram table", with_keepalive=True)
 
 
 @app.function(
@@ -1667,6 +1844,7 @@ def _resolve_model_entrypoint(
     repo_id: str | None,
     revision: str | None,
     quant: str | None,
+    exclude_files: Sequence[str] | None = None,
 ) -> Path:
     """Pick a GGUF file from HF hub cache."""
     if repo_id:
@@ -1676,7 +1854,10 @@ def _resolve_model_entrypoint(
                 f"No cached snapshot found for repo {repo_id!r} in HF cache {HF_HUB_DIR}"
             )
         scoped_candidates = _snapshot_gguf_candidates(snapshot_dir, quant)
-        complete_candidates, incomplete_groups = _partition_complete_gguf_candidates(scoped_candidates)
+        complete_candidates, incomplete_groups = _partition_complete_gguf_candidates(
+            scoped_candidates,
+            exclude_files=exclude_files,
+        )
         if complete_candidates:
             return _pick_preferred_gguf_entrypoint(complete_candidates)
         if incomplete_groups:
@@ -1747,8 +1928,21 @@ def serve():
     host = str(cfg.get("host", "0.0.0.0"))
     port = int(cfg.get("port", 8080))
 
+    engram = cfg.get("engram")
+    replaced_shard = str(engram.get("replaced_shard") or "").strip() if isinstance(engram, dict) else ""
+    exclude_files = [replaced_shard] if replaced_shard else None
+
     # Prefer cached GGUFs already in the shared volume; download only on cache miss.
-    model_path = _resolve_or_download_model_entrypoint(model_repo_id, revision, quant)
+    model_path = (
+        _resolve_or_download_model_entrypoint(
+            model_repo_id,
+            revision,
+            quant,
+            exclude_files=exclude_files,
+        )
+        if exclude_files
+        else _resolve_or_download_model_entrypoint(model_repo_id, revision, quant)
+    )
     print(f"🦙 using model file: {model_path}")
 
     # Leave GPU layer placement unset by default so llama.cpp can fit the
@@ -1762,6 +1956,10 @@ def serve():
         print(f"🦙 using llama-server cwd: {server_cwd}")
 
     server_args = extra_server_args or DEFAULT_SERVER_ARGS
+    engram_path: str | None = None
+    if isinstance(engram, dict):
+        engram_path = download_engram.remote(engram)
+        print(f"🦙 using external Engram table (--ple): {engram_path}")
     draft_path: str | None = None
     if draft := cfg.get("dspark"):
         draft_path = download_dspark.remote(draft)
@@ -1774,11 +1972,18 @@ def serve():
         if not projector:
             raise RuntimeError("Vision enabled without a resolved projector.")
         projector_path = download_projector.remote(projector)
-    if projector_path or draft_path:
+    if projector_path or draft_path or engram_path:
         model_cache.reload()
 
     if WARM_VOLUME:
-        warm_paths: list[Path | str] = [*_gguf_weight_paths(model_path)]
+        excluded_warm = _normalize_excluded_files(exclude_files)
+        warm_paths: list[Path | str] = [
+            path
+            for path in _gguf_weight_paths(model_path)
+            if not _is_excluded_gguf_path(path, excluded_warm)
+        ]
+        if engram_path:
+            warm_paths.append(engram_path)
         if projector_path:
             warm_paths.append(projector_path)
         if draft_path:
@@ -1803,6 +2008,7 @@ def serve():
                 fit_binary,
                 "--model",
                 str(model_path),
+                *(["--ple", engram_path] if engram_path else []),
                 # The planner's measurements are logged at trace level. Without
                 # this the only thing a rejected plan leaves behind is the
                 # abort message, which names whichever guard the planner
@@ -1892,6 +2098,8 @@ def serve():
         command += ["--no-mmproj"]
     if draft_path:
         command += ["--spec-type", "draft-dspark", "--spec-draft-model", draft_path, "--spec-draft-ngl", "all"]
+    if engram_path:
+        command += ["--ple", engram_path]
     command += server_args
 
     print("🦙 starting llama-server:")
@@ -1948,6 +2156,7 @@ def main(
     serving_fingerprint: str | None = None,
     vision_json: str | None = None,
     dspark_json: str | None = None,
+    engram_json: str | None = None,
     deploy: bool = False,
 ):
     """Configure, optionally preload weights, and optionally deploy the server.
@@ -1985,6 +2194,7 @@ def main(
     )
     cfg["vision"] = json.loads(vision_json) if vision_json else None
     cfg["dspark"] = json.loads(dspark_json) if dspark_json else None
+    cfg["engram"] = json.loads(engram_json) if engram_json else None
     cfg["host"] = host
     cfg["port"] = int(port)
     cfg["n_gpu_layers"] = n_gpu_layers if n_gpu_layers is not None else None
@@ -2003,9 +2213,21 @@ def main(
         download_projector.remote(cfg["vision"]["projector"])
     if preload and cfg.get("dspark"):
         download_dspark.remote(cfg["dspark"])
+    if preload and cfg.get("engram"):
+        download_engram.remote(cfg["engram"])
     if preload:
         allow_patterns = _gguf_allow_patterns(cfg.get("quant"))
-        matches = download_model.remote(cfg["repo_id"], allow_patterns, cfg.get("revision"))
+        engram_cfg = cfg.get("engram")
+        replaced_shard = (
+            str(engram_cfg.get("replaced_shard") or "").strip()
+            if isinstance(engram_cfg, dict)
+            else ""
+        )
+        matches = (
+            download_model.remote(cfg["repo_id"], allow_patterns, cfg.get("revision"), [replaced_shard])
+            if replaced_shard
+            else download_model.remote(cfg["repo_id"], allow_patterns, cfg.get("revision"))
+        )
         if not matches:
             _raise_missing_gguf_match(cfg["repo_id"], allow_patterns, cfg.get("revision"))
         print(f"✅ Weights cached in Modal Volume ({len(matches)} GGUF file(s)).")

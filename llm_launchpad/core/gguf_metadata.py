@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import math
 import re
 import struct
 from typing import Any
@@ -14,6 +15,12 @@ from ..gguf_files import is_target_gguf
 
 GGUF_METADATA_CHUNK_BYTES = 1024 * 1024
 GGUF_METADATA_MAX_BYTES = 32 * 1024 * 1024
+GGUF_PLE_HEADER_CHUNK_BYTES = 64 * 1024
+# Upstream llama.cpp b12233+ assigns type_id 43 to GGML_TYPE_F8_E4M3, while
+# Unsloth's PR #30817 DeepSeek-V4.1 MXFP8 Engram shards also wrote type_id 43
+# with block-scaled (33/32 bytes per element) data.
+GGML_TYPE_F8_E4M3_ID = 43
+PLE_TENSOR_NAME = "per_layer_token_embd.weight"
 
 _GGUF_MAGIC = b"GGUF"
 _STRING_LENGTH = struct.Struct("<Q")
@@ -79,6 +86,33 @@ class GgufServingMetadata:
     indexer_key_length: int | None = None
     indexer_kpool: int | None = None
     nextn_predict_layers: int = 0
+
+
+@dataclass(frozen=True)
+class GgufPleTensorInfo:
+    """Tensor descriptor for a single-tensor per-layer embedding (Engram) shard."""
+
+    name: str
+    dims: tuple[int, ...]
+    type_id: int
+    source_file: str | None = None
+
+    @property
+    def num_elements(self) -> int:
+        return math.prod(self.dims) if self.dims else 0
+
+    def is_mxfp8_type43_collision(self, size_bytes: int | None = None) -> bool:
+        """Return True when this PLE shard collides with upstream F8_E4M3 (type 43).
+
+        Plain F8_E4M3 stores 1 byte per element, whereas PR #30817 MXFP8 stores
+        one E8M0 scale byte per 32 elements (33/32 bytes per element). Checking
+        the file size when known avoids false positives against real F8_E4M3.
+        """
+        if self.name != PLE_TENSOR_NAME or self.type_id != GGML_TYPE_F8_E4M3_ID:
+            return False
+        if size_bytes is None or self.num_elements <= 0:
+            return True
+        return size_bytes >= (self.num_elements * 33) // 32
 
 
 class _NeedMoreData(Exception):
@@ -347,6 +381,98 @@ def fetch_gguf_serving_metadata(
             except _NeedMoreData:
                 # Large tokenizers need several MiB. Grow geometrically to
                 # avoid fetching and reparsing the table one MiB at a time.
+                next_chunk_bytes *= 2
+                continue
+    except Exception:
+        return None
+    return None
+
+
+def parse_gguf_ple_tensor_info(
+    data: bytes,
+    source_file: str | None = None,
+) -> GgufPleTensorInfo | None:
+    """Parse a GGUF shard header and return PLE tensor info if it is PLE-only.
+
+    Returns ``None`` immediately when the shard holds more (or fewer) than one
+    tensor, or when its lone tensor is not ``per_layer_token_embd.weight``.
+    """
+
+    if len(data) < 24:
+        raise _NeedMoreData
+    if data[:4] != _GGUF_MAGIC:
+        raise _InvalidGguf("Missing GGUF magic")
+    version = _unpack(data, 4, "<I")[0]
+    if version not in {2, 3}:
+        raise _InvalidGguf(f"Unsupported GGUF version {version}")
+    tensor_count = _unpack(data, 8, "<Q")[0]
+    if tensor_count != 1:
+        return None
+    metadata_count = _unpack(data, 16, "<Q")[0]
+    if metadata_count > 10_000_000:
+        raise _InvalidGguf("Implausible GGUF metadata count")
+
+    offset = 24
+    for _ in range(metadata_count):
+        key, offset = _read_string(data, offset, max_length=1024 * 1024)
+        if key is None:
+            raise _InvalidGguf("GGUF metadata key could not be decoded")
+        value_type = _unpack(data, offset, "<I")[0]
+        offset += 4
+        _, offset = _read_value(data, offset, value_type, capture=False)
+
+    tensor_name, offset = _read_string(data, offset, max_length=1024 * 1024)
+    if tensor_name is None:
+        raise _InvalidGguf("GGUF tensor name could not be decoded")
+    n_dims = _unpack(data, offset, "<I")[0]
+    offset += 4
+    if n_dims > 8:
+        raise _InvalidGguf(f"Implausible GGUF tensor rank {n_dims}")
+    dims = tuple(int(dim) for dim in _unpack(data, offset, f"<{n_dims}Q")) if n_dims else ()
+    offset += 8 * n_dims
+    type_id = int(_unpack(data, offset, "<I")[0])
+    # Verify the 8-byte tensor data offset is present before trusting the entry.
+    _unpack(data, offset + 4, "<Q")
+    if tensor_name != PLE_TENSOR_NAME:
+        return None
+    return GgufPleTensorInfo(
+        name=tensor_name,
+        dims=dims,
+        type_id=type_id,
+        source_file=source_file,
+    )
+
+
+def fetch_gguf_ple_tensor_info(
+    repo_id: str,
+    filename: str,
+    *,
+    revision: str | None = None,
+    chunk_bytes: int = GGUF_PLE_HEADER_CHUNK_BYTES,
+    max_bytes: int = GGUF_METADATA_MAX_BYTES,
+) -> GgufPleTensorInfo | None:
+    """Inspect one GGUF shard through bounded HTTP range requests for PLE info."""
+
+    if not filename or chunk_bytes <= 0 or max_bytes <= 0:
+        return None
+    payload = bytearray()
+    next_chunk_bytes = chunk_bytes
+    try:
+        while len(payload) < max_bytes:
+            end = min(len(payload) + next_chunk_bytes, max_bytes) - 1
+            chunk = _fetch_hf_file_range(
+                repo_id,
+                filename,
+                revision=revision,
+                start=len(payload),
+                end=end,
+            )
+            if not chunk:
+                break
+            payload.extend(chunk)
+            try:
+                return parse_gguf_ple_tensor_info(bytes(payload), source_file=filename)
+            except _NeedMoreData:
                 next_chunk_bytes *= 2
                 continue
     except Exception:

@@ -26,6 +26,7 @@ class DeploymentJob:
     outcome: str = "Running"
     persistent_id: str | None = None
     last_seen_seq: int = 0
+    last_failure_exit_code: int | None = None
     opencode_synced: bool = False
 
 

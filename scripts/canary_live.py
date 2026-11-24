@@ -86,7 +86,15 @@ def _credentials_present(provider: str) -> str | None:
         return f"Vast.ai key unreadable: {exc}"
 
 
-def _deploy_args(provider: str, app_name: str, max_hourly_cost: float) -> list[str]:
+def _deploy_args(
+    provider: str,
+    app_name: str,
+    max_hourly_cost: float,
+    *,
+    modal_gpu_count: int = 1,
+    tail_logs: bool | None = None,
+) -> list[str]:
+    use_tail_logs = (provider == "modal") if tail_logs is None else tail_logs
     args = [
         "deploy",
         "--provider", provider,
@@ -99,11 +107,16 @@ def _deploy_args(provider: str, app_name: str, max_hourly_cost: float) -> list[s
         "--vision", "off",
         "--do-warmup",
         "--summary-logs",
-        "--no-tail-logs",
+        "--tail-logs" if use_tail_logs else "--no-tail-logs",
         "--timeout", "1500",
     ]
     if provider == "modal":
-        args += ["--gpu-type", "T4", "--gpu-count", "1"]
+        from llm_launchpad.core.modal_gpu import modal_gpu_count_options
+
+        allowed = modal_gpu_count_options("T4")
+        if modal_gpu_count not in allowed:
+            raise ValueError(f"Unsupported Modal T4 GPU count {modal_gpu_count}; expected one of {allowed}.")
+        args += ["--gpu-type", "T4", "--gpu-count", str(modal_gpu_count)]
     else:
         args += ["--idle-shutdown", IDLE_SHUTDOWN]
     if provider == "prime":
@@ -131,7 +144,14 @@ def _run(command: list[str], timeout: int) -> tuple[int, list[str]]:
     return completed.returncode, _redact(lines[-40:])
 
 
-def run_provider(provider: str, *, run_id: str, max_hourly_cost: float, max_minutes: int) -> ProviderResult:
+def run_provider(
+    provider: str,
+    *,
+    run_id: str,
+    max_hourly_cost: float,
+    max_minutes: int,
+    modal_gpu_count: int = 1,
+) -> ProviderResult:
     result = ProviderResult(provider=provider)
     missing = _credentials_present(provider)
     if missing:
@@ -141,7 +161,7 @@ def run_provider(provider: str, *, run_id: str, max_hourly_cost: float, max_minu
     started = time.monotonic()
     try:
         code, tail = _run(
-            [*_cli(), *_deploy_args(provider, result.app_name, max_hourly_cost)],
+            [*_cli(), *_deploy_args(provider, result.app_name, max_hourly_cost, modal_gpu_count=modal_gpu_count)],
             timeout=max_minutes * 60,
         )
         result.deploy_seconds = round(time.monotonic() - started, 1)
@@ -174,6 +194,13 @@ def main() -> int:
     parser.add_argument("--provider", action="append", choices=PROVIDERS, help="Repeat to choose; default all.")
     parser.add_argument("--max-hourly-cost", type=float, default=0.25, help="Vast hourly ceiling, disk included.")
     parser.add_argument("--max-minutes", type=int, default=35, help="Wall-clock limit per provider deploy.")
+    parser.add_argument(
+        "--modal-gpu-count",
+        type=int,
+        default=1,
+        choices=(1, 2, 4, 8),
+        help="Modal T4 card count (use 2 to exercise multi-GPU layer split cheaply).",
+    )
     parser.add_argument("--report", type=Path, default=Path("canary-report.json"))
     args = parser.parse_args()
     if not args.live:
@@ -182,7 +209,13 @@ def main() -> int:
         parser.error("Billable canary deployments are disabled in GitHub Actions. Run locally instead.")
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d%H%M")
     results = [
-        run_provider(provider, run_id=run_id, max_hourly_cost=args.max_hourly_cost, max_minutes=args.max_minutes)
+        run_provider(
+            provider,
+            run_id=run_id,
+            max_hourly_cost=args.max_hourly_cost,
+            max_minutes=args.max_minutes,
+            modal_gpu_count=args.modal_gpu_count,
+        )
         for provider in (args.provider or PROVIDERS)
     ]
     report = {

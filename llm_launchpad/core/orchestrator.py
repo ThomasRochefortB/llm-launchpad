@@ -372,7 +372,11 @@ class Orchestrator:
 
     def deploy(self, config: DeploymentConfig) -> EventStream:
         """Run a full deploy workflow (optional preload + deploy + warmup)."""
-        from .deployment_preflight import preflight_config, resolve_dspark_draft
+        from .deployment_preflight import (
+            preflight_config,
+            resolve_dspark_draft,
+            resolve_engram_table,
+        )
 
         preflight = preflight_config(config)
         blocking = [finding for finding in preflight.findings if finding.blocking]
@@ -440,6 +444,34 @@ class Orchestrator:
                     line=f"Compatibility preflight warning: {detail} Continuing unverified.",
                     operation=OperationType.DEPLOY,
                 )
+            if config.engram_table is None:
+                try:
+                    engram_table, engram_message = resolve_engram_table(config)
+                except ValueError as exc:
+                    yield from fail_operation(
+                        OperationType.DEPLOY,
+                        f"Engram preflight failed: {exc}",
+                        exit_code=2,
+                        recoverable=False,
+                    )
+                    return
+                except Exception as exc:
+                    yield LogEvent(
+                        line=(
+                            "Engram table preflight warning: could not inspect "
+                            f"per-layer embedding shards ({exc}). Continuing unverified."
+                        ),
+                        operation=OperationType.DEPLOY,
+                    )
+                else:
+                    if engram_table is not None:
+                        config.engram_table = engram_table
+                        if engram_message:
+                            yield LogEvent(
+                                line=engram_message,
+                                operation=OperationType.DEPLOY,
+                                is_milestone=True,
+                            )
             if config.dspark or config.dspark_repo or config.dspark_file:
                 try:
                     config.dspark_draft = resolve_dspark_draft(config)

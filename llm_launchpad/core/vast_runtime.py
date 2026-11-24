@@ -18,6 +18,7 @@ from ..protocol.models import DeploymentConfig
 from .runtime_support import load_llamacpp_support_manifest
 from .serving_runtime import (
     GGUF_FILE_PLACEHOLDER,
+    engram_setup,
     gguf_exec_command,
     projector_setup,
     vllm_serve_args,
@@ -310,6 +311,11 @@ def vast_runtime_script(config: DeploymentConfig) -> str:
     quant = (config.quant or "").strip()
     if not repo or not quant:
         raise ValueError("Vast llama.cpp rentals require a GGUF repository and quant.")
+    excluded_shards = (
+        [config.engram_table.replaced_shard]
+        if config.engram_table is not None and config.engram_table.replaced_shard
+        else None
+    )
     stage_setup, hf_file_flag = gguf_stage_command(
         repo_id=repo,
         revision=None,
@@ -318,6 +324,7 @@ def vast_runtime_script(config: DeploymentConfig) -> str:
         # staged dir rather than fighting its layout.
         dest_dir=f"{VAST_RUNTIME_DIR}/gguf",
         cache_dir=f"{VAST_RUNTIME_DIR}/gguf/hf-hub",
+        exclude_files=excluded_shards,
     )
     arguments = [
         "/app/llama-server", "--hf-repo", f"{repo}:{quant}",
@@ -334,6 +341,10 @@ def vast_runtime_script(config: DeploymentConfig) -> str:
     ]
     # The same pinned image Prime uses, so the projector stages identically.
     setup = stage_setup
+    if config.engram_table is not None:
+        engram_setup_text, engram_path = engram_setup(config, root=VAST_RUNTIME_DIR)
+        setup += engram_setup_text
+        arguments.extend(["--ple", engram_path])
     if config.vision is not None and config.vision.enabled:
         projector_setup_text, projector_path = projector_setup(config, root=VAST_RUNTIME_DIR)
         setup += projector_setup_text

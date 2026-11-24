@@ -87,6 +87,34 @@ class EndpointUrlResolverTests(unittest.TestCase):
     def test_a_dev_url_is_still_better_than_none(self) -> None:
         self.assertEqual(_resolve(LogEvent(line=f"Created web function => {DEV}")), DEV)
 
+    def test_regional_modal_urls_and_multiline_created_function_announcements(self) -> None:
+        from llm_launchpad.core.backend import ModalBackend
+
+        dev_regional = "https://alice--llp-lc-fff9e0209f4c-dev.us-east.modal.run"
+        prod_regional = "https://alice--llp-lc-fff9e0209f4c.us-east.modal.run"
+        self.assertEqual(ModalBackend.extract_modal_web_url(f"│   └── {prod_regional} "), prod_regional)
+        self.assertTrue(ModalBackend.is_modal_dev_url(dev_regional))
+        self.assertFalse(ModalBackend.is_modal_dev_url(prod_regional))
+        self.assertEqual(
+            _resolve(
+                LogEvent(line="├── ✓ Created Function serve-impossible-tapir"),
+                LogEvent(line=f"│   └── {dev_regional} "),
+                LogEvent(line="├── ✓ Created Function serve-impossible-tapir"),
+                LogEvent(line=f"│   └── {prod_regional} "),
+            ),
+            prod_regional,
+        )
+        # Deployed regional URL still beats an incidental or later -dev URL.
+        self.assertEqual(
+            _resolve(
+                LogEvent(line="├── ✓ Created Function serve-impossible-tapir"),
+                LogEvent(line=f"│   └── {prod_regional} "),
+                LogEvent(line="├── ✓ Created Function serve-impossible-tapir"),
+                LogEvent(line=f"│   └── {dev_regional} "),
+            ),
+            prod_regional,
+        )
+
 
 class FailureDetailTests(unittest.TestCase):
     def test_a_detail_is_used_when_present(self) -> None:

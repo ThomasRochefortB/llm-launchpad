@@ -803,6 +803,158 @@ class OrchestratorNetworkLoopTests(unittest.TestCase):
             )
         )
 
+    def test_warmup_timeout_carries_scheduling_hint_in_completion_detail(self) -> None:
+        fake_requests = types.SimpleNamespace(
+            post=lambda *_args, **_kwargs: _Response(
+                503,
+                "Function 'serve' (fu-1) is waiting to be scheduled on a GPU_RTX_PRO_6000 worker.",
+            )
+        )
+        call_count = {"n": 0}
+
+        def _fake_time() -> float:
+            call_count["n"] += 1
+            return 0.0 if call_count["n"] <= 5 else 999.0
+
+        with (
+            patch.dict("sys.modules", {"requests": fake_requests}),
+            patch("llm_launchpad.core.warmup.time.time", side_effect=_fake_time),
+            patch(
+                "llm_launchpad.core.warmup.shutdown_event",
+                return_value=types.SimpleNamespace(wait=lambda **_kwargs: False),
+            ),
+        ):
+            events = list(
+                Orchestrator().warmup(
+                    backend=BackendType.LLAMACPP,
+                    server_url="https://example.modal.run",
+                    timeout=1,
+                    tail_logs=False,
+                )
+            )
+
+        completions = [
+            e for e in events if isinstance(e, OperationCompleteEvent) and e.operation == OperationType.WARMUP
+        ]
+        self.assertEqual(len(completions), 1)
+        self.assertFalse(completions[0].success)
+        self.assertIn("Timed out after 1s", completions[0].detail)
+        self.assertIn("Waiting for GPU scheduling (GPU_RTX_PRO_6000)", completions[0].detail)
+
+    def test_warmup_modal_probe_uses_extended_timeout_and_drains_logs_while_in_flight(self) -> None:
+        import threading as _threading
+
+        captured_timeouts: list[float] = []
+        probe_started = _threading.Event()
+        release_probe = _threading.Event()
+        self.addCleanup(release_probe.set)
+
+        def _blocking_post(*_args, **kwargs):
+            captured_timeouts.append(float(kwargs["timeout"]))
+            probe_started.set()
+            release_probe.wait(timeout=5.0)
+            return _Response(503, "still warming")
+
+        class _LiveCrashTail:
+            def __init__(self, app_name: str) -> None:
+                self.app_name = app_name
+                self.seen_lines: set[str] = set()
+                self.stopped: str | None = None
+                self._emitted = False
+
+            def may_attach(self) -> bool:
+                return False
+
+            def attach(self):
+                yield from ()
+
+            def drain(self):
+                if probe_started.is_set() and not self._emitted:
+                    self._emitted = True
+                    yield LogEvent(
+                        line="llama.cpp rejected the full-context GPU-only serving plan",
+                        operation=OperationType.WARMUP,
+                    )
+
+            def stop(self, reason: str) -> None:
+                self.stopped = reason
+
+        with (
+            patch.dict("sys.modules", {"requests": types.SimpleNamespace(post=_blocking_post)}),
+            patch("llm_launchpad.core.warmup._ModalLogTail", _LiveCrashTail),
+        ):
+            events = list(
+                WarmupRunner().run(
+                    backend=BackendType.LLAMACPP,
+                    server_url="https://example.modal.run",
+                    timeout=1800,
+                    tail_logs=True,
+                    app_name="llamacpp-test",
+                )
+            )
+
+        self.assertEqual(captured_timeouts, [60.0])
+        completion = next(e for e in events if isinstance(e, OperationCompleteEvent))
+        self.assertFalse(completion.success)
+        self.assertIn("rejected the full-context", completion.detail)
+
+    def test_warmup_modal_cold_timeout_uses_short_retry_pause(self) -> None:
+        attempts = {"n": 0}
+        wait_timeouts: list[float] = []
+
+        def _post(*_args, **_kwargs):
+            attempts["n"] += 1
+            if attempts["n"] <= 3:
+                raise TimeoutError("Read timed out.")
+            return _Response(200, '{"choices":[{"text":"ok"}]}')
+
+        clock = {"t": 0.0}
+
+        def _tick() -> float:
+            clock["t"] += 1.0
+            return clock["t"]
+
+        def _wait(*, timeout: float = 0.0) -> bool:
+            wait_timeouts.append(timeout)
+            clock["t"] += timeout
+            return False
+
+        with (
+            patch.dict("sys.modules", {"requests": types.SimpleNamespace(post=_post)}),
+            patch("llm_launchpad.core.warmup.time.time", side_effect=_tick),
+            patch(
+                "llm_launchpad.core.warmup.shutdown_event",
+                return_value=types.SimpleNamespace(wait=_wait),
+            ),
+            patch(
+                "llm_launchpad.core.warmup.ModalBackend.test_curl_command",
+                return_value="curl ok",
+            ),
+        ):
+            events = list(
+                WarmupRunner().run(
+                    backend=BackendType.LLAMACPP,
+                    server_url="https://example.modal.run",
+                    timeout=1800,
+                    tail_logs=False,
+                )
+            )
+
+        self.assertEqual(attempts["n"], 4)
+        self.assertTrue(any(isinstance(e, OperationCompleteEvent) and e.success for e in events))
+        # Each cold-start retry waits at most ~2s (in <=0.5s chunks), never 30s.
+        self.assertLessEqual(sum(wait_timeouts), 7.5)
+
+    def test_recent_system_logs_uses_twenty_second_timeout(self) -> None:
+        from llm_launchpad.core.backend import ModalBackend
+
+        with patch("llm_launchpad.core.backend.subprocess.run") as run:
+            run.return_value = types.SimpleNamespace(returncode=0, stdout="line1\n")
+            lines = ModalBackend.recent_system_logs("my-app", 1700000000.0)
+
+        self.assertEqual(lines, ["line1"])
+        self.assertEqual(run.call_args.kwargs["timeout"], 20)
+
 
 if __name__ == "__main__":
     unittest.main()

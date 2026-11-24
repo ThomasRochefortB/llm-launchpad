@@ -177,8 +177,15 @@ class ModalBackend:
     @staticmethod
     def extract_modal_web_url(line: str) -> str | None:
         """Extract the first Modal web URL from an output line."""
-        match = re.search(r"https://[A-Za-z0-9-]+\.modal\.run", line or "")
+        match = re.search(r"https://[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.modal\.run", line or "")
         return match.group(0) if match else None
+
+    @staticmethod
+    def is_modal_dev_url(url: str) -> bool:
+        """Return whether a Modal web URL targets an ephemeral ``-dev`` endpoint."""
+        host = (url or "").removeprefix("https://").removeprefix("http://").split("/", 1)[0]
+        first_label = host.split(".", 1)[0]
+        return first_label.endswith("-dev")
 
     @staticmethod
     def test_curl_command(
@@ -328,6 +335,8 @@ class ModalBackend:
             args += ["--vision-json", json.dumps(vision_to_dict(config.vision))]
         if config.dspark_draft is not None:
             args += ["--dspark-json", json.dumps(asdict(config.dspark_draft))]
+        if config.engram_table is not None:
+            args += ["--engram-json", json.dumps(asdict(config.engram_table))]
         if config.preload:
             args += ["--preload"]
         else:
@@ -388,13 +397,15 @@ class ModalBackend:
         """Fetch the app's system logs since the given Unix timestamp."""
         since = datetime.fromtimestamp(started_at, tz=timezone.utc).isoformat()
         try:
+            # `modal app logs --source system` commonly takes 10-14s to
+            # authenticate and respond; a 5s cap silently dropped every check.
             result = subprocess.run(
                 cls._resolve_command(
                     ["modal", "app", "logs", app_name, "--source", "system", "--since", since]
                 ),
                 capture_output=True,
                 text=True,
-                timeout=5,
+                timeout=20,
             )
         except (OSError, subprocess.TimeoutExpired):
             return []
@@ -850,7 +861,7 @@ def _extract_item_web_url(item: dict[str, Any]) -> str | None:
         return None
 
     unique_urls = list(dict.fromkeys(urls))
-    unique_urls.sort(key=lambda url: (url.endswith("-dev.modal.run"), len(url)))
+    unique_urls.sort(key=lambda url: (ModalBackend.is_modal_dev_url(url), len(url)))
     return unique_urls[0]
 
 

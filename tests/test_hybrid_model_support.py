@@ -68,7 +68,8 @@ class HybridModelSupportTests(unittest.TestCase):
         placed = [profile for profile in profiles if profile.gpu_count > 0]
         self.assertEqual(len(placed), 1)
         self.assertEqual(placed[0].quant, "UD-Q2_K_XL")
-        self.assertEqual(placed[0].gpu_count, 6)
+        # Modal schedules power-of-two multi-GPU slices, so a 6-card fit rounds to 8.
+        self.assertEqual(placed[0].gpu_count, 8)
 
     def test_glm_cache_excludes_nextn_and_includes_pooling_indexer(self) -> None:
         metadata = metadata_fixture("GLM-5.3-Flash")

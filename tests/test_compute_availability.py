@@ -354,6 +354,21 @@ class ComputeAvailabilityTests(unittest.TestCase):
         self.assertEqual(modal_plan.quote.gpu_count, 2)
         self.assertEqual(modal_plan.quote.price_per_hour_usd, 8.0)
 
+    def test_modal_placements_round_up_to_power_of_two_gpu_counts(self) -> None:
+        # 105 GiB * 1.05 = 110.25 GiB needs >4 L4s (96 GB); Modal skips 5x L4
+        # and selects 8x L4 instead of an unschedulable non-power-of-two slice.
+        configuration = aggregate_compute_availability(
+            modal_catalog=[ModalGpuSpec("L4", price_per_hour_usd=0.80)],
+        ).configurations[0]
+
+        plans = plans_for_compute_profile(
+            configuration,
+            _profile(required_vram_gb=105.0),
+        )
+
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(plans[0].quote.gpu_count, 8)
+
     def test_rejects_gpu_type_when_maximum_vram_is_too_small(self) -> None:
         configuration = aggregate_compute_availability(
             modal_catalog=[ModalGpuSpec("T4", price_per_hour_usd=0.6)],

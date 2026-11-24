@@ -21,6 +21,19 @@ class DeployLogSummarizerTests(unittest.TestCase):
         out = s.transform("🦙 cache hit: using cached GGUF for repo/model", OperationType.WARMUP)
         self.assertEqual(out, ["Loading cached model"])
 
+    def test_llamacpp_preload_cache_hit_maps_to_model_cached_not_loading(self) -> None:
+        s = DeployLogSummarizer(BackendType.LLAMACPP)
+        first = s.transform(
+            "✅ Weights cached in Modal Volume (9 GGUF file(s)).",
+            OperationType.DEPLOY,
+        )
+        second = s.transform(
+            "🦙 cache hit: using existing GGUF entries for unsloth/DeepSeek-V4.1-Flash-1017-GGUF",
+            OperationType.DEPLOY,
+        )
+        self.assertEqual(first, ["Model cached"])
+        self.assertEqual(second, [])
+
     def test_llamacpp_offload_maps_to_loading_weights_on_gpu(self) -> None:
         s = DeployLogSummarizer(BackendType.LLAMACPP)
         out = s.transform("load_tensors: offloaded 33/33 layers to GPU", OperationType.WARMUP)

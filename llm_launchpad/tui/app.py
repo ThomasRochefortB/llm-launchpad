@@ -980,6 +980,12 @@ class TuiApp(App):
                 break
             for stored in events:
                 job.last_seen_seq = max(job.last_seen_seq, stored.seq)
+                if (
+                    isinstance(stored.event, OperationCompleteEvent)
+                    and not stored.event.success
+                    and stored.event.exit_code
+                ):
+                    job.last_failure_exit_code = stored.event.exit_code
                 try:
                     dispatch(job.monitor, stored.event, phase_only=True)
                 except Exception:
@@ -1076,6 +1082,12 @@ class TuiApp(App):
             stored_events = []
         for stored in stored_events:
             job.last_seen_seq = max(job.last_seen_seq, stored.seq)
+            if (
+                isinstance(stored.event, OperationCompleteEvent)
+                and not stored.event.success
+                and stored.event.exit_code
+            ):
+                job.last_failure_exit_code = stored.event.exit_code
             try:
                 dispatch(monitor, stored.event, phase_only=True)
             except Exception:
@@ -1105,10 +1117,17 @@ class TuiApp(App):
     def _finish_persistent_monitor(self, job: DeploymentJob, record: JobRecord) -> None:
         """Finish only after the durable job has published its final outcome."""
         success = record.status == "succeeded"
-        detail = record.outcome.removeprefix("Failed — check resource in Manage.").strip()
+        detail = record.outcome
+        for prefix in (
+            "Failed — check resource in Manage.",
+            "Failed — resource stopped.",
+        ):
+            detail = detail.removeprefix(prefix)
+        detail = detail.strip()
         _dispatch_event(job.monitor, OperationCompleteEvent(
             operation=OperationType.DEPLOY,
             success=success,
+            exit_code=0 if success else (job.last_failure_exit_code or 1),
             detail="" if success else detail,
             timestamp=datetime.fromtimestamp(record.updated_at) if record.updated_at else datetime.now(),
         ))
@@ -1357,21 +1376,21 @@ class TuiApp(App):
         url_resolver = EndpointUrlResolver()
         will_run_warmup = bool(config.do_warmup and config.do_deploy)
 
-        def _emit_connection_summary(url: str) -> None:
-            self._cache_deploy_connection_summary(config, url, deployed_endpoint)
-            for line in _deploy_connection_summary_lines(config, url):
+        def _emit_connection_summary(target_config: DeploymentConfig, url: str) -> None:
+            self._cache_deploy_connection_summary(target_config, url, deployed_endpoint)
+            for line in _deploy_connection_summary_lines(target_config, url):
                 _dispatch_event(monitor, LogEvent(line=line))
             poster = getattr(monitor, "post_message", None)
             if callable(poster):
-                poster(ConnectionSummaryReady(_deploy_connection_card_payload(config, url)))
+                poster(ConnectionSummaryReady(_deploy_connection_card_payload(target_config, url)))
 
-        def _sync_now(url: str) -> None:
-            target_app_name = config.app_name or legacy_app_name(config.backend)
+        def _sync_now(target_config: DeploymentConfig, url: str) -> None:
+            target_app_name = target_config.app_name or legacy_app_name(target_config.backend)
             live_rows, prune_providers = self._visible_rows_and_prune_scope()
             self._sync_opencode(
                 target_app_name=target_app_name,
                 target_url=url,
-                target_config=config,
+                target_config=target_config,
                 current_rows=live_rows,
                 prune_providers=prune_providers,
                 monitor=monitor,
@@ -1431,8 +1450,8 @@ class TuiApp(App):
                 # Publication is single-sourced here: after deploy when no
                 # warmup follows, and after warmup with the verified URL.
                 # Pre-certification credentials persist via on_credentials.
-                _emit_connection_summary(url)
-                _sync_now(url)
+                _emit_connection_summary(saved, url)
+                _sync_now(saved, url)
 
         from ..core.deployment_preflight import lifecycle_attempts_for_configs
 
@@ -1498,7 +1517,11 @@ class TuiApp(App):
         _dispatch_event(monitor, OperationCompleteEvent(
             operation=OperationType.DEPLOY,
             success=result.succeeded,
-            exit_code=(last_outcome.failure_exit_code or 0) if last_outcome else 0,
+            exit_code=(
+                0
+                if result.succeeded
+                else ((last_outcome.failure_exit_code or 1) if last_outcome else 1)
+            ),
             detail="" if result.succeeded else (
                 last_outcome.failure_detail if last_outcome and last_outcome.failure_detail else result.outcome
             ),

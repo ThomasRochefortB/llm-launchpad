@@ -297,6 +297,75 @@ class LifecycleParityTests(unittest.TestCase):
             result.attempts[0].disposition, AttemptDisposition.CANCELLED
         )
 
+    def test_confirmed_warmup_cleanup_emits_stop_completion_and_reports_stopped(self) -> None:
+        endpoint = EndpointInfo(
+            name="llamacpp-test", app_id="ap-1", web_url="https://example.modal.run"
+        )
+        orch = MagicMock()
+        orch.deploy.return_value = [
+            OperationCompleteEvent(operation=OperationType.DEPLOY, success=True, data=endpoint)
+        ]
+        orch.warmup.return_value = [
+            OperationCompleteEvent(
+                operation=OperationType.WARMUP,
+                success=False,
+                exit_code=1,
+                detail="Timed out after 1800s (Waiting for GPU scheduling (GPU_RTX_PRO_6000)).",
+            )
+        ]
+        orch.stop_app.return_value = [
+            OperationCompleteEvent(operation=OperationType.STOP, success=True, detail="Stopped app.")
+        ]
+        events: list[object] = []
+        result = run_lifecycle(
+            orch,
+            [LifecycleAttempt(config=_modal_config())],
+            callbacks=LifecycleCallbacks(on_event=events.append),
+        )
+        self.assertFalse(result.succeeded)
+        self.assertIn("Failed — resource stopped.", result.outcome)
+        self.assertIn("Waiting for GPU scheduling (GPU_RTX_PRO_6000)", result.outcome)
+        stop_events = [
+            event
+            for event in events
+            if isinstance(event, OperationCompleteEvent) and event.operation == OperationType.STOP
+        ]
+        self.assertEqual(len(stop_events), 1)
+        self.assertTrue(stop_events[0].success)
+
+    def test_failed_warmup_cleanup_emits_failed_stop_completion(self) -> None:
+        endpoint = EndpointInfo(
+            name="llamacpp-test", app_id="ap-1", web_url="https://example.modal.run"
+        )
+        orch = MagicMock()
+        orch.deploy.return_value = [
+            OperationCompleteEvent(operation=OperationType.DEPLOY, success=True, data=endpoint)
+        ]
+        orch.warmup.return_value = [
+            OperationCompleteEvent(
+                operation=OperationType.WARMUP, success=False, exit_code=1, detail="Timed out."
+            )
+        ]
+        orch.stop_app.return_value = [
+            OperationCompleteEvent(operation=OperationType.STOP, success=False, detail="stop failed")
+        ]
+        events: list[object] = []
+        result = run_lifecycle(
+            orch,
+            [LifecycleAttempt(config=_modal_config())],
+            callbacks=LifecycleCallbacks(on_event=events.append),
+        )
+        self.assertFalse(result.succeeded)
+        self.assertIn("Failed — check resource in Manage.", result.outcome)
+        stop_events = [
+            event
+            for event in events
+            if isinstance(event, OperationCompleteEvent) and event.operation == OperationType.STOP
+        ]
+        self.assertEqual(len(stop_events), 1)
+        self.assertFalse(stop_events[0].success)
+        self.assertEqual(stop_events[0].exit_code, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -675,6 +675,8 @@ class DeployLogSummarizer:
     def _map_llamacpp_line(self, text: str) -> str | None:
         if "dflash requires ctx_other to be set (this warning is normal during memory fitting)" in text:
             return "Warning: Draft context unavailable during memory fitting"
+        if "cache hit: using existing GGUF entries" in text:
+            return "Model cached"
         if "cache hit:" in text:
             return "Loading cached model"
         if "cache miss" in text or "acquired download lease" in text:
