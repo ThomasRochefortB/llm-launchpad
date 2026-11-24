@@ -175,7 +175,7 @@ class MonitorScreen(CopyEnabledScreen):
         if (
             self._done
             and action in {"page_up_log", "page_down_log", "resume_follow", "clear_log"}
-            and (not self.has_class("connection-ready") or self.has_class("logs-collapsed"))
+            and self.has_class("logs-collapsed")
         ):
             return False
         # Paging a log that fits on screen, or following one already followed,
