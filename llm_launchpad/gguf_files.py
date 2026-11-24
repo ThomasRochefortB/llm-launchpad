@@ -12,6 +12,15 @@ def is_dspark_gguf(filename: str) -> bool:
     return name.endswith(".gguf") and "dspark" in name
 
 
+def is_engram_table_file(filename: str) -> bool:
+    """Identify a standalone external Engram (--ple) GGUF table."""
+    lowered = filename.strip().casefold()
+    if not lowered.endswith((".gguf_file", ".gguf")):
+        return False
+    parts = lowered.split("/")
+    return "engram" in parts[:-1] or "engram" in parts[-1]
+
+
 def is_target_gguf(filename: str) -> bool:
     """Identify serving weights, excluding known GGUF add-ons."""
     lowered = filename.casefold()

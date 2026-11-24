@@ -38,6 +38,7 @@ class EndpointUrlResolver:
     def __init__(self) -> None:
         self._url = ""
         self._priority = -1
+        self._awaiting_function_url = False
 
     @property
     def url(self) -> str:
@@ -51,24 +52,30 @@ class EndpointUrlResolver:
         if isinstance(event, LogEvent):
             self._observe_line(event.line or "")
         elif isinstance(event, EndpointAvailableEvent):
+            self._awaiting_function_url = False
             self._offer(getattr(event.endpoint, "web_url", "") or "", _PRIORITY_EVENT)
         elif isinstance(event, OperationCompleteEvent):
+            self._awaiting_function_url = False
             self._offer(getattr(event.data, "web_url", "") or "", _PRIORITY_EVENT)
 
     def _observe_line(self, line: str) -> None:
         from .backend import ModalBackend
 
+        lowered = line.lower()
+        announced_here = "created web function" in lowered or "created function " in lowered
         found = ModalBackend.extract_modal_web_url(line)
         if not found:
+            self._awaiting_function_url = announced_here
             return
-        if "Created web function" in line:
+        if announced_here or self._awaiting_function_url:
             priority = (
                 _PRIORITY_ANNOUNCED_DEV
-                if found.endswith("-dev.modal.run")
+                if ModalBackend.is_modal_dev_url(found)
                 else _PRIORITY_ANNOUNCED
             )
         else:
             priority = _PRIORITY_INCIDENTAL
+        self._awaiting_function_url = False
         self._offer(found, priority)
 
     def _offer(self, url: str, priority: int) -> None:

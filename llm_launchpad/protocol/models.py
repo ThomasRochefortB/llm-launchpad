@@ -158,6 +158,17 @@ class DSparkDraft:
     size_bytes: int
 
 
+@dataclass(frozen=True)
+class EngramTable:
+    """A revision-pinned external per-layer embedding (--ple) GGUF table."""
+
+    repo_id: str
+    revision: str
+    filename: str
+    size_bytes: int
+    replaced_shard: str | None = None
+
+
 @dataclass
 class VisionCapabilities:
     """Model evidence and effective deployment image input state."""
@@ -538,6 +549,7 @@ class DeploymentConfig:
     dspark_repo: str | None = None
     dspark_file: str | None = None
     dspark_draft: DSparkDraft | None = None
+    engram_table: EngramTable | None = None
     serving_requirements: ServingRequirements | None = None
     runtime_tuning: RuntimeTuning | None = None
     placement_assessment: PlacementAssessment | None = None

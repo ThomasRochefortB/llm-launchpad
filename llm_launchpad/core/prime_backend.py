@@ -26,7 +26,7 @@ from .diagnostics import log_exception
 from .naming import infer_instance_from_app_name
 from .prime_auth import PrimeConfig, load_prime_config
 from .provider_options import prime_provider_options
-from .serving_runtime import projector_setup, vllm_serve_args
+from .serving_runtime import engram_setup, projector_setup, vllm_serve_args
 from .runtime_support import load_llamacpp_support_manifest, llamacpp_build_recipe, llamacpp_cuda_architecture
 
 
@@ -34,6 +34,12 @@ def _prime_projector_setup(config: DeploymentConfig) -> tuple[str, str]:
     """Stage the exact projector atomically in the persistent llama cache."""
     root = "/data/llama.cpp" if prime_provider_options(config).disk_id else "/root/.cache/llama.cpp"
     return projector_setup(config, root=root)
+
+
+def _prime_engram_setup(config: DeploymentConfig) -> tuple[str, str]:
+    """Stage the exact external Engram (--ple) table in the persistent llama cache."""
+    root = "/data/llama.cpp" if prime_provider_options(config).disk_id else "/root/.cache/llama.cpp"
+    return engram_setup(config, root=root)
 
 
 def _runtime_catalog() -> dict[str, Any]:
@@ -1547,12 +1553,18 @@ class PrimeBackend:
             # llama.cpp resolves LLAMA_CACHE first; stage through hf-xet into
             # the same cache the server lists so --hf-file pins the download.
             stage_root = "/data/llama.cpp" if options.disk_id else "/root/.cache/llama.cpp"
+            excluded_shards = (
+                [config.engram_table.replaced_shard]
+                if config.engram_table is not None and config.engram_table.replaced_shard
+                else None
+            )
             stage_setup, hf_file_flag = gguf_stage_command(
                 repo_id=repo,
                 revision=None,
                 quant=quant,
                 dest_dir=f"{stage_root}/staged",
                 cache_dir=f"{stage_root}/staged/hf-hub",
+                exclude_files=excluded_shards,
             )
             llama_args = [
                 "/app/llama-server",
@@ -1626,6 +1638,11 @@ class PrimeBackend:
                     f"{attestation_marker}"
                 )
             projector_setup = stage_setup
+            if config.engram_table is not None:
+                engram_prelude, engram_path = _prime_engram_setup(config)
+                projector_setup += engram_prelude
+                llama_args.extend(["--ple", engram_path])
+                fit_args.extend(["--ple", engram_path])
             if config.vision is not None:
                 if config.vision.enabled:
                     vision_setup, projector_path = _prime_projector_setup(config)

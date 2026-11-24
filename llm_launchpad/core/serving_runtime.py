@@ -84,6 +84,7 @@ def gguf_stage_command(
     quant: str,
     dest_dir: str,
     cache_dir: str | None = None,
+    exclude_files: Sequence[str] | None = None,
 ) -> tuple[str, tuple[str, ...]]:
     """Build the shell prelude that stages exact GGUF weights with hf-xet.
 
@@ -120,6 +121,13 @@ def gguf_stage_command(
             f"export LLM_LAUNCHPAD_GGUF_REVISION={shlex.quote(str(revision).strip())}; "
             if (revision or "").strip()
             else "export LLM_LAUNCHPAD_GGUF_REVISION=; "
+        )
+        + (
+            "export LLM_LAUNCHPAD_GGUF_EXCLUDE="
+            + shlex.quote("\n".join(str(item).strip() for item in (exclude_files or ()) if str(item).strip()))
+            + "; "
+            if exclude_files
+            else "export LLM_LAUNCHPAD_GGUF_EXCLUDE=; "
         )
         + "export HF_HUB_CACHE=\"$LLM_LAUNCHPAD_GGUF_CACHE\"; "
         # Separated like every other export here. Joined on a bare space these
@@ -195,10 +203,14 @@ except ImportError:
 
 info = HfApi().model_info(repo_id, revision=revision, files_metadata=True, timeout=30)
 folded = quant.casefold()
+import os
+excluded = {line.strip().casefold() for line in os.environ.get("LLM_LAUNCHPAD_GGUF_EXCLUDE", "").splitlines() if line.strip()}
 names = [
     s.rfilename for s in (info.siblings or [])
     if s.rfilename.lower().endswith(".gguf")
     and folded in s.rfilename.casefold()
+    and s.rfilename.casefold() not in excluded
+    and s.rfilename.rsplit("/", 1)[-1].casefold() not in excluded
     and all(m not in s.rfilename.casefold() for m in ("mmproj", "imatrix", "draft", "eagle"))
 ]
 if not names:
@@ -332,6 +344,38 @@ def projector_setup(config: DeploymentConfig, *, root: str) -> tuple[str, str]:
     )
     setup = (
         f"mkdir -p {shlex.quote(root + '/projectors')} || exit $?; "
+        f"if ! {size_check}; then "
+        f"curl --fail --location --retry 3 --connect-timeout 20 "
+        '${HF_TOKEN:+--header "Authorization: Bearer $HF_TOKEN"} '
+        f'{shlex.quote(url)} -o {quoted}.tmp '
+        f"&& mv {quoted}.tmp {quoted} || exit $?; fi; "
+        f"{size_check} || exit 1; "
+        f'[ "$(head -c 4 {quoted})" = GGUF ] || exit 1; '
+    )
+    return setup, path
+
+
+def engram_setup(config: DeploymentConfig, *, root: str) -> tuple[str, str]:
+    """Stage a revision-pinned external Engram (--ple) GGUF atomically under ``root``."""
+
+    from huggingface_hub import hf_hub_url
+
+    artifact = config.engram_table
+    if artifact is None:
+        raise ValueError("External Engram table requested without a resolved artifact.")
+    identity = hashlib.sha256(
+        f"{artifact.repo_id}@{artifact.revision}/{artifact.filename}".encode()
+    ).hexdigest()
+    path = f"{root}/engrams/{identity}.gguf_file"
+    quoted = shlex.quote(path)
+    url = hf_hub_url(artifact.repo_id, artifact.filename, revision=artifact.revision)
+    size_check = (
+        f'[ "$(stat -c %s {quoted})" = {artifact.size_bytes} ]'
+        if artifact.size_bytes
+        else f"[ -s {quoted} ]"
+    )
+    setup = (
+        f"mkdir -p {shlex.quote(root + '/engrams')} || exit $?; "
         f"if ! {size_check}; then "
         f"curl --fail --location --retry 3 --connect-timeout 20 "
         '${HF_TOKEN:+--header "Authorization: Bearer $HF_TOKEN"} '
