@@ -95,7 +95,15 @@ class CanaryTests(unittest.TestCase):
             self.assertIn("--idle-shutdown", args)
         self.assertIn("--max-hourly-cost", vast)
         self.assertIn("--do-warmup", modal)
+        self.assertIn("--tail-logs", modal)
+        self.assertIn("--no-tail-logs", vast)
         self.assertNotIn("--idle-shutdown", modal)  # Modal scales to zero
+
+    def test_modal_canary_supports_multi_gpu_power_of_two_and_rejects_non_power(self) -> None:
+        modal_two = canary._deploy_args("modal", "llp-canary-modal-x", 0.25, modal_gpu_count=2)
+        self.assertEqual(modal_two[modal_two.index("--gpu-count") + 1], "2")
+        with self.assertRaisesRegex(ValueError, "Unsupported Modal T4 GPU count"):
+            canary._deploy_args("modal", "llp-canary-modal-x", 0.25, modal_gpu_count=3)
 
     def test_report_lines_are_redacted(self) -> None:
         with patch.dict(os.environ, {"PRIME_API_KEY": "pk-live-secret-123"}):
