@@ -133,6 +133,11 @@ class SettingsScreen(CopyEnabledScreen):
                             default=settings.confirm_quit,
                         )
                         yield ToggleField(
+                            "Notify when deployments finish",
+                            "notify-on-complete",
+                            default=settings.notify_on_complete,
+                        )
+                        yield ToggleField(
                             "Prime pods self-stop (stores API key on pod)",
                             "prime-self-terminate",
                             default=settings.prime_self_terminate,
@@ -256,6 +261,7 @@ class SettingsScreen(CopyEnabledScreen):
             scaledown_window=scaledown,
             rental_idle_shutdown=rental_idle,
             prime_self_terminate=self.query_one("#prime-self-terminate", Switch).value,
+            notify_on_complete=self.query_one("#notify-on-complete", Switch).value,
             tui_theme=normalize_tui_theme(
                 self.query_one("#tui-theme", Select).value
             ),
@@ -279,8 +285,9 @@ class SettingsScreen(CopyEnabledScreen):
             )
 
     def _apply_behavior_settings(self, settings: LaunchpadSettings) -> None:
-        """Apply quit-confirmation preferences to the running app."""
+        """Apply quit-confirmation and notification preferences to the running app."""
         self.app._confirm_quit = settings.confirm_quit
+        self.app._notify_on_complete = settings.notify_on_complete
 
     def action_focus_next_control(self) -> None:
         move_focus_with_arrows(self, 1)

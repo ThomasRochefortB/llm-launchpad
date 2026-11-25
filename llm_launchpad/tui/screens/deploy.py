@@ -740,6 +740,501 @@ class _CostPreviewMixin(_DeployFormFeedbackMixin):
         )
 
 
+class _BaseDeployScreen(
+    _OptionListArrowNavigationMixin, _CostPreviewMixin, _DeployFormFeedbackMixin, CopyEnabledScreen
+):
+    """Shared form state, provider/offer pickers, model browser, and submit helpers."""
+
+    BACKEND: BackendType
+    RANK_MODE_ID: str
+    MODEL_LIST_ID: str
+    MODEL_STATUS_ID: str
+    PROVIDER_ID: str
+    GPU_TYPE_ID: str
+    GPU_SUBTITLE_ID: str
+    COST_PREVIEW_ID: str
+    PRIME_OFFER_ID: str
+    PRIME_STATUS_ID: str
+    PRIME_DISK_ID: str
+    PRIME_INSECURE_HTTP_ID: str
+    PRIME_KEEP_FAILED_ID: str
+    PRIME_AUTO_DISK_ID: str
+    VAST_OFFER_ID: str
+    VAST_STATUS_ID: str
+    VAST_DISK_ID: str
+    INSTANCE_NAME_ID: str
+    APP_NAME_ID: str
+    APP_PREVIEW_ID: str
+    TOGGLE_ADVANCED_BTN_ID: str
+    DEPLOY_BTN_ID: str
+    ADVANCED_MARKER_ID: str
+    WORKER_PREFIX: str
+    GPU_WORKER_NAME: str
+
+    def _init_shared_deploy_state(self) -> None:
+        self._rank_mode = "cached"
+        self._ranked_models: list[ModelCandidate] = []
+        self._cached_models: list[ModelCandidate] = []
+        self._has_cached_snapshot = False
+        self._selected_gpu_type = DEFAULT_GPU_TYPE
+        self._last_modal_gpu_type = DEFAULT_GPU_TYPE
+        self._modal_gpu_values: set[str] = {DEFAULT_GPU_TYPE}
+        self._provider = ComputeProvider.MODAL
+        self._prime_offers: dict[str, ComputeOffer] = {}
+        self._selected_prime_offer_id: str | None = None
+        self._vast_offers: dict[str, VastOffer] = {}
+        self._selected_vast_offer_id: str | None = None
+        self._gpu_price_by_value: dict[str, float] = {}
+        self._rank_mode_touched = False
+        self._updating_rank_mode = False
+        self._focus_model_list_when_loaded = False
+
+    def _required_vram_gb(self) -> float | None:
+        return None
+
+    def _fetch_ranked_models(self, mode: str) -> None:
+        raise NotImplementedError
+
+    def _show_cached_models(self) -> None:
+        raise NotImplementedError
+
+    def _refresh_app_preview(self) -> None:
+        raise NotImplementedError
+
+    def _sync_prime_visibility(self) -> None:
+        raise NotImplementedError
+
+    def _do_deploy(self) -> None:
+        raise NotImplementedError
+
+    def _on_marketplace_offer_bound(self, gpu_count: int) -> None:
+        return
+
+    def _switch_rank_mode(self, selected_mode: str | None) -> None:
+        """Switch the model-suggestion source, reloading when it changes."""
+        if selected_mode is None:
+            return
+        self._rank_mode_touched = True
+        if selected_mode != self._rank_mode:
+            self._rank_mode = selected_mode
+            self._ranked_models = []
+            self._set_model_status("[dim]Loading model suggestions...[/dim]")
+            _set_option_list(self.query_one(f"#{self.MODEL_LIST_ID}", OptionList), [])
+            if self._rank_mode == "cached":
+                self._set_model_status("[dim]Loading cached models from storage...[/dim]")
+                if self._has_cached_snapshot:
+                    self._show_cached_models()
+                self._refresh_cached_models_from_storage()
+            else:
+                self._fetch_ranked_models(self._rank_mode)
+        model_list = self.query_one(f"#{self.MODEL_LIST_ID}", OptionList)
+        self._focus_model_list_when_loaded = model_list.option_count == 0
+        _advance_deploy_focus(self, self.NAVIGATION_ORDER)
+
+    def _handle_shared_select_changed(self, event: Select.Changed) -> bool:
+        """Handle rank mode, provider, marketplace offer, and GPU dropdowns."""
+        select_id = event.select.id
+        if select_id == self.RANK_MODE_ID:
+            if not isinstance(event.value, str) or getattr(self, "_updating_rank_mode", False):
+                return True
+            if event.value == getattr(self, "_rank_mode", None) and not getattr(
+                self, "_rank_mode_initialized", False
+            ):
+                self._rank_mode_initialized = True
+                return True
+            self._rank_mode_initialized = True
+            self._switch_rank_mode(self._resolve_rank_mode(event.value))
+            return True
+
+        if select_id == self.PROVIDER_ID:
+            if not isinstance(event.value, str):
+                return True
+            self._provider = ComputeProvider(event.value)
+            self._sync_prime_visibility()
+            if self._provider == ComputeProvider.PRIME and not self._prime_offers:
+                self._refresh_prime_offers()
+            elif self._provider == ComputeProvider.VAST:
+                if self._vast_offers:
+                    self._refresh_vast_offer_options()
+                else:
+                    self._refresh_vast_offers()
+            elif self._provider == ComputeProvider.MODAL:
+                self._selected_gpu_type = self._last_modal_gpu_type
+                self._selected_prime_offer_id = None
+                self._selected_vast_offer_id = None
+                self._refresh_gpu_types()
+            self._refresh_app_preview()
+            self._update_cost_preview(self.COST_PREVIEW_ID)
+            return True
+
+        if select_id == self.VAST_OFFER_ID:
+            if not isinstance(event.value, str):
+                return True
+            self._selected_vast_offer_id = event.value
+            offer = self._vast_offers.get(event.value)
+            if offer is not None:
+                self._bind_offer_gpu_shape(offer.gpu_type, offer.gpu_count)
+            self._update_cost_preview(self.COST_PREVIEW_ID)
+            return True
+
+        if select_id == self.PRIME_OFFER_ID:
+            if not isinstance(event.value, str):
+                return True
+            self._selected_prime_offer_id = event.value
+            offer = self._prime_offers.get(event.value)
+            if offer is not None:
+                self._bind_offer_gpu_shape(offer.gpu_type, offer.gpu_count)
+            self._update_cost_preview(self.COST_PREVIEW_ID)
+            return True
+
+        if select_id == self.GPU_TYPE_ID:
+            if isinstance(event.value, str) and event.value.strip():
+                self._selected_gpu_type = normalize_gpu_type(event.value)
+                if self._selected_gpu_type in self._modal_gpu_values:
+                    self._last_modal_gpu_type = self._selected_gpu_type
+            self._update_cost_preview(self.COST_PREVIEW_ID)
+            return True
+
+        return False
+
+    def _bind_offer_gpu_shape(self, gpu_type: str, gpu_count: int) -> None:
+        self._selected_gpu_type = gpu_type
+        gpu_type_select = self.query_one(f"#{self.GPU_TYPE_ID}", Select)
+        gpu_type_select.set_options([(gpu_type, gpu_type)])
+        gpu_type_select.value = gpu_type
+        self.query_one(f"#{self.GPU_COUNT_FIELD_ID}", Input).value = str(gpu_count)
+        self._on_marketplace_offer_bound(gpu_count)
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        super().on_select_changed(event)
+        self._handle_shared_select_changed(event)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == self.TOGGLE_ADVANCED_BTN_ID:
+            for widget in self.query(f".{self.ADVANCED_CLASS}"):
+                widget.toggle_class("hidden")
+            self._sync_prime_visibility()
+        elif event.button.id == self.DEPLOY_BTN_ID:
+            self._do_deploy()
+
+    def _sync_provider_section_visibility(
+        self,
+        *,
+        provider_classes: tuple[tuple[str, ComputeProvider], ...],
+    ) -> None:
+        advanced_visible = not self.query_one(f"#{self.ADVANCED_MARKER_ID}").has_class("hidden")
+        for provider_class, provider in provider_classes:
+            for widget in self.query(provider_class):
+                hide = self._provider != provider
+                if widget.has_class(self.ADVANCED_CLASS) and not advanced_visible:
+                    hide = True
+                widget.set_class(hide, "hidden")
+
+    def _refresh_prime_offers(self) -> None:
+        self.query_one(f"#{self.PRIME_STATUS_ID}", Static).update(
+            "[dim]Loading Prime offers...[/dim]"
+        )
+        self.run_worker(
+            self._run_fetch_prime_offers,
+            name=f"{self.WORKER_PREFIX}-fetch-prime-offers",
+            thread=True,
+        )
+
+    def _run_fetch_prime_offers(self) -> None:
+        try:
+            offers = PrimeBackend().list_offers()
+        except Exception as exc:
+            self.post_message(PrimeOffersFailed(str(exc)))
+            return
+        self.post_message(PrimeOffersLoaded(offers))
+
+    def on_prime_offers_loaded(self, message: PrimeOffersLoaded) -> None:
+        self._prime_offers = {offer.id: offer for offer in message.offers}
+        self._refresh_prime_offer_options()
+
+    def _refresh_prime_offer_options(self) -> None:
+        required_vram_gb = self._required_vram_gb()
+        offers = _compatible_prime_offers(
+            list(self._prime_offers.values()),
+            required_vram_gb,
+            self.BACKEND,
+        )
+        options = _prime_offer_options(offers)
+        selector = self.query_one(f"#{self.PRIME_OFFER_ID}", Select)
+        selector.set_options(options)
+        if options:
+            self._selected_prime_offer_id = options[0][1]
+            selector.value = options[0][1]
+        else:
+            self._selected_prime_offer_id = None
+        self.query_one(f"#{self.PRIME_STATUS_ID}", Static).update(
+            _prime_offer_status(len(options), required_vram_gb, self.BACKEND)
+        )
+
+    def on_prime_offers_failed(self, message: PrimeOffersFailed) -> None:
+        self.query_one(f"#{self.PRIME_STATUS_ID}", Static).update(
+            f"[$error]Could not load Prime offers:[/$error] {escape(message.error)}"
+        )
+
+    def _refresh_vast_offers(self) -> None:
+        self.query_one(f"#{self.VAST_STATUS_ID}", Static).update(
+            "[dim]Loading Vast.ai rentals...[/dim]"
+        )
+        self.run_worker(
+            self._run_fetch_vast_offers,
+            name=f"{self.WORKER_PREFIX}-fetch-vast-offers",
+            thread=True,
+        )
+
+    def _run_fetch_vast_offers(self) -> None:
+        try:
+            offers = VastBackend().list_offers(
+                VastOfferQuery(gpu_count=None, disk_gb=self._vast_disk_gb())
+            )
+        except Exception as exc:
+            self.post_message(VastOffersFailed(str(exc)))
+            return
+        self.post_message(VastOffersLoaded(offers))
+
+    def on_vast_offers_loaded(self, message: VastOffersLoaded) -> None:
+        self._vast_offers = {offer.id: offer for offer in message.offers}
+        self._refresh_vast_offer_options()
+
+    def on_vast_offers_failed(self, message: VastOffersFailed) -> None:
+        self.query_one(f"#{self.VAST_STATUS_ID}", Static).update(
+            f"[$error]Could not load Vast.ai rentals:[/$error] {escape(message.error)}"
+        )
+
+    def _vast_disk_gb(self) -> int:
+        return (
+            positive_int(self.query_one(f"#{self.VAST_DISK_ID}", Input).value)
+            or self._default_vast_disk_gb()
+        )
+
+    def _refresh_vast_offer_options(self) -> None:
+        required_vram_gb = self._required_vram_gb()
+        offers = _compatible_vast_offers(list(self._vast_offers.values()), required_vram_gb)
+        options = _vast_offer_options(offers)
+        selector = self.query_one(f"#{self.VAST_OFFER_ID}", Select)
+        selector.set_options(options)
+        if options:
+            self._selected_vast_offer_id = options[0][1]
+            selector.value = options[0][1]
+        else:
+            self._selected_vast_offer_id = None
+        self.query_one(f"#{self.VAST_STATUS_ID}", Static).update(
+            _vast_offer_status(len(options), required_vram_gb)
+        )
+
+    def _refresh_gpu_types(self) -> None:
+        self.run_worker(
+            lambda: self._run_fetch_gpu_types(),
+            name=self.GPU_WORKER_NAME,
+            thread=True,
+        )
+
+    def _run_fetch_gpu_types(self) -> None:
+        poster = getattr(self, "post_message", None)
+        if poster is None:
+            return
+        try:
+            gpu_types = fetch_modal_gpu_catalog()
+        except Exception as exc:
+            poster(GpuTypesFailed(error=str(exc)))
+            return
+        poster(GpuTypesLoaded(gpu_types=gpu_types))
+
+    def on_gpu_types_loaded(self, message: GpuTypesLoaded) -> None:
+        dropdown = self.query_one(f"#{self.GPU_TYPE_ID}", Select)
+        options = build_gpu_type_options(message.gpu_types)
+        option_values = [value for _, value in options]
+        self._modal_gpu_values = set(option_values)
+        if self._selected_gpu_type and self._selected_gpu_type not in option_values:
+            options.insert(0, (self._selected_gpu_type, self._selected_gpu_type))
+            option_values.insert(0, self._selected_gpu_type)
+        if not options:
+            return
+        dropdown.set_options(options)
+        selected = (
+            self._selected_gpu_type
+            if self._selected_gpu_type in option_values
+            else option_values[0]
+        )
+        dropdown.value = selected
+        self._selected_gpu_type = selected
+        self._gpu_price_by_value = {
+            spec.value.strip(): spec.price_per_hour_usd
+            for spec in message.gpu_types
+            if spec.price_per_hour_usd is not None
+        }
+        self._update_cost_preview(self.COST_PREVIEW_ID)
+
+    def on_gpu_types_failed(self, _: GpuTypesFailed) -> None:
+        return
+
+    def on_storage_failed(self, message: StorageFailed) -> None:
+        if self._rank_mode != "cached":
+            return
+        self._ranked_models = []
+        _set_option_list(self.query_one(f"#{self.MODEL_LIST_ID}", OptionList), [])
+        self._set_model_status(
+            f"[$warning]Could not load cached models:[/$warning] {escape(message.error)}"
+        )
+
+    def _focus_model_list_if_pending(self) -> None:
+        """Give the model picker focus once a requested ranking has loaded."""
+        if not self._focus_model_list_when_loaded:
+            return
+        model_list = self.query_one(f"#{self.MODEL_LIST_ID}", OptionList)
+        if model_list.option_count == 0:
+            return
+        self._focus_model_list_when_loaded = False
+        model_list.focus()
+        if model_list.highlighted is None:
+            model_list.highlighted = 0
+
+    def _set_model_status(self, text: str) -> None:
+        status = self.query_one(f"#{self.MODEL_STATUS_ID}", Static)
+        status.update(text)
+        status.set_class(not text, "hidden")
+
+    def _resolve_rank_mode(self, option_id: str) -> str | None:
+        cleaned = (option_id or "").strip().lower()
+        if cleaned in {"cached", "downloads", "trending"}:
+            return cleaned
+        return None
+
+    def _refresh_cached_models_from_storage(self, force: bool = False) -> None:
+        refresher = getattr(self.app, "begin_storage_refresh", None)
+        if callable(refresher):
+            refresher(self, force=force)
+
+    def _fall_back_to_downloads_ranking(self) -> bool:
+        """Switch an empty default "Cached in storage" view to "Most downloaded"."""
+        if self._rank_mode_touched or self._rank_mode != "cached" or not self._has_cached_snapshot:
+            return False
+        self._rank_mode = "downloads"
+        self._updating_rank_mode = True
+        try:
+            try:
+                self.query_one(f"#{self.RANK_MODE_ID}", Select).value = "downloads"
+            except Exception:
+                pass
+        finally:
+            self._updating_rank_mode = False
+        self._set_model_status("[dim]Nothing cached yet. Loading popular models...[/dim]")
+        self._fetch_ranked_models("downloads")
+        return True
+
+    def _highlighted_ranked_model(self) -> ModelCandidate | None:
+        highlighted = highlighted_option(self.query_one(f"#{self.MODEL_LIST_ID}", OptionList))
+        option_id = highlighted.id if highlighted is not None else ""
+        return _model_from_option_id(option_id or "", self._ranked_models)
+
+    def _apply_provider_and_gpu(self, config: DeploymentConfig) -> bool:
+        """Validate GPU count/type and bind Prime or Vast offer options onto ``config``."""
+        gpu_type = normalize_gpu_type(self._selected_gpu_type or "")
+        if not gpu_type:
+            self._reject("GPU type is required.", f"#{self.GPU_TYPE_ID}")
+            return False
+        gpu_count = parse_gpu_count(
+            self.query_one(f"#{self.GPU_COUNT_FIELD_ID}", Input).value, default=0
+        )
+        if gpu_count <= 0:
+            self._reject("GPU count must be an integer >= 1.", f"#{self.GPU_COUNT_FIELD_ID}")
+            return False
+        config.gpu_type = gpu_type
+        config.gpu_count = gpu_count
+        if self._provider == ComputeProvider.PRIME:
+            offer = self._prime_offers.get(self._selected_prime_offer_id or "")
+            if offer is None:
+                self._reject("Select a live Prime GPU offer.", f"#{self.PRIME_OFFER_ID}")
+                return False
+            if config.backend == BackendType.LLAMACPP and config.revision:
+                self._reject(
+                    "Prime llama.cpp currently supports only the default HF revision.",
+                    "#revision",
+                )
+                return False
+            config.gpu_type = offer.gpu_type
+            config.gpu_count = offer.gpu_count
+            config.provider_options = PrimeProviderOptions(
+                offer_id=offer.id,
+                disk_id=self.query_one(f"#{self.PRIME_DISK_ID}", Input).value.strip() or None,
+                allow_insecure_http=self.query_one(
+                    f"#{self.PRIME_INSECURE_HTTP_ID}", Switch
+                ).value,
+                keep_failed_resource=self.query_one(
+                    f"#{self.PRIME_KEEP_FAILED_ID}", Switch
+                ).value,
+                auto_disk=self.query_one(f"#{self.PRIME_AUTO_DISK_ID}", Switch).value,
+            )
+        elif self._provider == ComputeProvider.VAST:
+            vast_options = self._build_vast_provider_options(f"#{self.VAST_DISK_ID}")
+            if vast_options is None:
+                return False
+            config.provider_options = vast_options
+            vast_offer = self._vast_offers[vast_options.offer_id]
+            config.gpu_type = vast_offer.gpu_type
+            config.gpu_count = vast_offer.gpu_count
+        return True
+
+    def _apply_deployment_names(self, config: DeploymentConfig, model_hint: str | None) -> None:
+        instance_override = self.query_one(f"#{self.INSTANCE_NAME_ID}", Input).value.strip()
+        app_override = self.query_one(f"#{self.APP_NAME_ID}", Input).value.strip()
+        if app_override:
+            config.app_name = app_override
+            config.instance_name = slugify_instance_name(instance_override or app_override)
+        elif instance_override:
+            config.instance_name = slugify_instance_name(instance_override)
+            config.app_name = build_deployment_name(
+                config.provider, config.backend, config.instance_name
+            )
+        else:
+            config.instance_name = auto_instance_name_for_backend(config.backend, model_hint)
+            config.app_name = build_deployment_name(
+                config.provider, config.backend, config.instance_name
+            )
+
+    def _update_app_preview_for(self, model_hint: str) -> None:
+        instance_override = self.query_one(f"#{self.INSTANCE_NAME_ID}", Input).value.strip()
+        app_override = self.query_one(f"#{self.APP_NAME_ID}", Input).value.strip()
+        if app_override:
+            preview = app_override
+        elif instance_override:
+            preview = build_deployment_name(self._provider, self.BACKEND, instance_override)
+        else:
+            preview = build_deployment_name(
+                self._provider,
+                self.BACKEND,
+                auto_instance_name_for_backend(self.BACKEND, model_hint),
+            )
+        self.query_one(f"#{self.APP_PREVIEW_ID}", Static).update(
+            f"[dim]App name preview: {escape(preview)}[/dim]"
+        )
+
+    def _finalize_and_submit_deploy(self, config: DeploymentConfig) -> None:
+        try:
+            self.query_one(VisionOptions).apply(config)
+        except ValueError as exc:
+            self._reject(str(exc))
+            return
+        reason = refuse_deployment(config)
+        if reason:
+            self._reject(reason)
+            return
+        self.app.begin_deploy(config)
+
+    def action_do_deploy(self) -> None:
+        self._do_deploy()
+
+    def action_pop_screen(self) -> None:
+        self.app.pop_screen()
+
+    def action_open_storage(self) -> None:
+        self.app.action_push_storage(self.BACKEND)
+
+
 class BackendSelectScreen(CopyEnabledScreen):
     """Step 1: pick backend (llama.cpp or vLLM)."""
 
@@ -782,13 +1277,37 @@ class BackendSelectScreen(CopyEnabledScreen):
         self.app.pop_screen()
 
 
-class LlamaCppDeployScreen(
-    _OptionListArrowNavigationMixin, _CostPreviewMixin, _DeployFormFeedbackMixin, CopyEnabledScreen
-):
+class LlamaCppDeployScreen(_BaseDeployScreen):
     """llama.cpp deploy form."""
 
+    BACKEND = BackendType.LLAMACPP
     FEEDBACK_ID = "#llama-deploy-feedback"
     ADVANCED_CLASS = "llama-advanced"
+    RANK_MODE_ID = "llama-rank-mode"
+    MODEL_LIST_ID = "llama-model-list"
+    MODEL_STATUS_ID = "llama-model-status"
+    PROVIDER_ID = "provider-llama"
+    GPU_TYPE_ID = "gpu-type-llama"
+    GPU_COUNT_FIELD_ID = "gpu-count-llama"
+    GPU_SUBTITLE_ID = "gpu-config-subtitle-llama"
+    COST_PREVIEW_ID = "llama-cost-preview"
+    PRIME_OFFER_ID = "prime-offer-llama"
+    PRIME_STATUS_ID = "prime-offer-status-llama"
+    PRIME_DISK_ID = "prime-disk-id-llama"
+    PRIME_INSECURE_HTTP_ID = "prime-insecure-http-llama"
+    PRIME_KEEP_FAILED_ID = "prime-keep-failed-llama"
+    PRIME_AUTO_DISK_ID = "prime-auto-disk-llama"
+    VAST_OFFER_ID = "vast-offer-llama"
+    VAST_STATUS_ID = "vast-offer-status-llama"
+    VAST_DISK_ID = "vast-disk-llama"
+    INSTANCE_NAME_ID = "instance-name-llama"
+    APP_NAME_ID = "app-name-llama"
+    APP_PREVIEW_ID = "llama-app-preview"
+    TOGGLE_ADVANCED_BTN_ID = "toggle-advanced-llama"
+    DEPLOY_BTN_ID = "deploy-btn"
+    ADVANCED_MARKER_ID = "warmup"
+    WORKER_PREFIX = "llamacpp"
+    GPU_WORKER_NAME = "llama-fetch-gpu-types"
 
     BINDINGS = [
         Binding("up", "navigate_option_list_up", show=False, priority=True),
@@ -799,7 +1318,6 @@ class LlamaCppDeployScreen(
         Binding("p", "predownload_highlighted", "Pre-download", show=True),
     ]
     _MODEL_LIST_ID = "llama-model-list"
-    GPU_COUNT_FIELD_ID = "gpu-count-llama"
     OPTION_LIST_IDS = ("llama-model-list", "llama-quant-list")
     NAVIGATION_ORDER = (
         "llama-rank-mode",
@@ -1035,11 +1553,8 @@ class LlamaCppDeployScreen(
         yield FittedFooter()
 
     def on_mount(self) -> None:
-        self._rank_mode = "cached"
-        self._ranked_models: list[ModelCandidate] = []
-        self._cached_models: list[ModelCandidate] = []
+        self._init_shared_deploy_state()
         self._cached_repo_to_quants: dict[str, tuple[str, ...]] = {}
-        self._has_cached_snapshot = False
         self._repo_to_quants: dict[str, tuple[str, ...]] = {}
         self._repo_to_quant_vram: dict[str, dict[str, float]] = {}
         self._repo_to_architecture: dict[tuple[str, str], str | None] = {}
@@ -1050,21 +1565,6 @@ class LlamaCppDeployScreen(
         self._quant_lookup_timer: Timer | None = None
         self._updating_quant_input = False
         self._quant_touched = False
-        self._selected_gpu_type = DEFAULT_GPU_TYPE
-        # Binding a Prime offer overwrites the GPU dropdown with that offer's
-        # GPU. Remember the Modal choice so switching back does not leave a
-        # Prime-only GPU name selected for a Modal deploy.
-        self._last_modal_gpu_type = DEFAULT_GPU_TYPE
-        self._modal_gpu_values: set[str] = {DEFAULT_GPU_TYPE}
-        self._provider = ComputeProvider.MODAL
-        self._prime_offers: dict[str, ComputeOffer] = {}
-        self._selected_prime_offer_id: str | None = None
-        self._vast_offers: dict[str, VastOffer] = {}
-        self._selected_vast_offer_id: str | None = None
-        self._gpu_price_by_value: dict[str, float] = {}
-        self._rank_mode_touched = False
-        self._updating_rank_mode = False
-        self._focus_model_list_when_loaded = False
         initial_hidden: list[Widget] = []
         for list_id in ("#llama-model-list", "#llama-quant-list"):
             widget = self.query_one(list_id, OptionList)
@@ -1083,28 +1583,14 @@ class LlamaCppDeployScreen(
         self._refresh_app_preview()
         self._update_cost_preview("llama-cost-preview")
 
+    def _required_vram_gb(self) -> float | None:
+        return self._current_llamacpp_required_vram()
+
+    def _fetch_ranked_models(self, mode: str) -> None:
+        self.app.begin_fetch_llamacpp_models(mode, self)
+
     def _set_rank_mode(self, selected_mode: str | None) -> None:
-        """Switch the model-suggestion source, reloading when it changes."""
-        if selected_mode is None:
-            return
-        self._rank_mode_touched = True
-        if selected_mode != self._rank_mode:
-            self._rank_mode = selected_mode
-            self._ranked_models = []
-            self._set_model_status("[dim]Loading model suggestions...[/dim]")
-            _set_option_list(self.query_one("#llama-model-list", OptionList), [])
-            if self._rank_mode == "cached":
-                self._set_model_status("[dim]Loading cached models from storage...[/dim]")
-                if self._has_cached_snapshot:
-                    self._show_cached_models()
-                self._refresh_cached_models_from_storage()
-            else:
-                self.app.begin_fetch_llamacpp_models(self._rank_mode, self)
-        model_list = self.query_one("#llama-model-list", OptionList)
-        # The picker is hidden until it has rows, so a still-loading list
-        # cannot take focus yet. Hand it over once the rows land.
-        self._focus_model_list_when_loaded = model_list.option_count == 0
-        _advance_deploy_focus(self, self.NAVIGATION_ORDER)
+        self._switch_rank_mode(selected_mode)
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option_list.id == "llama-model-list":
@@ -1125,15 +1611,8 @@ class LlamaCppDeployScreen(
         self._apply_ranked_model_selection(event.option.id or "")
         self._refresh_app_preview()
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "toggle-advanced-llama":
-            for widget in self.query(".llama-advanced"):
-                widget.toggle_class("hidden")
-            self._sync_prime_visibility()
-        elif event.button.id == "deploy-btn":
-            self._do_deploy()
-
     def on_input_changed(self, event: Input.Changed) -> None:
+        super().on_input_changed(event)
         if event.input.id == "quant" and not self._updating_quant_input:
             self._quant_touched = True
         if event.input.id in {"repo-id", "instance-name-llama", "app-name-llama"}:
@@ -1145,90 +1624,14 @@ class LlamaCppDeployScreen(
         if event.input.id == "gpu-count-llama":
             self._update_cost_preview("llama-cost-preview")
 
-    def on_select_changed(self, event: Select.Changed) -> None:
-        if event.select.id == "llama-rank-mode":
-            if not isinstance(event.value, str):
-                return
-            if getattr(self, "_updating_rank_mode", False):
-                return
-            # Select fires Changed for its initial value during mount, which
-            # is not a user choice and must not opt out of the empty-cache
-            # fallback. Mount-time delivery carries the same value on_mount
-            # is about to assign, so a no-op change is the mount echo.
-            if event.value == getattr(self, "_rank_mode", None) and not getattr(
-                self, "_rank_mode_initialized", False
-            ):
-                self._rank_mode_initialized = True
-                return
-            self._rank_mode_initialized = True
-            self._set_rank_mode(self._resolve_rank_mode(event.value))
-            return
-        if event.select.id == "provider-llama":
-            if not isinstance(event.value, str):
-                return
-            self._provider = ComputeProvider(event.value)
-            self._sync_prime_visibility()
-            if self._provider == ComputeProvider.PRIME and not self._prime_offers:
-                self._refresh_prime_offers()
-            elif self._provider == ComputeProvider.VAST:
-                if self._vast_offers:
-                    self._refresh_vast_offer_options()
-                else:
-                    self._refresh_vast_offers()
-            elif self._provider == ComputeProvider.MODAL:
-                self._selected_gpu_type = self._last_modal_gpu_type
-                self._selected_prime_offer_id = None
-                self._selected_vast_offer_id = None
-                self._refresh_gpu_types()
-            self._refresh_app_preview()
-            self._update_cost_preview("llama-cost-preview")
-            return
-        if event.select.id == "vast-offer-llama":
-            if not isinstance(event.value, str):
-                return
-            self._selected_vast_offer_id = event.value
-            offer = self._vast_offers.get(event.value)
-            if offer is not None:
-                self._selected_gpu_type = offer.gpu_type
-                gpu_type_select = self.query_one("#gpu-type-llama", Select)
-                gpu_type_select.set_options([(offer.gpu_type, offer.gpu_type)])
-                gpu_type_select.value = offer.gpu_type
-                self.query_one("#gpu-count-llama", Input).value = str(offer.gpu_count)
-            self._update_cost_preview("llama-cost-preview")
-            return
-        if event.select.id == "prime-offer-llama":
-            if not isinstance(event.value, str):
-                return
-            self._selected_prime_offer_id = event.value
-            offer = self._prime_offers.get(event.value)
-            if offer is not None:
-                self._selected_gpu_type = offer.gpu_type
-                self.query_one("#gpu-type-llama", Select).set_options(
-                    [(offer.gpu_type, offer.gpu_type)]
-                )
-                self.query_one("#gpu-type-llama", Select).value = offer.gpu_type
-                self.query_one("#gpu-count-llama", Input).value = str(offer.gpu_count)
-            self._update_cost_preview("llama-cost-preview")
-            return
-        if event.select.id != "gpu-type-llama":
-            return
-        if isinstance(event.value, str) and event.value.strip():
-            self._selected_gpu_type = normalize_gpu_type(event.value)
-            if self._selected_gpu_type in self._modal_gpu_values:
-                self._last_modal_gpu_type = self._selected_gpu_type
-        self._update_cost_preview("llama-cost-preview")
-
     def _sync_prime_visibility(self) -> None:
         subtitle = _gpu_panel_subtitle(BackendType.LLAMACPP, self._provider)
         subtitle_widget = self.query_one("#gpu-config-subtitle-llama", Static)
         subtitle_widget.update(subtitle)
         subtitle_widget.set_class(not subtitle, "hidden")
-        # A bound Prime offer dictates the GPU shape and count, and the deploy
-        # path overwrites whatever these hold. Leaving them editable invites
-        # changes that are silently discarded.
         reasons = _provider_field_reasons(self._provider)
         offer_bound = self._provider in (ComputeProvider.PRIME, ComputeProvider.VAST)
-        for field_id in ("#gpu-type-llama", "#gpu-count-llama",):
+        for field_id in ("#gpu-type-llama", "#gpu-count-llama"):
             _disable_with_reason(self, field_id, reasons.get("gpu") if offer_bound else None)
         for field_id, key in (
             ("#host-input", "host"),
@@ -1238,39 +1641,13 @@ class LlamaCppDeployScreen(
             _disable_with_reason(self, field_id, reasons.get(key))
         revision_reason = refuse_deployment_revision(self._provider, BackendType.LLAMACPP)
         _disable_with_reason(self, "#revision", revision_reason)
-        advanced_visible = not self.query_one("#warmup").has_class("hidden")
-        for provider_class, provider in (
-            (".modal-only", ComputeProvider.MODAL),
-            (".prime-only", ComputeProvider.PRIME),
-            (".vast-only", ComputeProvider.VAST),
-        ):
-            for widget in self.query(provider_class):
-                hide = self._provider != provider
-                if widget.has_class("llama-advanced") and not advanced_visible:
-                    hide = True
-                widget.set_class(hide, "hidden")
-
-    def _refresh_prime_offers(self) -> None:
-        self.query_one("#prime-offer-status-llama", Static).update(
-            "[dim]Loading Prime offers...[/dim]"
+        self._sync_provider_section_visibility(
+            provider_classes=(
+                (".modal-only", ComputeProvider.MODAL),
+                (".prime-only", ComputeProvider.PRIME),
+                (".vast-only", ComputeProvider.VAST),
+            )
         )
-        self.run_worker(
-            self._run_fetch_prime_offers,
-            name="llamacpp-fetch-prime-offers",
-            thread=True,
-        )
-
-    def _run_fetch_prime_offers(self) -> None:
-        try:
-            offers = PrimeBackend().list_offers()
-        except Exception as exc:
-            self.post_message(PrimeOffersFailed(str(exc)))
-            return
-        self.post_message(PrimeOffersLoaded(offers))
-
-    def on_prime_offers_loaded(self, message: PrimeOffersLoaded) -> None:
-        self._prime_offers = {offer.id: offer for offer in message.offers}
-        self._refresh_prime_offer_options()
 
     def _current_llamacpp_required_vram(self) -> float | None:
         repo_key = self.query_one("#repo-id", Input).value.strip().casefold()
@@ -1278,125 +1655,6 @@ class LlamaCppDeployScreen(
         if not repo_key or not quant_key:
             return None
         return self._repo_to_quant_vram.get(repo_key, {}).get(quant_key)
-
-    def _refresh_prime_offer_options(self) -> None:
-        required_vram_gb = self._current_llamacpp_required_vram()
-        offers = _compatible_prime_offers(
-            list(self._prime_offers.values()),
-            required_vram_gb,
-            BackendType.LLAMACPP,
-        )
-        options = _prime_offer_options(offers)
-        selector = self.query_one("#prime-offer-llama", Select)
-        selector.set_options(options)
-        status = self.query_one("#prime-offer-status-llama", Static)
-        if options:
-            self._selected_prime_offer_id = options[0][1]
-            selector.value = options[0][1]
-        else:
-            self._selected_prime_offer_id = None
-        status.update(
-            _prime_offer_status(
-                len(options),
-                required_vram_gb,
-                BackendType.LLAMACPP,
-            )
-        )
-
-    def on_prime_offers_failed(self, message: PrimeOffersFailed) -> None:
-        self.query_one("#prime-offer-status-llama", Static).update(
-            f"[$error]Could not load Prime offers:[/$error] {escape(message.error)}"
-        )
-
-    def _refresh_vast_offers(self) -> None:
-        self.query_one("#vast-offer-status-llama", Static).update(
-            "[dim]Loading Vast.ai rentals...[/dim]"
-        )
-        self.run_worker(
-            self._run_fetch_vast_offers,
-            name="llamacpp-fetch-vast-offers",
-            thread=True,
-        )
-
-    def _run_fetch_vast_offers(self) -> None:
-        try:
-            offers = VastBackend().list_offers(
-                VastOfferQuery(gpu_count=None, disk_gb=self._vast_disk_gb())
-            )
-        except Exception as exc:
-            self.post_message(VastOffersFailed(str(exc)))
-            return
-        self.post_message(VastOffersLoaded(offers))
-
-    def on_vast_offers_loaded(self, message: VastOffersLoaded) -> None:
-        self._vast_offers = {offer.id: offer for offer in message.offers}
-        self._refresh_vast_offer_options()
-
-    def on_vast_offers_failed(self, message: VastOffersFailed) -> None:
-        self.query_one("#vast-offer-status-llama", Static).update(
-            f"[$error]Could not load Vast.ai rentals:[/$error] {escape(message.error)}"
-        )
-
-    def _vast_disk_gb(self) -> int:
-        return positive_int(self.query_one("#vast-disk-llama", Input).value) or DEFAULT_VAST_DISK_GB
-
-    def _refresh_vast_offer_options(self) -> None:
-        required_vram_gb = self._current_llamacpp_required_vram()
-        offers = _compatible_vast_offers(list(self._vast_offers.values()), required_vram_gb)
-        options = _vast_offer_options(offers)
-        selector = self.query_one("#vast-offer-llama", Select)
-        selector.set_options(options)
-        if options:
-            self._selected_vast_offer_id = options[0][1]
-            selector.value = options[0][1]
-        else:
-            self._selected_vast_offer_id = None
-        self.query_one("#vast-offer-status-llama", Static).update(
-            _vast_offer_status(len(options), required_vram_gb)
-        )
-
-    def _refresh_gpu_types(self) -> None:
-        self.run_worker(
-            lambda: self._run_fetch_gpu_types(),
-            name="llama-fetch-gpu-types",
-            thread=True,
-        )
-
-    def _run_fetch_gpu_types(self) -> None:
-        poster = getattr(self, "post_message", None)
-        if poster is None:
-            return
-        try:
-            gpu_types = fetch_modal_gpu_catalog()
-        except Exception as exc:
-            poster(GpuTypesFailed(error=str(exc)))
-            return
-        poster(GpuTypesLoaded(gpu_types=gpu_types))
-
-    def on_gpu_types_loaded(self, message: GpuTypesLoaded) -> None:
-        dropdown = self.query_one("#gpu-type-llama", Select)
-        options = build_gpu_type_options(message.gpu_types)
-        option_values = [value for _, value in options]
-        self._modal_gpu_values = set(option_values)
-        if self._selected_gpu_type and self._selected_gpu_type not in option_values:
-            options.insert(0, (self._selected_gpu_type, self._selected_gpu_type))
-            option_values.insert(0, self._selected_gpu_type)
-        if not options:
-            return
-        dropdown.set_options(options)
-        selected = self._selected_gpu_type if self._selected_gpu_type in option_values else option_values[0]
-        dropdown.value = selected
-        self._selected_gpu_type = selected
-        self._gpu_price_by_value = {
-            spec.value.strip(): spec.price_per_hour_usd
-            for spec in message.gpu_types
-            if spec.price_per_hour_usd is not None
-        }
-        self._update_cost_preview("llama-cost-preview")
-
-    def on_gpu_types_failed(self, _: GpuTypesFailed) -> None:
-        # Keep default value if Modal docs fetch fails.
-        return
 
     def on_llama_cpp_models_loaded(self, message: LlamaCppModelsLoaded) -> None:
         if message.mode != self._rank_mode:
@@ -1425,13 +1683,6 @@ class LlamaCppDeployScreen(
         self._has_cached_snapshot = True
         if self._rank_mode == "cached":
             self._show_cached_models()
-
-    def on_storage_failed(self, message: StorageFailed) -> None:
-        if self._rank_mode != "cached":
-            return
-        self._ranked_models = []
-        _set_option_list(self.query_one("#llama-model-list", OptionList), [])
-        self._set_model_status(f"[$warning]Could not load cached models:[/$warning] {escape(message.error)}")
 
     def on_llama_cpp_models_failed(self, message: LlamaCppModelsFailed) -> None:
         if message.mode != self._rank_mode:
@@ -1501,9 +1752,6 @@ class LlamaCppDeployScreen(
             f"[$warning]Could not load quantizations:[/$warning] {escape(message.error)} [dim](manual quant still works)[/dim]"
         )
 
-    def action_do_deploy(self) -> None:
-        self._do_deploy()
-
     def action_predownload_highlighted(self) -> None:
         selected = self._highlighted_ranked_model()
         if selected is None:
@@ -1549,49 +1797,9 @@ class LlamaCppDeployScreen(
         config.do_warmup = self.query_one("#warmup", Switch).value
         config.show_debug_logs = self.query_one("#show-debug-logs-llama", Switch).value
 
-        gpu_type = normalize_gpu_type(self._selected_gpu_type or "")
-        if not gpu_type:
-            self._reject("GPU type is required.", "#gpu-type-llama")
+        if not self._apply_provider_and_gpu(config):
             return
-        gpu_count = parse_gpu_count(self.query_one("#gpu-count-llama", Input).value, default=0)
-        if gpu_count <= 0:
-            self._reject("GPU count must be an integer >= 1.", "#gpu-count-llama")
-            return
-        config.gpu_type = gpu_type
-        config.gpu_count = gpu_count
-        if self._provider == ComputeProvider.PRIME:
-            offer = self._prime_offers.get(self._selected_prime_offer_id or "")
-            if offer is None:
-                self._reject("Select a live Prime GPU offer.", "#prime-offer-llama")
-                return
-            if config.revision:
-                self._reject("Prime llama.cpp currently supports only the default HF revision.", "#revision")
-                return
-            config.gpu_type = offer.gpu_type
-            config.gpu_count = offer.gpu_count
-            allow_insecure_http = self.query_one(
-                "#prime-insecure-http-llama", Switch
-            ).value
-            config.provider_options = PrimeProviderOptions(
-                offer_id=offer.id,
-                disk_id=self.query_one("#prime-disk-id-llama", Input).value.strip() or None,
-                allow_insecure_http=allow_insecure_http,
-                keep_failed_resource=self.query_one(
-                    "#prime-keep-failed-llama", Switch
-                ).value,
-                auto_disk=self.query_one("#prime-auto-disk-llama", Switch).value,
-            )
-        elif self._provider == ComputeProvider.VAST:
-            vast_options = self._build_vast_provider_options("#vast-disk-llama")
-            if vast_options is None:
-                return
-            config.provider_options = vast_options
-            vast_offer = self._vast_offers[vast_options.offer_id]
-            config.gpu_type = vast_offer.gpu_type
-            config.gpu_count = vast_offer.gpu_count
 
-        # Advanced values are always read: collapsing the section must never
-        # silently discard options the user entered before collapsing it.
         sa = self.query_one("#server-args", Input).value.strip()
         config.server_args = sa or None
         if self._provider == ComputeProvider.MODAL:
@@ -1616,69 +1824,11 @@ class LlamaCppDeployScreen(
                 return
         config.llamacpp_image_no_cache = self.query_one("#llama-image-no-cache", Switch).value
 
-        model_hint = config.repo_id
-        instance_override = self.query_one("#instance-name-llama", Input).value.strip()
-        app_override = self.query_one("#app-name-llama", Input).value.strip()
-        if app_override:
-            config.app_name = app_override
-            config.instance_name = slugify_instance_name(instance_override or app_override)
-        elif instance_override:
-            config.instance_name = slugify_instance_name(instance_override)
-            config.app_name = build_deployment_name(
-                config.provider, config.backend, config.instance_name
-            )
-        else:
-            config.instance_name = auto_instance_name_for_backend(config.backend, model_hint)
-            config.app_name = build_deployment_name(
-                config.provider, config.backend, config.instance_name
-            )
-
-        try:
-            self.query_one(VisionOptions).apply(config)
-        except ValueError as exc:
-            self._reject(str(exc))
-            return
-        # Refuse here rather than after routing, so the form never accepts a
-        # configuration its provider will reject.
-        reason = refuse_deployment(config)
-        if reason:
-            self._reject(reason)
-            return
-        self.app.begin_deploy(config)
-
-    def _focus_model_list_if_pending(self) -> None:
-        """Give the model picker focus once a requested ranking has loaded."""
-        if not self._focus_model_list_when_loaded:
-            return
-        model_list = self.query_one(f"#{self._MODEL_LIST_ID}", OptionList)
-        if model_list.option_count == 0:
-            return
-        self._focus_model_list_when_loaded = False
-        model_list.focus()
-        if model_list.highlighted is None:
-            model_list.highlighted = 0
-
-    def _set_model_status(self, text: str) -> None:
-        status = self.query_one("#llama-model-status", Static)
-        status.update(text)
-        # A loaded list explains itself; the line only speaks while loading
-        # or when something went wrong.
-        status.set_class(not text, "hidden")
-
+        self._apply_deployment_names(config, config.repo_id)
+        self._finalize_and_submit_deploy(config)
 
     def _set_quant_status(self, text: str) -> None:
         self.query_one("#llama-quant-status", Static).update(text)
-
-    def _resolve_rank_mode(self, option_id: str) -> str | None:
-        cleaned = (option_id or "").strip().lower()
-        if cleaned in {"cached", "downloads", "trending"}:
-            return cleaned
-        return None
-
-    def _refresh_cached_models_from_storage(self, force: bool = False) -> None:
-        refresher = getattr(self.app, "begin_storage_refresh", None)
-        if callable(refresher):
-            refresher(self, force=force)
 
     def _show_cached_models(self) -> None:
         self._ranked_models = list(self._cached_models)
@@ -1700,28 +1850,6 @@ class LlamaCppDeployScreen(
         else:
             self._set_model_status("[$warning]No cached llama.cpp models found in storage.[/$warning]")
 
-    def _fall_back_to_downloads_ranking(self) -> bool:
-        """Switch an empty default "Cached in storage" view to "Most downloaded".
-
-        A first-time user has nothing cached, so the default ranking mode opens
-        the form on an empty picker and a warning. Only the automatic default
-        is replaced: once the mode has been chosen by hand it is left alone.
-        """
-        if self._rank_mode_touched or self._rank_mode != "cached" or not self._has_cached_snapshot:
-            return False
-        self._rank_mode = "downloads"
-        self._updating_rank_mode = True
-        try:
-            try:
-                self.query_one("#llama-rank-mode", Select).value = "downloads"
-            except Exception:
-                pass
-        finally:
-            self._updating_rank_mode = False
-        self._set_model_status("[dim]Nothing cached yet. Loading popular models...[/dim]")
-        self.app.begin_fetch_llamacpp_models("downloads", self)
-        return True
-
     def _apply_ranked_model_selection(self, option_id: str) -> None:
         selected = _model_from_option_id(option_id, self._ranked_models)
         if selected is None:
@@ -1742,18 +1870,7 @@ class LlamaCppDeployScreen(
             self._lookup_quantizations_for_current_repo(force_refresh=True)
         self._refresh_app_preview()
 
-    def _highlighted_ranked_model(self) -> ModelCandidate | None:
-        highlighted = highlighted_option(self.query_one("#llama-model-list", OptionList))
-        option_id = highlighted.id if highlighted is not None else ""
-        return _model_from_option_id(option_id or "", self._ranked_models)
-
     def _display_quantizations_for_repo(self, repo_key: str, quantizations: list[str]) -> list[str]:
-        """Return every known quantization for a repo, cached or not.
-
-        Which quantizations a repo publishes has nothing to do with which model
-        list is being browsed, so the ranking mode must not narrow this. What
-        is already in storage is shown as a per-row marker instead.
-        """
         cached_quants = self._cached_repo_to_quants.get(repo_key) or ()
         merged = list(quantizations)
         seen = {quant.strip().upper() for quant in merged}
@@ -1828,11 +1945,10 @@ class LlamaCppDeployScreen(
         vram_gb_by_quant: dict[str, float] | None = None,
     ) -> None:
         normalized_vram = _normalize_vram_map(vram_gb_by_quant)
-        sorted_quantizations: list[str] = []
         if normalized_vram:
             sorted_quantizations = sorted(
                 quantizations,
-                key=lambda q: normalized_vram.get(q.strip().upper(), float("inf"))
+                key=lambda q: normalized_vram.get(q.strip().upper(), float("inf")),
             )
         else:
             sorted_quantizations = list(quantizations)
@@ -1879,39 +1995,40 @@ class LlamaCppDeployScreen(
 
     def _refresh_app_preview(self) -> None:
         repo_id = self.query_one("#repo-id", Input).value.strip()
-        model_hint = repo_id or "default"
-        instance_override = self.query_one("#instance-name-llama", Input).value.strip()
-        app_override = self.query_one("#app-name-llama", Input).value.strip()
-        if app_override:
-            preview = app_override
-        elif instance_override:
-            preview = build_deployment_name(
-                self._provider,
-                BackendType.LLAMACPP,
-                instance_override,
-            )
-        else:
-            preview = build_deployment_name(
-                self._provider,
-                BackendType.LLAMACPP,
-                auto_instance_name_for_backend(BackendType.LLAMACPP, model_hint),
-            )
-        self.query_one("#llama-app-preview", Static).update(f"[dim]App name preview: {escape(preview)}[/dim]")
-
-    def action_pop_screen(self) -> None:
-        self.app.pop_screen()
-
-    def action_open_storage(self) -> None:
-        self.app.action_push_storage(BackendType.LLAMACPP)
+        self._update_app_preview_for(repo_id or "default")
 
 
-class VllmDeployScreen(
-    _OptionListArrowNavigationMixin, _CostPreviewMixin, _DeployFormFeedbackMixin, CopyEnabledScreen
-):
+class VllmDeployScreen(_BaseDeployScreen):
     """vLLM deploy form."""
 
+    BACKEND = BackendType.VLLM
     FEEDBACK_ID = "#vllm-deploy-feedback"
     ADVANCED_CLASS = "vllm-advanced"
+    RANK_MODE_ID = "vllm-rank-mode"
+    MODEL_LIST_ID = "vllm-model-list"
+    MODEL_STATUS_ID = "vllm-model-status"
+    PROVIDER_ID = "provider-vllm"
+    GPU_TYPE_ID = "gpu-type-vllm"
+    GPU_COUNT_FIELD_ID = "gpu-count-vllm"
+    GPU_SUBTITLE_ID = "gpu-config-subtitle-vllm"
+    COST_PREVIEW_ID = "vllm-cost-preview"
+    PRIME_OFFER_ID = "prime-offer-vllm"
+    PRIME_STATUS_ID = "prime-offer-status"
+    PRIME_DISK_ID = "prime-disk-id"
+    PRIME_INSECURE_HTTP_ID = "prime-insecure-http"
+    PRIME_KEEP_FAILED_ID = "prime-keep-failed"
+    PRIME_AUTO_DISK_ID = "prime-auto-disk"
+    VAST_OFFER_ID = "vast-offer-vllm"
+    VAST_STATUS_ID = "vast-offer-status-vllm"
+    VAST_DISK_ID = "vast-disk-vllm"
+    INSTANCE_NAME_ID = "instance-name-vllm"
+    APP_NAME_ID = "app-name-vllm"
+    APP_PREVIEW_ID = "vllm-app-preview"
+    TOGGLE_ADVANCED_BTN_ID = "toggle-advanced-vllm"
+    DEPLOY_BTN_ID = "deploy-vllm-btn"
+    ADVANCED_MARKER_ID = "model-revision"
+    WORKER_PREFIX = "vllm"
+    GPU_WORKER_NAME = "vllm-fetch-gpu-types"
 
     BINDINGS = [
         Binding("up", "navigate_option_list_up", show=False, priority=True),
@@ -1922,7 +2039,6 @@ class VllmDeployScreen(
         Binding("p", "predownload_highlighted", "Pre-download", show=True),
     ]
     _MODEL_LIST_ID = "vllm-model-list"
-    GPU_COUNT_FIELD_ID = "gpu-count-vllm"
     OPTION_LIST_IDS = ("vllm-model-list",)
     NAVIGATION_ORDER = (
         "vllm-rank-mode",
@@ -2196,21 +2312,7 @@ class VllmDeployScreen(
         yield FittedFooter()
 
     def on_mount(self) -> None:
-        self._rank_mode = "cached"
-        self._ranked_models: list[ModelCandidate] = []
-        self._cached_models: list[ModelCandidate] = []
-        self._has_cached_snapshot = False
-        self._selected_gpu_type = DEFAULT_GPU_TYPE
-        # Binding a Prime offer overwrites the GPU dropdown with that offer's
-        # GPU. Remember the Modal choice so switching back does not leave a
-        # Prime-only GPU name selected for a Modal deploy.
-        self._last_modal_gpu_type = DEFAULT_GPU_TYPE
-        self._modal_gpu_values: set[str] = {DEFAULT_GPU_TYPE}
-        self._provider = ComputeProvider.MODAL
-        self._prime_offers: dict[str, ComputeOffer] = {}
-        self._selected_prime_offer_id: str | None = None
-        self._vast_offers: dict[str, VastOffer] = {}
-        self._selected_vast_offer_id: str | None = None
+        self._init_shared_deploy_state()
         self._served_alias_touched = False
         self._updating_served_alias = False
         self._last_auto_served_alias = ""
@@ -2223,10 +2325,6 @@ class VllmDeployScreen(
         self._model_to_memory_estimate: dict[str, VllmMemoryBreakdown | None] = {}
         self._last_memory_lookup: tuple[str, str] | None = None
         self._memory_lookup_timer: Timer | None = None
-        self._gpu_price_by_value: dict[str, float] = {}
-        self._rank_mode_touched = False
-        self._updating_rank_mode = False
-        self._focus_model_list_when_loaded = False
         initial_hidden: list[Widget] = [self.query_one("#vllm-model-list", OptionList)]
         initial_hidden[0].add_class("hidden", update=False)
         for selector in (".vllm-advanced", ".prime-only", ".vast-only"):
@@ -2246,28 +2344,17 @@ class VllmDeployScreen(
         self._update_cost_preview("vllm-cost-preview")
         self._refresh_vllm_memory_status()
 
+    def _required_vram_gb(self) -> float | None:
+        return self._current_vllm_required_vram()
+
+    def _fetch_ranked_models(self, mode: str) -> None:
+        self.app.begin_fetch_vllm_models(mode, self)
+
+    def _on_marketplace_offer_bound(self, gpu_count: int) -> None:
+        self.query_one("#n-gpu", Input).value = str(gpu_count)
+
     def _set_vllm_rank_mode(self, selected_mode: str | None) -> None:
-        """Switch the vLLM suggestion source, reloading when it changes."""
-        if selected_mode is None:
-            return
-        self._rank_mode_touched = True
-        if selected_mode != self._rank_mode:
-            self._rank_mode = selected_mode
-            self._ranked_models = []
-            self._set_model_status("[dim]Loading model suggestions...[/dim]")
-            _set_option_list(self.query_one("#vllm-model-list", OptionList), [])
-            if self._rank_mode == "cached":
-                self._set_model_status("[dim]Loading cached models from storage...[/dim]")
-                if self._has_cached_snapshot:
-                    self._show_cached_models()
-                self._refresh_cached_models_from_storage()
-            else:
-                self.app.begin_fetch_vllm_models(self._rank_mode, self)
-        model_list = self.query_one("#vllm-model-list", OptionList)
-        # The picker is hidden until it has rows, so a still-loading list
-        # cannot take focus yet. Hand it over once the rows land.
-        self._focus_model_list_when_loaded = model_list.option_count == 0
-        _advance_deploy_focus(self, self.NAVIGATION_ORDER)
+        self._switch_rank_mode(selected_mode)
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
         if event.option_list.id == "vllm-model-list":
@@ -2283,15 +2370,8 @@ class VllmDeployScreen(
         self._apply_ranked_model_selection(event.option.id or "")
         self._refresh_app_preview()
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "toggle-advanced-vllm":
-            for widget in self.query(".vllm-advanced"):
-                widget.toggle_class("hidden")
-            self._sync_prime_visibility()
-        elif event.button.id == "deploy-vllm-btn":
-            self._do_deploy()
-
     def on_input_changed(self, event: Input.Changed) -> None:
+        super().on_input_changed(event)
         if event.input.id == "model-name":
             self._sync_served_alias_from_model()
             self._sync_tool_call_parser_from_model()
@@ -2318,130 +2398,29 @@ class VllmDeployScreen(
         if event.input.id == "gpu-count-vllm":
             self._update_cost_preview("vllm-cost-preview")
         if event.input.id == "max-model-len":
-            # The cap changes the cache the estimate has to hold, and the
-            # estimate is what both marketplaces filter their offers by.
             self._refresh_vllm_memory_status(from_cache_only=True)
             if self._prime_offers:
                 self._refresh_prime_offer_options()
             if self._vast_offers:
                 self._refresh_vast_offer_options()
 
-    def on_select_changed(self, event: Select.Changed) -> None:
-        if event.select.id == "vllm-rank-mode":
-            if not isinstance(event.value, str):
-                return
-            if getattr(self, "_updating_rank_mode", False):
-                return
-            if event.value == getattr(self, "_rank_mode", None) and not getattr(
-                self, "_rank_mode_initialized", False
-            ):
-                self._rank_mode_initialized = True
-                return
-            self._rank_mode_initialized = True
-            self._set_vllm_rank_mode(self._resolve_rank_mode(event.value))
-            return
-        if event.select.id == "provider-vllm":
-            if not isinstance(event.value, str):
-                return
-            self._provider = ComputeProvider(event.value)
-            self._sync_prime_visibility()
-            if self._provider == ComputeProvider.PRIME and not self._prime_offers:
-                self._refresh_prime_offers()
-            elif self._provider == ComputeProvider.VAST:
-                if self._vast_offers:
-                    self._refresh_vast_offer_options()
-                else:
-                    self._refresh_vast_offers()
-            elif self._provider == ComputeProvider.MODAL:
-                self._selected_gpu_type = self._last_modal_gpu_type
-                self._selected_prime_offer_id = None
-                self._selected_vast_offer_id = None
-                self._refresh_gpu_types()
-            self._refresh_app_preview()
-            self._update_cost_preview("vllm-cost-preview")
-            return
-        if event.select.id == "vast-offer-vllm":
-            if not isinstance(event.value, str):
-                return
-            self._selected_vast_offer_id = event.value
-            offer = self._vast_offers.get(event.value)
-            if offer is not None:
-                self._selected_gpu_type = offer.gpu_type
-                gpu_type_select = self.query_one("#gpu-type-vllm", Select)
-                gpu_type_select.set_options([(offer.gpu_type, offer.gpu_type)])
-                gpu_type_select.value = offer.gpu_type
-                self.query_one("#gpu-count-vllm", Input).value = str(offer.gpu_count)
-                self.query_one("#n-gpu", Input).value = str(offer.gpu_count)
-            self._update_cost_preview("vllm-cost-preview")
-            return
-        if event.select.id == "prime-offer-vllm":
-            if not isinstance(event.value, str):
-                return
-            self._selected_prime_offer_id = event.value
-            offer = self._prime_offers.get(event.value)
-            if offer is not None:
-                self._selected_gpu_type = offer.gpu_type
-                self.query_one("#gpu-type-vllm", Select).set_options(
-                    [(offer.gpu_type, offer.gpu_type)]
-                )
-                self.query_one("#gpu-type-vllm", Select).value = offer.gpu_type
-                self.query_one("#gpu-count-vllm", Input).value = str(offer.gpu_count)
-                self.query_one("#n-gpu", Input).value = str(offer.gpu_count)
-            self._update_cost_preview("vllm-cost-preview")
-            return
-        if event.select.id != "gpu-type-vllm":
-            return
-        if isinstance(event.value, str) and event.value.strip():
-            self._selected_gpu_type = normalize_gpu_type(event.value)
-            if self._selected_gpu_type in self._modal_gpu_values:
-                self._last_modal_gpu_type = self._selected_gpu_type
-        self._update_cost_preview("vllm-cost-preview")
-
     def _sync_prime_visibility(self) -> None:
         subtitle = _gpu_panel_subtitle(BackendType.VLLM, self._provider)
         subtitle_widget = self.query_one("#gpu-config-subtitle-vllm", Static)
         subtitle_widget.update(subtitle)
         subtitle_widget.set_class(not subtitle, "hidden")
-        # A bound Prime offer dictates the GPU shape and count, and the deploy
-        # path overwrites whatever these hold. Leaving them editable invites
-        # changes that are silently discarded.
         reasons = _provider_field_reasons(self._provider)
         offer_bound = self._provider in (ComputeProvider.PRIME, ComputeProvider.VAST)
-        for field_id in ("#gpu-type-vllm", "#gpu-count-vllm", "#n-gpu",):
+        for field_id in ("#gpu-type-vllm", "#gpu-count-vllm", "#n-gpu"):
             _disable_with_reason(self, field_id, reasons.get("gpu") if offer_bound else None)
-        # The vLLM form has no host/port controls; vLLM binds its own.
         revision_reason = refuse_deployment_revision(self._provider, BackendType.VLLM)
         _disable_with_reason(self, "#model-revision", revision_reason)
-        advanced_visible = not self.query_one("#model-revision").has_class("hidden")
-        for provider_class, provider in (
-            (".prime-only", ComputeProvider.PRIME),
-            (".vast-only", ComputeProvider.VAST),
-        ):
-            for widget in self.query(provider_class):
-                hide = self._provider != provider
-                if widget.has_class("vllm-advanced") and not advanced_visible:
-                    hide = True
-                widget.set_class(hide, "hidden")
-
-    def _refresh_prime_offers(self) -> None:
-        self.query_one("#prime-offer-status", Static).update("[dim]Loading Prime offers...[/dim]")
-        self.run_worker(
-            self._run_fetch_prime_offers,
-            name="vllm-fetch-prime-offers",
-            thread=True,
+        self._sync_provider_section_visibility(
+            provider_classes=(
+                (".prime-only", ComputeProvider.PRIME),
+                (".vast-only", ComputeProvider.VAST),
+            )
         )
-
-    def _run_fetch_prime_offers(self) -> None:
-        try:
-            offers = PrimeBackend().list_offers()
-        except Exception as exc:
-            self.post_message(PrimeOffersFailed(str(exc)))
-            return
-        self.post_message(PrimeOffersLoaded(offers))
-
-    def on_prime_offers_loaded(self, message: PrimeOffersLoaded) -> None:
-        self._prime_offers = {offer.id: offer for offer in message.offers}
-        self._refresh_prime_offer_options()
 
     def _requested_context_tokens(self) -> int | None:
         """Return the context the form asks vLLM to serve, if any."""
@@ -2464,138 +2443,18 @@ class VllmDeployScreen(
         estimate = self._current_vllm_estimate()
         return estimate.total_gb if estimate is not None else None
 
-    def _refresh_prime_offer_options(self) -> None:
-        required_vram_gb = self._current_vllm_required_vram()
-        offers = _compatible_prime_offers(
-            list(self._prime_offers.values()),
-            required_vram_gb,
-            BackendType.VLLM,
-        )
-        options = _prime_offer_options(offers)
-        selector = self.query_one("#prime-offer-vllm", Select)
-        selector.set_options(options)
-        if options:
-            self._selected_prime_offer_id = options[0][1]
-            selector.value = options[0][1]
-        else:
-            self._selected_prime_offer_id = None
-        self.query_one("#prime-offer-status", Static).update(
-            _prime_offer_status(
-                len(options),
-                required_vram_gb,
-                BackendType.VLLM,
-            )
-        )
-
-    def on_prime_offers_failed(self, message: PrimeOffersFailed) -> None:
-        self.query_one("#prime-offer-status", Static).update(
-            f"[$error]Could not load Prime offers:[/$error] {escape(message.error)}"
-        )
-
-    def _refresh_vast_offers(self) -> None:
-        self.query_one("#vast-offer-status-vllm", Static).update(
-            "[dim]Loading Vast.ai rentals...[/dim]"
-        )
-        self.run_worker(
-            self._run_fetch_vast_offers,
-            name="vllm-fetch-vast-offers",
-            thread=True,
-        )
-
-    def _run_fetch_vast_offers(self) -> None:
-        try:
-            offers = VastBackend().list_offers(
-                VastOfferQuery(gpu_count=None, disk_gb=self._vast_disk_gb())
-            )
-        except Exception as exc:
-            self.post_message(VastOffersFailed(str(exc)))
-            return
-        self.post_message(VastOffersLoaded(offers))
-
-    def on_vast_offers_loaded(self, message: VastOffersLoaded) -> None:
-        self._vast_offers = {offer.id: offer for offer in message.offers}
-        self._refresh_vast_offer_options()
-
-    def on_vast_offers_failed(self, message: VastOffersFailed) -> None:
-        self.query_one("#vast-offer-status-vllm", Static).update(
-            f"[$error]Could not load Vast.ai rentals:[/$error] {escape(message.error)}"
-        )
-
-    def _vast_disk_gb(self) -> int:
-        return positive_int(self.query_one("#vast-disk-vllm", Input).value) or self._default_vast_disk_gb()
-
     def _default_vast_disk_gb(self) -> int:
-        """Size the rental for fp16 weights plus the image and its caches.
-
-        The GGUF default is far too small for an unquantized checkpoint, and a
-        disk that fills mid-download is a rental the user pays for and cannot
-        use.
-        """
+        """Size the rental for fp16 weights plus the image and its caches."""
         required = self._current_vllm_required_vram()
         if not required or required <= 0:
             return DEFAULT_VAST_DISK_GB
         return max(DEFAULT_VAST_DISK_GB, math.ceil(required * 1.1) + 20)
 
     def _refresh_vast_offer_options(self) -> None:
-        required_vram_gb = self._current_vllm_required_vram()
         disk_field = self.query_one("#vast-disk-vllm", Input)
         if not disk_field.value.strip():
             disk_field.placeholder = f"{self._default_vast_disk_gb()} (sized for this model)"
-        offers = _compatible_vast_offers(list(self._vast_offers.values()), required_vram_gb)
-        options = _vast_offer_options(offers)
-        selector = self.query_one("#vast-offer-vllm", Select)
-        selector.set_options(options)
-        if options:
-            self._selected_vast_offer_id = options[0][1]
-            selector.value = options[0][1]
-        else:
-            self._selected_vast_offer_id = None
-        self.query_one("#vast-offer-status-vllm", Static).update(
-            _vast_offer_status(len(options), required_vram_gb)
-        )
-
-    def _refresh_gpu_types(self) -> None:
-        self.run_worker(
-            lambda: self._run_fetch_gpu_types(),
-            name="vllm-fetch-gpu-types",
-            thread=True,
-        )
-
-    def _run_fetch_gpu_types(self) -> None:
-        poster = getattr(self, "post_message", None)
-        if poster is None:
-            return
-        try:
-            gpu_types = fetch_modal_gpu_catalog()
-        except Exception as exc:
-            poster(GpuTypesFailed(error=str(exc)))
-            return
-        poster(GpuTypesLoaded(gpu_types=gpu_types))
-
-    def on_gpu_types_loaded(self, message: GpuTypesLoaded) -> None:
-        dropdown = self.query_one("#gpu-type-vllm", Select)
-        options = build_gpu_type_options(message.gpu_types)
-        option_values = [value for _, value in options]
-        self._modal_gpu_values = set(option_values)
-        if self._selected_gpu_type and self._selected_gpu_type not in option_values:
-            options.insert(0, (self._selected_gpu_type, self._selected_gpu_type))
-            option_values.insert(0, self._selected_gpu_type)
-        if not options:
-            return
-        dropdown.set_options(options)
-        selected = self._selected_gpu_type if self._selected_gpu_type in option_values else option_values[0]
-        dropdown.value = selected
-        self._selected_gpu_type = selected
-        self._gpu_price_by_value = {
-            spec.value.strip(): spec.price_per_hour_usd
-            for spec in message.gpu_types
-            if spec.price_per_hour_usd is not None
-        }
-        self._update_cost_preview("vllm-cost-preview")
-
-    def on_gpu_types_failed(self, _: GpuTypesFailed) -> None:
-        # Keep default value if Modal docs fetch fails.
-        return
+        super()._refresh_vast_offer_options()
 
     def _sync_served_alias_from_model(self, force: bool = False) -> None:
         alias_input = self.query_one("#served-model-name", Input)
@@ -2614,7 +2473,6 @@ class VllmDeployScreen(
 
     def _sync_tool_call_parser_from_model(self, force: bool = False) -> None:
         """Prefill known-safe tool calling without overwriting a user choice."""
-
         parser_input = self.query_one("#tool-call-parser", Input)
         next_parser = recommended_vllm_tool_call_parser(
             self.query_one("#model-name", Input).value
@@ -2637,7 +2495,6 @@ class VllmDeployScreen(
 
     def _sync_reasoning_parser_from_model(self, force: bool = False) -> None:
         """Prefill the reasoning parser a thinking model needs to split ``<think>``."""
-
         parser_input = self.query_one("#reasoning-parser", Input)
         next_parser = recommended_vllm_reasoning_parser(
             self.query_one("#model-name", Input).value
@@ -2683,13 +2540,6 @@ class VllmDeployScreen(
         if self._rank_mode == "cached":
             self._show_cached_models()
 
-    def on_storage_failed(self, message: StorageFailed) -> None:
-        if self._rank_mode != "cached":
-            return
-        self._ranked_models = []
-        _set_option_list(self.query_one("#vllm-model-list", OptionList), [])
-        self._set_model_status(f"[$warning]Could not load cached models:[/$warning] {escape(message.error)}")
-
     def on_vllm_models_failed(self, message: VllmModelsFailed) -> None:
         if message.mode != self._rank_mode:
             return
@@ -2698,9 +2548,6 @@ class VllmDeployScreen(
         self._set_model_status(
             f"[$warning]Could not load model suggestions:[/$warning] {escape(message.error)} [dim](manual input still works)[/dim]"
         )
-
-    def action_do_deploy(self) -> None:
-        self._do_deploy()
 
     def action_predownload_highlighted(self) -> None:
         selected = self._highlighted_ranked_model()
@@ -2714,35 +2561,6 @@ class VllmDeployScreen(
             revision=revision,
         )
 
-    def _focus_model_list_if_pending(self) -> None:
-        """Give the model picker focus once a requested ranking has loaded."""
-        if not self._focus_model_list_when_loaded:
-            return
-        model_list = self.query_one(f"#{self._MODEL_LIST_ID}", OptionList)
-        if model_list.option_count == 0:
-            return
-        self._focus_model_list_when_loaded = False
-        model_list.focus()
-        if model_list.highlighted is None:
-            model_list.highlighted = 0
-
-    def _set_model_status(self, text: str) -> None:
-        status = self.query_one("#vllm-model-status", Static)
-        status.update(text)
-        status.set_class(not text, "hidden")
-
-
-    def _resolve_rank_mode(self, option_id: str) -> str | None:
-        cleaned = (option_id or "").strip().lower()
-        if cleaned in {"cached", "downloads", "trending"}:
-            return cleaned
-        return None
-
-    def _refresh_cached_models_from_storage(self, force: bool = False) -> None:
-        refresher = getattr(self.app, "begin_storage_refresh", None)
-        if callable(refresher):
-            refresher(self, force=force)
-
     def _show_cached_models(self) -> None:
         self._ranked_models = list(self._cached_models)
         model_list = self.query_one("#vllm-model-list", OptionList)
@@ -2755,28 +2573,6 @@ class VllmDeployScreen(
             return
         else:
             self._set_model_status("[$warning]No cached vLLM models found in storage.[/$warning]")
-
-    def _fall_back_to_downloads_ranking(self) -> bool:
-        """Switch an empty default "Cached in storage" view to "Most downloaded".
-
-        A first-time user has nothing cached, so the default ranking mode opens
-        the form on an empty picker and a warning. Only the automatic default
-        is replaced: once the mode has been chosen by hand it is left alone.
-        """
-        if self._rank_mode_touched or self._rank_mode != "cached" or not self._has_cached_snapshot:
-            return False
-        self._rank_mode = "downloads"
-        self._updating_rank_mode = True
-        try:
-            try:
-                self.query_one("#vllm-rank-mode", Select).value = "downloads"
-            except Exception:
-                pass
-        finally:
-            self._updating_rank_mode = False
-        self._set_model_status("[dim]Nothing cached yet. Loading popular models...[/dim]")
-        self.app.begin_fetch_vllm_models("downloads", self)
-        return True
 
     def _apply_ranked_model_selection(self, option_id: str) -> None:
         selected = _model_from_option_id(option_id, self._ranked_models)
@@ -2814,8 +2610,6 @@ class VllmDeployScreen(
             return
         tensor_parallel = self._current_tensor_parallel()
         per_gpu_gb = estimate.total_gb / max(1, tensor_parallel)
-        # An image encoder's working memory is not modelled, so say so rather
-        # than letting the total read as if it covered image requests.
         vision_note = (
             " — excludes unknown image working memory"
             if estimate.vision_working_memory_gb is None
@@ -2923,26 +2717,9 @@ class VllmDeployScreen(
         if self._prime_offers:
             self._refresh_prime_offer_options()
 
-    def _highlighted_ranked_model(self) -> ModelCandidate | None:
-        highlighted = highlighted_option(self.query_one("#vllm-model-list", OptionList))
-        option_id = highlighted.id if highlighted is not None else ""
-        return _model_from_option_id(option_id or "", self._ranked_models)
-
     def _refresh_app_preview(self) -> None:
         model_name = self.query_one("#model-name", Input).value.strip()
-        instance_override = self.query_one("#instance-name-vllm", Input).value.strip()
-        app_override = self.query_one("#app-name-vllm", Input).value.strip()
-        if app_override:
-            preview = app_override
-        elif instance_override:
-            preview = build_deployment_name(self._provider, BackendType.VLLM, instance_override)
-        else:
-            preview = build_deployment_name(
-                self._provider,
-                BackendType.VLLM,
-                auto_instance_name_for_backend(BackendType.VLLM, model_name),
-            )
-        self.query_one("#vllm-app-preview", Static).update(f"[dim]App name preview: {escape(preview)}[/dim]")
+        self._update_app_preview_for(model_name)
 
     def _do_deploy(self) -> None:
         config = DeploymentConfig(backend=BackendType.VLLM, provider=self._provider)
@@ -2966,39 +2743,8 @@ class VllmDeployScreen(
                 return
             config.max_concurrent_sequences = sequences
         config.required_vram_gb = self._current_vllm_required_vram()
-        gpu_type = normalize_gpu_type(self._selected_gpu_type or "")
-        if not gpu_type:
-            self._reject("GPU type is required.", "#gpu-type-vllm")
+        if not self._apply_provider_and_gpu(config):
             return
-        gpu_count = parse_gpu_count(self.query_one("#gpu-count-vllm", Input).value, default=0)
-        if gpu_count <= 0:
-            self._reject("GPU count must be an integer >= 1.", "#gpu-count-vllm")
-            return
-        config.gpu_type = gpu_type
-        config.gpu_count = gpu_count
-        if self._provider == ComputeProvider.PRIME:
-            offer = self._prime_offers.get(self._selected_prime_offer_id or "")
-            if offer is None:
-                self._reject("Select a live Prime GPU offer.", "#prime-offer-vllm")
-                return
-            config.gpu_type = offer.gpu_type
-            config.gpu_count = offer.gpu_count
-            allow_insecure_http = self.query_one("#prime-insecure-http", Switch).value
-            config.provider_options = PrimeProviderOptions(
-                offer_id=offer.id,
-                disk_id=self.query_one("#prime-disk-id", Input).value.strip() or None,
-                allow_insecure_http=allow_insecure_http,
-                keep_failed_resource=self.query_one("#prime-keep-failed", Switch).value,
-                auto_disk=self.query_one("#prime-auto-disk", Switch).value,
-            )
-        elif self._provider == ComputeProvider.VAST:
-            vast_options = self._build_vast_provider_options("#vast-disk-vllm")
-            if vast_options is None:
-                return
-            config.provider_options = vast_options
-            vast_offer = self._vast_offers[vast_options.offer_id]
-            config.gpu_type = vast_offer.gpu_type
-            config.gpu_count = vast_offer.gpu_count
         alias = self.query_one("#served-model-name", Input).value.strip()
         config.served_model_name = alias or default_served_model_name(config.model_name)
         config.fast_boot = self.query_one("#fast-boot", Switch).value
@@ -3012,8 +2758,6 @@ class VllmDeployScreen(
                 self._reject("Tensor parallel size must be an integer >= 1.", "#n-gpu")
                 return
         config.tool_call_parser = self.query_one("#tool-call-parser", Input).value.strip() or None
-        # Advanced values are always read: collapsing the section must never
-        # silently discard options the user entered before collapsing it.
         config.reasoning_parser = self.query_one("#reasoning-parser", Input).value.strip() or None
         kwargs_raw = self.query_one("#chat-template-kwargs", Input).value.strip()
         if kwargs_raw:
@@ -3028,43 +2772,14 @@ class VllmDeployScreen(
             config.default_chat_template_kwargs = kwargs_raw
         smoke_only = self.query_one("#smoke-only-vllm", Switch).value
         if smoke_only and self._provider != ComputeProvider.MODAL:
-            self._reject(f"{self._provider.display_name} does not support smoke-test-only mode.", "#smoke-only-vllm")
+            self._reject(
+                f"{self._provider.display_name} does not support smoke-test-only mode.",
+                "#smoke-only-vllm",
+            )
             return
         config.do_deploy = not smoke_only
         config.run_smoke = smoke_only
         config.do_warmup = self.query_one("#warmup-vllm", Switch).value if config.do_deploy else False
         config.show_debug_logs = self.query_one("#show-debug-logs-vllm", Switch).value
-        instance_override = self.query_one("#instance-name-vllm", Input).value.strip()
-        app_override = self.query_one("#app-name-vllm", Input).value.strip()
-        if app_override:
-            config.app_name = app_override
-            config.instance_name = slugify_instance_name(instance_override or app_override)
-        elif instance_override:
-            config.instance_name = slugify_instance_name(instance_override)
-            config.app_name = build_deployment_name(
-                config.provider, config.backend, config.instance_name
-            )
-        else:
-            config.instance_name = auto_instance_name_for_backend(config.backend, config.model_name)
-            config.app_name = build_deployment_name(
-                config.provider, config.backend, config.instance_name
-            )
-
-        try:
-            self.query_one(VisionOptions).apply(config)
-        except ValueError as exc:
-            self._reject(str(exc))
-            return
-        # Refuse here rather than after routing, so the form never accepts a
-        # configuration its provider will reject.
-        reason = refuse_deployment(config)
-        if reason:
-            self._reject(reason)
-            return
-        self.app.begin_deploy(config)
-
-    def action_pop_screen(self) -> None:
-        self.app.pop_screen()
-
-    def action_open_storage(self) -> None:
-        self.app.action_push_storage(BackendType.VLLM)
+        self._apply_deployment_names(config, config.model_name)
+        self._finalize_and_submit_deploy(config)

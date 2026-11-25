@@ -3,223 +3,78 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
-from importlib.resources import files
-import json
 import os
 from pathlib import Path
 import re
 import shlex
 import subprocess
 from typing import Any
-from collections.abc import Iterable, Sequence
 
 import requests
 
-from ..protocol.enums import BackendType, ComputeProvider, QuoteAvailability
+from ..protocol.enums import BackendType, ComputeProvider
 from ..protocol.models import ComputeOffer, DeploymentConfig, EndpointInfo
-from .deployment_preflight import price_cap_finding
-from .deploy_log_summary import is_error_like
-from .config import SETTINGS_DIR
 from .coerce import optional_float
+from .config import SETTINGS_DIR
 from .diagnostics import log_exception
 from .naming import infer_instance_from_app_name
 from .prime_auth import PrimeConfig, load_prime_config
+from .prime_offers import (
+    PRIME_DEFAULT_BOOTSTRAP_IMAGE as PRIME_DEFAULT_BOOTSTRAP_IMAGE,
+    PRIME_VRAM_HEADROOM_FACTOR as PRIME_VRAM_HEADROOM_FACTOR,
+    PrimeDiskOffer as PrimeDiskOffer,
+    PrimeLaunchSpec as PrimeLaunchSpec,
+    _dict,
+    _optional_int,
+    cached_hourly_rate as _cached_hourly_rate,
+    default_prime_container_image as default_prime_container_image,
+    is_compatible_prime_offer as is_compatible_prime_offer,
+    is_prime_gpu_offer as is_prime_gpu_offer,
+    parse_prime_offer as parse_prime_offer,
+    preferred_prime_offer_image as preferred_prime_offer_image,
+    prime_networking_runtime as prime_networking_runtime,
+    prime_offer_gpu_memory_gb as prime_offer_gpu_memory_gb,
+    prime_offer_id as prime_offer_id,
+    prime_offer_matches_location as prime_offer_matches_location,
+    prime_offer_satisfies_vram as prime_offer_satisfies_vram,
+    prime_pod_hourly_rate as _prime_pod_hourly_rate,
+    prime_pod_started_at as _prime_pod_started_at,
+    prime_runtime as prime_runtime,
+    prime_stock_availability as prime_stock_availability,
+    resolve_prime_launch_spec as resolve_prime_launch_spec,
+    select_prime_offer as select_prime_offer,
+    supports_prime_image as supports_prime_image,
+)
+from .prime_runtime import (
+    LLAMACPP_FIT_LOG_VERBOSITY as LLAMACPP_FIT_LOG_VERBOSITY,
+    PRIME_FIT_FILE_VARIABLE as PRIME_FIT_FILE_VARIABLE,
+    PRIME_RUNTIME_CONTAINER_NAME as PRIME_RUNTIME_CONTAINER_NAME,
+    PRIME_RUNTIME_ROOT as PRIME_RUNTIME_ROOT,
+    PRIME_TUNNEL_ID_NAME as PRIME_TUNNEL_ID_NAME,
+    PRIME_TUNNEL_LABEL as PRIME_TUNNEL_LABEL,
+    PRIME_TUNNEL_LOG_PATH as PRIME_TUNNEL_LOG_PATH,
+    PRIME_TUNNEL_PID_PATH as PRIME_TUNNEL_PID_PATH,
+    build_bootstrap_docker_command,
+    build_bootstrap_script,
+    build_docker_env_file,
+    build_probe_config,
+    build_runtime_env,
+    build_tunnel_config,
+    build_tunnel_start_script,
+    expected_model_bytes,
+    format_runtime_load_detail,
+    parse_docker_byte_count,
+    parse_runtime_image_progress,
+    parse_runtime_progress_output,
+    redact_runtime_log,
+    runtime_failure_detail as runtime_failure_detail,
+)
 from .provider_options import prime_provider_options
-from .serving_runtime import engram_setup, projector_setup, vllm_serve_args
-from .runtime_support import load_llamacpp_support_manifest, llamacpp_build_recipe, llamacpp_cuda_architecture
-
-
-def _prime_projector_setup(config: DeploymentConfig) -> tuple[str, str]:
-    """Stage the exact projector atomically in the persistent llama cache."""
-    root = "/data/llama.cpp" if prime_provider_options(config).disk_id else "/root/.cache/llama.cpp"
-    return projector_setup(config, root=root)
-
-
-def _prime_engram_setup(config: DeploymentConfig) -> tuple[str, str]:
-    """Stage the exact external Engram (--ple) table in the persistent llama cache."""
-    root = "/data/llama.cpp" if prime_provider_options(config).disk_id else "/root/.cache/llama.cpp"
-    return engram_setup(config, root=root)
-
-
-def _runtime_catalog() -> dict[str, Any]:
-    try:
-        payload = json.loads(
-            files("llm_launchpad.data")
-            .joinpath("prime_runtime.json")
-            .read_text(encoding="utf-8")
-        )
-    except Exception:
-        return {}
-    return payload if isinstance(payload, dict) else {}
-
-
-_PRIME_RUNTIME = _runtime_catalog()
-PRIME_DEFAULT_BOOTSTRAP_IMAGE = "ubuntu_22_cuda_12"
-
-
-def prime_runtime(backend: BackendType) -> dict[str, Any]:
-    """Return runtime metadata for one Prime serving backend."""
-
-    runtimes = _PRIME_RUNTIME.get("runtimes")
-    if isinstance(runtimes, dict):
-        runtime = runtimes.get(backend.value)
-        return runtime if isinstance(runtime, dict) else {}
-    if backend == BackendType.VLLM:
-        # Backward compatibility with the original single-runtime catalog.
-        return _PRIME_RUNTIME
-    return {}
-
-
-def prime_networking_runtime() -> dict[str, Any]:
-    """Return pinned metadata for Prime's reverse-tunnel client."""
-
-    networking = _PRIME_RUNTIME.get("networking")
-    return networking if isinstance(networking, dict) else {}
-
-
-def default_prime_container_image(backend: BackendType) -> str:
-    """Return the configured upstream runtime used by portable Prime launches."""
-
-    backend_env = f"LLM_LAUNCHPAD_PRIME_{backend.value.upper()}_CONTAINER_IMAGE"
-    return (
-        os.getenv(backend_env, "").strip()
-        or str(prime_runtime(backend).get("bootstrap_container_image") or "").strip()
-    )
-
-
-def preferred_prime_offer_image(backend: BackendType) -> str:
-    """Return the Prime base image required by the portable runtime."""
-
-    backend_env = f"LLM_LAUNCHPAD_PRIME_{backend.value.upper()}_OFFER_IMAGE"
-    return (
-        os.getenv(backend_env, "").strip()
-        or os.getenv("LLM_LAUNCHPAD_PRIME_OFFER_IMAGE", "").strip()
-        or str(prime_runtime(backend).get("bootstrap_base_image") or "").strip()
-        or PRIME_DEFAULT_BOOTSTRAP_IMAGE
-    )
-
-
-def resolve_prime_launch_spec(config: DeploymentConfig) -> PrimeLaunchSpec:
-    """Resolve Prime's single supported Ubuntu bootstrap runtime."""
-
-    offer_image = preferred_prime_offer_image(config.backend)
-    container_image = default_prime_container_image(config.backend)
-    build_recipe = None
-    if config.backend == BackendType.LLAMACPP and not os.getenv(
-        "LLM_LAUNCHPAD_PRIME_LLAMACPP_CONTAINER_IMAGE", ""
-    ).strip():
-        runtime = load_llamacpp_support_manifest(config.gguf_architecture)
-        if runtime.build_recipe:
-            container_image = runtime.image_ref
-            build_recipe = llamacpp_build_recipe(config.gguf_architecture)
-    if not container_image:
-        raise ValueError(
-            f"Prime {config.backend.value} portable runtime image is not configured."
-        )
-    return PrimeLaunchSpec(
-        offer_image=offer_image,
-        container_image=container_image,
-        build_recipe=build_recipe,
-    )
-
 
 PRIME_POD_PREFIX = "llp-prime-"
-PRIME_VRAM_HEADROOM_FACTOR = 1.05
-PRIME_RUNTIME_CONTAINER_NAME = "llm-launchpad-runtime"
-PRIME_RUNTIME_ROOT = "/opt/llm-launchpad"
-PRIME_TUNNEL_LABEL = "llm-launchpad"
-PRIME_TUNNEL_PID_PATH = f"{PRIME_RUNTIME_ROOT}/tunnel.pid"
-PRIME_TUNNEL_ID_NAME = "tunnel-id"
-PRIME_TUNNEL_LOG_PATH = f"{PRIME_RUNTIME_ROOT}/tunnel.log"
 PRIME_BOOTSTRAP_SSH_KEY_NAME = "llm-launchpad-bootstrap"
-
-
-LLAMACPP_FIT_LOG_VERBOSITY = 4
-
-
-# Shell variable carrying the staged shard's name into the fit projection.
-# Assigned from weights.args and spliced into the joined fit command after
-# the fact, because shlex.join quotes a command substitution into literal
-# text. Distinct from the server line's own variable: both are read in the
-# same container shell, and sharing one would clobber the other's value.
-PRIME_FIT_FILE_VARIABLE = "LLAMA_ARG_FIT_FILE"
-
-
-# cmake prints "[ 45%] Building CXX object ..." as it compiles; docker build
-# prefixes each line with its step number, so the marker is matched anywhere.
-_CMAKE_PERCENT_RE = re.compile(r"\[\s*(\d{1,3})%\]")
-
-
-def _gigabytes(byte_count: int) -> str:
-    """Format a byte count in decimal GB, the unit model weights are quoted in."""
-
-    return f"{byte_count / 1000**3:.1f}"
-
-
-def _llamacpp_fit_relevant_args(arguments: list[str]) -> list[str]:
-    """Keep memory-affecting common args accepted by llama-fit-params."""
-
-    supported = {
-        "-c",
-        "--ctx-size",
-        "-b",
-        "--batch-size",
-        "-ub",
-        "--ubatch-size",
-        "-ctk",
-        "--cache-type-k",
-        "-ctv",
-        "--cache-type-v",
-        "-ngl",
-        "--n-gpu-layers",
-        "--gpu-layers",
-        "-fa",
-        "--flash-attn",
-        "-fitt",
-        "--fit-target",
-    }
-    result: list[str] = []
-    index = 0
-    while index < len(arguments):
-        token = arguments[index]
-        if token.split("=", 1)[0] in supported:
-            result.append(token)
-            if "=" not in token and index + 1 < len(arguments):
-                result.append(arguments[index + 1])
-                index += 2
-                continue
-        index += 1
-    return result
-
-
 PRIME_BOOTSTRAP_SSH_KEY_PATH = SETTINGS_DIR / "prime" / "bootstrap_ed25519"
 PRIME_KNOWN_HOSTS_DIR = SETTINGS_DIR / "prime" / "known_hosts"
-
-
-@dataclass(frozen=True)
-class PrimeLaunchSpec:
-    """Resolved portable runtime and the Prime image an offer must support."""
-
-    offer_image: str
-    container_image: str = ""
-    build_recipe: str | None = None
-
-
-@dataclass(frozen=True)
-class PrimeDiskOffer:
-    """Normalized persistent-disk availability used by live validation."""
-
-    cloud_id: str
-    provider_name: str
-    data_center: str
-    country: str
-    region: str
-    stock_status: str
-    price_per_gb_hour: float | None
-    minimum_size_gb: int | None
-    maximum_size_gb: int | None
-    raw: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -249,17 +104,6 @@ class PrimeApiError(RuntimeError):
 
     def __str__(self) -> str:
         return self.message
-
-
-def _dict(value: Any) -> dict[str, Any]:
-    return value if isinstance(value, dict) else {}
-
-
-def _optional_int(value: Any) -> int | None:
-    try:
-        return int(value) if value is not None else None
-    except (TypeError, ValueError):
-        return None
 
 
 def _format_prime_error_value(value: Any, *, field: str = "") -> str:
@@ -309,7 +153,6 @@ def _prime_error_detail(payload: Any, fallback_text: str = "") -> str:
     detail = _format_prime_error_value(payload)
     if not detail:
         detail = fallback_text.strip()
-    # Keep a malformed upstream response from flooding the TUI log view.
     return detail[:2000]
 
 
@@ -378,365 +221,6 @@ def _parse_prime_tunnel(payload: Any, *, credentials_required: bool) -> PrimeTun
     )
 
 
-def prime_offer_id(payload: dict[str, Any]) -> str:
-    """Return the same six-character offer ID displayed by the Prime CLI."""
-
-    memory = _dict(payload.get("memory"))
-    vcpu = _dict(payload.get("vcpu"))
-    location = f"{payload.get('country') or 'N/A'} - {payload.get('dataCenter') or 'N/A'}"
-    value = (
-        f"{payload.get('cloudId', '')}-{payload.get('gpuType', '')}-"
-        f"{payload.get('socket') or 'N/A'}-{location}-{payload.get('provider') or 'N/A'}-"
-        f"{memory.get('defaultCount')}-{vcpu.get('defaultCount')}-{payload.get('gpuCount', '')}"
-    )
-    return hashlib.md5(value.encode()).hexdigest()[:6]
-
-
-def parse_prime_offer(payload: dict[str, Any]) -> ComputeOffer:
-    """Normalize one Prime availability item."""
-
-    prices = _dict(payload.get("prices"))
-    price = prices.get("communityPrice")
-    if price is None:
-        price = prices.get("onDemand")
-    disk = _dict(payload.get("disk"))
-    vcpu = _dict(payload.get("vcpu"))
-    memory = _dict(payload.get("memory"))
-    images = payload.get("images")
-    return ComputeOffer(
-        id=prime_offer_id(payload),
-        cloud_id=str(payload.get("cloudId") or ""),
-        provider_name=str(payload.get("provider") or ""),
-        gpu_type=str(payload.get("gpuType") or ""),
-        gpu_count=int(payload.get("gpuCount") or 0),
-        gpu_memory_gb=optional_float(payload.get("gpuMemory")),
-        region=str(payload.get("region")) if payload.get("region") else None,
-        data_center=str(payload.get("dataCenter")) if payload.get("dataCenter") else None,
-        country=str(payload.get("country")) if payload.get("country") else None,
-        socket=str(payload.get("socket")) if payload.get("socket") else None,
-        security=str(payload.get("security")) if payload.get("security") else None,
-        price_per_hour=optional_float(price),
-        is_spot=bool(payload.get("isSpot", False)),
-        is_variable_price=bool(prices.get("isVariable", False)),
-        stock_status=str(payload.get("stockStatus")) if payload.get("stockStatus") else None,
-        disk_default_gb=_optional_int(disk.get("defaultCount")),
-        vcpu_default=_optional_int(vcpu.get("defaultCount")),
-        memory_default_gb=_optional_int(memory.get("defaultCount")),
-        images=tuple(str(item) for item in images) if isinstance(images, list) else (),
-        raw=dict(payload),
-    )
-
-
-def _gpu_type_memory_gb(gpu_type: str) -> float | None:
-    """Parse a per-GPU memory size encoded in a Prime GPU type name."""
-
-    normalized = re.sub(r"[^A-Z0-9]+", "_", gpu_type.upper()).strip("_")
-    if normalized == "CPU_NODE" or normalized.startswith("CPU_"):
-        return None
-    match = re.search(r"(?:^|_)(\d{1,3})GB(?:_|$)", normalized)
-    return float(match.group(1)) if match is not None else None
-
-
-def prime_offer_gpu_memory_gb(offer: ComputeOffer) -> float | None:
-    """Return per-GPU memory from Prime metadata or its canonical GPU name.
-
-    Prime sometimes reports aggregate node memory (for example 640 GB on an
-    8x A100_80GB offer). Identity and VRAM math always use the per-GPU size.
-    """
-
-    named = _gpu_type_memory_gb(offer.gpu_type)
-    reported = (
-        float(offer.gpu_memory_gb)
-        if offer.gpu_memory_gb is not None and offer.gpu_memory_gb > 0
-        else None
-    )
-    count = max(1, int(offer.gpu_count or 1))
-    if named is not None:
-        if reported is None:
-            return named
-        if abs(reported - named) < 1.0 or abs(reported - named * count) < 1.0:
-            return named
-        return named
-    return reported
-
-
-def is_prime_gpu_offer(offer: ComputeOffer) -> bool:
-    """Return whether an availability row describes usable GPU compute."""
-
-    gpu_type = offer.gpu_type.strip().upper()
-    return (
-        offer.gpu_count > 0
-        and gpu_type != "CPU_NODE"
-        and not gpu_type.startswith("CPU_")
-        and prime_offer_gpu_memory_gb(offer) is not None
-    )
-
-
-def _prime_pod_hourly_rate(pod: dict[str, Any]) -> float | None:
-    """Best-effort hourly price from a Prime pod payload (never a guess).
-
-    Pod shapes vary across API versions, so known price keys are searched at
-    the top level and one level deep. Absence means unknown, never free.
-    """
-    candidates: list[Any] = []
-    for key in (
-        "pricePerHour",
-        "price_per_hour",
-        "hourlyPrice",
-        "hourly_price",
-        "costPerHour",
-        "cost_per_hour",
-        "price",
-        "cost",
-    ):
-        candidates.append(pod.get(key))
-        nested = pod.get("billing")
-        if isinstance(nested, dict):
-            candidates.append(nested.get(key))
-        nested = pod.get("pricing")
-        if isinstance(nested, dict):
-            candidates.append(nested.get(key))
-    for candidate in candidates:
-        try:
-            rate = optional_float(candidate)
-        except Exception:
-            continue
-        if rate is not None and rate >= 0:
-            return rate
-    return None
-
-
-def _prime_pod_started_at(pod: dict[str, Any]) -> float | None:
-    """Best-effort run start from a Prime pod payload, as wall-clock epoch."""
-    from datetime import datetime, timezone
-
-    for key in ("createdAt", "created_at", "created", "startTime", "startedAt", "started_at"):
-        raw = pod.get(key)
-        if isinstance(raw, (int, float)) and raw > 0:
-            # Heuristic: seconds vs milliseconds since epoch.
-            value = float(raw)
-            if value > 1e12:
-                value /= 1000.0
-            return value
-        if isinstance(raw, str) and raw.strip():
-            text = raw.strip()
-            try:
-                normalized = text.replace("Z", "+00:00")
-                parsed = datetime.fromisoformat(normalized)
-            except ValueError:
-                continue
-            if parsed.tzinfo is None:
-                parsed = parsed.replace(tzinfo=timezone.utc)
-            return parsed.timestamp()
-    return None
-
-
-def _cached_hourly_rate(cached: dict[str, Any]) -> float | None:
-    try:
-        rate = optional_float(cached.get("price_per_hour_usd"))
-    except Exception:
-        return None
-    if rate is None or rate < 0:
-        return None
-    return rate
-
-
-_UNAVAILABLE_STOCK = frozenset({
-    "unavailable",
-    "out_of_stock",
-    "outofstock",
-    "sold_out",
-    "soldout",
-    "not_available",
-    "notavailable",
-})
-_AVAILABLE_STOCK = frozenset({"available", "in_stock", "instock"})
-
-
-def prime_stock_availability(stock_status: str | None) -> QuoteAvailability:
-    """Map a Prime stock status string onto a normalized availability state."""
-
-    normalized = re.sub(r"[^a-z0-9]+", "_", (stock_status or "").casefold()).strip("_")
-    if normalized in _UNAVAILABLE_STOCK:
-        return QuoteAvailability.UNAVAILABLE
-    if normalized in _AVAILABLE_STOCK:
-        return QuoteAvailability.AVAILABLE
-    return QuoteAvailability.UNKNOWN
-
-
-def _is_prime_offer_unavailable(stock_status: str | None) -> bool:
-    """Return whether Prime marks an offer as unavailable under a known spelling."""
-
-    return prime_stock_availability(stock_status) is QuoteAvailability.UNAVAILABLE
-
-
-def supports_prime_image(offer: ComputeOffer, image: str) -> bool:
-    """Return whether an availability row advertises one Prime image type."""
-
-    wanted = image.strip().casefold()
-    return bool(wanted) and any(
-        candidate.strip().casefold() == wanted for candidate in offer.images
-    )
-
-
-def prime_offer_matches_location(offer: ComputeOffer, location: str | None) -> bool:
-    """Match user-facing region, country, or data-center text locally."""
-
-    wanted = str(location or "").strip().casefold()
-    if not wanted:
-        return True
-    return wanted in {
-        str(offer.region or "").strip().casefold(),
-        str(offer.country or "").strip().casefold(),
-        str(offer.data_center or "").strip().casefold(),
-    }
-
-
-def prime_offer_satisfies_vram(
-    offer: ComputeOffer,
-    required_vram_gb: float | None,
-) -> bool:
-    """Check aggregate GPU memory with the catalog's safety headroom."""
-
-    per_gpu_memory = prime_offer_gpu_memory_gb(offer)
-    if not is_prime_gpu_offer(offer) or per_gpu_memory is None:
-        return False
-    if required_vram_gb is None or required_vram_gb <= 0:
-        return True
-    available_vram = per_gpu_memory * offer.gpu_count
-    return available_vram >= required_vram_gb * PRIME_VRAM_HEADROOM_FACTOR
-
-
-def is_compatible_prime_offer(
-    offer: ComputeOffer,
-    required_vram_gb: float | None = None,
-    *,
-    required_image: str = PRIME_DEFAULT_BOOTSTRAP_IMAGE,
-) -> bool:
-    """Return whether a Prime row is a deployable secure inference option."""
-
-    return (
-        prime_offer_satisfies_vram(offer, required_vram_gb)
-        and supports_prime_image(offer, required_image)
-        and not offer.is_spot
-        and not offer.is_variable_price
-        and (offer.security or "").casefold() == "secure_cloud"
-        and not _is_prime_offer_unavailable(offer.stock_status)
-    )
-
-
-def select_prime_offer(
-    offers: Iterable[ComputeOffer],
-    *,
-    offer_id: str | None = None,
-    gpu_type: str | None = None,
-    gpu_count: int | None = None,
-    region: str | None = None,
-    required_vram_gb: float | None = None,
-    max_hourly_cost_usd: float | None = None,
-    required_image: str = PRIME_DEFAULT_BOOTSTRAP_IMAGE,
-) -> ComputeOffer:
-    """Select an exact offer or the cheapest secure on-demand matching offer."""
-
-    rows = list(offers)
-    if offer_id:
-        match = next((row for row in rows if row.id.casefold() == offer_id.strip().casefold()), None)
-        if match is None:
-            raise ValueError(f"Prime offer not found: {offer_id}")
-        if gpu_type and match.gpu_type.casefold() != gpu_type.casefold():
-            raise ValueError(f"Prime offer {offer_id} does not match the requested GPU type.")
-        if gpu_count is not None and match.gpu_count != gpu_count:
-            raise ValueError(f"Prime offer {offer_id} does not match the requested GPU count.")
-        if region and not prime_offer_matches_location(match, region):
-            raise ValueError(f"Prime offer {offer_id} does not match the requested region.")
-        if not is_prime_gpu_offer(match):
-            raise ValueError(f"Prime offer {offer_id} is not a GPU instance.")
-        if not prime_offer_satisfies_vram(match, required_vram_gb):
-            required = float(required_vram_gb or 0) * PRIME_VRAM_HEADROOM_FACTOR
-            raise ValueError(
-                f"Prime offer {offer_id} does not provide the required "
-                f"~{required:.1f} GB of GPU memory."
-            )
-        if not supports_prime_image(match, required_image):
-            raise ValueError(
-                f"Prime offer {offer_id} does not support runtime image {required_image}."
-            )
-        if match.is_spot:
-            raise ValueError(f"Prime offer {offer_id} is a spot instance.")
-        if match.is_variable_price:
-            raise ValueError(f"Prime offer {offer_id} has variable pricing.")
-        if (match.security or "").casefold() != "secure_cloud":
-            raise ValueError(f"Prime offer {offer_id} is not secure_cloud.")
-        if _is_prime_offer_unavailable(match.stock_status):
-            raise ValueError(f"Prime offer {offer_id} is unavailable.")
-        if finding := price_cap_finding(max_hourly_cost_usd, match.price_per_hour):
-            raise ValueError(finding.message)
-        return match
-
-    matches = [
-        row
-        for row in rows
-        if is_prime_gpu_offer(row) and supports_prime_image(row, required_image)
-        and price_cap_finding(max_hourly_cost_usd, row.price_per_hour) is None
-    ]
-    matches = [row for row in matches if not row.is_spot and not row.is_variable_price]
-    matches = [row for row in matches if (row.security or "").casefold() == "secure_cloud"]
-    if gpu_type:
-        matches = [row for row in matches if row.gpu_type.casefold() == gpu_type.casefold()]
-    if gpu_count is not None:
-        matches = [row for row in matches if row.gpu_count == gpu_count]
-    if region:
-        matches = [row for row in matches if prime_offer_matches_location(row, region)]
-    matches = [
-        row for row in matches if prime_offer_satisfies_vram(row, required_vram_gb)
-    ]
-    matches = [row for row in matches if not _is_prime_offer_unavailable(row.stock_status)]
-    if not matches:
-        raise ValueError(
-            f"No secure on-demand Prime GPU offer supporting {required_image} "
-            "matches the requested filters."
-        )
-    return min(
-        matches,
-        key=lambda row: (
-            row.price_per_hour is None,
-            row.price_per_hour if row.price_per_hour is not None else float("inf"),
-            row.id,
-        ),
-    )
-
-
-# llama.cpp prefixes its own warnings with a W level and a "warn:" note, and
-# both carry words an error match would accept.
-_RUNTIME_WARNING_RE = re.compile(r"^\s*(warn(ing)?[: ]|\S+\s+W\s)", re.IGNORECASE)
-
-
-def runtime_failure_detail(logs: Sequence[str], fallback: str) -> str:
-    """Pick the line that explains a dead runtime, not the one printed last.
-
-    A restarting container's tail ends with the *next* attempt's opening
-    lines, so taking the last line reports whatever the runtime happens to
-    say first. llama.cpp opens with a harmless note that LLAMA_ARG_HOST will
-    be overwritten by --host, and that is exactly what a live H200 deploy
-    reported as its cause of death -- while the real one, "failed to resolve
-    commit for unsloth/Qwen3.8-27B-GGUF" after the container could not reach
-    huggingface.co, sat a few lines above it and never reached the user.
-    Prefer the first line that reads like a failure, and never a warning: the
-    first error is the cause and the ones after it are its consequences. In
-    that same deploy the tail ended with "failed to load model", which is only
-    what happens once the download it depended on has already failed.
-    """
-    candidates = [line.strip() for line in logs if line and line.strip()]
-    if not candidates:
-        return fallback
-    for line in candidates:
-        if _RUNTIME_WARNING_RE.search(line):
-            continue
-        if is_error_like(line):
-            return line
-    return candidates[-1]
-
-
 class PrimeBackend:
     """Small requests-based client compatible with Prime CLI authentication state."""
 
@@ -751,8 +235,6 @@ class PrimeBackend:
         self.session = session or requests.Session()
         self.timeout = timeout
         self.ssh_private_key_path = ssh_private_key_path or PRIME_BOOTSTRAP_SSH_KEY_PATH
-        # Last byte count seen per pod, so a poll can tell a download that is
-        # still moving from one that has finished.
         self._runtime_byte_samples: dict[str, int] = {}
 
     def preflight(self) -> tuple[bool, str]:
@@ -767,13 +249,11 @@ class PrimeBackend:
     @staticmethod
     def _public_key_identity(value: str) -> str:
         """Normalize an OpenSSH public key without its mutable comment."""
-
         parts = value.strip().split()
         return " ".join(parts[:2]) if len(parts) >= 2 else value.strip()
 
     def _ensure_bootstrap_key_files(self) -> str:
         """Create Launchpad's dedicated Prime bootstrap key when absent."""
-
         private_path = self.ssh_private_key_path
         public_path = Path(f"{private_path}.pub")
         private_path.parent.mkdir(parents=True, exist_ok=True)
@@ -835,7 +315,6 @@ class PrimeBackend:
 
     def ensure_bootstrap_ssh_key(self) -> str:
         """Return the Prime key ID for Launchpad's dedicated bootstrap key."""
-
         public_key = self._ensure_bootstrap_key_files()
         wanted = self._public_key_identity(public_key)
         payload = self._request("GET", "/ssh_keys/", params={"offset": 0, "limit": 100})
@@ -900,6 +379,10 @@ class PrimeBackend:
             message = f"{message}: {detail}"
         raise PrimeApiError(message, status_code=response.status_code, detail=detail)
 
+    # ------------------------------------------------------------------
+    # Offers, disks, tunnels, pods (REST API)
+    # ------------------------------------------------------------------
+
     def list_offers(
         self,
         *,
@@ -933,17 +416,11 @@ class PrimeBackend:
                 if total and page * 100 >= total:
                     break
             page += 1
-        # Prime's GPU endpoint also enumerates CPU_NODE. Launchpad only serves
-        # GPU inference, so keep that provider quirk behind this adapter.
         rows = [row for row in rows if is_prime_gpu_offer(row)]
-        # Prime's API only accepts its canonical region enum in `regions`.
-        # Launchpad also accepts country and data-center labels, so location
-        # matching belongs in the adapter instead of forwarding display text.
         return [row for row in rows if prime_offer_matches_location(row, region)]
 
     def list_disk_offers(self) -> list[PrimeDiskOffer]:
         """Return live persistent-disk availability without leaking provider shapes."""
-
         rows: list[PrimeDiskOffer] = []
         page = 1
         while True:
@@ -991,7 +468,6 @@ class PrimeBackend:
         name: str,
     ) -> dict[str, Any]:
         """Create one persistent disk from an exact availability row."""
-
         if size_gb <= 0:
             raise ValueError("Prime disk size must be greater than zero.")
         if offer.minimum_size_gb is not None and size_gb < offer.minimum_size_gb:
@@ -1024,21 +500,13 @@ class PrimeBackend:
 
     def get_disk(self, disk_id: str) -> dict[str, Any]:
         """Return one persistent disk."""
-
         payload = self._request("GET", f"/disks/{disk_id}")
         if not isinstance(payload, dict):
             raise PrimeApiError("Prime disk response was not an object.")
         return payload
 
     def list_disks(self) -> list[dict[str, Any]]:
-        """Return every persistent disk on the account, across pages.
-
-        The account is the authority on what is billing. Local state records
-        only the disks Launchpad created and still remembers, and it is
-        dropped on several paths -- a create that never became ready, a
-        forgotten entry after a failed attach -- so a disk can outlive the
-        record of it and keep costing money with nothing naming it.
-        """
+        """Return every persistent disk on the account, across pages."""
         rows: list[dict[str, Any]] = []
         offset = 0
         limit = 100
@@ -1046,11 +514,6 @@ class PrimeBackend:
             payload = self._request("GET", "/disks", params={"offset": offset, "limit": limit})
             page_rows = payload.get("data", []) if isinstance(payload, dict) else []
             rows.extend(row for row in page_rows if isinstance(row, dict))
-            # A missing or unreadable total is not "one page and done": callers
-            # forget local records for disks this list omits, so stopping early
-            # drops the record of a disk that is still billing. Keep paging
-            # until a short page proves the end, and treat a null count the
-            # same way rather than crashing on int(None).
             total = (
                 optional_float(
                     payload.get("total_count", payload.get("totalCount"))
@@ -1065,7 +528,6 @@ class PrimeBackend:
 
     def delete_disk(self, disk_id: str) -> None:
         """Permanently terminate one persistent disk."""
-
         self._request("DELETE", f"/disks/{disk_id}")
 
     def create_tunnel(
@@ -1076,7 +538,6 @@ class PrimeBackend:
         local_port: int = 8000,
     ) -> PrimeTunnel:
         """Register an authenticated Prime reverse tunnel for one pod."""
-
         if not 1 <= local_port <= 65535:
             raise ValueError("Prime Tunnel local port must be between 1 and 65535.")
         payload: dict[str, Any] = {
@@ -1091,7 +552,6 @@ class PrimeBackend:
 
     def get_tunnel(self, tunnel_id: str) -> PrimeTunnel | None:
         """Return an active Prime Tunnel, or ``None`` after it is removed."""
-
         try:
             result = self._request("GET", f"/tunnel/{tunnel_id}")
         except PrimeApiError as exc:
@@ -1102,7 +562,6 @@ class PrimeBackend:
 
     def list_tunnels(self) -> list[PrimeTunnel]:
         """List active Prime Tunnels for the configured user or team."""
-
         rows: list[PrimeTunnel] = []
         page = 1
         per_page = 100
@@ -1128,7 +587,6 @@ class PrimeBackend:
 
     def delete_tunnel(self, tunnel_id: str) -> None:
         """Delete one Prime Tunnel, tolerating an already-removed registration."""
-
         try:
             self._request("DELETE", f"/tunnel/{tunnel_id}")
         except PrimeApiError as exc:
@@ -1137,7 +595,6 @@ class PrimeBackend:
 
     def delete_tunnels_for_pod(self, pod_id: str) -> list[str]:
         """Delete every Launchpad tunnel associated with a pod."""
-
         pod_label = _pod_tunnel_label(pod_id)
         tunnel_ids = [
             tunnel.tunnel_id
@@ -1186,72 +643,81 @@ class PrimeBackend:
             raise PrimeApiError("Prime create-pod response was not an object.")
         return result
 
+    # ------------------------------------------------------------------
+    # Runtime command/script facades (delegated to prime_runtime)
+    # ------------------------------------------------------------------
+
     @staticmethod
     def runtime_env(config: DeploymentConfig) -> dict[str, str]:
-        from .hf_download import hf_download_env
+        return build_runtime_env(config)
 
-        options = prime_provider_options(config)
-        if config.backend == BackendType.VLLM:
-            env: dict[str, str] = {
-                "MODEL_NAME": (config.model_name or "").strip(),
-                "SERVED_MODEL_NAME": (config.served_model_name or "").strip(),
-                "N_GPU": str(config.n_gpu or config.gpu_count or 1),
-                "TRUST_REMOTE_CODE": "true" if config.trust_remote_code else "false",
-                "FAST_BOOT": "true" if config.fast_boot else "false",
-                "VLLM_API_KEY": (config.endpoint_api_key or "").strip(),
-            }
-            optional = {
-                "MODEL_REVISION": config.model_revision,
-                "REASONING_PARSER": config.reasoning_parser,
-                "TOOL_CALL_PARSER": config.tool_call_parser,
-                "DEFAULT_CHAT_TEMPLATE_KWARGS": config.default_chat_template_kwargs,
-            }
-            env.update(
-                {
-                    key: value.strip()
-                    for key, value in optional.items()
-                    if value and value.strip()
-                }
-            )
-            # vLLM downloads through huggingface_hub, so propagate the same
-            # accelerated-transfer policy Modal uses. Explicit user overrides
-            # still win via the process environment.
-            env.update(
-                {
-                    key: value
-                    for key, value in hf_download_env().items()
-                    if key.startswith(("HF_HUB_", "HF_XET_"))
-                }
-            )
-            if options.disk_id:
-                env["HF_HOME"] = "/data/huggingface"
-                env["VLLM_CACHE_ROOT"] = "/data/vllm"
-        else:
-            extra_args = shlex.split(config.server_args or "")
-            env = {
-                "REPO_ID": (config.repo_id or "").strip(),
-                "QUANT": (config.quant or "").strip(),
-                "SERVED_MODEL_NAME": (config.served_model_name or "").strip(),
-                "LLAMACPP_API_KEY": (config.endpoint_api_key or "").strip(),
-                "LLAMACPP_SERVER_ARGS": "\n".join(extra_args),
-            }
-            if config.placement_assessment is not None:
-                env["LLM_LAUNCHPAD_SERVING_FINGERPRINT"] = (
-                    config.placement_assessment.fingerprint
-                )
-            if config.n_gpu_layers is not None:
-                env["N_GPU_LAYERS"] = str(config.n_gpu_layers)
-            if options.disk_id:
-                env["LLAMA_CACHE"] = "/data/llama.cpp"
-        try:
-            from huggingface_hub import get_token
+    @staticmethod
+    def _docker_env_file(config: DeploymentConfig) -> str:
+        return build_docker_env_file(config, PrimeBackend.runtime_env(config))
 
-            hf_token = (get_token() or "").strip()
-        except Exception:
-            hf_token = ""
-        if hf_token:
-            env["HF_TOKEN"] = hf_token
-        return {key: value for key, value in env.items() if value}
+    @staticmethod
+    def _probe_config(config: DeploymentConfig) -> str:
+        return build_probe_config(config)
+
+    @staticmethod
+    def _bootstrap_docker_command(
+        config: DeploymentConfig,
+        launch: PrimeLaunchSpec,
+    ) -> list[str]:
+        return build_bootstrap_docker_command(config, launch)
+
+    @staticmethod
+    def _bootstrap_script(config: DeploymentConfig, launch: PrimeLaunchSpec) -> str:
+        return build_bootstrap_script(
+            config, launch, PrimeBackend._bootstrap_docker_command(config, launch)
+        )
+
+    @staticmethod
+    def _tunnel_config(tunnel: PrimeTunnel, *, local_port: int = 8000) -> str:
+        return build_tunnel_config(tunnel, local_port=local_port)
+
+    @staticmethod
+    def _tunnel_start_script() -> str:
+        return build_tunnel_start_script()
+
+    @staticmethod
+    def _redact_runtime_log(value: str) -> str:
+        return redact_runtime_log(value)
+
+    @staticmethod
+    def _expected_model_bytes(config: DeploymentConfig) -> int:
+        return expected_model_bytes(config)
+
+    @staticmethod
+    def _parse_docker_byte_count(value: str) -> int | None:
+        return parse_docker_byte_count(value)
+
+    @staticmethod
+    def _parse_runtime_progress_output(stdout: str) -> tuple[str, int, int]:
+        return parse_runtime_progress_output(stdout)
+
+    @staticmethod
+    def _runtime_load_detail(
+        *,
+        network: str,
+        cache_bytes: int,
+        expected_bytes: int,
+        growing: bool | None = None,
+    ) -> str:
+        return format_runtime_load_detail(
+            network=network,
+            cache_bytes=cache_bytes,
+            expected_bytes=expected_bytes,
+            growing=growing,
+        )
+
+    @staticmethod
+    def _parse_runtime_image_progress(stdout: str) -> tuple[str, bool, int | None]:
+        return parse_runtime_image_progress(stdout)
+
+    # ------------------------------------------------------------------
+    # SSH transport and remote file staging
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _ssh_connection(pod: dict[str, Any]) -> tuple[str, str | None]:
@@ -1347,7 +813,6 @@ class PrimeBackend:
     @staticmethod
     def _privileged_shell_command(command: str) -> str:
         """Run as root directly, or use passwordless sudo for non-root images."""
-
         quoted = shlex.quote(command)
         return (
             'if [ "$(id -u)" -eq 0 ]; then '
@@ -1365,8 +830,6 @@ class PrimeBackend:
         input_text: str | None = None,
         timeout: float = 60.0,
     ) -> subprocess.CompletedProcess[str]:
-        """Run a privileged shell command across Prime image user variants."""
-
         return self._run_ssh(
             pod,
             self._privileged_shell_command(command),
@@ -1382,14 +845,25 @@ class PrimeBackend:
         input_data: bytes | None = None,
         timeout: float = 60.0,
     ) -> subprocess.CompletedProcess[bytes]:
-        """Run a privileged command with a binary stdin payload."""
-
         return self._run_ssh_bytes(
             pod,
             self._privileged_shell_command(command),
             input_data=input_data,
             timeout=timeout,
         )
+
+    def _prepare_remote_runtime_dir(self, pod: dict[str, Any], filename: str) -> str:
+        if not re.fullmatch(r"[a-z][a-z0-9_.-]*", filename):
+            raise ValueError(f"Invalid Prime runtime filename: {filename}")
+        directory = self._run_privileged_ssh(
+            pod, f"install -d -m 700 {PRIME_RUNTIME_ROOT}"
+        )
+        if directory.returncode != 0:
+            raise RuntimeError(
+                "Could not prepare the Prime runtime directory: "
+                f"{(directory.stderr or directory.stdout).strip()}"
+            )
+        return f"{PRIME_RUNTIME_ROOT}/{filename}"
 
     def _write_remote_runtime_file(
         self,
@@ -1399,22 +873,9 @@ class PrimeBackend:
         *,
         mode: str,
     ) -> None:
-        if not re.fullmatch(r"[a-z][a-z0-9_.-]*", filename):
-            raise ValueError(f"Invalid Prime runtime filename: {filename}")
-        directory = self._run_privileged_ssh(
-            pod,
-            f"install -d -m 700 {PRIME_RUNTIME_ROOT}",
-        )
-        if directory.returncode != 0:
-            raise RuntimeError(
-                "Could not prepare the Prime runtime directory: "
-                f"{(directory.stderr or directory.stdout).strip()}"
-            )
-        path = f"{PRIME_RUNTIME_ROOT}/{filename}"
+        path = self._prepare_remote_runtime_dir(pod, filename)
         written = self._run_privileged_ssh(
-            pod,
-            f"umask 077; cat > {path}",
-            input_text=content,
+            pod, f"umask 077; cat > {path}", input_text=content
         )
         if written.returncode != 0:
             raise RuntimeError(
@@ -1434,307 +895,22 @@ class PrimeBackend:
         mode: str,
         timeout: float = 180.0,
     ) -> None:
-        if not re.fullmatch(r"[a-z][a-z0-9_.-]*", filename):
-            raise ValueError(f"Invalid Prime runtime filename: {filename}")
-        directory = self._run_privileged_ssh(
-            pod,
-            f"install -d -m 700 {PRIME_RUNTIME_ROOT}",
-        )
-        if directory.returncode != 0:
-            raise RuntimeError(
-                "Could not prepare the Prime runtime directory: "
-                f"{(directory.stderr or directory.stdout).strip()}"
-            )
-        path = f"{PRIME_RUNTIME_ROOT}/{filename}"
+        path = self._prepare_remote_runtime_dir(pod, filename)
         written = self._run_privileged_ssh_bytes(
-            pod,
-            f"umask 077; cat > {path}",
-            input_data=content,
-            timeout=timeout,
+            pod, f"umask 077; cat > {path}", input_data=content, timeout=timeout
         )
         if written.returncode != 0:
             detail = (written.stderr or written.stdout or b"").decode(
-                "utf-8",
-                "replace",
+                "utf-8", "replace"
             ).strip()
             raise RuntimeError(f"Could not upload {filename} to the Prime pod: {detail}")
         changed = self._run_privileged_ssh(pod, f"chmod {mode} {path}")
         if changed.returncode != 0:
             raise RuntimeError(f"Could not secure {filename} on the Prime pod.")
 
-    @staticmethod
-    def _docker_env_file(config: DeploymentConfig) -> str:
-        runtime_env = PrimeBackend.runtime_env(config)
-        values: dict[str, str] = {}
-        endpoint_api_key = str(config.endpoint_api_key or "").strip()
-        if not endpoint_api_key:
-            raise ValueError("Prime portable runtimes require an endpoint API key.")
-        if runtime_env.get("HF_TOKEN"):
-            values["HF_TOKEN"] = runtime_env["HF_TOKEN"]
-        if config.backend == BackendType.LLAMACPP:
-            values["LLAMA_ARG_API_KEY"] = endpoint_api_key
-            fingerprint = str(
-                runtime_env.get("LLM_LAUNCHPAD_SERVING_FINGERPRINT") or ""
-            ).strip()
-            if fingerprint:
-                values["LLM_LAUNCHPAD_SERVING_FINGERPRINT"] = fingerprint
-            if prime_provider_options(config).disk_id:
-                values["LLAMA_CACHE"] = "/data/llama.cpp"
-        else:
-            values["VLLM_API_KEY"] = endpoint_api_key
-            for key in (
-                "HF_HUB_ETAG_TIMEOUT",
-                "HF_HUB_DOWNLOAD_TIMEOUT",
-                "HF_HUB_DISABLE_XET",
-                "HF_XET_HIGH_PERFORMANCE",
-            ):
-                if runtime_env.get(key):
-                    values[key] = runtime_env[key]
-            if prime_provider_options(config).disk_id:
-                values["HF_HOME"] = "/data/huggingface"
-                values["VLLM_CACHE_ROOT"] = "/data/vllm"
-        for key, value in values.items():
-            if "\n" in value or "\r" in value:
-                raise ValueError(f"Prime runtime value {key} may not contain newlines.")
-        return "".join(f"{key}={value}\n" for key, value in values.items() if value)
-
-    @staticmethod
-    def _probe_config(config: DeploymentConfig) -> str:
-        api_key = str(config.endpoint_api_key or "")
-        if any(character in api_key for character in {'"', "\\", "\n", "\r"}):
-            raise ValueError(
-                "Endpoint API keys may not contain quotes, backslashes, or newlines on Prime."
-            )
-        return (
-            "silent\nshow-error\nfail\nmax-time = 5\n"
-            f'header = "Authorization: Bearer {api_key}"\n'
-        )
-
-    @staticmethod
-    def _bootstrap_docker_command(
-        config: DeploymentConfig,
-        launch: PrimeLaunchSpec,
-    ) -> list[str]:
-        options = prime_provider_options(config)
-        command = [
-            "docker",
-            "run",
-            "-d",
-            "--name",
-            PRIME_RUNTIME_CONTAINER_NAME,
-            "--restart",
-            "unless-stopped",
-            "--gpus",
-            "all",
-            "--ipc=host",
-            "-p",
-            "8000:8000" if options.allow_insecure_http else "127.0.0.1:8000:8000",
-            "--env-file",
-            f"{PRIME_RUNTIME_ROOT}/runtime.env",
-            "-v",
-            "llm-launchpad-hf-cache:/root/.cache/huggingface",
-        ]
-        if options.disk_id:
-            command.extend(["-v", "/data:/data"])
-
-        if config.backend == BackendType.LLAMACPP:
-            from .serving_runtime import (
-                GGUF_FILE_PLACEHOLDER,
-                PRIME_API_KEY_PLACEHOLDER,
-                gguf_exec_command,
-                gguf_stage_command,
-            )
-
-            repo = str(config.repo_id or "").strip()
-            quant = str(config.quant or "").strip()
-            if not repo or not quant:
-                raise ValueError("Prime llama.cpp runtimes require a GGUF repository and quant.")
-            hf_repo = f"{repo}:{quant}" if quant else repo
-            # llama.cpp resolves LLAMA_CACHE first; stage through hf-xet into
-            # the same cache the server lists so --hf-file pins the download.
-            stage_root = "/data/llama.cpp" if options.disk_id else "/root/.cache/llama.cpp"
-            excluded_shards = (
-                [config.engram_table.replaced_shard]
-                if config.engram_table is not None and config.engram_table.replaced_shard
-                else None
-            )
-            stage_setup, hf_file_flag = gguf_stage_command(
-                repo_id=repo,
-                revision=None,
-                quant=quant,
-                dest_dir=f"{stage_root}/staged",
-                cache_dir=f"{stage_root}/staged/hf-hub",
-                exclude_files=excluded_shards,
-            )
-            llama_args = [
-                "/app/llama-server",
-                "--hf-repo",
-                hf_repo,
-                # Pin the exact staged shard: same repo listing, no quant
-                # guessing. The name is spliced in after the join, because
-                # shlex.join would quote a command substitution into literal
-                # text; see gguf_exec_command.
-                hf_file_flag[0],
-                GGUF_FILE_PLACEHOLDER,
-            ]
-            # Leave GPU placement unset by default so llama.cpp can reserve
-            # enough device memory for the context and compute buffers. An
-            # explicit override intentionally disables that automatic fit.
-            if config.n_gpu_layers is not None:
-                llama_args.extend(["--n-gpu-layers", str(config.n_gpu_layers)])
-            llama_args.extend(
-                [
-                    *shlex.split(config.server_args or ""),
-                    # Serve /metrics so the fleet can read tokens and
-                    # throughput off the runtime itself, as Modal already does.
-                    "--metrics",
-                    "--host",
-                    "0.0.0.0",
-                    "--port",
-                    "8000",
-                    "--alias",
-                    str(config.served_model_name or repo.rsplit("/", 1)[-1]),
-                ]
-            )
-            server_extra_args = shlex.split(config.server_args or "")
-            # Pin the exact staged shard, spliced in after the join: shlex.join
-            # quotes a command substitution into literal text, so embedding
-            # ``$(cat …)`` here hands the planner that text as the file name.
-            # The server line carries the same value through its own variable;
-            # see gguf_exec_command.
-            fit_args = [
-                "/app/llama-fit-params",
-                "--hf-repo",
-                hf_repo,
-                hf_file_flag[0],
-                GGUF_FILE_PLACEHOLDER,
-                # Trace level: llama.cpp logs the projected-versus-free
-                # arithmetic there, and without it a rejected plan leaves only
-                # the guard it aborted at, which says nothing about how much
-                # memory was missing.
-                "--verbosity",
-                str(LLAMACPP_FIT_LOG_VERBOSITY),
-                *_llamacpp_fit_relevant_args(server_extra_args),
-            ]
-            attestation_marker = (
-                "echo LLM_LAUNCHPAD_ATTESTATION_JSON_BEGIN; "
-                "printf '{\"schema_version\":1,\"fingerprint\":\"%s\","
-                "\"gpu_only_requested\":true}\\n' "
-                '"$LLM_LAUNCHPAD_SERVING_FINGERPRINT"; '
-                "echo LLM_LAUNCHPAD_ATTESTATION_JSON_END; "
-            )
-            fit_guard = ""
-            if config.placement_assessment is not None:
-                joined_fit = shlex.join(fit_args).replace(
-                    shlex.quote(GGUF_FILE_PLACEHOLDER),
-                    f'"${PRIME_FIT_FILE_VARIABLE}"',
-                )
-                fit_guard = (
-                    f"{PRIME_FIT_FILE_VARIABLE}="
-                    f"$(cat {shlex.quote(hf_file_flag[1])} 2>/dev/null || true); "
-                    f"if [ -x /app/llama-fit-params ] && "
-                    f"[ -n \"${PRIME_FIT_FILE_VARIABLE}\" ]; then {joined_fit} "
-                    "|| exit $?; fi; "
-                    f"{attestation_marker}"
-                )
-            projector_setup = stage_setup
-            if config.engram_table is not None:
-                engram_prelude, engram_path = _prime_engram_setup(config)
-                projector_setup += engram_prelude
-                llama_args.extend(["--ple", engram_path])
-                fit_args.extend(["--ple", engram_path])
-            if config.vision is not None:
-                if config.vision.enabled:
-                    vision_setup, projector_path = _prime_projector_setup(config)
-                    projector_setup += vision_setup
-                    llama_args.extend(["--mmproj", projector_path])
-                else:
-                    llama_args.append("--no-mmproj")
-            inner = projector_setup + fit_guard + gguf_exec_command(
-                [*llama_args, "--api-key", PRIME_API_KEY_PLACEHOLDER],
-                weights_args_path=hf_file_flag[1],
-            ).replace(
-                shlex.quote(PRIME_API_KEY_PLACEHOLDER), '"$LLAMA_ARG_API_KEY"'
-            )
-            if not options.disk_id:
-                command.extend(
-                    ["-v", "llm-launchpad-llama-cache:/root/.cache/llama.cpp"]
-                )
-            command.extend(
-                ["--env", "LLAMA_CACHE=/root/.cache/llama.cpp/staged/hf-hub"]
-                if not options.disk_id
-                else ["--env", "LLAMA_CACHE=/data/llama.cpp/staged/hf-hub"]
-            )
-            command.extend(
-                ["--entrypoint", "/bin/sh", launch.container_image, "-lc", inner]
-            )
-            return command
-
-        vllm_args = list(vllm_serve_args(config, host="0.0.0.0", port=8000))
-        inner = f'exec {shlex.join(vllm_args)} --api-key "$VLLM_API_KEY"'
-        command.extend(
-            [
-                "--entrypoint",
-                "/bin/bash",
-                launch.container_image,
-                "-lc",
-                inner,
-            ]
-        )
-        return command
-
-    @staticmethod
-    def _bootstrap_script(config: DeploymentConfig, launch: PrimeLaunchSpec) -> str:
-        docker_command = PrimeBackend._bootstrap_docker_command(config, launch)
-        # An owned base image (or any pod whose Docker store already carries
-        # the serving tag) skips the registry pull entirely: the pull is the
-        # dominant billed-time cost on Prime, and on branded base images the
-        # Docker daemon arrives with the image rather than being installed
-        # during boot (the 180s wait loop below still covers stock images).
-        prepare_image = (
-            f"if docker image inspect {shlex.quote(launch.container_image)} "
-            f">/dev/null 2>&1; then echo 'Serving image already present; "
-            f"skipping pull'; else docker pull {shlex.quote(launch.container_image)}; fi"
-        )
-        if launch.build_recipe:
-            # Source builds compile on billed GPU time, so use every CPU the
-            # pod has rather than a fixed small job count.
-            jobs = os.cpu_count() or 4
-            cuda_arch = llamacpp_cuda_architecture(config.gpu_type)
-            build_flags = f"--build-arg CUDA_ARCHITECTURES={cuda_arch} " if cuda_arch else ""
-            build_flags += f"--build-arg BUILD_JOBS={jobs} "
-            prepare_image = (
-                f"docker build -t {shlex.quote(launch.container_image)} "
-                f"{build_flags}- < {PRIME_RUNTIME_ROOT}/runtime.dockerfile"
-            )
-        return "\n".join(
-            [
-                "#!/usr/bin/env bash",
-                "set -euo pipefail",
-                f"rm -f {PRIME_RUNTIME_ROOT}/bootstrap.exit",
-                (
-                    "trap 'status=$?; printf \"%s\\n\" \"$status\" > "
-                    f"{PRIME_RUNTIME_ROOT}/bootstrap.exit' EXIT"
-                ),
-                (
-                    "for attempt in $(seq 1 36); do "
-                    "if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; "
-                    "then break; fi; "
-                    'echo "Waiting for the Prime image to finish installing Docker '
-                    '($attempt/36)"; sleep 5; done'
-                ),
-                (
-                    "command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1 || "
-                    "{ echo 'Prime image did not provide a ready Docker runtime after 180 seconds' "
-                    ">&2; exit 127; }"
-                ),
-                "nvidia-smi >/dev/null",
-                prepare_image,
-                f"docker rm -f {PRIME_RUNTIME_CONTAINER_NAME} >/dev/null 2>&1 || true",
-                shlex.join(docker_command),
-                "",
-            ]
-        )
+    # ------------------------------------------------------------------
+    # Remote runtime bootstrap, watchdog, tunnel, and status probes
+    # ------------------------------------------------------------------
 
     def start_bootstrap_runtime(
         self,
@@ -1742,33 +918,22 @@ class PrimeBackend:
         pod: dict[str, Any],
     ) -> None:
         """Upload and asynchronously start a portable inference runtime."""
-
         launch = resolve_prime_launch_spec(config)
         if launch.build_recipe:
-            self._write_remote_runtime_file(pod, "runtime.dockerfile", launch.build_recipe, mode="644")
+            self._write_remote_runtime_file(
+                pod, "runtime.dockerfile", launch.build_recipe, mode="644"
+            )
         self._write_remote_runtime_file(
-            pod,
-            "runtime.env",
-            self._docker_env_file(config),
-            mode="600",
+            pod, "runtime.env", self._docker_env_file(config), mode="600"
         )
         self._write_remote_runtime_file(
-            pod,
-            "expected-bytes",
-            f"{self._expected_model_bytes(config)}\n",
-            mode="644",
+            pod, "expected-bytes", f"{self._expected_model_bytes(config)}\n", mode="644"
         )
         self._write_remote_runtime_file(
-            pod,
-            "probe.curl",
-            self._probe_config(config),
-            mode="600",
+            pod, "probe.curl", self._probe_config(config), mode="600"
         )
         self._write_remote_runtime_file(
-            pod,
-            "bootstrap.sh",
-            self._bootstrap_script(config, launch),
-            mode="700",
+            pod, "bootstrap.sh", self._bootstrap_script(config, launch), mode="700"
         )
         started = self._run_privileged_ssh(
             pod,
@@ -1791,12 +956,7 @@ class PrimeBackend:
         endpoint_api_key: str,
         idle_seconds: int,
     ) -> None:
-        """Let the pod delete itself once idle, with the user's opted-in key.
-
-        Prime has no instance-scoped key, so this places the account key on
-        the pod (mode 600, root-only). Only called when the user turned on
-        ``prime_self_terminate``.
-        """
+        """Let the pod delete itself once idle, with the user's opted-in key."""
         from .idle_watchdog import (
             WATCHDOG_SCRIPT_NAME,
             WatchdogSpec,
@@ -1806,19 +966,23 @@ class PrimeBackend:
         )
 
         key_path = f"{PRIME_RUNTIME_ROOT}/prime-api-key"
-        self._write_remote_runtime_file(pod, "prime-api-key", f"{self.config.api_key}\n", mode="600")
-        script = watchdog_script(WatchdogSpec(
-            metrics_url="http://127.0.0.1:8000/metrics",
-            endpoint_api_key=endpoint_api_key,
-            idle_seconds=idle_seconds,
-            destroy_command=prime_destroy_command(
-                f"{self.config.base_url}/api/v1",
-                pod_id,
-                key_path,
-                f"{PRIME_RUNTIME_ROOT}/{PRIME_TUNNEL_ID_NAME}",
-            ),
-            runtime_dir=PRIME_RUNTIME_ROOT,
-        ))
+        self._write_remote_runtime_file(
+            pod, "prime-api-key", f"{self.config.api_key}\n", mode="600"
+        )
+        script = watchdog_script(
+            WatchdogSpec(
+                metrics_url="http://127.0.0.1:8000/metrics",
+                endpoint_api_key=endpoint_api_key,
+                idle_seconds=idle_seconds,
+                destroy_command=prime_destroy_command(
+                    f"{self.config.base_url}/api/v1",
+                    pod_id,
+                    key_path,
+                    f"{PRIME_RUNTIME_ROOT}/{PRIME_TUNNEL_ID_NAME}",
+                ),
+                runtime_dir=PRIME_RUNTIME_ROOT,
+            )
+        )
         self._write_remote_runtime_file(pod, WATCHDOG_SCRIPT_NAME, script, mode="700")
         started = self._run_privileged_ssh(pod, start_command(PRIME_RUNTIME_ROOT))
         if started.returncode != 0:
@@ -1827,45 +991,7 @@ class PrimeBackend:
                 f"{(started.stderr or started.stdout).strip()}"
             )
 
-    @staticmethod
-    def _tunnel_config(tunnel: PrimeTunnel, *, local_port: int = 8000) -> str:
-        """Build the minimal frpc configuration documented by Prime Tunnel."""
-
-        if not 1 <= local_port <= 65535:
-            raise ValueError("Prime Tunnel local port must be between 1 and 65535.")
-        if not 1 <= tunnel.server_port <= 65535:
-            raise ValueError("Prime Tunnel returned an invalid server port.")
-
-        def toml_string(value: str) -> str:
-            return json.dumps(value, ensure_ascii=True)
-
-        return "\n".join(
-            [
-                f"serverAddr = {toml_string(tunnel.server_host)}",
-                f"serverPort = {tunnel.server_port}",
-                f"user = {toml_string(tunnel.tunnel_id)}",
-                'auth.method = "token"',
-                f"auth.token = {toml_string(tunnel.frp_token)}",
-                f"metadatas.binding_secret = {toml_string(tunnel.binding_secret)}",
-                "transport.tcpMux = true",
-                "transport.tcpMuxKeepaliveInterval = 30",
-                "transport.poolCount = 10",
-                "transport.dialServerKeepalive = 60",
-                'log.to = "console"',
-                'log.level = "info"',
-                "[[proxies]]",
-                f"name = {toml_string(tunnel.tunnel_id)}",
-                'type = "http"',
-                'localIP = "127.0.0.1"',
-                f"localPort = {local_port}",
-                f"subdomain = {toml_string(tunnel.tunnel_id)}",
-                "",
-            ]
-        )
-
     def _pod_frpc_arch(self, pod: dict[str, Any]) -> str:
-        """Return the frp architecture name for one Prime pod."""
-
         from .prime_frpc import normalize_frpc_arch
 
         result = self._run_privileged_ssh(pod, "uname -m", timeout=20)
@@ -1877,8 +1003,6 @@ class PrimeBackend:
         return normalize_frpc_arch((result.stdout or "").strip())
 
     def _ensure_remote_frpc(self, pod: dict[str, Any], arch: str) -> None:
-        """Reuse a cached frpc binary on the pod, or copy Launchpad's local build."""
-
         from .prime_frpc import ensure_cached_frpc
 
         probe = self._run_privileged_ssh(
@@ -1896,40 +1020,7 @@ class PrimeBackend:
             return
         binary = ensure_cached_frpc(arch)
         self._write_remote_runtime_bytes(
-            pod,
-            "frpc",
-            binary.read_bytes(),
-            mode="755",
-            timeout=180,
-        )
-
-    @staticmethod
-    def _tunnel_start_script() -> str:
-        """Start a preinstalled frpc binary and cache it on an attached disk."""
-
-        return "\n".join(
-            [
-                "#!/usr/bin/env bash",
-                "set -euo pipefail",
-                f"if [ ! -x {PRIME_RUNTIME_ROOT}/frpc ]; then",
-                '  echo "Prime Tunnel client is missing" >&2',
-                "  exit 127",
-                "fi",
-                f"if [ -s {PRIME_TUNNEL_PID_PATH} ]; then",
-                f'  old_pid="$(cat {PRIME_TUNNEL_PID_PATH})"',
-                '  if kill -0 "$old_pid" 2>/dev/null; then kill "$old_pid"; fi',
-                "fi",
-                (
-                    f"nohup {PRIME_RUNTIME_ROOT}/frpc -c {PRIME_RUNTIME_ROOT}/tunnel.toml "
-                    f"> {PRIME_TUNNEL_LOG_PATH} 2>&1 </dev/null &"
-                ),
-                f'printf "%s\\n" "$!" > {PRIME_TUNNEL_PID_PATH}',
-                "if [ -d /data ]; then",
-                "  install -d -m 700 /data/llm-launchpad",
-                f"  cp -f {PRIME_RUNTIME_ROOT}/frpc /data/llm-launchpad/frpc",
-                "fi",
-                "",
-            ]
+            pod, "frpc", binary.read_bytes(), mode="755", timeout=180
         )
 
     def start_tunnel(
@@ -1940,29 +1031,22 @@ class PrimeBackend:
         local_port: int = 8000,
     ) -> None:
         """Copy the cached tunnel client to the pod and start it."""
-
         self._write_remote_runtime_file(
             pod,
             "tunnel.toml",
             self._tunnel_config(tunnel, local_port=local_port),
             mode="600",
         )
-        # The on-pod idle watchdog deletes this tunnel along with the pod.
         self._write_remote_runtime_file(
             pod, PRIME_TUNNEL_ID_NAME, f"{tunnel.tunnel_id}\n", mode="600"
         )
         arch = self._pod_frpc_arch(pod)
         self._ensure_remote_frpc(pod, arch)
         self._write_remote_runtime_file(
-            pod,
-            "tunnel-bootstrap.sh",
-            self._tunnel_start_script(),
-            mode="700",
+            pod, "tunnel-bootstrap.sh", self._tunnel_start_script(), mode="700"
         )
         started = self._run_privileged_ssh(
-            pod,
-            f"{PRIME_RUNTIME_ROOT}/tunnel-bootstrap.sh",
-            timeout=60,
+            pod, f"{PRIME_RUNTIME_ROOT}/tunnel-bootstrap.sh", timeout=60
         )
         if started.returncode != 0:
             detail = (started.stderr or started.stdout).strip()
@@ -1972,12 +1056,9 @@ class PrimeBackend:
 
     def tunnel_runtime_logs(self, pod: dict[str, Any], tail: int = 50) -> list[str]:
         """Return sanitized Prime Tunnel client logs from the pod."""
-
         count = min(500, max(1, int(tail)))
         result = self._run_privileged_ssh(
-            pod,
-            f"tail -n {count} {PRIME_TUNNEL_LOG_PATH}",
-            timeout=20,
+            pod, f"tail -n {count} {PRIME_TUNNEL_LOG_PATH}", timeout=20
         )
         lines = (result.stdout or result.stderr).splitlines()
         return [self._redact_runtime_log(line) for line in lines]
@@ -1988,13 +1069,9 @@ class PrimeBackend:
         tunnel_id: str,
     ) -> tuple[bool, bool, str]:
         """Return ``(ready, failed, detail)`` for the pod-side tunnel client."""
-
         process = self._run_privileged_ssh(
             pod,
-            (
-                f"test -s {PRIME_TUNNEL_PID_PATH} && "
-                f"kill -0 $(cat {PRIME_TUNNEL_PID_PATH})"
-            ),
+            f"test -s {PRIME_TUNNEL_PID_PATH} && kill -0 $(cat {PRIME_TUNNEL_PID_PATH})",
             timeout=20,
         )
         logs = self.tunnel_runtime_logs(pod, tail=30)
@@ -2012,162 +1089,11 @@ class PrimeBackend:
             return True, False, "secure HTTPS tunnel is connected"
         return False, False, f"waiting for Prime Tunnel ({status or 'pending'})"
 
-    @staticmethod
-    def _redact_runtime_log(value: str) -> str:
-        value = re.sub(r"(--api-key(?:=|\s+))\S+", r"\1[redacted]", value)
-        value = re.sub(
-            (
-                r"((?:HF_TOKEN|VLLM_API_KEY|LLAMA_ARG_API_KEY|"
-                r"frp_token|binding_secret)=)\S+"
-            ),
-            r"\1[redacted]",
-            value,
-            flags=re.IGNORECASE,
-        )
-        return re.sub(
-            (
-                r"((?:['\"]?(?:api_key|token|frp_token|binding_secret)['\"]?)"
-                r"\s*[=:]\s*)"
-                r"(\[[^\]]*\]|'[^']*'|\"[^\"]*\"|\S+)"
-            ),
-            r"\1[redacted]",
-            value,
-            flags=re.IGNORECASE,
-        )
-
-    @staticmethod
-    def _expected_model_bytes(config: DeploymentConfig) -> int:
-        """Bytes the pod will actually download, for model-load percentages.
-
-        This used to be ``required_vram_gb``, which is the whole serving plan:
-        weights plus KV cache plus compute buffers plus reserve. The pod only
-        ever downloads the weights, so the percentage was scaled against a
-        number a third larger than the thing being measured -- a finished
-        download read as about 75%, and since completion is detected at 98%
-        of expected, it never read as finished at all. It sat at three
-        quarters for the whole of the model load.
-
-        The planner already knows the weight size; use that, and when it is
-        unavailable report nothing rather than a percentage that cannot reach
-        its own end. A wait with no percentage still reports elapsed time.
-        """
-
-        assessment = config.placement_assessment
-        memory = getattr(assessment, "memory", None)
-        weights_gb = getattr(memory, "weights_gb", None)
-        if not weights_gb or weights_gb <= 0:
-            return 0
-        return int(float(weights_gb) * (1000**3))
-
-    @staticmethod
-    def _parse_docker_byte_count(value: str) -> int | None:
-        """Parse docker stats sizes such as ``61.7GB`` or ``551MiB``."""
-        match = re.fullmatch(
-            r"\s*([0-9]+(?:\.[0-9]+)?)\s*([KMGTPE]i?B|B)\s*",
-            value or "",
-            flags=re.IGNORECASE,
-        )
-        if match is None:
-            return None
-        try:
-            amount = float(match.group(1))
-        except ValueError:
-            return None
-        unit = match.group(2).upper()
-        multipliers = {
-            "B": 1,
-            "KB": 1000,
-            "MB": 1000**2,
-            "GB": 1000**3,
-            "TB": 1000**4,
-            "PB": 1000**5,
-            "EB": 1000**6,
-            "KIB": 1024,
-            "MIB": 1024**2,
-            "GIB": 1024**3,
-            "TIB": 1024**4,
-            "PIB": 1024**5,
-            "EIB": 1024**6,
-        }
-        multiplier = multipliers.get(unit)
-        if multiplier is None:
-            return None
-        return int(amount * multiplier)
-
-    @staticmethod
-    def _parse_runtime_progress_output(stdout: str) -> tuple[str, int, int]:
-        """Parse docker stats plus cache/expected byte counters."""
-        network = ""
-        cache_bytes = 0
-        expected_bytes = 0
-        for raw_line in (stdout or "").splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            if line.startswith("CACHE:"):
-                try:
-                    cache_bytes = max(0, int(float(line.split(":", 1)[1].strip() or "0")))
-                except ValueError:
-                    cache_bytes = 0
-                continue
-            if line.startswith("EXPECTED:"):
-                try:
-                    expected_bytes = max(0, int(float(line.split(":", 1)[1].strip() or "0")))
-                except ValueError:
-                    expected_bytes = 0
-                continue
-            if not network:
-                network = line
-        return network, cache_bytes, expected_bytes
-
-    @staticmethod
-    def _runtime_load_detail(
-        *,
-        network: str,
-        cache_bytes: int,
-        expected_bytes: int,
-        growing: bool | None = None,
-    ) -> str:
-        """Describe model download/load using cache bytes when a size is known."""
-        downloaded = max(0, cache_bytes)
-        rx_token = (network or "").split("/", 1)[0].strip()
-        rx_bytes = PrimeBackend._parse_docker_byte_count(rx_token)
-        if downloaded <= 0 and rx_bytes:
-            downloaded = rx_bytes
-        download_complete = expected_bytes > 0 and downloaded >= int(expected_bytes * 0.98)
-        if downloaded > 0 and not download_complete:
-            # The percentage keeps its own parentheses: the summary reads it
-            # back with a "(N%)" pattern and would miss one followed by a
-            # comma.
-            if expected_bytes > 0:
-                percent = max(0, min(99, int(downloaded * 100 / expected_bytes)))
-                return (
-                    f"runtime container is downloading the model ({percent}%), "
-                    f"{_gigabytes(downloaded)} of {_gigabytes(expected_bytes)} GB"
-                )
-            # Without a planner estimate there is no percentage to give. A
-            # byte count still beats a bare "loading the model", but only
-            # once the count is known to be moving: the network counter holds
-            # its final value while the weights load into VRAM, and calling
-            # that a download would leave the step stuck there.
-            if growing:
-                return (
-                    "runtime container is downloading the model, "
-                    f"{_gigabytes(downloaded)} GB so far"
-                )
-        if network.strip():
-            return f"runtime container is loading the model (network {network.strip()})"
-        return "runtime container is loading the model"
-
     def bootstrap_runtime_status(self, pod: dict[str, Any]) -> tuple[bool, bool, str]:
         """Return ``(ready, failed, detail)`` for a portable runtime."""
-
         probe = self._run_privileged_ssh(
             pod,
-            (
-                f"curl --config {PRIME_RUNTIME_ROOT}/probe.curl "
-                "http://127.0.0.1:8000/v1/models"
-            ),
+            f"curl --config {PRIME_RUNTIME_ROOT}/probe.curl http://127.0.0.1:8000/v1/models",
             timeout=20,
         )
         if probe.returncode == 0:
@@ -2213,13 +1139,6 @@ class PrimeBackend:
                 (
                     "docker stats --no-stream --format='{{.NetIO}}' "
                     f"{PRIME_RUNTIME_CONTAINER_NAME}; "
-                    # No awk here on purpose. The program has to survive two
-                    # shells -- this one and the container's -- and an
-                    # unescaped "$1" inside the inner double quotes was being
-                    # expanded to nothing, so awk saw "{s+=}" and exited on a
-                    # syntax error. The cache size came back empty on every
-                    # poll, leaving docker's network counter as the only
-                    # measure of a download. "du -c" totals the paths itself.
                     f"echo CACHE:$(docker exec {PRIME_RUNTIME_CONTAINER_NAME} sh -lc "
                     "'du -scb /root/.cache/huggingface /root/.cache/llama.cpp "
                     "/data/huggingface /data/llama.cpp 2>/dev/null "
@@ -2243,10 +1162,6 @@ class PrimeBackend:
                 growing=self._runtime_bytes_growing(pod, cache_bytes, network),
             )
 
-        # One round trip for the exit status, the image kind and the build
-        # log: this runs every five seconds against a pod that may be busy
-        # compiling, so the image progress rides along with the status read
-        # rather than opening a connection of its own.
         bootstrap = self._run_privileged_ssh(
             pod,
             (
@@ -2272,47 +1187,12 @@ class PrimeBackend:
             return False, False, "building the runtime image from source"
         return False, False, f"building the runtime image from source ({percent}%)"
 
-    @staticmethod
-    def _parse_runtime_image_progress(stdout: str) -> tuple[str, bool, int | None]:
-        """Return the bootstrap exit status, whether it builds, and its percent.
-
-        An architecture served by a source build compiles llama.cpp with CUDA
-        on the pod, which takes far longer than a pull. Reporting both as
-        "pulling the runtime image" left a long compile looking like a stalled
-        download. The dockerfile staged beside the bootstrap script is what
-        distinguishes them, and cmake's own percentage is in the build log.
-        """
-
-        exit_status = ""
-        building = False
-        percent: int | None = None
-        for raw_line in (stdout or "").splitlines():
-            line = raw_line.strip()
-            if line.startswith("EXIT:"):
-                exit_status = line.split(":", 1)[1].strip()
-                continue
-            if line.startswith("KIND:"):
-                building = line.split(":", 1)[1].strip() == "build"
-                continue
-            match = _CMAKE_PERCENT_RE.search(line)
-            if match:
-                try:
-                    percent = max(0, min(99, int(match.group(1))))
-                except ValueError:
-                    percent = None
-        return exit_status, building, percent
-
     def _runtime_bytes_growing(
         self,
         pod: dict[str, Any],
         cache_bytes: int,
         network: str,
     ) -> bool | None:
-        """Return whether the pod has pulled more bytes since the last poll.
-
-        ``None`` on the first sample, when there is nothing to compare against.
-        """
-
         observed = max(0, cache_bytes)
         if observed <= 0:
             rx = PrimeBackend._parse_docker_byte_count(
@@ -2328,7 +1208,6 @@ class PrimeBackend:
 
     def bootstrap_runtime_logs(self, pod: dict[str, Any], tail: int = 200) -> list[str]:
         """Read portable runtime logs over SSH without exposing env files."""
-
         count = min(5000, max(1, int(tail)))
         result = self._run_privileged_ssh(
             pod,
@@ -2343,7 +1222,6 @@ class PrimeBackend:
 
     def billing_wallet(self, *, limit: int = 100) -> tuple[Any | None, str | None]:
         """Return the Prime wallet billing snapshot and an optional error message."""
-
         params: dict[str, Any] = {"limit": max(1, min(int(limit), 1000))}
         if self.config.team_id:
             params["teamId"] = self.config.team_id
@@ -2365,9 +1243,11 @@ class PrimeBackend:
             payload = self._request("GET", "/pods", params={"offset": offset, "limit": limit})
             page_rows = payload.get("data", []) if isinstance(payload, dict) else []
             rows.extend(row for row in page_rows if isinstance(row, dict))
-            total = int(
-                payload.get("total_count", payload.get("totalCount", len(page_rows)))
-            ) if isinstance(payload, dict) else 0
+            total = (
+                int(payload.get("total_count", payload.get("totalCount", len(page_rows))))
+                if isinstance(payload, dict)
+                else 0
+            )
             offset += len(page_rows)
             if not page_rows or offset >= total:
                 break
@@ -2504,7 +1384,6 @@ class PrimeBackend:
 
     def public_endpoint_ready(self, endpoint: str, api_key: str) -> tuple[bool, str]:
         """Probe the public runtime endpoint without forwarding Prime credentials."""
-
         try:
             response = requests.get(
                 f"{endpoint.rstrip('/')}/v1/models",

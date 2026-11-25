@@ -119,12 +119,9 @@ class _ModalAdapter:
         return ProviderListing(provider=self.provider, rows=tuple(rows))
 
     def deploy(self, config: DeploymentConfig) -> EventStream:
-        # Modal deploy is driven by the orchestrator's shared preparation
-        # (preflight, tuning, env). The adapter owns only the Modal-specific
-        # execution step; the orchestrator delegates here instead of
-        # branching on provider.
-        orchestrator = _orchestrator_for_adapter()
-        yield from orchestrator.deploy_modal_only(config)
+        from .modal_deployment import deploy_modal
+
+        yield from deploy_modal(config)
 
     def stop(self, resource: ProviderResource) -> ProviderCleanup:
         from .backend import ModalBackend
@@ -188,8 +185,9 @@ class _PrimeAdapter:
         return ProviderListing(provider=self.provider, rows=tuple(rows))
 
     def deploy(self, config: DeploymentConfig) -> EventStream:
-        orchestrator = _orchestrator_for_adapter()
-        yield from orchestrator.deploy_prime_only(config)
+        from .prime_deployment import PrimeDeploymentRunner
+
+        yield from PrimeDeploymentRunner().deploy(config)
 
     def stop(self, resource: ProviderResource) -> ProviderCleanup:
         from .prime_backend import PrimeBackend
@@ -258,12 +256,6 @@ class _VastAdapter:
             storage_consequence=storage,
             remains_billable=billable,
         )
-
-
-def _orchestrator_for_adapter() -> Any:
-    from .orchestrator import Orchestrator
-
-    return Orchestrator()
 
 
 _ADAPTERS: dict[ComputeProvider, ProviderAdapter] = {

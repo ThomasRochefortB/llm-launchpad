@@ -27,21 +27,19 @@ from llm_launchpad.protocol.events import LogEvent
 # progress on an interval, or is short enough that silence is defensible -- and
 # the bound that makes it defensible is written down.
 REPORTS_PROGRESS = {
-    ("orchestrator.py", "_await_prime_pod_active"),
-    ("orchestrator.py", "_establish_prime_endpoint"),
-    ("vast_deployment.py", "_deploy_locked"),
+    ("prime_deployment.py", "await_pod_active"),
+    ("prime_deployment.py", "establish_endpoint"),
+    ("vast_deployment.py", "_wait_for_ssh"),
 }
 BOUNDED_SILENT = {
     # Cannot report by construction: not a generator, so it has no channel to
     # emit on. Capped at 120s, which is the whole justification.
-    ("orchestrator.py", "_await_prime_public_endpoint"): 120,
+    ("prime_deployment.py", "await_public_endpoint"): 120,
 }
 # Not poll-until-ready at all: these wait a known interval before retrying, so
-# there is no unknown remaining time to report on. (The warmup backoff sleep
-# sits in `run`, after the nested log-drain helpers, so discovery names the
-# last def it passes.)
+# there is no unknown remaining time to report on.
 BACKOFF_SLEEPS = {
-    ("warmup.py", "live_logs"),
+    ("warmup.py", "_sleep_between_probes"),
 }
 
 _POLL_LOOP_RE = re.compile(r"^\s*while time\.(?:monotonic|time)\(\) < ", re.MULTILINE)

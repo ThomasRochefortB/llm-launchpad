@@ -513,7 +513,7 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
 
             write_line.assert_called_once_with(raw_line)
 
-    async def test_summary_mode_failure_appends_debug_hint(self) -> None:
+    async def test_summary_mode_failure_offers_retained_raw_logs(self) -> None:
         app = _TestApp()
         async with app.run_test() as pilot:
             app.push_screen(
@@ -528,6 +528,8 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
 
             screen = app.screen
             assert isinstance(screen, MonitorScreen)
+            raw_detail = "llama_model_loader: loaded tensor blk.0.attn_q.weight"
+            screen.on_log_message(LogMessage(raw_detail))
             screen.on_operation_done(
                 OperationDone(
                     operation=OperationType.WARMUP,
@@ -537,9 +539,139 @@ class MonitorScreenTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
             await pilot.pause()
+            await pilot.pause()
 
             content = "\n".join(screen.log_viewer.log_widget.lines)
-            self.assertIn('Tip: re-run with "Show debug logs" enabled to see full backend logs.', content)
+            self.assertIn("Tip: press v (or Raw logs) to inspect the full backend log.", content)
+            self.assertNotIn(raw_detail, content)
+
+            raw_btn = screen.query_one("#failure-raw-logs-btn", Button)
+            self.assertTrue(raw_btn.display)
+            self.assertEqual(str(raw_btn.label), "Raw logs")
+
+            raw_btn.press()
+            await pilot.pause()
+            raw_content = "\n".join(screen.log_viewer.log_widget.lines)
+            self.assertIn(raw_detail, raw_content)
+            self.assertEqual(str(raw_btn.label), "Summary")
+
+    async def test_failed_modal_deploy_enables_retry_and_other_placement_when_safe(self) -> None:
+        class _RecoveryApp(App[None]):
+            def __init__(self) -> None:
+                super().__init__()
+                self.retried: list[DeploymentConfig] = []
+                self.re_placed: list[DeploymentConfig] = []
+
+            def retry_deployment(self, config: DeploymentConfig) -> None:
+                self.retried.append(config)
+
+            def choose_other_placement(self, config: DeploymentConfig) -> None:
+                self.re_placed.append(config)
+
+        config = DeploymentConfig(
+            backend=BackendType.LLAMACPP,
+            provider=ComputeProvider.MODAL,
+            repo_id="unsloth/Qwen3-4B-GGUF",
+            gpu_type="A10G",
+            gpu_count=1,
+        )
+        app = _RecoveryApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen = MonitorScreen(
+                title="Deploy",
+                deploy_backend=BackendType.LLAMACPP,
+                summarize_backend_logs=True,
+                show_debug_logs=False,
+                deployment_config=config,
+            )
+            app.push_screen(screen)
+            await pilot.pause()
+            screen.on_operation_done(
+                OperationDone(OperationType.STOP, True, 0, "Stopped.", phase_only=True)
+            )
+            screen.on_operation_done(
+                OperationDone(OperationType.DEPLOY, False, 1, "GPU timed out")
+            )
+            await pilot.pause()
+            await pilot.pause()
+
+            self.assertTrue(screen.check_action("retry_deploy", ()))
+            self.assertTrue(screen.check_action("other_placement", ()))
+            self.assertTrue(screen.query_one("#failure-retry-btn", Button).display)
+            self.assertTrue(screen.query_one("#failure-placement-btn", Button).display)
+
+            screen.action_retry_deploy()
+            screen.action_other_placement()
+            self.assertEqual(app.retried, [config])
+            self.assertEqual(app.re_placed, [config])
+
+    async def test_failed_vast_deploy_offers_other_placement_but_not_blind_retry(self) -> None:
+        config = DeploymentConfig(
+            backend=BackendType.LLAMACPP,
+            provider=ComputeProvider.VAST,
+            repo_id="unsloth/Qwen3-4B-GGUF",
+            gpu_type="RTX_4090",
+            gpu_count=1,
+        )
+        app = _TestApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen = MonitorScreen(
+                title="Deploy",
+                deploy_backend=BackendType.LLAMACPP,
+                summarize_backend_logs=True,
+                show_debug_logs=False,
+                deployment_config=config,
+            )
+            app.push_screen(screen)
+            await pilot.pause()
+            screen.on_operation_done(
+                OperationDone(OperationType.STOP, True, 0, "Stopped.", phase_only=True)
+            )
+            screen.on_operation_done(
+                OperationDone(OperationType.DEPLOY, False, 1, "SSH refused")
+            )
+            await pilot.pause()
+            await pilot.pause()
+
+            self.assertFalse(screen.check_action("retry_deploy", ()))
+            self.assertTrue(screen.check_action("other_placement", ()))
+            self.assertFalse(screen.query_one("#failure-retry-btn", Button).display)
+            self.assertTrue(screen.query_one("#failure-placement-btn", Button).display)
+
+    async def test_failed_deploy_with_live_resource_blocks_retry_and_placement(self) -> None:
+        from llm_launchpad.tui.workers import ResourceAllocated
+
+        config = DeploymentConfig(
+            backend=BackendType.LLAMACPP,
+            provider=ComputeProvider.MODAL,
+            repo_id="unsloth/Qwen3-4B-GGUF",
+            gpu_type="A10G",
+            gpu_count=1,
+        )
+        app = _TestApp()
+        async with app.run_test(size=(120, 40)) as pilot:
+            screen = MonitorScreen(
+                title="Deploy",
+                deploy_backend=BackendType.LLAMACPP,
+                summarize_backend_logs=True,
+                show_debug_logs=False,
+                deployment_config=config,
+            )
+            app.push_screen(screen)
+            await pilot.pause()
+            screen.on_resource_allocated(ResourceAllocated(app_id="ap-live"))
+            screen.on_operation_done(
+                OperationDone(OperationType.DEPLOY, False, 1, "cleanup failed")
+            )
+            await pilot.pause()
+            await pilot.pause()
+
+            self.assertFalse(screen.check_action("retry_deploy", ()))
+            self.assertFalse(screen.check_action("other_placement", ()))
+            self.assertFalse(screen.query_one("#failure-retry-btn", Button).display)
+            self.assertFalse(screen.query_one("#failure-placement-btn", Button).display)
+            body = str(screen.query_one("#failure-card-body", Static).render())
+            self.assertIn("Open Manage", body)
 
     async def test_log_widget_is_selectable_log(self) -> None:
         """LogViewer should use SelectableLog (not plain Log) for line selection."""

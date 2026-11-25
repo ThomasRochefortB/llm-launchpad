@@ -284,6 +284,234 @@ def effective_config_for_attempt(attempt: LifecycleAttempt) -> DeploymentConfig:
     return config
 
 
+def _sync_runtime_outputs_to_caller(
+    source: DeploymentConfig,
+    target: DeploymentConfig,
+) -> None:
+    """Propagate runtime-minted fields from the executed config back to the caller's handle."""
+    if source is target:
+        return
+    if source.endpoint_api_key:
+        target.endpoint_api_key = source.endpoint_api_key
+    if source.function_slug:
+        target.function_slug = source.function_slug
+    if source.served_model_name and not target.served_model_name:
+        target.served_model_name = source.served_model_name
+    if source.price_per_hour_usd is not None:
+        target.price_per_hour_usd = source.price_per_hour_usd
+    if source.runtime_attestation is not None:
+        target.runtime_attestation = source.runtime_attestation
+    if source.tool_calling is not None:
+        target.tool_calling = source.tool_calling
+
+
+@dataclass
+class _DeployStreamResult:
+    """Observed outputs of consuming one ``orchestrator.deploy`` event stream."""
+
+    succeeded: bool = False
+    cancelled: bool = False
+    observed_url: str | None = None
+    observed_endpoint: EndpointInfo | None = None
+    resource_app_id: str | None = None
+    failure_detail: str = ""
+    failure_exit_code: int | None = None
+    failure_event: OperationCompleteEvent | None = None
+    cancel_cleanup: Any | None = None
+
+
+def _cancelled_attempt_outcome(
+    cleanup: Any,
+    *,
+    resource_app_id: str | None,
+    observed_url: str | None,
+    observed_endpoint: EndpointInfo | None,
+    attestation: Any | None = None,
+) -> DeploymentAttemptOutcome:
+    """Normalize a cancellation cleanup result into a ``CANCELLED`` attempt outcome."""
+    if cleanup.disposition == CleanupDisposition.CONFIRMED:
+        message = "Cancelled; resource stopped."
+    elif cleanup.disposition == CleanupDisposition.NOTHING_TO_CLEAN:
+        message = "Cancelled before allocating a resource."
+    else:
+        message = (
+            cleanup.detail
+            or "Cancellation cleanup failed; check Manage. Recovery record retained."
+        )
+    return DeploymentAttemptOutcome(
+        disposition=AttemptDisposition.CANCELLED,
+        resource_app_id=resource_app_id,
+        endpoint_url=observed_url,
+        endpoint=observed_endpoint,
+        runtime_attestation=attestation,
+        failure_detail=message,
+        cleanup=cleanup.disposition,
+        cleanup_error=cleanup.detail or None,
+        retry_allowed=False,
+    )
+
+
+def _consume_deploy_stream(
+    orchestrator: Any,
+    attempt: LifecycleAttempt,
+    config: DeploymentConfig,
+    *,
+    intent: OperationIntent,
+    hooks: LifecycleCallbacks,
+    phase_timer: StartupPhaseTimer,
+) -> _DeployStreamResult:
+    """Consume ``orchestrator.deploy(config)``, tracking URLs, resources, and cancellation."""
+    from .deploy_events import EndpointUrlResolver
+
+    state = _DeployStreamResult()
+    deploy_events = orchestrator.deploy(config)
+    url_resolver = EndpointUrlResolver()
+    try:
+        for event in deploy_events:
+            _sync_runtime_outputs_to_caller(config, attempt.config)
+            endpoint = _endpoint_from_event(event)
+            if endpoint is not None:
+                if endpoint.web_url:
+                    url_resolver.observe(event)
+                    state.observed_url = url_resolver.url or endpoint.web_url
+                state.observed_endpoint = endpoint
+                if endpoint.app_id:
+                    state.resource_app_id = endpoint.app_id
+                    hooks.on_resource(state.resource_app_id)
+            if isinstance(event, ResourceAllocatedEvent) and event.app_id:
+                state.resource_app_id = event.app_id
+                hooks.on_resource(state.resource_app_id)
+            if isinstance(event, LogEvent):
+                url_resolver.observe(event)
+                if url_resolver.url:
+                    state.observed_url = url_resolver.url
+            if hooks.is_cancelled():
+                state.cancelled = True
+                state.cancel_cleanup = _cancel_cleanup(
+                    orchestrator,
+                    hooks,
+                    config,
+                    state.resource_app_id,
+                    deploy_stream=deploy_events,
+                )
+                return state
+            hooks.on_event(event)
+            if isinstance(event, OperationCompleteEvent) and event.operation in (
+                OperationType.DEPLOY,
+                OperationType.SMOKE_TEST,
+            ):
+                deploy_phase = phase_timer.deploy_event(event.operation)
+                if deploy_phase is not None:
+                    hooks.on_event(deploy_phase)
+                if _is_smoke_success(event.operation, event.success, intent):
+                    state.succeeded = True
+                elif not event.success:
+                    state.failure_detail = event.detail or "Deployment failed."
+                    state.failure_exit_code = event.exit_code or None
+                    state.failure_event = event
+    finally:
+        _sync_runtime_outputs_to_caller(config, attempt.config)
+        _close_stream(deploy_events)
+    return state
+
+
+def _failed_deploy_outcome(
+    config: DeploymentConfig,
+    stream: _DeployStreamResult,
+) -> DeploymentAttemptOutcome:
+    """Classify retry eligibility and cleanup state for a failed deploy attempt."""
+    from .provider_adapters import rollback_from_event
+
+    failure_detail = stream.failure_detail
+    rollback = rollback_from_event(stream.failure_event)
+    if rollback is not None and rollback.confirmed:
+        retry_allowed = config.retry_allowed
+        cleanup = CleanupDisposition.CONFIRMED
+    elif rollback is not None:
+        retry_allowed = False
+        cleanup = CleanupDisposition.FAILED
+        if rollback.detail and "Cleanup remains pending" not in failure_detail:
+            failure_detail = f"{failure_detail} Cleanup remains pending: {rollback.detail}".strip()
+    elif stream.resource_app_id is None:
+        retry_allowed = config.retry_allowed
+        cleanup = CleanupDisposition.NOTHING_TO_CLEAN
+    else:
+        retry_allowed = False
+        cleanup = CleanupDisposition.UNKNOWN
+    return DeploymentAttemptOutcome(
+        disposition=AttemptDisposition.FAILED,
+        resource_app_id=stream.resource_app_id,
+        endpoint_url=stream.observed_url,
+        endpoint=stream.observed_endpoint,
+        failure_detail=failure_detail or "Deployment failed.",
+        cleanup=cleanup,
+        retry_allowed=retry_allowed,
+        failure_exit_code=stream.failure_exit_code,
+    )
+
+
+def _handle_failed_warmup_attempt(
+    orchestrator: Any,
+    hooks: LifecycleCallbacks,
+    config: DeploymentConfig,
+    warmup_outcome: WarmupOutcome,
+    *,
+    resource_app_id: str | None,
+    observed_url: str | None,
+    observed_endpoint: EndpointInfo | None,
+) -> DeploymentAttemptOutcome:
+    """Apply retention vs. cleanup policy when post-deploy warmup/certification fails."""
+    from .provider_options import prime_provider_options
+    from .vision_probe import is_vision_probe_failure
+
+    failure_event = warmup_outcome.failure_event
+    keep_failed = (
+        config.provider == ComputeProvider.PRIME
+        and prime_provider_options(config).keep_failed_resource
+    )
+    probe_only = failure_event is not None and is_vision_probe_failure(failure_event)
+    if keep_failed or probe_only:
+        hooks.on_event(
+            LogEvent(
+                line="Certification failed; keeping the endpoint for inspection.",
+                operation=OperationType.WARMUP,
+            )
+        )
+        return DeploymentAttemptOutcome(
+            disposition=AttemptDisposition.RETAINED,
+            resource_app_id=resource_app_id,
+            endpoint_url=warmup_outcome.url or observed_url,
+            endpoint=observed_endpoint,
+            runtime_attestation=warmup_outcome.attestation,
+            failure_detail=warmup_outcome.failure_detail or "Certification failed.",
+            cleanup=CleanupDisposition.RETAINED,
+            retry_allowed=False,
+        )
+    cleanup = _finalize_failed_attempt(
+        orchestrator,
+        hooks,
+        config,
+        resource_app_id=resource_app_id,
+        observed_endpoint=observed_endpoint,
+    )
+    retry_allowed = config.retry_allowed and cleanup.disposition not in (
+        CleanupDisposition.FAILED,
+        CleanupDisposition.UNKNOWN,
+    )
+    return DeploymentAttemptOutcome(
+        disposition=AttemptDisposition.FAILED,
+        resource_app_id=resource_app_id,
+        endpoint_url=warmup_outcome.url or observed_url,
+        endpoint=observed_endpoint,
+        runtime_attestation=warmup_outcome.attestation,
+        failure_detail=warmup_outcome.failure_detail or "Certification failed.",
+        cleanup=cleanup.disposition,
+        cleanup_error=cleanup.detail or None,
+        retry_allowed=retry_allowed,
+        failure_exit_code=warmup_outcome.failure_exit_code,
+    )
+
+
 def _run_single_attempt(
     orchestrator: Any,
     attempt: LifecycleAttempt,
@@ -292,14 +520,13 @@ def _run_single_attempt(
     opts: LifecycleOptions,
     hooks: LifecycleCallbacks,
 ) -> tuple[DeploymentAttemptOutcome, DeploymentConfig]:
-    from .provider_options import prime_provider_options
-    from .vision_probe import is_vision_probe_failure
-
     config = effective_config_for_attempt(attempt)
     intent = _intent_for_attempt(attempt)
     warmup_follows = (
         intent == OperationIntent.SERVE
-        and opts.warmup_enabled and config.do_warmup and config.do_deploy
+        and opts.warmup_enabled
+        and config.do_warmup
+        and config.do_deploy
     )
     hooks.on_event(
         DeploymentAttemptStartedEvent(
@@ -314,252 +541,111 @@ def _run_single_attempt(
     )
     phase_timer = StartupPhaseTimer()
     phase_timer.deploy_started()
-    observed_url: str | None = None
-    observed_endpoint: EndpointInfo | None = None
-    resource_app_id: str | None = None
-    deploy_ok = False
-    failure_detail = ""
-    failure_exit_code: int | None = None
-    failure_event: OperationCompleteEvent | None = None
-    deploy_events = orchestrator.deploy(config)
-    from .deploy_events import EndpointUrlResolver
 
-    url_resolver = EndpointUrlResolver()
-    try:
-        for event in deploy_events:
-            # The endpoint key is minted during the deploy, on the config the
-            # lifecycle executes -- which is rebuilt from the plan and is not
-            # the object the caller kept a handle to. Callers sync OpenCode
-            # from their own config, so the key never reached it and every
-            # synced provider was written without one: OpenCode then got
-            # `401 Invalid API Key` from an endpoint that had deployed,
-            # certified and was serving perfectly well.
-            if config is not attempt.config and config.endpoint_api_key:
-                attempt.config.endpoint_api_key = config.endpoint_api_key
-            endpoint = _endpoint_from_event(event)
-            if endpoint is not None:
-                if endpoint.web_url:
-                    url_resolver.observe(event)
-                    observed_url = url_resolver.url or endpoint.web_url
-                observed_endpoint = endpoint
-                if endpoint.app_id:
-                    resource_app_id = endpoint.app_id
-                    hooks.on_resource(resource_app_id)
-            if isinstance(event, ResourceAllocatedEvent) and event.app_id:
-                resource_app_id = event.app_id
-                hooks.on_resource(resource_app_id)
-            if isinstance(event, LogEvent):
-                # Modal's deploy stream carries the serving URL as a log line
-                # before any endpoint event; capture it with the same
-                # precedence the TUI always used (announced beats incidental,
-                # deployed beats -dev) so warmup and publication use the
-                # deployed address, not a guess.
-                url_resolver.observe(event)
-                if url_resolver.url:
-                    observed_url = url_resolver.url
-            if hooks.is_cancelled():
-                cleanup = _cancel_cleanup(
-                    orchestrator, hooks, config, resource_app_id,
-                    deploy_stream=deploy_events,
-                )
-                if cleanup.disposition == CleanupDisposition.CONFIRMED:
-                    failure_message = "Cancelled; resource stopped."
-                elif cleanup.disposition == CleanupDisposition.NOTHING_TO_CLEAN:
-                    failure_message = "Cancelled before allocating a resource."
-                else:
-                    failure_message = (
-                        cleanup.detail
-                        or "Cancellation cleanup failed; check Manage. Recovery record retained."
-                    )
-                return DeploymentAttemptOutcome(
-                    disposition=AttemptDisposition.CANCELLED,
-                    resource_app_id=resource_app_id,
-                    endpoint_url=observed_url,
-                    endpoint=observed_endpoint,
-                    failure_detail=failure_message,
-                    cleanup=cleanup.disposition,
-                    cleanup_error=cleanup.detail or None,
-                    retry_allowed=False,
-                ), config
-            hooks.on_event(event)
-            if isinstance(event, OperationCompleteEvent) and event.operation in (
-                OperationType.DEPLOY,
-                OperationType.SMOKE_TEST,
-            ):
-                deploy_phase = phase_timer.deploy_event(event.operation)
-                if deploy_phase is not None:
-                    hooks.on_event(deploy_phase)
-                if _is_smoke_success(event.operation, event.success, intent):
-                    deploy_ok = True
-                elif not event.success:
-                    failure_detail = event.detail or "Deployment failed."
-                    failure_exit_code = event.exit_code or None
-                    failure_event = event
-    finally:
-        _close_stream(deploy_events)
+    stream = _consume_deploy_stream(
+        orchestrator,
+        attempt,
+        config,
+        intent=intent,
+        hooks=hooks,
+        phase_timer=phase_timer,
+    )
+    if stream.cancelled:
+        return (
+            _cancelled_attempt_outcome(
+                stream.cancel_cleanup,
+                resource_app_id=stream.resource_app_id,
+                observed_url=stream.observed_url,
+                observed_endpoint=stream.observed_endpoint,
+            ),
+            config,
+        )
+    if not stream.succeeded:
+        return _failed_deploy_outcome(config, stream), config
 
-    if not deploy_ok:
-        # A deploy failure with an uncertain billable state must block the
-        # next rental. The provider reports its local rollback in the failure
-        # data; only a confirmed rollback allows the next approved placement.
-        # An explicit unconfirmed rollback blocks even without an allocation
-        # event (uncertain create, name conflict): the record may still bill.
-        from .provider_adapters import rollback_from_event
-
-        rollback = rollback_from_event(failure_event)
-        if rollback is not None and rollback.confirmed:
-            retry_allowed = config.retry_allowed
-            cleanup = CleanupDisposition.CONFIRMED
-        elif rollback is not None:
-            retry_allowed = False
-            cleanup = CleanupDisposition.FAILED
-            if rollback.detail and "Cleanup remains pending" not in failure_detail:
-                failure_detail = f"{failure_detail} Cleanup remains pending: {rollback.detail}".strip()
-        elif resource_app_id is None:
-            retry_allowed = config.retry_allowed
-            cleanup = CleanupDisposition.NOTHING_TO_CLEAN
-        else:
-            retry_allowed = False
-            cleanup = CleanupDisposition.UNKNOWN
-        return DeploymentAttemptOutcome(
-            disposition=AttemptDisposition.FAILED,
-            resource_app_id=resource_app_id,
-            endpoint_url=observed_url,
-            endpoint=observed_endpoint,
-            failure_detail=failure_detail or "Deployment failed.",
-            cleanup=cleanup,
-            retry_allowed=retry_allowed,
-            failure_exit_code=failure_exit_code,
-        ), config
-
-    # Persist credentials immediately: a later warmup failure must not strand
-    # a live, billable resource without its generated bearer key. When warmup
-    # follows, this is the pre-certification save; the verified URL publishes
-    # again after warmup succeeds.
     if intent == OperationIntent.PRELOAD:
-        # Preload-only work has no serving endpoint to certify; deploy success
-        # is the terminal state. Do not invoke warmup.
-        hooks.on_connection(config, observed_url, observed_endpoint)
-        return DeploymentAttemptOutcome(
-            disposition=AttemptDisposition.SUCCEEDED,
-            resource_app_id=resource_app_id,
-            endpoint_url=observed_url,
-            endpoint=observed_endpoint,
-            runtime_attestation=config.runtime_attestation,
-            cleanup=CleanupDisposition.NOTHING_TO_CLEAN,
-        ), config
+        hooks.on_connection(config, stream.observed_url, stream.observed_endpoint)
+        return (
+            DeploymentAttemptOutcome(
+                disposition=AttemptDisposition.SUCCEEDED,
+                resource_app_id=stream.resource_app_id,
+                endpoint_url=stream.observed_url,
+                endpoint=stream.observed_endpoint,
+                runtime_attestation=config.runtime_attestation,
+                cleanup=CleanupDisposition.NOTHING_TO_CLEAN,
+            ),
+            config,
+        )
     if not warmup_follows or intent == OperationIntent.SMOKE:
-        hooks.on_connection(config, observed_url, observed_endpoint)
-    elif hooks.on_credentials is not None and (observed_url or observed_endpoint is not None):
-        # Pre-certification credential save; publication happens after warmup.
-        hooks.on_credentials(config, observed_url, observed_endpoint)
+        hooks.on_connection(config, stream.observed_url, stream.observed_endpoint)
+    elif hooks.on_credentials is not None and (
+        stream.observed_url or stream.observed_endpoint is not None
+    ):
+        hooks.on_credentials(config, stream.observed_url, stream.observed_endpoint)
 
-    if intent == OperationIntent.SMOKE:
-        return DeploymentAttemptOutcome(
-            disposition=AttemptDisposition.SUCCEEDED,
-            resource_app_id=resource_app_id,
-            endpoint_url=observed_url,
-            endpoint=observed_endpoint,
-            cleanup=CleanupDisposition.NOTHING_TO_CLEAN,
-        ), config
-
-    if not warmup_follows:
-        return DeploymentAttemptOutcome(
-            disposition=AttemptDisposition.SUCCEEDED,
-            resource_app_id=resource_app_id,
-            endpoint_url=observed_url,
-            endpoint=observed_endpoint,
-            runtime_attestation=config.runtime_attestation,
-            cleanup=CleanupDisposition.NOTHING_TO_CLEAN,
-        ), config
+    if intent == OperationIntent.SMOKE or not warmup_follows:
+        return (
+            DeploymentAttemptOutcome(
+                disposition=AttemptDisposition.SUCCEEDED,
+                resource_app_id=stream.resource_app_id,
+                endpoint_url=stream.observed_url,
+                endpoint=stream.observed_endpoint,
+                runtime_attestation=None if intent == OperationIntent.SMOKE else config.runtime_attestation,
+                cleanup=CleanupDisposition.NOTHING_TO_CLEAN,
+            ),
+            config,
+        )
 
     warmup_outcome = _run_warmup(
-        orchestrator, hooks, config, observed_url, observed_endpoint,
+        orchestrator,
+        hooks,
+        config,
+        stream.observed_url,
+        stream.observed_endpoint,
         price_per_hour_usd=_price_for_attempt(attempt),
-        resource_app_id=resource_app_id,
-        opts=opts, phase_timer=phase_timer,
+        resource_app_id=stream.resource_app_id,
+        opts=opts,
+        phase_timer=phase_timer,
     )
     warmed_url = warmup_outcome.url
     attestation = warmup_outcome.attestation
     if attestation is not None:
         config.runtime_attestation = attestation
-        if observed_endpoint is not None:
-            observed_endpoint.runtime_attestation = attestation
+        if stream.observed_endpoint is not None:
+            stream.observed_endpoint.runtime_attestation = attestation
+    _sync_runtime_outputs_to_caller(config, attempt.config)
+
     if warmup_outcome.status == WarmupStatus.CANCELLED:
-        cleanup = _cancel_cleanup(
-            orchestrator, hooks, config,
-            resource_app_id,
+        cleanup = _cancel_cleanup(orchestrator, hooks, config, stream.resource_app_id)
+        return (
+            _cancelled_attempt_outcome(
+                cleanup,
+                resource_app_id=stream.resource_app_id,
+                observed_url=stream.observed_url,
+                observed_endpoint=stream.observed_endpoint,
+                attestation=attestation,
+            ),
+            config,
         )
-        if cleanup.disposition == CleanupDisposition.CONFIRMED:
-            cancel_message = "Cancelled; resource stopped."
-        elif cleanup.disposition == CleanupDisposition.NOTHING_TO_CLEAN:
-            cancel_message = "Cancelled before allocating a resource."
-        else:
-            cancel_message = (
-                cleanup.detail
-                or "Cancellation cleanup failed; check Manage. Recovery record retained."
-            )
-        return DeploymentAttemptOutcome(
-            disposition=AttemptDisposition.CANCELLED,
-            resource_app_id=resource_app_id,
-            endpoint_url=observed_url,
-            endpoint=observed_endpoint,
-            runtime_attestation=attestation,
-            failure_detail=cancel_message,
-            cleanup=cleanup.disposition,
-            cleanup_error=cleanup.detail or None,
-            retry_allowed=False,
-        ), config
     if warmup_outcome.status != WarmupStatus.SUCCEEDED:
-        failure_event = warmup_outcome.failure_event
-        keep_failed = (
-            config.provider == ComputeProvider.PRIME
-            and prime_provider_options(config).keep_failed_resource
+        return (
+            _handle_failed_warmup_attempt(
+                orchestrator,
+                hooks,
+                config,
+                warmup_outcome,
+                resource_app_id=stream.resource_app_id,
+                observed_url=stream.observed_url,
+                observed_endpoint=stream.observed_endpoint,
+            ),
+            config,
         )
-        probe_only = (
-            failure_event is not None and is_vision_probe_failure(failure_event)
-        )
-        if keep_failed or probe_only:
-            hooks.on_event(
-                LogEvent(
-                    line="Certification failed; keeping the endpoint for inspection.",
-                    operation=OperationType.WARMUP,
-                )
-            )
-            return DeploymentAttemptOutcome(
-                disposition=AttemptDisposition.RETAINED,
-                resource_app_id=resource_app_id,
-                endpoint_url=warmed_url or observed_url,
-                endpoint=observed_endpoint,
-                runtime_attestation=attestation,
-                failure_detail=warmup_outcome.failure_detail or "Certification failed.",
-                cleanup=CleanupDisposition.RETAINED,
-                retry_allowed=False,
-            ), config
-        cleanup = _finalize_failed_attempt(
-            orchestrator, hooks, config,
-            resource_app_id=resource_app_id,
-            observed_endpoint=observed_endpoint,
-        )
-        retry_allowed = config.retry_allowed and cleanup.disposition not in (
-            CleanupDisposition.FAILED,
-            CleanupDisposition.UNKNOWN,
-        )
-        return DeploymentAttemptOutcome(
-            disposition=AttemptDisposition.FAILED,
-            resource_app_id=resource_app_id,
-            endpoint_url=warmed_url or observed_url,
-            endpoint=observed_endpoint,
-            runtime_attestation=attestation,
-            failure_detail=warmup_outcome.failure_detail or "Certification failed.",
-            cleanup=cleanup.disposition,
-            cleanup_error=cleanup.detail or None,
-            retry_allowed=retry_allowed,
-            failure_exit_code=warmup_outcome.failure_exit_code,
-        ), config
 
     if opts.verify_tool_calls:
-        _verify_tool_calling(hooks, config, warmed_url or observed_url, observed_endpoint)
+        _verify_tool_calling(
+            hooks, config, warmed_url or stream.observed_url, stream.observed_endpoint
+        )
+        _sync_runtime_outputs_to_caller(config, attempt.config)
 
     hooks.on_event(
         StateChangeEvent(
@@ -568,11 +654,7 @@ def _run_single_attempt(
             detail="Publishing verified endpoint",
         )
     )
-    hooks.on_connection(config, warmed_url, observed_endpoint)
-    # Warmup reported HEALTHY before publishing began, so PUBLISHING was the
-    # last state anyone saw: a finished deploy kept reading "publishing" in
-    # the TUI's context bar and the job record. Close the sequence on the
-    # state the endpoint is actually in.
+    hooks.on_connection(config, warmed_url, stream.observed_endpoint)
     hooks.on_event(
         StateChangeEvent(
             current=DeploymentState.HEALTHY,
@@ -580,14 +662,17 @@ def _run_single_attempt(
             detail="Endpoint ready",
         )
     )
-    return DeploymentAttemptOutcome(
-        disposition=AttemptDisposition.SUCCEEDED,
-        resource_app_id=resource_app_id,
-        endpoint_url=warmed_url,
-        endpoint=observed_endpoint,
-        runtime_attestation=attestation,
-        cleanup=CleanupDisposition.NOTHING_TO_CLEAN,
-    ), config
+    return (
+        DeploymentAttemptOutcome(
+            disposition=AttemptDisposition.SUCCEEDED,
+            resource_app_id=stream.resource_app_id,
+            endpoint_url=warmed_url,
+            endpoint=stream.observed_endpoint,
+            runtime_attestation=attestation,
+            cleanup=CleanupDisposition.NOTHING_TO_CLEAN,
+        ),
+        config,
+    )
 
 
 def _verify_tool_calling(

@@ -830,6 +830,121 @@ def _parse_idle_shutdown(value: str | None) -> int | None:
         raise typer.BadParameter("--idle-shutdown must be a duration like 1h or 30m, or off.") from exc
 
 
+def _build_cli_deployment_config(
+    *,
+    provider: ComputeProvider,
+    backend: BackendType,
+    do_deploy: bool,
+    preload: bool = False,
+    vision: VisionMode = VisionMode.AUTO,
+    projector_repo: str | None = None,
+    projector_revision: str | None = None,
+    projector_file: str | None = None,
+    image_limit: int = 1,
+    mm_processor_kwargs: str | None = None,
+    preset: str | None = None,
+    repo_id: str | None = None,
+    quant: str | None = None,
+    revision: str | None = None,
+    server_args: str | None = None,
+    n_gpu_layers: int | None = None,
+    mtp: bool = True,
+    dspark: bool = False,
+    dspark_repo: str | None = None,
+    dspark_file: str | None = None,
+    model_name: str | None = None,
+    model_revision: str | None = None,
+    served_model_name: str | None = None,
+    fast_boot: bool | None = None,
+    n_gpu: int | None = None,
+    gpu_type: str | None = None,
+    gpu_count: int | None = None,
+    trust_remote_code: bool | None = None,
+    max_model_len: int | None = None,
+    max_num_seqs: int | None = None,
+    reasoning_parser: str | None = None,
+    tool_call_parser: str | None = None,
+    default_chat_template_kwargs: str | None = None,
+    instance_name: str | None = None,
+    app_name: str | None = None,
+    idle_shutdown_seconds: int | None = None,
+    prime_offer_id: str | None = None,
+    prime_region: str | None = None,
+    prime_disk_id: str | None = None,
+    prime_disk: bool = True,
+    keep_failed_pod: bool = False,
+    allow_insecure_http: bool = False,
+    vast_offer_id: str | None = None,
+    vast_disk_gb: int = 100,
+    max_hourly_cost: float | None = None,
+) -> tuple[DeploymentConfig, str, str]:
+    """Build a normalized ``DeploymentConfig`` and resolved target names for CLI commands."""
+    model_hint = model_name if backend == BackendType.VLLM else (repo_id or preset)
+    resolved_instance, resolved_app_name = _resolve_deploy_target(
+        backend,
+        model_hint=model_hint,
+        instance_name=instance_name,
+        app_name=app_name,
+        provider=provider,
+    )
+    provider_options: PrimeProviderOptions | VastProviderOptions | None = None
+    if provider == ComputeProvider.PRIME:
+        provider_options = PrimeProviderOptions(
+            offer_id=prime_offer_id,
+            region=prime_region,
+            disk_id=prime_disk_id,
+            keep_failed_resource=keep_failed_pod,
+            allow_insecure_http=allow_insecure_http,
+            auto_disk=prime_disk,
+        )
+    elif provider == ComputeProvider.VAST:
+        provider_options = VastProviderOptions(
+            vast_offer_id or "",
+            vast_disk_gb,
+            max_hourly_cost or 0,
+        )
+    config = DeploymentConfig(
+        vision_mode=vision,
+        projector_repo=projector_repo,
+        projector_revision=projector_revision,
+        projector_file=projector_file,
+        image_limit=image_limit,
+        mm_processor_kwargs=mm_processor_kwargs,
+        backend=backend,
+        provider=provider,
+        do_deploy=do_deploy,
+        preload=preload,
+        preset=preset,
+        repo_id=repo_id,
+        quant=quant,
+        revision=revision,
+        server_args=server_args,
+        n_gpu_layers=n_gpu_layers,
+        allow_speculative_decoding=mtp,
+        dspark=dspark,
+        dspark_repo=dspark_repo,
+        dspark_file=dspark_file,
+        model_name=model_name,
+        model_revision=model_revision,
+        served_model_name=served_model_name,
+        fast_boot=fast_boot,
+        n_gpu=n_gpu,
+        gpu_type=gpu_type,
+        gpu_count=(gpu_count or 1) if provider == ComputeProvider.VAST else gpu_count,
+        trust_remote_code=trust_remote_code,
+        max_context_tokens=max_model_len,
+        max_concurrent_sequences=max_num_seqs,
+        reasoning_parser=reasoning_parser,
+        tool_call_parser=tool_call_parser,
+        default_chat_template_kwargs=default_chat_template_kwargs,
+        instance_name=resolved_instance,
+        app_name=resolved_app_name,
+        idle_shutdown_seconds=idle_shutdown_seconds,
+        provider_options=provider_options,
+    )
+    return config, resolved_instance, resolved_app_name
+
+
 @app.command()
 def deploy(
     vast_offer_id: str | None = typer.Option(None, help="Exact Vast offer to rent."),
@@ -950,35 +1065,27 @@ def deploy(
     orch, username = _preflight(compute_provider)
     _print_banner()
 
-    from ..protocol.models import DeploymentConfig
-
     bt = BackendType(backend)
     if compute_provider == ComputeProvider.PRIME and bt == BackendType.LLAMACPP and not repo_id:
         typer.echo("Error: Prime llama.cpp requires --repo-id.", err=True)
         raise typer.Exit(code=2)
-    model_hint = model_name if bt == BackendType.VLLM else (repo_id or preset)
-    resolved_instance, resolved_app_name = _resolve_deploy_target(
-        bt,
-        model_hint=model_hint,
-        instance_name=instance_name,
-        app_name=app_name,
+    config, resolved_instance, resolved_app_name = _build_cli_deployment_config(
         provider=compute_provider,
-    )
-
-    config = DeploymentConfig(
-        vision_mode=vision, projector_repo=projector_repo,
-        projector_revision=projector_revision, projector_file=projector_file,
-        image_limit=image_limit, mm_processor_kwargs=mm_processor_kwargs,
         backend=bt,
-        provider=compute_provider,
         do_deploy=True,
+        vision=vision,
+        projector_repo=projector_repo,
+        projector_revision=projector_revision,
+        projector_file=projector_file,
+        image_limit=image_limit,
+        mm_processor_kwargs=mm_processor_kwargs,
         preset=preset,
         repo_id=repo_id,
         quant=quant,
         revision=revision,
         server_args=server_args,
         n_gpu_layers=n_gpu_layers,
-        allow_speculative_decoding=mtp,
+        mtp=mtp,
         dspark=dspark,
         dspark_repo=dspark_repo,
         dspark_file=dspark_file,
@@ -990,34 +1097,29 @@ def deploy(
         gpu_type=gpu_type,
         gpu_count=gpu_count,
         trust_remote_code=trust_remote_code,
-        max_context_tokens=max_model_len,
-        max_concurrent_sequences=max_num_seqs,
+        max_model_len=max_model_len,
+        max_num_seqs=max_num_seqs,
         reasoning_parser=reasoning_parser,
         tool_call_parser=tool_call_parser,
         default_chat_template_kwargs=default_chat_template_kwargs,
-        instance_name=resolved_instance,
-        app_name=resolved_app_name,
+        instance_name=instance_name,
+        app_name=app_name,
         idle_shutdown_seconds=idle_shutdown_seconds,
-        provider_options=(
-            PrimeProviderOptions(
-                offer_id=prime_offer_id,
-                region=prime_region,
-                disk_id=prime_disk_id,
-                keep_failed_resource=keep_failed_pod,
-                allow_insecure_http=allow_insecure_http,
-                auto_disk=prime_disk,
-            )
-            if compute_provider == ComputeProvider.PRIME
-            else (VastProviderOptions(vast_offer_id or "", vast_disk_gb, max_hourly_cost or 0) if compute_provider == ComputeProvider.VAST else None)
-        ),
+        prime_offer_id=prime_offer_id,
+        prime_region=prime_region,
+        prime_disk_id=prime_disk_id,
+        prime_disk=prime_disk,
+        keep_failed_pod=keep_failed_pod,
+        allow_insecure_http=allow_insecure_http,
+        vast_offer_id=vast_offer_id,
+        vast_disk_gb=vast_disk_gb,
+        max_hourly_cost=max_hourly_cost,
     )
     typer.echo(
         f"Deploy target: backend={bt.value} provider={compute_provider.value} "
         f"instance={resolved_instance} app={resolved_app_name}"
     )
 
-    if compute_provider == ComputeProvider.VAST:
-        config.gpu_count = gpu_count or 1
     # Refuse before preflight spends anything, with the same sentence the TUI shows.
     reason = refuse_deployment(config)
     if reason:
@@ -1606,21 +1708,22 @@ def switch(
     _print_banner()
     bt = BackendType(backend)
 
-    from ..protocol.models import DeploymentConfig
-
-    config = DeploymentConfig(
-        vision_mode=vision, projector_repo=projector_repo,
-        projector_revision=projector_revision, projector_file=projector_file,
-        image_limit=image_limit, mm_processor_kwargs=mm_processor_kwargs,
-        backend=bt,
+    config, resolved_instance, resolved_app_name = _build_cli_deployment_config(
         provider=compute_provider,
+        backend=bt,
+        do_deploy=False,  # first run just switches model
+        preload=preload,
+        vision=vision,
+        projector_repo=projector_repo,
+        projector_revision=projector_revision,
+        projector_file=projector_file,
+        image_limit=image_limit,
+        mm_processor_kwargs=mm_processor_kwargs,
         preset=preset,
         repo_id=repo_id,
         quant=quant,
         revision=revision,
-        preload=preload,
-        do_deploy=False,  # first run just switches model
-        allow_speculative_decoding=mtp,
+        mtp=mtp,
         model_name=model_name,
         model_revision=model_revision,
         served_model_name=served_model_name,
@@ -1629,34 +1732,20 @@ def switch(
         gpu_type=gpu_type,
         gpu_count=gpu_count,
         trust_remote_code=trust_remote_code,
-        max_context_tokens=max_model_len,
-        max_concurrent_sequences=max_num_seqs,
+        max_model_len=max_model_len,
+        max_num_seqs=max_num_seqs,
         reasoning_parser=reasoning_parser,
         tool_call_parser=tool_call_parser,
         default_chat_template_kwargs=default_chat_template_kwargs,
-        provider_options=(
-            PrimeProviderOptions(
-                offer_id=prime_offer_id,
-                region=prime_region,
-                disk_id=prime_disk_id,
-                keep_failed_resource=keep_failed_pod,
-                allow_insecure_http=allow_insecure_http,
-                auto_disk=prime_disk,
-            )
-            if compute_provider == ComputeProvider.PRIME
-            else None
-        ),
-    )
-    model_hint = model_name if bt == BackendType.VLLM else (repo_id or preset)
-    resolved_instance, resolved_app_name = _resolve_deploy_target(
-        bt,
-        model_hint=model_hint,
         instance_name=instance_name,
         app_name=app_name,
-        provider=compute_provider,
+        prime_offer_id=prime_offer_id,
+        prime_region=prime_region,
+        prime_disk_id=prime_disk_id,
+        prime_disk=prime_disk,
+        keep_failed_pod=keep_failed_pod,
+        allow_insecure_http=allow_insecure_http,
     )
-    config.instance_name = resolved_instance
-    config.app_name = resolved_app_name
 
     if compute_provider == ComputeProvider.PRIME:
         if bt == BackendType.LLAMACPP and not repo_id:
