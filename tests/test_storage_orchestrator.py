@@ -173,7 +173,37 @@ class StorageOrchestratorTests(unittest.TestCase):
     def test_list_storage_uses_llamacpp_backend_inventory_for_real_sizes(
         self, mock_list_volume, mock_capture
     ) -> None:  # type: ignore[no-untyped-def]
-        mock_list_volume.return_value = []
+        def side_effect(volume_name, path):  # type: ignore[no-untyped-def]
+            mapping = {
+                ("huggingface-cache", "/hub"): [
+                    {"path": "/hub/models--unsloth--GLM-5-GGUF", "type": "directory"}
+                ],
+                ("huggingface-cache", "/hub/models--unsloth--GLM-5-GGUF"): [
+                    {
+                        "path": "/hub/models--unsloth--GLM-5-GGUF/snapshots/abc/Q4_K_M/GLM-5-Q4_K_M-00001-of-00011.gguf",
+                        "type": "symlink",
+                        "size": 79,
+                    },
+                    {
+                        "path": "/hub/models--unsloth--GLM-5-GGUF/snapshots/abc/Q8_0/GLM-5-Q8_0-00001-of-00011.gguf",
+                        "type": "symlink",
+                        "size": 79,
+                    },
+                    {
+                        "path": "/hub/models--unsloth--GLM-5-GGUF/blobs/sha-q4",
+                        "type": "file",
+                        "size": 123456789,
+                    },
+                    {
+                        "path": "/hub/models--unsloth--GLM-5-GGUF/blobs/sha-q8",
+                        "type": "file",
+                        "size": 246913578,
+                    },
+                ],
+            }
+            return mapping.get((volume_name, path), [])
+
+        mock_list_volume.side_effect = side_effect
         mock_capture.return_value = (
             0,
             "\n".join(
@@ -192,10 +222,13 @@ class StorageOrchestratorTests(unittest.TestCase):
             "",
         )
 
+        partials: list[StorageSnapshot] = []
         orch = Orchestrator()
-        events = list(orch.list_storage())
+        events = list(orch.list_storage(on_partial=partials.append))
         done = next(e for e in events if isinstance(e, OperationCompleteEvent))
         self.assertTrue(done.success)
+        self.assertEqual(len(partials), 1)
+        self.assertEqual(len(partials[0].llamacpp_models), 2)
         snapshot = done.data
         assert isinstance(snapshot, StorageSnapshot)
         self.assertEqual(len(snapshot.llamacpp_models), 1)
@@ -674,6 +707,88 @@ class StorageOrchestratorTests(unittest.TestCase):
             "/hub/models--unsloth--GLM-5-GGUF",
             recursive=True,
         )
+
+    @patch("llm_launchpad.core.orchestrator.ModalBackend.run_modal_script_entrypoint_capture")
+    @patch("llm_launchpad.core.orchestrator.ModalBackend.list_volume")
+    def test_list_storage_resolves_single_quant_symlink_from_blobs_without_remote_container(
+        self, mock_list_volume, mock_capture
+    ) -> None:  # type: ignore[no-untyped-def]
+        hub_calls = 0
+
+        def side_effect(volume_name, path):  # type: ignore[no-untyped-def]
+            nonlocal hub_calls
+            if path == "/hub":
+                hub_calls += 1
+            mapping = {
+                ("huggingface-cache", "/hub"): [
+                    {"path": "/hub/.locks", "type": "directory"},
+                    {"path": "/hub/models--unsloth--GLM-5-GGUF", "type": "directory"},
+                    {"path": "/hub/models--Qwen--Qwen3-32B", "type": "directory"},
+                ],
+                ("huggingface-cache", "/hub/models--unsloth--GLM-5-GGUF"): [
+                    {
+                        "path": "/hub/models--unsloth--GLM-5-GGUF/snapshots/a8f31c9/GLM-5-Q4_K_M.gguf",
+                        "type": "symlink",
+                        "size": 79,
+                    },
+                    {
+                        "path": "/hub/models--unsloth--GLM-5-GGUF/blobs/sha256-real",
+                        "type": "file",
+                        "size": 17_200_000_000,
+                    },
+                ],
+                ("huggingface-cache", "/hub/models--Qwen--Qwen3-32B"): [
+                    {
+                        "path": "/hub/models--Qwen--Qwen3-32B/snapshots/main/config.json",
+                        "type": "file",
+                        "size": 500,
+                    },
+                ],
+            }
+            return mapping.get((volume_name, path), [])
+
+        mock_list_volume.side_effect = side_effect
+
+        orch = Orchestrator()
+        events = list(orch.list_storage())
+        done = next(e for e in events if isinstance(e, OperationCompleteEvent))
+        self.assertTrue(done.success)
+        snapshot = done.data
+        assert isinstance(snapshot, StorageSnapshot)
+        self.assertEqual(hub_calls, 1)
+        mock_capture.assert_not_called()
+        called_paths = [call.args[1] for call in mock_list_volume.call_args_list]
+        self.assertNotIn("/hub/.locks", called_paths)
+        self.assertEqual(len(snapshot.llamacpp_models), 1)
+        self.assertEqual(snapshot.llamacpp_models[0].revision, "a8f31c9")
+        self.assertEqual(snapshot.llamacpp_models[0].quant, "Q4_K_M")
+        self.assertEqual(snapshot.llamacpp_models[0].size_bytes, 17_200_000_000)
+        self.assertFalse(snapshot.llamacpp_models[0].incomplete)
+        self.assertEqual(len(snapshot.vllm_models), 1)
+
+    def test_walk_volume_files_uses_sdk_recursive_listing_when_unmocked(self) -> None:
+        from llm_launchpad.core.backend import ModalVolumeListResult
+        from llm_launchpad.core.modal_storage import walk_volume_files
+
+        sdk_entries = [
+            {"path": "/hub/.locks/models--a--b/lock", "type": "file", "size": 0},
+            {"path": "/hub/models--Qwen--Qwen3-4B", "type": "directory", "size": 0},
+            {
+                "path": "/hub/models--Qwen--Qwen3-4B/snapshots/main/config.json",
+                "type": "file",
+                "size": 512,
+            },
+        ]
+        with patch(
+            "llm_launchpad.core.backend.ModalBackend.list_volume_recursive_result",
+            return_value=ModalVolumeListResult(entries=sdk_entries, error=None),
+        ) as mock_sdk:
+            files = walk_volume_files("huggingface-cache", "/hub")
+
+        mock_sdk.assert_called_once_with("huggingface-cache", "/hub")
+        self.assertEqual(len(files), 1)
+        self.assertEqual(files[0]["path"], "/hub/models--Qwen--Qwen3-4B/snapshots/main/config.json")
+        self.assertEqual(files[0]["size_bytes"], 512)
 
 
 if __name__ == "__main__":

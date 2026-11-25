@@ -157,8 +157,9 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
             assert isinstance(screen, StorageScreen)
             table = screen.query_one("#storage-table", AdaptiveDataTable)
             self.assertEqual(table.row_count, 2)
-            self.assertEqual(str(table.get_cell_at(Coordinate(0, 4))), "$0.18/mo")
-            self.assertEqual(str(table.get_cell_at(Coordinate(1, 4))), "$0.27/mo")
+            # 5.0 GiB total stays inside Modal's 1 TiB free tier, so row costs are $0.00/mo.
+            self.assertEqual(str(table.get_cell_at(Coordinate(0, 4))), "$0.00/mo")
+            self.assertEqual(str(table.get_cell_at(Coordinate(1, 4))), "$0.00/mo")
 
             status = screen.query_one("#storage-status", Static)
             rendered_status = str(status.renderable)
@@ -167,6 +168,81 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
             # would say "0.00 GiB billable past 1 TiB free" is left out.
             self.assertNotIn("billable", rendered_status)
             self.assertIn("$0.00/mo", rendered_status)
+
+    async def test_modal_row_costs_reflect_billable_excess_above_free_tier(self) -> None:
+        over_tier = StorageSnapshot(
+            llamacpp_models=[
+                StoredModelInfo(
+                    backend=BackendType.LLAMACPP,
+                    model_id="org/large-a",
+                    size_bytes=800 * _GIB,
+                    file_count=1,
+                    source_volume="llamacpp-models",
+                ),
+            ],
+            vllm_models=[
+                StoredModelInfo(
+                    backend=BackendType.VLLM,
+                    model_id="org/large-b",
+                    size_bytes=400 * _GIB,
+                    file_count=2,
+                    source_volume="vllm-models",
+                ),
+            ],
+        )
+
+        class _OverTierApp(_TestApp):
+            def begin_storage_refresh(self, receiver: object, force: bool = False) -> None:
+                receiver.post_message(StorageLoaded(snapshot=over_tier))  # type: ignore[attr-defined]
+
+        app = _OverTierApp()
+        async with app.run_test(size=(140, 30)) as pilot:
+            app.push_screen(StorageScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, StorageScreen)
+            table = screen.query_one("#storage-table", AdaptiveDataTable)
+            cost_col = table.visible_column_keys.index("cost")
+            # 1200 GiB total -> 176 GiB billable ($15.84/mo); 2/3 ($10.56) and 1/3 ($5.28).
+            self.assertEqual(str(table.get_cell_at(Coordinate(0, cost_col))), "$10.56/mo")
+            self.assertEqual(str(table.get_cell_at(Coordinate(1, cost_col))), "$5.28/mo")
+            detail = str(screen.query_one("#storage-detail", Static).renderable)
+            self.assertIn("deleting saves $15.84/mo", detail)
+
+    async def test_stale_storage_loaded_renders_rows_immediately_with_refreshing_indicator(self) -> None:
+        from llm_launchpad.core.deploy_log_summary import SUMMARY_SPINNER_FRAMES
+
+        snapshot = _sample_snapshot()
+
+        class _StaleApp(_TestApp):
+            def begin_storage_refresh(self, receiver: object, force: bool = False) -> None:
+                _ = force
+                poster = getattr(receiver, "post_message", None)
+                if callable(poster):
+                    poster(StorageLoaded(snapshot=snapshot, is_stale=True))
+
+        app = _StaleApp()
+        async with app.run_test(size=(140, 30)) as pilot:
+            app.push_screen(StorageScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, StorageScreen)
+            table = screen.query_one("#storage-table", AdaptiveDataTable)
+            self.assertEqual(table.row_count, 2)
+            status = str(screen.query_one("#storage-status", Static).render())
+            self.assertIn("Refreshing…", status)
+            self.assertIn(SUMMARY_SPINNER_FRAMES[0], status)
+            self.assertIsNotNone(screen._refresh_spinner_timer)
+
+            screen._tick_refresh_spinner()
+            next_status = str(screen.query_one("#storage-status", Static).render())
+            self.assertIn(SUMMARY_SPINNER_FRAMES[1], next_status)
+
+            screen.post_message(StorageLoaded(snapshot=snapshot, is_stale=False))
+            await pilot.pause()
+            updated_status = str(screen.query_one("#storage-status", Static).render())
+            self.assertNotIn("Refreshing…", updated_status)
+            self.assertIsNone(screen._refresh_spinner_timer)
 
     async def test_table_adapts_columns_and_preserves_highlight_on_resize(self) -> None:
         app = _TestApp()

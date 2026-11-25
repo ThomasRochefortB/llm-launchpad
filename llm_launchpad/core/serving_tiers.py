@@ -14,6 +14,7 @@ from .quant_quality import (
     is_reduced_quality,
     quant_quality_label,
     quant_bits,
+    serving_quality_bits,
 )
 from .quick_deploy import plan_is_eligible
 
@@ -225,9 +226,23 @@ def _evidence_classes_match(left: InferencePlan, right: InferencePlan) -> bool:
 
 def _quality_partition(
     plans: Sequence[InferencePlan],
+    *,
+    require_known_width: bool = False,
 ) -> tuple[list[InferencePlan], list[InferencePlan]]:
-    primary = [p for p in plans if (quant_bits(p.recipe.quant) or 0) >= QUALITY_FLOOR_BITS]
-    lower = [p for p in plans if is_reduced_quality(p.recipe.quant)]
+    """Split a frontier into the floor-or-better widths and everything below.
+
+    An unlabelled or unrecognised width counts as meeting the floor: absence
+    of evidence is not evidence of degradation. ``require_known_width`` opts
+    into the stricter rule used when a placement is chosen on the user's
+    behalf, where the width must be positively verified at the floor.
+    """
+    primary = [
+        plan
+        for plan in plans
+        if serving_quality_bits(plan.recipe.quant) >= QUALITY_FLOOR_BITS
+        and (not require_known_width or quant_bits(plan.recipe.quant) is not None)
+    ]
+    lower = [plan for plan in plans if is_reduced_quality(plan.recipe.quant)]
     return primary, lower
 
 
@@ -242,7 +257,7 @@ def economy_sort_key(plan: InferencePlan) -> tuple[float, int, int, str]:
 
 def economy_plan(plans: Sequence[InferencePlan]) -> InferencePlan | None:
     """Pick the cheapest priced, eligible placement with verified 4-bit or better weights."""
-    eligible, _ = _quality_partition(plans)
+    eligible, _ = _quality_partition(plans, require_known_width=True)
     return min((p for p in eligible if plan_is_eligible(p) and first_hour_cost_usd(p.quote) is not None),
                key=economy_sort_key, default=None)
 

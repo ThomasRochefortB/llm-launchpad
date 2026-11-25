@@ -483,6 +483,8 @@ class ServingStats:
                 self.requests_waiting,
                 self.requests_finished,
                 self.kv_cache_usage,
+                self.avg_ttft_seconds,
+                self.reported_tokens_per_second,
             )
         )
 

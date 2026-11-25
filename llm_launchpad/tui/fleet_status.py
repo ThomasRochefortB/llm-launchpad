@@ -18,7 +18,10 @@ benchmark, inference).
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 import time
+from typing import Any
+from urllib.parse import urlparse
 
 from rich.markup import escape
 
@@ -35,8 +38,11 @@ from .format import clip, format_age
 
 _ERROR_WIDTH = 72
 
-# A reading has to come back inside the refresh cadence to be worth having.
-_METRICS_TIMEOUT_SECONDS = 2.5
+# A background reading has to come back inside the refresh cadence to be worth
+# having; an explicit user-triggered fetch may wake a cold container or cross a
+# slower tunnel, so it gets a realistic timeout.
+_METRICS_TIMEOUT_SECONDS = 3.0
+_EXPLICIT_METRICS_TIMEOUT_SECONDS = 15.0
 
 # Only an endpoint that is actually serving can answer for its own traffic.
 # Probing one that is still starting would record a "this runtime has no
@@ -61,10 +67,28 @@ SCALE_TO_ZERO_PROVIDERS = frozenset({ComputeProvider.MODAL})
 PASSIVE_METRICS_NOTE = "Live metrics paused to allow scale-to-zero."
 
 
+@dataclass(frozen=True)
+class MetricsFetchResult:
+    """Outcome of one `/metrics` read, including why it failed when it did."""
+
+    snapshot: ServingSnapshot | None = None
+    error: str | None = None
+    status_code: int | None = None
+
+
+def _is_loopback_url(url: str) -> bool:
+    """Whether ``url`` targets the local host (e.g. a Vast SSH tunnel)."""
+    try:
+        host = (urlparse(url).hostname or "").strip().lower()
+    except Exception:
+        return False
+    return host in {"127.0.0.1", "localhost", "::1"}
+
+
 def _state_bucket(state: str) -> str:
     """Deployment state bucket: running vs starting vs stopped vs failed."""
     normalized = (state or "").strip().lower()
-    if normalized in {"running", "deployed"}:
+    if normalized in {"active", "running", "deployed"}:
         return "running"
     if normalized in {"deploying", "starting", "initializing", "building", "ephemeral"}:
         return "starting"
@@ -244,67 +268,128 @@ def is_passive_traffic_row(row: EndpointInfo) -> bool:
     )
 
 
-def fetch_serving_snapshot(
+def has_explicit_live_metrics(row: EndpointInfo) -> bool:
+    """Whether a row carries a successful user-requested live metrics reading."""
+    return (
+        row.live_metrics_checked_at is not None
+        and row.live_metrics_error is None
+        and row.serving is not None
+        and (
+            row.serving.tokens_per_second is not None
+            or row.serving.stats.has_readings
+        )
+    )
+
+
+def _http_get_metrics(requests_mod: Any, url: str, *, headers: dict[str, str] | None, timeout: float) -> Any:
+    """Perform a metrics GET, bypassing system proxies for loopback tunnels."""
+    if _is_loopback_url(url) and hasattr(requests_mod, "Session"):
+        with requests_mod.Session() as session:
+            session.trust_env = False
+            return session.get(url, headers=headers, timeout=timeout)
+    return requests_mod.get(url, headers=headers, timeout=timeout)
+
+
+def fetch_serving_snapshot_detailed(
     row: EndpointInfo,
     username: str = "",
     *,
     explicit: bool = False,
-) -> ServingSnapshot | None:
-    """Read one endpoint's own counters, or None when it publishes none.
+) -> MetricsFetchResult:
+    """Read one endpoint's own counters and explain why when a fetch fails.
 
     A 2xx from /metrics is the same liveness evidence /health gives, so a
     caller that needs both spends one request rather than two. A runtime that
     will not serve metrics -- llama.cpp started without ``--metrics`` answers
-    501 -- is remembered, so the next refresh does not ask again.
+    501 -- is remembered for background polls, while an explicit user request
+    always retries with a generous timeout.
 
     With ``explicit=False`` (the default) a Modal endpoint is never contacted:
-    the call returns None before any HTTP request, including the health
-    fallback, so blocking /metrics cannot accidentally trigger /health.
+    the call returns before any HTTP request, including the health fallback, so
+    blocking /metrics cannot accidentally trigger /health.
     """
     if not can_report_traffic(row, explicit=explicit):
-        return None
+        if not explicit and is_passively_monitored(row):
+            return MetricsFetchResult(error="passive scale-to-zero endpoint")
+        return MetricsFetchResult(
+            error=f"endpoint is not serving ({(row.state or 'unknown').strip().lower()})"
+        )
     base_url, _was_derived = resolve_openai_base_url(row, username=username)
     if not base_url:
-        return None
+        return MetricsFetchResult(error="endpoint did not return metrics (no endpoint URL)")
     try:
         import requests
     except ImportError:
-        return None
+        return MetricsFetchResult(error="endpoint did not return metrics (requests unavailable)")
 
     tracker = default_tracker()
     key = usage_key(row)
-    if not tracker.metrics_supported(key):
-        return None
+    # Explicit user requests always bypass the unsupported backoff so a
+    # transient startup 404/401 cannot lock out "Fetch live metrics" for 15m.
+    if not explicit and not tracker.metrics_supported(key):
+        return MetricsFetchResult(error="endpoint did not return metrics (cooldown active)")
 
     base_root = base_url.rstrip("/")
     host_root = (base_root[:-3] if base_root.endswith("/v1") else base_root).rstrip("/")
     headers = (
         {"Authorization": f"Bearer {row.endpoint_api_key}"} if row.endpoint_api_key else None
     )
+    timeout = _EXPLICIT_METRICS_TIMEOUT_SECONDS if explicit else _METRICS_TIMEOUT_SECONDS
     try:
-        response = requests.get(
+        response = _http_get_metrics(
+            requests,
             host_root + METRICS_PATH,
             headers=headers,
-            timeout=_METRICS_TIMEOUT_SECONDS,
+            timeout=timeout,
         )
-    except Exception:
+    except Exception as exc:
         # A transport failure says nothing about whether metrics are served.
-        return None
+        detail = str(exc).strip()
+        if "timed out" in detail.lower() or "timeout" in detail.lower():
+            return MetricsFetchResult(
+                error=f"endpoint did not return metrics (timed out after {int(timeout)}s)"
+            )
+        return MetricsFetchResult(
+            error=f"endpoint did not return metrics ({clip(detail, 48) or type(exc).__name__})"
+        )
 
     status = getattr(response, "status_code", 0)
     if not 200 <= status < 300:
-        if status in _NO_METRICS_STATUSES:
+        if (not explicit and status in _NO_METRICS_STATUSES) or (explicit and status == 501):
             tracker.mark_unsupported(key)
-        return None
+        hint = {
+            401: "HTTP 401 — check API key",
+            403: "HTTP 403 — forbidden",
+            404: "HTTP 404 — /metrics unavailable",
+            501: "HTTP 501 — /metrics disabled",
+        }.get(status, f"HTTP {status}")
+        return MetricsFetchResult(
+            error=f"endpoint did not return metrics ({hint})",
+            status_code=status,
+        )
 
     stats = stats_from_metrics(getattr(response, "text", "") or "", row.backend)
     if not stats.has_readings:
         # A 200 carrying something other than this runtime's metrics: usually
         # a proxy's own page standing in for an endpoint that is not up yet.
-        tracker.mark_unsupported(key)
-        return None
+        if not explicit:
+            tracker.mark_unsupported(key)
+        return MetricsFetchResult(
+            error="endpoint did not return metrics (unrecognized /metrics payload)",
+            status_code=status,
+        )
     tracker.mark_supported(key)
-    return tracker.record(key, stats)
+    return MetricsFetchResult(snapshot=tracker.record(key, stats), status_code=status)
+
+
+def fetch_serving_snapshot(
+    row: EndpointInfo,
+    username: str = "",
+    *,
+    explicit: bool = False,
+) -> ServingSnapshot | None:
+    """Read one endpoint's own counters, or None when it publishes none."""
+    return fetch_serving_snapshot_detailed(row, username, explicit=explicit).snapshot
 
 
 def attach_cached_serving_stats(rows: list[EndpointInfo]) -> None:
@@ -317,6 +402,8 @@ def attach_cached_serving_stats(rows: list[EndpointInfo]) -> None:
     """
     tracker = default_tracker()
     for row in rows:
+        if has_explicit_live_metrics(row):
+            continue
         row.serving = tracker.snapshot(usage_key(row))
 
 
@@ -341,14 +428,20 @@ def annotate_serving_stats(
 
     with ThreadPoolExecutor(max_workers=min(4, len(candidates))) as executor:
         futures = {
-            executor.submit(fetch_serving_snapshot, row, username, explicit=explicit): row
+            executor.submit(fetch_serving_snapshot_detailed, row, username, explicit=explicit): row
             for row in candidates
         }
         for future in as_completed(futures):
             row = futures[future]
             try:
-                snapshot = future.result()
-            except Exception:
-                snapshot = None
-            if snapshot is not None:
-                row.serving = snapshot
+                result = future.result()
+            except Exception as exc:
+                result = MetricsFetchResult(error=str(exc))
+            if result.snapshot is not None:
+                row.serving = result.snapshot
+                row.live_metrics_error = None
+                if not is_passively_monitored(row):
+                    row.runtime_status = "healthy"
+                    row.runtime_status_detail = None
+            elif result.error and not is_passively_monitored(row):
+                row.live_metrics_error = result.error

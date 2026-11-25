@@ -669,6 +669,50 @@ class ModalBackend:
             ),
         )
 
+    @staticmethod
+    def list_volume_recursive_result(
+        volume_name: str,
+        path: str = "/",
+    ) -> ModalVolumeListResult:
+        """List Modal Volume entries recursively in one SDK RPC call."""
+        if _is_shutting_down():
+            return ModalVolumeListResult(entries=[], error=None)
+        command = ("modal.Volume.listdir", volume_name, path, "--recursive")
+        try:
+            import modal
+
+            volume = modal.Volume.from_name(volume_name)
+            raw_entries = volume.listdir(path, recursive=True)
+        except Exception as exc:
+            message = str(exc).strip() or f"Failed to list Modal volume '{volume_name}' at {path}."
+            return ModalVolumeListResult(
+                entries=None,
+                error=ModalCliError(message=message, command=command),
+            )
+
+        entries: list[dict[str, Any]] = []
+        for entry in raw_entries:
+            raw_path = str(getattr(entry, "path", "") or "").strip()
+            if not raw_path:
+                continue
+            normalized_path = f"/{raw_path.lstrip('/')}"
+            entry_type = getattr(entry, "type", None)
+            type_name = str(getattr(entry_type, "name", "") or "").upper()
+            if type_name == "DIRECTORY" or entry_type == 2:
+                kind = "directory"
+            elif type_name == "SYMLINK" or entry_type == 3:
+                kind = "symlink"
+            else:
+                kind = "file"
+            entries.append(
+                {
+                    "path": normalized_path,
+                    "type": kind,
+                    "size": int(getattr(entry, "size", 0) or 0),
+                }
+            )
+        return ModalVolumeListResult(entries=entries, error=None)
+
     # ------------------------------------------------------------------
     # Streaming subprocess execution
     # ------------------------------------------------------------------

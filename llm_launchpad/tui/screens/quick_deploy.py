@@ -7,6 +7,8 @@ from ..widgets.vision_options import VisionOptions
 from dataclasses import replace
 
 from rich.markup import escape
+from textual import events
+from textual.actions import SkipAction
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -46,7 +48,7 @@ from ..navigation import move_focus_with_arrows
 from ..widgets.input_form import FormField, ToggleField
 from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
-from ..visual import DEPLOY_STEPS, screen_title
+from ..visual import DEPLOY_STEPS, labelled_rows_markup, screen_title
 
 
 def _render_profile_label(profile: QuickDeployProfile, *, accent: str = "") -> str:
@@ -80,6 +82,15 @@ def _short_context_label(tokens: int) -> str:
     return format_context_length(tokens)
 
 
+def _availability_markup(plan: InferencePlan) -> str:
+    label = escape(_availability_label(plan))
+    if plan.quote.availability == QuoteAvailability.AVAILABLE:
+        return f"[$success]{label}[/]"
+    if plan.quote.availability == QuoteAvailability.UNAVAILABLE:
+        return f"[$error]{label}[/]"
+    return label
+
+
 def _render_decision_facts(profile: QuickDeployProfile, plan: InferencePlan) -> str:
     """Four facts for the deploy decision: compute, context, cost, availability.
 
@@ -87,35 +98,47 @@ def _render_decision_facts(profile: QuickDeployProfile, plan: InferencePlan) -> 
     the card's border title, and the details toggle below carries the
     technical evidence and monthly assumptions.
     """
-    return (
-        f"[bold]{escape(plan.quote.provider.display_name)}[/bold] · "
-        f"{f'{escape(plan.quote.region)} · ' if plan.quote.region else ''}"
-        f"{escape(display_gpu_type(plan.quote.gpu_type))} x{plan.quote.gpu_count}\n"
-        f"[dim]Context[/dim] {escape(_short_context_label(profile.max_context_tokens))} · "
-        f"[bold $money]{escape(_plan_hourly_cost(plan))}[/] · "
-        f"{escape(_billing_label(plan.quote.billing_model))}"
-        + (f" · ${total:.2f} first hour" if plan.quote.one_time_cost_usd and
-           (total := first_hour_cost_usd(plan.quote)) is not None else
-           " · first hour unknown" if plan.quote.one_time_cost_usd is None else "")
-        + "\n"
-        f"[dim]Availability[/dim] {escape(_availability_label(plan))}"
-        f"{_idle_shutdown_fact(plan)}"
+    compute_parts = [f"[bold]{escape(plan.quote.provider.display_name)}[/bold]"]
+    if plan.quote.region:
+        compute_parts.append(escape(plan.quote.region))
+    compute_parts.append(
+        f"{escape(display_gpu_type(plan.quote.gpu_type))} x{plan.quote.gpu_count}"
     )
+    compute_parts.append(f"{escape(_short_context_label(profile.max_context_tokens))} ctx")
+
+    cost_parts = [
+        f"[bold $money]{escape(_plan_hourly_cost(plan))}[/]",
+        escape(_billing_label(plan.quote.billing_model)),
+    ]
+    if plan.quote.one_time_cost_usd and (total := first_hour_cost_usd(plan.quote)) is not None:
+        cost_parts.append(f"${total:.2f} first hour")
+    elif plan.quote.one_time_cost_usd is None:
+        cost_parts.append("first hour unknown")
+
+    rows: list[tuple[str, str]] = [
+        ("Compute", " · ".join(compute_parts)),
+        ("Cost", " · ".join(cost_parts)),
+        ("Availability", _availability_markup(plan)),
+    ]
+    idle = _idle_shutdown_value(plan)
+    if idle is not None:
+        rows.append(("Idle stop", idle))
+    return labelled_rows_markup(rows)
 
 
-def _idle_shutdown_fact(plan: InferencePlan) -> str:
-    """What stops a rental that bills until deleted; nothing for scale-to-zero."""
+def _idle_shutdown_value(plan: InferencePlan) -> str | None:
+    """Styled idle-shutdown description for rentals, or None for scale-to-zero."""
     if plan.quote.billing_model == BillingModel.SCALE_TO_ZERO:
-        return ""
+        return None
     if plan.quote.provider not in (ComputeProvider.VAST, ComputeProvider.PRIME):
-        return ""
+        return None
     from ...core.config import ConfigStore
     from ...core.idle_watchdog import describe_idle_shutdown
 
     try:
         settings = ConfigStore().load()
     except Exception:
-        return ""
+        return None
     text = describe_idle_shutdown(settings.rental_idle_shutdown)
     if (
         settings.rental_idle_shutdown > 0
@@ -124,7 +147,13 @@ def _idle_shutdown_fact(plan: InferencePlan) -> str:
     ):
         text += " (while awake)"
     style = "$warning" if settings.rental_idle_shutdown <= 0 else "dim"
-    return f"\n[dim]Idle stop[/dim] [{style}]{escape(text)}[/{style}]"
+    return f"[{style}]{escape(text)}[/{style}]"
+
+
+def _idle_shutdown_fact(plan: InferencePlan) -> str:
+    """What stops a rental that bills until deleted; nothing for scale-to-zero."""
+    value = _idle_shutdown_value(plan)
+    return f"\n[dim]Idle stop[/dim] {value}" if value is not None else ""
 
 
 def _render_profile_details(profile: QuickDeployProfile, plan: InferencePlan) -> str:
@@ -283,17 +312,16 @@ def _plan_continuous_monthly_cost(plan: InferencePlan) -> str:
     return f"~${value:,.2f}/mo at 24/7"
 
 
-# Enter does not deploy, on purpose. That leaves the keyboard route stated only
-# in the footer -- which a phone terminal hides behind its on-screen keyboard.
-# So a narrow viewport says it beside the button; a wide one already shows the
-# same key in its footer, and saying it twice was noise.
+# On narrow/phone viewports the footer can sit behind the on-screen keyboard,
+# so restate the deploy shortcuts below the action bar. Wide viewports already
+# show the shortcuts in the footer.
 
 
 def deploy_key_hint(*, narrow: bool) -> str:
     """Describe keyboard deployment where the footer may be out of sight."""
     if not narrow:
         return ""
-    return "[dim]ctrl+d deploys · or tab to Deploy[/dim]"
+    return "[dim]enter to Deploy · ctrl+d anywhere[/dim]"
 
 
 def _fulfillment_option(plan: InferencePlan, *, recommended: bool = False) -> str:
@@ -359,6 +387,8 @@ class QuickDeployScreen(CopyEnabledScreen):
         # to move, that made the Deploy button unreachable.
         Binding("up", "focus_previous_control", "Previous", show=False, priority=True),
         Binding("down", "focus_next_control", "Next", show=False, priority=True),
+        Binding("left", "focus_previous_action", show=False, priority=True),
+        Binding("right", "focus_next_action", show=False, priority=True),
     ]
 
     def __init__(
@@ -426,19 +456,17 @@ class QuickDeployScreen(CopyEnabledScreen):
             caution.display = bool(_fulfillment_caution(self.plan))
             yield caution
             with Horizontal(id="quick-deploy-actions"):
-                yield Button("Deploy", id="quick-deploy-btn", variant="primary")
-                # Enter is deliberately not bound to Deploy (see on_mount); on
-                # a phone the footer that says so is under the keyboard.
-                hint = self._deploy_key_hint()
-                yield Static(
-                    hint, id="quick-deploy-feedback", classes="" if hint else "hidden"
-                )
+                yield Button("▸ Deploy", id="quick-deploy-btn", variant="primary")
+                yield Button("More options...", id="toggle-advanced-quick", variant="default")
+            hint = self._deploy_key_hint()
+            yield Static(
+                hint, id="quick-deploy-feedback", classes="" if hint else "hidden"
+            )
         with VerticalScroll(id="quick-deploy-layout"):
             with Vertical(id="quick-deploy-form"):
-                # One toggle for everything past the decision: tuning knobs
-                # first so expanding reveals interactive controls immediately,
-                # followed by the technical details and monthly assumptions.
-                yield Button("More options...", id="toggle-advanced-quick", variant="default")
+                # Everything past the decision: tuning knobs first so expanding
+                # reveals interactive controls immediately, followed by the
+                # technical details and monthly assumptions.
                 if len(self._alternative_plans) > 1:
                     yield Static("Runs on", classes="form-label quick-advanced")
                     yield Select(
@@ -556,28 +584,45 @@ class QuickDeployScreen(CopyEnabledScreen):
             widget.add_class("hidden")
         self._sync_form_frame()
         self._sync_prime_option_visibility()
-        # This screen is reached by pressing enter, and Deploy spends money the
-        # moment it fires, so a second enter must not be able to rent a GPU.
-        # Start on the first interactive control; ctrl+d and tab still deploy.
+        # Focus Deploy by default so pressing Enter immediately deploys.
         # Deferred past mount: focusing during on_mount races the footer and
         # surrounding layout, which can steal it back before first paint.
         self.call_after_refresh(self._focus_initial_control)
 
     def _focus_initial_control(self) -> None:
-        """Focus the first control after mount settles (see on_mount)."""
-        # Textual's automatic first focus lands on Deploy, which now leads the
-        # DOM beside the facts; that is exactly the focus this must replace.
+        """Focus Deploy after mount settles so Enter immediately deploys."""
         if self.focused is not None and getattr(self.focused, "id", None) not in {
             None, "quick-deploy-layout", "quick-deploy-btn",
         }:
+            self._sync_action_button_labels()
             return
-        target = next(iter(self.query("#toggle-advanced-quick")), None)
-        if target is None:
-            target = self.query_one("#quick-deploy-btn", Button)
-        # Not scroll_visible: on a short terminal, scrolling the form control
-        # into view pushes the profile summary the user came here to read off
-        # the top of the screen.
-        target.focus(scroll_visible=False)
+        # Not scroll_visible: on a short terminal, scrolling the control
+        # into view can push the profile summary off the top of the screen.
+        self.query_one("#quick-deploy-btn", Button).focus(scroll_visible=False)
+        self._sync_action_button_labels()
+
+    def _sync_action_button_labels(self) -> None:
+        """Prefix the focused action button with a non-colour pointer."""
+        if not self.is_mounted:
+            return
+        try:
+            deploy_btn = self.query_one("#quick-deploy-btn", Button)
+            toggle_btn = self.query_one("#toggle-advanced-quick", Button)
+        except Exception:
+            return
+        deploy_prefix = "▸ " if deploy_btn.has_focus else ""
+        toggle_prefix = "▸ " if toggle_btn.has_focus else ""
+        toggle_text = (
+            "More options..." if self._options_collapsed() else "Fewer options"
+        )
+        deploy_btn.label = f"{deploy_prefix}Deploy"
+        toggle_btn.label = f"{toggle_prefix}{toggle_text}"
+
+    def on_descendant_focus(self, _event: events.DescendantFocus) -> None:
+        self._sync_action_button_labels()
+
+    def on_descendant_blur(self, _event: events.DescendantBlur) -> None:
+        self._sync_action_button_labels()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "toggle-advanced-quick":
@@ -585,9 +630,7 @@ class QuickDeployScreen(CopyEnabledScreen):
                 widget.toggle_class("hidden")
             self._sync_prime_option_visibility()
             self._sync_form_frame()
-            event.button.label = (
-                "More options..." if self._options_collapsed() else "Fewer options"
-            )
+            self._sync_action_button_labels()
         elif event.button.id == "quick-deploy-btn":
             self._deploy()
 
@@ -705,6 +748,16 @@ class QuickDeployScreen(CopyEnabledScreen):
         move_focus_with_arrows(self, 1)
 
     def action_focus_previous_control(self) -> None:
+        move_focus_with_arrows(self, -1)
+
+    def action_focus_next_action(self) -> None:
+        if not isinstance(self.focused, Button):
+            raise SkipAction()
+        move_focus_with_arrows(self, 1)
+
+    def action_focus_previous_action(self) -> None:
+        if not isinstance(self.focused, Button):
+            raise SkipAction()
         move_focus_with_arrows(self, -1)
 
     def action_deploy(self) -> None:

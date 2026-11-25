@@ -882,14 +882,38 @@ class TuiApp(App):
             send_desktop_notification(title, body)
 
     def quick_deploy_catalog_updated(self) -> None:
-        """Notify the active model picker that the shared catalog changed."""
+        """Notify any mounted model picker that the shared catalog changed."""
+        notified: set[int] = set()
+        screens: list[object] = []
         try:
-            screen = self.screen
+            screens.extend(reversed(self.screen_stack))
         except Exception:
-            return
-        refresher = getattr(screen, "refresh_quick_deploy_catalog", None)
-        if callable(refresher):
-            refresher()
+            pass
+        try:
+            current = self.screen
+            if current is not None:
+                screens.insert(0, current)
+        except Exception:
+            pass
+        for screen in screens:
+            if id(screen) in notified:
+                continue
+            notified.add(id(screen))
+            refresher = getattr(screen, "refresh_quick_deploy_catalog", None)
+            if callable(refresher):
+                refresher()
+
+    def begin_quick_deploy_catalog_refresh(self, *, force: bool = False) -> bool:
+        """Trigger a live quick-deploy catalog refresh from any screen."""
+        try:
+            screens = list(reversed(self.screen_stack))
+        except Exception:
+            screens = []
+        for screen in screens:
+            if isinstance(screen, MainMenuScreen):
+                screen.ensure_quick_deploy_catalog_refresh(force=force)
+                return True
+        return False
 
     def action_push_custom_deploy(self) -> None:
         self.push_screen(BackendSelectScreen())
@@ -1931,10 +1955,12 @@ class TuiApp(App):
         if poster is None:
             return
         cache_age = time.time() - self._storage_snapshot_cached_at_epoch
-        if not force and self._storage_snapshot_cache is not None:
-            # Fast path: show the latest known snapshot immediately.
-            poster(StorageLoaded(snapshot=self._storage_snapshot_cache))
-            if cache_age <= self._STORAGE_CACHE_TTL_SECONDS:
+        if self._storage_snapshot_cache is not None:
+            is_fresh = not force and cache_age <= self._STORAGE_CACHE_TTL_SECONDS
+            # Fast path: show the latest known snapshot immediately while a live
+            # refresh runs in the background when stale or explicitly forced.
+            poster(StorageLoaded(snapshot=self._storage_snapshot_cache, is_stale=not is_fresh))
+            if is_fresh:
                 return
 
         with self._storage_refresh_lock:
@@ -1953,8 +1979,20 @@ class TuiApp(App):
     def _run_storage_refresh(self) -> None:
         result_snapshot: StorageSnapshot | None = None
         error: str | None = None
+
+        def publish_partial(partial_snapshot: StorageSnapshot) -> None:
+            with self._storage_refresh_lock:
+                waiting = list(self._storage_refresh_receivers)
+            for receiver in waiting:
+                receiver.post_message(StorageLoaded(snapshot=partial_snapshot, is_stale=True))
+
         try:
-            for event in self._orchestrator.list_storage():
+            list_storage = self._orchestrator.list_storage
+            try:
+                events = list_storage(on_partial=publish_partial)
+            except TypeError:
+                events = list_storage()
+            for event in events:
                 if isinstance(event, OperationCompleteEvent):
                     if event.success and isinstance(event.data, StorageSnapshot):
                         result_snapshot = event.data

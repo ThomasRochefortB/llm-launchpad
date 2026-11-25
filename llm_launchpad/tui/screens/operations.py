@@ -9,11 +9,13 @@ from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.content import Content
 from textual.message import Message
 from textual.timer import Timer
 from textual.widgets import Button, OptionList, Static
 from textual.widgets.option_list import Option
 
+from ..format import clip
 from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
 from ..compat import highlighted_option
@@ -30,6 +32,71 @@ class DurableJobsLoaded(Message):
         super().__init__()
         self.rows = rows
         self.error = error
+
+
+def _job_status_glyph(outcome: str) -> tuple[str, str]:
+    """Map a job outcome string to a semantic glyph and theme color."""
+    lowered = (outcome or "").strip().lower()
+    if any(token in lowered for token in ("failed", "error", "crash", "timed out", "unreadable")):
+        return "✕", "$error"
+    if any(token in lowered for token in ("cancel", "interrupt", "stopped")):
+        return "◌", "$text-muted"
+    if any(token in lowered for token in ("ready", "succeeded", "complete", "done", "healthy")):
+        return "✓", "$success"
+    return "▸", "$primary"
+
+
+def _format_job_option(job_id: str, label: str) -> Content:
+    """Style a job or operation row with semantic status colors."""
+    parts = [part.strip() for part in label.split(" · ", 2)]
+    if job_id.startswith("op:"):
+        if len(parts) == 3:
+            title, subject, outcome = parts
+            _glyph, color = _job_status_glyph(outcome)
+            return Content.from_markup(
+                f"[bold]{escape(title)}[/bold] [dim]·[/dim] {escape(subject)} "
+                f"[dim]·[/dim] [{color}]{escape(outcome)}[/]"
+            )
+        return Content.from_markup(escape(label))
+    if len(parts) == 3:
+        provider, target, outcome = parts
+        glyph, color = _job_status_glyph(outcome)
+        return Content.from_markup(
+            f"[{color}]{glyph}[/]  [bold]{escape(target)}[/bold]  "
+            f"[dim]{escape(provider)}[/dim]  [dim]·[/dim]  {escape(clip(outcome, 72))}"
+        )
+    glyph, color = _job_status_glyph(label)
+    return Content.from_markup(f"[{color}]{glyph}[/]  {escape(label)}")
+
+
+def _jobs_summary_line(labels: tuple[tuple[str, str], ...]) -> str:
+    """Compact summary count strip above the jobs list."""
+    total = len(labels)
+    if not total:
+        return ""
+    succeeded = 0
+    failed = 0
+    active = 0
+    for _job_id, text in labels:
+        parts = text.split(" · ", 2)
+        outcome = parts[2] if len(parts) == 3 else text
+        glyph, _ = _job_status_glyph(outcome)
+        if glyph == "✓":
+            succeeded += 1
+        elif glyph == "✕":
+            failed += 1
+        elif glyph == "▸":
+            active += 1
+    noun = "job" if total == 1 else "jobs"
+    bits = [f"[bold]{total} {noun}[/bold]"]
+    if active:
+        bits.append(f"[$primary]{active} active[/]")
+    if succeeded:
+        bits.append(f"[$success]{succeeded} succeeded[/]")
+    if failed:
+        bits.append(f"[$error]{failed} failed[/]")
+    bits.append("[dim]Enter to reopen · x cancel active[/dim]")
+    return "  [dim]·[/dim]  ".join(bits)
 
 
 class DeploymentJobsPanel(VerticalScroll):
@@ -57,6 +124,7 @@ class DeploymentJobsPanel(VerticalScroll):
     def compose(self) -> ComposeResult:
         jobs = OptionList(id="deployment-jobs")
         jobs.border_title = "Deployment Jobs"
+        yield Static("", id="operations-summary")
         yield jobs
         yield Static("Loading jobs…", id="operations-status")
         yield Static("", id="operations-empty")
@@ -162,6 +230,10 @@ class DeploymentJobsPanel(VerticalScroll):
         self.query_one("#operations-status", Static).display = bool(status)
         options = self.query_one("#deployment-jobs", OptionList)
         labels = tuple(rows)
+        summary = self.query_one("#operations-summary", Static)
+        summary_text = _jobs_summary_line(labels)
+        summary.update(summary_text)
+        summary.display = bool(summary_text)
         empty_label = "No operations yet." if self._jobs_loaded else "Loading jobs…"
         render_key = (labels, empty_label)
         if render_key == getattr(self, "_labels", None):
@@ -171,7 +243,7 @@ class DeploymentJobsPanel(VerticalScroll):
         selected = highlighted_option(options)
         selected_id = selected.id if selected is not None else None
         options.clear_options()
-        options.add_options(Option(escape(label), id=job_id) for job_id, label in labels)
+        options.add_options(Option(_format_job_option(job_id, label), id=job_id) for job_id, label in labels)
         if not labels:
             options.add_option(Option(empty_label, disabled=True))
         else:

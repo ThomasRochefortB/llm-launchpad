@@ -7,20 +7,25 @@ from dataclasses import replace
 
 from rich.markup import escape
 
-from ..format import format_free_tier, format_gib, format_money
+from ..format import clip, format_free_tier, format_gib, format_money
 from textual import events
 from textual.actions import SkipAction
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.content import Content
 from textual.css.query import NoMatches
+from textual.timer import Timer
 from textual.widget import Widget
 from textual.widgets import Button, DataTable, Input, OptionList, Select, Static
 
+from ...core.deploy_log_summary import SUMMARY_SPINNER_FRAMES
 from ...core.storage_costs import (
     MODAL_VOLUME_FREE_TIER_GIB_MONTH,
+    allocated_monthly_storage_cost_usd,
     estimate_monthly_storage_cost,
     gross_monthly_storage_cost_usd,
+    marginal_monthly_storage_savings_usd,
 )
 from ...core.storage_resources import storage_scope_label
 from ...protocol.enums import BackendType, ComputeProvider
@@ -35,7 +40,7 @@ from ..responsive import ViewportProfile, WidthMode
 from ..widgets.adaptive_table import AdaptiveColumn, AdaptiveDataTable
 from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
-from ..visual import screen_title
+from ..visual import labelled_rows_markup, screen_title
 
 
 def _human_bytes(size_bytes: int) -> str:
@@ -62,13 +67,61 @@ def _model_label(row: StoredModelInfo) -> str:
 _CONTINUATION_MARK = "  └"
 
 
-def _grouped_model_label(continuations: set[str]) -> Callable[[StoredModelInfo], str]:
-    def label(row: StoredModelInfo) -> str:
+def _backend_display_cell(row: StoredModelInfo) -> Content:
+    if row.model_id.startswith("prime:"):
+        return Content.from_markup("[dim]disk[/dim]")
+    if row.backend == BackendType.VLLM:
+        return Content.from_markup("[$primary]vLLM[/]")
+    return Content.from_markup("[$secondary]llama.cpp[/]")
+
+
+def _row_monthly_cost_usd(row: StoredModelInfo, *, modal_total_bytes: int | None = None) -> float:
+    """Compute effective monthly cost: Prime uses hourly rate; Modal applies the 1 TiB free tier."""
+    if row.model_id.startswith("prime:") and row.source_volume.startswith("$") and row.source_volume.endswith("/hr"):
+        try:
+            return float(row.source_volume[1:-3]) * 730.0
+        except ValueError:
+            pass
+    total_bytes = row.size_bytes if modal_total_bytes is None else modal_total_bytes
+    return allocated_monthly_storage_cost_usd(row.size_bytes, total_bytes)
+
+
+def _model_max_width(profile: ViewportProfile | None) -> int:
+    """Keep long Hugging Face repo IDs from pushing cost off the right edge."""
+    if profile is None:
+        return 32
+    if profile.width >= 130:
+        return 54
+    if profile.width >= 100:
+        return 30
+    if profile.width >= 80:
+        return 25
+    return 22
+
+
+def _grouped_model_label(
+    continuations: set[str],
+    *,
+    profile_getter: Callable[[], ViewportProfile | None] | None = None,
+) -> Callable[[StoredModelInfo], Content]:
+    def label(row: StoredModelInfo) -> Content:
         if _storage_row_key(row) in continuations:
-            return _CONTINUATION_MARK + (" (INCOMPLETE)" if row.incomplete else "")
-        return escape(_model_label(row))
+            suffix = " [$warning](INCOMPLETE)[/]" if row.incomplete else ""
+            return Content.from_markup(f"[dim]{_CONTINUATION_MARK}[/dim]{suffix}")
+        max_len = _model_max_width(profile_getter() if profile_getter else None)
+        if row.incomplete:
+            budget = max(12, max_len - len(" (INCOMPLETE)"))
+            name = escape(clip(row.model_id, budget))
+            return Content.from_markup(f"[bold]{name}[/bold] [$warning](INCOMPLETE)[/]")
+        return Content.from_markup(f"[bold]{escape(clip(row.model_id, max_len))}[/bold]")
 
     return label
+
+
+def _dim_or_value(text: str) -> Content:
+    if text == "-":
+        return Content.from_markup("[dim]-[/dim]")
+    return Content.from_markup(escape(text))
 
 
 def _short_revision(row: StoredModelInfo) -> str:
@@ -100,14 +153,14 @@ _STORAGE_COLUMNS = (
     AdaptiveColumn.visible(
         "backend",
         "backend",
-        lambda row: row.backend.value,
+        _backend_display_cell,
         _WIDE,
         _STANDARD,
     ),
     AdaptiveColumn.visible(
         "model",
         "model",
-        lambda row: escape(_model_label(row)),
+        lambda row: Content.from_markup(f"[bold]{escape(_model_label(row))}[/bold]"),
         _WIDE,
         _STANDARD,
         _COMPACT,
@@ -116,13 +169,13 @@ _STORAGE_COLUMNS = (
     AdaptiveColumn.visible(
         "revision",
         "revision",
-        lambda row: escape(_short_revision(row)),
+        lambda row: _dim_or_value(_short_revision(row)),
         _WIDE,
     ),
     AdaptiveColumn.visible(
         "quant",
         "quant",
-        lambda row: escape(row.quant or "-"),
+        lambda row: _dim_or_value(row.quant or "-"),
         _WIDE,
         _STANDARD,
     ),
@@ -144,8 +197,8 @@ _STORAGE_COLUMNS = (
     ),
     AdaptiveColumn.visible(
         "cost",
-        "list $/mo",
-        lambda row: f"{format_money(gross_monthly_storage_cost_usd(row.size_bytes))}/mo",
+        "$/mo",
+        lambda row: f"{format_money(_row_monthly_cost_usd(row))}/mo",
         _WIDE,
         _STANDARD,
         _COMPACT,
@@ -155,21 +208,51 @@ _STORAGE_COLUMNS = (
         "summary",
         "details",
         lambda row: (
-            f"{row.backend.value} · {_human_bytes(row.size_bytes)} · "
-            f"{format_money(gross_monthly_storage_cost_usd(row.size_bytes))}/mo"
+            f"{'disk' if row.model_id.startswith('prime:') else ('vLLM' if row.backend == BackendType.VLLM else 'llama.cpp')} · "
+            f"{_human_bytes(row.size_bytes)} · "
+            f"{format_money(_row_monthly_cost_usd(row))}/mo"
         ),
         _MINIMAL,
     ),
 )
 
 
-def _storage_columns(continuations: set[str]) -> tuple[AdaptiveColumn, ...]:
-    """The inventory columns, with repeated model names grouped."""
-    grouped = _grouped_model_label(continuations)
-    return tuple(
-        replace(column, value=grouped) if column.key == "model" else column
-        for column in _STORAGE_COLUMNS
-    )
+def _storage_columns(
+    continuations: set[str],
+    *,
+    profile_getter: Callable[[], ViewportProfile | None] | None = None,
+    total_bytes_getter: Callable[[], int] | None = None,
+) -> tuple[AdaptiveColumn, ...]:
+    """The inventory columns, with repeated model names grouped and free tier applied."""
+    grouped = _grouped_model_label(continuations, profile_getter=profile_getter)
+
+    def cost_cell(row: StoredModelInfo) -> str:
+        total = total_bytes_getter() if total_bytes_getter is not None else row.size_bytes
+        return f"{format_money(_row_monthly_cost_usd(row, modal_total_bytes=total))}/mo"
+
+    def summary_cell(row: StoredModelInfo) -> str:
+        total = total_bytes_getter() if total_bytes_getter is not None else row.size_bytes
+        kind = (
+            "disk"
+            if row.model_id.startswith("prime:")
+            else ("vLLM" if row.backend == BackendType.VLLM else "llama.cpp")
+        )
+        return (
+            f"{kind} · {_human_bytes(row.size_bytes)} · "
+            f"{format_money(_row_monthly_cost_usd(row, modal_total_bytes=total))}/mo"
+        )
+
+    columns: list[AdaptiveColumn] = []
+    for column in _STORAGE_COLUMNS:
+        if column.key == "model":
+            columns.append(replace(column, value=grouped))
+        elif column.key == "cost":
+            columns.append(replace(column, value=cost_cell))
+        elif column.key == "summary":
+            columns.append(replace(column, value=summary_cell))
+        else:
+            columns.append(column)
+    return tuple(columns)
 
 
 def _current_row_key(table: AdaptiveDataTable) -> str | None:
@@ -224,6 +307,11 @@ class StorageScreen(CopyEnabledScreen):
         self._predownload_expanded = False
         self._continuations: set[str] = set()
         self._table_filter = initial_backend.value if initial_backend else ""
+        self._storage_refreshing = False
+        self._storage_has_snapshot = False
+        self._prime_has_snapshot = False
+        self._refresh_spinner_index = 0
+        self._refresh_spinner_timer: Timer | None = None
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="storage-scroll", classes="screen-scroll"):
@@ -254,39 +342,51 @@ class StorageScreen(CopyEnabledScreen):
                         placeholder="model or backend",
                         id="storage-filter",
                     )
-            table = AdaptiveDataTable(id="storage-table", fit_to_rows=True)
+            table = AdaptiveDataTable(id="storage-table", fit_to_rows=True, min_fit_rows=5)
             table.border_title = "Cached Models"
             yield table
+            detail = Static("", id="storage-detail", classes="hidden")
+            detail.border_title = "Selected Model"
+            yield detail
             # A table showing only its header cannot say whether nothing is
             # cached, the filter excluded everything, or the refresh failed.
             yield Static("", id="storage-empty", classes="hidden")
             # Only Prime's and Vast's inventory limits are news; the footer
             # carries the keys.
             yield Static("", id="storage-hint", classes="hidden")
-            with Vertical(id="storage-predownload-form"):
-                yield Static("[bold]Pre-download a model[/bold]")
+            predownload = Vertical(id="storage-predownload-form")
+            predownload.border_title = "Pre-download to Modal Cache"
+            with predownload:
+                yield Static("[bold]Model ID[/bold]", classes="form-label")
                 yield Input(
-                    placeholder="Model id (e.g. Qwen/Qwen3-4B-Thinking-2507-FP8)",
+                    placeholder="e.g. Qwen/Qwen3-4B-Thinking-2507-FP8 or unsloth/GLM-4.7-Flash-GGUF",
                     id="storage-model-id",
                 )
-                yield Static("Backend for pre-download", classes="form-label")
-                yield Select(
-                    options=[("llama.cpp", "llamacpp"), ("vLLM", "vllm")],
-                    value=(self._initial_backend.value if self._initial_backend else "llamacpp"),
-                    allow_blank=False,
-                    id="storage-model-backend",
-                )
-                yield Input(
-                    placeholder="Quant pattern (llama.cpp only, optional)",
-                    id="storage-model-quant",
-                )
-                yield Input(
-                    placeholder="Revision (optional)",
-                    id="storage-model-revision",
-                )
+                with Horizontal(id="storage-predownload-options"):
+                    with Vertical(classes="storage-predownload-col"):
+                        yield Static("[bold]Backend[/bold]", classes="form-label")
+                        yield Select(
+                            options=[("llama.cpp", "llamacpp"), ("vLLM", "vllm")],
+                            value=(self._initial_backend.value if self._initial_backend else "llamacpp"),
+                            allow_blank=False,
+                            id="storage-model-backend",
+                        )
+                    with Vertical(classes="storage-predownload-col"):
+                        yield Static("[bold]Quant[/bold] [dim](llama.cpp)[/dim]", classes="form-label")
+                        yield Input(
+                            placeholder="e.g. Q4_K_M (optional)",
+                            id="storage-model-quant",
+                        )
+                    with Vertical(classes="storage-predownload-col"):
+                        yield Static("[bold]Revision[/bold]", classes="form-label")
+                        yield Input(
+                            placeholder="branch or commit (optional)",
+                            id="storage-model-revision",
+                        )
                 with Horizontal(id="storage-predownload-actions"):
                     yield Button("Pre-download", id="storage-predownload-btn", variant="primary")
-                    yield Static("[dim]Downloads using the values above.[/dim]")
+                    yield Button("Hide", id="storage-predownload-cancel")
+                    yield Static("[dim]Downloads into the shared Modal cache volume.[/dim]")
         yield FittedFooter()
 
     def on_mount(self) -> None:
@@ -301,7 +401,11 @@ class StorageScreen(CopyEnabledScreen):
         table.cursor_type = "row"
         table.zebra_stripes = True
         table.configure(
-            _storage_columns(self._continuations),
+            _storage_columns(
+                self._continuations,
+                profile_getter=lambda: self.viewport_profile,
+                total_bytes_getter=lambda: self._snapshot.total_size_bytes,
+            ),
             row_key=_storage_row_key,
             profile=self.viewport_profile,
         )
@@ -333,12 +437,129 @@ class StorageScreen(CopyEnabledScreen):
 
     def on_screen_suspend(self, _: events.ScreenSuspend) -> None:
         self._was_suspended = True
+        if self._refresh_spinner_timer is not None:
+            self._refresh_spinner_timer.pause()
 
     def on_screen_resume(self, _: events.ScreenResume) -> None:
         """Refresh storage when returning to this screen."""
+        if self._refresh_spinner_timer is not None and self._storage_refreshing:
+            self._refresh_spinner_timer.resume()
         if self._was_suspended:
             self._was_suspended = False
             self._refresh_storage_snapshot()
+
+    def _spinner_frame(self) -> str:
+        return SUMMARY_SPINNER_FRAMES[self._refresh_spinner_index % len(SUMMARY_SPINNER_FRAMES)]
+
+    def _set_storage_refreshing(self, active: bool) -> None:
+        self._storage_refreshing = active
+        if active:
+            if self._refresh_spinner_timer is None:
+                self._refresh_spinner_timer = self.set_interval(
+                    0.15,
+                    self._tick_refresh_spinner,
+                    name="storage-refresh-spinner",
+                )
+            else:
+                self._refresh_spinner_timer.resume()
+        elif self._refresh_spinner_timer is not None:
+            self._refresh_spinner_timer.stop()
+            self._refresh_spinner_timer = None
+
+    def _tick_refresh_spinner(self) -> None:
+        if not self._storage_refreshing:
+            self._set_storage_refreshing(False)
+            return
+        if not self.is_current:
+            return
+        self._refresh_spinner_index = (
+            self._refresh_spinner_index + 1
+        ) % len(SUMMARY_SPINNER_FRAMES)
+        self._render_storage_status()
+
+    def _render_storage_status(self) -> None:
+        try:
+            status = self.query_one("#storage-status", Static)
+        except NoMatches:
+            return
+        frame = self._spinner_frame()
+        if self._selected_provider == ComputeProvider.VAST:
+            status.update(
+                "[dim]Vast has no separate storage inventory; rental disks are destroyed with the rental.[/dim]"
+            )
+            return
+        if self._selected_provider == ComputeProvider.PRIME:
+            if self._storage_refreshing and not self._prime_has_snapshot:
+                status.update(
+                    f"[bold $primary]{frame}[/] [bold]Refreshing Prime disks…[/bold]"
+                )
+                return
+            from ...core.prime_disks import RetainedPrimeDisk
+
+            total = sum(
+                (disk.size_gb if isinstance(disk, RetainedPrimeDisk) else int(getattr(disk, "size_gb", 0) or 0))
+                for disk in self._prime_disks
+            )
+            hourly = sum(float(getattr(disk, "price_per_hour_usd", 0.0) or 0.0) for disk in self._prime_disks)
+            rate_part = f" · ~{format_money(hourly * 730.0)}/mo" if hourly > 0 else ""
+            color = "$warning" if self._prime_disks else "$success"
+            if self._storage_refreshing:
+                status.update(
+                    f"[{color}]{len(self._prime_disks)} Prime disk(s)[/{color}] "
+                    f"[dim]· {total} GB retained{rate_part}[/dim]  "
+                    f"[bold $primary]{frame} Refreshing…[/]"
+                )
+            else:
+                status.update(
+                    f"[{color}]{len(self._prime_disks)} Prime disk(s)[/{color}] "
+                    f"[dim]· {total} GB retained{rate_part} · stop keeps disks billing; "
+                    f"delete unneeded ones[/dim]"
+                )
+            return
+
+        if self._storage_refreshing and not self._storage_has_snapshot:
+            status.update(
+                f"[bold $primary]{frame}[/] [bold]Refreshing storage…[/bold] "
+                "[dim]scanning Modal volume[/dim]"
+            )
+            return
+
+        estimate = estimate_monthly_storage_cost(self._snapshot)
+        # One line, and only the numbers: the instruction that used to trail it
+        # wrapped the status onto a second row and repeated the hint below.
+        # The free-tier arithmetic only matters once something is billable.
+        free_tier = format_free_tier(MODAL_VOLUME_FREE_TIER_GIB_MONTH)
+        total_models = self._snapshot.total_models
+        llama_count = len(self._snapshot.llamacpp_models)
+        vllm_count = len(self._snapshot.vllm_models)
+        breakdown_bits: list[str] = []
+        if llama_count:
+            breakdown_bits.append(f"{llama_count} llama.cpp")
+        if vllm_count:
+            breakdown_bits.append(f"{vllm_count} vLLM")
+        model_noun = "model" if total_models == 1 else "models"
+        count_part = (
+            f" ({total_models} {model_noun} · {', '.join(breakdown_bits)})"
+            if total_models
+            else ""
+        )
+        if estimate.billable_gib_month > 0:
+            cost_detail = (
+                f"· {format_gib(estimate.billable_gib_month)} billable past "
+                f"{free_tier} free · est. {format_money(estimate.estimated_monthly_cost_usd)}/mo"
+            )
+        elif estimate.total_size_bytes > 0:
+            used_gib = estimate.total_size_bytes / (1024.0**3)
+            pct = min(100, int(round((used_gib / MODAL_VOLUME_FREE_TIER_GIB_MONTH) * 100)))
+            pct_note = f"{pct}% of {free_tier} free" if pct >= 1 else f"<1% of {free_tier} free"
+            cost_detail = f"· {pct_note} · est. {format_money(estimate.estimated_monthly_cost_usd)}/mo"
+        else:
+            cost_detail = f"· est. {format_money(estimate.estimated_monthly_cost_usd)}/mo"
+        refresh_badge = f"  [bold $primary]{frame} Refreshing…[/]" if self._storage_refreshing else ""
+        status.update(
+            f"[$success]{_human_bytes(estimate.total_size_bytes)} cached[/$success]"
+            f"[dim]{count_part} {cost_detail}[/dim]{refresh_badge}"
+        )
 
     def viewport_profile_changed(
         self,
@@ -352,6 +573,9 @@ class StorageScreen(CopyEnabledScreen):
         except NoMatches:
             return
         table.set_viewport_profile(profile)
+        if getattr(self, "_rows_by_key", None) is not None:
+            table._rebuild()
+            self._update_selected_detail()
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id != "storage-provider-filter":
@@ -414,28 +638,13 @@ class StorageScreen(CopyEnabledScreen):
 
     def on_storage_loaded(self, message: StorageLoaded) -> None:
         self._snapshot = message.snapshot
+        self._storage_has_snapshot = True
         if self._selected_provider != ComputeProvider.MODAL:
             self._render_table()
             return
+        self._set_storage_refreshing(message.is_stale)
         self._render_table()
-        estimate = estimate_monthly_storage_cost(self._snapshot)
-        # One line, and only the numbers: the instruction that used to trail it
-        # wrapped the status onto a second row and repeated the hint below.
-        # The free-tier arithmetic only matters once something is billable.
-        free_tier = format_free_tier(MODAL_VOLUME_FREE_TIER_GIB_MONTH)
-        if estimate.billable_gib_month > 0:
-            cost_detail = (
-                f"· {format_gib(estimate.billable_gib_month)} billable past "
-                f"{free_tier} free · est. {format_money(estimate.estimated_monthly_cost_usd)}/mo"
-            )
-        elif estimate.total_size_bytes > 0:
-            cost_detail = f"· est. {format_money(estimate.estimated_monthly_cost_usd)}/mo ({free_tier} free)"
-        else:
-            cost_detail = f"· est. {format_money(estimate.estimated_monthly_cost_usd)}/mo"
-        self.query_one("#storage-status", Static).update(
-            f"[$success]{_human_bytes(estimate.total_size_bytes)} cached[/$success] "
-            f"[dim]{cost_detail}[/dim]"
-        )
+        self._render_storage_status()
         should_refocus = self._initial_focus_pending
         self._initial_focus_pending = False
         focused = self.focused
@@ -445,26 +654,19 @@ class StorageScreen(CopyEnabledScreen):
     def on_storage_failed(self, message: StorageFailed) -> None:
         if self._selected_provider != ComputeProvider.MODAL:
             return
+        self._set_storage_refreshing(False)
         self.query_one("#storage-status", Static).update(
             f"[$warning]Storage refresh failed:[/$warning] {escape(message.error)}"
         )
 
     def on_prime_disks_loaded(self, message: PrimeDisksLoaded) -> None:
-        from ...core.prime_disks import RetainedPrimeDisk
-
         self._prime_disks = list(message.disks)
         self._prime_error = None
+        self._prime_has_snapshot = True
         if self._selected_provider != ComputeProvider.PRIME:
             return
-        total = sum(
-            (disk.size_gb if isinstance(disk, RetainedPrimeDisk) else int(getattr(disk, "size_gb", 0) or 0))
-            for disk in self._prime_disks
-        )
-        self.query_one("#storage-status", Static).update(
-            f"[$success]{len(self._prime_disks)} Prime disk(s)[/$success] "
-            f"[dim]· {total} GB retained · stop keeps disks billing; "
-            f"delete unneeded ones[/dim]"
-        )
+        self._set_storage_refreshing(False)
+        self._render_storage_status()
         self._render_table()
 
     def on_prime_disks_failed(self, message: PrimeDisksFailed) -> None:
@@ -472,6 +674,7 @@ class StorageScreen(CopyEnabledScreen):
         self._prime_error = message.error
         if self._selected_provider != ComputeProvider.PRIME:
             return
+        self._set_storage_refreshing(False)
         self.query_one("#storage-status", Static).update(
             f"[$warning]Prime disk refresh failed:[/$warning] {escape(message.error)}"
         )
@@ -564,7 +767,15 @@ class StorageScreen(CopyEnabledScreen):
         if rows:
             empty.add_class("hidden")
             table.remove_class("hidden")
+            if self._selected_model is None:
+                key = _current_row_key(table)
+                if key and key in self._rows_by_key:
+                    self._selected_model = self._rows_by_key[key]
+                    if self._selected_provider == ComputeProvider.PRIME:
+                        self._selected_prime_disk_id = self._selected_model.model_id.removeprefix("prime:")
+            self._update_selected_detail()
             return
+        self._update_selected_detail()
         if self._selected_provider == ComputeProvider.VAST:
             empty.update(
                 "[dim]Vast rentals use rental-local disks that are destroyed with "
@@ -609,6 +820,7 @@ class StorageScreen(CopyEnabledScreen):
         if self._selected_provider == ComputeProvider.PRIME:
             disk_id = selected.model_id.removeprefix("prime:")
             self._selected_prime_disk_id = disk_id
+            self._update_selected_detail()
             return
         self._selected_prime_disk_id = None
         self._prefilled_model_id = selected.model_id
@@ -616,27 +828,136 @@ class StorageScreen(CopyEnabledScreen):
         self.query_one("#storage-model-backend", Select).value = selected.backend.value
         self.query_one("#storage-model-quant", Input).value = selected.quant or ""
         self.query_one("#storage-model-revision", Input).value = selected.revision or ""
+        self._update_selected_detail()
+
+    def _update_selected_detail(self) -> None:
+        """Render the compact selected-model or selected-disk inspector card."""
+        try:
+            detail = self.query_one("#storage-detail", Static)
+        except NoMatches:
+            return
+        selected = self._selected_model
+        if selected is None or not self._rows_by_key or self._predownload_expanded:
+            detail.add_class("hidden")
+            return
+        profile = self.viewport_profile
+        compact_height = profile.short or profile.constrained
+        detail.remove_class("hidden")
+
+        if self._selected_provider == ComputeProvider.PRIME:
+            disk_id = selected.model_id.removeprefix("prime:")
+            detail.border_title = f"{disk_id} · Prime Disk"
+            location = selected.revision or "-"
+            rate = selected.source_volume or "-"
+            if compact_height:
+                detail.update(
+                    f"[bold]{escape(disk_id)}[/bold]  [dim]· {escape(location)} · "
+                    f"{_human_bytes(selected.size_bytes)} · {escape(rate)} · x delete[/dim]"
+                )
+                return
+            rows_markup = [
+                ("Disk", f"[bold]{escape(disk_id)}[/bold]  [dim]· {escape(location)}[/dim]"),
+                ("Billing", f"{escape(selected.quant or '-')}  [dim]· {escape(rate)} · bills until deleted[/dim]"),
+            ]
+            footer = "[dim][bold $error]x[/] delete disk  ·  [bold $primary]/[/] filter  ·  [bold $primary]r[/] refresh[/dim]"
+            detail.update(f"{labelled_rows_markup(rows_markup)}\n{footer}")
+            return
+
+        runtime_label = "vLLM" if selected.backend == BackendType.VLLM else "llama.cpp"
+        short_name = selected.model_id.rsplit("/", 1)[-1]
+        detail.border_title = f"{clip(short_name, 42)} · {runtime_label}"
+        siblings = self._rows_removed_with(selected)
+        total_modal_bytes = self._snapshot.total_size_bytes
+        estimate = estimate_monthly_storage_cost(self._snapshot)
+        free_tier = format_free_tier(MODAL_VOLUME_FREE_TIER_GIB_MONTH)
+        effective_usd = allocated_monthly_storage_cost_usd(selected.size_bytes, total_modal_bytes)
+        list_usd = gross_monthly_storage_cost_usd(selected.size_bytes)
+        if compact_height:
+            parts = [f"[bold]{escape(clip(selected.model_id, 44))}[/bold]"]
+            if selected.quant:
+                parts.append(escape(selected.quant))
+            parts.append(_human_bytes(selected.size_bytes))
+            parts.append(f"{format_money(effective_usd)}/mo")
+            if selected.source_volume:
+                parts.append(f"[dim]{escape(selected.source_volume)}[/dim]")
+            if selected.incomplete:
+                parts.append("[$warning]incomplete · p resume[/]")
+            detail.update(" [dim]·[/dim] ".join(parts))
+            return
+
+        cache_bits = [_human_bytes(selected.size_bytes)]
+        file_noun = "file" if selected.file_count == 1 else "files"
+        cache_bits.append(f"{selected.file_count} {file_noun}")
+        if selected.quant:
+            cache_bits.append(f"quant {escape(selected.quant)}")
+        if selected.revision:
+            cache_bits.append(f"rev {escape(_short_revision(selected))}")
+        if selected.source_volume:
+            cache_bits.append(f"vol {escape(selected.source_volume)}")
+
+        model_value = f"[bold]{escape(selected.model_id)}[/bold]"
+        if selected.incomplete:
+            model_value += "  [$warning]incomplete download — press p to resume[/]"
+
+        if estimate.billable_gib_month <= 0:
+            remaining_gib = max(0.0, MODAL_VOLUME_FREE_TIER_GIB_MONTH - estimate.total_gib_month)
+            cost_value = (
+                f"[$success]{format_money(0.0)}/mo[/] "
+                f"[dim](within {free_tier} free tier · {format_gib(remaining_gib)} left · "
+                f"list {format_money(list_usd)}/mo)[/dim]"
+            )
+        else:
+            repo_bytes = selected.size_bytes + sum(item.size_bytes for item in siblings)
+            savings_usd = marginal_monthly_storage_savings_usd(repo_bytes, total_modal_bytes)
+            cost_value = (
+                f"{format_money(effective_usd)}/mo share "
+                f"[dim]· deleting saves {format_money(savings_usd)}/mo · "
+                f"list {format_money(list_usd)}/mo[/dim]"
+            )
+
+        rows_markup = [
+            ("Model", model_value),
+            ("Cache", "  [dim]·[/dim]  ".join(cache_bits)),
+            ("Cost", cost_value),
+        ]
+        lines = [labelled_rows_markup(rows_markup)]
+        if siblings:
+            total_bytes = selected.size_bytes + sum(item.size_bytes for item in siblings)
+            quants = ", ".join(escape((item.quant or "unquantized").strip()) for item in siblings)
+            lines.append(
+                f"[$warning]⚠ Deleting removes the whole repo including {len(siblings)} "
+                f"sibling quant{'s' if len(siblings) != 1 else ''} ({quants}) · "
+                f"{_human_bytes(total_bytes)} total[/]"
+            )
+        lines.append(
+            "[dim][bold $primary]p[/] pre-download  ·  [bold $primary]n[/] new download  ·  "
+            "[bold $primary]/[/] filter  ·  [bold $error]x[/] delete  ·  [bold $primary]r[/] refresh[/dim]"
+        )
+        detail.update("\n".join(lines))
 
     def action_refresh_storage(self) -> None:
         self._refresh_storage_snapshot(force=True)
 
     def _refresh_storage_snapshot(self, force: bool = False) -> None:
-        self.query_one("#storage-status", Static).update("[dim]Refreshing storage snapshot...[/dim]")
+        if self._selected_provider == ComputeProvider.VAST:
+            self._set_storage_refreshing(False)
+            self._render_table()
+            self._render_storage_status()
+            return
         if self._selected_provider == ComputeProvider.PRIME:
             refresher = getattr(self.app, "begin_prime_disks_refresh", None)
             if callable(refresher):
+                self._set_storage_refreshing(True)
+                self._render_storage_status()
                 refresher(self)
                 return
+            self._set_storage_refreshing(False)
             self.query_one("#storage-status", Static).update(
                 "[$warning]Prime disk refresh is unavailable in this session.[/$warning]"
             )
             return
-        if self._selected_provider == ComputeProvider.VAST:
-            self._render_table()
-            self.query_one("#storage-status", Static).update(
-                "[dim]Vast has no separate storage inventory; rental disks are destroyed with the rental.[/dim]"
-            )
-            return
+        self._set_storage_refreshing(True)
+        self._render_storage_status()
         self.app.begin_storage_refresh(self, force=force)
 
     def action_predownload_selected(self) -> None:
@@ -670,6 +991,11 @@ class StorageScreen(CopyEnabledScreen):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "storage-predownload-btn":
             self.action_predownload_selected()
+        elif event.button.id == "storage-predownload-cancel":
+            self._predownload_expanded = False
+            self._sync_predownload_visibility()
+            self._update_selected_detail()
+            self.query_one("#storage-table", AdaptiveDataTable).focus()
 
     def _sync_predownload_visibility(self) -> None:
         """Collapse the pre-download form until it is needed.
@@ -685,11 +1011,14 @@ class StorageScreen(CopyEnabledScreen):
         form.display = self._predownload_expanded
 
     def action_toggle_predownload_form(self) -> None:
-        """Expand the pre-download form; pre-download acts on typed values."""
-        if not self._predownload_expanded:
-            self._predownload_expanded = True
-            self._sync_predownload_visibility()
-        self.query_one("#storage-model-id", Input).focus()
+        """Toggle the pre-download form; opening focuses the model ID field."""
+        self._predownload_expanded = not self._predownload_expanded
+        self._sync_predownload_visibility()
+        self._update_selected_detail()
+        if self._predownload_expanded:
+            self.query_one("#storage-model-id", Input).focus()
+        else:
+            self.query_one("#storage-table", AdaptiveDataTable).focus()
 
     def action_delete_selected_model(self) -> None:
         if self._selected_provider == ComputeProvider.VAST:
@@ -864,9 +1193,12 @@ class PrimeDiskDeleteConfirmScreen(CopyEnabledScreen):
     """Confirm terminating a billable Prime persistent disk."""
 
     BINDINGS = [
+        Binding("left,up", "previous_action", show=False, priority=True),
+        Binding("right,down", "next_action", show=False, priority=True),
         Binding("escape", "cancel", "Cancel", show=True),
         Binding("x", "confirm_delete", "Confirm delete", show=True),
     ]
+    ACTION_IDS = ("delete-cancel", "delete-confirm")
 
     def __init__(self, disk_id: str) -> None:
         super().__init__()
@@ -900,6 +1232,12 @@ class PrimeDiskDeleteConfirmScreen(CopyEnabledScreen):
 
     def action_cancel(self) -> None:
         self.app.pop_screen()
+
+    def action_previous_action(self) -> None:
+        move_focus_across_widgets(self, self.ACTION_IDS, -1)
+
+    def action_next_action(self) -> None:
+        move_focus_across_widgets(self, self.ACTION_IDS, 1)
 
     def action_confirm_delete(self) -> None:
         disk_id = self.disk_id

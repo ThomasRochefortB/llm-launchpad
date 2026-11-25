@@ -215,12 +215,25 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(instance_input.parent is not None)
             assert instance_input.parent is not None
             self.assertTrue(instance_input.parent.has_class("hidden"))
-            # Deploy spends money on the keypress that reaches this screen, so
-            # it must not be the thing a second enter lands on.
-            self.assertFalse(screen.query_one("#quick-deploy-btn", Button).has_focus)
-            self.assertTrue(
-                screen.query_one("#toggle-advanced-quick", Button).has_focus
-            )
+            deploy_btn = screen.query_one("#quick-deploy-btn", Button)
+            toggle_btn = screen.query_one("#toggle-advanced-quick", Button)
+            self.assertTrue(deploy_btn.has_focus)
+            self.assertFalse(toggle_btn.has_focus)
+            self.assertIn("▸", str(deploy_btn.label))
+            self.assertNotIn("▸", str(toggle_btn.label))
+
+    async def test_pressing_enter_immediately_deploys_from_default_focus(self) -> None:
+        app = _TestApp()
+        async with app.run_test() as pilot:
+            app.push_screen(QuickDeployScreen(profile_id="qwen35-397b-rtxpro"))
+            await pilot.pause()
+            await pilot.pause()
+
+            await pilot.press("enter")
+            await pilot.pause()
+
+        self.assertIsNotNone(app.deployed_config)
+        self.assertEqual(app.deployed_config.instance_name, "qwen35-397b-rtxpro")
 
     async def test_supported_profile_shows_default_on_mtp_toggle_and_can_disable_it(self) -> None:
         profile = replace(
@@ -260,7 +273,7 @@ class QuickDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             button = screen.query_one("#quick-deploy-btn", Button)
             self.assertGreaterEqual(facts.region.y, 0)
             self.assertLessEqual(button.region.bottom, 24)
-            self.assertFalse(button.has_focus)
+            self.assertTrue(button.has_focus)
 
     async def test_a_provisioned_plan_quantifies_what_leaving_it_up_costs(self) -> None:
         """The windowed estimate and "bills continuously" contradicted each other.
@@ -613,13 +626,13 @@ class ArrowNavigationTests(unittest.IsolatedAsyncioTestCase):
         )
         return QuickDeployScreen(base, alternative_plans=(base,) + alternatives)
 
-    async def test_down_reaches_deploy_instead_of_entering_the_dropdown(self) -> None:
+    async def test_down_reaches_more_options_and_returns_to_deploy_without_entering_dropdown(self) -> None:
         app = _StyledApp()
         async with app.run_test(size=(52, 30)) as pilot:
             app.push_screen(self._screen_with_alternatives())
             await pilot.pause()
             await pilot.pause()
-            self.assertEqual(getattr(app.focused, "id", None), "toggle-advanced-quick")
+            self.assertEqual(getattr(app.focused, "id", None), "quick-deploy-btn")
 
             reached = []
             for _ in range(3):
@@ -627,7 +640,9 @@ class ArrowNavigationTests(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 reached.append(getattr(app.focused, "id", None))
 
+            self.assertIn("toggle-advanced-quick", reached)
             self.assertIn("quick-deploy-btn", reached)
+            self.assertNotIn("quick-fulfillment", reached)
 
     async def test_an_open_dropdown_keeps_the_arrow_keys(self) -> None:
         # Taking them away there would make the option list unusable.
@@ -667,8 +682,41 @@ class ArrowNavigationTests(unittest.IsolatedAsyncioTestCase):
             await pilot.press("up")
             await pilot.pause()
 
-            self.assertEqual(getattr(app.focused, "id", None), "toggle-advanced-quick")
-            self.assertNotEqual(forward, "toggle-advanced-quick")
+            self.assertEqual(getattr(app.focused, "id", None), "quick-deploy-btn")
+            self.assertEqual(forward, "toggle-advanced-quick")
+
+    async def test_left_and_right_move_between_action_buttons_and_update_focus_marker(self) -> None:
+        app = _StyledApp()
+        async with app.run_test(size=(80, 24)) as pilot:
+            app.push_screen(QuickDeployScreen(profile_id="kimi25-rtxpro"))
+            await pilot.pause()
+            await pilot.pause()
+
+            screen = app.screen
+            assert isinstance(screen, QuickDeployScreen)
+            deploy_btn = screen.query_one("#quick-deploy-btn", Button)
+            toggle_btn = screen.query_one("#toggle-advanced-quick", Button)
+
+            self.assertTrue(deploy_btn.has_focus)
+            self.assertEqual(str(deploy_btn.label), "▸ Deploy")
+            self.assertEqual(str(toggle_btn.label), "More options...")
+
+            await pilot.press("right")
+            await pilot.pause()
+            self.assertTrue(toggle_btn.has_focus)
+            self.assertEqual(str(deploy_btn.label), "Deploy")
+            self.assertEqual(str(toggle_btn.label), "▸ More options...")
+
+            await pilot.press("enter")
+            await pilot.pause()
+            self.assertIsNone(app.deployed_config)
+            self.assertEqual(str(toggle_btn.label), "▸ Fewer options")
+
+            await pilot.press("left")
+            await pilot.pause()
+            self.assertTrue(deploy_btn.has_focus)
+            self.assertEqual(str(deploy_btn.label), "▸ Deploy")
+            self.assertEqual(str(toggle_btn.label), "Fewer options")
 
     async def test_collapsed_advanced_controls_are_skipped(self) -> None:
         app = _StyledApp()

@@ -116,19 +116,20 @@ def parse_prometheus_text(text: str) -> dict[str, float]:
 # published under, newest first, so a rename between runtime releases does not
 # silently blank the column.
 _VLLM_FIELDS: dict[str, tuple[str, ...]] = {
-    "prompt_tokens": ("vllm:prompt_tokens_total",),
-    "generation_tokens": ("vllm:generation_tokens_total",),
+    "prompt_tokens": ("vllm:prompt_tokens_total", "vllm:prompt_tokens"),
+    "generation_tokens": ("vllm:generation_tokens_total", "vllm:generation_tokens"),
     "requests_running": ("vllm:num_requests_running",),
     "requests_waiting": ("vllm:num_requests_waiting",),
-    "requests_finished": ("vllm:request_success_total",),
+    "requests_finished": ("vllm:request_success_total", "vllm:request_success"),
     "kv_cache_usage": ("vllm:kv_cache_usage_perc", "vllm:gpu_cache_usage_perc"),
 }
 
 _LLAMACPP_FIELDS: dict[str, tuple[str, ...]] = {
-    "prompt_tokens": ("llamacpp:prompt_tokens_total",),
-    "generation_tokens": ("llamacpp:tokens_predicted_total",),
+    "prompt_tokens": ("llamacpp:prompt_tokens_total", "llamacpp:prompt_tokens"),
+    "generation_tokens": ("llamacpp:tokens_predicted_total", "llamacpp:tokens_predicted"),
     "requests_running": ("llamacpp:requests_processing",),
     "requests_waiting": ("llamacpp:requests_deferred",),
+    "kv_cache_usage": ("llamacpp:kv_cache_usage_ratio",),
     "reported_tokens_per_second": ("llamacpp:predicted_tokens_seconds",),
 }
 
