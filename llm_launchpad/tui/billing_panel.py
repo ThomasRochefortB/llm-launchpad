@@ -189,3 +189,43 @@ def render_provider_billing(
             f"[dim]  {detail}[/dim]" for detail in _detail_lines(row, storage_estimate)
         )
     return "\n".join(lines)
+
+
+def _inline_amount(row: ProviderBilling) -> str:
+    """Short single-row figure for constrained home viewports."""
+    if row.status is BillingStatus.READY and row.amount_usd is not None:
+        amount = f"[bold {MONEY_STYLE}]{format_money(row.amount_usd)}[/]"
+        suffix = " [dim]MTD[/dim]" if row.kind is not None and "month" in row.kind.label else ""
+        owed = f" [$warning]owed {format_money(row.owed_usd)}[/]" if row.owed_usd is not None else ""
+        return f"{amount}{suffix}{owed}"
+    if row.status is BillingStatus.LOADING:
+        return "[dim]…[/dim]"
+    if row.status is BillingStatus.UNCONFIGURED:
+        return "[dim]—[/dim]"
+    return "[$warning]n/a[/]"
+
+
+def render_provider_billing_inline(
+    rows: tuple[ProviderBilling, ...] | list[ProviderBilling],
+    *,
+    storage_snapshot: StorageSnapshot | None = None,
+) -> str:
+    """Render a one-line cost & balance strip for constrained viewports."""
+    if not rows:
+        return "[dim]Usage unavailable[/dim]"
+    short_names = {
+        ComputeProvider.MODAL: "Modal",
+        ComputeProvider.PRIME: "Prime",
+        ComputeProvider.VAST: "Vast",
+    }
+    parts = [
+        f"[dim]{provider_marker(row.provider)} {short_names[row.provider]}[/dim] {_inline_amount(row)}"
+        for row in rows
+    ]
+    if storage_snapshot is not None:
+        estimate = estimate_monthly_storage_cost(storage_snapshot)
+        if estimate.estimated_monthly_cost_usd > 0:
+            parts.append(
+                f"[dim]cache {format_money(estimate.estimated_monthly_cost_usd)}/mo[/dim]"
+            )
+    return "  [dim]·[/dim]  ".join(parts)

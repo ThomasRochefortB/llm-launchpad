@@ -12,6 +12,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import unicodedata
 from uuid import uuid4
 
@@ -40,18 +41,22 @@ def _slugify_name(raw: str) -> str:
     return "".join(ch if ch.isalnum() or ch == "-" else "-" for ch in raw.lower()).strip("-")
 
 
-def _modal_web_label(app_name: str, function_slug: str) -> str:
-    """Build a short deterministic web label without importing CLI dependencies."""
-    normalized = unicodedata.normalize("NFKD", app_name or "")
-    app_slug = re.sub(
+def _slugify_ascii_token(raw: str) -> str:
+    normalized = unicodedata.normalize("NFKD", raw or "")
+    return re.sub(
         r"-{2,}",
         "-",
         re.sub(r"[^a-z0-9-]+", "-", normalized.encode("ascii", "ignore").decode("ascii").lower()),
-    ).strip("-") or "default"
+    ).strip("-")
+
+
+def _modal_web_label(app_name: str, function_slug: str) -> str:
+    """Build a short deterministic web label without importing CLI dependencies."""
+    app_slug = _slugify_ascii_token(app_name) or "default"
     function_name = "serve"
-    function_slug = _slugify_name(function_slug)
-    if function_slug:
-        function_name = f"{function_name}-{function_slug}"
+    normalized_slug = _slugify_ascii_token(function_slug)
+    if normalized_slug:
+        function_name = f"{function_name}-{normalized_slug}"
     digest = hashlib.sha256(f"{app_slug}:{function_name}".encode()).hexdigest()[:12]
     return f"llp-lc-{digest}"
 
@@ -129,6 +134,7 @@ PREDOWNLOAD_TIMEOUT_MINUTES = _read_int_env("PREDOWNLOAD_TIMEOUT_MINUTES", 6 * 6
 SNAPSHOT_MAX_WORKERS = _read_int_env("HF_SNAPSHOT_MAX_WORKERS", 32)
 DOWNLOAD_CPU = _read_int_env("HF_DOWNLOAD_CPU", 4)
 SERVE_CPU = _read_int_env("LLAMACPP_SERVE_CPU", 4)
+SERVE_PORT = _read_int_env("LLAMACPP_SERVE_PORT", 8080)
 # First llama-server mmap after a large volume write can exceed 30 minutes on a
 # cold Modal volume (GLM-5.3-Flash ~109GiB). Sequential hydration plus a longer
 # bind wait covers that first GPU host read; later starts stay fast.
@@ -175,7 +181,8 @@ HF_DOWNLOAD_LOCK_WAIT_SECONDS = _read_int_env("HF_DOWNLOAD_LOCK_WAIT_SECONDS", 1
 HF_DOWNLOAD_LOCK_WAIT_TIMEOUT_SECONDS = _read_int_env("HF_DOWNLOAD_LOCK_WAIT_TIMEOUT_SECONDS", 5 * 60)
 HF_DOWNLOAD_LOCK_STALE_SECONDS = _read_int_env("HF_DOWNLOAD_LOCK_STALE_SECONDS", 15 * 60)
 download_leases = modal.Dict.from_name(HF_DOWNLOAD_LEASES_NAME, create_if_missing=True)
-CONFIG_PATH = f"{HF_CACHE_DIR}/serve_config.json"
+_LEGACY_CONFIG_PATH = f"{HF_CACHE_DIR}/serve_config.json"
+CONFIG_PATH = f"{HF_CACHE_DIR}/serve_configs/{_slugify_name(APP_NAME) or 'default'}.json"
 HF_HUB_DIR = Path(HF_CACHE_DIR) / "hub"
 _GGUF_QUANT_RE = re.compile(r"(Q\d(?:_[A-Z0-9]+)+|IQ\d+_[A-Z0-9_]+)", flags=re.IGNORECASE)
 _GGUF_SPLIT_RE = re.compile(r"-(\d+)-of-(\d+)\.gguf$", flags=re.IGNORECASE)
@@ -211,16 +218,24 @@ def _describe_transport_env(env: dict[str, str]) -> str:
     return "xet"
 
 
+_HTTP_AUTH_RE = re.compile(
+    r"(?:\bhttp(?:/\d(?:\.\d)?)?\s+|\bstatus(?:\s+code)?[:=\s]+|\bclient\s+error[:=\s]+)(?:401|403)\b"
+    r"|\b(?:401|403)\s+client\s+error\b|\b401\s+unauthorized\b|\b403\s+forbidden\b"
+)
+_HTTP_NOT_FOUND_RE = re.compile(
+    r"(?:\bhttp(?:/\d(?:\.\d)?)?\s+|\bstatus(?:\s+code)?[:=\s]+|\bclient\s+error[:=\s]+)404\b"
+    r"|\b404\s+client\s+error\b|\b404\s+not\s+found\b"
+)
+
+
 def _classify_download_failure(output: str) -> str | None:
     """Classify a failure as non-retryable (mirrors core.hf_download)."""
     text = (output or "").lower()
     if not text.strip():
         return None
-    if any(
+    if _HTTP_AUTH_RE.search(text) or any(
         marker in text
         for marker in (
-            "401",
-            "403",
             "unauthorized",
             "forbidden",
             "invalid token",
@@ -230,10 +245,9 @@ def _classify_download_failure(output: str) -> str | None:
         )
     ):
         return "auth"
-    if any(
+    if _HTTP_NOT_FOUND_RE.search(text) or any(
         marker in text
         for marker in (
-            "404",
             "repository not found",
             "repo not found",
             "revision not found",
@@ -259,16 +273,17 @@ def _classify_download_failure(output: str) -> str | None:
 
 def _load_config() -> dict[str, Any]:
     """Load configuration from the volume, with sane defaults."""
-    if Path(CONFIG_PATH).exists():
-        with open(CONFIG_PATH) as f:
-            return json.load(f)
+    for candidate in (Path(CONFIG_PATH), Path(_LEGACY_CONFIG_PATH)):
+        if candidate.exists():
+            with open(candidate) as f:
+                return json.load(f)
     # Fall back to module defaults
     return {
         "repo_id": REPO_ID,
         "quant": QUANT,
         "revision": None,
         "server_args": None,  # use DEFAULT_SERVER_ARGS
-        "port": 8080,
+        "port": SERVE_PORT,
         "host": "0.0.0.0",
         "n_gpu_layers": None,
     }
@@ -382,8 +397,10 @@ def _fetch_expected_gguf_sizes(
             continue
         if _is_excluded_gguf_path(repo_path, excluded):
             continue
-        filename = Path(repo_path).name
-        if allow_patterns and not _matches_any_pattern(filename, allow_patterns):
+        if allow_patterns and not (
+            _matches_any_pattern(repo_path, allow_patterns)
+            or _matches_any_pattern(Path(repo_path).name, allow_patterns)
+        ):
             continue
         size = getattr(sibling, "size", None)
         if isinstance(size, int) and size > 0:
@@ -479,9 +496,13 @@ def _matched_snapshot_gguf_candidates(snapshot_dir: Path, allow_patterns: list[s
     for path in snapshot_dir.glob("**/*"):
         if not path.is_file():
             continue
-        if not is_target_gguf(path.relative_to(snapshot_dir).as_posix()):
+        rel_path = path.relative_to(snapshot_dir).as_posix()
+        if not is_target_gguf(rel_path):
             continue
-        if allow_patterns and not _matches_any_pattern(path.name, allow_patterns):
+        if allow_patterns and not (
+            _matches_any_pattern(rel_path, allow_patterns)
+            or _matches_any_pattern(path.name, allow_patterns)
+        ):
             continue
         candidates.append(path)
     return candidates
@@ -800,6 +821,13 @@ def _write_hydration_marker(
             ),
             encoding="utf-8",
         )
+        try:
+            if not modal.is_local() and str(marker_path.resolve()).startswith(
+                str(Path(HF_CACHE_DIR).resolve())
+            ):
+                model_cache.commit()
+        except Exception as exc:
+            print(f"🦙 hydration marker commit skipped: {exc}")
     except OSError as exc:
         # A missing marker only means the next start hydrates again; never
         # fail a serve for bookkeeping.
@@ -979,7 +1007,7 @@ def _acquire_download_lease(
             heartbeat_at = 0.0
         age_seconds = max(0, int(now - heartbeat_at))
 
-        if heartbeat_at and now - heartbeat_at > HF_DOWNLOAD_LOCK_STALE_SECONDS:
+        if heartbeat_at <= 0 or now - heartbeat_at > HF_DOWNLOAD_LOCK_STALE_SECONDS:
             print(
                 f"🦙 removing stale download lease for {repo_id} "
                 f"(owner={current.get('owner_id')!r}, age={age_seconds}s)"
@@ -1205,6 +1233,7 @@ def _snapshot_download_with_keepalive(
         env = {
             **os.environ,
             "LLM_LAUNCHPAD_SNAPSHOT_CFG": json.dumps(payload),
+            "HF_HUB_DISABLE_PROGRESS_BARS": "1",
         }
         if disable_xet:
             env["HF_HUB_DISABLE_XET"] = "1"
@@ -1214,89 +1243,99 @@ def _snapshot_download_with_keepalive(
             env.pop("HF_XET_HIGH_PERFORMANCE", None)
             return env
         env.pop("HF_HUB_DISABLE_XET", None)
-        if not _env_value_is_true(env.get("HF_XET_HIGH_PERFORMANCE")) and HF_XET_HIGH_PERFORMANCE_DEFAULT:
+        xet_hp_override = _read_optional_bool_env("HF_XET_HIGH_PERFORMANCE")
+        if xet_hp_override is False:
+            env.pop("HF_XET_HIGH_PERFORMANCE", None)
+        elif xet_hp_override is True or HF_XET_HIGH_PERFORMANCE_DEFAULT:
             env["HF_XET_HIGH_PERFORMANCE"] = "1"
         return env
 
     def _run_attempt(env: dict[str, str]) -> tuple[int, str]:
-        process = subprocess.Popen(
-            [sys.executable, "-c", worker_code],
-            env=env,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        keepalive_interval_seconds = 20
-        started = time.time()
-        try:
-            baseline_bytes, _ = _estimate_completed_expected_gguf_size_fallback(
-                repo_id=repo_id,
-                revision=revision,
-                expected_sizes=expected_sizes,
-                allow_patterns=allow_patterns,
+        with tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as stderr_file:
+            process = subprocess.Popen(
+                [sys.executable, "-c", worker_code],
+                env=env,
+                stderr=stderr_file,
+                text=True,
             )
-        except OSError:
-            baseline_bytes = 0
-        last_bytes = -1
-        stalled_intervals = 0
-        stderr_text = ""
-        try:
-            while process.poll() is None:
-                elapsed = int(time.time() - started)
-                try:
-                    if expected_sizes:
-                        complete_bytes, complete_files = _estimate_completed_expected_gguf_size(
-                            repo_id=repo_id,
-                            revision=revision,
-                            expected_sizes=expected_sizes,
-                        )
-                    else:
-                        complete_bytes, complete_files = _estimate_matched_snapshot_size(
-                            repo_id=repo_id,
-                            revision=revision,
-                            allow_patterns=allow_patterns,
-                        )
-                    inflight_bytes, inflight_files = _estimate_incomplete_blob_size(repo_id=repo_id)
-                except OSError:
-                    complete_bytes, complete_files = 0, 0
-                    inflight_bytes, inflight_files = 0, 0
-                observed_bytes = complete_bytes + inflight_bytes
-                observed_files = complete_files + inflight_files
-                if total_expected_bytes > 0:
-                    observed_bytes = min(observed_bytes, total_expected_bytes)
-                size_gib = observed_bytes / (1024**3)
-                transferred_bytes = max(0, observed_bytes - baseline_bytes)
-                rate_mib_s = (transferred_bytes / (1024**2)) / elapsed if elapsed > 0 else 0.0
-                if observed_bytes > last_bytes:
-                    stalled_intervals = 0
-                else:
-                    stalled_intervals += 1
-                last_bytes = observed_bytes
-                stall_note = " (no growth detected)" if stalled_intervals >= 3 else ""
-                progress_text = ""
-                if total_expected_bytes > 0:
-                    total_gib = total_expected_bytes / (1024**3)
-                    pct = int((observed_bytes * 100) / total_expected_bytes) if total_expected_bytes else 0
-                    pct = max(0, min(100, pct))
-                    progress_text = f"/{total_gib:.2f}GiB pct={pct}%"
-                print(
-                    "🦙 download in progress... "
-                    f"transport={_describe_transport_env(env)} "
-                    f"elapsed={elapsed}s files={observed_files} size={size_gib:.2f}GiB{progress_text} "
-                    f"complete={complete_files} inflight={inflight_files} "
-                    f"avg_rate={rate_mib_s:.2f}MiB/s{stall_note}"
-                )
-                if heartbeat is not None:
-                    heartbeat()
-                time.sleep(keepalive_interval_seconds)
+            keepalive_interval_seconds = 20
+            started = time.time()
             try:
-                _, stderr_text = process.communicate(timeout=30)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                _, stderr_text = process.communicate()
-        finally:
-            if process.poll() is None:
-                process.kill()
-        return process.returncode, stderr_text or ""
+                baseline_bytes, _ = _estimate_completed_expected_gguf_size_fallback(
+                    repo_id=repo_id,
+                    revision=revision,
+                    expected_sizes=expected_sizes,
+                    allow_patterns=allow_patterns,
+                )
+            except OSError:
+                baseline_bytes = 0
+            last_bytes = -1
+            stalled_intervals = 0
+            stderr_text = ""
+            try:
+                while process.poll() is None:
+                    elapsed = int(time.time() - started)
+                    try:
+                        if expected_sizes:
+                            complete_bytes, complete_files = _estimate_completed_expected_gguf_size(
+                                repo_id=repo_id,
+                                revision=revision,
+                                expected_sizes=expected_sizes,
+                            )
+                        else:
+                            complete_bytes, complete_files = _estimate_matched_snapshot_size(
+                                repo_id=repo_id,
+                                revision=revision,
+                                allow_patterns=allow_patterns,
+                            )
+                        inflight_bytes, inflight_files = _estimate_incomplete_blob_size(repo_id=repo_id)
+                    except OSError:
+                        complete_bytes, complete_files = 0, 0
+                        inflight_bytes, inflight_files = 0, 0
+                    observed_bytes = complete_bytes + inflight_bytes
+                    observed_files = complete_files + inflight_files
+                    if total_expected_bytes > 0:
+                        observed_bytes = min(observed_bytes, total_expected_bytes)
+                    size_gib = observed_bytes / (1024**3)
+                    transferred_bytes = max(0, observed_bytes - baseline_bytes)
+                    rate_mib_s = (transferred_bytes / (1024**2)) / elapsed if elapsed > 0 else 0.0
+                    if observed_bytes > last_bytes:
+                        stalled_intervals = 0
+                    else:
+                        stalled_intervals += 1
+                    last_bytes = observed_bytes
+                    stall_note = " (no growth detected)" if stalled_intervals >= 3 else ""
+                    progress_text = ""
+                    if total_expected_bytes > 0:
+                        total_gib = total_expected_bytes / (1024**3)
+                        pct = int((observed_bytes * 100) / total_expected_bytes) if total_expected_bytes else 0
+                        pct = max(0, min(100, pct))
+                        progress_text = f"/{total_gib:.2f}GiB pct={pct}%"
+                    print(
+                        "🦙 download in progress... "
+                        f"transport={_describe_transport_env(env)} "
+                        f"elapsed={elapsed}s files={observed_files} size={size_gib:.2f}GiB{progress_text} "
+                        f"complete={complete_files} inflight={inflight_files} "
+                        f"avg_rate={rate_mib_s:.2f}MiB/s{stall_note}"
+                    )
+                    if heartbeat is not None:
+                        heartbeat()
+                    time.sleep(keepalive_interval_seconds)
+                try:
+                    _, comm_stderr = process.communicate(timeout=30)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    _, comm_stderr = process.communicate()
+                stderr_file.seek(0)
+                stderr_text = stderr_file.read() or (comm_stderr or "")
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    try:
+                        process.wait(timeout=5)
+                    except Exception:
+                        pass
+            return process.returncode, stderr_text or ""
 
     env = _attempt_env(disable_xet=False)
     returncode, stderr_text = _run_attempt(env)
@@ -1387,7 +1426,11 @@ def _estimate_matched_snapshot_size(
     for path in snapshot_dir.glob("**/*"):
         if not path.is_file():
             continue
-        if allow_patterns and not _matches_any_pattern(path.name, allow_patterns):
+        rel_path = path.relative_to(snapshot_dir).as_posix()
+        if allow_patterns and not (
+            _matches_any_pattern(rel_path, allow_patterns)
+            or _matches_any_pattern(path.name, allow_patterns)
+        ):
             continue
         file_count += 1
         try:
@@ -1462,6 +1505,7 @@ def _download_exact_gguf(
         env = {
             **os.environ,
             "LLM_LAUNCHPAD_EXACT_GGUF_CFG": json.dumps(payload),
+            "HF_HUB_DISABLE_PROGRESS_BARS": "1",
         }
         if disable_xet:
             env["HF_HUB_DISABLE_XET"] = "1"
@@ -1471,7 +1515,10 @@ def _download_exact_gguf(
             env.pop("HF_XET_HIGH_PERFORMANCE", None)
             return env
         env.pop("HF_HUB_DISABLE_XET", None)
-        if not _env_value_is_true(env.get("HF_XET_HIGH_PERFORMANCE")) and HF_XET_HIGH_PERFORMANCE_DEFAULT:
+        xet_hp_override = _read_optional_bool_env("HF_XET_HIGH_PERFORMANCE")
+        if xet_hp_override is False:
+            env.pop("HF_XET_HIGH_PERFORMANCE", None)
+        elif xet_hp_override is True or HF_XET_HIGH_PERFORMANCE_DEFAULT:
             env["HF_XET_HIGH_PERFORMANCE"] = "1"
         return env
 
@@ -1484,36 +1531,52 @@ def _download_exact_gguf(
                 text=True,
             )
             return completed.returncode, (completed.stdout or "").strip(), completed.stderr or ""
-        process = subprocess.Popen(
-            [sys.executable, "-c", worker_code],
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        started = time.time()
-        try:
-            while process.poll() is None:
-                elapsed = int(time.time() - started)
+        with (
+            tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as stdout_file,
+            tempfile.TemporaryFile(mode="w+", encoding="utf-8", errors="replace") as stderr_file,
+        ):
+            process = subprocess.Popen(
+                [sys.executable, "-c", worker_code],
+                env=env,
+                stdout=stdout_file,
+                stderr=stderr_file,
+                text=True,
+            )
+            started = time.time()
+            try:
+                while process.poll() is None:
+                    elapsed = int(time.time() - started)
+                    try:
+                        inflight_bytes, _ = _estimate_incomplete_blob_size(repo_id=repo_id)
+                    except OSError:
+                        inflight_bytes = 0
+                    progress_text = ""
+                    if expected_bytes and expected_bytes > 0:
+                        pct = max(0, min(100, int((inflight_bytes * 100) / expected_bytes)))
+                        progress_text = f" size={inflight_bytes / (1024**3):.2f}GiB/{expected_bytes / (1024**3):.2f}GiB pct={pct}%"
+                    print(
+                        f"🦙 {label} download in progress... "
+                        f"transport={_describe_transport_env(env)} elapsed={elapsed}s{progress_text}"
+                    )
+                    heartbeat()
+                    time.sleep(20)
                 try:
-                    inflight_bytes, _ = _estimate_incomplete_blob_size(repo_id=repo_id)
-                except OSError:
-                    inflight_bytes = 0
-                progress_text = ""
-                if expected_bytes and expected_bytes > 0:
-                    pct = max(0, min(100, int((inflight_bytes * 100) / expected_bytes)))
-                    progress_text = f" size={inflight_bytes / (1024**3):.2f}GiB/{expected_bytes / (1024**3):.2f}GiB pct={pct}%"
-                print(
-                    f"🦙 {label} download in progress... "
-                    f"transport={_describe_transport_env(env)} elapsed={elapsed}s{progress_text}"
-                )
-                heartbeat()
-                time.sleep(20)
-            stdout_text, stderr_text = process.communicate(timeout=30)
-        finally:
-            if process.poll() is None:
-                process.kill()
-        return process.returncode, (stdout_text or "").strip(), stderr_text or ""
+                    comm_stdout, comm_stderr = process.communicate(timeout=30)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    comm_stdout, comm_stderr = process.communicate()
+                stdout_file.seek(0)
+                stderr_file.seek(0)
+                stdout_text = stdout_file.read() or (comm_stdout or "")
+                stderr_text = stderr_file.read() or (comm_stderr or "")
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    try:
+                        process.wait(timeout=5)
+                    except Exception:
+                        pass
+            return process.returncode, (stdout_text or "").strip(), stderr_text or ""
 
     env = _attempt_env(disable_xet=False)
     print(f"🦙 downloading {label} with transport={_describe_transport_env(env)}")
@@ -1637,7 +1700,7 @@ def list_downloaded_models() -> list[dict[str, Any]]:
             if not model_dir.is_dir():
                 continue
             encoded = model_dir.name[len("models--") :]
-            model_id = encoded.replace("--", "/")
+            model_id = encoded.replace("--", "/", 1)
             snapshots_root = model_dir / "snapshots"
             if not snapshots_root.exists() or not snapshots_root.is_dir():
                 continue
@@ -1645,7 +1708,15 @@ def list_downloaded_models() -> list[dict[str, Any]]:
                 if not snapshot_dir.is_dir():
                     continue
                 revision = snapshot_dir.name
-                for gguf in snapshot_dir.glob("**/*.gguf"):
+                for gguf in snapshot_dir.glob("**/*"):
+                    if not gguf.name.casefold().endswith(".gguf"):
+                        continue
+                    try:
+                        if not gguf.is_file():
+                            continue
+                        size_bytes = int(gguf.stat().st_size)
+                    except OSError:
+                        continue
                     rel = str(gguf.relative_to(cache_dir))
                     quant = _extract_quant(gguf.name)
                     key = (model_id, revision, quant)
@@ -1662,7 +1733,7 @@ def list_downloaded_models() -> list[dict[str, Any]]:
                             "paths": [],
                         }
                         grouped[key] = entry
-                    entry["size_bytes"] += int(gguf.stat().st_size)
+                    entry["size_bytes"] += size_bytes
                     entry["file_count"] += 1
                     entry["paths"].append(rel)
 
@@ -1810,8 +1881,19 @@ def _dspark_fit_args(server_args: list[str], size_bytes: int) -> list[str]:
     for index in range(len(args) - 1, -1, -1):
         flag, separator, value = args[index].partition("=")
         if flag in {"-fitt", "--fit-target"}:
-            target = value if separator else args[index + 1]
-            margins = ",".join(str(int(margin) + draft_mib) for margin in target.split(","))
+            if separator:
+                target = value
+            elif index + 1 < len(args):
+                target = args[index + 1]
+            else:
+                raise ValueError(f"{flag} requires a comma-separated MiB value.")
+            tokens = [token.strip() for token in target.split(",")]
+            if not target.strip() or any(not token for token in tokens):
+                raise ValueError(f"Invalid {flag} value: {target!r}")
+            try:
+                margins = ",".join(str(int(margin) + draft_mib) for margin in tokens)
+            except ValueError as exc:
+                raise ValueError(f"Invalid {flag} value: {target!r}") from exc
             args[index:index + (1 if separator else 2)] = ["--fit-target", margins]
             return args
     # llama.cpp's default margin is 1024 MiB on every device. The draft's
@@ -1904,7 +1986,7 @@ except Exception:
     max_containers=1,  # cap number of containers (replicas) to 1
 )
 @modal.web_server(
-    8080,
+    SERVE_PORT,
     startup_timeout=SERVE_STARTUP_TIMEOUT_MINUTES * MINUTES,
     label=WEB_LABEL,
 )
@@ -2136,8 +2218,9 @@ def save_config_remote(config: dict[str, Any]) -> None:
 
     This avoids attempting to write to /root locally when running the local entrypoint.
     """
-    Path(cache_dir).mkdir(parents=True, exist_ok=True)
-    with open(CONFIG_PATH, "w") as f:
+    config_path = Path(CONFIG_PATH)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(config_path, "w") as f:
         json.dump(config, f)
     model_cache.commit()
 
@@ -2173,9 +2256,10 @@ def main(
     cfg: dict[str, Any] = {}
     if preset:
         if preset not in PRESETS:
-            print(f"⚠️ Unknown preset '{preset}'. Available: {', '.join(PRESETS.keys())}")
-        else:
-            cfg.update(PRESETS[preset])
+            raise ValueError(
+                f"Unknown preset {preset!r}. Available: {', '.join(PRESETS.keys())}"
+            )
+        cfg.update(PRESETS[preset])
 
     if repo_id is not None:
         cfg["repo_id"] = repo_id
@@ -2197,6 +2281,11 @@ def main(
     cfg["engram"] = json.loads(engram_json) if engram_json else None
     cfg["host"] = host
     cfg["port"] = int(port)
+    if cfg["port"] != SERVE_PORT:
+        raise ValueError(
+            f"Modal llama.cpp web_server is bound to port {SERVE_PORT}; "
+            f"set LLAMACPP_SERVE_PORT={cfg['port']} to match."
+        )
     cfg["n_gpu_layers"] = n_gpu_layers if n_gpu_layers is not None else None
     cfg["serving_fingerprint"] = (serving_fingerprint or "").strip() or None
 

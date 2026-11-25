@@ -28,7 +28,10 @@ from llm_launchpad.core.provider_billing import (
 )
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider
 from llm_launchpad.protocol.models import StorageSnapshot, StoredModelInfo
-from llm_launchpad.tui.billing_panel import render_provider_billing
+from llm_launchpad.tui.billing_panel import (
+    render_provider_billing,
+    render_provider_billing_inline,
+)
 from llm_launchpad.tui.markers import PROVIDER_MARKERS
 
 _GIB = 1024**3
@@ -376,6 +379,21 @@ class BillingPanelRenderTests(unittest.TestCase):
             )
         )
         self.assertNotIn("cached", rendered)
+
+
+    def test_inline_billing_summarizes_providers_and_cache(self) -> None:
+        rows = [
+            ProviderBilling.ready(ComputeProvider.MODAL, BalanceKind.SPEND_MTD, 14.20),
+            ProviderBilling.ready(ComputeProvider.PRIME, BalanceKind.BALANCE, 42.50),
+            ProviderBilling.unconfigured(ComputeProvider.VAST),
+        ]
+        rendered = _plain(
+            render_provider_billing_inline(rows, storage_snapshot=_snapshot(1026 * _GIB))
+        )
+        self.assertIn("Modal $14.20 MTD", rendered)
+        self.assertIn("Prime $42.50", rendered)
+        self.assertIn("Vast —", rendered)
+        self.assertIn("cache $0.18/mo", rendered)
 
 
 if __name__ == "__main__":

@@ -31,7 +31,7 @@ class DownloadMetadataTests(unittest.TestCase):
             files = fetch_download_files(config)
         self.assertEqual([file.size for file in files], [1000, 2000])
         self.assertEqual({file.group for file in files}, {"Q4/model-Q4"})
-        self.assertEqual(files[0].path, "models/models--acme--model/blobs/" + "a" * 64)
+        self.assertEqual(files[0].path, "gguf/hf-hub/models--acme--model/blobs/" + "a" * 64)
         api.return_value.model_info.assert_called_once_with(
             "acme/model", revision=None, files_metadata=True, timeout=10,
         )

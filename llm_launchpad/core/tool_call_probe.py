@@ -71,9 +71,11 @@ def classify_tool_call_response(payload: Any) -> ToolCallProbeResult:
         message = payload["choices"][0]["message"]
     except (KeyError, IndexError, TypeError):
         return ToolCallProbeResult(TOOL_CALLING_FAILED, "response had no assistant message")
-    calls = message.get("tool_calls") if isinstance(message, dict) else None
+    if not isinstance(message, dict):
+        return ToolCallProbeResult(TOOL_CALLING_FAILED, "response had no assistant message")
+    calls = message.get("tool_calls")
     if not calls:
-        content = str((message or {}).get("content") or "").strip()
+        content = str(message.get("content") or "").strip()
         if _PROBE_TOOL in content:
             return ToolCallProbeResult(
                 TOOL_CALLING_FAILED,
@@ -82,7 +84,11 @@ def classify_tool_call_response(payload: Any) -> ToolCallProbeResult:
         return ToolCallProbeResult(
             TOOL_CALLING_FAILED, "the model answered in text instead of calling the tool"
         )
-    function = (calls[0] or {}).get("function") or {}
+    if not isinstance(calls, list) or not isinstance(calls[0], dict):
+        return ToolCallProbeResult(TOOL_CALLING_FAILED, "tool_calls entry was malformed")
+    function = calls[0].get("function")
+    if not isinstance(function, dict):
+        return ToolCallProbeResult(TOOL_CALLING_FAILED, "tool call had no function object")
     if function.get("name") != _PROBE_TOOL:
         return ToolCallProbeResult(
             TOOL_CALLING_FAILED, f"the model called an unknown tool {function.get('name')!r}"

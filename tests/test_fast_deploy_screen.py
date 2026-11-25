@@ -1647,6 +1647,38 @@ class QuantDisclosureRenderTests(unittest.TestCase):
         rendered = Content.from_markup(_tier_option(saver, WidthMode.MINIMAL, width)).plain
         self.assertIn("2-bit", rendered)
 
+    def test_tier_rows_and_detail_name_the_compute_provider(self) -> None:
+        from llm_launchpad.protocol.models import ComputeConfiguration
+        from llm_launchpad.tui.screens.fast_deploy import _InfraRow, _infra_detail
+
+        for provider, expected_wide, expected_short in (
+            (ComputeProvider.MODAL, "Modal", "Modal"),
+            (ComputeProvider.PRIME, "Prime Intellect", "Prime"),
+            (ComputeProvider.VAST, "Vast.ai", "Vast.ai"),
+        ):
+            tier = self._tier(ECONOMY, "UD-Q4_K_XL", 3.03)
+            plan = replace(tier.plan, quote=replace(tier.plan.quote, provider=provider))
+            tier = replace(tier, plan=plan)
+            with self.subTest(provider=provider):
+                wide = Content.from_markup(_tier_option(tier, WidthMode.WIDE, 0)).plain
+                compact = Content.from_markup(_tier_option(tier, WidthMode.COMPACT, 0)).plain
+                minimal = Content.from_markup(_tier_option(tier, WidthMode.MINIMAL, 0)).plain
+                self.assertIn(expected_wide, wide)
+                self.assertIn(expected_short, compact)
+                self.assertIn(expected_short, minimal)
+
+                row = _InfraRow(
+                    profile=_profile("model", required_vram_gb=40.0),
+                    plan=plan,
+                    configuration=ComputeConfiguration(
+                        id="cfg", gpu_type="B200", gpu_memory_gb=180.0, placements=()
+                    ),
+                    alternative_plans=(plan,),
+                )
+                detail = Content.from_markup(_infra_detail(row)).plain
+                self.assertIn(expected_wide, detail)
+                self.assertIn("1x B200", detail)
+
     def test_a_reduced_quant_is_flagged_rather_than_highlighted(self) -> None:
         reduced = _quant_markup(
             _profile("small", required_vram_gb=40.0, quant="UD-Q2_K_XL")

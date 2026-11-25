@@ -268,15 +268,26 @@ def gguf_exec_command(
     """
 
     quoted_path = shlex.quote(weights_args_path)
-    joined = shlex.join(list(arguments))
+    arg_list = list(arguments)
+    joined = shlex.join(arg_list)
     pinned = joined.replace(
         shlex.quote(GGUF_FILE_PLACEHOLDER), f'"${GGUF_FILE_VARIABLE}"'
     )
     # Dropping the value alone would leave a dangling flag for llama.cpp to
-    # read the next argument as, so the pair goes together.
-    unpinned = joined.replace(
-        f"{shlex.quote(file_flag)} {shlex.quote(GGUF_FILE_PLACEHOLDER)} ", ""
-    )
+    # read the next argument as, so the pair goes together regardless of position.
+    unpinned_args: list[str] = []
+    idx = 0
+    while idx < len(arg_list):
+        if (
+            arg_list[idx] == file_flag
+            and idx + 1 < len(arg_list)
+            and arg_list[idx + 1] == GGUF_FILE_PLACEHOLDER
+        ):
+            idx += 2
+            continue
+        unpinned_args.append(arg_list[idx])
+        idx += 1
+    unpinned = shlex.join(unpinned_args)
     # Newline-separated so each exec stays the first word of its own line: both
     # providers hand this to a shell as one script, and a reader (or a test)
     # looking for the server invocation should find it where it is.

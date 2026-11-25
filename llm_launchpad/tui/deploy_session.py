@@ -110,7 +110,7 @@ def run_tui_deploy_lifecycle(
             if (
                 endpoint is not None
                 and endpoint.web_url
-                and config.provider == ComputeProvider.MODAL
+                and saved.provider == ComputeProvider.MODAL
             ):
                 try:
                     from ..core.runtime_health import record_explicit_health

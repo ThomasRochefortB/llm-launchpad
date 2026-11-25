@@ -360,9 +360,18 @@ class _ModalLogTail:
     def __init__(self, app_name: str) -> None:
         self.app_name = app_name
         self.seen_lines: set[str] = set()
+        self.ordered_lines: list[str] = []
         self._proc: subprocess.Popen[str] | None = None
         self._queue: queue.Queue[str | None] | None = None
         self._retry_at = 0.0
+
+    def record_line(self, line: str) -> bool:
+        """Record a line in chronological arrival order; return True if newly seen."""
+        self.ordered_lines.append(line)
+        if line in self.seen_lines:
+            return False
+        self.seen_lines.add(line)
+        return True
 
     def may_attach(self) -> bool:
         """Return whether the stream is detached and its retry delay has passed."""
@@ -391,7 +400,7 @@ class _ModalLogTail:
                 self._queue = None
                 self._retry_at = time.time() + self.RETRY_DELAY_SECONDS
                 break
-            self.seen_lines.add(line)
+            self.record_line(line)
             yield LogEvent(line=line, operation=OperationType.WARMUP)
 
     def stop(self, reason: str) -> None:
@@ -401,8 +410,22 @@ class _ModalLogTail:
             return
         try:
             proc.terminate()
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                try:
+                    proc.wait(timeout=2.0)
+                except Exception:
+                    pass
         except Exception:
             log_exception(f"Failed to terminate Modal log tail {reason}")
+        finally:
+            if proc.stdout is not None:
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
 
     def _spawn(self) -> subprocess.Popen[str]:
         follow = ModalBackend.logs_follow_args()
@@ -483,9 +506,13 @@ def _verify_gpu_residency(
     runtime_evidence: LlamacppRuntimeEvidence,
     runtime_log_text: str,
     app_name: str,
+    provider: ComputeProvider = ComputeProvider.MODAL,
+    pod_id: str | None = None,
+    prime_backend: Any | None = None,
 ) -> Generator[BaseEvent, None, tuple[LlamacppRuntimeEvidence, bool, EvidenceLevel | None] | None]:
     """Check runtime offload logs/cache and reject contradicted GPU residency."""
     from .runtime_evidence import (
+        LlamacppRuntimeEvidence,
         combine_runtime_evidence,
         remembered_attestation_evidence,
         runtime_log_evidence,
@@ -504,7 +531,15 @@ def _verify_gpu_residency(
         if observed_residency is None:
             # The live tail can lose the offload report to a burst upstream, so
             # look again before concluding the runtime never said anything.
-            recovered = _refetched_log_evidence(app_name)
+            recovered = LlamacppRuntimeEvidence()
+            if provider == ComputeProvider.MODAL:
+                recovered = _refetched_log_evidence(app_name)
+            elif provider == ComputeProvider.PRIME and pod_id and prime_backend is not None:
+                try:
+                    lines = prime_backend.get_pod_logs(pod_id, tail=200)
+                    recovered = runtime_log_evidence("\n".join(lines))
+                except Exception:
+                    log_exception(f"Failed to re-read Prime pod logs for {pod_id}")
             if recovered.gpu_resident is None:
                 recovered = remembered_attestation_evidence(
                     load_runtime_attestation(placement_assessment.fingerprint)
@@ -572,6 +607,9 @@ def _certify_serving_requirements(
     price_per_hour_usd: float | None = None,
     runtime_log_text: str = "",
     app_name: str = "",
+    provider: ComputeProvider = ComputeProvider.MODAL,
+    pod_id: str | None = None,
+    prime_backend: Any | None = None,
 ) -> Generator[BaseEvent, None, RuntimeAttestation | None]:
     """Verify full-context GPU residency and throughput for a ready endpoint.
 
@@ -612,6 +650,9 @@ def _certify_serving_requirements(
         runtime_evidence=runtime_evidence,
         runtime_log_text=runtime_log_text,
         app_name=app_name,
+        provider=provider,
+        pod_id=pod_id,
+        prime_backend=prime_backend,
     )
     if residency_result is None:
         return None
@@ -797,6 +838,13 @@ class _WarmupSession:
         self.unrecoverable: str | None = None
         self.draft_context_error = False
         self.managed_dspark = False
+        self._log_tail_stopped = False
+
+    def _stop_log_tail(self, reason: str) -> None:
+        if self._log_tail_stopped:
+            return
+        self._log_tail_stopped = True
+        self.log_tail.stop(reason)
 
     def _timeout_message(self, detail: str | None) -> str:
         if self.last_scheduling_hint:
@@ -861,12 +909,13 @@ class _WarmupSession:
             yield from self._drain_live_logs(
                 fetch_historical_logs(self.target_app_name, self.log_tail.seen_lines)
             )
+            self._log_tail_stopped = False
             yield from self.log_tail.attach()
 
     def _fail_if_unrecoverable(self) -> Generator[BaseEvent, None, bool]:
         if self.unrecoverable is None:
             return False
-        self.log_tail.stop("on unrecoverable startup failure")
+        self._stop_log_tail("on unrecoverable startup failure")
         yield from fail_operation(
             OperationType.WARMUP,
             self.unrecoverable,
@@ -917,7 +966,7 @@ class _WarmupSession:
                 return probe_resp, probe_exc, False
             except queue.Empty:
                 if is_shutting_down():
-                    self.log_tail.stop("on shutdown")
+                    self._stop_log_tail("on shutdown")
                     return None, None, True
                 yield from self._reattach_modal_logs_if_needed()
                 yield from self._drain_live_logs()
@@ -925,7 +974,7 @@ class _WarmupSession:
                     return None, None, True
                 now = time.time()
                 if now - self.start > self.req.timeout:
-                    self.log_tail.stop("on timeout")
+                    self._stop_log_tail("on timeout")
                     yield from fail_operation(
                         OperationType.WARMUP,
                         self._timeout_message(
@@ -937,11 +986,17 @@ class _WarmupSession:
 
     def _handle_ready_endpoint(self, requests_module: Any) -> EventStream:
         """Certify residency/vision, emit the curl hint, and finish healthy."""
-        self.log_tail.stop("after readiness")
+        self._stop_log_tail("after readiness")
         if self.req.phase_timer is not None:
             self.req.phase_timer.ready()
         attestation = None
         if self.req.serving_requirements is not None:
+            ordered_lines = getattr(self.log_tail, "ordered_lines", None)
+            runtime_log_lines = (
+                ordered_lines
+                if ordered_lines is not None
+                else sorted(self.log_tail.seen_lines)
+            )
             attestation = yield from _certify_serving_requirements(
                 requests_module,
                 backend=self.req.backend,
@@ -953,8 +1008,11 @@ class _WarmupSession:
                 runtime_id=self.req.runtime_id,
                 phase_timer=self.req.phase_timer,
                 price_per_hour_usd=self.req.price_per_hour_usd,
-                runtime_log_text="\n".join(sorted(self.log_tail.seen_lines)),
+                runtime_log_text="\n".join(runtime_log_lines),
                 app_name=self.target_app_name or "",
+                provider=self.req.provider,
+                pod_id=self.req.pod_id,
+                prime_backend=self.req.prime_backend,
             )
             if attestation is None:
                 return
@@ -1020,7 +1078,10 @@ class _WarmupSession:
                 lines = self.req.prime_backend.get_pod_logs(self.req.pod_id, tail=200)
                 for line in lines:
                     if line not in self.log_tail.seen_lines:
-                        self.log_tail.seen_lines.add(line)
+                        if hasattr(self.log_tail, "record_line"):
+                            self.log_tail.record_line(line)
+                        else:
+                            self.log_tail.seen_lines.add(line)
                         yield LogEvent(line=line, operation=OperationType.WARMUP)
             except Exception:
                 log_exception("Failed to fetch Prime pod logs during warmup")
@@ -1056,78 +1117,81 @@ class _WarmupSession:
             )
             return
 
-        if self.tail_modal_logs:
-            yield from self.log_tail.attach()
-
         try:
-            import requests
-        except ImportError:
-            yield from fail_operation(
-                OperationType.WARMUP,
-                "'requests' is required. Install with: pip install requests",
-                recoverable=False,
-            )
-            return
+            if self.tail_modal_logs:
+                yield from self.log_tail.attach()
 
-        backoff = 2.0
-        while True:
-            if is_shutting_down():
-                self.log_tail.stop("on shutdown")
-                return
-
-            yield from self._reattach_modal_logs_if_needed()
-            yield from self._drain_live_logs()
-            if (yield from self._fail_if_unrecoverable()):
-                return
-
-            elapsed = time.time() - self.start
-            if elapsed > self.req.timeout:
-                self.log_tail.stop("on timeout")
+            try:
+                import requests
+            except ImportError:
                 yield from fail_operation(
                     OperationType.WARMUP,
-                    self._timeout_message(self.last_err),
+                    "'requests' is required. Install with: pip install requests",
+                    recoverable=False,
                 )
                 return
 
-            probe_timeout = _probe_timeout_seconds(
-                self.req.provider, self.req.timeout, elapsed
-            )
-            probe_resp, probe_exc, aborted = yield from self._execute_probe(
-                requests, probe_timeout
-            )
-            if aborted:
-                return
+            backoff = 2.0
+            while True:
+                if is_shutting_down():
+                    self._stop_log_tail("on shutdown")
+                    return
 
-            if probe_exc is not None:
-                self.last_err = str(probe_exc)
-            else:
-                try:
-                    body = probe_resp.text or ""
-                    ready_ok, readiness_reason = probe_response_is_ready(
-                        self.req.backend, probe_resp.status_code, body
+                yield from self._reattach_modal_logs_if_needed()
+                yield from self._drain_live_logs()
+                if (yield from self._fail_if_unrecoverable()):
+                    return
+
+                elapsed = time.time() - self.start
+                if elapsed > self.req.timeout:
+                    self._stop_log_tail("on timeout")
+                    yield from fail_operation(
+                        OperationType.WARMUP,
+                        self._timeout_message(self.last_err),
                     )
-                    if ready_ok:
-                        yield from self._handle_ready_endpoint(requests)
-                        return
-                    yield from self._handle_non_ready_response(
-                        probe_resp.status_code, body, readiness_reason
-                    )
-                except Exception as exc:
-                    self.last_err = str(exc)
+                    return
 
-            yield from self._maybe_check_system_scheduling(time.time())
+                probe_timeout = _probe_timeout_seconds(
+                    self.req.provider, self.req.timeout, elapsed
+                )
+                probe_resp, probe_exc, aborted = yield from self._execute_probe(
+                    requests, probe_timeout
+                )
+                if aborted:
+                    return
 
-            # Keep retry pauses short after a Modal cold-start timeout/connect
-            # error so Modal sees continuous demand until a container binds.
-            cold_modal_retry = (
-                self.req.provider == ComputeProvider.MODAL and probe_exc is not None
-            )
-            wait_seconds = (
-                _MODAL_COLD_RETRY_BACKOFF_SECONDS if cold_modal_retry else backoff
-            )
-            yield from self._sleep_between_probes(wait_seconds)
-            if not cold_modal_retry:
-                backoff = min(self._MAX_BACKOFF_SECONDS, backoff * 1.5)
+                if probe_exc is not None:
+                    self.last_err = str(probe_exc)
+                else:
+                    try:
+                        body = probe_resp.text or ""
+                        ready_ok, readiness_reason = probe_response_is_ready(
+                            self.req.backend, probe_resp.status_code, body
+                        )
+                        if ready_ok:
+                            yield from self._handle_ready_endpoint(requests)
+                            return
+                        yield from self._handle_non_ready_response(
+                            probe_resp.status_code, body, readiness_reason
+                        )
+                    except Exception as exc:
+                        self.last_err = str(exc)
+
+                yield from self._maybe_check_system_scheduling(time.time())
+
+                # Keep retry pauses short after a Modal cold-start timeout/connect
+                # error so Modal sees continuous demand until a container binds.
+                cold_modal_retry = (
+                    self.req.provider == ComputeProvider.MODAL and probe_exc is not None
+                )
+                wait_seconds = (
+                    _MODAL_COLD_RETRY_BACKOFF_SECONDS if cold_modal_retry else backoff
+                )
+                yield from self._sleep_between_probes(wait_seconds)
+                if not cold_modal_retry:
+                    backoff = min(self._MAX_BACKOFF_SECONDS, backoff * 1.5)
+        finally:
+            self._stop_log_tail("on exit")
 
 
 class WarmupRunner:

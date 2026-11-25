@@ -32,7 +32,14 @@ def write_evaluation_record(record: EvaluationRecord, run_dir: Path) -> Path:
     """Persist one frozen prediction-plus-observation pair."""
 
     run_dir.mkdir(parents=True, exist_ok=True)
-    path = run_dir / f"record-{record.record_id}.json"
+    safe_id = (
+        "".join(
+            char if char.isalnum() or char in {"-", "_", "."} else "-"
+            for char in str(record.record_id or "")
+        ).strip("-.")
+        or "record"
+    )
+    path = run_dir / f"record-{safe_id}.json"
     payload = {
         "schema_version": EVALUATION_SCHEMA_VERSION,
         "estimator_version": ESTIMATOR_VERSION,
@@ -138,10 +145,25 @@ def _record_from_dict(raw: Any) -> EvaluationRecord | None:
             WorkloadScenario,
         )
 
-        scenario_raw = payload.get("scenario") or {}
-        runtime_raw = payload.get("runtime") or {}
-        prediction_raw = payload.get("prediction") or {}
-        compatibility_raw = payload.get("compatibility") or {}
+        scenario_raw = payload.get("scenario")
+        runtime_raw = payload.get("runtime")
+        prediction_raw = payload.get("prediction")
+        compatibility_raw = payload.get("compatibility")
+        if scenario_raw is None:
+            scenario_raw = {}
+        if runtime_raw is None:
+            runtime_raw = {}
+        if prediction_raw is None:
+            prediction_raw = {}
+        if compatibility_raw is None:
+            compatibility_raw = {}
+        if not (
+            isinstance(scenario_raw, dict)
+            and isinstance(runtime_raw, dict)
+            and isinstance(prediction_raw, dict)
+            and isinstance(compatibility_raw, dict)
+        ):
+            return None
         scenario = WorkloadScenario(
             id=str(scenario_raw.get("id") or ""),
             display_name=str(scenario_raw.get("display_name") or ""),

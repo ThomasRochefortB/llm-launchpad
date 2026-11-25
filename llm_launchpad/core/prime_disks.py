@@ -181,15 +181,23 @@ def _disk_stock_unavailable(stock_status: str | None) -> bool:
 def matching_disk_offer(
     disk_offers: list[PrimeDiskOffer],
     gpu_offer: ComputeOffer,
+    *,
+    required_gb: int | None = None,
 ) -> PrimeDiskOffer | None:
     """Return the first available persistent-disk offer for a GPU location."""
 
+    fallback: PrimeDiskOffer | None = None
     for disk in disk_offers:
         if _disk_stock_unavailable(disk.stock_status):
             continue
-        if disk_matches_gpu_offer(disk, gpu_offer):
-            return disk
-    return None
+        if not disk_matches_gpu_offer(disk, gpu_offer):
+            continue
+        if required_gb is not None and disk.maximum_size_gb is not None and disk.maximum_size_gb < required_gb:
+            if fallback is None:
+                fallback = disk
+            continue
+        return disk
+    return None if required_gb is not None else fallback
 
 
 def _model_weights_gb(config: DeploymentConfig) -> float:
@@ -370,9 +378,19 @@ def _create_cache_disk(
         log_exception("Could not list Prime disk offers")
         _record(f"disk offers could not be listed ({exc})")
         return None
-    disk_offer = matching_disk_offer(list(disk_offers or []), gpu_offer)
+    weights_gb = _model_weights_gb(config) if config is not None else 0.0
+    required_gb = _required_cache_disk_gb(weights_gb) if weights_gb > 0 else None
+    all_offers = list(disk_offers or [])
+    disk_offer = matching_disk_offer(all_offers, gpu_offer, required_gb=required_gb)
     if disk_offer is None:
-        _record(f"no disk product in {gpu_offer.data_center or gpu_offer.region or 'this location'}")
+        any_offer = matching_disk_offer(all_offers, gpu_offer) if required_gb is not None else None
+        if any_offer is not None and any_offer.maximum_size_gb is not None and required_gb is not None:
+            _record(
+                f"max disk size {any_offer.maximum_size_gb} GB is smaller than the "
+                f"{required_gb} GB required"
+            )
+        else:
+            _record(f"no disk product in {gpu_offer.data_center or gpu_offer.region or 'this location'}")
         return None
     size_gb = cache_disk_size_gb(disk_offer, config)
     try:

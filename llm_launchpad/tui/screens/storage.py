@@ -66,7 +66,7 @@ def _grouped_model_label(continuations: set[str]) -> Callable[[StoredModelInfo],
     def label(row: StoredModelInfo) -> str:
         if _storage_row_key(row) in continuations:
             return _CONTINUATION_MARK + (" (INCOMPLETE)" if row.incomplete else "")
-        return _model_label(row)
+        return escape(_model_label(row))
 
     return label
 
@@ -107,7 +107,7 @@ _STORAGE_COLUMNS = (
     AdaptiveColumn.visible(
         "model",
         "model",
-        _model_label,
+        lambda row: escape(_model_label(row)),
         _WIDE,
         _STANDARD,
         _COMPACT,
@@ -116,13 +116,13 @@ _STORAGE_COLUMNS = (
     AdaptiveColumn.visible(
         "revision",
         "revision",
-        _short_revision,
+        lambda row: escape(_short_revision(row)),
         _WIDE,
     ),
     AdaptiveColumn.visible(
         "quant",
         "quant",
-        lambda row: row.quant or "-",
+        lambda row: escape(row.quant or "-"),
         _WIDE,
         _STANDARD,
     ),
@@ -254,7 +254,9 @@ class StorageScreen(CopyEnabledScreen):
                         placeholder="model or backend",
                         id="storage-filter",
                     )
-            yield AdaptiveDataTable(id="storage-table", fit_to_rows=True)
+            table = AdaptiveDataTable(id="storage-table", fit_to_rows=True)
+            table.border_title = "Cached Models"
+            yield table
             # A table showing only its header cannot say whether nothing is
             # cached, the filter excluded everything, or the refresh failed.
             yield Static("", id="storage-empty", classes="hidden")
@@ -452,6 +454,8 @@ class StorageScreen(CopyEnabledScreen):
 
         self._prime_disks = list(message.disks)
         self._prime_error = None
+        if self._selected_provider != ComputeProvider.PRIME:
+            return
         total = sum(
             (disk.size_gb if isinstance(disk, RetainedPrimeDisk) else int(getattr(disk, "size_gb", 0) or 0))
             for disk in self._prime_disks
@@ -466,6 +470,8 @@ class StorageScreen(CopyEnabledScreen):
     def on_prime_disks_failed(self, message: PrimeDisksFailed) -> None:
         self._prime_disks = []
         self._prime_error = message.error
+        if self._selected_provider != ComputeProvider.PRIME:
+            return
         self.query_one("#storage-status", Static).update(
             f"[$warning]Prime disk refresh failed:[/$warning] {escape(message.error)}"
         )
@@ -551,6 +557,10 @@ class StorageScreen(CopyEnabledScreen):
         """Say why the inventory is empty, distinguishing cause from failure."""
         empty = self.query_one("#storage-empty", Static)
         table = self.query_one("#storage-table", AdaptiveDataTable)
+        table.border_title = {
+            ComputeProvider.VAST: "Vast Rental Disks",
+            ComputeProvider.PRIME: "Prime Disks",
+        }.get(self._selected_provider, "Cached Models")
         if rows:
             empty.add_class("hidden")
             table.remove_class("hidden")

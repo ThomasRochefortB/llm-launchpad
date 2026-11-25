@@ -1,5 +1,6 @@
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -76,9 +77,19 @@ def tool_call_flags(
     return flags, parser, enabled
 
 
+def _gpu_count_from_config(gpu_config: str) -> int:
+    """Extract positive `:N` GPU count from Modal `GPU_CONFIG`, defaulting to 1."""
+    _, sep, suffix = (gpu_config or "").rpartition(":")
+    if sep and suffix.strip().isdigit():
+        count = int(suffix.strip())
+        if count > 0:
+            return count
+    return 1
+
+
 # These values are captured at deploy/run time by the Modal CLI process.
-DEPLOY_N_GPU = _read_int_env("N_GPU", 1)
 DEPLOY_GPU_CONFIG = _read_str_env("GPU_CONFIG", "A100-80GB:1")
+DEPLOY_N_GPU = _read_int_env("N_GPU", _gpu_count_from_config(DEPLOY_GPU_CONFIG))
 DEPLOY_MODEL_NAME = _read_str_env("MODEL_NAME", "Qwen/Qwen3-4B-Thinking-2507-FP8")
 DEPLOY_MODEL_REVISION = os.environ.get("MODEL_REVISION", "").strip() or None
 DEPLOY_SERVED_MODEL_NAME = _read_str_env("SERVED_MODEL_NAME", default_served_model_name(DEPLOY_MODEL_NAME))
@@ -225,13 +236,22 @@ def predownload_model(
             env.pop("HF_XET_HIGH_PERFORMANCE", None)
         return env
 
+    _http_auth_re = re.compile(
+        r"(?:\bhttp(?:/\d(?:\.\d)?)?\s+|\bstatus(?:\s+code)?[:=\s]+|\bclient\s+error[:=\s]+)(?:401|403)\b"
+        r"|\b(?:401|403)\s+client\s+error\b|\b401\s+unauthorized\b|\b403\s+forbidden\b"
+    )
+    _http_not_found_re = re.compile(
+        r"(?:\bhttp(?:/\d(?:\.\d)?)?\s+|\bstatus(?:\s+code)?[:=\s]+|\bclient\s+error[:=\s]+)404\b"
+        r"|\b404\s+client\s+error\b|\b404\s+not\s+found\b"
+    )
+
     def _failure_kind(stderr: str) -> str | None:
         text = (stderr or "").lower()
         if not text.strip():
             return None
-        if any(m in text for m in ("401", "403", "unauthorized", "forbidden", "invalid token", "gated repo", "access denied")):
+        if _http_auth_re.search(text) or any(m in text for m in ("unauthorized", "forbidden", "invalid token", "gated repo", "access denied")):
             return "auth"
-        if any(m in text for m in ("404", "repository not found", "repo not found", "revision not found", "no such revision", "entry not found", "does not exist")):
+        if _http_not_found_re.search(text) or any(m in text for m in ("repository not found", "repo not found", "revision not found", "no such revision", "entry not found", "does not exist")):
             return "not_found"
         if any(m in text for m in ("no space left", "disk quota", "enospc", "no space on device", "volume out of space")):
             return "no_space"
@@ -374,4 +394,12 @@ def serve() -> None:
     print("Starting vLLM command:")
     print(" ", shlex.join(cmd))
     subprocess.Popen(cmd)
+
+
+@app.local_entrypoint()
+def main(preload: bool = False) -> None:
+    """Pre-download / smoke-verify model weights in the shared Modal HF cache."""
+    result = predownload_model.remote(DEPLOY_MODEL_NAME, DEPLOY_MODEL_REVISION)
+    action = "Preloaded" if preload else "Smoke-verified"
+    print(f"{action} {result.get('repo_id', DEPLOY_MODEL_NAME)} at {result.get('path', '')}")
 

@@ -329,10 +329,14 @@ def memory_for_cache_type(
     pass the result to ``assess_memory_placement``, which recomputes it.
     """
 
-    source_bytes = _cache_bytes(from_cache_type)
-    target_bytes = _cache_bytes(to_cache_type)
-    if source_bytes <= 0:
+    source_key = from_cache_type.strip().casefold()
+    target_key = to_cache_type.strip().casefold()
+    source_bytes = _CACHE_BYTES.get(source_key)
+    target_bytes = _CACHE_BYTES.get(target_key)
+    if source_bytes is None or source_bytes <= 0:
         raise ValueError(f"Unknown source cache type: {from_cache_type!r}")
+    if target_bytes is None or target_bytes <= 0:
+        raise ValueError(f"Unknown target cache type: {to_cache_type!r}")
     if memory.source != "gguf-metadata":
         raise ValueError(
             "Only a metadata-derived estimate can be rescaled; the fallback "
@@ -538,11 +542,12 @@ def serving_variants(
     """
     candidates: list[tuple[ServingRequirements, RuntimeTuning, str]] = []
     base_requirements = serving_requirements(context_tokens, objective=objective)
+    arch_tuning = tuning_for_architecture(
+        tuning_for_objective(objective, speculative_decoding=speculative_decoding),
+        metadata.architecture,
+    )
     base_tuning = tuning_for_attention_scratch(
-        tuning_for_architecture(
-            tuning_for_objective(objective, speculative_decoding=speculative_decoding),
-            metadata.architecture,
-        ),
+        arch_tuning,
         context_tokens=base_requirements.context_tokens,
         attention_head_count=attention_head_count(metadata),
     )
@@ -552,7 +557,7 @@ def serving_variants(
             continue
         requirements = replace(base_requirements, context_tokens=alternative)
         tuning = tuning_for_attention_scratch(
-            replace(base_tuning),
+            replace(arch_tuning),
             context_tokens=alternative,
             attention_head_count=attention_head_count(metadata),
         )

@@ -347,15 +347,14 @@ class JobStore:
         with self._lock:
             conn = self._connect()
             try:
-                row = conn.execute("SELECT status FROM jobs WHERE id=?;", (job_id,)).fetchone()
-                if row is None or row["status"] not in ACTIVE_STATUSES:
-                    return False
-                conn.execute(
-                    "UPDATE jobs SET cancel_requested=1, outcome=?, updated_at=? WHERE id=?;",
+                conn.execute("BEGIN IMMEDIATE;")
+                cursor = conn.execute(
+                    "UPDATE jobs SET cancel_requested=1, outcome=?, updated_at=? "
+                    "WHERE id=? AND status IN ('pending','running');",
                     ("Cancelling; waiting for provider call to return.", time.time(), job_id),
                 )
                 conn.commit()
-                return True
+                return cursor.rowcount == 1
             finally:
                 conn.close()
 
@@ -379,6 +378,19 @@ class JobStore:
                 conn.execute(
                     "UPDATE jobs SET config_b64=?, app_name=?, provider=?, backend=?, updated_at=? WHERE id=?;",
                     (_encode(config), app_name, provider, backend, time.time(), job_id),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def clear_resource(self, job_id: str) -> None:
+        """Clear ``resource_app_id`` before starting a fallback placement."""
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    "UPDATE jobs SET resource_app_id=NULL, updated_at=? WHERE id=?;",
+                    (time.time(), job_id),
                 )
                 conn.commit()
             finally:
@@ -540,14 +552,29 @@ class JobStore:
             alive = self.pid_alive(record.worker_pid)
             stale = (time.time() - (record.heartbeat or 0.0)) > HEARTBEAT_TIMEOUT_SECONDS
             if record.worker_pid and not alive:
-                self.finish_job(
-                    record.id,
-                    JobStatus.INTERRUPTED,
-                    "Worker interrupted; check provider for a billing resource, then clean up from Jobs or Manage.",
-                )
-                updated = self.get_job(record.id)
-                if updated is not None:
-                    interrupted.append(updated)
+                with self._lock:
+                    conn = self._connect()
+                    try:
+                        conn.execute("BEGIN IMMEDIATE;")
+                        cursor = conn.execute(
+                            "UPDATE jobs SET status=?, outcome=?, updated_at=? "
+                            "WHERE id=? AND status IN ('pending','running') AND worker_pid=?;",
+                            (
+                                JobStatus.INTERRUPTED,
+                                "Worker interrupted; check provider for a billing resource, then clean up from Jobs or Manage.",
+                                time.time(),
+                                record.id,
+                                record.worker_pid,
+                            ),
+                        )
+                        conn.commit()
+                        changed = cursor.rowcount == 1
+                    finally:
+                        conn.close()
+                if changed:
+                    updated = self.get_job(record.id)
+                    if updated is not None:
+                        interrupted.append(updated)
             elif record.worker_pid and stale and record.outcome != self._STALLED_OUTCOME:
                 self.note_outcome(record.id, self._STALLED_OUTCOME)
             # A job with no pid was never claimed (e.g. spawn failed); it stays

@@ -280,6 +280,19 @@ def _llamacpp_docker_command(
         str(LLAMACPP_FIT_LOG_VERBOSITY),
         *llamacpp_fit_relevant_args(server_extra_args),
     ]
+    projector_setup = stage_setup
+    if config.engram_table is not None:
+        engram_prelude, engram_path = _prime_engram_setup(config)
+        projector_setup += engram_prelude
+        llama_args.extend(["--ple", engram_path])
+        fit_args.extend(["--ple", engram_path])
+    if config.vision is not None:
+        if config.vision.enabled:
+            vision_setup, projector_path = _prime_projector_setup(config)
+            projector_setup += vision_setup
+            llama_args.extend(["--mmproj", projector_path])
+        else:
+            llama_args.append("--no-mmproj")
     attestation_marker = (
         "echo LLM_LAUNCHPAD_ATTESTATION_JSON_BEGIN; "
         "printf '{\"schema_version\":1,\"fingerprint\":\"%s\","
@@ -301,19 +314,6 @@ def _llamacpp_docker_command(
             "|| exit $?; fi; "
             f"{attestation_marker}"
         )
-    projector_setup = stage_setup
-    if config.engram_table is not None:
-        engram_prelude, engram_path = _prime_engram_setup(config)
-        projector_setup += engram_prelude
-        llama_args.extend(["--ple", engram_path])
-        fit_args.extend(["--ple", engram_path])
-    if config.vision is not None:
-        if config.vision.enabled:
-            vision_setup, projector_path = _prime_projector_setup(config)
-            projector_setup += vision_setup
-            llama_args.extend(["--mmproj", projector_path])
-        else:
-            llama_args.append("--no-mmproj")
     inner = projector_setup + fit_guard + gguf_exec_command(
         [*llama_args, "--api-key", PRIME_API_KEY_PLACEHOLDER],
         weights_args_path=hf_file_flag[1],
@@ -461,9 +461,12 @@ def build_tunnel_config(tunnel: Any, *, local_port: int = 8000) -> str:
     )
 
 
-def build_tunnel_start_script() -> str:
+def build_tunnel_start_script(*, cache_filename: str = "frpc") -> str:
     """Start a preinstalled frpc binary and cache it on an attached disk."""
 
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", cache_filename).strip("-") or "frpc"
+    cached_target = f"/data/llm-launchpad/{safe_name}"
+    cached_tmp = f"/data/llm-launchpad/.{safe_name}.tmp.$$"
     return "\n".join(
         [
             "#!/usr/bin/env bash",
@@ -483,7 +486,7 @@ def build_tunnel_start_script() -> str:
             f'printf "%s\\n" "$!" > {PRIME_TUNNEL_PID_PATH}',
             "if [ -d /data ]; then",
             "  install -d -m 700 /data/llm-launchpad",
-            f"  cp -f {PRIME_RUNTIME_ROOT}/frpc /data/llm-launchpad/frpc",
+            f"  cp -f {PRIME_RUNTIME_ROOT}/frpc {cached_tmp} && mv -f {cached_tmp} {cached_target}",
             "fi",
             "",
         ]

@@ -81,6 +81,7 @@ def follow_job(job_id: str = typer.Argument(..., help="Job id from 'jobs list'."
     from ..core.job_store import JobStore
 
     store = JobStore()
+    store.reconcile_workers()
     job = store.get_job(job_id)
     if job is None:
         typer.echo(f"Error: unknown job {job_id}", err=True)
@@ -95,6 +96,9 @@ def follow_job(job_id: str = typer.Argument(..., help="Job id from 'jobs list'."
                 typer.echo(f"[{stored.type}] {_event_line(stored.event)}")
             current = store.get_job(job_id)
             if current is None or current.terminal:
+                for stored in store.get_events(job_id, after_seq=seen):
+                    seen = max(seen, stored.seq)
+                    typer.echo(f"[{stored.type}] {_event_line(stored.event)}")
                 if current is not None:
                     typer.echo(f"[{current.status}] {current.outcome}")
                     if not started_terminal and current.status != "cancelled":
@@ -136,6 +140,7 @@ def cancel_job(job_id: str = typer.Argument(..., help="Job id from 'jobs list'."
     from ..core.job_store import JobStore
 
     store = JobStore()
+    store.reconcile_workers()
     if store.request_cancel(job_id):
         typer.echo(f"Cancellation requested for {job_id}. The worker stops its resource after the current provider call returns.")
     else:

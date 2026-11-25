@@ -34,8 +34,13 @@ def fetch_download_files(config: DeploymentConfig) -> tuple[DownloadFile, ...]:
     if not repo:
         return ()
     try:
-        info = HfApi().model_info(repo, revision=config.revision or None, files_metadata=True, timeout=10)
-        root = "models" if config.backend == BackendType.LLAMACPP else "hf/hub"
+        revision = (
+            (config.model_revision or config.revision)
+            if config.backend == BackendType.VLLM
+            else config.revision
+        ) or None
+        info = HfApi().model_info(repo, revision=revision, files_metadata=True, timeout=10)
+        root = "gguf/hf-hub" if config.backend == BackendType.LLAMACPP else "hf/hub"
         cache = f"{root}/models--{repo.replace('/', '--')}/blobs"
         files: list[DownloadFile] = []
         incomplete: set[str] = set()

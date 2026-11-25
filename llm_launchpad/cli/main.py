@@ -700,7 +700,6 @@ def llamacpp_support(
 ) -> None:
     """List supported llama.cpp architectures or preflight one GGUF repo."""
 
-    manifest = load_llamacpp_support_manifest()
     resolved_architecture = architecture
     if repo_id:
         try:
@@ -711,7 +710,7 @@ def llamacpp_support(
         resolved_architecture = metadata.architecture
 
     if repo_id or architecture:
-        decision = evaluate_llamacpp_architecture(resolved_architecture, manifest=manifest)
+        decision = evaluate_llamacpp_architecture(resolved_architecture)
         payload = {
             "repo_id": repo_id,
             "architecture": decision.architecture,
@@ -730,6 +729,8 @@ def llamacpp_support(
             typer.echo(f"runtime: {decision.runtime_id}")
             typer.echo(decision.message)
         return
+
+    manifest = load_llamacpp_support_manifest()
 
     payload = {
         "runtime_id": manifest.runtime_id,
@@ -835,7 +836,7 @@ def _build_cli_deployment_config(
     provider: ComputeProvider,
     backend: BackendType,
     do_deploy: bool,
-    preload: bool = False,
+    preload: bool = True,
     vision: VisionMode = VisionMode.AUTO,
     projector_repo: str | None = None,
     projector_revision: str | None = None,
@@ -1216,7 +1217,7 @@ def warmup(
             served_model_name=served_model_name or target.served_model_name,
             **vision_kwargs,
         )
-        if compute_provider == ComputeProvider.MODAL
+        if compute_provider == ComputeProvider.MODAL and not target.endpoint_api_key
         else orch.warmup(
             bt,
             url,
@@ -1278,6 +1279,7 @@ def list_apps(
                 [row for row in event.data if isinstance(row, EndpointInfo)]
             )
         _print_event(event)
+        _raise_on_failed_completion(event)
     if visible_rows is not None:
         _sync_opencode_cli(
             current_rows=visible_rows,
@@ -1332,14 +1334,15 @@ def status(
     if not url:
         typer.echo("Error: could not resolve the endpoint URL for this deployment.", err=True)
         raise typer.Exit(code=1)
+    effective_served_model = served_model_name or target.served_model_name
     status_events = (
-        orch.check_status(bt, url, timeout, served_model_name=served_model_name)
-        if compute_provider == ComputeProvider.MODAL
+        orch.check_status(bt, url, timeout, served_model_name=effective_served_model)
+        if compute_provider == ComputeProvider.MODAL and not target.endpoint_api_key
         else orch.check_status(
             bt,
             url,
             timeout,
-            served_model_name=served_model_name,
+            served_model_name=effective_served_model,
             provider=compute_provider,
             api_key=target.endpoint_api_key,
             pod_id=target.app_id,
@@ -1566,6 +1569,7 @@ def _redeploy_modal_llamacpp(
             timeout,
             tail_logs,
             app_name=resolved_app_name,
+            served_model_name=config.served_model_name,
             vision=config.vision,
         ):
             if (
@@ -1784,8 +1788,29 @@ def switch(
         typer.echo("Provide --preset or --repo-id to switch.", err=True)
         raise typer.Exit(code=1)
 
-    # Run model switch (no deploy)
-    for event in orch.deploy(config):
+    if not preload and redeploy:
+        _redeploy_or_explain(
+            orch,
+            username=username,
+            backend=bt,
+            config=config,
+            redeploy=True,
+            server_url=server_url,
+            do_warmup=do_warmup,
+            timeout=timeout,
+            tail_logs=tail_logs,
+            skip_message="",
+        )
+
+    # Run model switch (no deploy). When --no-preload and --no-redeploy are both
+    # passed, persist the updated Modal config directly without triggering
+    # serve/smoke/preload intent rejection.
+    switch_events = (
+        orch.deploy(config)
+        if preload
+        else orch.deploy_modal_only(config)
+    )
+    for event in switch_events:
         _print_event(event)
         _raise_on_failed_completion(event)
 

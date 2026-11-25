@@ -14,12 +14,16 @@ from llm_launchpad.core.provider_billing import (
     ProviderBilling,
 )
 from llm_launchpad.tui.screens.main_menu import (
+    BANNER,
     MainMenuScreen,
     ProviderBillingLoaded,
+    _format_action_prompt,
     _render_auth_status_block,
     _render_artificial_analysis_auth_status,
+    _render_compact_header,
     _render_deployment_status,
     _render_hf_auth_status,
+    _render_home_tagline,
     _render_modal_auth_status,
     _should_show_in_panel,
 )
@@ -348,6 +352,193 @@ class ProviderBillingWiringTests(unittest.TestCase):
         screen._billing_refresh_inflight = True
         screen.on_provider_billing_finished(Mock())
         self.assertFalse(screen._billing_refresh_inflight)
+
+
+class HomeAestheticsTests(unittest.IsolatedAsyncioTestCase):
+    def test_banner_is_pure_ascii_and_fits_standard_column(self) -> None:
+        from textual.content import Content
+
+        plain = Content.from_markup(BANNER).plain
+        lines = plain.splitlines()
+        self.assertEqual(len(lines), 4)
+        for line in lines:
+            self.assertTrue(line.isascii(), f"non-ASCII character in banner line: {line!r}")
+            self.assertLessEqual(len(line), 70)
+        self.assertIn("$primary", BANNER)
+
+    def test_home_tagline_reflects_provider_readiness_and_version(self) -> None:
+        from llm_launchpad.core.provider_readiness import ProviderReadiness, ProviderReadinessStage
+
+        rendered = _render_home_tagline(
+            "1.2.0",
+            readiness=(
+                ProviderReadiness(ComputeProvider.MODAL, ProviderReadinessStage.READY),
+                ProviderReadiness(ComputeProvider.PRIME, ProviderReadinessStage.AUTH_FAILED),
+                ProviderReadiness(ComputeProvider.VAST, ProviderReadinessStage.MISSING_CREDENTIALS),
+            ),
+        )
+        self.assertIn("[$success]▰[/] Modal", rendered)
+        self.assertIn("[$warning]✦[/] Prime Intellect", rendered)
+        self.assertIn("[dim]❖ Vast.ai[/dim]", rendered)
+        self.assertIn("v1.2.0", rendered)
+
+    def test_compact_header_shortens_for_minimal_width(self) -> None:
+        standard = _render_compact_header("1.2.0", minimal=False)
+        minimal = _render_compact_header("1.2.0", minimal=True)
+        self.assertIn("L A U N C H P A D", standard)
+        self.assertIn("LLM", minimal)
+        self.assertIn("v1.2.0", minimal)
+
+    def test_format_action_prompt_keeps_plain_text_and_hotkey(self) -> None:
+        wide = _format_action_prompt(
+            "deploy",
+            "  Deploy model       Pick a model, get a live placement",
+            show_key=True,
+        )
+        self.assertIn("d  Deploy model", str(wide))
+        self.assertIn("Pick a model, get a live placement", str(wide))
+
+        compact = _format_action_prompt("manage", "  Manage", show_key=False)
+        self.assertEqual(str(compact).strip(), "Manage")
+
+    async def test_banner_and_compact_header_switch_by_viewport(self) -> None:
+        from textual.app import App
+        from textual.widgets import Static
+        from llm_launchpad.tui.app import TuiApp
+
+        class _App(App[None]):
+            CSS_PATH = TuiApp.CSS_PATH
+
+        app = _App()
+        screen = MainMenuScreen(username="alice", version="1.2.0")
+        with patch.object(MainMenuScreen, "on_mount", lambda self: None):
+            async with app.run_test(size=(120, 36)) as pilot:
+                await app.push_screen(screen)
+                await pilot.pause()
+                banner = screen.query_one("#home-banner", Static)
+                tagline = screen.query_one("#home-tagline", Static)
+                compact = screen.query_one("#compact-menu-header", Static)
+
+                self.assertTrue(banner.display)
+                self.assertTrue(tagline.display)
+                self.assertFalse(compact.display)
+
+                await pilot.resize_terminal(80, 24)
+                await pilot.pause()
+                self.assertTrue(banner.display)
+                self.assertTrue(tagline.display)
+                self.assertFalse(compact.display)
+
+                await pilot.resize_terminal(60, 20)
+                await pilot.pause()
+                self.assertFalse(banner.display)
+                self.assertFalse(tagline.display)
+                self.assertTrue(compact.display)
+
+                await pilot.resize_terminal(120, 16)
+                await pilot.pause()
+                self.assertFalse(banner.display)
+                self.assertTrue(compact.display)
+
+    async def test_fleet_summary_tracks_active_and_warning_classes(self) -> None:
+        from textual.app import App
+        from textual.widgets import Static
+        from llm_launchpad.protocol.models import FleetDiscovery, ProviderListing
+        from llm_launchpad.tui.app import TuiApp
+
+        class _App(App[None]):
+            CSS_PATH = TuiApp.CSS_PATH
+
+        app = _App()
+        screen = MainMenuScreen(username="alice", version="1.2.0")
+        with patch.object(MainMenuScreen, "on_mount", lambda self: None):
+            async with app.run_test(size=(100, 30)) as pilot:
+                await app.push_screen(screen)
+                await pilot.pause()
+                summary = screen.query_one("#fleet-summary-line", Static)
+
+                screen._show_deployments([])
+                self.assertFalse(summary.has_class("fleet-active"))
+                self.assertFalse(summary.has_class("fleet-warning"))
+
+                screen._show_deployments([
+                    EndpointInfo(
+                        name="vllm-qwen",
+                        app_id="ap-1",
+                        state="running",
+                        backend=BackendType.VLLM,
+                        provider=ComputeProvider.MODAL,
+                    )
+                ])
+                self.assertTrue(summary.has_class("fleet-active"))
+                self.assertFalse(summary.has_class("fleet-warning"))
+
+                screen._fleet_discovery = FleetDiscovery(
+                    (ProviderListing(ComputeProvider.VAST, error="timed out"),)
+                )
+                screen._update_fleet_summary()
+                self.assertFalse(summary.has_class("fleet-active"))
+                self.assertTrue(summary.has_class("fleet-warning"))
+
+    async def test_home_displays_cost_usage_panel_and_switches_to_inline(self) -> None:
+        from textual.app import App
+        from textual.widgets import Static
+        from llm_launchpad.tui.app import TuiApp
+
+        class _App(App[None]):
+            CSS_PATH = TuiApp.CSS_PATH
+
+        app = _App()
+        screen = MainMenuScreen(username="alice", version="1.2.0")
+        with patch.object(MainMenuScreen, "on_mount", lambda self: None):
+            async with app.run_test(size=(120, 36)) as pilot:
+                await app.push_screen(screen)
+                await pilot.pause()
+
+                card = screen.query_one("#home-billing-panel", Static)
+                inline = screen.query_one("#home-billing-inline", Static)
+                self.assertTrue(card.display)
+                self.assertFalse(inline.display)
+
+                screen.post_message(
+                    ProviderBillingLoaded(
+                        ProviderBilling.ready(ComputeProvider.MODAL, BalanceKind.SPEND_MTD, 14.20)
+                    )
+                )
+                await pilot.pause()
+                self.assertIn("$14.20", str(card.content))
+                self.assertIn("$14.20", str(inline.content))
+
+                await pilot.resize_terminal(80, 24)
+                await pilot.pause()
+                self.assertFalse(card.display)
+                self.assertTrue(inline.display)
+
+                await pilot.resize_terminal(40, 12)
+                await pilot.pause()
+                self.assertFalse(card.display)
+                self.assertFalse(inline.display)
+
+    async def test_secondary_refresh_loads_billing_while_home_is_active(self) -> None:
+        from textual.app import App
+        from llm_launchpad.tui.app import TuiApp
+
+        class _App(App[None]):
+            CSS_PATH = TuiApp.CSS_PATH
+
+        app = _App()
+        screen = MainMenuScreen(username="alice", version="1.2.0")
+        with (
+            patch.object(MainMenuScreen, "on_mount", lambda self: None),
+            patch.object(MainMenuScreen, "_refresh_quick_deploy_catalog"),
+            patch.object(MainMenuScreen, "_refresh_storage_estimate"),
+            patch.object(MainMenuScreen, "_refresh_provider_billing") as refresh_billing,
+        ):
+            async with app.run_test(size=(120, 36)) as pilot:
+                await app.push_screen(screen)
+                await pilot.pause()
+                screen._refresh_secondary_panels()
+                refresh_billing.assert_called_once_with()
 
 
 if __name__ == "__main__":

@@ -89,6 +89,8 @@ def parse_offload_report(text: str) -> tuple[int | None, int | None]:
                 total = int(raw_total)
             except (TypeError, ValueError):
                 pass
+        else:
+            total = None
     return done, total
 
 

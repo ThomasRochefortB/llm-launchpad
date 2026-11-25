@@ -164,6 +164,7 @@ def fetch_modal_gpu_catalog(
         raise RuntimeError(str(flight.error)) from flight.error
 
     stale_catalog = cached[1] if cached is not None else None
+    cache_timestamp: float | None = None
     try:
         catalog = tuple(
             _fetch_modal_gpu_catalog_uncached(
@@ -172,6 +173,7 @@ def fetch_modal_gpu_catalog(
                 timeout=timeout,
             )
         )
+        cache_timestamp = time.monotonic()
         if cached is not None:
             stale_prices = {
                 item.value: replace(item, stale_since=item.stale_since or cached[0])
@@ -191,10 +193,14 @@ def fetch_modal_gpu_catalog(
             raise
         assert cached is not None
         catalog = tuple(replace(item, stale_since=item.stale_since or cached[0]) for item in stale_catalog)
+        cache_timestamp = cached[0]
     finally:
         with _CATALOG_LOCK:
             if flight.error is None and "catalog" in locals():
-                _CATALOG_CACHE[cache_key] = (time.monotonic(), catalog)
+                _CATALOG_CACHE[cache_key] = (
+                    cache_timestamp if cache_timestamp is not None else time.monotonic(),
+                    catalog,
+                )
                 flight.result = catalog
             _CATALOG_FLIGHTS.pop(cache_key, None)
             flight.completed.set()
@@ -254,19 +260,20 @@ def _reset_modal_gpu_catalog_cache() -> None:
 
 def _parse_modal_gpu_types(page_text: str) -> list[str]:
     """Parse GPU identifiers from Modal docs HTML or markdown text."""
-    content = _strip_html_tags(_slice_gpu_type_section(page_text))
-    raw_tokens = _GPU_TOKEN_RE.findall(content)
-    if not raw_tokens:
-        raw_tokens = _GPU_TOKEN_RE.findall(_strip_html_tags(page_text))
+    def _extract(text: str) -> list[str]:
+        parsed: list[str] = []
+        seen: set[str] = set()
+        for raw in _GPU_TOKEN_RE.findall(text):
+            token = _normalize_gpu_token(raw)
+            if token is None or token in seen:
+                continue
+            seen.add(token)
+            parsed.append(token)
+        return parsed
 
-    parsed: list[str] = []
-    seen: set[str] = set()
-    for raw in raw_tokens:
-        token = _normalize_gpu_token(raw)
-        if token is None or token in seen:
-            continue
-        seen.add(token)
-        parsed.append(token)
+    parsed = _extract(_strip_html_tags(_slice_gpu_type_section(page_text)))
+    if not parsed:
+        parsed = _extract(_strip_html_tags(page_text))
     return parsed
 
 

@@ -27,6 +27,7 @@ def is_target_gguf(filename: str) -> bool:
     parts = lowered.split("/")
     return (
         lowered.endswith(".gguf")
+        and not is_engram_table_file(filename)
         and not any(marker in lowered for marker in _AUXILIARY_GGUF_MARKERS)
         and not any(part in ("mtp", "engram") or part.startswith("mtp-") for part in parts[:-1])
     )
@@ -37,7 +38,7 @@ def auxiliary_gguf_ignore_patterns() -> list[str]:
     def case_insensitive(pattern: str) -> str:
         return "".join(f"[{char}{char.upper()}]" if char.isalpha() else char for char in pattern)
 
-    patterns = [f"*{marker}*" for marker in _AUXILIARY_GGUF_MARKERS]
+    patterns = [f"*{marker}*" for marker in (*_AUXILIARY_GGUF_MARKERS, "engram")]
     for directory in _AUXILIARY_GGUF_DIRS:
         patterns.extend((f"{directory}/*", f"*/{directory}/*"))
     return [case_insensitive(pattern) for pattern in patterns]

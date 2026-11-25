@@ -58,6 +58,25 @@ def usage_key(row: EndpointInfo) -> str:
     return f"{provider}:id:{(row.app_id or '').strip()}"
 
 
+def _strip_prometheus_comment(line: str) -> str:
+    """Remove an unquoted OpenMetrics exemplar or trailing ``#`` comment."""
+    in_quotes = False
+    escaped = False
+    for index, char in enumerate(line):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\" and in_quotes:
+            escaped = True
+            continue
+        if char == '"':
+            in_quotes = not in_quotes
+            continue
+        if char == "#" and not in_quotes:
+            return line[:index].strip()
+    return line
+
+
 def parse_prometheus_text(text: str) -> dict[str, float]:
     """Sum each metric's samples into one value per metric name.
 
@@ -67,8 +86,8 @@ def parse_prometheus_text(text: str) -> dict[str, float]:
     """
     totals: dict[str, float] = {}
     for raw_line in (text or "").splitlines():
-        line = raw_line.strip()
-        if not line or line.startswith("#"):
+        line = _strip_prometheus_comment(raw_line.strip())
+        if not line:
             continue
         if "{" in line:
             name = line.partition("{")[0].strip()
@@ -77,7 +96,9 @@ def parse_prometheus_text(text: str) -> dict[str, float]:
             # mistaken for the terminator.
             tail = line.rsplit("}", 1)[-1]
         else:
-            name, _, tail = line.partition(" ")
+            parts = line.split(None, 1)
+            name = parts[0] if parts else ""
+            tail = parts[1] if len(parts) > 1 else ""
         fields = tail.split()
         if not name or not fields:
             continue
@@ -352,26 +373,51 @@ class ServingMetricsTracker:
                 else None
             )
 
+            next_prompt = (
+                stats.prompt_tokens
+                if stats.prompt_tokens is not None or restarted or previous is None
+                else previous.prompt_tokens
+            )
+            next_generation = (
+                stats.generation_tokens
+                if stats.generation_tokens is not None or restarted or previous is None
+                else previous.generation_tokens
+            )
+            next_started_at = (
+                stats.runtime_started_at
+                if stats.runtime_started_at is not None or restarted or previous is None
+                else previous.runtime_started_at
+            )
             changed = (
                 total_prompt != banked_prompt
                 or total_generation != banked_generation
-                or entry.get("last_prompt_tokens") != stats.prompt_tokens
-                or entry.get("last_generation_tokens") != stats.generation_tokens
-                or entry.get("runtime_started_at") != stats.runtime_started_at
+                or entry.get("last_prompt_tokens") != next_prompt
+                or entry.get("last_generation_tokens") != next_generation
+                or entry.get("runtime_started_at") != next_started_at
                 or entries.get(key) is None
             )
             entry.update(
                 {
                     "total_prompt_tokens": total_prompt,
                     "total_generation_tokens": total_generation,
-                    "last_prompt_tokens": stats.prompt_tokens,
-                    "last_generation_tokens": stats.generation_tokens,
-                    "runtime_started_at": stats.runtime_started_at,
+                    "last_prompt_tokens": next_prompt,
+                    "last_generation_tokens": next_generation,
+                    "runtime_started_at": next_started_at,
                     "updated_at_epoch": time.time(),
                 }
             )
             entries[key] = entry
-            self._previous[key] = stats
+            self._previous[key] = ServingStats(
+                prompt_tokens=next_prompt,
+                generation_tokens=next_generation,
+                requests_running=stats.requests_running,
+                requests_waiting=stats.requests_waiting,
+                requests_finished=stats.requests_finished,
+                kv_cache_usage=stats.kv_cache_usage,
+                reported_tokens_per_second=stats.reported_tokens_per_second,
+                runtime_started_at=next_started_at,
+                captured_at=stats.captured_at,
+            )
             if changed:
                 self._save(entries)
 

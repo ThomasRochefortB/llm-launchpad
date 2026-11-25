@@ -22,7 +22,10 @@ def _justified(column: AdaptiveColumn, value: object) -> object:
     """Align a string cell as its column asks; other renderables pass through."""
     if column.justify == "left" or not isinstance(value, str):
         return value
-    return Text.from_markup(value, justify=column.justify)
+    try:
+        return Text.from_markup(value, justify=column.justify)
+    except Exception:
+        return Text(value, justify=column.justify)
 
 
 @dataclass(frozen=True)

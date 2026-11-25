@@ -124,8 +124,7 @@ def _iter_effective_bindings(
             "Select",
         }
     )
-    if app is not None:
-        get_key_display = getattr(app, "get_key_display", None)
+    get_key_display = getattr(app, "get_key_display", None) if app is not None else None
     by_label: dict[str, list[str]] = {}
     order: list[str] = []
     for _key, entry in active.items():

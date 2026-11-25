@@ -121,9 +121,10 @@ def extract_llamacpp_mtp_architectures(
 def load_llamacpp_support_manifest(architecture: str | None = None) -> LlamaCppSupportManifest:
     """Load and validate the bundled support manifest."""
 
+    normalized_architecture = _optional_string(architecture)
     filename = (
         "llamacpp_glm5next_support.json"
-        if architecture == "glm5next" else LLAMACPP_SUPPORT_MANIFEST_FILENAME
+        if normalized_architecture == "glm5next" else LLAMACPP_SUPPORT_MANIFEST_FILENAME
     )
     resource = resources.files("llm_launchpad.data").joinpath(filename)
     payload = json.loads(resource.read_text(encoding="utf-8"))
@@ -309,15 +310,15 @@ def _image_matches_manifest(
     manifest: LlamaCppSupportManifest,
 ) -> bool:
     accepted = {
-        manifest.image_ref,
-        *manifest.compatible_image_refs,
+        manifest.image_ref.strip().casefold(),
+        *(ref.strip().casefold() for ref in manifest.compatible_image_refs),
     }
     if manifest.image_digest:
         accepted.update({
-            f"{manifest.image_ref}@{manifest.image_digest}",
-            f"{manifest.image_ref.split(':', 1)[0]}@{manifest.image_digest}",
+            f"{manifest.image_ref}@{manifest.image_digest}".strip().casefold(),
+            f"{manifest.image_ref.split(':', 1)[0]}@{manifest.image_digest}".strip().casefold(),
         })
-    return image_ref in accepted
+    return image_ref.strip().casefold() in accepted
 
 
 def _manifest_for_image(architecture: str | None, image_ref: str | None) -> LlamaCppSupportManifest:

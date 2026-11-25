@@ -55,7 +55,9 @@ class DeploymentJobsPanel(VerticalScroll):
         self._reconcile_timer: Timer | None = None
 
     def compose(self) -> ComposeResult:
-        yield OptionList(id="deployment-jobs")
+        jobs = OptionList(id="deployment-jobs")
+        jobs.border_title = "Deployment Jobs"
+        yield jobs
         yield Static("Loading jobs…", id="operations-status")
         yield Static("", id="operations-empty")
         yield Button("Deploy model", id="operations-deploy-btn", variant="primary")
@@ -229,6 +231,18 @@ class DeploymentJobsPanel(VerticalScroll):
             return
         if option_id.startswith("persistent:"):
             persistent_id = option_id.removeprefix("persistent:")
+            store = getattr(self.app, "_get_job_store", None)
+            if callable(store):
+                try:
+                    record = store().get_job(persistent_id)
+                except Exception:
+                    record = None
+                if record is not None and record.terminal:
+                    self.app.notify(
+                        f"Job is already {record.status}; nothing to cancel.",
+                        timeout=3,
+                    )
+                    return
             self.app.push_screen(PersistentCancelDeploymentScreen(persistent_id))
             return
         job = self.app.deployment_jobs.get(option_id)
@@ -325,13 +339,20 @@ class PersistentCancelDeploymentScreen(CopyEnabledScreen):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "cancel-deployment":
+            cancelled = False
             canceller = getattr(self.app._get_job_store(), "request_cancel", None)
             if callable(canceller):
                 try:
-                    canceller(self.persistent_id)
+                    cancelled = bool(canceller(self.persistent_id))
                 except Exception:
-                    pass
-            self.app.notify("Cancellation requested; the worker cleans up after its current call.", timeout=6)
+                    cancelled = False
+            if cancelled:
+                self.app.notify(
+                    "Cancellation requested; the worker cleans up after its current call.",
+                    timeout=6,
+                )
+            else:
+                self.app.notify("Job is no longer active; nothing to cancel.", timeout=4)
         self.app.pop_screen()
 
     def action_go_back(self) -> None:

@@ -1363,19 +1363,25 @@ def _extract_parameter_count(repo_id: str, config: Any, safetensors: Any) -> flo
     if direct is not None and direct > 0:
         return float(direct)
 
-    if isinstance(safetensors, dict):
-        parameters = safetensors.get("parameters")
-        if isinstance(parameters, dict):
-            total = 0.0
-            for value in parameters.values():
-                try:
-                    numeric = float(value)
-                except (TypeError, ValueError):
-                    continue
-                if numeric > 0:
-                    total += numeric
-            if total > 0:
-                return total
+    parameters = _safetensors_field(safetensors, "parameters")
+    if isinstance(parameters, dict):
+        total = 0.0
+        for value in parameters.values():
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                continue
+            if numeric > 0:
+                total += numeric
+        if total > 0:
+            return total
+    total_raw = _safetensors_field(safetensors, "total")
+    try:
+        total_numeric = float(total_raw) if total_raw is not None else 0.0
+    except (TypeError, ValueError):
+        total_numeric = 0.0
+    if total_numeric > 0:
+        return total_numeric
 
     return _parse_parameter_count_from_repo_id(repo_id)
 

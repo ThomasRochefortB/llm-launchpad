@@ -11,11 +11,13 @@ from rich.cells import set_cell_size
 from rich.markup import escape
 
 from ..format import clip, format_money
+from textual import events
 from textual.actions import SkipAction
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
 from textual.message import Message
+from textual.timer import Timer
 from textual.widgets import Input, OptionList, Select, Static
 from textual.widgets.option_list import Option
 
@@ -69,6 +71,7 @@ from ...protocol.models import (
     InferencePlan,
     ProviderQuote,
 )
+from ..markers import provider_marker
 from ..responsive import ViewportProfile, WidthMode
 from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
@@ -525,22 +528,33 @@ def _tier_quality_width(tiers: Sequence[ServingTier]) -> int:
     )
 
 
+_SHORT_PROVIDER_NAMES: dict[ComputeProvider, str] = {
+    ComputeProvider.MODAL: "Modal",
+    ComputeProvider.PRIME: "Prime",
+    ComputeProvider.VAST: "Vast.ai",
+}
+
+
+def _provider_badge(provider: ComputeProvider, *, short: bool = False) -> str:
+    """Single-cell marker plus provider name for placement rows and details."""
+    name = _SHORT_PROVIDER_NAMES.get(provider, provider.display_name) if short else provider.display_name
+    return f"{provider_marker(provider)} {name}"
+
+
 def _tier_option(
     tier: ServingTier,
     width_mode: WidthMode = WidthMode.WIDE,
     quality_width: int = 0,
 ) -> str:
-    """One tier line: what it costs, how fast it is, what it trades away.
-
-    Hardware is deliberately absent. The user picked a model, not a data
-    centre; the GPU belongs in the detail pane.
-    """
+    """One tier line: cost, provider, speed, and what it trades away."""
 
     marker = "[$primary]*[/]" if tier.is_recommended else " "
     quote = tier.plan.quote
     price = _format_price(quote.price_per_hour_usd, estimate=quote.is_estimate)
     speed = tier.output_tokens_per_second
     speed_text = f"~{speed:.0f} tok/s" if speed > 0 else "speed n/a"
+    full_provider = escape(_provider_badge(quote.provider, short=False))
+    short_provider = escape(_provider_badge(quote.provider, short=True))
     # A merged role now occupies the tradeoff column on the recommended row,
     # where the bare word "recommended" used to sit alone. Both belong there.
     note = " · ".join(
@@ -561,15 +575,18 @@ def _tier_option(
         padded = f"{escape(label):<{quality_width}}"
         quality = f" [$warning]{padded}[/$warning]" if label else f" {padded}"
     if width_mode == WidthMode.MINIMAL:
-        return f" {marker} {escape(tier.label):<9}{quality} {money(price)}"
+        return (
+            f" {marker} {escape(tier.label):<9}{quality} "
+            f"{money(price)} [dim]{short_provider}[/dim]"
+        )
     if width_mode in (WidthMode.COMPACT, WidthMode.STANDARD):
         return (
             f" {marker} {escape(tier.label):<9}{quality} "
-            f"{money(price)} [dim]· {speed_text}[/dim]"
+            f"{money(f'{price:<11}')} {short_provider:<9} [dim]· {speed_text}[/dim]"
         )
     return (
         f" {marker} {escape(tier.label):<10}{quality} "
-        f"{money(f'{price:<12}')} {speed_text:<14} "
+        f"{money(f'{price:<12}')} {full_provider:<18} {speed_text:<14} "
         f"[dim]{escape(note)}[/dim]"
     )
 
@@ -578,33 +595,38 @@ def _infra_option(row: _InfraRow, width_mode: WidthMode = WidthMode.WIDE) -> str
     quote = row.plan.quote
     gpu = _infra_gpu_label(row)
     price = _format_price(quote.price_per_hour_usd, estimate=quote.is_estimate)
-    provider = escape(quote.provider.display_name)
+    full_provider = escape(_provider_badge(quote.provider, short=False))
+    short_provider = escape(_provider_badge(quote.provider, short=True))
     if width_mode == WidthMode.MINIMAL:
         quant = _quant_markup(row.profile)
         return (
             f"  {escape(clip(gpu, 14))} x{quote.gpu_count} "
-            f"{quant} [dim]{provider}[/dim] {money(price)}"
+            f"{quant} [dim]{short_provider}[/dim] {money(price)}"
         )
     quant = _quant_markup(row.profile, width=5)
     if width_mode == WidthMode.COMPACT:
         return (
             f"  {escape(clip(gpu, 16)):<16} x{quote.gpu_count:<2} "
-            f"{quant} {provider:<15} {money(f'{price:>10}')}"
+            f"{quant} {short_provider:<10} {money(f'{price:>10}')}"
         )
     if width_mode == WidthMode.STANDARD:
         return (
             f"  {escape(clip(gpu, 22)):<22} x{quote.gpu_count:<2} "
-            f"{quant} {provider:<15} {money(f'{price:>10}')}"
+            f"{quant} {full_provider:<17} {money(f'{price:>10}')}"
         )
     return (
         f"  {escape(clip(gpu, 22)):<22} x{quote.gpu_count:<2} "
-        f"{quant} {provider:<15} {money(f'{price:>10}')}  "
+        f"{quant} {full_provider:<17} {money(f'{price:>10}')}  "
         f"{_availability_label(row.configuration)}"
     )
 
 
 def _infra_detail(row: _InfraRow) -> str:
     quote = row.plan.quote
+    provider = escape(_provider_badge(quote.provider, short=False))
+    gpu = escape(_infra_gpu_label(row))
+    quant = (row.plan.recipe.quant or "").strip()
+    quant_part = f" · {escape(quant)}" if quant else ""
     monthly = _scenario_monthly_label(row.plan)
     region = escape((quote.region or "").strip() or "provider-managed regions")
     basis = escape(_plan_cost_evaluation(row.plan).basis_label().rstrip("."))
@@ -636,10 +658,10 @@ def _infra_detail(row: _InfraRow) -> str:
             )
     once = _one_time_label(quote)
     return (
-        f"[bold]{escape(monthly)}[/bold]"
-        f"{f' · {escape(once)}' if once else ''}  "
-        f"[dim]{performance}{region} · {_availability_label(row.configuration)}[/dim]\n"
-        f"[dim]{basis} · storage separate[/dim]"
+        f"[bold]{provider}[/bold]  [bold]{quote.gpu_count}x {gpu}[/bold]{quant_part}  "
+        f"[dim]·[/dim]  [bold]{escape(monthly)}[/bold]"
+        f"{f' · {escape(once)}' if once else ''}\n"
+        f"[dim]{performance}{region} · {_availability_label(row.configuration)} · {basis} · storage separate[/dim]"
     )
 
 
@@ -666,7 +688,7 @@ def _gpu_filter_options(snapshot: ComputeAvailabilitySnapshot) -> list[tuple[str
     """Filter by hardware family. A model and GPU count are needed to quote a price."""
     names = {row.gpu_type for row in snapshot.configurations if row.gpu_type}
     names.update(vast_gpu_label(offer) for offer in snapshot.vast_offers if vast_offer_is_rentable(offer))
-    return [("Any GPU", "any"), *((name, name) for name in sorted(names, key=str.casefold))]
+    return [("Any GPU", "any"), *((escape(name), name) for name in sorted(names, key=str.casefold))]
 
 
 def _model_fits_gpu_type(
@@ -786,10 +808,20 @@ class FastDeployScreen(CopyEnabledScreen):
         if self.is_mounted:
             self.set_class(value == "infra", "placement-step")
             self.set_class(value == "loading", "placement-loading")
+            try:
+                results = self.query_one("#fast-deploy-list", OptionList)
+                results.border_title = {
+                    "models": "Models",
+                    "infra": "Placements",
+                }.get(value)
+            except Exception:
+                pass
             self.refresh_bindings()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         """Hide and disable the keys that do not apply to the current step."""
+        if super().check_action(action, parameters) is False:
+            return False
         if action == "choose_selected" and (
             self._phase == "loading" or (self._phase == "infra" and not self._infra_rows)
         ):
@@ -858,6 +890,7 @@ class FastDeployScreen(CopyEnabledScreen):
         self._updating_gpu_filter = False
         self._catalog_building = False
         self._catalog_spinner_index = 0
+        self._catalog_spinner_timer: Timer | None = None
 
     def compose(self) -> ComposeResult:
         with Vertical(id="fast-deploy-container"):
@@ -892,7 +925,9 @@ class FastDeployScreen(CopyEnabledScreen):
                         id="fast-deploy-gpu-filter",
                     )
             yield Static("[dim]Loading models...[/dim]", id="fast-deploy-status")
-            yield FittedOptionList(id="fast-deploy-list")
+            results = FittedOptionList(id="fast-deploy-list")
+            results.border_title = "Models"
+            yield results
             yield Static("", id="fast-deploy-detail")
         yield FittedFooter()
 
@@ -908,11 +943,19 @@ class FastDeployScreen(CopyEnabledScreen):
         self._apply_model_catalog(force=True)
         self.query_one("#fast-deploy-list", OptionList).focus()
         self._load_availability(purpose="filter")
-        self.set_interval(
+        self._catalog_spinner_timer = self.set_interval(
             0.25,
             self._tick_catalog_spinner,
             name="fast-deploy-catalog-spinner",
         )
+
+    def on_screen_suspend(self, _: events.ScreenSuspend) -> None:
+        if self._catalog_spinner_timer is not None:
+            self._catalog_spinner_timer.pause()
+
+    def on_screen_resume(self, _: events.ScreenResume) -> None:
+        if self._catalog_spinner_timer is not None and self._catalog_building:
+            self._catalog_spinner_timer.resume()
 
     def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
         if event.option_list.id != "fast-deploy-list":
@@ -994,6 +1037,11 @@ class FastDeployScreen(CopyEnabledScreen):
     def _tick_catalog_spinner(self) -> None:
         """Advance the building-catalog spinner like deploy-log in-progress steps."""
         if not self._catalog_building:
+            if self._catalog_spinner_timer is not None and self._catalog_info.ready:
+                self._catalog_spinner_timer.stop()
+                self._catalog_spinner_timer = None
+            return
+        if not self.is_current:
             return
         self._catalog_spinner_index = (
             self._catalog_spinner_index + 1
@@ -1706,7 +1754,7 @@ class FastDeployScreen(CopyEnabledScreen):
         if current not in values:
             if self._selected_model is not None or self._fetch_pending:
                 # Partial updates may not include the user's GPU yet.
-                options.append((current, current))
+                options.append((escape(current), current))
             else:
                 current = "any"
                 self._gpu_filter = "any"
