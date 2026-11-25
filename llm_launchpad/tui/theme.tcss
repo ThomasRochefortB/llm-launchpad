@@ -94,19 +94,49 @@ LogViewer Log {
 
 #main-menu-center {
     height: 1fr;
+    align: center middle;
+}
+
+#main-menu-primary {
+    width: 76;
+    max-width: 100%;
+    height: auto;
+    max-height: 100%;
+    padding: 1 2;
+}
+
+#home-banner {
+    width: 100%;
+    height: auto;
+    content-align: center middle;
+    text-align: center;
+    padding: 0;
+    margin: 0;
+}
+
+#home-tagline {
+    width: 100%;
+    height: 1;
+    content-align: center middle;
+    text-align: center;
+    margin: 0 0 1 0;
 }
 
 #compact-menu-header {
+    display: none;
+    width: 100%;
     height: 1;
     padding: 0 1;
     margin: 0 0 1 0;
 }
 
-#main-menu-primary {
-    width: 64;
-    max-width: 100%;
-    height: 1fr;
-    padding: 1 2;
+#action-list {
+    border-title-color: $text-muted;
+    border-title-style: bold;
+}
+
+#action-list:focus {
+    border-title-color: $primary;
 }
 
 #fleet-summary-line,
@@ -114,10 +144,99 @@ LogViewer Log {
     width: 100%;
     height: auto;
     padding: 0 1;
+    background: $surface;
+    border-left: tall $foreground 25%;
 }
 
 #fleet-summary-line {
     margin-top: 1;
+}
+
+#fleet-summary-line.fleet-active {
+    border-left: tall $primary;
+}
+
+#fleet-summary-line.fleet-warning,
+#auth-status-block {
+    border-left: tall $warning;
+}
+
+#home-billing-panel {
+    width: 100%;
+    height: auto;
+    margin-top: 1;
+    padding: 0 2;
+    border: round $foreground 20%;
+    border-title-color: $text-muted;
+    border-title-style: bold;
+    background: $surface;
+}
+
+#home-billing-inline {
+    display: none;
+    width: 100%;
+    height: auto;
+    padding: 0 1;
+    background: $surface;
+    border-left: tall $secondary;
+}
+
+#home-details-scroll {
+    align: center top;
+}
+
+#home-details-container {
+    width: 100%;
+    max-width: 88;
+    height: auto;
+}
+
+#home-details-title {
+    margin-bottom: 1;
+}
+
+.details-card {
+    width: 100%;
+    height: auto;
+    padding: 0 2;
+    margin-bottom: 1;
+    border: round $foreground 20%;
+    border-title-color: $primary;
+    border-title-style: bold;
+    background: $surface;
+}
+
+/* Centered focused sub-menus (engine picker, endpoint actions, connection info,
+   status/benchmark forms) so narrow forms never sprawl across wide terminals. */
+.focused-panel-scroll {
+    align: center top;
+}
+
+.focused-panel {
+    width: 100%;
+    max-width: 80;
+    height: auto;
+}
+
+.focused-panel-title {
+    margin-bottom: 1;
+}
+
+.focused-panel-context {
+    width: 100%;
+    height: auto;
+    padding: 0 1;
+    margin-bottom: 1;
+    background: $surface;
+    border-left: tall $primary;
+}
+
+.focused-form-card {
+    width: 100%;
+    height: auto;
+    padding: 1 2;
+    border: round $foreground 20%;
+    background: $surface;
 }
 
 .screen-scroll {
@@ -133,6 +252,8 @@ LogViewer Log {
 OptionList {
     background: transparent;
     border: round $foreground 20%;
+    border-title-color: $text-muted;
+    border-title-style: bold;
     padding: 0;
     height: auto;
     max-height: 20;
@@ -140,6 +261,7 @@ OptionList {
 
 OptionList:focus {
     border: round $primary;
+    border-title-color: $primary;
     background-tint: transparent;
 }
 
@@ -158,6 +280,8 @@ OptionList > .option-list--option-hover-highlighted {
 DataTable {
     background: transparent;
     border: round $foreground 20%;
+    border-title-color: $text-muted;
+    border-title-style: bold;
     height: 1fr;
     /* Two rows go to the border, so a floor of 3 left a single content row for
        the header and none for the data. A table that shows no rows is worse
@@ -170,6 +294,16 @@ DataTable {
 
 DataTable:focus {
     border: round $primary;
+    border-title-color: $primary;
+}
+
+Tabs {
+    background: $background;
+}
+
+Underline > .underline--bar {
+    color: $primary;
+    background: $foreground 15%;
 }
 
 SelectionList {
@@ -863,6 +997,12 @@ DeploymentProgressWidget #deploy-progress-hint {
     display: block;
 }
 
+.viewport-compact DeploymentProgressWidget #deploy-progress-next.hidden,
+.viewport-short DeploymentProgressWidget #deploy-progress-next.hidden,
+MonitorScreen.connection-ready DeploymentProgressWidget #deploy-progress-next {
+    display: none;
+}
+
 .viewport-shallow DeploymentProgressWidget #deploy-progress-next {
     display: none;
 }
@@ -960,22 +1100,54 @@ DeploymentProgressWidget #deploy-progress-hint {
 
 #manage-selection-detail {
     margin-top: 1;
+    padding: 0 1;
+    background: $surface;
+    border-left: tall $primary;
 }
 
 #manage-actions {
     width: 100%;
     height: auto;
-    max-height: 8;
+    max-height: 9;
     margin: 1 0 0 0;
 }
 
-#manage-action-context,
-#manage-action-metrics {
+#manage-action-context {
+    width: 100%;
     height: auto;
+    padding: 0 1;
+    background: $surface;
+    border-left: tall $primary;
 }
 
 #manage-action-metrics {
+    width: 100%;
+    height: auto;
     margin-top: 1;
+    padding: 0 2;
+    border: round $foreground 20%;
+    border-title-color: $text-muted;
+    border-title-style: bold;
+    background: $surface;
+}
+
+#connection-info-context {
+    width: 100%;
+    height: auto;
+    padding: 0 1;
+    margin-bottom: 1;
+    background: $surface;
+    border-left: tall $primary;
+}
+
+#connection-info-fields {
+    width: 100%;
+    height: auto;
+    padding: 1 2;
+    border: round $primary;
+    border-title-color: $primary;
+    border-title-style: bold;
+    background: $surface;
 }
 
 #stop-confirm-actions {
@@ -1047,6 +1219,21 @@ DeploymentProgressWidget #deploy-progress-hint {
 .setup-option {
     height: auto;
     margin-bottom: 1;
+    padding: 0 1;
+    background: $surface;
+    border-left: tall $foreground 25%;
+}
+
+.setup-option.setup-ready {
+    border-left: tall $success;
+}
+
+.setup-option.setup-error {
+    border-left: tall $error;
+}
+
+.setup-option.setup-warning {
+    border-left: tall $warning;
 }
 
 .setup-provider-status {
@@ -1111,6 +1298,9 @@ DeploymentProgressWidget #deploy-progress-hint {
 
 #storage-status {
     margin: 0 0 1 0;
+    padding: 0 1;
+    background: $surface;
+    border-left: tall $primary;
 }
 
 #storage-filter-row {
@@ -1190,6 +1380,8 @@ DeploymentProgressWidget #deploy-progress-hint {
     height: auto;
     padding: 1 2;
     border: round $foreground 20%;
+    border-title-color: $primary;
+    border-title-style: bold;
     background: $surface;
 }
 
@@ -1198,7 +1390,7 @@ DeploymentProgressWidget #deploy-progress-hint {
 .settings-section {
     height: 1;
     margin-top: 1;
-    color: $text;
+    color: $primary;
 }
 
 /* Fields carry their own bottom padding; the section margin on top of it
@@ -1375,8 +1567,59 @@ DeploymentProgressWidget #deploy-progress-hint {
 }
 
 .viewport-constrained #main-menu-primary {
-    padding-top: 1;
-    padding-bottom: 1;
+    padding: 0 1;
+}
+
+.viewport-constrained #home-billing-panel,
+.viewport-compact #home-billing-panel,
+.viewport-short #home-billing-panel {
+    display: none;
+}
+
+.viewport-constrained #home-billing-inline,
+.viewport-compact #home-billing-inline,
+.viewport-short #home-billing-inline {
+    display: block;
+}
+
+.viewport-shallow #home-billing-inline {
+    display: none;
+}
+
+.viewport-compact #main-menu-center,
+.viewport-short #main-menu-center {
+    align: center top;
+}
+
+.viewport-compact #home-banner,
+.viewport-compact #home-tagline,
+.viewport-short #home-banner,
+.viewport-short #home-tagline {
+    display: none;
+}
+
+.viewport-compact #compact-menu-header,
+.viewport-short #compact-menu-header {
+    display: block;
+}
+
+.viewport-short #main-menu-primary {
+    padding: 0 1;
+}
+
+.viewport-shallow #compact-menu-header {
+    margin-bottom: 0;
+}
+
+.viewport-shallow #fleet-summary-line {
+    margin-top: 0;
+}
+
+.viewport-compact .details-card,
+.viewport-compact .focused-form-card,
+.viewport-compact #connection-info-fields,
+.viewport-compact #manage-action-metrics {
+    padding: 0 1;
 }
 
 .viewport-constrained #fast-deploy-subtitle,
@@ -1573,6 +1816,7 @@ StatusHeader.state-error {
 .viewport-constrained #connection-card,
 .viewport-constrained #result-card,
 .viewport-constrained #failure-card,
+MonitorScreen.connection-ready.viewport-short #connection-card,
 .viewport-short #connection-card,
 .viewport-short #result-card,
 .viewport-short #failure-card {
@@ -1727,6 +1971,14 @@ StatusHeader.state-error {
 .density-compact #settings-form {
     padding-top: 0;
     padding-bottom: 0;
+}
+
+.density-compact #home-tagline {
+    margin-bottom: 0;
+}
+
+.density-compact #home-billing-panel {
+    margin-top: 0;
 }
 
 CopyEnabledScreen.viewport-ultra-wide {

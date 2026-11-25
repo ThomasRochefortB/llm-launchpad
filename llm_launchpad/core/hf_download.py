@@ -14,6 +14,7 @@ behavior.
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -193,6 +194,16 @@ def allocated_file_size(path: str | Path) -> int:
     return max(0, min(logical, allocated))
 
 
+_HTTP_AUTH_RE = re.compile(
+    r"(?:\bhttp(?:/\d(?:\.\d)?)?\s+|\bstatus(?:\s+code)?[:=\s]+|\bclient\s+error[:=\s]+)(?:401|403)\b"
+    r"|\b(?:401|403)\s+client\s+error\b|\b401\s+unauthorized\b|\b403\s+forbidden\b"
+)
+_HTTP_NOT_FOUND_RE = re.compile(
+    r"(?:\bhttp(?:/\d(?:\.\d)?)?\s+|\bstatus(?:\s+code)?[:=\s]+|\bclient\s+error[:=\s]+)404\b"
+    r"|\b404\s+client\s+error\b|\b404\s+not\s+found\b"
+)
+
+
 def classify_download_failure(output: str) -> str | None:
     """Classify a download failure as non-retryable, or None when retryable.
 
@@ -203,11 +214,9 @@ def classify_download_failure(output: str) -> str | None:
     text = (output or "").lower()
     if not text.strip():
         return None
-    if any(
+    if _HTTP_AUTH_RE.search(text) or any(
         marker in text
         for marker in (
-            "401",
-            "403",
             "unauthorized",
             "forbidden",
             "invalid token",
@@ -217,10 +226,9 @@ def classify_download_failure(output: str) -> str | None:
         )
     ):
         return "auth"
-    if any(
+    if _HTTP_NOT_FOUND_RE.search(text) or any(
         marker in text
         for marker in (
-            "404",
             "repository not found",
             "repo not found",
             "revision not found",

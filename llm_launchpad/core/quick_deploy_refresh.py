@@ -1615,6 +1615,12 @@ def attach_quick_deploy_mtp_recommendations(
             requirements.objective,
             speculative_decoding=recommendation,
         )
+        tuning = tuning_for_architecture(tuning, metadata.architecture)
+        tuning = tuning_for_attention_scratch(
+            tuning,
+            context_tokens=requirements.context_tokens,
+            attention_head_count=attention_head_count(metadata),
+        )
         weights_gb = _required_vram_for_quant(metadata, profile.quant)
         memory = (
             estimate_memory(
@@ -2036,7 +2042,7 @@ def _profiles_for_quant(
                 f"{quant}: estimated {required_vram_gb:,.0f} GB at {context_tokens:,} tokens "
                 "does not fit any priced catalog topology (maximum 8 GPUs)."
             )
-            if memory_estimate.attention_scratch_gb > 0:
+            if not runtime_tuning.flash_attention and memory_estimate.attention_scratch_gb >= 1.0:
                 # Naming the term matters here: it is the one requirement extra
                 # GPUs cannot share, so the shortfall does not look like one more
                 # card would close it.

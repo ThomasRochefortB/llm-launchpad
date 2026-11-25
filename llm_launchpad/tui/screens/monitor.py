@@ -215,6 +215,8 @@ class MonitorScreen(CopyEnabledScreen):
         done, Done/Copy URL/Copy take precedence over log navigation, which
         remains reachable by shortcut and help.
         """
+        if super().check_action(action, parameters) is False:
+            return False
         if action == "retry_deploy":
             return self._can_retry_deploy()
         if action == "other_placement":

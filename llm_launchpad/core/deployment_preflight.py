@@ -138,10 +138,11 @@ def validate_request(request: DeploymentRequest) -> tuple[PreflightFinding, ...]
                     fields=("model_name",),
                 )
             )
+        effective_gpu_count = 1 if request.gpu_count is None else request.gpu_count
         if (
             request.vllm.n_gpu is not None
-            and (request.gpu_count or 1) > 0
-            and request.vllm.n_gpu > (request.gpu_count or 1)
+            and effective_gpu_count > 0
+            and request.vllm.n_gpu > effective_gpu_count
         ):
             findings.append(
                 PreflightFinding(
@@ -149,7 +150,7 @@ def validate_request(request: DeploymentRequest) -> tuple[PreflightFinding, ...]
                     message=(
                         "vLLM tensor parallelism needs one GPU per shard: "
                         f"{request.vllm.n_gpu} requested across "
-                        f"{request.gpu_count or 1} allocated."
+                        f"{effective_gpu_count} allocated."
                     ),
                     fields=("n_gpu", "gpu_count"),
                 )
@@ -191,7 +192,7 @@ def validate_request(request: DeploymentRequest) -> tuple[PreflightFinding, ...]
             )
         )
 
-    gpu_count = request.gpu_count or 1
+    gpu_count = 1 if request.gpu_count is None else request.gpu_count
     if gpu_count < 1:
         findings.append(
             PreflightFinding(

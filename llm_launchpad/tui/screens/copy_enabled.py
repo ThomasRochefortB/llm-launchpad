@@ -167,6 +167,13 @@ class CopyEnabledScreen(Screen):
     def refresh_visual_preferences(self) -> None:
         """Reapply app-level theme and density classes immediately."""
         self._sync_visual_classes()
+        try:
+            from ..widgets.input_form import ToggleField
+
+            for toggle in self.query(ToggleField):
+                toggle.sync_monochrome_state()
+        except Exception:
+            pass
         self.refresh(repaint=True, layout=True)
 
     def _active_visual_classes(self) -> set[str]:
@@ -188,7 +195,7 @@ class CopyEnabledScreen(Screen):
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         """Keep priority shortcuts behind the same minimum-size gate as input."""
         if self.has_class("viewport-too-small") and action not in {
-            "pop_screen", "go_back", "quit_app", "cancel",
+            "pop_screen", "go_back", "back", "quit_app", "cancel",
         }:
             return False
         return super().check_action(action, parameters)

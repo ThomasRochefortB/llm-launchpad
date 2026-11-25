@@ -142,7 +142,8 @@ _MODEL_COLUMN_WIDTH = 38
 
 def _model_row(repo_id: str, detail: str) -> str:
     """Render a model picker row with a stable repo-id column."""
-    return f"  {clip(repo_id, _MODEL_COLUMN_WIDTH):<{_MODEL_COLUMN_WIDTH}} {detail}"
+    padded = f"{clip(repo_id, _MODEL_COLUMN_WIDTH):<{_MODEL_COLUMN_WIDTH}}"
+    return f"  {escape(padded)} {escape(detail)}"
 
 
 def _format_hourly_cost(value: float | None) -> str:
@@ -364,8 +365,8 @@ def _prime_offer_options(
         # rather than as the name of the thing being chosen.
         options.append(
             (
-                f"{price} · {offer.gpu_count}x {offer.gpu_type}{memory} · "
-                f"in {location} · offer {clip(offer.id, 8)}",
+                f"{price} · {offer.gpu_count}x {escape(offer.gpu_type)}{memory} · "
+                f"in {escape(location)} · offer {escape(clip(offer.id, 8))}",
                 offer.id,
             )
         )
@@ -471,8 +472,8 @@ def _vast_offer_options(offers: list[VastOffer]) -> list[tuple[str, str]]:
         )
         options.append(
             (
-                f"{price_text} incl. disk · {offer.gpu_count}x {offer.gpu_type} · "
-                f"{memory} · in {location} · offer {clip(offer.id, 8)}",
+                f"{price_text} incl. disk · {offer.gpu_count}x {escape(offer.gpu_type)} · "
+                f"{memory} · in {escape(location)} · offer {escape(clip(offer.id, 8))}",
                 offer.id,
             )
         )
@@ -604,6 +605,9 @@ class _DeployFormFeedbackMixin(_ScreenMixinBase):
         if inside:
             for widget in self.query(f".{self.ADVANCED_CLASS}"):
                 widget.remove_class("hidden")
+            sync_visibility = getattr(self, "_sync_prime_visibility", None)
+            if callable(sync_visibility):
+                sync_visibility()
 
     def _clear_rejection(self) -> None:
         from textual.css.query import NoMatches
@@ -851,11 +855,20 @@ class _BaseDeployScreen(
                 return True
             self._provider = ComputeProvider(event.value)
             self._sync_prime_visibility()
-            if self._provider == ComputeProvider.PRIME and not self._prime_offers:
-                self._refresh_prime_offers()
+            if self._provider == ComputeProvider.PRIME:
+                if self._prime_offers:
+                    self._refresh_prime_offer_options()
+                    offer = self._prime_offers.get(self._selected_prime_offer_id or "")
+                    if offer is not None:
+                        self._bind_offer_gpu_shape(offer.gpu_type, offer.gpu_count)
+                else:
+                    self._refresh_prime_offers()
             elif self._provider == ComputeProvider.VAST:
                 if self._vast_offers:
                     self._refresh_vast_offer_options()
+                    vast_offer = self._vast_offers.get(self._selected_vast_offer_id or "")
+                    if vast_offer is not None:
+                        self._bind_offer_gpu_shape(vast_offer.gpu_type, vast_offer.gpu_count)
                 else:
                     self._refresh_vast_offers()
             elif self._provider == ComputeProvider.MODAL:
@@ -871,20 +884,22 @@ class _BaseDeployScreen(
             if not isinstance(event.value, str):
                 return True
             self._selected_vast_offer_id = event.value
-            offer = self._vast_offers.get(event.value)
-            if offer is not None:
-                self._bind_offer_gpu_shape(offer.gpu_type, offer.gpu_count)
-            self._update_cost_preview(self.COST_PREVIEW_ID)
+            if self._provider == ComputeProvider.VAST:
+                offer = self._vast_offers.get(event.value)
+                if offer is not None:
+                    self._bind_offer_gpu_shape(offer.gpu_type, offer.gpu_count)
+                self._update_cost_preview(self.COST_PREVIEW_ID)
             return True
 
         if select_id == self.PRIME_OFFER_ID:
             if not isinstance(event.value, str):
                 return True
             self._selected_prime_offer_id = event.value
-            offer = self._prime_offers.get(event.value)
-            if offer is not None:
-                self._bind_offer_gpu_shape(offer.gpu_type, offer.gpu_count)
-            self._update_cost_preview(self.COST_PREVIEW_ID)
+            if self._provider == ComputeProvider.PRIME:
+                offer = self._prime_offers.get(event.value)
+                if offer is not None:
+                    self._bind_offer_gpu_shape(offer.gpu_type, offer.gpu_count)
+                self._update_cost_preview(self.COST_PREVIEW_ID)
             return True
 
         if select_id == self.GPU_TYPE_ID:
@@ -900,7 +915,7 @@ class _BaseDeployScreen(
     def _bind_offer_gpu_shape(self, gpu_type: str, gpu_count: int) -> None:
         self._selected_gpu_type = gpu_type
         gpu_type_select = self.query_one(f"#{self.GPU_TYPE_ID}", Select)
-        gpu_type_select.set_options([(gpu_type, gpu_type)])
+        gpu_type_select.set_options([(escape(gpu_type), gpu_type)])
         gpu_type_select.value = gpu_type
         self.query_one(f"#{self.GPU_COUNT_FIELD_ID}", Input).value = str(gpu_count)
         self._on_marketplace_offer_bound(gpu_count)
@@ -961,12 +976,21 @@ class _BaseDeployScreen(
         )
         options = _prime_offer_options(offers)
         selector = self.query_one(f"#{self.PRIME_OFFER_ID}", Select)
-        selector.set_options(options)
-        if options:
-            self._selected_prime_offer_id = options[0][1]
-            selector.value = options[0][1]
+        if self._provider == ComputeProvider.PRIME:
+            selector.set_options(options)
+            if options:
+                self._selected_prime_offer_id = options[0][1]
+                selector.value = options[0][1]
+            else:
+                self._selected_prime_offer_id = None
         else:
-            self._selected_prime_offer_id = None
+            with selector.prevent(Select.Changed):
+                selector.set_options(options)
+                if options:
+                    self._selected_prime_offer_id = options[0][1]
+                    selector.value = options[0][1]
+                else:
+                    self._selected_prime_offer_id = None
         self.query_one(f"#{self.PRIME_STATUS_ID}", Static).update(
             _prime_offer_status(len(options), required_vram_gb, self.BACKEND)
         )
@@ -980,16 +1004,18 @@ class _BaseDeployScreen(
         self.query_one(f"#{self.VAST_STATUS_ID}", Static).update(
             "[dim]Loading Vast.ai rentals...[/dim]"
         )
+        disk_gb = self._vast_disk_gb()
         self.run_worker(
-            self._run_fetch_vast_offers,
+            lambda: self._run_fetch_vast_offers(disk_gb),
             name=f"{self.WORKER_PREFIX}-fetch-vast-offers",
             thread=True,
         )
 
-    def _run_fetch_vast_offers(self) -> None:
+    def _run_fetch_vast_offers(self, disk_gb: int | None = None) -> None:
+        resolved_disk_gb = DEFAULT_VAST_DISK_GB if disk_gb is None else disk_gb
         try:
             offers = VastBackend().list_offers(
-                VastOfferQuery(gpu_count=None, disk_gb=self._vast_disk_gb())
+                VastOfferQuery(gpu_count=None, disk_gb=resolved_disk_gb)
             )
         except Exception as exc:
             self.post_message(VastOffersFailed(str(exc)))
@@ -1016,12 +1042,21 @@ class _BaseDeployScreen(
         offers = _compatible_vast_offers(list(self._vast_offers.values()), required_vram_gb)
         options = _vast_offer_options(offers)
         selector = self.query_one(f"#{self.VAST_OFFER_ID}", Select)
-        selector.set_options(options)
-        if options:
-            self._selected_vast_offer_id = options[0][1]
-            selector.value = options[0][1]
+        if self._provider == ComputeProvider.VAST:
+            selector.set_options(options)
+            if options:
+                self._selected_vast_offer_id = options[0][1]
+                selector.value = options[0][1]
+            else:
+                self._selected_vast_offer_id = None
         else:
-            self._selected_vast_offer_id = None
+            with selector.prevent(Select.Changed):
+                selector.set_options(options)
+                if options:
+                    self._selected_vast_offer_id = options[0][1]
+                    selector.value = options[0][1]
+                else:
+                    self._selected_vast_offer_id = None
         self.query_one(f"#{self.VAST_STATUS_ID}", Static).update(
             _vast_offer_status(len(options), required_vram_gb)
         )
@@ -1045,12 +1080,20 @@ class _BaseDeployScreen(
         poster(GpuTypesLoaded(gpu_types=gpu_types))
 
     def on_gpu_types_loaded(self, message: GpuTypesLoaded) -> None:
-        dropdown = self.query_one(f"#{self.GPU_TYPE_ID}", Select)
-        options = build_gpu_type_options(message.gpu_types)
+        options = [(escape(label), value) for label, value in build_gpu_type_options(message.gpu_types)]
         option_values = [value for _, value in options]
         self._modal_gpu_values = set(option_values)
+        self._gpu_price_by_value = {
+            spec.value.strip(): spec.price_per_hour_usd
+            for spec in message.gpu_types
+            if spec.price_per_hour_usd is not None
+        }
+        if self._provider != ComputeProvider.MODAL:
+            self._update_cost_preview(self.COST_PREVIEW_ID)
+            return
+        dropdown = self.query_one(f"#{self.GPU_TYPE_ID}", Select)
         if self._selected_gpu_type and self._selected_gpu_type not in option_values:
-            options.insert(0, (self._selected_gpu_type, self._selected_gpu_type))
+            options.insert(0, (escape(self._selected_gpu_type), self._selected_gpu_type))
             option_values.insert(0, self._selected_gpu_type)
         if not options:
             return
@@ -1062,11 +1105,6 @@ class _BaseDeployScreen(
         )
         dropdown.value = selected
         self._selected_gpu_type = selected
-        self._gpu_price_by_value = {
-            spec.value.strip(): spec.price_per_hour_usd
-            for spec in message.gpu_types
-            if spec.price_per_hour_usd is not None
-        }
         self._update_cost_preview(self.COST_PREVIEW_ID)
 
     def on_gpu_types_failed(self, _: GpuTypesFailed) -> None:
@@ -1243,22 +1281,33 @@ class BackendSelectScreen(CopyEnabledScreen):
     ]
 
     def compose(self) -> ComposeResult:
-        with VerticalScroll(classes="screen-scroll"):
-            yield Static(screen_title("Advanced deploy", steps=ADVANCED_DEPLOY_STEPS, current=0))
-            yield Static("")
-            yield OptionList(
-                Option(
-                    "  [bold]llama.cpp (GGUF)[/bold]  [dim]· recommended[/dim]\n"
-                    "  [dim]Quantized models · smaller GPUs · fast cold starts[/dim]",
-                    id="llamacpp",
+        from textual.content import Content
+
+        backend_list = OptionList(
+            Option(
+                Content.from_markup(
+                    "  [bold]llama.cpp (GGUF)[/bold]  [bold $primary]recommended[/]\n"
+                    "  [dim]Quantized models · smaller GPUs · fast cold starts[/dim]"
                 ),
-                Option(
+                id="llamacpp",
+            ),
+            Option(
+                Content.from_markup(
                     "  [bold]vLLM[/bold]\n"
-                    "  [dim]Full-precision models · high concurrency · multi-GPU[/dim]",
-                    id="vllm",
+                    "  [dim]Full-precision models · high concurrency · multi-GPU[/dim]"
                 ),
-                id="backend-list",
-            )
+                id="vllm",
+            ),
+            id="backend-list",
+        )
+        backend_list.border_title = "Choose inference engine"
+        with VerticalScroll(classes="screen-scroll focused-panel-scroll"):
+            with Vertical(classes="focused-panel"):
+                yield Static(
+                    screen_title("Advanced deploy", steps=ADVANCED_DEPLOY_STEPS, current=0),
+                    classes="focused-panel-title",
+                )
+                yield backend_list
         yield FittedFooter()
 
     def on_mount(self) -> None:
@@ -1619,8 +1668,11 @@ class LlamaCppDeployScreen(_BaseDeployScreen):
             self._refresh_app_preview()
         if event.input.id in {"repo-id", "revision"}:
             self._schedule_quantization_lookup()
-        if event.input.id in {"repo-id", "quant"} and self._prime_offers:
-            self._refresh_prime_offer_options()
+        if event.input.id in {"repo-id", "quant"}:
+            if self._prime_offers:
+                self._refresh_prime_offer_options()
+            if self._vast_offers:
+                self._refresh_vast_offer_options()
         if event.input.id == "gpu-count-llama":
             self._update_cost_preview("llama-cost-preview")
 
@@ -1739,6 +1791,8 @@ class LlamaCppDeployScreen(_BaseDeployScreen):
             )
         if self._prime_offers:
             self._refresh_prime_offer_options()
+        if self._vast_offers:
+            self._refresh_vast_offer_options()
 
     def on_llama_cpp_quants_failed(self, message: LlamaCppQuantsFailed) -> None:
         current_repo = self.query_one("#repo-id", Input).value.strip()
@@ -1956,7 +2010,7 @@ class LlamaCppDeployScreen(_BaseDeployScreen):
         cached = self._cached_quants_for_current_repo()
         options = []
         for quant in sorted_quantizations:
-            label = f"  {_format_quant_with_vram(quant, normalized_vram)}"
+            label = f"  {escape(_format_quant_with_vram(quant, normalized_vram))}"
             if quant.strip().upper() in cached:
                 label = f"{label}  [dim]· in storage[/dim]"
             options.append(Option(label, id=f"quant-{quant}"))
@@ -2116,56 +2170,56 @@ class VllmDeployScreen(_BaseDeployScreen):
                     allow_blank=False,
                     id="provider-vllm",
                 )
-            yield Static("Prime GPU offer", classes="form-label prime-only")
-            yield Select(
-                options=[],
-                prompt="Select an exact live Prime offer",
-                id="prime-offer-vllm",
-                classes="prime-only",
-            )
-            yield Static(
-                "[dim]Prime offers are secure, on-demand availability sorted by price.[/dim]",
-                id="prime-offer-status",
-                classes="prime-only",
-            )
-            yield Static("Vast.ai rental", classes="form-label vast-only")
-            yield Select(
-                options=[],
-                prompt="Select a live Vast.ai rental",
-                id="vast-offer-vllm",
-                classes="vast-only",
-            )
-            yield Static(
-                "[dim]Vast.ai rentals are priced including disk.[/dim]",
-                id="vast-offer-status-vllm",
-                classes="vast-only",
-            )
-            gpu_panel = Vertical(classes="gpu-config-panel")
-            gpu_panel.border_title = "GPU configuration"
-            with gpu_panel:
-                yield Static(
-                    "",
-                    id="gpu-config-subtitle-vllm",
-                    classes="form-section-subtitle hidden",
+                yield Static("Prime GPU offer", classes="form-label prime-only")
+                yield Select(
+                    options=[],
+                    prompt="Select an exact live Prime offer",
+                    id="prime-offer-vllm",
+                    classes="prime-only",
                 )
-                with Horizontal(id="gpu-config-row-vllm", classes="gpu-config-main-row"):
-                    with Vertical(id="gpu-type-group-vllm"):
-                        yield Static("GPU type", classes="form-label")
-                        yield Select(
-                            options=[(DEFAULT_GPU_TYPE, DEFAULT_GPU_TYPE)],
-                            prompt="Select GPU type",
-                            value=DEFAULT_GPU_TYPE,
-                            id="gpu-type-vllm",
-                        )
-                    with Vertical(id="gpu-count-group-vllm"):
-                        yield Static("GPU count", classes="form-label")
-                        yield Input(
-                            value=str(DEFAULT_GPU_COUNT),
-                            placeholder="1",
-                            id="gpu-count-vllm",
-                            type="integer",
-                        )
-                yield Static("", id="vllm-cost-preview")
+                yield Static(
+                    "[dim]Prime offers are secure, on-demand availability sorted by price.[/dim]",
+                    id="prime-offer-status",
+                    classes="prime-only",
+                )
+                yield Static("Vast.ai rental", classes="form-label vast-only")
+                yield Select(
+                    options=[],
+                    prompt="Select a live Vast.ai rental",
+                    id="vast-offer-vllm",
+                    classes="vast-only",
+                )
+                yield Static(
+                    "[dim]Vast.ai rentals are priced including disk.[/dim]",
+                    id="vast-offer-status-vllm",
+                    classes="vast-only",
+                )
+                gpu_panel = Vertical(classes="gpu-config-panel")
+                gpu_panel.border_title = "GPU configuration"
+                with gpu_panel:
+                    yield Static(
+                        "",
+                        id="gpu-config-subtitle-vllm",
+                        classes="form-section-subtitle hidden",
+                    )
+                    with Horizontal(id="gpu-config-row-vllm", classes="gpu-config-main-row"):
+                        with Vertical(id="gpu-type-group-vllm"):
+                            yield Static("GPU type", classes="form-label")
+                            yield Select(
+                                options=[(DEFAULT_GPU_TYPE, DEFAULT_GPU_TYPE)],
+                                prompt="Select GPU type",
+                                value=DEFAULT_GPU_TYPE,
+                                id="gpu-type-vllm",
+                            )
+                        with Vertical(id="gpu-count-group-vllm"):
+                            yield Static("GPU count", classes="form-label")
+                            yield Input(
+                                value=str(DEFAULT_GPU_COUNT),
+                                placeholder="1",
+                                id="gpu-count-vllm",
+                                type="integer",
+                            )
+                    yield Static("", id="vllm-cost-preview")
             yield Button("Advanced options...", id="toggle-advanced-vllm", variant="default")
             yield VisionOptions(BackendType.VLLM, classes="vllm-advanced")
             # One model sharded across every attached GPU is the common case;
@@ -2393,8 +2447,11 @@ class VllmDeployScreen(_BaseDeployScreen):
             )
         if event.input.id in {"model-name", "instance-name-vllm", "app-name-vllm"}:
             self._refresh_app_preview()
-        if event.input.id in {"model-name", "model-revision"} and self._prime_offers:
-            self._refresh_prime_offer_options()
+        if event.input.id in {"model-name", "model-revision"}:
+            if self._prime_offers:
+                self._refresh_prime_offer_options()
+            if self._vast_offers:
+                self._refresh_vast_offer_options()
         if event.input.id == "gpu-count-vllm":
             self._update_cost_preview("vllm-cost-preview")
         if event.input.id == "max-model-len":
@@ -2564,7 +2621,7 @@ class VllmDeployScreen(_BaseDeployScreen):
     def _show_cached_models(self) -> None:
         self._ranked_models = list(self._cached_models)
         model_list = self.query_one("#vllm-model-list", OptionList)
-        options = [Option(f"  {model.repo_id}", id=f"model-{idx}") for idx, model in enumerate(self._ranked_models)]
+        options = [Option(f"  {escape(model.repo_id)}", id=f"model-{idx}") for idx, model in enumerate(self._ranked_models)]
         _set_option_list(model_list, options)
         if self._ranked_models:
             self._set_model_status("")
@@ -2704,6 +2761,8 @@ class VllmDeployScreen(_BaseDeployScreen):
         self._render_vllm_memory_status(message.estimate)
         if self._prime_offers:
             self._refresh_prime_offer_options()
+        if self._vast_offers:
+            self._refresh_vast_offer_options()
 
     def on_vllm_memory_failed(self, message: VllmMemoryFailed) -> None:
         current_repo, current_revision = self._current_memory_lookup()
@@ -2716,6 +2775,8 @@ class VllmDeployScreen(_BaseDeployScreen):
         self._render_vllm_memory_status(None)
         if self._prime_offers:
             self._refresh_prime_offer_options()
+        if self._vast_offers:
+            self._refresh_vast_offer_options()
 
     def _refresh_app_preview(self) -> None:
         model_name = self.query_one("#model-name", Input).value.strip()

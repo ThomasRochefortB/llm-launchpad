@@ -151,12 +151,19 @@ class ToggleField(Horizontal):
         yield Static(_toggle_state_label(self._default), classes="toggle-state")
         yield Switch(value=self._default, id=self._field_id)
 
+    def sync_monochrome_state(self) -> None:
+        """Show explicit On/Off text only when the monochrome theme is active."""
+        monochrome = getattr(getattr(self.app, "_monochrome_filter", None), "enabled", False)
+        try:
+            self.query_one(".toggle-state", Static).set_class(not monochrome, "hidden")
+        except Exception:
+            pass
+
     def on_mount(self) -> None:
         self.set_class(self._default, "-on")
         # The switch's knob position already says on or off; the word is for
         # the monochrome theme, where the knob's colour is flattened away.
-        monochrome = getattr(getattr(self.app, "_monochrome_filter", None), "enabled", False)
-        self.query_one(".toggle-state", Static).set_class(not monochrome, "hidden")
+        self.sync_monochrome_state()
 
     def on_switch_changed(self, event: Switch.Changed) -> None:
         """Keep the state word in step. The event still reaches the screen."""

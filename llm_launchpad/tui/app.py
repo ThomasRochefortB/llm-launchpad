@@ -256,6 +256,7 @@ class TuiApp(App):
         self._storage_cache_path = SETTINGS_DIR / "storage_snapshot.json"
         self._deploy_connection_cache_path = SETTINGS_DIR / "deployment_connection_summaries.json"
         self._deploy_connection_cache: dict[str, dict[str, object]] = {}
+        self._deploy_connection_lock = threading.RLock()
         self._in_flight_deploys: dict[tuple[str, str, str], InFlightDeployment] = {}
         self._deployment_lock = threading.RLock()
         self.deployment_jobs: dict[str, DeploymentJob] = {}
@@ -296,15 +297,26 @@ class TuiApp(App):
         self.theme = normalize_tui_theme(theme)
         self.tui_density = normalize_tui_density(density)
         self._monochrome_filter.enabled = self.theme == "launchpad-monochrome"
-        try:
-            screen = self.screen
-        except Exception:
-            return
-        refresher = getattr(screen, "refresh_visual_preferences", None)
-        if callable(refresher):
-            refresher()
-        else:
-            screen.refresh(repaint=True, layout=True)
+        screens: list[Screen[Any]] = []
+        seen: set[int] = set()
+        for candidate in (
+            *list(getattr(self, "screen_stack", ()) or ()),
+            *list(getattr(self, "_installed_screens", {}).values()),
+        ):
+            if id(candidate) not in seen:
+                seen.add(id(candidate))
+                screens.append(candidate)
+        if not screens:
+            try:
+                screens.append(self.screen)
+            except Exception:
+                return
+        for screen in screens:
+            refresher = getattr(screen, "refresh_visual_preferences", None)
+            if callable(refresher):
+                refresher()
+            else:
+                screen.refresh(repaint=True, layout=True)
 
     def copy_to_clipboard(self, text: str) -> None:
         """Copy text via OSC 52 and the host clipboard when available."""
@@ -859,7 +871,13 @@ class TuiApp(App):
             return
         driver = getattr(self, "_driver", None)
         if driver is not None:
-            emit_terminal_notification(title, body, writer=driver)
+            def _emit_terminal() -> None:
+                emit_terminal_notification(title, body, writer=driver)
+
+            try:
+                self.call_from_thread(_emit_terminal)
+            except Exception:
+                _emit_terminal()
         if not getattr(self, "is_headless", False):
             send_desktop_notification(title, body)
 
@@ -923,7 +941,14 @@ class TuiApp(App):
         active = [job for job in jobs.values() if not job.finished.is_set()]
         if active:
             job = active[0]
-            label = getattr(getattr(job, "config", None), "model", "") or job.id[:8]
+            cfg = getattr(job, "config", None)
+            label = (
+                getattr(cfg, "served_model_name", None)
+                or getattr(cfg, "model_name", None)
+                or getattr(cfg, "repo_id", None)
+                or getattr(cfg, "app_name", None)
+                or job.id[:8]
+            )
 
             def _reopen(job_id: str = job.id) -> None:
                 self.reopen_deployment(job_id)
@@ -1037,6 +1062,17 @@ class TuiApp(App):
             self._spawn_job_worker(persistent.id)
         except Exception as exc:
             log_exception("Could not spawn deployment worker; falling back to a session thread")
+            job.persistent_id = None
+            try:
+                from ..core.job_store import JobStatus
+
+                store.finish_job(
+                    persistent.id,
+                    JobStatus.FAILED,
+                    f"Background worker failed to start ({exc}); running in session.",
+                )
+            except Exception:
+                pass
             self.notify(
                 f"Background worker failed to start ({exc}); running in this session instead. Closing the TUI will interrupt it.",
                 severity="warning",
@@ -1666,8 +1702,9 @@ class TuiApp(App):
                 and event.success
                 and event.operation == OperationType.STOP
             ):
-                self._deploy_connection_cache.pop(app_name, None)
-                self._persist_deploy_connection_cache()
+                with self._deploy_connection_lock:
+                    self._deploy_connection_cache.pop(app_name, None)
+                    self._persist_deploy_connection_cache()
                 live_rows, prune_providers = self._visible_rows_and_prune_scope()
                 self._cache_endpoint_snapshot(live_rows)
                 self._sync_opencode(
@@ -2092,35 +2129,39 @@ class TuiApp(App):
         cached_endpoint.name = cached_endpoint.name or app_name
         cached_endpoint.web_url = server_url
         try:
-            save_connection(config, cached_endpoint, self._deploy_connection_cache_path)
-            self._deploy_connection_cache = load_connection_entries(
-                self._deploy_connection_cache_path
-            )
+            with self._deploy_connection_lock:
+                save_connection(config, cached_endpoint, self._deploy_connection_cache_path)
+                self._deploy_connection_cache = load_connection_entries(
+                    self._deploy_connection_cache_path
+                )
         except Exception:
             log_exception("Failed to cache deploy connection summary")
             return
 
     def _persist_deploy_connection_cache(self) -> None:
-        persist_deploy_connection_cache(
-            self._deploy_connection_cache_path, self._deploy_connection_cache
-        )
+        with self._deploy_connection_lock:
+            persist_deploy_connection_cache(
+                self._deploy_connection_cache_path, self._deploy_connection_cache
+            )
 
     def _load_persisted_deploy_connection_cache(self) -> None:
-        self._deploy_connection_cache = load_persisted_deploy_connection_cache(
-            self._deploy_connection_cache_path
-        )
+        with self._deploy_connection_lock:
+            self._deploy_connection_cache = load_persisted_deploy_connection_cache(
+                self._deploy_connection_cache_path
+            )
 
     def _merge_deploy_connection_cache(self, rows: list[EndpointInfo]) -> None:
-        if not self._deploy_connection_cache:
-            return
-        merge_connections(
-            rows,
-            self._deploy_connection_cache_path,
-            self._storage_cache_path,
-        )
-        self._deploy_connection_cache = load_connection_entries(
-            self._deploy_connection_cache_path
-        )
+        with self._deploy_connection_lock:
+            if not self._deploy_connection_cache and not self._deploy_connection_cache_path.exists():
+                return
+            merge_connections(
+                rows,
+                self._deploy_connection_cache_path,
+                self._storage_cache_path,
+            )
+            self._deploy_connection_cache = load_connection_entries(
+                self._deploy_connection_cache_path
+            )
 
     def _load_persisted_storage_cache(self) -> None:
         snapshot, cached_at = load_persisted_storage_snapshot(self._storage_cache_path)

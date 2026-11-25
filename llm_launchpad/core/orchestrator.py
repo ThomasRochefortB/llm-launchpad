@@ -563,6 +563,9 @@ class Orchestrator:
             yield from self.deploy_prime_only(config)
             return
         if config.provider == ComputeProvider.VAST:
+            if self._vast_backend is not None:
+                yield from self._vast_backend.deploy(config)
+                return
             from .provider_adapters import provider_adapter
 
             yield from provider_adapter(ComputeProvider.VAST).deploy(config)
@@ -847,7 +850,7 @@ class Orchestrator:
             entry = load_connection_entries().get(app_name, {})
             if str(entry.get("base_url") or "").removesuffix("/v1").rstrip("/") == server_url.removesuffix("/v1").rstrip("/"):
                 vision = vision_from_dict(entry.get("vision"))
-        for event in WarmupRunner().run(
+        warmup_stream = WarmupRunner().run(
             vision=vision,
             backend=backend,
             server_url=server_url,
@@ -864,18 +867,22 @@ class Orchestrator:
             runtime_id=runtime_id,
             phase_timer=phase_timer,
             price_per_hour_usd=price_per_hour_usd,
-        ):
-            if (
-                isinstance(event, OperationCompleteEvent)
-                and app_name
-                and vision is not None
-                # A cancelled probe leaves this untested and teaches nothing, so
-                # the stored verification must survive untouched.
-                and vision.verification != VisionVerification.UNTESTED
-            ):
-                from .connection_store import update_vision_verification
-                update_vision_verification(app_name, server_url, vision)
-            yield event
+        )
+        try:
+            for event in warmup_stream:
+                if (
+                    isinstance(event, OperationCompleteEvent)
+                    and app_name
+                    and vision is not None
+                    # A cancelled probe leaves this untested and teaches nothing, so
+                    # the stored verification must survive untouched.
+                    and vision.verification != VisionVerification.UNTESTED
+                ):
+                    from .connection_store import update_vision_verification
+                    update_vision_verification(app_name, server_url, vision)
+                yield event
+        finally:
+            warmup_stream.close()
 
 
     # ------------------------------------------------------------------

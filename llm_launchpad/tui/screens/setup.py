@@ -10,6 +10,7 @@ from textual.widgets import Button, Static
 
 from ...core.provider_readiness import ProviderReadiness, ProviderReadinessStage
 from ...protocol.enums import ComputeProvider
+from ..markers import provider_marker
 from ..widgets.fitted_footer import FittedFooter
 from .copy_enabled import CopyEnabledScreen
 from ..visual import screen_title
@@ -36,7 +37,7 @@ class SetupRequiredScreen(CopyEnabledScreen):
                     yield Static(screen_title("Compute provider required"))
                     yield Static("Connect a provider, then press r to re-check.", id="setup-required-intro")
                     for provider, command in _SETUP_COMMANDS.items():
-                        with Horizontal(classes="setup-option"):
+                        with Horizontal(id=f"setup-option-{provider.value}", classes="setup-option"):
                             yield Static(
                                 self._provider_setup_text(provider, command),
                                 id=f"setup-status-{provider.value}",
@@ -94,18 +95,25 @@ class SetupRequiredScreen(CopyEnabledScreen):
             ProviderReadinessStage.AUTH_FAILED: "$error",
             ProviderReadinessStage.UNREACHABLE: "$warning",
         }.get(stage, "dim")
+        marker = provider_marker(provider)
         detail = f" · {escape(row.detail)}" if row is not None and row.detail else ""
         return (
-            f"[bold]{escape(provider.display_name)}[/] · [{style}]{escape(stage.display_name)}[/]"
-            f"{detail}\n{escape(command)}"
+            f"[{style}]{marker}[/] [bold]{escape(provider.display_name)}[/] · "
+            f"[{style}]{escape(stage.display_name)}[/]{detail}\n[dim]{escape(command)}[/dim]"
         )
 
     def _render_readiness(self, readiness: tuple[ProviderReadiness, ...]) -> None:
         by_provider = {row.provider: row for row in readiness}
         for provider, command in _SETUP_COMMANDS.items():
+            row = by_provider.get(provider)
             self.query_one(f"#setup-status-{provider.value}", Static).update(
-                self._provider_setup_text(provider, command, by_provider.get(provider))
+                self._provider_setup_text(provider, command, row)
             )
+            option = self.query_one(f"#setup-option-{provider.value}", Horizontal)
+            stage = row.stage if row is not None else ProviderReadinessStage.CREDENTIALS_PRESENT
+            option.set_class(stage == ProviderReadinessStage.READY, "setup-ready")
+            option.set_class(stage == ProviderReadinessStage.AUTH_FAILED, "setup-error")
+            option.set_class(stage == ProviderReadinessStage.UNREACHABLE, "setup-warning")
 
     async def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id

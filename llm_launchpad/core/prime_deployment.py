@@ -206,7 +206,10 @@ class PrimeDeploymentRunner:
         wait_deadline = waiting_started + 1800
         while self._monotonic() < wait_deadline:
             if not runtime_ready:
-                ready, failed, detail = self.prime_backend.bootstrap_runtime_status(pod)
+                try:
+                    ready, failed, detail = self.prime_backend.bootstrap_runtime_status(pod)
+                except RuntimeError as exc:
+                    ready, failed, detail = False, False, f"waiting for pod SSH ({exc})"
                 if detail and detail != last_runtime_detail:
                     yield LogEvent(
                         line=f"Prime runtime: {detail}",
@@ -220,9 +223,12 @@ class PrimeDeploymentRunner:
                 if ready:
                     runtime_ready = True
             if not tunnel_ready:
-                ready, failed, detail = self.prime_backend.tunnel_runtime_status(
-                    pod, tunnel_id
-                )
+                try:
+                    ready, failed, detail = self.prime_backend.tunnel_runtime_status(
+                        pod, tunnel_id
+                    )
+                except RuntimeError as exc:
+                    ready, failed, detail = False, False, f"waiting for tunnel SSH ({exc})"
                 if detail and detail != last_tunnel_detail:
                     yield LogEvent(
                         line=f"Prime Tunnel: {detail}",
@@ -417,6 +423,8 @@ class PrimeDeploymentRunner:
 
         config.endpoint_api_key = config.endpoint_api_key or secrets.token_urlsafe(32)
         pod_id = ""
+        completed = False
+        cleaned_up = False
         try:
             launch = self._resolve_launch_spec(config)
             yield StateChangeEvent(
@@ -429,6 +437,9 @@ class PrimeDeploymentRunner:
                 config,
                 required_image=launch.offer_image,
             )
+            config.gpu_count = offer.gpu_count
+            if offer.gpu_type:
+                config.gpu_type = offer.gpu_type
             config.price_per_hour_usd = offer.price_per_hour
             bind_prime_disk(config, disk_id)
             options = prime_provider_options(config)
@@ -495,6 +506,7 @@ class PrimeDeploymentRunner:
             info = announced or prime_endpoint_info(config, pod_id, endpoint)
             info.web_url = endpoint
             info.state = "running"
+            completed = True
             yield LogEvent(
                 line=f"Prime endpoint: {endpoint}",
                 operation=OperationType.DEPLOY,
@@ -506,6 +518,7 @@ class PrimeDeploymentRunner:
                 data=info,
             )
         except Exception as exc:
+            cleaned_up = True
             message, rollback = yield from self.cleanup_failed_pod(
                 pod_id, options, str(exc)
             )
@@ -514,3 +527,9 @@ class PrimeDeploymentRunner:
                 message,
                 data={"rollback": rollback} if rollback is not None else None,
             )
+        finally:
+            if pod_id and not completed and not cleaned_up and not options.keep_failed_resource:
+                try:
+                    self.prime_backend.delete_pod(pod_id)
+                except Exception:
+                    log_exception(f"Could not delete Prime pod {pod_id} during abrupt exit")

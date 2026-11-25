@@ -35,6 +35,19 @@ def _tag_operation(events: EventStream, operation: OperationType) -> EventStream
             yield event
 
 
+_SENSITIVE_ENV_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD")
+
+
+def _format_env_for_log(env: dict[str, str]) -> str:
+    """Format environment key/value pairs for logs with secrets redacted."""
+    formatted: list[str] = []
+    for key, value in env.items():
+        upper = key.upper()
+        display = "[redacted]" if any(marker in upper for marker in _SENSITIVE_ENV_MARKERS) else value
+        formatted.append(f"{key}={display}")
+    return ", ".join(formatted)
+
+
 def _deploy_vllm(config: DeploymentConfig, env: dict[str, str]) -> EventStream:
     if config.do_deploy:
         cmd = ModalBackend.build_deploy_command(config.backend, app_name=config.app_name)
@@ -45,22 +58,43 @@ def _deploy_vllm(config: DeploymentConfig, env: dict[str, str]) -> EventStream:
         )
         yield LogEvent(line=f"Running: {' '.join(cmd)}")
         if env:
-            yield LogEvent(line=f"  env: {', '.join(f'{k}={v}' for k, v in env.items())}")
+            yield LogEvent(line=f"  env: {_format_env_for_log(env)}")
         yield from _tag_operation(
             ModalBackend.run_streaming(cmd, env=env),
             OperationType.DEPLOY,
         )
     elif config.run_smoke:
-        cmd = ["modal", "run", BackendType.VLLM.script]
+        cmd = ModalBackend.build_run_command(config)
         yield StateChangeEvent(
             current=DeploymentState.RUNNING,
             operation=OperationType.SMOKE_TEST,
             detail=" ".join(cmd),
         )
         yield LogEvent(line=f"Running: {' '.join(cmd)}")
+        if env:
+            yield LogEvent(line=f"  env: {_format_env_for_log(env)}")
         yield from _tag_operation(
             ModalBackend.run_streaming(cmd, env=env),
             OperationType.SMOKE_TEST,
+        )
+    elif config.preload:
+        cmd = [*ModalBackend.build_run_command(config), "--preload"]
+        yield StateChangeEvent(
+            current=DeploymentState.RUNNING,
+            operation=OperationType.DEPLOY,
+            detail=" ".join(cmd),
+        )
+        yield LogEvent(line=f"Running: {' '.join(cmd)}")
+        if env:
+            yield LogEvent(line=f"  env: {_format_env_for_log(env)}")
+        yield from _tag_operation(
+            ModalBackend.run_streaming(cmd, env=env),
+            OperationType.DEPLOY,
+        )
+    else:
+        yield from fail_operation(
+            OperationType.DEPLOY,
+            "Modal vLLM deployment requires deploy, smoke test, or preload intent.",
         )
 
 
@@ -78,7 +112,7 @@ def _deploy_llamacpp(config: DeploymentConfig, env: dict[str, str]) -> EventStre
         )
         yield LogEvent(line=f"Running: {' '.join(cmd)}")
         if emit_env and env:
-            yield LogEvent(line=f"  env: {', '.join(f'{k}={v}' for k, v in env.items())}")
+            yield LogEvent(line=f"  env: {_format_env_for_log(env)}")
 
         saw_completion = False
         success = True
@@ -178,11 +212,12 @@ def deploy_modal(
     ):
         try:
             rates = gpu_catalog_fetcher(force_refresh=True)
+            target_gpu = (config.gpu_type or "").strip().upper()
             unit = next(
                 (
                     r.price_per_hour_usd
                     for r in rates
-                    if r.value == config.gpu_type and r.stale_since is None
+                    if r.value.upper() == target_gpu and r.stale_since is None
                 ),
                 None,
             )

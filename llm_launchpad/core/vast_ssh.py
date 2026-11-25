@@ -108,6 +108,13 @@ class VastSsh:
         result = self._run(["ssh-keygen", "-y", "-f", str(self.key)])
         return result.stdout.strip()
 
+    def clear_host_key(self) -> None:
+        """Remove any cached host key seen while Vast's shared proxy was provisioning."""
+        try:
+            (self.directory / "known_hosts").unlink(missing_ok=True)
+        except OSError:
+            pass
+
     def args(self, instance: VastInstance) -> list[str]:
         if not re.fullmatch(r"ssh[0-9]+\.vast\.ai", instance.ssh_host) or not 1 <= instance.ssh_port <= 65535:
             raise ValueError("Vast has not supplied a valid proxy SSH address.")

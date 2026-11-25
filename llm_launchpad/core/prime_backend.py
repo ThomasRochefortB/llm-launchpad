@@ -577,10 +577,10 @@ class PrimeBackend:
                 if isinstance(item, dict)
             )
             has_next = bool(result.get("has_next")) if isinstance(result, dict) else False
-            total = int(result.get("total", len(rows))) if isinstance(result, dict) else 0
-            if not has_next and len(rows) >= total:
-                break
+            total = _optional_int(result.get("total")) if isinstance(result, dict) else None
             if not payload_rows:
+                break
+            if not has_next and (total is None or len(rows) >= total):
                 break
             page += 1
         return rows
@@ -677,8 +677,8 @@ class PrimeBackend:
         return build_tunnel_config(tunnel, local_port=local_port)
 
     @staticmethod
-    def _tunnel_start_script() -> str:
-        return build_tunnel_start_script()
+    def _tunnel_start_script(*, cache_filename: str = "frpc") -> str:
+        return build_tunnel_start_script(cache_filename=cache_filename)
 
     @staticmethod
     def _redact_runtime_log(value: str) -> str:
@@ -1002,16 +1002,28 @@ class PrimeBackend:
             )
         return normalize_frpc_arch((result.stdout or "").strip())
 
+    @staticmethod
+    def _frpc_cache_filename(arch: str) -> str:
+        from .prime_frpc import frpc_release_meta
+
+        try:
+            version, _ = frpc_release_meta()
+        except Exception:
+            version = "unknown"
+        return f"frpc-{version}-{arch}"
+
     def _ensure_remote_frpc(self, pod: dict[str, Any], arch: str) -> None:
         from .prime_frpc import ensure_cached_frpc
 
+        cache_filename = self._frpc_cache_filename(arch)
+        cached_path = f"/data/llm-launchpad/{cache_filename}"
         probe = self._run_privileged_ssh(
             pod,
             (
                 f"if [ -x {PRIME_RUNTIME_ROOT}/frpc ]; then echo ready; "
-                f"elif [ -x /data/llm-launchpad/frpc ]; then "
+                f"elif [ -x {cached_path} ]; then "
                 f"install -d -m 700 {PRIME_RUNTIME_ROOT}; "
-                f"cp /data/llm-launchpad/frpc {PRIME_RUNTIME_ROOT}/frpc; "
+                f"cp {cached_path} {PRIME_RUNTIME_ROOT}/frpc; "
                 "echo ready; else echo missing; fi"
             ),
             timeout=30,
@@ -1041,9 +1053,13 @@ class PrimeBackend:
             pod, PRIME_TUNNEL_ID_NAME, f"{tunnel.tunnel_id}\n", mode="600"
         )
         arch = self._pod_frpc_arch(pod)
+        cache_filename = self._frpc_cache_filename(arch)
         self._ensure_remote_frpc(pod, arch)
         self._write_remote_runtime_file(
-            pod, "tunnel-bootstrap.sh", self._tunnel_start_script(), mode="700"
+            pod,
+            "tunnel-bootstrap.sh",
+            self._tunnel_start_script(cache_filename=cache_filename),
+            mode="700",
         )
         started = self._run_privileged_ssh(
             pod, f"{PRIME_RUNTIME_ROOT}/tunnel-bootstrap.sh", timeout=60
@@ -1074,6 +1090,8 @@ class PrimeBackend:
             f"test -s {PRIME_TUNNEL_PID_PATH} && kill -0 $(cat {PRIME_TUNNEL_PID_PATH})",
             timeout=20,
         )
+        if process.returncode == 255:
+            return False, False, "waiting for pod SSH (transient disconnect)"
         logs = self.tunnel_runtime_logs(pod, tail=30)
         lowered_logs = "\n".join(logs).casefold()
         if process.returncode != 0:
@@ -1134,24 +1152,27 @@ class PrimeBackend:
             )
             return False, True, detail
         if container_state == "running":
-            progress = self._run_privileged_ssh(
-                pod,
-                (
-                    "docker stats --no-stream --format='{{.NetIO}}' "
-                    f"{PRIME_RUNTIME_CONTAINER_NAME}; "
-                    f"echo CACHE:$(docker exec {PRIME_RUNTIME_CONTAINER_NAME} sh -lc "
-                    "'du -scb /root/.cache/huggingface /root/.cache/llama.cpp "
-                    "/data/huggingface /data/llama.cpp 2>/dev/null "
-                    "| tail -n1 | cut -f1' 2>/dev/null || echo 0); "
-                    f"echo EXPECTED:$(cat {PRIME_RUNTIME_ROOT}/expected-bytes "
-                    "2>/dev/null || echo 0)"
-                ),
-                timeout=20,
-            )
             network = ""
             cache_bytes = 0
             expected_bytes = 0
-            if progress.returncode == 0:
+            try:
+                progress = self._run_privileged_ssh(
+                    pod,
+                    (
+                        "docker stats --no-stream --format='{{.NetIO}}' "
+                        f"{PRIME_RUNTIME_CONTAINER_NAME}; "
+                        f"echo CACHE:$(docker exec {PRIME_RUNTIME_CONTAINER_NAME} sh -lc "
+                        "'du -scb /root/.cache/huggingface /root/.cache/llama.cpp "
+                        "/data/huggingface /data/llama.cpp 2>/dev/null "
+                        "| tail -n1 | cut -f1' 2>/dev/null || echo 0); "
+                        f"echo EXPECTED:$(cat {PRIME_RUNTIME_ROOT}/expected-bytes "
+                        "2>/dev/null || echo 0)"
+                    ),
+                    timeout=20,
+                )
+            except RuntimeError:
+                progress = None
+            if progress is not None and progress.returncode == 0:
                 network, cache_bytes, expected_bytes = self._parse_runtime_progress_output(
                     progress.stdout or ""
                 )
@@ -1244,12 +1265,21 @@ class PrimeBackend:
             page_rows = payload.get("data", []) if isinstance(payload, dict) else []
             rows.extend(row for row in page_rows if isinstance(row, dict))
             total = (
-                int(payload.get("total_count", payload.get("totalCount", len(page_rows))))
-                if isinstance(payload, dict)
-                else 0
+                _optional_int(payload.get("total_count"))
+                if isinstance(payload, dict) and payload.get("total_count") is not None
+                else (
+                    _optional_int(payload.get("totalCount"))
+                    if isinstance(payload, dict)
+                    else None
+                )
             )
             offset += len(page_rows)
-            if not page_rows or offset >= total:
+            if not page_rows:
+                break
+            if total is not None:
+                if offset >= total:
+                    break
+            elif len(page_rows) < limit:
                 break
         return rows
 

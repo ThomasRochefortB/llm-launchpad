@@ -81,12 +81,8 @@ def run_job(job_id: str, store: JobStore | None = None) -> int:
     if record.status == "pending" and not store.claim_job(job_id, pid):
         # Cancelled before start, or claimed by another worker: no duplicate rental.
         return 0
-    if (
-        record.status == "running"
-        and record.worker_pid not in (None, pid)
-        and store.pid_alive(record.worker_pid)
-    ):
-        # Another worker owns it; never run allocation twice.
+    if record.status == "running" and record.worker_pid != pid:
+        # Another worker owns (or owned) it; never run allocation twice.
         return 0
     stop_heartbeat = threading.Event()
     heartbeat = threading.Thread(
@@ -146,6 +142,7 @@ def _run_claimed_job(job_id: str, store: JobStore, pid: int) -> int:
     worker_endpoint: EndpointInfo | None = None
     worker_config: DeploymentConfig | None = None
     worker_index: int = 0
+    journal_config: DeploymentConfig = config
 
     def _on_event(event: BaseEvent) -> None:
         try:
@@ -169,19 +166,18 @@ def _run_claimed_job(job_id: str, store: JobStore, pid: int) -> int:
     ) -> None:
         nonlocal worker_url, worker_endpoint, worker_config
         worker_config = saved_config
+        resolved_url = url or (endpoint.web_url if endpoint is not None else None)
         if endpoint is not None:
             worker_endpoint = endpoint
-            if endpoint.web_url:
-                worker_url = endpoint.web_url
-        elif url:
-            worker_url = url
+        if resolved_url:
+            worker_url = resolved_url
         try:
             _save_connection(saved_config, worker_url, worker_endpoint)
         except Exception:
             pass
 
     def _on_attempt_start(index: int, attempt_config: DeploymentConfig) -> None:
-        nonlocal worker_index, worker_resource, worker_url, worker_endpoint, worker_config
+        nonlocal worker_index, worker_resource, worker_url, worker_endpoint, worker_config, journal_config
         worker_index = index
         # A previous attempt's resource must not leak into the next one.
         if index > 0:
@@ -189,7 +185,24 @@ def _run_claimed_job(job_id: str, store: JobStore, pid: int) -> int:
             worker_url = None
             worker_endpoint = None
             worker_config = None
+            _clear_journal(journal_config)
+            journal_config = attempt_config
             try:
+                record_in_flight(
+                    InFlightDeployment(
+                        app_name=attempt_config.app_name or "",
+                        provider=attempt_config.provider.value,
+                        backend=attempt_config.backend.value,
+                        instance_name=attempt_config.instance_name,
+                        gpu_type=attempt_config.gpu_type,
+                        gpu_count=max(1, int(attempt_config.gpu_count or 1)),
+                        started_at_epoch=time.time(),
+                    )
+                )
+            except Exception:
+                pass
+            try:
+                store.clear_resource(job_id)
                 store.update_config(job_id, attempt_config)
                 store.append_event(
                     job_id,
@@ -263,8 +276,12 @@ def _run_claimed_job(job_id: str, store: JobStore, pid: int) -> int:
     current = worker_config or attempt_configs[min(current_index, len(attempt_configs) - 1)]
     outcome = result.attempts[-1] if result.attempts else None
     if outcome is not None and outcome.disposition == AttemptDisposition.CANCELLED:
+        from ..protocol.enums import CleanupDisposition
+
         _finish_cancelled_from_lifecycle(job_id, store, current, outcome)
-        _clear_journal(current)
+        if outcome.cleanup in (CleanupDisposition.CONFIRMED, CleanupDisposition.NOTHING_TO_CLEAN):
+            _clear_journal(journal_config)
+            _clear_journal(current)
         return 0
     if result.succeeded:
         try:
@@ -280,6 +297,7 @@ def _run_claimed_job(job_id: str, store: JobStore, pid: int) -> int:
             job_id, JobStatus.SUCCEEDED, "Finished — open result",
             result={"url": observed_url, "app_name": current.app_name},
         )
+        _clear_journal(journal_config)
         _clear_journal(current)
         return 0
     failure_detail = (
@@ -362,12 +380,11 @@ def _run_attempt_phases(
         observed_config = saved_config
         # The authoritative endpoint wins over incidental URLs: prefer the
         # last endpoint object with a URL, and persist warmup replacements.
+        resolved_url = url or (endpoint.web_url if endpoint is not None else None)
         if endpoint is not None:
             observed_endpoint = endpoint
-            if endpoint.web_url:
-                observed_url = endpoint.web_url
-        elif url:
-            observed_url = url
+        if resolved_url:
+            observed_url = resolved_url
         _save_connection(saved_config, observed_url, observed_endpoint)
 
     result = run_lifecycle(
@@ -563,8 +580,12 @@ def _finish_cancelled_from_lifecycle(
             pass
         store.finish_job(job_id, JobStatus.CANCELLED, "Cancelled; resource stopped.")
         return
-    if not config.do_deploy:
-        detail = "Cancelled before allocating a resource."
+    if (
+        not config.do_deploy
+        or cleanup == CleanupDisposition.NOTHING_TO_CLEAN
+        or (isinstance(cleanup, str) and cleanup == CleanupDisposition.NOTHING_TO_CLEAN.value)
+    ):
+        detail = failure_detail if failure_detail and failure_detail != "Cancelled." else "Cancelled before allocating a resource."
         try:
             store.append_event(
                 job_id,
@@ -597,9 +618,15 @@ def _save_connection(config: DeploymentConfig, url: str | None, endpoint: Endpoi
     if not url:
         return
     try:
+        from dataclasses import replace as _replace
         from .connection_store import save_connection
 
-        save_connection(config, endpoint or EndpointInfo(name=config.app_name or "", web_url=url))
+        target_endpoint = (
+            _replace(endpoint, web_url=url)
+            if endpoint is not None and endpoint.web_url != url
+            else (endpoint or EndpointInfo(name=config.app_name or "", web_url=url))
+        )
+        save_connection(config, target_endpoint)
     except Exception:
         log_exception("Could not cache deploy connection summary")
 

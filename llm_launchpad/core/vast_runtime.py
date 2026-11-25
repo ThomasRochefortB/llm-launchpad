@@ -73,7 +73,7 @@ _VAST_RUNTIME_PROCESS_PATTERNS = ("[r]untime[.]sh", "[l]lama-server", "[v]llm")
 VAST_STARTUP_PROBE_COMMAND = rf"""
 cd {VAST_RUNTIME_DIR} 2>/dev/null || exit 0
 find . \( -name '*.downloadInProgress' -o -name '*.incomplete' \) -printf '%s\n' 2>/dev/null | awk '{{ total += $1 }} END {{ printf "BYTES %d\n", total }}'
-find models hf/hub -type f \( -path '*/blobs/*' -o -name '*.gguf' -o -name '*.downloadInProgress' -o -name '*.incomplete' \) -printf 'FILE %s %b %p\n' 2>/dev/null
+find gguf/hf-hub models hf/hub -type f \( -path '*/blobs/*' -o -name '*.gguf' -o -name '*.downloadInProgress' -o -name '*.incomplete' \) -printf 'FILE %s %b %p\n' 2>/dev/null
 tail -c 8000 server.log 2>/dev/null | tr '\r' '\n' | grep -v '^[[:space:]]*$' | tail -n {VAST_STARTUP_LOG_LINES} | cut -c1-200 | sed 's|^|LOG |'
 if grep -lsa {" ".join(f"-e '{pattern}'" for pattern in _VAST_RUNTIME_PROCESS_PATTERNS)} /proc/[0-9]*/cmdline >/dev/null 2>&1; then echo 'RUNTIME 1'; else echo 'RUNTIME 0'; fi
 """

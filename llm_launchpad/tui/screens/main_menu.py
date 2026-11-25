@@ -22,7 +22,8 @@ from ..format import (
 from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Center, VerticalScroll
+from textual.containers import Center, Vertical, VerticalScroll
+from textual.content import Content
 from textual.message import Message
 from textual.timer import Timer
 from textual.widgets import OptionList, Static
@@ -63,7 +64,7 @@ from ...core.quick_deploy_refresh import (
 )
 from ...protocol.enums import BackendType, ComputeProvider
 from ...protocol.models import EndpointInfo, FleetDiscovery, ServingSnapshot, StorageSnapshot
-from ..billing_panel import render_provider_billing
+from ..billing_panel import render_provider_billing, render_provider_billing_inline
 from ..connection import endpoint_model_summary, resolve_openai_base_url
 from ..fleet_status import (
     SCALE_TO_ZERO_PROVIDERS,
@@ -86,6 +87,79 @@ from ..compat import highlighted_option, replace_options
 from ..visual import screen_title
 
 PANEL_SEPARATOR = "[dim]----------------------------------------[/dim]"
+
+# Pure ASCII so every terminal font renders exact single-cell alignment with no
+# block-glyph gaps or CJK width ambiguity. Each row is 70 columns wide.
+_BANNER_ROWS: tuple[tuple[str, str], ...] = (
+    (r" _    _    __  __ ", r" _      _    _   _ _  _  ___  _  _ ___   _   ___  "),
+    (r"| |  | |  |  \/  |", r"| |    /_\  | | | | \| |/ __|| || | _ \ /_\ |   \ "),
+    (r"| |_ | |_ | |\/| |", r"| |_  / _ \ | |_| | .` | (__ | __ |  _// _ \| |) |"),
+    (r"|___||___||_|  |_|", r"|___|/_/ \_\ \___/|_|\_|\___||_||_|_| /_/ \_\___/ "),
+)
+
+BANNER = "\n".join(
+    f"[bold $primary]{escape(left)}[/]  [bold]{escape(right)}[/bold]"
+    for left, right in _BANNER_ROWS
+)
+
+
+def _render_compact_header(version: str = "", *, minimal: bool = False) -> str:
+    """Render the single-line header used on compact or short viewports."""
+    ver = f"  [dim]v{escape(version)}[/dim]" if version else ""
+    if minimal:
+        compact_ver = f" [dim]v{escape(version)}[/dim]" if version else ""
+        return f"[bold $primary]LLM[/] [bold]Launchpad[/bold]{compact_ver}"
+    return f"[bold $primary]L L M[/]  [bold]L A U N C H P A D[/bold]{ver}"
+
+
+def _render_home_tagline(
+    version: str = "",
+    *,
+    readiness: tuple[ProviderReadiness, ...] | None = None,
+    modal_status: ModalAuthStatus | None = None,
+    prime_status: PrimeAuthStatus | None = None,
+) -> str:
+    """Render the provider status strip and version directly below the logo."""
+    states = {row.provider: row for row in readiness} if readiness is not None else {}
+    chips: list[str] = []
+    for provider, marker in (
+        (ComputeProvider.MODAL, MODAL_MARKER),
+        (ComputeProvider.PRIME, PRIME_MARKER),
+        (ComputeProvider.VAST, VAST_MARKER),
+    ):
+        name = escape(provider.display_name)
+        if readiness is not None:
+            row = states.get(provider)
+            if row is not None and row.verified:
+                chips.append(f"[$success]{marker}[/] {name}")
+            elif row is not None and row.stage in (
+                ProviderReadinessStage.AUTH_FAILED,
+                ProviderReadinessStage.UNREACHABLE,
+            ):
+                chips.append(f"[$warning]{marker}[/] {name}")
+            else:
+                chips.append(f"[dim]{marker} {name}[/dim]")
+        elif provider == ComputeProvider.MODAL:
+            if modal_status is not None and modal_status.authenticated:
+                chips.append(f"[$success]{marker}[/] {name}")
+            elif modal_status is not None and modal_status.error:
+                chips.append(f"[$warning]{marker}[/] {name}")
+            else:
+                chips.append(f"[dim]{marker} {name}[/dim]")
+        elif provider == ComputeProvider.PRIME:
+            if prime_status is not None and prime_status.authenticated:
+                chips.append(f"[$success]{marker}[/] {name}")
+            elif prime_status is not None and prime_status.error:
+                chips.append(f"[$warning]{marker}[/] {name}")
+            else:
+                chips.append(f"[dim]{marker} {name}[/dim]")
+        else:
+            chips.append(f"[dim]{marker} {name}[/dim]")
+
+    tagline = "  [dim]·[/dim]  ".join(chips)
+    if version:
+        tagline += f"  [dim]·  v{escape(version)}[/dim]"
+    return tagline
 
 
 class DeploymentsLoaded(Message):
@@ -719,6 +793,17 @@ def _render_deployment_status(
 
 _ActionLabels = tuple[tuple[str, str], ...]
 
+_ACTION_SHORTCUTS: dict[str, str] = {
+    "relaunch": "r",
+    "deploy": "d",
+    "custom-deploy": "c",
+    "manage": "m",
+    "storage": "t",
+    "settings": "s",
+}
+
+_ACTION_DESC_COL = 21
+
 # Fullest first. `_fit_action_labels` takes the first one that fits the width
 # the option list actually receives, so a description is shortened rather than
 # wrapped onto a second line that breaks the two-column grid.
@@ -745,6 +830,24 @@ _ACTION_LABEL_TIERS: tuple[_ActionLabels, ...] = (
         ("settings", "  Settings"),
     ),
 )
+
+
+def _format_action_prompt(option_id: str, label: str, *, show_key: bool) -> Content:
+    """Style an action row with shortcut key, bold label, and muted summary."""
+    desc = label[_ACTION_DESC_COL:].strip() if len(label) > _ACTION_DESC_COL else ""
+    title = (label[:_ACTION_DESC_COL] if desc else label).strip()
+    if show_key and desc:
+        key = _ACTION_SHORTCUTS.get(option_id, " ")
+        pad = " " * max(2, 19 - len(title))
+        return Content.from_markup(
+            f"  [bold $primary]{escape(key)}[/]  [bold]{escape(title)}[/bold]{pad}[dim]{escape(desc)}[/dim]"
+        )
+    if desc:
+        pad = " " * max(2, 19 - len(title))
+        return Content.from_markup(
+            f"  [bold]{escape(title)}[/bold]{pad}[dim]{escape(desc)}[/dim]"
+        )
+    return Content.from_markup(f"  [bold]{escape(title)}[/bold]")
 
 
 def _relaunch_labels(last: LastLaunch) -> tuple[tuple[str, str], ...]:
@@ -824,22 +927,53 @@ class MainMenuScreen(CopyEnabledScreen):
         self._visible_fleet: list[EndpointInfo] = []
         self._fleet_detail_error: str | None = None
         self._action_labels: _ActionLabels | None = None
+        self._action_show_key: bool | None = None
         self._action_label_ceiling = 0
         self._last_launch = load_last_launch()
 
     def compose(self) -> ComposeResult:
         snapshot = getattr(self.app, "provider_readiness_snapshot", None)
         self._readiness = snapshot() if callable(snapshot) else None
+        action_list = OptionList(
+            *(
+                Option(_format_action_prompt(option_id, label, show_key=True), id=option_id)
+                for option_id, label in _action_label_tiers(self._last_launch)[0]
+            ),
+            id="action-list",
+        )
+        action_list.border_title = "Actions"
+        billing_rows = [self._provider_billing[provider] for provider in PROVIDER_BILLING_ORDER]
+        billing_panel = Static(
+            render_provider_billing(
+                billing_rows,
+                storage_snapshot=self._storage_snapshot,
+                compact=True,
+            ),
+            id="home-billing-panel",
+        )
+        billing_panel.border_title = "Usage & Balance"
         with Center(id="main-menu-center"):
             with VerticalScroll(id="main-menu-primary"):
-                yield Static("[bold $primary]LLM Launchpad[/]", id="compact-menu-header")
-                yield OptionList(
-                    *(Option(label, id=option_id)
-                      for option_id, label in _action_label_tiers(self._last_launch)[0]),
-                    id="action-list",
+                yield Static(BANNER, id="home-banner")
+                yield Static(
+                    _render_home_tagline(self.version, readiness=self._readiness),
+                    id="home-tagline",
                 )
-                yield Static("[dim]Checking fleet…[/dim]", id="fleet-summary-line")
+                yield Static(
+                    _render_compact_header(self.version),
+                    id="compact-menu-header",
+                )
+                yield action_list
+                yield Static("[dim]◦ Checking fleet…[/dim]", id="fleet-summary-line")
                 yield Static("", id="auth-status-block", classes="hidden")
+                yield billing_panel
+                yield Static(
+                    render_provider_billing_inline(
+                        billing_rows,
+                        storage_snapshot=self._storage_snapshot,
+                    ),
+                    id="home-billing-inline",
+                )
         yield FittedFooter()
 
     def on_mount(self) -> None:
@@ -929,6 +1063,17 @@ class MainMenuScreen(CopyEnabledScreen):
         profile: ViewportProfile,
         previous: ViewportProfile | None,
     ) -> None:
+        try:
+            self.query_one("#compact-menu-header", Static).update(
+                _render_compact_header(self.version, minimal=profile.minimal)
+            )
+        except Exception:
+            pass
+        try:
+            action_list = self.query_one("#action-list", OptionList)
+            action_list.border_title = None if profile.minimal else "Actions"
+        except Exception:
+            pass
         self._refresh_action_labels(profile)
 
     def _refresh_action_labels(self, profile: ViewportProfile) -> None:
@@ -946,7 +1091,11 @@ class MainMenuScreen(CopyEnabledScreen):
         if has_width:
             self._fit_action_labels()
         else:
-            self._apply_action_labels(tiers[self._action_label_ceiling])
+            is_compact = self._action_label_ceiling >= len(tiers) - 1
+            self._apply_action_labels(
+                tiers[self._action_label_ceiling],
+                show_key=not is_compact,
+            )
         # Re-fit after layout in case width changed on the same resize pass.
         self.call_after_refresh(self._fit_action_labels)
 
@@ -960,25 +1109,41 @@ class MainMenuScreen(CopyEnabledScreen):
         if available <= 0:
             return
         tiers = _action_label_tiers(self._last_launch)
-        for tier in tiers[self._action_label_ceiling:]:
-            if max(cell_len(label) for _option_id, label in tier) <= available:
-                self._apply_action_labels(tier)
+        last_index = len(tiers) - 1
+        for offset, tier in enumerate(tiers[self._action_label_ceiling:]):
+            tier_index = self._action_label_ceiling + offset
+            if tier_index < last_index:
+                for show_key in (True, False):
+                    widest = max(
+                        cell_len(str(_format_action_prompt(option_id, label, show_key=show_key)))
+                        for option_id, label in tier
+                    )
+                    if widest <= available:
+                        self._apply_action_labels(tier, show_key=show_key)
+                        return
+            else:
+                self._apply_action_labels(tier, show_key=False)
                 return
-        self._apply_action_labels(tiers[-1])
+        self._apply_action_labels(tiers[-1], show_key=False)
 
-    def _apply_action_labels(self, labels: _ActionLabels) -> None:
+    def _apply_action_labels(self, labels: _ActionLabels, *, show_key: bool = True) -> None:
         """Install a label set, keeping whichever action was highlighted."""
         try:
             action_list = self.query_one("#action-list", OptionList)
         except Exception:
             return
-        if self._action_labels == labels:
+        if self._action_labels == labels and self._action_show_key == show_key:
             return
         highlighted = highlighted_option(action_list)
         selected_id = str(highlighted.id) if highlighted is not None else "deploy"
         self._action_labels = labels
-        replace_options(action_list, 
-            [Option(label, id=option_id) for option_id, label in labels]
+        self._action_show_key = show_key
+        replace_options(
+            action_list,
+            [
+                Option(_format_action_prompt(option_id, label, show_key=show_key), id=option_id)
+                for option_id, label in labels
+            ],
         )
         for index, (option_id, _) in enumerate(labels):
             if option_id == selected_id:
@@ -1086,6 +1251,17 @@ class MainMenuScreen(CopyEnabledScreen):
         block = self.query_one("#auth-status-block", Static)
         block.set_class(not issues, "hidden")
         block.update(f"[$warning]Check {escape(', '.join(issues))}[/] · i Details" if issues else "")
+        try:
+            self.query_one("#home-tagline", Static).update(
+                _render_home_tagline(
+                    self.version,
+                    readiness=self._readiness,
+                    modal_status=self._modal_auth_status,
+                    prime_status=self._prime_auth_status,
+                )
+            )
+        except Exception:
+            pass
         details = self.app.screen
         if isinstance(details, HomeDetailsScreen) and details._menu is self and details.is_mounted:
             details.update_connections()
@@ -1214,12 +1390,15 @@ class MainMenuScreen(CopyEnabledScreen):
         # skipped while suspended.
         self._refresh_quick_deploy_catalog()
         self._refresh_storage_estimate()
+        self._refresh_billing_panels()
 
     def _refresh_billing_panels(self) -> None:
         if not self.is_mounted:
             return
         active = self.app.screen
-        if not isinstance(active, HomeDetailsScreen) or active._menu is not self:
+        on_home = active is self
+        on_details = isinstance(active, HomeDetailsScreen) and active._menu is self
+        if not (on_home or on_details):
             return
         self._sync_storage_snapshot()
         self._last_billing_refresh_at = time.monotonic()
@@ -1322,6 +1501,27 @@ class MainMenuScreen(CopyEnabledScreen):
         self.post_message(DeploymentsLoadFailed(error=message.error))
 
     def _update_billing_panel(self) -> None:
+        rows = [self._provider_billing[provider] for provider in PROVIDER_BILLING_ORDER]
+        if self.is_mounted:
+            try:
+                self.query_one("#home-billing-panel", Static).update(
+                    render_provider_billing(
+                        rows,
+                        storage_snapshot=self._storage_snapshot,
+                        compact=True,
+                    )
+                )
+            except Exception:
+                pass
+            try:
+                self.query_one("#home-billing-inline", Static).update(
+                    render_provider_billing_inline(
+                        rows,
+                        storage_snapshot=self._storage_snapshot,
+                    )
+                )
+            except Exception:
+                pass
         details = self.app.screen
         if isinstance(details, HomeDetailsScreen) and details._menu is self and details.is_mounted:
             details.update_billing()
@@ -1442,18 +1642,25 @@ class MainMenuScreen(CopyEnabledScreen):
             names = ", ".join(listing.provider.display_name for listing in unavailable)
             confirmed = [row for row in current if row.provider not in providers]
             state = fleet_summary_line(confirmed) if confirmed else "Fleet status unknown"
-            summary.update(f"{state} · [$warning]{names} unavailable[/]")
+            summary.set_class(False, "fleet-active")
+            summary.set_class(True, "fleet-warning")
+            summary.update(f"[$warning]⋯[/] {state} · [$warning]{names} unavailable[/]")
             return
+        summary.set_class(False, "fleet-warning")
         if not current and self._status_refresh_inflight:
-            summary.update("[dim]Checking fleet...[/dim]")
+            summary.set_class(False, "fleet-active")
+            summary.update("[dim]◦ Checking fleet...[/dim]")
             return
         if not current and self._fleet_discovery is not None and not self._fleet_discovery.listings:
-            summary.update("[dim]Fleet status unknown · No provider listing available[/dim]")
+            summary.set_class(False, "fleet-active")
+            summary.update("[dim]◦ Fleet status unknown · No provider listing available[/dim]")
             return
         if not current:
-            summary.update("[dim]No active endpoints · Deploy to start[/dim]")
+            summary.set_class(False, "fleet-active")
+            summary.update("[dim]◦ No active endpoints · Deploy to start[/dim]")
             return
-        summary.update(fleet_summary_line(current))
+        summary.set_class(True, "fleet-active")
+        summary.update(f"[$primary]▸[/] {fleet_summary_line(current)}")
 
     @staticmethod
     def _runtime_fingerprint(rows: list[EndpointInfo]) -> tuple[tuple[object, ...], ...]:
@@ -1476,7 +1683,10 @@ class MainMenuScreen(CopyEnabledScreen):
         self._status_refresh_inflight = False
         self._fleet_detail_error = message.error
         self._update_fleet_details()
-        self.query_one("#fleet-summary-line", Static).update("[$warning]Fleet status unknown[/]")
+        summary = self.query_one("#fleet-summary-line", Static)
+        summary.set_class(False, "fleet-active")
+        summary.set_class(True, "fleet-warning")
+        summary.update("[$warning]⋯ Fleet status unknown[/]")
 
     def on_provider_billing_loaded(self, message: ProviderBillingLoaded) -> None:
         self._provider_billing[message.row.provider] = message.row
@@ -1544,19 +1754,31 @@ class HomeDetailsScreen(CopyEnabledScreen):
         self._menu = menu
 
     def compose(self) -> ComposeResult:
-        from textual.containers import VerticalScroll
-
         from ..widgets.fitted_footer import FittedFooter
 
-        with VerticalScroll(classes="screen-scroll"):
-            version = f"v{self._menu.version}" if self._menu.version else ""
-            yield Static(screen_title("Details", version))
-            yield Static("[bold]Fleet[/bold]", classes="settings-section")
-            yield Static("[dim]Loading fleet...[/dim]", id="home-details-fleet")
-            yield Static("[bold]Billing[/bold]", classes="settings-section")
-            yield Static("[dim]Loading billing...[/dim]", id="home-details-billing")
-            yield Static("[bold]Connections[/bold]", classes="settings-section")
-            yield Static("[dim]Loading connections...[/dim]", id="home-details-connections")
+        fleet_card = Vertical(
+            Static("[dim]Loading fleet...[/dim]", id="home-details-fleet"),
+            classes="details-card",
+        )
+        fleet_card.border_title = "Fleet"
+        billing_card = Vertical(
+            Static("[dim]Loading billing...[/dim]", id="home-details-billing"),
+            classes="details-card",
+        )
+        billing_card.border_title = "Billing"
+        connections_card = Vertical(
+            Static("[dim]Loading connections...[/dim]", id="home-details-connections"),
+            classes="details-card",
+        )
+        connections_card.border_title = "Connections"
+
+        with VerticalScroll(id="home-details-scroll", classes="screen-scroll"):
+            with Vertical(id="home-details-container"):
+                version = f"v{self._menu.version}" if self._menu.version else ""
+                yield Static(screen_title("Details", version), id="home-details-title")
+                yield fleet_card
+                yield billing_card
+                yield connections_card
         yield FittedFooter()
 
     def on_mount(self) -> None:

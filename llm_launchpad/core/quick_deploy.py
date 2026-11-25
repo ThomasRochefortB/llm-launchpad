@@ -362,7 +362,10 @@ def model_for_context(model: QuickDeployModel, tokens: int) -> QuickDeployModel 
     for profile in model.profiles:
         layout = profile.serving_metadata
         req, tuning, memory = profile.serving_requirements, profile.runtime_tuning, profile.memory_estimate
-        if not layout or not req or not tuning or not memory or tokens >= req.context_tokens:
+        if req is not None and tokens == req.context_tokens:
+            profiles.append(profile)
+            continue
+        if not layout or not req or not tuning or not memory or tokens > req.context_tokens:
             continue
         metadata = GgufQuantMetadata([], {}, serving_metadata=layout, **{
             name: getattr(layout, name) for name in (
@@ -371,7 +374,11 @@ def model_for_context(model: QuickDeployModel, tokens: int) -> QuickDeployModel 
             )
         })
         req = replace(req, context_tokens=tokens)
-        tuning = tuning_for_attention_scratch(tuning, context_tokens=tokens, attention_head_count=attention_head_count(metadata))
+        base_ubatch = tuning_for_objective(
+            req.objective, speculative_decoding=tuning.speculative_decoding
+        ).ubatch_size
+        base_tuning = replace(tuning, ubatch_size=max(tuning.ubatch_size, base_ubatch))
+        tuning = tuning_for_attention_scratch(base_tuning, context_tokens=tokens, attention_head_count=attention_head_count(metadata))
         memory = estimate_memory(metadata, weights_gb=memory.weights_gb, requirements=req, tuning=tuning)
         if memory.source == "conservative-fallback":
             continue
@@ -793,7 +800,9 @@ def build_quick_deploy_config(
         config.quant = profile.quant
         config.gguf_architecture = profile.gguf_architecture
         config.llamacpp_runtime_id = profile.llamacpp_runtime_id
-        config.server_args = shlex.join(profile.server_args)
+        config.server_args = shlex.join(
+            plan.recipe.server_args if plan is not None else profile.server_args
+        )
         config.serving_requirements = (
             plan.recipe.serving_requirements
             if plan is not None
@@ -869,6 +878,10 @@ def build_quick_deploy_config(
                     gpu_memory_gb=plan.quote.gpu_memory_gb,
                     price_per_hour_usd=plan.quote.price_per_hour_usd,
                 )
+        if config.serving_requirements is not None and config.runtime_tuning is not None:
+            config.server_args = shlex.join(
+                compile_server_args(config.serving_requirements, config.runtime_tuning)
+            )
     else:
         config.model_name = profile.model_name or profile.repo_id
         config.n_gpu = plan.quote.gpu_count if plan is not None else profile.gpu_count

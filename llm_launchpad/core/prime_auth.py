@@ -51,13 +51,13 @@ def load_prime_config(config_path: Path | None = None) -> PrimeConfig:
 
     root_path = config_path or PRIME_CONFIG_PATH
     root = _read_json_object(root_path)
-    context = (os.getenv("PRIME_CONTEXT") or str(root.get("current_environment", "production"))).strip()
+    context = (os.getenv("PRIME_CONTEXT") or str(root.get("current_environment") or "production")).strip()
     selected = root
     if context and context.casefold() != "production":
         context_path = root_path.parent / "environments" / f"{context}.json"
         selected = {**root, **_read_json_object(context_path)}
 
-    api_key = (os.getenv("PRIME_API_KEY") or str(selected.get("api_key", ""))).strip()
+    api_key = (os.getenv("PRIME_API_KEY") or str(selected.get("api_key") or "")).strip()
     team_id = (os.getenv("PRIME_TEAM_ID") or str(selected.get("team_id") or "")).strip() or None
     user_id = (os.getenv("PRIME_USER_ID") or str(selected.get("user_id") or "")).strip() or None
     base_url = (

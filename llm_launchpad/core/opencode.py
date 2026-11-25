@@ -634,7 +634,11 @@ def sync_opencode_config(
                     registry_changed = True
                     continue
 
-                if row is not None and _is_removable_modal_state(row.state):
+                if (
+                    row is not None
+                    and app_name not in protected_app_names
+                    and _is_removable_modal_state(row.state)
+                ):
                     provider_map.pop(provider_id, None)
                     registry.pop(app_name, None)
                     result.removed_provider_ids.append(provider_id)

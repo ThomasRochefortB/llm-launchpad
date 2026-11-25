@@ -416,7 +416,8 @@ class LogViewer(Vertical):
     def set_lines(self, lines: list[str], *, keep_follow: bool = True) -> None:
         """Replace log contents, optionally preserving the current follow mode."""
         was_following = self._following
-        self._plain_lines = list(lines[-MAX_RETAINED_LOG_LINES:])
+        expanded = [part for line in lines for part in (line.splitlines() or [""])]
+        self._plain_lines = expanded[-MAX_RETAINED_LOG_LINES:]
         self.log_widget.clear()
         if self._plain_lines:
             self.log_widget.write_lines(self._plain_lines, scroll_end=False)

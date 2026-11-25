@@ -68,7 +68,7 @@ def run(
     endpoint_api_key: str,
     idle_seconds: int,
     pod_exists: Callable[[], bool],
-    stop: Callable[[], None],
+    stop: Callable[[], bool | None],
     poll_seconds: float = 60.0,
     clock: Callable[[], float] = time.time,
     sleep: Callable[[float], None] = time.sleep,
@@ -92,8 +92,7 @@ def run(
         except requests.RequestException:
             text = None
         idle.observe(clock(), text)
-        if idle.expired(clock()):
-            stop()
+        if idle.expired(clock()) and stop() is not False:
             return "stopped after idle window"
         sleep(poll_seconds)
 
@@ -163,7 +162,11 @@ def main(argv: list[str] | None = None) -> int:
             return True
         return str(pod.get("status") or "").upper() not in {"TERMINATED", "TERMINATING"}
 
-    def stop() -> None:
+    def stop() -> bool:
+        from ..protocol.enums import OperationType
+        from ..protocol.events import OperationCompleteEvent
+
+        stopped = False
         events = Orchestrator().stop_app(
             BackendType(args.backend),
             app_name=args.app_name,
@@ -171,9 +174,16 @@ def main(argv: list[str] | None = None) -> int:
             app_id=args.pod_id,
         )
         for event in events:
+            if (
+                isinstance(event, OperationCompleteEvent)
+                and event.operation == OperationType.STOP
+                and event.success
+            ):
+                stopped = True
             line = getattr(event, "line", None) or getattr(event, "message", None)
             if line:
                 print(line, flush=True)
+        return stopped
 
     print(
         f"{time.strftime('%Y-%m-%dT%H:%M:%S')} watching {args.app_name} "

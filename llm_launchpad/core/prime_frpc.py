@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import tarfile
+import tempfile
 from collections.abc import Callable
 
 import requests
@@ -92,9 +93,16 @@ def ensure_cached_frpc(
             raise RuntimeError(
                 "Prime Tunnel client download failed checksum verification."
             )
-        tmp = archive.with_name(archive.name + ".tmp")
-        tmp.write_bytes(payload)
-        tmp.replace(archive)
+        fd, raw_tmp = tempfile.mkstemp(prefix=".frp-tar-", suffix=".tmp", dir=root)
+        tmp = Path(raw_tmp)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+            tmp.replace(archive)
+            tmp = None
+        finally:
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
 
     member_name = f"frp_{version}_linux_{resolved_arch}/frpc"
     with tarfile.open(archive, "r:gz") as tar:
@@ -121,10 +129,17 @@ def ensure_cached_frpc(
     except OSError:
         cached_payload = None
     if cached_payload != binary_payload:
-        temporary_binary = binary.with_name(f"{binary.name}.tmp")
-        temporary_binary.write_bytes(binary_payload)
-        os.chmod(temporary_binary, 0o755)
-        temporary_binary.replace(binary)
+        fd, raw_tmp = tempfile.mkstemp(prefix=".frpc-", suffix=".tmp", dir=root)
+        temporary_binary: Path | None = Path(raw_tmp)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(binary_payload)
+            os.chmod(temporary_binary, 0o755)
+            temporary_binary.replace(binary)
+            temporary_binary = None
+        finally:
+            if temporary_binary is not None:
+                temporary_binary.unlink(missing_ok=True)
     else:
         os.chmod(binary, 0o755)
     return binary

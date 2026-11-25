@@ -260,6 +260,8 @@ class ModalBackend:
                 env["LLAMA_CPP_BUILD_JOBS"] = str(build_jobs)
             if config.llamacpp_image_no_cache is not None:
                 env["LLAMA_CPP_IMAGE_NO_CACHE"] = "true" if config.llamacpp_image_no_cache else "false"
+            if config.port is not None and config.port != 8080:
+                env["LLAMACPP_SERVE_PORT"] = str(config.port)
             return env
         if config.backend != BackendType.VLLM:
             return env
@@ -271,8 +273,13 @@ class ModalBackend:
             env["SERVED_MODEL_NAME"] = config.served_model_name
         if config.fast_boot is not None:
             env["FAST_BOOT"] = "true" if config.fast_boot else "false"
-        if config.n_gpu is not None and config.n_gpu > 0:
-            env["N_GPU"] = str(config.n_gpu)
+        n_gpu = (
+            config.n_gpu
+            if config.n_gpu is not None and config.n_gpu > 0
+            else (config.gpu_count if config.gpu_count is not None and config.gpu_count > 0 else None)
+        )
+        if n_gpu is not None:
+            env["N_GPU"] = str(n_gpu)
         context_tokens = positive_int(config.max_context_tokens)
         if context_tokens:
             env["MAX_MODEL_LEN"] = str(context_tokens)
@@ -572,10 +579,18 @@ class ModalBackend:
             "Upgrade Modal CLI and retry.",
         )
 
+    _volume_error_state = threading.local()
+
+    @staticmethod
+    def last_volume_error() -> ModalCliError | None:
+        """Return the last ModalCliError captured by list_volume on this thread."""
+        return getattr(ModalBackend._volume_error_state, "error", None)
+
     @staticmethod
     def list_volume(volume_name: str, path: str = "/") -> list[dict[str, Any]] | None:
         """List files/directories in a Modal Volume path."""
         result = ModalBackend.list_volume_result(volume_name, path)
+        ModalBackend._volume_error_state.error = result.error
         return result.entries if result.success else None
 
     @staticmethod
@@ -726,6 +741,7 @@ class ModalBackend:
         entrypoint: str,
         args: list[str] | None = None,
         env: dict[str, str] | None = None,
+        timeout: float = 60.0,
     ) -> tuple[int, str, str] | None:
         """Run `modal run <script>::<entrypoint>` and capture stdout/stderr."""
         cmd = ModalBackend.build_modal_entrypoint_command(script, entrypoint, args=args)
@@ -737,7 +753,7 @@ class ModalBackend:
                 stderr=subprocess.PIPE,
                 text=True,
                 env=merged,
-                timeout=ModalBackend._CLI_TIMEOUT_SECONDS,
+                timeout=timeout,
             )
         except subprocess.TimeoutExpired:
             return None

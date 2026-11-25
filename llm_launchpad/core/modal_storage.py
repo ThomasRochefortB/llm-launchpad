@@ -116,7 +116,23 @@ def walk_volume_files(
         if current in visited:
             continue
         visited.add(current)
-        rows = ModalBackend.list_volume(volume_name, current) or []
+        rows = ModalBackend.list_volume(volume_name, current)
+        if rows is None:
+            err = ModalBackend.last_volume_error()
+            err_msg = err.message if err is not None else ""
+            lower_msg = err_msg.lower()
+            is_missing_path = (
+                err is not None
+                and not err.timed_out
+                and "volume" not in lower_msg
+                and any(marker in lower_msg for marker in ("no such file", "path not found"))
+            )
+            if is_missing_path:
+                rows = []
+            else:
+                raise RuntimeError(
+                    err_msg or f"Failed to list Modal volume '{volume_name}' at {current}."
+                )
         for row in rows:
             path = volume_entry_path(current, row)
             if not path:
@@ -237,7 +253,7 @@ def list_llamacpp_models_from_volume(
         parts = rel.split("/")
         if len(parts) < 2:
             continue
-        model_id = parts[0][len("models--") :].replace("--", "/")
+        model_id = parts[0][len("models--") :].replace("--", "/", 1)
         lower_path = path.lower()
         if "/blobs/" in lower_path:
             blob_name = path.rsplit("/", 1)[-1].strip()
@@ -319,7 +335,7 @@ def list_vllm_models(
         parts = rel.split("/")
         if not parts:
             continue
-        model_id = parts[0][len("models--") :].replace("--", "/")
+        model_id = parts[0][len("models--") :].replace("--", "/", 1)
         entry = grouped.get(model_id)
         if entry is None:
             entry = StoredModelInfo(

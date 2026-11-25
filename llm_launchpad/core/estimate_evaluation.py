@@ -179,28 +179,32 @@ def build_scorecard(records: tuple[EvaluationRecord, ...]) -> EstimateScorecard:
 def _observed_peak_per_device_gb(
     record: EvaluationRecord,
 ) -> tuple[float, ...]:
-    peaks: list[float] = []
-    for observation in record.memory_observations:
-        if observation.per_device_used_gb:
-            peaks.append(max(observation.per_device_used_gb))
-    if not peaks:
-        return ()
-    peak = max(peaks)
     width = max(
         (len(observation.per_device_used_gb) for observation in record.memory_observations if observation.per_device_used_gb),
-        default=1,
+        default=0,
     )
-    return tuple([peak] * width)
+    if width <= 0:
+        return ()
+    return tuple(
+        max(
+            observation.per_device_used_gb[index]
+            for observation in record.memory_observations
+            if index < len(observation.per_device_used_gb)
+        )
+        for index in range(width)
+    )
 
 
 def _observed_single_tps(
     performance: tuple[PerformancePoint, ...],
 ) -> float | None:
     values = [
-        point.output_tokens_per_second or 0.0
+        point.output_tokens_per_second
         for point in performance
         if point.measured and point.concurrency == 1
         and (point.actual_output_tokens or 0) > 0
+        and point.output_tokens_per_second is not None
+        and point.output_tokens_per_second > 0
     ]
     return max(values) if values else None
 
@@ -209,9 +213,11 @@ def _observed_aggregate_tps(
     performance: tuple[PerformancePoint, ...],
 ) -> float | None:
     values = [
-        point.aggregate_output_tokens_per_second or 0.0
+        point.aggregate_output_tokens_per_second
         for point in performance
         if point.measured and (point.actual_output_tokens or 0) > 0
+        and point.aggregate_output_tokens_per_second is not None
+        and point.aggregate_output_tokens_per_second > 0
     ]
     return max(values) if values else None
 

@@ -39,7 +39,7 @@ from .vast_runtime import (
     verify_streaming,
 )
 from .vast_startup_history import record_vast_startup
-from .vast_ssh import SSH_REFUSED, SSH_REJECTED, SSH_THROTTLED, VastSsh, VastSshError
+from .vast_ssh import SSH_HOST_KEY, SSH_REFUSED, SSH_REJECTED, SSH_THROTTLED, VastSsh, VastSshError
 from .vast_state import VastState
 
 _CANCELLATIONS: dict[str, threading.Event] = {}
@@ -458,6 +458,8 @@ class VastDeploymentBackend:
                     yield LogEvent(line="Vast SSH ready")
                     return instance, ssh_ready_at
                 except RuntimeError as exc:
+                    if isinstance(exc, VastSshError) and exc.reason == SSH_HOST_KEY:
+                        ssh.clear_host_key()
                     ssh_backoff, ssh_reported, log_line = self._classify_ssh_knock_error(
                         exc,
                         knocking_since=knocking_since,
@@ -696,7 +698,7 @@ class VastDeploymentBackend:
         rental_started: float,
         ssh_ready_at: float | None,
         cancellation: threading.Event,
-    ) -> Generator[BaseEvent, None, None]:
+    ) -> EndpointInfo:
         """Verify auth and streaming, mark running, and record startup telemetry."""
         verify_endpoint_auth(url, record.served_model_name)
         verify_streaming(url, record.endpoint_api_key, record.served_model_name)
@@ -715,15 +717,7 @@ class VastDeploymentBackend:
             )
         except Exception:
             pass
-        yield LogEvent(
-            line="Vast streaming chat verified. The endpoint is local to this computer; stop destroys the rental and its disk.",
-            operation=OperationType.DEPLOY,
-        )
-        yield OperationCompleteEvent(
-            operation=OperationType.DEPLOY,
-            success=True,
-            data=self._endpoint(record, "running", url),
-        )
+        return self._endpoint(record, "running", url)
 
     def _handle_deploy_failure(
         self,
@@ -827,10 +821,19 @@ class VastDeploymentBackend:
             yield from self._wait_for_healthy_endpoint(
                 record, instance, ssh, config, url, download_files, cancellation
             )
-            yield from self._finalize_deployment(
+            endpoint = self._finalize_deployment(
                 record, offer, url, rental_started, ssh_ready_at, cancellation
             )
             completed = True
+            yield LogEvent(
+                line="Vast streaming chat verified. The endpoint is local to this computer; stop destroys the rental and its disk.",
+                operation=OperationType.DEPLOY,
+            )
+            yield OperationCompleteEvent(
+                operation=OperationType.DEPLOY,
+                success=True,
+                data=endpoint,
+            )
         except Exception as exc:
             record = yield from self._handle_deploy_failure(record, exc)
         finally:
@@ -851,6 +854,7 @@ class VastDeploymentBackend:
             name=record.name, app_id=record.instance_id or "", backend=backend,
             provider=ComputeProvider.VAST, state=state, web_url=url,
             instance_name=infer_instance_from_app_name(record.name, backend),
+            model_name=record.model_name or None,
             repo_id=record.repo_id, quant=record.quant, served_model_name=record.served_model_name,
             endpoint_api_key=record.endpoint_api_key, max_context_tokens=record.max_context_tokens,
         )
@@ -892,6 +896,10 @@ class VastDeploymentBackend:
                 if self.state.load(name) is None:
                     return
         record = self._record(name, instance_id)
+        with _CANCELLATIONS_LOCK:
+            cancellation = _CANCELLATIONS.get(record.name)
+            if cancellation:
+                cancellation.set()
         with self.state.locked(record.name):
             record = self.state.load(record.name)
             if record is None:
@@ -915,23 +923,33 @@ class VastDeploymentBackend:
             verify_streaming(url, record.endpoint_api_key, record.served_model_name)
             return self._endpoint(record, "running", url)
 
+    @staticmethod
+    def _redact_log_text(text: str, endpoint_api_key: str) -> str:
+        output = text
+        if endpoint_api_key:
+            output = output.replace(endpoint_api_key, "[redacted]")
+        output = re.sub(r"hf_[A-Za-z0-9]+", "[redacted]", output)
+        return re.sub(r"(Bearer\s+)\S+", r"\1[redacted]", output, flags=re.IGNORECASE)
+
     def _failure_log(
         self, record: Any, instance: Any, fallback: tuple[str, ...]
     ) -> tuple[str, ...]:
         """Re-read enough of the runtime log to carry a whole traceback."""
+        api_key = getattr(record, "endpoint_api_key", "") or ""
         try:
             output = VastSsh(self.state.directory(record.name)).run(
                 instance, VAST_FAILURE_LOG_COMMAND
             )
         except Exception:
             log_exception(f"Could not read the Vast runtime log for {record.name}")
-            return fallback
+            return tuple(self._redact_log_text(line, api_key) for line in fallback)
+        redacted = self._redact_log_text(output, api_key)
         lines = tuple(
             cleaned
-            for line in output.splitlines()
+            for line in redacted.splitlines()
             if (cleaned := "".join(char for char in line if char.isprintable()).strip())
         )
-        return lines or fallback
+        return lines or tuple(self._redact_log_text(line, api_key) for line in fallback)
 
     def logs(self, instance_id: str) -> list[str]:
         record = self._record(None, instance_id)
@@ -940,6 +958,5 @@ class VastDeploymentBackend:
         if instance is None:
             raise ValueError("The Vast instance no longer exists.")
         output = VastSsh(self.state.directory(record.name)).run(instance, f"tail -n 200 {VAST_RUNTIME_DIR}/server.log")
-        output = output.replace(record.endpoint_api_key, "[redacted]")
-        output = re.sub(r"hf_[A-Za-z0-9]+", "[redacted]", output)
+        output = self._redact_log_text(output, record.endpoint_api_key or "")
         return ["".join(char for char in line if char.isprintable()) for line in output.splitlines()]

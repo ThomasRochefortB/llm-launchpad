@@ -162,6 +162,7 @@ class SettingsScreen(CopyEnabledScreen):
         yield FittedFooter()
 
     def on_mount(self) -> None:
+        self.query_one("#settings-form", Vertical).border_title = "Configuration"
         # Land on the first field. Textual's default auto-focus took the
         # scrolling container instead, so the screen opened with nothing
         # visibly focused and the first keystroke went nowhere.

@@ -64,12 +64,23 @@ def load_connection_entries(path: Path | None = None) -> dict[str, dict[str, Any
 
 
 def _write(entries: dict[str, dict[str, Any]], path: Path) -> None:
+    import tempfile
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"entries": entries}, indent=2), encoding="utf-8")
+    fd, raw_tmp = tempfile.mkstemp(prefix=".connections-", suffix=".tmp", dir=path.parent)
+    tmp_path: Path | None = Path(raw_tmp)
     try:
-        os.chmod(path, 0o600)
-    except OSError:
-        pass
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"entries": entries}, indent=2))
+        tmp_path.replace(path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
 
 
 def save_connection(
@@ -153,9 +164,15 @@ def merge_connections(
         if resource_conflict or url_conflict:
             continue
         row.vision = row.vision or vision_from_dict(cached.get("vision"))
+        provider_raw = str(cached.get("provider") or "")
+        cached_provider = (
+            ComputeProvider(provider_raw)
+            if provider_raw in {item.value for item in ComputeProvider}
+            else None
+        )
         # A missing Vast URL means its local SSH tunnel is disconnected. A
         # cached listener address cannot establish that the tunnel is alive.
-        if row.provider != ComputeProvider.VAST:
+        if row.provider != ComputeProvider.VAST and cached_provider != ComputeProvider.VAST:
             row.web_url = row.web_url or cached_url
         row.served_model_name = row.served_model_name or str(cached.get("model_id") or "") or None
         row.display_name = row.display_name or str(cached.get("display_name") or "") or None

@@ -85,10 +85,10 @@ def _live_process_start(row: EndpointInfo) -> float | None:
 
 
 def _row_rate(row: EndpointInfo) -> float | None:
-    rate = row.hourly_cost_usd
+    rate = optional_float(row.hourly_cost_usd)
     if rate is None or rate < 0:
         return None
-    return float(rate)
+    return rate
 
 
 class EndpointRuntimeTracker:
@@ -224,11 +224,9 @@ class EndpointRuntimeTracker:
                 return before != after
             # A live gauge exists only on an explicit pass (or a Prime/Vast
             # row mislabelled Modal). Passive Modal totals never carry one.
-            if not explicit and row.serving is not None and row.serving.observed_at is not None:
-                # Defensive: a banked total must never accrue Modal cost.
-                # Only accrue when this observation itself produced a live
-                # reading (observed_at == this pass is approximated by
-                # explicit=True from callers; explicit probes set it).
+            if not explicit:
+                # Defensive: a passive pass must never accrue Modal cost even if
+                # a stale live gauge is attached to the row.
                 entry["last_billable"] = False
                 entry["last_observation_epoch"] = moment
                 after = json.dumps(entry, sort_keys=True, default=str)
@@ -264,8 +262,8 @@ class EndpointRuntimeTracker:
                     # was skipped or capped.
                     if delta > MAX_RATE_WINDOW_SECONDS:
                         entry["cost_estimated"] = True
-                        entry["coverage_gap_seconds"] = float(
-                            entry.get("coverage_gap_seconds") or 0.0
+                        entry["coverage_gap_seconds"] = (
+                            optional_float(entry.get("coverage_gap_seconds")) or 0.0
                         ) + delta
                     else:
                         self._accrue(entry, rate, delta)
@@ -276,14 +274,14 @@ class EndpointRuntimeTracker:
                         # is right at the current rate, but the continuity is
                         # inferred rather than observed.
                         entry["cost_estimated"] = True
-                        entry["coverage_gap_seconds"] = float(
-                            entry.get("coverage_gap_seconds") or 0.0
+                        entry["coverage_gap_seconds"] = (
+                            optional_float(entry.get("coverage_gap_seconds")) or 0.0
                         ) + delta
         elif last_obs is not None and rate is None and last_billable:
             # Billable time with no known rate: the total stays unknown but
             # the gap is recorded so a later rate does not backfill fiction.
-            entry["coverage_gap_seconds"] = float(
-                entry.get("coverage_gap_seconds") or 0.0
+            entry["coverage_gap_seconds"] = (
+                optional_float(entry.get("coverage_gap_seconds")) or 0.0
             ) + max(0.0, moment - last_obs)
             entry["cost_estimated"] = True
 
@@ -301,7 +299,7 @@ class EndpointRuntimeTracker:
     @staticmethod
     def _accrue(entry: dict[str, Any], rate: float, delta_seconds: float) -> None:
         current = optional_float(entry.get("cumulative_cost_usd")) or 0.0
-        billed = float(entry.get("billed_seconds") or 0.0)
+        billed = optional_float(entry.get("billed_seconds")) or 0.0
         entry["cumulative_cost_usd"] = current + rate * delta_seconds / 3600.0
         entry["billed_seconds"] = billed + delta_seconds
 

@@ -14,13 +14,21 @@ finish, which is the only signal that survives a SIGKILL.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 import json
 import os
 from pathlib import Path
+import tempfile
 import time
 import threading
+from collections.abc import Generator
 from typing import Any
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None  # type: ignore[assignment]
 
 from ..protocol.enums import BackendType, ComputeProvider
 from .config import SETTINGS_DIR
@@ -81,6 +89,31 @@ class InFlightDeployment:
         return self.price_per_hour_usd * elapsed / 3600.0
 
 
+@contextmanager
+def _locked_journal(target: Path) -> Generator[None, None, None]:
+    """Serialize read-modify-write across both threads and worker processes."""
+    with _JOURNAL_LOCK:
+        if fcntl is None:
+            yield
+            return
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            lock_path = target.with_suffix(f"{target.suffix}.lock")
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        except OSError:
+            yield
+            return
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(lock_fd)
+
+
 def record_in_flight(
     entry: InFlightDeployment,
     path: Path | None = None,
@@ -88,7 +121,7 @@ def record_in_flight(
     """Note that a deployment is starting, before the provider is contacted."""
 
     target = path if path is not None else DEPLOY_JOURNAL_PATH
-    with _JOURNAL_LOCK:
+    with _locked_journal(target):
         entries = {
             (row.provider, row.backend, row.app_name): row for row in load_in_flight(target)
         }
@@ -104,7 +137,7 @@ def clear_in_flight(
 
     target = path if path is not None else DEPLOY_JOURNAL_PATH
     name = (app_name or "").strip()
-    with _JOURNAL_LOCK:
+    with _locked_journal(target):
         remaining = [
             row for row in load_in_flight(target)
             if not (
@@ -166,16 +199,26 @@ def _write(path: Path, entries: Any) -> None:
         "schema_version": JOURNAL_SCHEMA_VERSION,
         "entries": [asdict(entry) for entry in entries],
     }
+    tmp_path: Path | None = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = path.with_suffix(f"{path.suffix}.tmp")
-        temporary_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        fd, raw_tmp = tempfile.mkstemp(prefix=".in-flight-", suffix=".tmp", dir=path.parent)
+        tmp_path = Path(raw_tmp)
         try:
-            os.chmod(temporary_path, 0o600)
+            os.chmod(tmp_path, 0o600)
         except OSError:
             pass
-        temporary_path.replace(path)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(payload, indent=2) + "\n")
+        tmp_path.replace(path)
+        tmp_path = None
     except Exception:
         # Losing the journal must never break a deployment; the worst case is
         # the recovery prompt this exists to provide.
         log_exception("Failed to write the in-flight deployment journal")
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass

@@ -25,10 +25,19 @@ from .copy_enabled import CopyEnabledScreen
 class VastPreviewResult(Message):
     """Completed account action or offer lookup; contains no credentials."""
 
-    def __init__(self, detail: str, offers: list[VastOffer] | None = None) -> None:
+    def __init__(
+        self,
+        detail: str,
+        offers: list[VastOffer] | None = None,
+        *,
+        action: str = "",
+        ok: bool = True,
+    ) -> None:
         super().__init__()
         self.detail = detail
         self.offers = offers
+        self.action = action
+        self.ok = ok
 
 
 class VastPreviewScreen(CopyEnabledScreen):
@@ -139,6 +148,7 @@ class VastPreviewScreen(CopyEnabledScreen):
 
     def _run_action(self, action: str, key: str, query: VastOfferQuery | None) -> None:
         offers = None
+        ok = True
         try:
             if action == "vast-forget":
                 clear_vast_api_key()
@@ -160,19 +170,24 @@ class VastPreviewScreen(CopyEnabledScreen):
                 offers = VastBackend().list_offers(query)
                 detail = f"Found {len(offers)} eligible rental offers. Use Deploy model to select one."
         except (ValueError, OSError, VastApiError) as exc:
+            ok = False
             detail = f"Error: {exc}"
-        self.post_message(VastPreviewResult(detail, offers))
+        self.post_message(VastPreviewResult(detail, offers, action=action, ok=ok))
 
     def on_vast_preview_result(self, message: VastPreviewResult) -> None:
         self._busy = False
         for button in self.query(Button):
             button.disabled = False
         self.query_one("#vast-feedback", Static).update(escape(message.detail))
+        if message.ok and message.action in {"vast-connect", "vast-forget"}:
+            refresher = getattr(self.app, "refresh_provider_readiness", None)
+            if callable(refresher):
+                refresher()
         table = self.query_one("#vast-offers", DataTable)
         for offer in message.offers or []:
             cost = offer.costs
             table.add_row(
-                offer.id, escape(offer.gpu_type), f"{offer.gpu_memory_gb:.2f}",
+                escape(offer.id), escape(offer.gpu_type), f"{offer.gpu_memory_gb:.2f}",
                 escape(offer.location), "Datacenter" if offer.datacenter else "Verified",
                 f"{offer.reliability:.4f}",
                 *(format_money(value, decimals=4) if value is not None else "unknown" for value in (

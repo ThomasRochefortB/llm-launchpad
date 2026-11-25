@@ -297,12 +297,12 @@ def deploy_key_hint(*, narrow: bool) -> str:
 
 
 def _fulfillment_option(plan: InferencePlan, *, recommended: bool = False) -> str:
-    location = plan.quote.region or "provider-managed region"
-    price = _plan_hourly_cost(plan)
+    location = escape(plan.quote.region or "provider-managed region")
+    price = escape(_plan_hourly_cost(plan))
     prefix = "Best available · " if recommended else ""
     return (
-        f"{prefix}{plan.quote.provider.display_name} · "
-        f"{plan.quote.gpu_count}x {display_gpu_type(plan.quote.gpu_type)} · {location} · {price}"
+        f"{prefix}{escape(plan.quote.provider.display_name)} · "
+        f"{plan.quote.gpu_count}x {escape(display_gpu_type(plan.quote.gpu_type))} · {location} · {price}"
     )
 
 

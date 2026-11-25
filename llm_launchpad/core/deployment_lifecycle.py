@@ -165,6 +165,7 @@ def run_lifecycle(
     hooks = callbacks or LifecycleCallbacks()
     outcomes: list[DeploymentAttemptOutcome] = []
     attempt_list = list(attempts)
+    last_app_name: str | None = None
     index = 0
     while index < len(attempt_list):
         attempt = attempt_list[index]
@@ -180,14 +181,21 @@ def run_lifecycle(
                 hooks.on_attempt_finish(index, outcome)
             except Exception:
                 pass
-            break
+            return DeploymentResult(
+                succeeded=False,
+                app_name=attempt.config.app_name,
+                attempts=tuple(outcomes),
+                outcome=outcome.failure_detail or "Cancelled.",
+            )
         try:
             hooks.on_attempt_start(index, attempt.config)
         except Exception:
             pass
-        outcome, _ = _run_single_attempt(
+        outcome, executed_config = _run_single_attempt(
             orchestrator, attempt, attempt_number=index + 1, opts=opts, hooks=hooks
         )
+        attempt_app_name = executed_config.app_name or attempt.config.app_name
+        last_app_name = attempt_app_name
         outcomes.append(outcome)
         try:
             hooks.on_attempt_finish(index, outcome)
@@ -197,7 +205,7 @@ def run_lifecycle(
             return DeploymentResult(
                 succeeded=True,
                 url=outcome.endpoint_url,
-                app_name=attempt.config.app_name,
+                app_name=attempt_app_name,
                 attempts=tuple(outcomes),
                 outcome="Finished — open result",
             )
@@ -208,14 +216,14 @@ def run_lifecycle(
                 detail = outcome.failure_detail or "Cancelled."
             return DeploymentResult(
                 succeeded=False,
-                app_name=attempt.config.app_name,
+                app_name=attempt_app_name,
                 attempts=tuple(outcomes),
                 outcome=detail,
             )
         if outcome.disposition == AttemptDisposition.RETAINED:
             return DeploymentResult(
                 succeeded=False,
-                app_name=attempt.config.app_name,
+                app_name=attempt_app_name,
                 attempts=tuple(outcomes),
                 outcome=f"Retained — check resource in Manage. {outcome.failure_detail or 'Certification failed.'}".strip(),
             )
@@ -233,7 +241,7 @@ def run_lifecycle(
         outcome_text = f"Failed — check resource in Manage. {detail}".strip()
     return DeploymentResult(
         succeeded=False,
-        app_name=attempt_list[0].config.app_name if attempt_list else None,
+        app_name=last_app_name or (attempt_list[0].config.app_name if attempt_list else None),
         attempts=tuple(outcomes),
         outcome=outcome_text,
     )
@@ -346,7 +354,11 @@ def _cancelled_attempt_outcome(
         runtime_attestation=attestation,
         failure_detail=message,
         cleanup=cleanup.disposition,
-        cleanup_error=cleanup.detail or None,
+        cleanup_error=(
+            None
+            if cleanup.disposition in (CleanupDisposition.CONFIRMED, CleanupDisposition.NOTHING_TO_CLEAN)
+            else (cleanup.detail or None)
+        ),
         retry_allowed=False,
     )
 
@@ -506,7 +518,11 @@ def _handle_failed_warmup_attempt(
         runtime_attestation=warmup_outcome.attestation,
         failure_detail=warmup_outcome.failure_detail or "Certification failed.",
         cleanup=cleanup.disposition,
-        cleanup_error=cleanup.detail or None,
+        cleanup_error=(
+            None
+            if cleanup.disposition in (CleanupDisposition.CONFIRMED, CleanupDisposition.NOTHING_TO_CLEAN)
+            else (cleanup.detail or None)
+        ),
         retry_allowed=retry_allowed,
         failure_exit_code=warmup_outcome.failure_exit_code,
     )

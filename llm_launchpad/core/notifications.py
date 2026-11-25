@@ -153,7 +153,7 @@ def send_desktop_notification(title: str, body: str) -> bool:
             if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY") or os.environ.get("DBUS_SESSION_BUS_ADDRESS")):
                 return False
             subprocess.Popen(
-                ["notify-send", "--app-name=LLM Launchpad", safe_title, safe_body],
+                ["notify-send", "--app-name=LLM Launchpad", "--", safe_title, safe_body],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,

@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from rich.markup import escape
 from textual import events
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.content import Content
+from textual.message import Message
 from textual.timer import Timer
 from textual.widgets import Button, DataTable, Input, OptionList, Static, TabbedContent, TabPane
 from textual.widgets.option_list import Option
@@ -361,14 +365,14 @@ _ENDPOINT_COLUMNS = (
     AdaptiveColumn.visible(
         "endpoint",
         "endpoint",
-        _endpoint_name,
+        lambda row: escape(_endpoint_name(row)),
         _WIDE,
         _STANDARD,
     ),
     AdaptiveColumn.visible(
         "endpoint-host",
         "endpoint / host",
-        _endpoint_compact_label,
+        lambda row: escape(_endpoint_compact_label(row)),
         _COMPACT,
         _MINIMAL,
     ),
@@ -389,7 +393,7 @@ _ENDPOINT_COLUMNS = (
     AdaptiveColumn.visible(
         "state",
         "state",
-        lambda row: _state_label(row.state),
+        lambda row: escape(_state_label(row.state)),
         _WIDE,
         _STANDARD,
         _COMPACT,
@@ -400,7 +404,7 @@ _ENDPOINT_COLUMNS = (
     AdaptiveColumn.visible(
         "model",
         "model",
-        _endpoint_model,
+        lambda row: escape(_endpoint_model(row)),
         _WIDE,
         _STANDARD,
     ),
@@ -441,13 +445,43 @@ _ENDPOINT_COLUMNS = (
     AdaptiveColumn.visible(
         "app",
         "app / pod",
-        lambda row: row.name or row.app_id or "-",
+        lambda row: escape(row.name or row.app_id or "-"),
         _WIDE,
         # Usually the app is named after the endpoint; only a different name
         # is worth a column.
         redundant=lambda row: (row.name or row.app_id or "-") == _endpoint_name(row),
     ),
 )
+
+
+class BatchServingStatsReady(Message):
+    """Background passive serving-stats pass finished on cloned rows."""
+
+    def __init__(self, target_rows: list[EndpointInfo], updated: dict[str, EndpointInfo]) -> None:
+        super().__init__()
+        self.target_rows = target_rows
+        self.updated = updated
+
+
+class LiveMetricsReady(Message):
+    """Explicit single-endpoint live metrics fetch finished on a cloned row."""
+
+    def __init__(self, key: str, updated: EndpointInfo) -> None:
+        super().__init__()
+        self.key = key
+        self.updated = updated
+
+
+def _copy_runtime_metrics(target: EndpointInfo, source: EndpointInfo) -> None:
+    """Apply background-collected serving/runtime telemetry onto a UI row."""
+    target.serving = source.serving
+    target.live_metrics_checked_at = source.live_metrics_checked_at
+    target.live_metrics_error = source.live_metrics_error
+    target.run_started_at_epoch = source.run_started_at_epoch
+    target.hourly_cost_usd = source.hourly_cost_usd
+    target.cumulative_cost_usd = source.cumulative_cost_usd
+    target.cost_estimated = source.cost_estimated
+    target.cost_tracked_since_epoch = source.cost_tracked_since_epoch
 
 
 class ManageScreen(CopyEnabledScreen):
@@ -482,12 +516,14 @@ class ManageScreen(CopyEnabledScreen):
         self._initial_tab = "manage-jobs" if jobs else "manage-endpoints"
 
     def compose(self) -> ComposeResult:
+        table = AdaptiveDataTable(id="manage-endpoint-table", fit_to_rows=True)
+        table.border_title = "Endpoints"
         with Vertical(id="manage-layout"):
             yield Static(screen_title("Manage"), id="manage-title")
             with TabbedContent(initial=self._initial_tab, id="manage-tabs"):
                 with TabPane("Endpoints", id="manage-endpoints"):
                     yield Static("[dim]Loading endpoints…[/dim]", id="manage-status")
-                    yield AdaptiveDataTable(id="manage-endpoint-table", fit_to_rows=True)
+                    yield table
                     yield Static("", id="manage-selection-detail")
                 with TabPane("Jobs", id="manage-jobs"):
                     yield DeploymentJobsPanel()
@@ -504,6 +540,8 @@ class ManageScreen(CopyEnabledScreen):
             self.query_one("#manage-endpoint-table", AdaptiveDataTable).focus()
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if super().check_action(action, parameters) is False:
+            return False
         if action == "open_actions":
             return self.focused is not None and self.focused.id == "manage-endpoint-table"
         if action in {
@@ -526,6 +564,7 @@ class ManageScreen(CopyEnabledScreen):
         self._selected_key: str | None = None
         self._retained_providers: set[str] = set()
         self._was_suspended = False
+        self._skip_next_resume_refresh = False
         self._fleet_refresh_inflight = False
         self._traffic_refresh_timer: Timer | None = None
         self._clock_refresh_timer: Timer | None = None
@@ -583,13 +622,26 @@ class ManageScreen(CopyEnabledScreen):
             self._was_suspended = False
             show_jobs = self.query_one("#manage-tabs", TabbedContent).active == "manage-jobs"
             self.query_one(DeploymentJobsPanel).set_active(show_jobs)
-            self.call_after_refresh(self._refresh_if_current)
+            if self._skip_next_resume_refresh:
+                self._skip_next_resume_refresh = False
+            else:
+                self.call_after_refresh(self._refresh_if_current)
 
     def on_endpoints_loaded(self, message: EndpointsLoaded) -> None:
+        previous_by_key = {_endpoint_key(row): row for row in self._all_rows}
         self._all_rows = sorted(
             (row for row in message.rows if row.backend is not None),
             key=lambda row: (_endpoint_name(row).casefold(), _endpoint_key(row)),
         )
+        for row in self._all_rows:
+            prior = previous_by_key.get(_endpoint_key(row))
+            if prior is None:
+                continue
+            if row.live_metrics_checked_at is None and prior.live_metrics_checked_at is not None:
+                row.live_metrics_checked_at = prior.live_metrics_checked_at
+                row.live_metrics_error = prior.live_metrics_error
+                if row.serving is None:
+                    row.serving = prior.serving
         self._retained_providers = retained_providers(message.discovery)
         self._outage_lines = provider_outage_lines(message.discovery)
         if message.is_stale:
@@ -639,24 +691,27 @@ class ManageScreen(CopyEnabledScreen):
         )
 
     def _run_serving_stats(self, rows: list[EndpointInfo], username: str) -> None:
-        annotate_serving_stats(rows, username)
-        attach_endpoint_runtime(rows, explicit=False)
-        self.post_message(ServingStatsReady(rows))
+        copies = [replace(row) for row in rows]
+        annotate_serving_stats(copies, username)
+        attach_endpoint_runtime(copies, explicit=False)
+        self.post_message(
+            BatchServingStatsReady(rows, {_endpoint_key(row): row for row in copies})
+        )
 
-    def _run_live_single(self, row: EndpointInfo, username: str) -> None:
+    def _run_live_single(self, key: str, row_copy: EndpointInfo, username: str) -> None:
         """Fetch one endpoint's live counters, even when that may wake it."""
-        snapshot = fetch_serving_snapshot(row, username, explicit=True)
+        snapshot = fetch_serving_snapshot(row_copy, username, explicit=True)
         moment = time.time()
-        row.live_metrics_checked_at = moment
+        row_copy.live_metrics_checked_at = moment
         if snapshot is not None:
-            row.serving = snapshot
-            row.live_metrics_error = None
+            row_copy.serving = snapshot
+            row_copy.live_metrics_error = None
         else:
             # Keep the banked totals: a failed explicit read says the probe
             # missed, not that the endpoint served nothing.
-            row.live_metrics_error = "endpoint did not return metrics"
-        attach_endpoint_runtime([row], now=moment, explicit=True)
-        self.post_message(ServingStatsReady(self._all_rows))
+            row_copy.live_metrics_error = "endpoint did not return metrics"
+        attach_endpoint_runtime([row_copy], now=moment, explicit=True)
+        self.post_message(LiveMetricsReady(key, row_copy))
 
     def action_fetch_live_selected(self) -> None:
         """Fetch live metrics for the selected endpoint (may start its GPU)."""
@@ -664,16 +719,36 @@ class ManageScreen(CopyEnabledScreen):
         if row is None:
             return
         key = _endpoint_key(row)
+        row_copy = replace(row)
         self.query_one("#manage-status", Static).update(
             f"[dim]Fetching live metrics for {escape(_endpoint_name(row))}…[/dim]"
         )
         username = self._modal_username()
         self.run_worker(
-            lambda: self._run_live_single(row, username),
+            lambda: self._run_live_single(key, row_copy, username),
             name=f"manage-live-metrics-{key}",
+            group="manage-live-metrics",
             thread=True,
             exclusive=True,
         )
+
+    def on_batch_serving_stats_ready(self, message: BatchServingStatsReady) -> None:
+        """Apply background serving stats on the UI thread, unless the fleet moved on."""
+        if message.target_rows is not self._all_rows:
+            return
+        for row in self._all_rows:
+            updated = message.updated.get(_endpoint_key(row))
+            if updated is not None:
+                _copy_runtime_metrics(row, updated)
+        self._render_rows()
+
+    def on_live_metrics_ready(self, message: LiveMetricsReady) -> None:
+        """Apply an explicit single-endpoint live metrics fetch on the UI thread."""
+        for row in self._all_rows:
+            if _endpoint_key(row) == message.key:
+                _copy_runtime_metrics(row, message.updated)
+                break
+        self._render_rows()
 
     def on_serving_stats_ready(self, message: ServingStatsReady) -> None:
         """Repaint with the traffic that was read, unless the fleet moved on."""
@@ -931,29 +1006,46 @@ class EndpointActionsScreen(CopyEnabledScreen):
             labels.append((action, label))
         return tuple(labels)
 
+    @staticmethod
+    def _format_action_option(action: str, label: str) -> Content:
+        stripped = label.strip()
+        if action == "stop":
+            return Content.from_markup(f"  [bold $error]{escape(stripped)}[/]")
+        if " — " in stripped:
+            head, note = stripped.split(" — ", 1)
+            return Content.from_markup(
+                f"  [bold]{escape(head)}[/bold]  [dim]—[/dim] [$warning]{escape(note)}[/]"
+            )
+        return Content.from_markup(f"  [bold]{escape(stripped)}[/bold]")
+
     def compose(self) -> ComposeResult:
         from ..fleet_status import deployment_and_health_line
 
-        with VerticalScroll(classes="screen-scroll"):
-            yield Static(screen_title("Endpoint actions"))
-            yield Static(
-                f"[bold]{escape(_endpoint_name(self.endpoint))}[/bold]  "
-                f"[dim]{escape(_endpoint_host(self.endpoint))}[/dim]\n"
-                f"{deployment_and_health_line(self.endpoint)}",
-                id="manage-action-context",
-            )
-            yield OptionList(
-                *(
-                    Option(label, id=action)
-                    for action, label in self._action_labels()
-                    if action in _available_actions(self.endpoint)
-                ),
-                id="manage-actions",
-            )
-            yield Static(
-                _serving_detail_lines(self.endpoint).lstrip("\n"),
-                id="manage-action-metrics",
-            )
+        actions = OptionList(
+            *(
+                Option(self._format_action_option(action, label), id=action)
+                for action, label in self._action_labels()
+                if action in _available_actions(self.endpoint)
+            ),
+            id="manage-actions",
+        )
+        actions.border_title = "Actions"
+        metrics = Static(
+            _serving_detail_lines(self.endpoint).lstrip("\n"),
+            id="manage-action-metrics",
+        )
+        metrics.border_title = "Runtime & Traffic"
+        with VerticalScroll(classes="screen-scroll focused-panel-scroll"):
+            with Vertical(classes="focused-panel"):
+                yield Static(screen_title("Endpoint actions"), classes="focused-panel-title")
+                yield Static(
+                    f"[bold]{escape(_endpoint_name(self.endpoint))}[/bold]  "
+                    f"[dim]{escape(_endpoint_host(self.endpoint))}[/dim]\n"
+                    f"{deployment_and_health_line(self.endpoint)}",
+                    id="manage-action-context",
+                )
+                yield actions
+                yield metrics
         yield FittedFooter()
 
     def on_mount(self) -> None:
@@ -992,7 +1084,9 @@ class EndpointActionsScreen(CopyEnabledScreen):
             manage = self.app.screen
             if isinstance(manage, ManageScreen):
                 # The menu holds the selected row; Manage re-resolves its own
-                # selection, so prefer the endpoint the user just chose.
+                # selection, so prefer the endpoint the user just chose and
+                # avoid clobbering the live fetch with an immediate resume reload.
+                manage._skip_next_resume_refresh = True
                 manage._selected_key = _endpoint_key(endpoint)
                 manage.action_fetch_live_selected()
             else:
@@ -1022,20 +1116,24 @@ class ConnectionInfoScreen(CopyEnabledScreen):
         self._payload: dict[str, str | None] = {}
 
     def compose(self) -> ComposeResult:
-        with VerticalScroll(classes="screen-scroll"):
-            yield Static(screen_title("Connection info"))
-            yield Static(
-                f"[bold]{escape(_endpoint_name(self.endpoint))}[/bold]  "
-                f"{_endpoint_summary(self.endpoint)}"
-            )
-            yield Static("", id="connection-info-fields")
-            with Horizontal(id="connection-info-actions"):
-                yield Button("Copy URL", id="connection-copy-url")
-                yield Button("Copy model", id="connection-copy-model")
-                yield Button("Copy API key", id="connection-copy-key")
-                yield Button("Copy image", id="connection-copy-image")
-                yield Button("Copy curl", id="connection-copy-curl")
-                yield Button("Copy JSON", id="connection-copy-json")
+        fields = Static("", id="connection-info-fields")
+        fields.border_title = "OpenAI Endpoint"
+        with VerticalScroll(classes="screen-scroll focused-panel-scroll"):
+            with Vertical(classes="focused-panel"):
+                yield Static(screen_title("Connection info"), classes="focused-panel-title")
+                yield Static(
+                    f"[bold]{escape(_endpoint_name(self.endpoint))}[/bold]  "
+                    f"{_endpoint_summary(self.endpoint)}",
+                    id="connection-info-context",
+                )
+                yield fields
+                with Horizontal(id="connection-info-actions"):
+                    yield Button("Copy URL", id="connection-copy-url")
+                    yield Button("Copy model", id="connection-copy-model")
+                    yield Button("Copy API key", id="connection-copy-key")
+                    yield Button("Copy image", id="connection-copy-image")
+                    yield Button("Copy curl", id="connection-copy-curl")
+                    yield Button("Copy JSON", id="connection-copy-json")
         yield FittedFooter()
 
     def on_mount(self) -> None:
@@ -1145,20 +1243,23 @@ class StatusOptionsScreen(CopyEnabledScreen):
         self.endpoint = endpoint
 
     def compose(self) -> ComposeResult:
-        with VerticalScroll(classes="screen-scroll"):
-            yield Static(screen_title("Status check"))
-            yield Static(
-                f"[bold]{escape(_endpoint_name(self.endpoint))}[/bold]  "
-                f"{_endpoint_summary(self.endpoint)}"
-            )
-            yield FormField(
-                "Server URL override (optional)",
-                "status-url",
-                hint="Leave blank to use the endpoint URL.",
-            )
-            yield FormField("Timeout (seconds)", "status-timeout", default="60")
-            yield Static("", id="status-feedback")
-            yield Button("Check status", id="status-submit", variant="primary")
+        with VerticalScroll(classes="screen-scroll focused-panel-scroll"):
+            with Vertical(classes="focused-panel"):
+                yield Static(screen_title("Status check"), classes="focused-panel-title")
+                yield Static(
+                    f"[bold]{escape(_endpoint_name(self.endpoint))}[/bold]  "
+                    f"{_endpoint_summary(self.endpoint)}",
+                    classes="focused-panel-context",
+                )
+                with Vertical(classes="focused-form-card"):
+                    yield FormField(
+                        "Server URL override (optional)",
+                        "status-url",
+                        hint="Leave blank to use the endpoint URL.",
+                    )
+                    yield FormField("Timeout (seconds)", "status-timeout", default="60")
+                    yield Static("", id="status-feedback")
+                    yield Button("Check status", id="status-submit", variant="primary")
         yield FittedFooter()
 
     def on_mount(self) -> None:
@@ -1215,33 +1316,36 @@ class BenchmarkOptionsScreen(CopyEnabledScreen):
         self.endpoint = endpoint
 
     def compose(self) -> ComposeResult:
-        with VerticalScroll(classes="screen-scroll"):
-            yield Static(screen_title("Benchmark"))
-            yield Static(
-                f"[bold]{escape(_endpoint_name(self.endpoint))}[/bold]  "
-                f"{_endpoint_summary(self.endpoint)}"
-            )
-            yield FormField(
-                "Concurrency sweep",
-                "benchmark-concurrency",
-                default="1,2,4,8,16",
-                hint="Comma or space separated values.",
-            )
-            yield FormField(
-                "Request count (optional)",
-                "benchmark-request-count",
-                hint="Blank uses max(24, concurrency * 4).",
-            )
-            yield FormField("Input tokens", "benchmark-input-tokens", default="550")
-            yield FormField("Output tokens", "benchmark-output-tokens", default="256")
-            yield FormField("Tokenizer", "benchmark-tokenizer", default="gpt2")
-            yield FormField(
-                "Output directory (optional)",
-                "benchmark-output-dir",
-                hint="Blank stores under ~/.llm_launchpad/benchmarks.",
-            )
-            yield Static("", id="benchmark-feedback")
-            yield Button("Benchmark", id="benchmark-submit", variant="primary")
+        with VerticalScroll(classes="screen-scroll focused-panel-scroll"):
+            with Vertical(classes="focused-panel"):
+                yield Static(screen_title("Benchmark"), classes="focused-panel-title")
+                yield Static(
+                    f"[bold]{escape(_endpoint_name(self.endpoint))}[/bold]  "
+                    f"{_endpoint_summary(self.endpoint)}",
+                    classes="focused-panel-context",
+                )
+                with Vertical(classes="focused-form-card"):
+                    yield FormField(
+                        "Concurrency sweep",
+                        "benchmark-concurrency",
+                        default="1,2,4,8,16",
+                        hint="Comma or space separated values.",
+                    )
+                    yield FormField(
+                        "Request count (optional)",
+                        "benchmark-request-count",
+                        hint="Blank uses max(24, concurrency * 4).",
+                    )
+                    yield FormField("Input tokens", "benchmark-input-tokens", default="550")
+                    yield FormField("Output tokens", "benchmark-output-tokens", default="256")
+                    yield FormField("Tokenizer", "benchmark-tokenizer", default="gpt2")
+                    yield FormField(
+                        "Output directory (optional)",
+                        "benchmark-output-dir",
+                        hint="Blank stores under ~/.llm_launchpad/benchmarks.",
+                    )
+                    yield Static("", id="benchmark-feedback")
+                    yield Button("Benchmark", id="benchmark-submit", variant="primary")
         yield FittedFooter()
 
     def on_mount(self) -> None:

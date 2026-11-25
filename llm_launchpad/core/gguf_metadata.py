@@ -322,7 +322,7 @@ def parse_gguf_serving_metadata(
         if key == "general.architecture" and isinstance(value, str):
             architecture = value.strip().casefold() or None
         elif matched is not None:
-            values[key] = value
+            values[key.casefold()] = value
 
     # Only the target architecture may supply these fields (not a vision tower).
     scalars: dict[str, int] = {}
@@ -543,7 +543,12 @@ def _read_value(
     capture: bool,
 ) -> tuple[Any, int]:
     if value_type == _GGUF_STRING:
-        value, next_offset = _read_string(data, offset, max_length=GGUF_METADATA_MAX_BYTES)
+        value, next_offset = _read_string(
+            data,
+            offset,
+            max_length=GGUF_METADATA_MAX_BYTES,
+            decode=capture,
+        )
         return (value if capture else None, next_offset)
     if value_type == _GGUF_ARRAY:
         element_type = _unpack(data, offset, "<I")[0]
