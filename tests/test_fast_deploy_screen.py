@@ -1512,6 +1512,80 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 str(option_list.get_option_at_index(0).prompt),
             )
 
+    async def test_incremental_catalog_refresh_updates_list_immediately_and_keeps_prices(self) -> None:
+        from dataclasses import replace as dc_replace
+        from llm_launchpad.core.deploy_log_summary import SUMMARY_SPINNER_FRAMES
+        from tests.catalog_fixtures import STATIC_LIKE_PROFILES
+
+        first = STATIC_LIKE_PROFILES[0]
+        second = dc_replace(
+            STATIC_LIKE_PROFILES[1],
+            id="fresh-model-q4-cheap",
+            display_name="Fresh Streamed Model",
+            repo_id="unsloth/Fresh-Streamed-Model-GGUF",
+            aa_model_id="aa-fresh-streamed",
+            aa_model_slug="fresh-streamed-model",
+            aa_intelligence_score=99.0,
+            aa_rank=1,
+        )
+        quick_deploy.activate_quick_deploy_catalog(
+            QuickDeployCatalogInfo(source_label="Live", is_live=True, ready=True, refreshing=True),
+            (first,),
+        )
+
+        refresh_calls: list[bool] = []
+
+        class _RefreshApp(_TestApp):
+            def begin_quick_deploy_catalog_refresh(self, *, force: bool = False) -> bool:
+                refresh_calls.append(force)
+                return True
+
+        app = _RefreshApp()
+        async with app.run_test(size=(120, 32)) as pilot:
+            app.push_screen(FastDeployScreen())
+            await pilot.pause()
+            screen = app.screen
+            assert isinstance(screen, FastDeployScreen)
+            await screen.workers.wait_for_complete()
+            await pilot.pause()
+
+            status_before = str(screen.query_one("#fast-deploy-status", Static).render())
+            self.assertIn("Refreshing model catalog…", status_before)
+            self.assertTrue(any(frame in status_before for frame in SUMMARY_SPINNER_FRAMES))
+            self.assertIsNotNone(screen._catalog_spinner_timer)
+            before_index = screen._catalog_spinner_index
+            screen._tick_catalog_spinner()
+            status_ticked = str(screen.query_one("#fast-deploy-status", Static).render())
+            self.assertEqual(
+                screen._catalog_spinner_index,
+                (before_index + 1) % len(SUMMARY_SPINNER_FRAMES),
+            )
+            self.assertIn(SUMMARY_SPINNER_FRAMES[screen._catalog_spinner_index], status_ticked)
+            first_model_id = screen._models[0].id
+            first_price = screen._prices.get(first_model_id)
+            self.assertIsNotNone(first_price)
+
+            # A partial catalog update arrives with a new model: list updates
+            # immediately without discarding unchanged models' cached prices.
+            quick_deploy.activate_quick_deploy_catalog(
+                QuickDeployCatalogInfo(source_label="Live", is_live=True, ready=True, refreshing=False),
+                (first, second),
+            )
+            screen.refresh_quick_deploy_catalog()
+            await screen.workers.wait_for_complete()
+            await pilot.pause()
+
+            self.assertIn("aa-fresh-streamed", screen._model_by_id)
+            self.assertIs(screen._prices.get(first_model_id), first_price)
+            status_after = str(screen.query_one("#fast-deploy-status", Static).render())
+            self.assertNotIn("Refreshing model catalog…", status_after)
+            self.assertIsNone(screen._catalog_spinner_timer)
+
+            screen.action_refresh_availability()
+            await pilot.pause()
+            self.assertEqual(refresh_calls, [True])
+            self.assertIsNotNone(screen._catalog_spinner_timer)
+
 
 class FastDeployMainMenuTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
@@ -1694,16 +1768,13 @@ class QuantDisclosureRenderTests(unittest.TestCase):
 
 
 class DeployKeyHintTests(unittest.TestCase):
-    """Step three is the one screen where enter does not do the obvious thing."""
+    """Narrow viewports restate the deploy shortcuts when the footer is hidden."""
 
     def test_the_keyboard_route_is_stated_beside_the_button(self) -> None:
         from llm_launchpad.tui.screens.quick_deploy import deploy_key_hint
 
-        # Enter is deliberately unbound here so a keystroke carried over from
-        # step two cannot rent a GPU. The footer says so, but the fulfillment
-        # dropdown paints over the footer while open, and a phone terminal
-        # hides the footer behind its on-screen keyboard for good.
         narrow = Content.from_markup(deploy_key_hint(narrow=True)).plain
+        self.assertIn("enter", narrow)
         self.assertIn("ctrl+d", narrow)
         self.assertIn("Deploy", narrow)
         # A wide terminal shows the same key in its footer.
@@ -1723,7 +1794,7 @@ class DeployKeyHintTests(unittest.TestCase):
 
         text = Content.from_markup(deploy_key_hint(narrow=True)).plain
         self.assertNotIn("ctrl+t", text)
-        self.assertIn("tab to Deploy", text)
+        self.assertIn("enter to Deploy", text)
 
     def test_enter_is_not_bound_to_deploy(self) -> None:
         from llm_launchpad.tui.screens.quick_deploy import QuickDeployScreen

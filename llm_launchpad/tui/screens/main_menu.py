@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter
 from dataclasses import dataclass, replace
 import time
+from typing import Any
 
 from rich.cells import cell_len
 from rich.markup import escape
@@ -381,7 +382,7 @@ def _with_spinner(line: str, spinner: str) -> str:
 
 def _state_bucket(state: str) -> str:
     normalized = (state or "").strip().lower()
-    if normalized in {"running", "deployed"}:
+    if normalized in {"active", "running", "deployed"}:
         return "healthy"
     if normalized in {"deploying", "starting", "initializing", "building", "ephemeral"}:
         return "deploying"
@@ -1021,6 +1022,7 @@ class MainMenuScreen(CopyEnabledScreen):
         self._resume_refresh_timers()
         self._refresh_panels()
         self._sync_storage_snapshot()
+        self._refresh_billing_panels_if_due()
         last = load_last_launch()
         if last != self._last_launch:
             # A deploy started from a nested flow is now the one to offer.
@@ -1154,21 +1156,57 @@ class MainMenuScreen(CopyEnabledScreen):
         """Open fleet, billing and connection detail as a full-width view."""
         self.app.push_screen(HomeDetailsScreen(self))
 
-    def _refresh_quick_deploy_catalog(self) -> None:
-        if self._quick_deploy_catalog_refresh_inflight or (
+    def _demo_app(self) -> Any | None:
+        try:
+            app = self.app
+        except Exception:
+            return None
+        return app if getattr(app, "is_demo_mode", False) is True else None
+
+    def _refresh_quick_deploy_catalog(self, *, force: bool = False) -> None:
+        if self._demo_app() is not None:
+            return
+        if self._quick_deploy_catalog_refresh_inflight:
+            return
+        if not force and (
             self._last_catalog is not None and self._can_reuse_catalog(self._last_catalog)
         ):
             return
         self._quick_deploy_catalog_refresh_inflight = True
+        if force:
+            from dataclasses import replace as _dc_replace
+            from ...core.quick_deploy import (
+                get_quick_deploy_catalog_info,
+                list_quick_deploy_profiles,
+            )
+
+            active_info = get_quick_deploy_catalog_info()
+            active_profiles = list_quick_deploy_profiles()
+            if (active_profiles or active_info.exclusions) and not active_info.refreshing:
+                activate_quick_deploy_catalog(
+                    _dc_replace(active_info, refreshing=True),
+                    active_profiles,
+                )
+                notifier = getattr(self.app, "quick_deploy_catalog_updated", None)
+                if callable(notifier):
+                    notifier()
+        worker = (
+            self._run_refresh_quick_deploy_catalog
+            if force
+            else self._run_load_quick_deploy_catalog
+        )
         self.run_worker(
-            self._run_load_quick_deploy_catalog,
+            worker,
             name="main-menu-quick-deploy-catalog-worker",
             thread=True,
         )
 
-    def ensure_quick_deploy_catalog_refresh(self) -> None:
+    def ensure_quick_deploy_catalog_refresh(self, *, force: bool = False) -> None:
         """Start the live model-catalog refresh before opening the picker."""
-        self._refresh_quick_deploy_catalog()
+        if force:
+            self._refresh_quick_deploy_catalog(force=True)
+        else:
+            self._refresh_quick_deploy_catalog()
 
     @staticmethod
     def _can_reuse_catalog(info: QuickDeployCatalogInfo) -> bool:
@@ -1184,14 +1222,36 @@ class MainMenuScreen(CopyEnabledScreen):
             info, profiles = cached
             if profiles or info.exclusions:
                 fresh = self._can_reuse_catalog(info)
-                self.post_message(QuickDeployCatalogLoaded(info, profiles, from_cache=True, refresh_complete=fresh))
+                self.post_message(
+                    QuickDeployCatalogLoaded(
+                        info,
+                        profiles,
+                        from_cache=True,
+                        refresh_complete=fresh,
+                    )
+                )
                 if fresh:
                     return
         self._run_refresh_quick_deploy_catalog()
 
     def _run_refresh_quick_deploy_catalog(self) -> None:
+        def publish_partial(
+            partial_info: QuickDeployCatalogInfo,
+            partial_profiles: tuple[QuickDeployProfile, ...],
+        ) -> None:
+            self.post_message(
+                QuickDeployCatalogLoaded(
+                    info=partial_info,
+                    profiles=partial_profiles,
+                    refresh_complete=False,
+                )
+            )
+
         try:
-            info, profiles = build_live_quick_deploy_catalog()
+            try:
+                info, profiles = build_live_quick_deploy_catalog(on_partial=publish_partial)
+            except TypeError:
+                info, profiles = build_live_quick_deploy_catalog()
         except Exception as exc:
             self.post_message(QuickDeployCatalogLoadFailed(error=str(exc)))
             return
@@ -1319,6 +1379,10 @@ class MainMenuScreen(CopyEnabledScreen):
         self._apply_auth_to_billing(ComputeProvider.PRIME, message.status.authenticated)
 
     def _refresh_hf_auth_status(self) -> None:
+        if self._demo_app() is not None:
+            self._hf_auth_status = HuggingFaceAuthStatus(authenticated=True, username="demo")
+            self._render_connection_widgets()
+            return
         if self._hf_auth_refresh_inflight:
             return
         self._hf_auth_refresh_inflight = True
@@ -1345,6 +1409,10 @@ class MainMenuScreen(CopyEnabledScreen):
         self._render_connection_widgets()
 
     def _refresh_aai_auth_status(self) -> None:
+        if self._demo_app() is not None:
+            self._aai_auth_status = ArtificialAnalysisAuthStatus(authenticated=True, tier="demo")
+            self._render_connection_widgets()
+            return
         if self._aai_auth_refresh_inflight:
             return
         self._aai_auth_refresh_inflight = True
@@ -1403,6 +1471,21 @@ class MainMenuScreen(CopyEnabledScreen):
         self._sync_storage_snapshot()
         self._last_billing_refresh_at = time.monotonic()
         self._refresh_provider_billing()
+
+    def _refresh_billing_panels_if_due(self) -> None:
+        """Refresh on return to Home without defeating the interval throttle.
+
+        The billing timer keeps its own cadence while Home is suspended, so a
+        nested deploy flow can leave the panel showing the figure from before
+        the deployment started. Resuming refreshes immediately when the last
+        reading is older than the interval; a quick round trip stays cheap.
+        """
+        if (
+            not self._last_billing_refresh_at
+            or time.monotonic() - self._last_billing_refresh_at
+            >= self._BILLING_REFRESH_INTERVAL_SECONDS
+        ):
+            self._refresh_billing_panels()
 
     def _is_active_screen(self) -> bool:
         """Return whether this screen is the visible top of the app stack."""
@@ -1476,10 +1559,14 @@ class MainMenuScreen(CopyEnabledScreen):
             # behind the TTL. Prime/Vast rows keep their cached verdicts --
             # reprobing them here would defeat the cache.
             cached = [replace(row) for row in self._runtime_rows]
-            try:
-                _refresh_cached_passive_rows(cached)
-            except Exception:
-                pass
+            demo_app = self._demo_app()
+            if demo_app is not None:
+                demo_app.annotate_home_deployments(cached)
+            else:
+                try:
+                    _refresh_cached_passive_rows(cached)
+                except Exception:
+                    pass
             self._show_deployments(cached)
             return
         if message.is_stale:
@@ -1494,7 +1581,11 @@ class MainMenuScreen(CopyEnabledScreen):
         )
 
     def _run_annotate_deployments(self, rows: list[EndpointInfo]) -> None:
-        _annotate_runtime_statuses(rows, self.username)
+        demo_app = self._demo_app()
+        if demo_app is not None:
+            demo_app.annotate_home_deployments(rows)
+        else:
+            _annotate_runtime_statuses(rows, self.username)
         self.post_message(DeploymentsLoaded(rows=rows))
 
     def on_endpoints_failed(self, message: EndpointsFailed) -> None:
@@ -1585,6 +1676,14 @@ class MainMenuScreen(CopyEnabledScreen):
         poster = getattr(self, "post_message", None)
         if poster is None:
             return
+        demo_app = self._demo_app()
+        if demo_app is not None:
+            try:
+                for row in demo_app.load_demo_billing():
+                    poster(ProviderBillingLoaded(row=row))
+            finally:
+                poster(ProviderBillingFinished())
+            return
         loaders = {
             ComputeProvider.MODAL: lambda: load_modal_billing(
                 authenticated=modal_authenticated
@@ -1595,19 +1694,24 @@ class MainMenuScreen(CopyEnabledScreen):
             ComputeProvider.VAST: load_vast_billing,
         }
         # One provider's slow API must not hold up the two that already
-        # answered, so each row is posted as it lands.
-        with ThreadPoolExecutor(max_workers=len(loaders)) as pool:
-            futures = {
-                pool.submit(loader): provider for provider, loader in loaders.items()
-            }
-            for future in as_completed(futures):
-                provider = futures[future]
-                try:
-                    row = future.result()
-                except Exception as exc:  # pragma: no cover - loaders are total
-                    row = ProviderBilling.failed(provider, str(exc))
-                poster(ProviderBillingLoaded(row=row))
-        poster(ProviderBillingFinished())
+        # answered, so each row is posted as it lands. The settled message is
+        # in a finally block: if a loader or a post raises, the screen must
+        # still learn that this pass is over, or billing refreshes stop for
+        # the rest of the session.
+        try:
+            with ThreadPoolExecutor(max_workers=len(loaders)) as pool:
+                futures = {
+                    pool.submit(loader): provider for provider, loader in loaders.items()
+                }
+                for future in as_completed(futures):
+                    provider = futures[future]
+                    try:
+                        row = future.result()
+                    except Exception as exc:  # pragma: no cover - loaders are total
+                        row = ProviderBilling.failed(provider, str(exc))
+                    poster(ProviderBillingLoaded(row=row))
+        finally:
+            poster(ProviderBillingFinished())
 
     def on_deployments_loaded(self, message: DeploymentsLoaded) -> None:
         self._status_refresh_inflight = False
@@ -1785,14 +1889,11 @@ class HomeDetailsScreen(CopyEnabledScreen):
         self.update_fleet()
         self.update_billing()
         self.update_connections()
-        menu = self._menu
-        if not menu._last_billing_refresh_at or (
-            time.monotonic() - menu._last_billing_refresh_at >= menu._BILLING_REFRESH_INTERVAL_SECONDS
-        ):
-            menu._refresh_billing_panels()
+        self._menu._refresh_billing_panels_if_due()
 
     def on_screen_resume(self, _: events.ScreenResume) -> None:
         if self.is_mounted:
+            self._menu._refresh_billing_panels_if_due()
             self.update_fleet()
             self.update_billing()
             self.update_connections()

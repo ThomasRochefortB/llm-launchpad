@@ -186,9 +186,10 @@ class LlamaCppQuantsFailed(Message):
 class StorageLoaded(Message):
     """Storage snapshot loaded successfully."""
 
-    def __init__(self, snapshot: StorageSnapshot) -> None:
+    def __init__(self, snapshot: StorageSnapshot, *, is_stale: bool = False) -> None:
         super().__init__()
         self.snapshot = snapshot
+        self.is_stale = is_stale
 
 
 class ConnectionSummaryReady(Message):

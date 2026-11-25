@@ -889,8 +889,11 @@ class FastDeployScreen(CopyEnabledScreen):
         self._show_top_models = True
         self._updating_gpu_filter = False
         self._catalog_building = False
+        self._catalog_refresh_requested = False
         self._catalog_spinner_index = 0
         self._catalog_spinner_timer: Timer | None = None
+        self._models_status_base = ""
+        self._infra_status_base = ""
 
     def compose(self) -> ComposeResult:
         with Vertical(id="fast-deploy-container"):
@@ -943,19 +946,41 @@ class FastDeployScreen(CopyEnabledScreen):
         self._apply_model_catalog(force=True)
         self.query_one("#fast-deploy-list", OptionList).focus()
         self._load_availability(purpose="filter")
-        self._catalog_spinner_timer = self.set_interval(
-            0.25,
-            self._tick_catalog_spinner,
-            name="fast-deploy-catalog-spinner",
-        )
+        self._sync_refresh_spinner()
 
     def on_screen_suspend(self, _: events.ScreenSuspend) -> None:
         if self._catalog_spinner_timer is not None:
             self._catalog_spinner_timer.pause()
 
     def on_screen_resume(self, _: events.ScreenResume) -> None:
-        if self._catalog_spinner_timer is not None and self._catalog_building:
-            self._catalog_spinner_timer.resume()
+        if self._is_refresh_animating():
+            self._sync_refresh_spinner()
+
+    def _spinner_frame(self) -> str:
+        return SUMMARY_SPINNER_FRAMES[self._catalog_spinner_index % len(SUMMARY_SPINNER_FRAMES)]
+
+    def _is_refresh_animating(self) -> bool:
+        return (
+            self._catalog_building
+            or self._catalog_info.refreshing
+            or self._catalog_refresh_requested
+            or self._fetch_pending
+            or self._pricing_pending
+        )
+
+    def _sync_refresh_spinner(self) -> None:
+        if self._is_refresh_animating():
+            if self._catalog_spinner_timer is None:
+                self._catalog_spinner_timer = self.set_interval(
+                    0.15,
+                    self._tick_catalog_spinner,
+                    name="fast-deploy-catalog-spinner",
+                )
+            else:
+                self._catalog_spinner_timer.resume()
+        elif self._catalog_spinner_timer is not None:
+            self._catalog_spinner_timer.stop()
+            self._catalog_spinner_timer = None
 
     def on_option_list_option_highlighted(self, event: OptionList.OptionHighlighted) -> None:
         if event.option_list.id != "fast-deploy-list":
@@ -1032,30 +1057,44 @@ class FastDeployScreen(CopyEnabledScreen):
                 "from Artificial Analysis and Hugging Face…[/dim]"
             )
         self.query_one("#fast-deploy-status", Static).update(status)
+        self._sync_refresh_spinner()
         option_list.focus()
 
     def _tick_catalog_spinner(self) -> None:
-        """Advance the building-catalog spinner like deploy-log in-progress steps."""
-        if not self._catalog_building:
-            if self._catalog_spinner_timer is not None and self._catalog_info.ready:
-                self._catalog_spinner_timer.stop()
-                self._catalog_spinner_timer = None
+        """Advance the refresh spinner across catalog, offer, and pricing refreshes."""
+        if not self._is_refresh_animating():
+            self._sync_refresh_spinner()
             return
         if not self.is_current:
             return
         self._catalog_spinner_index = (
             self._catalog_spinner_index + 1
         ) % len(SUMMARY_SPINNER_FRAMES)
-        frame = SUMMARY_SPINNER_FRAMES[self._catalog_spinner_index]
+        frame = self._spinner_frame()
         try:
-            option_list = self.query_one("#fast-deploy-list", OptionList)
-            replace_options(option_list, 
-                [Option(f"  {frame} Building the live model catalog…", disabled=True)]
-            )
-            self.query_one("#fast-deploy-status", Static).update(
-                f"[bold $primary]{frame}[/][dim] Building the live model catalog "
-                "from Artificial Analysis and Hugging Face…[/dim]"
-            )
+            if self._catalog_building:
+                option_list = self.query_one("#fast-deploy-list", OptionList)
+                replace_options(
+                    option_list,
+                    [Option(f"  {frame} Building the live model catalog…", disabled=True)],
+                )
+                self.query_one("#fast-deploy-status", Static).update(
+                    f"[bold $primary]{frame}[/][dim] Building the live model catalog "
+                    "from Artificial Analysis and Hugging Face…[/dim]"
+                )
+            elif self._phase == "models":
+                self._update_models_status()
+            elif self._phase == "loading":
+                status = (
+                    self._offer_wait_label()
+                    if self._fetch_pending or self._snapshot is None
+                    else "Pricing placements…"
+                )
+                self.query_one("#fast-deploy-status", Static).update(
+                    f"[bold $primary]{frame}[/] [dim]{escape(status)}[/dim]"
+                )
+            elif self._phase == "infra":
+                self._update_infra_status()
         except Exception:
             return
 
@@ -1136,7 +1175,11 @@ class FastDeployScreen(CopyEnabledScreen):
         replace_options(self.query_one("#fast-deploy-list", OptionList), [])
         self.query_one("#fast-deploy-detail", Static).update("")
         status = self._offer_wait_label() if self._fetch_pending or self._snapshot is None else "Pricing placements…"
-        self.query_one("#fast-deploy-status", Static).update(f"[dim]{status}[/dim]")
+        frame = self._spinner_frame()
+        self.query_one("#fast-deploy-status", Static).update(
+            f"[bold $primary]{frame}[/] [dim]{escape(status)}[/dim]"
+        )
+        self._sync_refresh_spinner()
 
     def _load_availability(self, *, purpose: str, force_refresh: bool = False) -> None:
         self._availability_request_id += 1
@@ -1148,6 +1191,7 @@ class FastDeployScreen(CopyEnabledScreen):
         self._pricing_pending = True
         self._availability_inflight = purpose == "infra"
         self.workers.cancel_group(self, "fast-deploy-prices")
+        self._sync_refresh_spinner()
 
         def run_load() -> None:
             self._run_load_availability(request_id, purpose=purpose, force_refresh=force_refresh)
@@ -1214,6 +1258,7 @@ class FastDeployScreen(CopyEnabledScreen):
         self._prices.clear()
         self._shorter_contexts.clear()
         self._pricing_pending = False
+        self._sync_refresh_spinner()
         if self._selected_model is None:
             self._render_model_list(preferred_id=self._highlighted_model_id())
         else:
@@ -1290,14 +1335,31 @@ class FastDeployScreen(CopyEnabledScreen):
             self._render_infra_from_snapshot(self._selected_model, self._snapshot)
 
     def action_refresh_availability(self) -> None:
-        """Reload prices and credentials, invalidating pending results."""
+        """Reload catalog, prices, and credentials, invalidating pending results."""
+        refreshed_catalog = False
         if self._phase == "models":
             self._load_availability(purpose="filter", force_refresh=True)
+            catalog_refresher = getattr(self.app, "begin_quick_deploy_catalog_refresh", None)
+            if callable(catalog_refresher):
+                refreshed_catalog = bool(catalog_refresher(force=True))
+                self._catalog_refresh_requested = refreshed_catalog
         elif self._selected_model is not None:
             self._remember_highlighted_placement()
             self._load_availability(purpose="infra", force_refresh=True)
             self._show_placement_loading()
-        self.query_one("#fast-deploy-status", Static).update("[dim]Refreshing live offers…[/dim]")
+        self._sync_refresh_spinner()
+        if self._phase == "models" and self._models_status_base:
+            self._update_models_status()
+            return
+        label = (
+            "Refreshing catalog and live offers…"
+            if refreshed_catalog
+            else "Refreshing live offers…"
+        )
+        frame = self._spinner_frame()
+        self.query_one("#fast-deploy-status", Static).update(
+            f"[bold $primary]{frame} {label}[/]"
+        )
 
     def _render_infra_from_snapshot(
         self,
@@ -1420,24 +1482,30 @@ class FastDeployScreen(CopyEnabledScreen):
             status += f"\n[$warning]{escape(quality_note)}[/$warning]"
         if self._gpu_filter != "any":
             status += f" [dim]· GPU {escape(self._gpu_filter)}[/dim]"
+        self._infra_status_base = status
+        self._update_infra_status()
+        self._sync_refresh_spinner()
+        if self.focused is None:
+            option_list.focus()
+
+    def _update_infra_status(self) -> None:
+        status = self._infra_status_base
         if self._fetch_pending:
-            status += f"\n[dim]{escape(self._offer_wait_label())}[/dim]"
+            frame = self._spinner_frame()
+            status += f"\n[bold $primary]{frame}[/] [dim]{escape(self._offer_wait_label())}[/dim]"
+        snapshot = self._snapshot
         if (
-            snapshot.vast_configured
+            snapshot is not None
+            and snapshot.vast_configured
             and ComputeProvider.VAST not in self._pending_providers
-            and not any(row.plan.quote.provider == ComputeProvider.VAST for row in rows)
+            and not any(row.plan.quote.provider == ComputeProvider.VAST for row in self._infra_rows.values())
         ):
-            # Unrentable offers are no longer listed, so this line is the only
-            # thing distinguishing "Vast has nothing for you" from "Vast is
-            # misconfigured".
             status += "\n[dim]No Vast offer can serve this model.[/dim]"
-        if snapshot.errors:
+        if snapshot is not None and snapshot.errors:
             status += "\n[$warning]Partial results:[/$warning] " + escape(
                 "; ".join(snapshot.errors)
             )
         self.query_one("#fast-deploy-status", Static).update(status)
-        if self.focused is None:
-            option_list.focus()
 
     def _take_preferred_index(self, plans: Sequence[InferencePlan], *, default: int) -> int:
         """Index of the relaunch shape among ``plans``; applies only once."""
@@ -1559,16 +1627,36 @@ class FastDeployScreen(CopyEnabledScreen):
             info, models = await asyncio.to_thread(read_catalog)
             if not self.is_attached or self._phase != "models":
                 return
+            previous_by_id = self._model_by_id
             changed = models != self._models
-            if not force and not changed and info == self._catalog_info:
+            if (
+                not force
+                and not changed
+                and info == self._catalog_info
+                and not (self._catalog_refresh_requested and not info.refreshing)
+            ):
                 return
             self._catalog_info = info
+            if not info.refreshing:
+                self._catalog_refresh_requested = False
             self._models = models
             self._model_by_id = {model.id: model for model in models}
             if changed:
-                self._pricing_pending = self._fetch_pending or self._snapshot is not None
-                self._prices.clear()
-                self._shorter_contexts.clear()
+                unchanged_ids = {
+                    model.id
+                    for model in models
+                    if previous_by_id.get(model.id) == model
+                }
+                for stale_id in list(self._prices):
+                    if stale_id not in unchanged_ids:
+                        del self._prices[stale_id]
+                for stale_id in list(self._shorter_contexts):
+                    if stale_id not in unchanged_ids:
+                        del self._shorter_contexts[stale_id]
+                self._pricing_pending = self._fetch_pending or (
+                    self._snapshot is not None
+                    and any(model.id not in self._prices for model in models)
+                )
             initial = self._initial_model_id
             if initial and initial in self._model_by_id:
                 self._initial_model_id = None
@@ -1578,7 +1666,9 @@ class FastDeployScreen(CopyEnabledScreen):
                 self._initial_model_id = None
                 self._preferred_placement = None
             self._render_model_list(preferred_id=preferred_id or self._highlighted_model_id())
-            if self._snapshot is not None:
+            if self._snapshot is not None and any(
+                model.id not in self._prices for model in models
+            ):
                 self._prepare_prices(self._snapshot)
 
         self.run_worker(apply, group="fast-deploy-catalog", exclusive=True)
@@ -1720,13 +1810,23 @@ class FastDeployScreen(CopyEnabledScreen):
         )
         # The source label belongs to the subtitle; repeating it here put the
         # same sentence on screen twice, three lines apart.
-        self.query_one("#fast-deploy-status", Static).update(
-            f"[dim]{count_label} · {view_label}{filter_note}{excluded_note}[/dim]"
+        self._models_status_base = f"[dim]{count_label} · {view_label}{filter_note}{excluded_note}[/dim]"
+        self._update_models_status()
+        self._sync_refresh_spinner()
+        if self.focused is None:
+            option_list.focus()
+
+    def _update_models_status(self) -> None:
+        frame = self._spinner_frame()
+        catalog_refreshing = self._catalog_info.refreshing or self._catalog_refresh_requested
+        status = (
+            self._models_status_base
             + ("\n[$warning]Partial results: " + escape("; ".join(self._snapshot.errors)) + "[/$warning]"
                if self._snapshot is not None and self._snapshot.errors else "")
             + (f"\n[$warning]{escape(self._pricing_error)}[/$warning]" if self._pricing_error else "")
-            + (f"\n[dim]{escape(self._offer_wait_label())}[/dim]" if self._pending_providers
-               else "\n[dim]Pricing live placements…[/dim]"
+            + (f"\n[bold $primary]{frame} Refreshing model catalog…[/]" if catalog_refreshing else "")
+            + (f"\n[bold $primary]{frame}[/] [dim]{escape(self._offer_wait_label())}[/dim]" if self._pending_providers
+               else f"\n[bold $primary]{frame}[/] [dim]Pricing live placements…[/dim]"
                if self._fetch_pending or self._pricing_pending else "")
             # A build that stopped early still publishes what it found. Saying
             # so is the difference between "nothing better exists" and "we ran
@@ -1738,8 +1838,7 @@ class FastDeployScreen(CopyEnabledScreen):
                    1 for exclusion in self._catalog_info.exclusions
                    if exclusion.unchecked)) else "")
         )
-        if self.focused is None:
-            option_list.focus()
+        self.query_one("#fast-deploy-status", Static).update(status)
 
     def _populate_gpu_filter(self, prices: _ModelPrices | None = None) -> None:
         selector = self.query_one("#fast-deploy-gpu-filter", Select)

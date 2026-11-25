@@ -54,6 +54,54 @@ def estimated_monthly_storage_cost_usd(
     return billable_storage_gib_month(size_bytes, free_tier_gib_month) * price_per_gib_month_usd
 
 
+def allocated_monthly_storage_cost_usd(
+    row_size_bytes: int,
+    total_size_bytes: int,
+    price_per_gib_month_usd: float = MODAL_VOLUME_PRICE_PER_GIB_MONTH_USD,
+    free_tier_gib_month: float = MODAL_VOLUME_FREE_TIER_GIB_MONTH,
+) -> float:
+    """Return one cached item's share of estimated monthly cost after the free tier.
+
+    Returns ``0.0`` while total workspace storage stays within Modal's 1 TiB
+    free allowance. Above the free tier, allocates the billable excess
+    proportionally by size so per-row costs sum to the workspace estimate.
+    """
+    row_bytes = max(0, row_size_bytes)
+    total_bytes = max(row_bytes, total_size_bytes)
+    if row_bytes == 0 or total_bytes == 0:
+        return 0.0
+    total_estimated = estimated_monthly_storage_cost_usd(
+        total_bytes,
+        price_per_gib_month_usd=price_per_gib_month_usd,
+        free_tier_gib_month=free_tier_gib_month,
+    )
+    if total_estimated <= 0.0:
+        return 0.0
+    return total_estimated * (row_bytes / total_bytes)
+
+
+def marginal_monthly_storage_savings_usd(
+    removed_size_bytes: int,
+    total_size_bytes: int,
+    price_per_gib_month_usd: float = MODAL_VOLUME_PRICE_PER_GIB_MONTH_USD,
+    free_tier_gib_month: float = MODAL_VOLUME_FREE_TIER_GIB_MONTH,
+) -> float:
+    """Return monthly cost reduction if ``removed_size_bytes`` are deleted."""
+    total_bytes = max(0, total_size_bytes)
+    removed_bytes = min(total_bytes, max(0, removed_size_bytes))
+    before = estimated_monthly_storage_cost_usd(
+        total_bytes,
+        price_per_gib_month_usd=price_per_gib_month_usd,
+        free_tier_gib_month=free_tier_gib_month,
+    )
+    after = estimated_monthly_storage_cost_usd(
+        total_bytes - removed_bytes,
+        price_per_gib_month_usd=price_per_gib_month_usd,
+        free_tier_gib_month=free_tier_gib_month,
+    )
+    return max(0.0, before - after)
+
+
 def estimate_monthly_storage_cost(
     snapshot: StorageSnapshot,
     price_per_gib_month_usd: float = MODAL_VOLUME_PRICE_PER_GIB_MONTH_USD,

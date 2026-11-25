@@ -393,16 +393,31 @@ class QuantQualityFloorTests(unittest.TestCase):
         self.assertEqual({tier.plan.quote.id for tier in tiers}, {"xl", "km"})
 
     def test_an_unlabelled_frontier_is_unchanged(self) -> None:
-        # Curated recipes carry no quant. They must not be read as degraded.
+        # Curated recipes carry no quant. They must not be read as degraded --
+        # or silently dropped from the frontier.
         plans = [
-            _plan("a", price=1.95, single_tps=55.0, aggregate_tps=60.0),
-            _plan("b", price=4.00, single_tps=110.0, aggregate_tps=130.0),
+            _plan("a", price=1.95, single_tps=55.0, aggregate_tps=60.0, quant=None),
+            _plan("b", price=4.00, single_tps=110.0, aggregate_tps=130.0, quant=None),
         ]
 
         tiers = serving_tiers(plans)
 
         self.assertNotIn(SAVER, {tier.key for tier in tiers})
+        self.assertEqual({tier.plan.quote.id for tier in tiers}, {"a", "b"})
         self.assertIsNone(reduced_quality_note(tiers))
+
+    def test_an_unknown_quant_label_is_not_dropped(self) -> None:
+        # A label the parser does not recognize is not evidence of a reduced
+        # width; it belongs on the frontier with the known labels.
+        plans = [
+            _plan("known", price=1.95, single_tps=55.0, aggregate_tps=60.0, quant="Q4_K_M"),
+            _plan("unknown", price=4.00, single_tps=110.0, aggregate_tps=130.0, quant="some-new-format"),
+        ]
+
+        tiers = serving_tiers(plans)
+
+        self.assertEqual({tier.plan.quote.id for tier in tiers}, {"known", "unknown"})
+        self.assertNotIn(SAVER, {tier.key for tier in tiers})
 
 
 class MergedRoleTests(unittest.TestCase):

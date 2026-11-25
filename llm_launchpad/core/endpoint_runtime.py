@@ -245,11 +245,18 @@ class EndpointRuntimeTracker:
                 run_started = live_start
         elif run_started is None:
             # Provisioned rentals bill scheduled uptime even without a metrics
-            # gauge, so the first billable observation opens the run. Modal
-            # never reaches here without a live gauge (handled above).
-            entry["run_id"] = f"observed:{int(moment)}"
-            entry["run_started_at_epoch"] = moment
-            run_started = moment
+            # gauge, so prefer the provider-reported start time when present
+            # and fall back to the first billable observation. Modal never
+            # reaches here without a live gauge (handled above).
+            provider_start = optional_float(row.run_started_at_epoch)
+            effective_start = (
+                provider_start
+                if provider_start is not None and 0 < provider_start <= moment
+                else moment
+            )
+            entry["run_id"] = f"observed:{int(effective_start)}"
+            entry["run_started_at_epoch"] = effective_start
+            run_started = effective_start
 
         # Accrue cost across the interval since the last observation.
         billable_now = True

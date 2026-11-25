@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Generator
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable, Generator
+from concurrent.futures import Future, ThreadPoolExecutor, wait, FIRST_COMPLETED
 import json
 import re
 import time
@@ -33,6 +33,8 @@ _SIZE_TOKEN_RE = re.compile(r"^\s*(?P<num>\d+(?:\.\d+)?)\s*(?P<unit>[A-Za-z]+)?\
 _LLAMACPP_MIN_PLAUSIBLE_GGUF_BYTES = 1024 * 1024
 _LLAMACPP_STORAGE_JSON_BEGIN = "LLM_LAUNCHPAD_STORAGE_JSON_BEGIN"
 _LLAMACPP_STORAGE_JSON_END = "LLM_LAUNCHPAD_STORAGE_JSON_END"
+_VOLUME_WALK_WORKERS = 8
+_DEFAULT_LIST_VOLUME = ModalBackend.list_volume
 
 
 def entry_value(row: dict[str, Any], *keys: str) -> Any:
@@ -103,54 +105,115 @@ def parse_size_bytes(value: Any) -> int:
     return int(number * factors.get(unit, 1))
 
 
+def _is_missing_volume_path_error(err: Any) -> bool:
+    if err is None or getattr(err, "timed_out", False):
+        return False
+    lower_msg = str(getattr(err, "message", "") or "").lower()
+    return "volume" not in lower_msg and any(
+        marker in lower_msg for marker in ("no such file", "path not found")
+    )
+
+
+def _should_skip_volume_dir(root: str, path: str) -> bool:
+    """Skip non-model metadata dirs like /hub/.locks during Hub cache scans."""
+    if root.rstrip("/") != "/hub":
+        return False
+    rel = path.removeprefix("/hub/").strip("/")
+    if not rel:
+        return False
+    top = rel.split("/", 1)[0]
+    return top.startswith(".") or not top.startswith("models--")
+
+
+def _extract_snapshot_revision(path: str) -> str | None:
+    """Extract the HF snapshot revision segment from ``.../snapshots/<rev>/...``."""
+    parts = [part for part in path.strip("/").split("/") if part]
+    for index, part in enumerate(parts):
+        if part.lower() == "snapshots" and index + 1 < len(parts):
+            candidate = parts[index + 1].strip()
+            if candidate:
+                return candidate
+    return None
+
+
+def _file_record_from_entry(parent: str, row: dict[str, Any], path: str) -> dict[str, Any]:
+    entry_type = str(entry_value(row, "type", "kind") or "").strip().lower()
+    return {
+        "path": path,
+        "size_bytes": parse_size_bytes(
+            entry_value(row, "size", "size_bytes", "bytes", "filesize")
+        ),
+        "is_file": True,
+        "is_symlink": entry_type == "symlink",
+    }
+
+
 def walk_volume_files(
     volume_name: str,
     root: str,
     recursive: bool = True,
 ) -> list[dict[str, Any]]:
-    pending = [root]
-    files: list[dict[str, Any]] = []
-    visited: set[str] = set()
-    while pending:
-        current = pending.pop()
-        if current in visited:
-            continue
-        visited.add(current)
-        rows = ModalBackend.list_volume(volume_name, current)
-        if rows is None:
-            err = ModalBackend.last_volume_error()
-            err_msg = err.message if err is not None else ""
-            lower_msg = err_msg.lower()
-            is_missing_path = (
-                err is not None
-                and not err.timed_out
-                and "volume" not in lower_msg
-                and any(marker in lower_msg for marker in ("no such file", "path not found"))
-            )
-            if is_missing_path:
-                rows = []
-            else:
-                raise RuntimeError(
-                    err_msg or f"Failed to list Modal volume '{volume_name}' at {current}."
-                )
-        for row in rows:
-            path = volume_entry_path(current, row)
-            if not path:
-                continue
-            if volume_entry_is_dir(row, path):
-                if path == current or not recursive:
+    # Fast path: one Modal SDK recursive RPC (~0.3s) instead of N sequential CLI
+    # subprocesses. Stay on ModalBackend.list_volume whenever it has been mocked
+    # or replaced (unit tests), or if the SDK call fails for a non-path reason.
+    if recursive and ModalBackend.list_volume is _DEFAULT_LIST_VOLUME:
+        sdk_result = ModalBackend.list_volume_recursive_result(volume_name, root)
+        if sdk_result.success and sdk_result.entries is not None:
+            files: list[dict[str, Any]] = []
+            for row in sdk_result.entries:
+                path = volume_entry_path(root, row)
+                if not path or _should_skip_volume_dir(root, path):
                     continue
-                pending.append(path)
-            else:
-                files.append(
-                    {
-                        "path": path,
-                        "size_bytes": parse_size_bytes(
-                            entry_value(row, "size", "size_bytes", "bytes", "filesize")
-                        ),
-                        "is_file": True,
-                    }
-                )
+                if volume_entry_is_dir(row, path):
+                    continue
+                files.append(_file_record_from_entry(root, row, path))
+            return files
+        if _is_missing_volume_path_error(sdk_result.error):
+            return []
+
+    def list_dir(current: str) -> tuple[str, list[dict[str, Any]] | None, Any]:
+        rows = ModalBackend.list_volume(volume_name, current)
+        err = ModalBackend.last_volume_error() if rows is None else None
+        return current, rows, err
+
+    files = []
+    visited: set[str] = {root}
+    in_flight: set[Future[tuple[str, list[dict[str, Any]] | None, Any]]] = set()
+    max_workers = _VOLUME_WALK_WORKERS if recursive else 1
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        in_flight.add(executor.submit(list_dir, root))
+        while in_flight:
+            done, in_flight = wait(in_flight, return_when=FIRST_COMPLETED)
+            for future in done:
+                current, rows, err = future.result()
+                if rows is None:
+                    if _is_missing_volume_path_error(err):
+                        rows = []
+                    else:
+                        for remaining in in_flight:
+                            remaining.cancel()
+                        err_msg = err.message if err is not None else ""
+                        raise RuntimeError(
+                            err_msg
+                            or f"Failed to list Modal volume '{volume_name}' at {current}."
+                        )
+                for row in rows:
+                    path = volume_entry_path(current, row)
+                    if not path:
+                        continue
+                    if volume_entry_is_dir(row, path):
+                        if (
+                            path == current
+                            or not recursive
+                            or path in visited
+                            or _should_skip_volume_dir(root, path)
+                        ):
+                            continue
+                        visited.add(path)
+                        in_flight.add(executor.submit(list_dir, path))
+                    else:
+                        files.append(_file_record_from_entry(current, row, path))
     return files
 
 
@@ -235,15 +298,25 @@ def list_llamacpp_models_via_backend(
     return sorted(rows, key=lambda row: (row.model_id, row.revision or ""))
 
 
-def list_llamacpp_models_from_volume(
+def _parse_llamacpp_models_from_files(
+    hub_files: list[dict[str, Any]],
     *,
     llamacpp_volume: str = LLAMACPP_STORAGE_VOLUME,
-) -> list[StoredModelInfo]:
-    grouped: dict[tuple[str, str | None], StoredModelInfo] = {}
+) -> tuple[list[StoredModelInfo], bool]:
+    """Parse llama.cpp GGUF entries from scanned ``/hub`` files.
+
+    Returns ``(models, needs_backend_size_refinement)``. Single-quant repos can
+    attribute their real blob size directly without spinning up a remote Modal
+    container; multi-quant repos whose snapshots are symlinks still benefit from
+    remote ``stat()`` refinement for per-quant byte splits.
+    """
+    grouped: dict[tuple[str, str | None, str | None], StoredModelInfo] = {}
     blob_files: dict[str, set[str]] = {}
+    blob_sizes_by_model: dict[str, int] = {}
     incomplete_blob_files: dict[str, set[str]] = {}
     snapshot_gguf_sizes: dict[str, list[int]] = {}
-    hub_files = walk_volume_files(llamacpp_volume, "/hub")
+    snapshot_gguf_has_symlink: dict[str, bool] = {}
+
     for row in hub_files:
         path = str(row.get("path", "")).strip()
         size = int(row.get("size_bytes", 0) or 0)
@@ -263,17 +336,27 @@ def list_llamacpp_models_from_volume(
                     incomplete_blob_files.setdefault(model_id, set()).add(final_blob_name)
             elif blob_name:
                 blob_files.setdefault(model_id, set()).add(blob_name)
+                blob_sizes_by_model[model_id] = blob_sizes_by_model.get(model_id, 0) + size
+            continue
         if not lower_path.endswith(".gguf"):
             continue
+        filename = path.rsplit("/", 1)[-1].lower()
+        if "mmproj" in filename:
+            continue
         snapshot_gguf_sizes.setdefault(model_id, []).append(size)
-        key = (model_id, None)
+        if row.get("is_symlink", False):
+            snapshot_gguf_has_symlink[model_id] = True
+        revision = _extract_snapshot_revision(path)
+        quant_match = _GGUF_QUANT_RE.search(path.upper())
+        quant = quant_match.group(1).upper() if quant_match else None
+        key = (model_id, revision, quant)
         entry = grouped.get(key)
         if entry is None:
             entry = StoredModelInfo(
                 backend=BackendType.LLAMACPP,
                 model_id=model_id,
-                revision=None,
-                quant=None,
+                revision=revision,
+                quant=quant,
                 size_bytes=0,
                 file_count=0,
                 source_volume=llamacpp_volume,
@@ -284,12 +367,13 @@ def list_llamacpp_models_from_volume(
         entry.file_count += 1
         if entry.paths is not None and path not in entry.paths:
             entry.paths.append(path)
-        if entry.quant is None:
-            quant_match = _GGUF_QUANT_RE.search(path.upper())
-            if quant_match:
-                entry.quant = quant_match.group(1).upper()
 
-    for (model_id, _revision), entry in grouped.items():
+    entries_by_model: dict[str, list[StoredModelInfo]] = {}
+    for entry in grouped.values():
+        entries_by_model.setdefault(entry.model_id, []).append(entry)
+
+    needs_backend_refinement = False
+    for model_id, model_entries in entries_by_model.items():
         known_blobs = blob_files.get(model_id, set())
         pending_blobs = incomplete_blob_files.get(model_id, set())
         unresolved_incomplete = any(blob_name not in known_blobs for blob_name in pending_blobs)
@@ -300,26 +384,80 @@ def list_llamacpp_models_from_volume(
             and not known_blobs
         )
         if unresolved_incomplete or tiny_snapshot_without_blob:
-            entry.incomplete = True
+            for entry in model_entries:
+                entry.incomplete = True
 
-    return sorted(grouped.values(), key=lambda row: (row.model_id, row.revision or ""))
+        all_tiny_or_symlink = bool(gguf_sizes) and (
+            snapshot_gguf_has_symlink.get(model_id, False)
+            or all(size < _LLAMACPP_MIN_PLAUSIBLE_GGUF_BYTES for size in gguf_sizes)
+        )
+        blob_total = blob_sizes_by_model.get(model_id, 0)
+        if all_tiny_or_symlink and blob_total > 0:
+            if len(model_entries) == 1:
+                model_entries[0].size_bytes = max(model_entries[0].size_bytes, blob_total)
+            else:
+                needs_backend_refinement = True
+                total_files = sum(max(1, entry.file_count) for entry in model_entries)
+                allocated = 0
+                for index, entry in enumerate(model_entries):
+                    if index == len(model_entries) - 1:
+                        entry.size_bytes = max(0, blob_total - allocated)
+                    else:
+                        share = int(blob_total * (max(1, entry.file_count) / total_files))
+                        entry.size_bytes = share
+                        allocated += share
+
+    models = sorted(
+        grouped.values(),
+        key=lambda row: (row.model_id, row.revision or "", row.quant or ""),
+    )
+    return models, needs_backend_refinement
+
+
+def list_llamacpp_models_from_volume(
+    *,
+    llamacpp_volume: str = LLAMACPP_STORAGE_VOLUME,
+) -> list[StoredModelInfo]:
+    hub_files = walk_volume_files(llamacpp_volume, "/hub")
+    models, _needs_refinement = _parse_llamacpp_models_from_files(
+        hub_files, llamacpp_volume=llamacpp_volume
+    )
+    return models
 
 
 def list_llamacpp_models(
     *,
     llamacpp_volume: str = LLAMACPP_STORAGE_VOLUME,
 ) -> list[StoredModelInfo]:
-    backend_rows = list_llamacpp_models_via_backend(llamacpp_volume=llamacpp_volume)
-    if backend_rows is not None:
+    hub_files = walk_volume_files(llamacpp_volume, "/hub")
+    models, needs_refinement = _parse_llamacpp_models_from_files(
+        hub_files, llamacpp_volume=llamacpp_volume
+    )
+    if needs_refinement:
+        backend_rows = list_llamacpp_models_via_backend(llamacpp_volume=llamacpp_volume)
+        if backend_rows is not None:
+            return _merge_incomplete_flags(backend_rows, models)
+    return models
+
+
+def _merge_incomplete_flags(
+    backend_rows: list[StoredModelInfo],
+    volume_rows: list[StoredModelInfo],
+) -> list[StoredModelInfo]:
+    incomplete_models = {row.model_id for row in volume_rows if row.incomplete}
+    if not incomplete_models:
         return backend_rows
-    return list_llamacpp_models_from_volume(llamacpp_volume=llamacpp_volume)
+    for row in backend_rows:
+        if row.model_id in incomplete_models:
+            row.incomplete = True
+    return backend_rows
 
 
-def list_vllm_models(
+def _parse_vllm_models_from_files(
+    files: list[dict[str, Any]],
     *,
     vllm_volume: str = VLLM_STORAGE_VOLUME,
 ) -> list[StoredModelInfo]:
-    files = walk_volume_files(vllm_volume, "/hub")
     grouped: dict[str, StoredModelInfo] = {}
     blob_files: dict[str, set[str]] = {}
     incomplete_blob_files: dict[str, set[str]] = {}
@@ -390,12 +528,21 @@ def list_vllm_models(
     return sorted(grouped.values(), key=lambda row: row.model_id)
 
 
+def list_vllm_models(
+    *,
+    vllm_volume: str = VLLM_STORAGE_VOLUME,
+) -> list[StoredModelInfo]:
+    files = walk_volume_files(vllm_volume, "/hub")
+    return _parse_vllm_models_from_files(files, vllm_volume=vllm_volume)
+
+
 def stream_list_storage(
     *,
     llamacpp_volume: str = LLAMACPP_STORAGE_VOLUME,
     vllm_volume: str = VLLM_STORAGE_VOLUME,
+    on_partial: Callable[[StorageSnapshot], None] | None = None,
 ) -> EventStream:
-    """List cached model artifacts for both backends."""
+    """List cached model artifacts for both backends in a single fast pass."""
     yield StateChangeEvent(
         current=DeploymentState.RUNNING,
         operation=OperationType.STORAGE_LIST,
@@ -403,15 +550,34 @@ def stream_list_storage(
     )
     scan_started = time.perf_counter()
     try:
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            llamacpp_future = executor.submit(
-                list_llamacpp_models, llamacpp_volume=llamacpp_volume
-            )
-            vllm_future = executor.submit(list_vllm_models, vllm_volume=vllm_volume)
-            snapshot = StorageSnapshot(
-                llamacpp_models=llamacpp_future.result(),
-                vllm_models=vllm_future.result(),
-            )
+        if llamacpp_volume == vllm_volume:
+            shared_files = walk_volume_files(llamacpp_volume, "/hub")
+            llamacpp_files = shared_files
+            vllm_files = shared_files
+        else:
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                llamacpp_future = executor.submit(walk_volume_files, llamacpp_volume, "/hub")
+                vllm_future = executor.submit(walk_volume_files, vllm_volume, "/hub")
+                llamacpp_files = llamacpp_future.result()
+                vllm_files = vllm_future.result()
+
+        llamacpp_models, needs_refinement = _parse_llamacpp_models_from_files(
+            llamacpp_files, llamacpp_volume=llamacpp_volume
+        )
+        vllm_models = _parse_vllm_models_from_files(vllm_files, vllm_volume=vllm_volume)
+        snapshot = StorageSnapshot(
+            llamacpp_models=llamacpp_models,
+            vllm_models=vllm_models,
+        )
+        if needs_refinement:
+            if on_partial is not None:
+                on_partial(snapshot)
+            backend_rows = list_llamacpp_models_via_backend(llamacpp_volume=llamacpp_volume)
+            if backend_rows is not None:
+                snapshot = StorageSnapshot(
+                    llamacpp_models=_merge_incomplete_flags(backend_rows, llamacpp_models),
+                    vllm_models=vllm_models,
+                )
     except Exception as exc:
         yield from fail_operation(
             OperationType.STORAGE_LIST,

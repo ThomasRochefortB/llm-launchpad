@@ -6,8 +6,10 @@ from dataclasses import dataclass
 from typing import Any
 from collections.abc import Callable, Iterable
 
+from rich.cells import cell_len
 from rich.console import JustifyMethod
 from rich.text import Text
+from textual.content import Content
 from textual.coordinate import Coordinate
 from textual.widgets import DataTable
 
@@ -37,6 +39,9 @@ class AdaptiveColumn:
     value: CellFactory
     modes: frozenset[WidthMode]
     width: int | None = None
+    # Hide the column when the terminal is narrower than this width even within
+    # an allowed WidthMode (prevents horizontal clipping around 100 columns).
+    min_terminal_width: int | None = None
     # Hide the column when every row renders one of these values: a column of
     # dashes is noise, and it pushes the useful columns apart.
     empty_values: frozenset[str] = frozenset()
@@ -53,6 +58,7 @@ class AdaptiveColumn:
         value: CellFactory,
         *modes: WidthMode,
         width: int | None = None,
+        min_terminal_width: int | None = None,
         hide_when_empty: bool = False,
         redundant: Callable[[Any], bool] | None = None,
         justify: JustifyMethod = "left",
@@ -63,6 +69,7 @@ class AdaptiveColumn:
             value=value,
             modes=frozenset(modes),
             width=width,
+            min_terminal_width=min_terminal_width,
             empty_values=frozenset({"", "-"}) if hide_when_empty else frozenset(),
             redundant=redundant,
             justify=justify,
@@ -87,12 +94,19 @@ _FIT_MIN_ROWS = 9
 class AdaptiveDataTable(DataTable[Any]):
     """Rebuild visible columns while retaining row data and cursor identity."""
 
-    def __init__(self, *args: Any, fit_to_rows: bool = False, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *args: Any,
+        fit_to_rows: bool = False,
+        min_fit_rows: int = _FIT_MIN_ROWS,
+        **kwargs: Any,
+    ) -> None:
         super().__init__(*args, **kwargs)
         # With `height: 1fr` alone a two-row inventory sat in a box twenty rows
         # tall. Fitting caps the height at the rows plus header and border;
         # the stylesheet's min-height still keeps a usable floor.
         self._fit_to_rows = fit_to_rows
+        self._min_fit_rows = max(4, min_fit_rows)
         self._adaptive_columns: tuple[AdaptiveColumn, ...] = ()
         self._adaptive_rows: tuple[Any, ...] = ()
         self._row_key: RowKeyFactory = lambda row: str(row)
@@ -110,6 +124,10 @@ class AdaptiveDataTable(DataTable[Any]):
             column
             for column in self._adaptive_columns
             if self._profile.width_mode in column.modes
+            and (
+                column.min_terminal_width is None
+                or self._profile.width >= column.min_terminal_width
+            )
             and not column.is_empty_for(self._adaptive_rows)
         ]
 
@@ -132,11 +150,12 @@ class AdaptiveDataTable(DataTable[Any]):
         self._rebuild()
 
     def set_viewport_profile(self, profile: ViewportProfile) -> None:
-        """Change presentation only when the horizontal mode changes."""
-        if self._profile is not None and self._profile.width_mode == profile.width_mode:
-            self._profile = profile
-            return
+        """Rebuild when the horizontal mode or column visibility changes."""
+        previous_keys = self.visible_column_keys
+        previous_mode = self._profile.width_mode if self._profile is not None else None
         self._profile = profile
+        if previous_mode == profile.width_mode and self.visible_column_keys == previous_keys:
+            return
         self._rebuild()
 
     def _highlighted_row_key(self) -> str | None:
@@ -153,20 +172,38 @@ class AdaptiveDataTable(DataTable[Any]):
             return
         highlighted_key = self._highlighted_row_key()
         columns = self._visible_columns()
+        rendered_rows: list[tuple[str, tuple[object, ...]]] = [
+            (
+                self._row_key(row),
+                tuple(_justified(column, column.value(row)) for column in columns),
+            )
+            for row in self._adaptive_rows
+        ]
         self.clear(columns=True)
-        for column in columns:
+        for col_index, column in enumerate(columns):
             label: str | Text = column.label
             if column.justify != "left":
                 label = Text(column.label, justify=column.justify)
-            self.add_column(label, key=column.key, width=column.width)
+            col_width = column.width
+            # DataTable's auto-width only measures str/Text cells, not Textual
+            # Content objects; size columns containing Content cells explicitly
+            # so theme-styled badges and bold labels are never clipped.
+            if col_width is None and any(
+                isinstance(cells[col_index], Content) for _, cells in rendered_rows
+            ):
+                col_width = max(
+                    cell_len(column.label),
+                    *(
+                        cell.cell_length if isinstance(cell, Content) else cell_len(str(cell))
+                        for _, cells in rendered_rows
+                        for cell in (cells[col_index],)
+                    ),
+                )
+            self.add_column(label, key=column.key, width=col_width)
 
         restored_row = 0
-        for index, row in enumerate(self._adaptive_rows):
-            key = self._row_key(row)
-            self.add_row(
-                *(_justified(column, column.value(row)) for column in columns),
-                key=key,
-            )
+        for index, (key, cells) in enumerate(rendered_rows):
+            self.add_row(*cells, key=key)
             if key == highlighted_key:
                 restored_row = index
         if self.row_count:
@@ -175,4 +212,4 @@ class AdaptiveDataTable(DataTable[Any]):
             # Rows, the header, two border rows and a horizontal scrollbar
             # row. An inline cap outranks the stylesheet's min-height, so the
             # floor is restated here rather than inherited.
-            self.styles.max_height = max(self.row_count + 4, _FIT_MIN_ROWS)
+            self.styles.max_height = max(self.row_count + 4, self._min_fit_rows)

@@ -5,10 +5,12 @@ import unittest
 from llm_launchpad.core.storage_costs import (
     MODAL_VOLUME_FREE_TIER_GIB_MONTH,
     MODAL_VOLUME_PRICE_PER_GIB_MONTH_USD,
+    allocated_monthly_storage_cost_usd,
     billable_storage_gib_month,
     estimate_monthly_storage_cost,
     estimated_monthly_storage_cost_usd,
     gross_monthly_storage_cost_usd,
+    marginal_monthly_storage_savings_usd,
     storage_gib_month,
 )
 from llm_launchpad.protocol.enums import BackendType
@@ -71,6 +73,27 @@ class StorageCostTests(unittest.TestCase):
         self.assertAlmostEqual(estimate.gross_monthly_cost_usd, 92.34)
         self.assertEqual(estimate.billable_gib_month, 2.0)
         self.assertAlmostEqual(estimate.estimated_monthly_cost_usd, 0.18)
+
+    def test_allocated_cost_is_zero_within_free_tier_and_sums_above_free_tier(self) -> None:
+        # 126 GiB total stays inside 1 TiB free tier: every row is $0.00/mo.
+        self.assertEqual(allocated_monthly_storage_cost_usd(60 * _GIB, 126 * _GIB), 0.0)
+        self.assertEqual(marginal_monthly_storage_savings_usd(60 * _GIB, 126 * _GIB), 0.0)
+
+        # Above 1 TiB (800 + 400 = 1200 GiB -> 176 GiB billable = $15.84/mo):
+        # proportional shares sum to the exact workspace total.
+        total_bytes = 1200 * _GIB
+        share_a = allocated_monthly_storage_cost_usd(800 * _GIB, total_bytes)
+        share_b = allocated_monthly_storage_cost_usd(400 * _GIB, total_bytes)
+        self.assertAlmostEqual(share_a + share_b, estimated_monthly_storage_cost_usd(total_bytes))
+        self.assertAlmostEqual(
+            marginal_monthly_storage_savings_usd(100 * _GIB, total_bytes),
+            100.0 * MODAL_VOLUME_PRICE_PER_GIB_MONTH_USD,
+        )
+        # Removing 400 GiB from 1200 GiB drops back below 1 TiB, saving the full billable 176 GiB.
+        self.assertAlmostEqual(
+            marginal_monthly_storage_savings_usd(400 * _GIB, total_bytes),
+            estimated_monthly_storage_cost_usd(total_bytes),
+        )
 
 
 if __name__ == "__main__":

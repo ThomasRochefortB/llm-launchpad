@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -48,6 +49,35 @@ class MainMenuStatusRenderTests(unittest.TestCase):
         secondary_timer.stop.assert_called_once_with()
         self.assertIsNone(screen._secondary_refresh_timer)
         refresh_secondary.assert_called_once_with()
+
+    def test_resume_refreshes_billing_after_the_interval(self) -> None:
+        """A deploy flow outlives the billing interval; coming back must refresh."""
+        screen = MainMenuScreen(username="alice")
+        screen._was_suspended = True
+        screen._last_billing_refresh_at = 0.0
+
+        with patch.object(screen, "_resume_refresh_timers"), patch.object(
+            screen, "_refresh_panels"
+        ), patch.object(screen, "_refresh_secondary_panels"), patch.object(
+            screen, "_refresh_billing_panels"
+        ) as refresh:
+            screen.on_screen_resume(Mock())
+
+        refresh.assert_called_once_with()
+
+    def test_resume_keeps_a_recent_billing_reading(self) -> None:
+        screen = MainMenuScreen(username="alice")
+        screen._was_suspended = True
+        screen._last_billing_refresh_at = time.monotonic()
+
+        with patch.object(screen, "_resume_refresh_timers"), patch.object(
+            screen, "_refresh_panels"
+        ), patch.object(screen, "_refresh_secondary_panels"), patch.object(
+            screen, "_refresh_billing_panels"
+        ) as refresh:
+            screen.on_screen_resume(Mock())
+
+        refresh.assert_not_called()
 
     def test_each_provider_row_names_its_own_kind_of_resource(self) -> None:
         """A Vast rental was labelled a Prime pod by a two-way branch."""

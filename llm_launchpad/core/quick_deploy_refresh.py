@@ -13,7 +13,7 @@ import re
 from statistics import median
 import time
 from typing import Any
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from urllib.parse import urlparse
 
 from .artificial_analysis import (
@@ -220,11 +220,37 @@ class _ResolvedAAModel:
     profiles: tuple[QuickDeployProfile, ...]
 
 
+_PARTIAL_PUBLISH_INTERVAL_SECONDS = 0.35
+
+
+def _merge_partial_catalog_profiles(
+    fresh_profiles: Sequence[QuickDeployProfile],
+    previous_profiles: Sequence[QuickDeployProfile],
+) -> tuple[QuickDeployProfile, ...]:
+    """Merge newly resolved profiles onto an existing catalog without shrinking it."""
+    if not previous_profiles:
+        ordered = sorted(fresh_profiles, key=lambda profile: profile.aa_rank or 10**9)
+        return _with_unique_ids(ordered)
+    fresh_ids = {profile.id for profile in fresh_profiles}
+    fresh_repos = {profile.repo_id.casefold() for profile in fresh_profiles if profile.repo_id}
+    kept_previous = [
+        profile
+        for profile in previous_profiles
+        if profile.id not in fresh_ids and profile.repo_id.casefold() not in fresh_repos
+    ]
+    combined = sorted(
+        [*fresh_profiles, *kept_previous],
+        key=lambda profile: profile.aa_rank or 10**9,
+    )
+    return _with_unique_ids(combined)
+
+
 def build_live_quick_deploy_catalog(
     *,
     model_limit: int = DEFAULT_MODEL_LIMIT,
     overall_model_limit: int = DEFAULT_OVERALL_MODEL_LIMIT,
     candidate_limit: int = DEFAULT_CANDIDATE_LIMIT,
+    on_partial: Callable[[QuickDeployCatalogInfo, tuple[QuickDeployProfile, ...]], None] | None = None,
 ) -> tuple[QuickDeployCatalogInfo, tuple[QuickDeployProfile, ...]]:
     """Rebuild the Deploy catalog from the top AAI open models and live pricing."""
 
@@ -232,6 +258,14 @@ def build_live_quick_deploy_catalog(
     normalized_candidate_limit = max(
         normalized_model_limit,
         int(candidate_limit),
+    )
+    previous_cached = (
+        _read_quick_deploy_catalog_cache(_quick_deploy_catalog_cache_path())
+        if on_partial is not None
+        else None
+    )
+    previous_profiles: tuple[QuickDeployProfile, ...] = (
+        previous_cached[1] if previous_cached is not None else ()
     )
     with ThreadPoolExecutor(max_workers=2) as executor:
         rankings_future = executor.submit(
@@ -245,6 +279,37 @@ def build_live_quick_deploy_catalog(
 
     exclusions: list[CatalogExclusion] = []
     if rankings is not None:
+        tier_suffix = f", {rankings.tier} tier" if rankings.tier else ""
+        aa_source_label = (
+            "Artificial Analysis top open models "
+            f"({rankings.freshness}{tier_suffix}) + "
+            f"{'live' if has_live_modal_pricing else 'fallback'} Modal pricing"
+        )
+        aa_attribution = (
+            f"{AA_ATTRIBUTION} Model metadata sourced from Hugging Face; "
+            "GPU pricing sourced from Modal."
+        )
+
+        def publish_aa_partial(
+            partial_profiles: tuple[QuickDeployProfile, ...],
+            partial_exclusions: tuple[CatalogExclusion, ...],
+        ) -> None:
+            if on_partial is None or not partial_profiles:
+                return
+            merged = _merge_partial_catalog_profiles(partial_profiles, previous_profiles)
+            if not merged:
+                return
+            partial_info = QuickDeployCatalogInfo(
+                source_label=aa_source_label,
+                generated_at=_utc_now_iso(),
+                attribution=aa_attribution,
+                is_live=True,
+                ready=True,
+                refreshing=True,
+                exclusions=tuple(sorted(partial_exclusions, key=lambda row: row.rank or 10**9)),
+            )
+            on_partial(partial_info, merged)
+
         profiles = _profiles_from_aa_rankings(
             rankings.candidates,
             modal_gpu_catalog,
@@ -252,8 +317,10 @@ def build_live_quick_deploy_catalog(
             overall_model_limit=max(0, int(overall_model_limit)),
             candidate_limit=normalized_candidate_limit,
             exclusions=exclusions,
+            on_partial=publish_aa_partial if on_partial is not None else None,
         )
         if profiles:
+            publish_aa_partial(profiles, tuple(exclusions))
             try:
                 _, trending = _build_trending_fallback_catalog(
                     model_limit=_FALLBACK_TRENDING_LIMIT, modal_gpu_catalog=modal_gpu_catalog,
@@ -265,18 +332,10 @@ def build_live_quick_deploy_catalog(
                 log_debug(f"Trending discovery unavailable: {exc}")
                 trending = ()
             profiles = _with_unique_ids([*profiles, *trending])
-            tier_suffix = f", {rankings.tier} tier" if rankings.tier else ""
             info = QuickDeployCatalogInfo(
-                source_label=(
-                    "Artificial Analysis top open models "
-                    f"({rankings.freshness}{tier_suffix}) + "
-                    f"{'live' if has_live_modal_pricing else 'fallback'} Modal pricing"
-                ),
+                source_label=aa_source_label,
                 generated_at=_utc_now_iso(),
-                attribution=(
-                    f"{AA_ATTRIBUTION} Model metadata sourced from Hugging Face; "
-                    "GPU pricing sourced from Modal."
-                ),
+                attribution=aa_attribution,
                 is_live=True,
                 exclusions=tuple(sorted(exclusions, key=lambda row: row.rank or 10**9)),
             )
@@ -287,12 +346,24 @@ def build_live_quick_deploy_catalog(
             _write_quick_deploy_catalog_cache(info, profiles)
             return (info, profiles)
 
+    def publish_trending_partial(
+        partial_info: QuickDeployCatalogInfo,
+        partial_profiles: tuple[QuickDeployProfile, ...],
+    ) -> None:
+        if on_partial is None or not partial_profiles:
+            return
+        merged = _merge_partial_catalog_profiles(partial_profiles, previous_profiles)
+        if not merged:
+            return
+        on_partial(replace(partial_info, refreshing=True), merged)
+
     try:
         fallback = _build_trending_fallback_catalog(
             model_limit=max(normalized_model_limit, overall_model_limit),
             modal_gpu_catalog=modal_gpu_catalog,
             has_live_modal_pricing=has_live_modal_pricing,
             exclusions=exclusions,
+            on_partial=publish_trending_partial if on_partial is not None else None,
         )
     except RuntimeError:
         if not exclusions:
@@ -834,6 +905,7 @@ def _profiles_from_aa_rankings(
     exclusions: list[CatalogExclusion] | None = None,
     hub_request_budget: int = DEFAULT_BUDGET,
     overall_model_limit: int = 0,
+    on_partial: Callable[[tuple[QuickDeployProfile, ...], tuple[CatalogExclusion, ...]], None] | None = None,
 ) -> tuple[QuickDeployProfile, ...]:
     """Discover ranked repositories within a request budget, independent of display categories."""
     candidates = _deduped_candidates(candidates)
@@ -889,6 +961,8 @@ def _profiles_from_aa_rankings(
 
     try:
         fill_pending()
+        last_published_at = 0.0
+        published_count = 0
         while pending:
             candidate, future, reasons = pending.popleft()
             resolved = future.result()
@@ -897,6 +971,15 @@ def _profiles_from_aa_rankings(
             if resolved is not None and resolved.repo_id and resolved.repo_id not in seen_repos:
                 seen_repos.add(resolved.repo_id)
                 profiles.extend(resolved.profiles)
+                if on_partial is not None and len(profiles) > published_count:
+                    now = time.monotonic()
+                    if published_count == 0 or now - last_published_at >= _PARTIAL_PUBLISH_INTERVAL_SECONDS:
+                        snapshot = _with_unique_ids(
+                            sorted(profiles, key=lambda profile: profile.aa_rank or 10**9)
+                        )
+                        on_partial(snapshot, tuple(exclusions or ()))
+                        last_published_at = now
+                        published_count = len(profiles)
             fill_pending()
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
@@ -1123,6 +1206,7 @@ def _build_trending_fallback_catalog(
     has_live_modal_pricing: bool,
     skip_repos: set[str] | None = None,
     exclusions: list[CatalogExclusion] | None = None,
+    on_partial: Callable[[QuickDeployCatalogInfo, tuple[QuickDeployProfile, ...]], None] | None = None,
 ) -> tuple[QuickDeployCatalogInfo, tuple[QuickDeployProfile, ...]]:
     models = list_llamacpp_candidates(mode="trending", limit=_FALLBACK_TRENDING_LIMIT)
     if skip_repos:
@@ -1133,7 +1217,30 @@ def _build_trending_fallback_catalog(
             "were available"
         )
 
+    trending_source_label = (
+        "Hugging Face trending GGUF models + "
+        f"{'live' if has_live_modal_pricing else 'fallback'} Modal pricing"
+    )
+    trending_attribution = (
+        "Model metadata sourced from Hugging Face; GPU pricing sourced from Modal."
+    )
+
+    def build_ordered_profiles(by_repo: dict[str, list[QuickDeployProfile]]) -> list[QuickDeployProfile]:
+        ordered: list[QuickDeployProfile] = []
+        selected_count = 0
+        for candidate_model in models:
+            group = by_repo.get(candidate_model.repo_id)
+            if not group:
+                continue
+            ordered.extend(group)
+            selected_count += 1
+            if selected_count >= model_limit:
+                break
+        return ordered
+
     profiles_by_repo: dict[str, list[QuickDeployProfile]] = {}
+    last_published_at = 0.0
+    published_repos = 0
     with ThreadPoolExecutor(max_workers=min(8, len(models))) as executor:
         metadata_futures = {
             executor.submit(_safe_fetch_gguf_metadata, model.repo_id): model
@@ -1163,29 +1270,33 @@ def _build_trending_fallback_catalog(
             )
             if group:
                 profiles_by_repo[model.repo_id] = group
+                if on_partial is not None and len(profiles_by_repo) > published_repos:
+                    now = time.monotonic()
+                    if published_repos == 0 or now - last_published_at >= _PARTIAL_PUBLISH_INTERVAL_SECONDS:
+                        partial_ordered = build_ordered_profiles(profiles_by_repo)
+                        if partial_ordered:
+                            on_partial(
+                                QuickDeployCatalogInfo(
+                                    source_label=trending_source_label,
+                                    generated_at=_utc_now_iso(),
+                                    attribution=trending_attribution,
+                                    is_live=True,
+                                    is_fallback=True,
+                                    exclusions=tuple(exclusions or ()),
+                                ),
+                                tuple(partial_ordered),
+                            )
+                            last_published_at = now
+                            published_repos = len(profiles_by_repo)
 
-    profiles: list[QuickDeployProfile] = []
-    selected_models = 0
-    for model in models:
-        group = profiles_by_repo.get(model.repo_id)
-        if not group:
-            continue
-        profiles.extend(group)
-        selected_models += 1
-        if selected_models >= model_limit:
-            break
+    profiles = build_ordered_profiles(profiles_by_repo)
     if not profiles:
         raise RuntimeError("No deployable profiles could be built from fallback trending models")
 
     info = QuickDeployCatalogInfo(
-        source_label=(
-            "Hugging Face trending GGUF models + "
-            f"{'live' if has_live_modal_pricing else 'fallback'} Modal pricing"
-        ),
+        source_label=trending_source_label,
         generated_at=_utc_now_iso(),
-        attribution=(
-            "Model metadata sourced from Hugging Face; GPU pricing sourced from Modal."
-        ),
+        attribution=trending_attribution,
         is_live=True,
         is_fallback=True,
     )

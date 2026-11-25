@@ -108,10 +108,26 @@ def _default(
             help="Show the installed version and exit.",
         ),
     ] = None,
+    demo: Annotated[
+        bool,
+        typer.Option(
+            "--demo",
+            help="Launch the TUI with fake deployments for local UI iteration (no cloud calls).",
+        ),
+    ] = False,
+    manage: Annotated[
+        bool,
+        typer.Option(
+            "--manage",
+            help="Open directly on the Manage screen (use with --demo).",
+        ),
+    ] = False,
 ) -> None:
     """Launch the TUI when no subcommand is given."""
     if ctx.invoked_subcommand is None:
-        tui()
+        tui(demo=demo, manage=manage)
+    elif demo or manage:
+        raise typer.BadParameter("--demo and --manage apply only when launching the TUI.")
 
 
 # -----------------------------------------------------------------------
@@ -614,10 +630,33 @@ def tui(
             help="Legacy option; terminal-native selection is always enabled.",
         ),
     ] = None,
+    demo: Annotated[
+        bool,
+        typer.Option(
+            "--demo",
+            help="Launch the TUI with fake deployments for local UI iteration (no cloud calls).",
+        ),
+    ] = False,
+    manage: Annotated[
+        bool,
+        typer.Option(
+            "--manage",
+            help="Open directly on the Manage screen (use with --demo).",
+        ),
+    ] = False,
 ) -> None:
     """Interactive terminal UI for deploying and managing LLM backends."""
+    if manage and not demo:
+        raise typer.BadParameter("--manage currently requires --demo.")
     try:
-        from ..tui.app import TuiApp
+        if demo:
+            from ..tui.demo import DemoTuiApp
+
+            app_cls: Any = DemoTuiApp
+        else:
+            from ..tui.app import TuiApp
+
+            app_cls = TuiApp
     except ImportError as exc:
         typer.echo(
             f"Error: Textual is required for the TUI. Install with: pip install textual\n({exc})",
@@ -626,12 +665,17 @@ def tui(
         raise typer.Exit(code=1) from exc
 
     _ensure_tui_runtime()
-    app_instance = TuiApp(mouse_enabled=mouse)
+    app_instance = (
+        app_cls(mouse_enabled=mouse, open_manage=manage)
+        if demo
+        else app_cls(mouse_enabled=mouse)
+    )
     try:
         app_instance.run(mouse=False)
     finally:
-        from ..core.backend import ModalBackend
-        ModalBackend.terminate_all()
+        if not demo:
+            from ..core.backend import ModalBackend
+            ModalBackend.terminate_all()
     # Textual swallows unhandled exceptions: it prints the traceback, sets a
     # return code and lets run() return normally. Reporting success after that
     # hides a crash from anything scripting the CLI.

@@ -123,6 +123,7 @@ class QuickDeployCatalogInfo:
     ready: bool = True
     error: str | None = None
     exclusions: tuple[CatalogExclusion, ...] = ()
+    refreshing: bool = False
 
 
 _PENDING_CATALOG_INFO = QuickDeployCatalogInfo(
@@ -192,6 +193,10 @@ def record_quick_deploy_catalog_failure(error: str) -> bool:
     global _CATALOG_CACHE
     with _CATALOG_LOCK:
         if _CATALOG_CACHE is not None and _CATALOG_CACHE[1]:
+            info, profiles = _CATALOG_CACHE
+            if info.refreshing:
+                _CATALOG_CACHE = (replace(info, refreshing=False), profiles)
+                return True
             return False
         detail = error.strip() or "The live model catalog could not be reached."
         _CATALOG_CACHE = (

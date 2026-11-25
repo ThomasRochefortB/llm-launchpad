@@ -424,6 +424,12 @@ DataTable:focus > .datatable--cursor {
 
 Switch {
     background: $surface;
+    border: tall $foreground 25%;
+}
+
+Switch:focus {
+    border: tall $primary;
+    background: $surface-lighten-1;
 }
 
 Switch > .switch--slider {
@@ -438,7 +444,9 @@ Switch.-on > .switch--slider {
 /* ---- Buttons ---- */
 
 /* Compact 1-row borderless pills across every screen: avoids the double-halo
-   artifact of filled rounded borders and keeps action bars crisp and uniform. */
+   artifact of filled rounded borders and keeps action bars crisp and uniform.
+   Only the focused button earns the solid inverted fill, matching Switch/Input
+   focus chrome so keyboard focus is unmistakable at a glance. */
 Button {
     width: auto;
     min-width: 10;
@@ -447,6 +455,7 @@ Button {
     padding: 0 2;
     background: $panel;
     color: $text;
+    text-style: none;
     border: none;
 }
 
@@ -456,27 +465,27 @@ Button:hover {
 }
 
 Button:focus {
-    background: $primary 30%;
-    color: $primary;
+    background: $primary;
+    color: $background;
     text-style: bold;
 }
 
 Button.-primary {
-    background: $primary;
-    color: $button-color-foreground;
+    background: $primary 20%;
+    color: $primary;
     text-style: bold;
     border: none;
 }
 
 Button.-primary:hover {
-    background: $accent;
-    color: $button-color-foreground;
+    background: $primary 35%;
+    color: $primary;
 }
 
 Button.-primary:focus {
-    background: $accent;
-    color: $button-color-foreground;
-    text-style: bold underline;
+    background: $primary;
+    color: $background;
+    text-style: bold;
 }
 
 /* `variant="error"` adds `-error`. */
@@ -487,7 +496,11 @@ Button.-error {
     border: none;
 }
 
-Button.-error:hover,
+Button.-error:hover {
+    background: $error 35%;
+    color: $error;
+}
+
 Button.-error:focus {
     background: $error;
     color: $background;
@@ -604,14 +617,16 @@ Button.-error:focus {
 /* ---- Quick deploy screen ---- */
 
 #quick-deploy-title {
+    width: 100%;
+    max-width: 100;
     padding: 1 2 0 2;
 }
 
-/* The decision facts, their caution and the Deploy button sit above the
-   scroll container, so none can scroll away on a short terminal. Deploy goes
-   directly under the facts it commits to, left-aligned with them. */
+/* The decision facts, their caution and the action bar sit above the scroll
+   container, so none can scroll away on a short terminal. */
 #quick-deploy-summary {
     width: 100%;
+    max-width: 100;
     height: auto;
     padding: 1 2 1 2;
     layout: vertical;
@@ -620,37 +635,36 @@ Button.-error:focus {
 #quick-vast-note {
     width: 100%;
     height: auto;
-    padding: 0 1;
+    padding: 1 1 0 1;
     text-wrap: wrap;
 }
 
 #quick-deploy-facts {
     width: 1fr;
     height: auto;
-    padding: 0 1;
+    padding: 1 2;
     color: $text;
+    background: $surface;
     text-wrap: wrap;
-    border: round $primary;
+    border: round $foreground 25%;
     border-title-color: $text;
     border-title-style: bold;
 }
 
 #quick-deploy-layout {
     width: 100%;
+    max-width: 100;
     height: 1fr;
     padding: 0 2 1 2;
 }
 
 #quick-deploy-form {
+    width: 100%;
     height: auto;
     padding: 1 2;
+    margin: 0;
     border: round $foreground 20%;
     background: $surface;
-}
-
-#quick-deploy-form {
-    width: 100%;
-    margin: 0 0 0 0;
 }
 
 #quick-deploy-form.-bare {
@@ -668,7 +682,8 @@ Button.-error:focus {
 
 #quick-deploy-btn {
     width: auto;
-    min-width: 16;
+    min-width: 14;
+    margin: 0 2 0 0;
 }
 
 #quick-deploy-profile-title {
@@ -684,6 +699,7 @@ Button.-error:focus {
 
 #toggle-advanced-quick {
     width: auto;
+    min-width: 21;
 }
 
 .viewport-compact #quick-deploy-title,
@@ -692,14 +708,30 @@ Button.-error:focus {
     padding-right: 1;
 }
 
+.viewport-constrained #quick-deploy-facts,
+.viewport-compact #quick-deploy-facts,
+.viewport-short #quick-deploy-facts {
+    padding: 0 1;
+}
+
+.viewport-minimal #quick-deploy-btn {
+    margin: 0 1 0 0;
+}
+
 #quick-deploy-feedback {
-    width: 1fr;
+    width: 100%;
     height: auto;
-    padding: 0 0 0 2;
+    padding: 1 0 0 0;
     text-wrap: wrap;
 }
 
 .viewport-constrained #quick-deploy-actions {
+    padding-top: 1;
+}
+
+.viewport-short #quick-deploy-actions,
+.viewport-short #quick-vast-note,
+.viewport-short #quick-deploy-feedback {
     padding-top: 0;
 }
 
@@ -1017,19 +1049,24 @@ MonitorScreen.connection-ready DeploymentProgressWidget #deploy-progress-next {
     padding: 0 1;
 }
 
-/* Compact 1-row pill buttons sit in a single horizontal bar on desktop widths
-   and wrap into a tight 2-column grid only on compact/minimal viewports. */
+/* Compact 1-row pill buttons sit in a neat 3-column grid on desktop widths
+   (preventing 6 buttons from overflowing `.focused-panel`), 2-column on
+   compact, and stacked vertically on minimal viewports. */
 #connection-info-actions {
     width: 100%;
     height: auto;
-    layout: horizontal;
+    layout: grid;
+    grid-size: 3;
+    grid-rows: 1;
+    grid-gutter: 1 1;
     margin: 1 0 0 0;
 }
 
 #connection-info-actions Button {
+    width: 100%;
     min-width: 0;
     padding: 0 1;
-    margin: 0 1 0 0;
+    margin: 0;
 }
 
 .viewport-compact #connection-info-actions {
@@ -1078,6 +1115,9 @@ MonitorScreen.connection-ready DeploymentProgressWidget #deploy-progress-next {
 
 #manage-status {
     margin: 0 0 1 0;
+    padding: 0 1;
+    background: $surface;
+    border-left: tall $primary;
 }
 
 #manage-tabs {
@@ -1088,9 +1128,18 @@ MonitorScreen.connection-ready DeploymentProgressWidget #deploy-progress-next {
     height: 1fr;
 }
 
+#operations-summary {
+    height: auto;
+    margin: 0 0 1 0;
+    padding: 0 1;
+    background: $surface;
+    border-left: tall $primary;
+}
+
 #deployment-jobs {
     height: 1fr;
     min-height: 3;
+    padding: 0 1;
 }
 
 #manage-endpoint-table {
@@ -1100,9 +1149,24 @@ MonitorScreen.connection-ready DeploymentProgressWidget #deploy-progress-next {
 
 #manage-selection-detail {
     margin-top: 1;
-    padding: 0 1;
+    padding: 0 2;
     background: $surface;
+    border: round $foreground 20%;
+    border-title-color: $primary;
+    border-title-style: bold;
+    text-wrap: wrap;
+}
+
+.viewport-constrained #manage-selection-detail,
+.viewport-short #manage-selection-detail {
+    margin-top: 0;
+    padding: 0 1;
+    border: none;
     border-left: tall $primary;
+}
+
+#manage-action-panel {
+    max-width: 64;
 }
 
 #manage-actions {
@@ -1118,17 +1182,7 @@ MonitorScreen.connection-ready DeploymentProgressWidget #deploy-progress-next {
     padding: 0 1;
     background: $surface;
     border-left: tall $primary;
-}
-
-#manage-action-metrics {
-    width: 100%;
-    height: auto;
-    margin-top: 1;
-    padding: 0 2;
-    border: round $foreground 20%;
-    border-title-color: $text-muted;
-    border-title-style: bold;
-    background: $surface;
+    text-wrap: wrap;
 }
 
 #connection-info-context {
@@ -1334,8 +1388,28 @@ MonitorScreen.connection-ready DeploymentProgressWidget #deploy-progress-next {
    taken their share. */
 #storage-table {
     height: 1fr;
-    min-height: 9;
+    min-height: 5;
     max-height: 100%;
+}
+
+#storage-detail {
+    width: 100%;
+    height: auto;
+    margin-top: 1;
+    padding: 0 2;
+    background: $surface;
+    border: round $foreground 20%;
+    border-title-color: $primary;
+    border-title-style: bold;
+    text-wrap: wrap;
+}
+
+.viewport-constrained #storage-detail,
+.viewport-short #storage-detail {
+    margin-top: 0;
+    padding: 0 1;
+    border: none;
+    border-left: tall $primary;
 }
 
 #storage-hint {
@@ -1348,17 +1422,37 @@ MonitorScreen.connection-ready DeploymentProgressWidget #deploy-progress-next {
     width: 100%;
     height: auto;
     margin: 1 0 0 0;
-    padding: 1 2;
+    padding: 0 2;
     border: round $foreground 20%;
+    border-title-color: $primary;
+    border-title-style: bold;
     background: $surface;
 }
 
-.viewport-compact #storage-filter-row {
+#storage-predownload-options {
+    width: 100%;
+    height: auto;
+    margin-top: 0;
+}
+
+.storage-predownload-col {
+    width: 1fr;
+    height: auto;
+    margin-right: 2;
+}
+
+.storage-predownload-col:last-child {
+    margin-right: 0;
+}
+
+.viewport-compact #storage-filter-row,
+.viewport-compact #storage-predownload-options {
     layout: vertical;
 }
 
 .viewport-compact #storage-provider-group,
-.viewport-compact #storage-backend-group {
+.viewport-compact #storage-backend-group,
+.viewport-compact .storage-predownload-col {
     width: 100%;
     margin-right: 0;
 }
@@ -1439,10 +1533,14 @@ MonitorScreen.connection-ready DeploymentProgressWidget #deploy-progress-next {
     margin-top: 1;
 }
 
+#storage-predownload-actions Button {
+    margin-right: 1;
+}
+
 #storage-predownload-actions Static {
     width: auto;
     height: auto;
-    margin: 1 0 0 1;
+    margin: 0 0 0 1;
     color: $text-muted;
 }
 
@@ -1617,8 +1715,7 @@ MonitorScreen.connection-ready DeploymentProgressWidget #deploy-progress-next {
 
 .viewport-compact .details-card,
 .viewport-compact .focused-form-card,
-.viewport-compact #connection-info-fields,
-.viewport-compact #manage-action-metrics {
+.viewport-compact #connection-info-fields {
     padding: 0 1;
 }
 

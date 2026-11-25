@@ -1580,5 +1580,81 @@ class StableProfileIdentityTests(unittest.TestCase):
         )
 
 
+class ProgressiveCatalogRefreshTests(unittest.TestCase):
+    def test_merge_partial_catalog_profiles_preserves_existing_models_while_updating(self) -> None:
+        from llm_launchpad.core.quick_deploy_refresh import _merge_partial_catalog_profiles
+
+        old_a = replace(_catalog_profile("a"), aa_rank=1, display_name="Model A (old)")
+        old_b = replace(_catalog_profile("b"), aa_rank=2, display_name="Model B")
+        fresh_a = replace(_catalog_profile("a"), aa_rank=1, display_name="Model A (fresh)")
+        fresh_c = replace(_catalog_profile("c"), aa_rank=3, display_name="Model C (new)")
+
+        merged = _merge_partial_catalog_profiles([fresh_a, fresh_c], [old_a, old_b])
+
+        self.assertEqual([p.id for p in merged], [fresh_a.id, old_b.id, fresh_c.id])
+        self.assertEqual(merged[0].display_name, "Model A (fresh)")
+
+    def test_profiles_from_aa_rankings_emits_partial_batches_before_completion(self) -> None:
+        from llm_launchpad.core.artificial_analysis import AAModelCandidate
+        from llm_launchpad.core.quick_deploy_refresh import _ResolvedAAModel, _profiles_from_aa_rankings
+
+        candidates = [
+            AAModelCandidate(
+                aa_model_id=f"aa-{index}",
+                name=f"Model {index}",
+                slug=f"model-{index}",
+                creator_name="Creator",
+                coding_score=90.0 - index,
+                intelligence_score=90.0 - index,
+                rank=index + 1,
+                parameter_count_b=14.0,
+            )
+            for index in range(3)
+        ]
+
+        def fake_resolve(candidate, *_args, **_kwargs):
+            profile = replace(
+                _catalog_profile(candidate.slug),
+                aa_model_id=candidate.aa_model_id,
+                aa_rank=candidate.rank,
+                display_name=candidate.name,
+            )
+            return _ResolvedAAModel(
+                candidate=candidate,
+                repo_id=profile.repo_id,
+                size_bucket="compact",
+                profiles=(profile,),
+            )
+
+        partials: list[tuple[str, ...]] = []
+        with (
+            patch(
+                "llm_launchpad.core.quick_deploy_refresh._resolve_aa_model",
+                side_effect=fake_resolve,
+            ),
+            patch(
+                "llm_launchpad.core.quick_deploy_refresh.RepoMatchStore.load",
+                return_value=SimpleNamespace(get=lambda _k: None, save=lambda: None),
+            ),
+            patch(
+                "llm_launchpad.core.quick_deploy_refresh._PARTIAL_PUBLISH_INTERVAL_SECONDS",
+                0.0,
+            ),
+        ):
+            final = _profiles_from_aa_rankings(
+                candidates,
+                (),
+                model_limit=3,
+                candidate_limit=10,
+                on_partial=lambda profiles, _exclusions: partials.append(
+                    tuple(p.id for p in profiles)
+                ),
+            )
+
+        self.assertGreaterEqual(len(partials), 2)
+        self.assertEqual(len(partials[0]), 1)
+        self.assertEqual(len(final), 3)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -20,7 +20,7 @@ import re
 import shlex
 import time
 from typing import Any
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 
 from ..protocol.enums import (
     BackendType,
@@ -38,7 +38,7 @@ from ..protocol.events import (
 )
 from ..protocol.models import DeploymentConfig, EndpointInfo, SpeculativeDecodingConfig
 from ..protocol.models import BenchmarkConcurrencyResult, BenchmarkConfig
-from ..protocol.models import PlacementAssessment, ServingRequirements, StoredModelInfo
+from ..protocol.models import PlacementAssessment, ServingRequirements, StorageSnapshot, StoredModelInfo
 
 from .benchmark import (
     BENCHMARK_UNAVAILABLE_REASON,
@@ -1385,13 +1385,18 @@ class Orchestrator:
     # Storage (delegated to modal_storage)
     # ------------------------------------------------------------------
 
-    def list_storage(self) -> EventStream:
+    def list_storage(
+        self,
+        *,
+        on_partial: Callable[[StorageSnapshot], None] | None = None,
+    ) -> EventStream:
         """List cached model artifacts for both backends."""
         from .modal_storage import stream_list_storage
 
         yield from stream_list_storage(
             llamacpp_volume=self._LLAMACPP_STORAGE_VOLUME,
             vllm_volume=self._VLLM_STORAGE_VOLUME,
+            on_partial=on_partial,
         )
 
     def predownload_model(
