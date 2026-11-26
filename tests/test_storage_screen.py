@@ -229,14 +229,20 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
             assert isinstance(screen, StorageScreen)
             table = screen.query_one("#storage-table", AdaptiveDataTable)
             self.assertEqual(table.row_count, 2)
+            # The 0.15s spinner interval may tick between mount and the first
+            # assertion on slower/contended runners, so assert against the
+            # frame actually on screen instead of assuming index 0.
+            initial_index = screen._refresh_spinner_index
             status = str(screen.query_one("#storage-status", Static).render())
             self.assertIn("Refreshing…", status)
-            self.assertIn(SUMMARY_SPINNER_FRAMES[0], status)
+            self.assertIn(SUMMARY_SPINNER_FRAMES[initial_index], status)
             self.assertIsNotNone(screen._refresh_spinner_timer)
 
             screen._tick_refresh_spinner()
+            expected_index = (initial_index + 1) % len(SUMMARY_SPINNER_FRAMES)
+            self.assertEqual(screen._refresh_spinner_index, expected_index)
             next_status = str(screen.query_one("#storage-status", Static).render())
-            self.assertIn(SUMMARY_SPINNER_FRAMES[1], next_status)
+            self.assertIn(SUMMARY_SPINNER_FRAMES[expected_index], next_status)
 
             screen.post_message(StorageLoaded(snapshot=snapshot, is_stale=False))
             await pilot.pause()
