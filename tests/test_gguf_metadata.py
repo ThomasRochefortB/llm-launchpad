@@ -161,6 +161,30 @@ class GgufMetadataTests(unittest.TestCase):
         self.assertEqual(metadata.context_length, 131_072)
         self.assertEqual(ranges, [(0, 63), (64, 191), (192, 447), (448, 799)])
 
+    def test_incremental_serving_reader_resumes_mid_string_array_across_chunks(self) -> None:
+        payload = _gguf_metadata([
+            ("general.architecture", 8, "qwen35"),
+            ("tokenizer.ggml.tokens", 9, [f"tok-{i:04d}" for i in range(60)]),
+            ("qwen35.context_length", 4, 262_144),
+            ("qwen35.nextn_predict_layers", 4, 1),
+        ])
+        with patch.object(
+            gguf_metadata,
+            "_fetch_hf_file_range",
+            side_effect=lambda *args, start, end, **kwargs: payload[start : end + 1],
+        ):
+            metadata = fetch_gguf_serving_metadata(
+                "org/model",
+                [SimpleNamespace(rfilename="model.gguf")],
+                chunk_bytes=96,
+                max_bytes=4096,
+            )
+        self.assertIsNotNone(metadata)
+        assert metadata is not None
+        self.assertEqual(metadata.architecture, "qwen35")
+        self.assertEqual(metadata.context_length, 262_144)
+        self.assertEqual(metadata.nextn_predict_layers, 1)
+
     def test_growing_header_reads_never_exceed_inspection_limit(self) -> None:
         payload = _gguf_metadata([
             ("general.architecture", 8, "llama"),

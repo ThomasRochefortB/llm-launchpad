@@ -8,6 +8,9 @@ from html.parser import HTMLParser
 import threading
 import time
 
+import requests as _requests_mod
+from requests.adapters import HTTPAdapter
+
 from .shutdown import is_shutting_down
 
 import html
@@ -135,6 +138,21 @@ _CATALOG_CACHE: dict[
 ] = {}
 _CATALOG_FLIGHTS: dict[tuple[str, str], _CatalogFlight] = {}
 _CATALOG_LOCK = threading.Lock()
+_ORIGINAL_REQUESTS_GET = _requests_mod.get
+_MODAL_SESSION_LOCK = threading.Lock()
+_MODAL_SESSION: _requests_mod.Session | None = None
+
+
+def _modal_http_session() -> _requests_mod.Session:
+    global _MODAL_SESSION
+    with _MODAL_SESSION_LOCK:
+        if _MODAL_SESSION is None:
+            session = _requests_mod.Session()
+            adapter = HTTPAdapter(pool_connections=4, pool_maxsize=4)
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+            _MODAL_SESSION = session
+        return _MODAL_SESSION
 
 
 def fetch_modal_gpu_types(
@@ -433,7 +451,8 @@ def _fetch_modal_page_text(url: str, timeout: float) -> str:
         ) from exc
 
     try:
-        response = requests.get(url, timeout=timeout, headers=_REQUEST_HEADERS)
+        http_get = _modal_http_session().get if requests.get is _ORIGINAL_REQUESTS_GET else requests.get
+        response = http_get(url, timeout=timeout, headers=_REQUEST_HEADERS)
     except Exception as exc:
         if is_shutting_down():
             raise RuntimeError("Shutdown requested") from exc

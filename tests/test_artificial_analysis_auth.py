@@ -115,6 +115,38 @@ class ArtificialAnalysisAuthTests(unittest.TestCase):
         self.assertEqual(status.tier, "free")
         fetch.assert_called_once_with("secret-key")
 
+    def test_catalog_load_reuses_fresh_disk_cache_without_authenticating_key(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            cache_path = Path(temporary_directory) / "aa.json"
+            _write_aa_cache(
+                cache_path,
+                _aa_payload(tier="free"),
+                fetched_at=datetime.now(UTC),
+            )
+            _reset_artificial_analysis_auth_status_cache()
+            with patch(
+                "llm_launchpad.core.artificial_analysis.fetch_artificial_analysis_models",
+                return_value=_aa_payload(tier="pro"),
+            ) as fetch:
+                rankings = _load_aa_rankings(
+                    api_key="secret-key",
+                    cache_path=cache_path,
+                    verify_key=False,
+                )
+                self.assertIsNotNone(rankings)
+                assert rankings is not None
+                self.assertEqual(rankings.freshness, "cached")
+                fetch.assert_not_called()
+                # Auth verification still validates the key live after restart.
+                status = get_artificial_analysis_auth_status(
+                    api_key="secret-key",
+                    cache_path=cache_path,
+                )
+
+        self.assertTrue(status.authenticated)
+        self.assertEqual(status.tier, "pro")
+        fetch.assert_called_once_with("secret-key")
+
     def test_invalid_key_returns_clear_error(self) -> None:
         with TemporaryDirectory() as temporary_directory, patch(
             "llm_launchpad.core.artificial_analysis.fetch_artificial_analysis_models",

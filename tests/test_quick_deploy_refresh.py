@@ -1712,6 +1712,153 @@ class ProgressiveCatalogRefreshTests(unittest.TestCase):
         self.assertEqual(len(partials[0]), 1)
         self.assertEqual(len(final), 3)
 
+    def test_unsloth_index_matches_without_hub_searches_and_skips_missing_mtp_probes(self) -> None:
+        from llm_launchpad.core.quick_deploy_refresh import (
+            _active_unsloth_gguf_index,
+            _build_unsloth_gguf_index,
+            _verified_mtp_variant,
+        )
+
+        index = _build_unsloth_gguf_index(
+            [
+                "unsloth/Qwen3-32B-GGUF",
+                "unsloth/Some-Other-Model",
+                "unsloth/Qwen3.5-27B-GGUF",
+            ]
+        )
+
+        class _NoNetworkApi:
+            def model_info(self, **_kwargs: object) -> object:
+                raise AssertionError("index match must not call model_info")
+
+            def list_models(self, **_kwargs: object) -> list[object]:
+                raise AssertionError("index match must not call list_models")
+
+        with _active_unsloth_gguf_index(index):
+            matched = _find_unsloth_gguf_match(_aa_candidate("Qwen3 32B", 32, 85), _NoNetworkApi())
+            missed = _find_unsloth_gguf_match(_aa_candidate("Closed Frontier", 100, 95), _NoNetworkApi())
+            mtp_meta = GgufQuantMetadata(
+                quantizations=["Q4_K_M"],
+                vram_gb_by_quant={"Q4_K_M": 16.0},
+                architecture="qwen35",
+            )
+            with patch("llm_launchpad.core.quick_deploy_refresh.fetch_gguf_quant_metadata") as fetch_mtp:
+                variant = _verified_mtp_variant("unsloth/Qwen3.5-27B-GGUF", mtp_meta, None)
+
+        self.assertEqual(matched, "unsloth/Qwen3-32B-GGUF")
+        self.assertIsNone(missed)
+        self.assertIsNone(variant)
+        fetch_mtp.assert_not_called()
+
+    def test_non_mtp_repo_reuses_verified_header_across_quants_while_mtp_arch_checks_all(self) -> None:
+        from llm_launchpad.core import hf_models
+        from llm_launchpad.protocol.models import GgufArtifact
+
+        hf_models._pinned_gguf_header.cache_clear()
+        revision = "a" * 40
+        artifacts = {
+            "UD-Q4_K_XL": GgufArtifact(revision, (("model-UD-Q4_K_XL.gguf", 10_000_000_000),)),
+            "Q6_K": GgufArtifact(revision, (("model-Q6_K.gguf", 14_000_000_000),)),
+            "Q8_0": GgufArtifact(revision, (("model-Q8_0.gguf", 18_000_000_000),)),
+        }
+
+        def make_meta(arch: str) -> GgufQuantMetadata:
+            layout = GgufServingMetadata(
+                source_file="model-UD-Q4_K_XL.gguf",
+                architecture=arch,
+                context_length=32_768,
+                block_count=32,
+                embedding_length=4096,
+                attention_head_count=32,
+                attention_head_count_kv=8,
+                attention_key_length=128,
+                attention_value_length=128,
+            )
+            return GgufQuantMetadata(
+                quantizations=list(artifacts),
+                vram_gb_by_quant={k: v.size_bytes / 1e9 for k, v in artifacts.items()},
+                architecture=arch,
+                context_length=32_768,
+                block_count=32,
+                embedding_length=4096,
+                attention_head_count=32,
+                attention_head_count_kv=8,
+                attention_key_length=128,
+                attention_value_length=128,
+                serving_metadata=layout,
+                artifacts_by_quant=artifacts,
+            )
+
+        from llm_launchpad.core.quick_deploy_refresh import _profiles_for_model
+
+        gpus = [ModalGpuSpec("L40S", 1.95)]
+        with patch("llm_launchpad.core.quick_deploy_refresh._fetch_quant_layout") as fetch_quant:
+            llama_profiles = _profiles_for_model(
+                ModelCandidate(repo_id="unsloth/Llama-Test-GGUF"),
+                gpus,
+                metadata=make_meta("llama"),
+                prefer_mtp=False,
+            )
+        self.assertEqual(fetch_quant.call_count, 0)
+        self.assertEqual({p.quant for p in llama_profiles}, {"UD-Q4_K_XL", "Q6_K", "Q8_0"})
+
+        qwen_meta = make_meta("qwen35")
+        with patch(
+            "llm_launchpad.core.quick_deploy_refresh._fetch_quant_layout",
+            side_effect=lambda repo_id, metadata, artifact: metadata,
+        ) as fetch_quant:
+            qwen_profiles = _profiles_for_model(
+                ModelCandidate(repo_id="unsloth/Qwen35-Test-GGUF"),
+                gpus,
+                metadata=qwen_meta,
+                prefer_mtp=False,
+            )
+        self.assertEqual(fetch_quant.call_count, 2)
+        self.assertEqual({p.quant for p in qwen_profiles}, {"UD-Q4_K_XL", "Q6_K", "Q8_0"})
+
+    def test_persistent_gguf_header_cache_avoids_re_reading_immutable_headers(self) -> None:
+        from llm_launchpad.core import hf_models
+
+        hf_models._pinned_gguf_header.cache_clear()
+        revision = "b" * 40
+        layout = GgufServingMetadata(
+            source_file="model-Q4_K_M.gguf",
+            architecture="llama",
+            context_length=65_536,
+            block_count=32,
+            attention_head_count=32,
+            attention_head_count_kv=8,
+            attention_key_length=128,
+            attention_value_length=128,
+        )
+        with TemporaryDirectory() as directory:
+            cache_path = Path(directory) / "gguf_header_cache.json"
+            cache = hf_models.GgufHeaderCache.load(path=cache_path)
+            with (
+                hf_models.active_gguf_header_cache(cache),
+                patch(
+                    "llm_launchpad.core.hf_models.fetch_gguf_serving_metadata",
+                    return_value=layout,
+                ) as fetch_header,
+            ):
+                first = hf_models._pinned_gguf_header("unsloth/Test-GGUF", revision, "model-Q4_K_M.gguf")
+            cache.save(path=cache_path)
+            self.assertEqual(first, layout)
+            self.assertEqual(fetch_header.call_count, 1)
+
+            # Simulate a process restart: clear in-memory cache and reload from disk.
+            hf_models._pinned_gguf_header.cache_clear()
+            reloaded = hf_models.GgufHeaderCache.load(path=cache_path)
+            with (
+                hf_models.active_gguf_header_cache(reloaded),
+                patch(
+                    "llm_launchpad.core.hf_models.fetch_gguf_serving_metadata",
+                    side_effect=AssertionError("should hit disk header cache"),
+                ),
+            ):
+                second = hf_models._pinned_gguf_header("unsloth/Test-GGUF", revision, "model-Q4_K_M.gguf")
+            self.assertEqual(second, layout)
+
 
 if __name__ == "__main__":
     unittest.main()
