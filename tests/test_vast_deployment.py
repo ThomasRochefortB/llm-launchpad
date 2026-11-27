@@ -11,7 +11,10 @@ from unittest.mock import Mock, patch
 
 from llm_launchpad.core.orchestrator import Orchestrator
 from llm_launchpad.core.connection_store import merge_connections
+from llm_launchpad.core.quick_deploy import build_quick_deploy_config
+from llm_launchpad.core.runtime_support import load_llamacpp_support_manifest
 from llm_launchpad.core.vast_backend import VastApiError, VastBackend
+from llm_launchpad.core.vast_comparison import vast_offers_for_model, vast_plan_for_offer
 from llm_launchpad.core.vast_deployment import (
     VAST_PULL_STALL_SECONDS, VAST_READY_DEADLINE_SECONDS, VAST_SSH_STALL_SECONDS,
     VAST_KEY_GRACE_SECONDS,
@@ -26,8 +29,8 @@ from llm_launchpad.core.vast_ssh import (
 from llm_launchpad.core.vast_state import VastState
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider, OperationType
 from llm_launchpad.protocol.events import LogEvent, OperationCompleteEvent
-from llm_launchpad.protocol.models import DeploymentConfig, VastAuthStatus, VastInstance, VastProviderOptions
-from tests.test_vast_fast_deploy import vast_offer
+from llm_launchpad.protocol.models import DeploymentConfig, GgufArtifact, VastAuthStatus, VastInstance, VastProviderOptions
+from tests.test_vast_fast_deploy import comparison_model, vast_offer
 
 
 class InstantEvent(threading.Event):
@@ -293,6 +296,37 @@ class VastLifecycleTests(unittest.TestCase):
         self.config.required_vram_gb = 50
         self.assertFalse(self.deploy().success)
         self.api.create_instance.assert_not_called()
+
+    def test_vast_revalidates_the_pinned_catalog_plan_before_renting(self) -> None:
+        artifact = GgufArtifact("2" * 40, (("model-Q4_K_M.gguf", 40 * 1024**3),))
+        model = comparison_model(weights=40, total=44.5)
+        profile = replace(
+            model.profiles[0], gguf_artifact=artifact, gguf_architecture="llama",
+            llamacpp_runtime_id=load_llamacpp_support_manifest().runtime_id,
+        )
+        offer = vast_offer(gpu_name="L40S", gpu_ram=49_152)
+        (row,) = vast_offers_for_model(replace(model, profiles=(profile,)), (offer,))
+        plan = vast_plan_for_offer(row, profile)
+        assert plan is not None
+        self.config = build_quick_deploy_config(profile, plan=plan)
+        self.assertEqual(row.download_gb, artifact.size_bytes / 1e9)
+        self.assertEqual(plan.quote.gpu_memory_gb, 46_068 / 1024)
+
+        self.api.get_offer.return_value = vast_offer(gpu_name="L40S", gpu_ram=44_000)
+        failed = self.deploy()
+        self.assertFalse(failed.success)
+        self.assertIn("no longer fits", failed.detail)
+        self.api.create_instance.assert_not_called()
+
+        self.api.get_offer.return_value = offer
+        self.gpu_inventory = "0, NVIDIA L40S, 46068, 0, 46068, 00000000:01:00.0"
+        succeeded = self.deploy()
+        self.assertTrue(succeeded.success, succeeded.detail)
+        self.api.create_instance.assert_called_once()
+        script = next(call.kwargs["input_text"] for call in self.ssh.run.call_args_list if "input_text" in call.kwargs)
+        self.assertIn(f"/resolve/{artifact.revision}/", script)
+        self.assertIn("--model", script)
+        self.assertNotIn("--hf-repo", script)
 
     def test_a_reporting_host_that_goes_silent_is_given_back(self) -> None:
         """A host that reports a step and never leaves it is stuck, not slow.

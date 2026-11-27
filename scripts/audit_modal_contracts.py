@@ -197,13 +197,11 @@ def audit_placement_sweep(
             runtime_tuning=tuning,
             memory_estimate=memory,
         )
-        per_dev_overhead = memory.compute_gb + memory.attention_scratch_gb
         best = _select_gpu_shape(
             profile.quant,
             memory.total_gb,
             specs,
-            per_device_overhead_gb=per_dev_overhead,
-            layer_count=layers,
+            memory_estimate=memory,
         )
         if best is not None:
             summary_rows.append(
@@ -228,8 +226,7 @@ def audit_placement_sweep(
                 memory.total_gb,
                 specs,
                 gpu_type=gpu_type,
-                per_device_overhead_gb=per_dev_overhead,
-                layer_count=layers,
+                memory_estimate=memory,
             )
             live_count = _placement_gpu_count(placement, memory.total_gb, memory_estimate=memory)
             expected = catalog_for_gpu.gpu_count if catalog_for_gpu is not None else None

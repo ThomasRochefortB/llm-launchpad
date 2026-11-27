@@ -127,10 +127,12 @@ class FingerprintAndCalibrationTests(unittest.TestCase):
 
         common = {
             "model_id": "org/model",
-            "revision": None,
+            "revision": "a" * 40,
             "quant": "Q4_K_M",
             "runtime_id": "runtime-1",
             "requirements": serving_requirements(131_072),
+            "gpu_type": "L4",
+            "gpu_count": 1,
         }
         plain = tuning_for_objective(ServingObjective.GENERAL_PURPOSE)
         speculative = tuning_for_objective(

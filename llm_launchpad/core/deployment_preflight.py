@@ -74,6 +74,13 @@ def validate_request(request: DeploymentRequest) -> tuple[PreflightFinding, ...]
     provider_name = request.provider.display_name
 
     llama = request.llamacpp
+    if llama.gguf_artifact is not None and (
+        request.backend != BackendType.LLAMACPP or not llama.repo_id or not llama.quant or llama.preset
+        or (llama.revision is not None and llama.revision != llama.gguf_artifact.revision)
+    ):
+        findings.append(PreflightFinding(
+            "gguf-artifact-mismatch", "The selected GGUF files do not match the requested model revision.",
+        ))
     if llama.dspark or llama.dspark_repo or llama.dspark_file:
         if request.provider != ComputeProvider.MODAL or request.backend != BackendType.LLAMACPP:
             findings.append(PreflightFinding("dspark-provider", "DSpark requires Modal with llama.cpp."))
@@ -81,6 +88,7 @@ def validate_request(request: DeploymentRequest) -> tuple[PreflightFinding, ...]
             not (llama.repo_id or "").strip()
             or not (llama.quant or "").strip()
             or request.serving_requirements is not None
+            or llama.gguf_artifact is not None
         ):
             findings.append(PreflightFinding(
                 "dspark-target", "DSpark requires a Hugging Face target repo and quantization in Advanced Deploy.",
@@ -174,7 +182,7 @@ def validate_request(request: DeploymentRequest) -> tuple[PreflightFinding, ...]
         if request.backend == BackendType.VLLM
         else request.llamacpp.revision
     )
-    if revision and request.backend not in caps.pinned_revision_backends:
+    if revision and request.backend not in caps.pinned_revision_backends and llama.gguf_artifact is None:
         if request.provider == ComputeProvider.PRIME and request.backend == BackendType.LLAMACPP:
             message = (
                 "Prime llama.cpp currently supports only the default Hugging Face revision."
@@ -471,9 +479,10 @@ def resolve_engram_table(
     from .gguf_metadata import fetch_gguf_ple_tensor_info
 
     api = HfApi()
+    pinned = config.gguf_artifact
     target = api.model_info(
         target_repo,
-        revision=config.revision,
+        revision=pinned.revision if pinned else config.revision,
         files_metadata=True,
         timeout=15,
     )
@@ -483,8 +492,8 @@ def resolve_engram_table(
 
     quant_folded = quant.casefold()
     siblings = list(target.siblings or [])
-    matched_shards: list[tuple[str, int | None]] = []
-    for sibling in siblings:
+    matched_shards: list[tuple[str, int | None]] = list(pinned.files) if pinned else []
+    for sibling in siblings if pinned is None else ():
         rfilename = str(getattr(sibling, "rfilename", "") or "").strip()
         if not rfilename or not is_target_gguf(rfilename):
             continue

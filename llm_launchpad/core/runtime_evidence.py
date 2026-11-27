@@ -151,7 +151,7 @@ def remembered_attestation_evidence(attestation: Any) -> LlamacppRuntimeEvidence
     why it is graded here rather than treated as proof of the running process.
     """
 
-    if attestation is None:
+    if attestation is None or getattr(attestation, "residency_evidence", None) != EvidenceLevel.OBSERVED:
         return LlamacppRuntimeEvidence()
     gpu_layers = getattr(attestation, "gpu_layers", None)
     total_layers = getattr(attestation, "total_layers", None)

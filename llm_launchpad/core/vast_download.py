@@ -6,10 +6,10 @@ import re
 
 from huggingface_hub import HfApi
 
+from ..gguf_files import GGUF_SHARD_RE
 from ..protocol.enums import BackendType
 from ..protocol.models import DeploymentConfig
 
-_SPLIT_GGUF = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$", re.IGNORECASE)
 _BLOB = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$", re.IGNORECASE)
 _PARTIAL_SUFFIXES = (".downloadInProgress", ".incomplete")
 
@@ -33,6 +33,15 @@ def fetch_download_files(config: DeploymentConfig) -> tuple[DownloadFile, ...]:
     repo = config.repo_id if config.backend == BackendType.LLAMACPP else config.model_name
     if not repo:
         return ()
+    if artifact := config.gguf_artifact:
+        from .serving_runtime import pinned_gguf_directory
+
+        root = PurePosixPath("gguf") / pinned_gguf_directory(repo, artifact)
+        excluded = config.engram_table.replaced_shard if config.engram_table else None
+        return tuple(
+            DownloadFile(str(root / name), size, str(root / artifact.entrypoint))
+            for name, size in artifact.files if name != excluded
+        )
     try:
         revision = (
             (config.model_revision or config.revision)
@@ -46,7 +55,7 @@ def fetch_download_files(config: DeploymentConfig) -> tuple[DownloadFile, ...]:
         incomplete: set[str] = set()
         for sibling in info.siblings or ():
             name, size = sibling.rfilename, sibling.size
-            split = _SPLIT_GGUF.fullmatch(name)
+            split = GGUF_SHARD_RE.fullmatch(name)
             if name.endswith(".gguf"):
                 group = split[1] if split else name
             elif name.endswith((".safetensors", ".bin")):
@@ -61,7 +70,7 @@ def fetch_download_files(config: DeploymentConfig) -> tuple[DownloadFile, ...]:
             files.append(DownloadFile(f"{cache}/{oid}", size, group))
         # A missing shard size must not turn a partial manifest into 100%.
         for sibling in info.siblings or ():
-            split = _SPLIT_GGUF.fullmatch(sibling.rfilename)
+            split = GGUF_SHARD_RE.fullmatch(sibling.rfilename)
             if split and sum(file.group == split[1] for file in files) != int(split[3]):
                 incomplete.add(split[1])
         return tuple(file for file in files if file.group not in incomplete)
@@ -89,6 +98,8 @@ def measure_download(output: str, files: tuple[DownloadFile, ...]) -> DownloadPr
         partial = path.endswith(_PARTIAL_SUFFIXES)
         if partial:
             path = path.rsplit(".", 1)[0]
+            if path.startswith("gguf/pinned/"):
+                path = path.rsplit(".", 1)[0]  # unique suffix of the staging temporary file
             # Xet can preallocate sparse files: logical length is not progress.
             size = min(size, blocks * 512)
         previous = observed.get(path)

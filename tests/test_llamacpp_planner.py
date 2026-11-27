@@ -7,12 +7,16 @@ from dataclasses import replace
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
-from llm_launchpad.core.hf_models import GgufQuantMetadata
+from llm_launchpad.core.gguf_metadata import GgufMtpCapability, GgufMtpStatus, GgufServingMetadata
+from llm_launchpad.core.hf_models import GgufQuantMetadata, ModelCandidate
 from llm_launchpad.core.llamacpp_planner import (
     assess_placement,
+    bytes_to_gib,
     compile_server_args,
     estimate_memory,
     load_runtime_attestation,
+    memory_fits_device,
+    memory_on_topology,
     predict_performance,
     save_runtime_attestation,
     QUANTIZED_KV_ARCHITECTURES,
@@ -24,8 +28,17 @@ from llm_launchpad.core.llamacpp_planner import (
     tuning_for_gpu_memory,
     tuning_for_objective,
 )
+from llm_launchpad.core.modal_gpu import ModalGpuSpec, modal_gpu_capacity_gib
+from llm_launchpad.core.quick_deploy import (
+    build_quick_deploy_config,
+    list_quick_deploy_models,
+    model_for_context,
+    resolve_quick_deploy_plans,
+    retune_quick_deploy_plan,
+)
+from llm_launchpad.core.quick_deploy_refresh import _profiles_for_model
 from llm_launchpad.protocol.enums import CertificationState, ServingObjective
-from llm_launchpad.protocol.models import RuntimeAttestation, RuntimeTuning
+from llm_launchpad.protocol.models import GgufArtifact, RuntimeAttestation, RuntimeTuning
 
 
 class LlamaCppPlannerTests(unittest.TestCase):
@@ -78,7 +91,7 @@ class LlamaCppPlannerTests(unittest.TestCase):
             tuning=tuning,
         )
 
-        self.assertAlmostEqual(memory.kv_cache_gb, 4.295, places=3)
+        self.assertEqual(memory.kv_cache_gb, 4.0)
         self.assertEqual(memory.total_layer_count, 32)
         self.assertEqual(memory.source, "gguf-metadata")
         self.assertGreater(memory.total_gb, memory.weights_gb + memory.kv_cache_gb)
@@ -293,6 +306,84 @@ class LlamaCppPlannerTests(unittest.TestCase):
 
 
 
+class CatalogGgufLayoutTests(unittest.TestCase):
+    def test_gemma4_uses_mixed_attention_and_shared_kv_at_native_context(self) -> None:
+        # Public Gemma 4 headers and b12464 CUDA allocation projections.
+        l40s = modal_gpu_capacity_gib("L40S")
+        l4 = modal_gpu_capacity_gib("L4")
+        assert l40s is not None and l4 is not None
+        for block_count, shared, kv_heads, window, context, cache_mib in (
+            (60, 0, (16, 16, 16, 16, 16, 4) * 10, 1024, 262_144, 24080),
+            (42, 18, (2,) * 42, 512, 131_072, 2148),
+        ):
+            with self.subTest(block_count=block_count):
+                layout = GgufServingMetadata(
+                    architecture="gemma4", block_count=block_count,
+                    attention_head_count_kv_by_layer=kv_heads, attention_key_length=512,
+                    attention_value_length=512, attention_key_length_swa=256,
+                    attention_value_length_swa=256, sliding_window=window, shared_kv_layers=shared,
+                    sliding_window_pattern=(True, True, True, True, True, False) * (block_count // 6),
+                )
+                memory = estimate_memory(
+                    GgufQuantMetadata([], {}, architecture="gemma4", serving_metadata=layout),
+                    weights_gb=bytes_to_gib(18_822_970_304),
+                    requirements=serving_requirements(context),
+                    tuning=tuning_for_objective(ServingObjective.GENERAL_PURPOSE),
+                )
+                self.assertEqual(memory.kv_cache_gb, cache_mib / 1024)
+                self.assertEqual(memory.layer_cache_bytes.count(0), shared)
+                if block_count == 60:
+                    self.assertTrue(memory_fits_device(memory_on_topology(memory, 1, l40s), l40s))
+                    self.assertFalse(memory_fits_device(memory_on_topology(memory, 2, l4), l4))
+
+    def test_qwen_hybrid_retuning_keeps_artifact_and_recomputes_recurrent_state(self) -> None:
+        revision = "4af51b3542f775b0a8e4b310bfb3f17e01c306c9"
+        quant = "UD-Q4_K_XL"
+        filename = f"Qwen3.8-27B-{quant}.gguf"
+        artifact = GgufArtifact(revision, ((filename, 17_659_407_264),))
+        layout = GgufServingMetadata(
+            architecture="qwen35", context_length=262_144, block_count=65, embedding_length=5120,
+            attention_head_count=24, attention_head_count_kv=4, attention_key_length=256,
+            attention_value_length=256, source_file=filename, nextn_predict_layers=1,
+            full_attention_interval=4, ssm_conv_kernel=4, ssm_inner_size=6144,
+            ssm_state_size=128, ssm_group_count=16,
+        )
+        metadata = GgufQuantMetadata(
+            [quant], {quant: artifact.size_bytes / 1e9}, architecture=layout.architecture,
+            context_length=layout.context_length, serving_metadata=layout,
+            artifacts_by_quant={quant: artifact}, mtp=GgufMtpCapability(GgufMtpStatus.SUPPORTED, 1, filename),
+        )
+        (profile,) = _profiles_for_model(
+            ModelCandidate(repo_id="unsloth/Qwen3.8-27B-GGUF"), [ModalGpuSpec("L40S", 1.95)],
+            metadata=metadata, prefer_mtp=False,
+        )
+        (plan,) = resolve_quick_deploy_plans((profile,))
+        assert plan.assessment is not None
+        memory = plan.assessment.memory
+        self.assertEqual(plan.quote.gpu_count, 1)
+        self.assertEqual(memory.kv_cache_gb, bytes_to_gib(19_690_160_128 + 1_073_741_824))
+        self.assertEqual(memory.layer_cache_bytes[-1], 1024**3)
+
+        retuned = retune_quick_deploy_plan(profile, plan, ServingObjective.THROUGHPUT)
+        assert retuned.assessment is not None
+        self.assertEqual(retuned.assessment.memory.recurrent_gb, memory.recurrent_gb * 2)
+        self.assertEqual(retuned.assessment.memory.kv_cache_gb - memory.kv_cache_gb, memory.recurrent_gb)
+        config = build_quick_deploy_config(profile, plan=plan, enable_speculative_decoding=False)
+        assert config.placement_assessment is not None
+        self.assertEqual(config.placement_assessment.memory.layer_cache_bytes[-1], 0)
+        self.assertEqual(config.placement_assessment.memory.recurrent_gb, memory.recurrent_gb / 4)
+        self.assertEqual((config.gguf_artifact, config.quant, config.max_context_tokens), (artifact, quant, 262_144))
+
+        (model,) = list_quick_deploy_models((profile,))
+        shorter = model_for_context(model, 131_072)
+        assert shorter is not None
+        short_memory = shorter.profiles[0].memory_estimate
+        assert short_memory is not None
+        self.assertEqual(shorter.profiles[0].gguf_artifact, artifact)
+        self.assertEqual(short_memory.recurrent_gb, memory.recurrent_gb)
+        self.assertEqual(short_memory.kv_cache_gb - memory.recurrent_gb, (memory.kv_cache_gb - memory.recurrent_gb) / 2)
+
+
 class KvCacheTypeTests(unittest.TestCase):
     """The planner may vary KV precision, but never silently."""
 
@@ -326,13 +417,13 @@ class KvCacheTypeTests(unittest.TestCase):
 
         # Flash attention still reserves one f16 mask over the whole context.
         self.assertAlmostEqual(
-            with_fa.attention_scratch_gb, 262144 * 512 * 2 / 1e9, places=3
+            with_fa.attention_scratch_gb, 262144 * 512 * 2 / 1024**3, places=3
         )
         # Without it the scores are materialized too: one f32 plane per query
         # head, and the mask widens to f32.
         self.assertAlmostEqual(
             without_fa.attention_scratch_gb,
-            262144 * 512 * (32 + 1) * 4 / 1e9,
+            262144 * 512 * (32 + 1) * 4 / 1024**3,
             places=3,
         )
         self.assertGreater(without_fa.total_gb, with_fa.total_gb)
@@ -363,13 +454,11 @@ class KvCacheTypeTests(unittest.TestCase):
         )
 
         per_device_graph = four.compute_gb + four.attention_scratch_gb
-        shardable = four.weights_gb + four.kv_cache_gb + four.speculative_gb
-        # 65 layers over 4 devices is 17/16/16/16, so the busiest carries 17
-        # of them -- and a whole graph of its own on top, which is the part
-        # adding GPUs never divides.
+        # 65 repeating blocks plus output split 17/16/17/16. KV belongs to
+        # the 65 repeating blocks alone.
         self.assertAlmostEqual(
             four.per_device_required_gb[0],
-            shardable * 17 / 65 + per_device_graph,
+            four.weights_gb * 17 / 66 + four.kv_cache_gb * 17 / 65 + per_device_graph,
             places=1,
         )
         # Four devices cost four copies of the graph, not one shared between
@@ -398,7 +487,7 @@ class KvCacheTypeTests(unittest.TestCase):
         self.assertGreater(busiest, quietest)
         shardable = memory.weights_gb + memory.kv_cache_gb + memory.speculative_gb
         graph = memory.compute_gb + memory.attention_scratch_gb
-        self.assertAlmostEqual(busiest, shardable * 23 / 45 + graph, places=1)
+        self.assertAlmostEqual(busiest, memory.weights_gb / 2 + memory.kv_cache_gb * 23 / 45 + graph, places=1)
         # The total is unchanged by how it is split.
         self.assertAlmostEqual(memory.total_gb, shardable + graph * 2, places=1)
 
@@ -593,4 +682,3 @@ class TopologyEstimateTests(unittest.TestCase):
         )
         self.assertTrue(points)
         self.assertFalse(any(point.measured for point in points))
-

@@ -337,6 +337,8 @@ class ModalBackend:
             args += ["--quant", config.quant]
         if config.revision:
             args += ["--revision", config.revision]
+        if config.gguf_artifact is not None:
+            args += ["--gguf-artifact-json", json.dumps(asdict(config.gguf_artifact))]
         if config.vision is not None:
             from .vision import vision_to_dict
             args += ["--vision-json", json.dumps(vision_to_dict(config.vision))]

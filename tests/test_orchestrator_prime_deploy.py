@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
+from llm_launchpad.core.fit_calibration import load_memory_calibration
+from llm_launchpad.core.llamacpp_planner import assess_memory_placement, serving_requirements
 from llm_launchpad.core.orchestrator import Orchestrator
 from llm_launchpad.core.prime_backend import PrimeApiError
+from llm_launchpad.core.runtime_support import load_llamacpp_support_manifest
 from llm_launchpad.protocol.enums import BackendType, ComputeProvider
 from llm_launchpad.protocol.events import (
     EndpointAvailableEvent,
@@ -15,7 +20,10 @@ from llm_launchpad.protocol.events import (
     OperationCompleteEvent,
     ResourceAllocatedEvent,
 )
-from llm_launchpad.protocol.models import ComputeOffer, DeploymentConfig, PrimeProviderOptions
+from llm_launchpad.protocol.models import (
+    ComputeOffer, DeploymentConfig, GgufArtifact, LLAMACPP_FIT_START_MARKER,
+    MemoryEstimate, PrimeProviderOptions, RuntimeTuning,
+)
 
 
 def _prime_config(**overrides: object) -> DeploymentConfig:
@@ -82,6 +90,53 @@ class OrchestratorPrimeDeployTests(unittest.TestCase):
         completion = next(e for e in events if isinstance(e, OperationCompleteEvent))
         self.assertFalse(completion.success)
         self.assertIn("default Hugging Face revision", completion.detail)
+
+    def test_pinned_prime_deploy_records_a_refused_native_fit_before_cleanup(self) -> None:
+        artifact = GgufArtifact("1" * 40, (("model-Q4_K_M.gguf", 8_000_000_000),))
+        runtime = load_llamacpp_support_manifest()
+        requirements = serving_requirements(32_768)
+        assessment = assess_memory_placement(
+            MemoryEstimate(8, 4, 1, 0, 0, 13),
+            model_id="acme/model", revision=artifact.revision, quant="Q4_K_M", runtime_id=runtime.runtime_id,
+            requirements=requirements, tuning=RuntimeTuning(), gpu_type="H100_80GB",
+            gpu_count=1, gpu_memory_gb=80, artifact=artifact, provider=ComputeProvider.PRIME,
+        )
+        config = _prime_config(
+            backend=BackendType.LLAMACPP, model_name=None, repo_id="acme/model", quant="Q4_K_M",
+            revision=artifact.revision, gguf_artifact=artifact, gguf_architecture="llama",
+            serving_requirements=requirements, runtime_tuning=assessment.tuning, placement_assessment=assessment,
+            provider_options=PrimeProviderOptions(allow_insecure_http=True),
+        )
+        backend = SimpleNamespace(
+            create_pod=Mock(return_value={"id": "pod-fit"}),
+            get_pod=lambda _: {"id": "pod-fit", "status": "ACTIVE", "installationStatus": "FINISHED",
+                               "sshConnection": "ssh://x"},
+            start_bootstrap_runtime=Mock(),
+            endpoint_url=lambda *_, **__: "http://10.0.0.1:8080",
+            bootstrap_runtime_status=lambda _: (False, True, "runtime could not allocate model"),
+            get_pod_logs=Mock(return_value=[
+                f"{LLAMACPP_FIT_START_MARKER} {assessment.fingerprint}",
+                f"common_params_print_info: build 12464 ({runtime.source_revision[:9]})",
+                "- CUDA0 : NVIDIA H100 80GB HBM3 (81559 MiB, 81000 MiB free)",
+                "common_params_fit_impl: projected to use 82000 MiB of device memory vs. 81000 MiB of free device memory",
+            ]),
+            delete_pod=Mock(),
+        )
+        with (
+            TemporaryDirectory() as directory,
+            patch("llm_launchpad.core.fit_calibration.CALIBRATION_CACHE_PATH", Path(directory)),
+            patch("llm_launchpad.core.orchestrator.resolve_prime_offer_and_disk", return_value=(_offer(), None, [])),
+        ):
+            events = list(Orchestrator(prime_backend=backend).deploy(config))  # type: ignore[arg-type]
+            projection = load_memory_calibration(assessment.calibration_key)
+        self.assertFalse(next(e for e in events if isinstance(e, OperationCompleteEvent)).success)
+        backend.create_pod.assert_called_once()
+        backend.start_bootstrap_runtime.assert_called_once()
+        self.assertEqual(backend.start_bootstrap_runtime.call_args.args[0].gguf_artifact, artifact)
+        backend.get_pod_logs.assert_called_once_with("pod-fit", tail=2000)
+        backend.delete_pod.assert_called_once_with("pod-fit")
+        assert projection is not None
+        self.assertEqual(projection.per_device_bytes, (82_001 * 1024**2,))
 
     def test_prime_deploy_success_emits_running_endpoint(self) -> None:
         offer = _offer()

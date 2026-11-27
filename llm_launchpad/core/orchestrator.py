@@ -56,6 +56,7 @@ from .backend import ModalBackend
 from .config import ConfigStore
 from .deploy_log_summary import format_elapsed
 from .deployment_states import is_terminal_deployment_state
+from .fit_calibration import FitCalibrationRecorder
 from .operation_events import fail_operation
 from .gguf_metadata import GgufMtpStatus
 from .hf_models import fetch_gguf_quant_metadata
@@ -110,6 +111,8 @@ _LLAMACPP_STORAGE_JSON_END = "LLM_LAUNCHPAD_STORAGE_JSON_END"
 def _configured_llamacpp_image(config: DeploymentConfig) -> str:
     if config.provider == ComputeProvider.PRIME:
         return resolve_prime_launch_spec(config).container_image
+    if config.provider == ComputeProvider.VAST:
+        return load_llamacpp_support_manifest(config.gguf_architecture).image_ref
     return (
         os.environ.get("LLAMA_CPP_IMAGE_REF", "").strip()
         or load_llamacpp_support_manifest(config.gguf_architecture).image_ref
@@ -396,6 +399,20 @@ class Orchestrator:
                 config.quant,
             )
         compatibility, lookup_error = self._llamacpp_compatibility(config)
+        if config.gguf_artifact is not None and (
+            not compatibility.is_supported
+            or (
+                config.placement_assessment is not None
+                and config.placement_assessment.runtime_id != compatibility.runtime_id
+            )
+        ):
+            yield from fail_operation(
+                OperationType.DEPLOY,
+                "This GGUF placement was sized for the catalog's llama.cpp runtime. "
+                "Use Advanced deploy with a custom runtime.",
+                exit_code=2, recoverable=False,
+            )
+            return False
         if compatibility.status == RuntimeCompatibility.UNSUPPORTED:
             message = (
                 f"Cannot deploy {config.repo_id or config.preset or 'this GGUF'}: "
@@ -451,6 +468,26 @@ class Orchestrator:
                             is_milestone=True,
                         )
 
+        if config.gguf_artifact is not None and config.engram_table is not None:
+            table = config.engram_table
+            original_size = dict(config.gguf_artifact.files).get(table.replaced_shard or "", 0)
+            assessment = config.placement_assessment
+            if (
+                table.replaced_shard == config.gguf_artifact.entrypoint or table.size_bytes > original_size
+                or (assessment is not None and assessment.memory.source == "runtime-projection")
+            ):
+                yield from fail_operation(
+                    OperationType.DEPLOY,
+                    "The required Engram replacement changes the planned GGUF size or entrypoint. Use Advanced deploy.",
+                    exit_code=2, recoverable=False,
+                )
+                return False
+            if assessment is not None:
+                config.placement_assessment = replace(
+                    assessment, calibration_key="",
+                )
+
+        requested_speculation = config.speculative_decoding
         if config.dspark or config.dspark_repo or config.dspark_file:
             try:
                 config.dspark_draft = resolve_dspark_draft(config)
@@ -469,6 +506,12 @@ class Orchestrator:
             )
         else:
             yield from self._prepare_llamacpp_speculative_decoding(config)
+        if config.gguf_artifact is not None and config.speculative_decoding != requested_speculation:
+            yield from fail_operation(
+                OperationType.DEPLOY, "The pinned serving configuration could not be reproduced. Refresh the plan.",
+                exit_code=2, recoverable=False,
+            )
+            return False
 
         if config.serving_requirements is not None:
             if (
@@ -498,6 +541,7 @@ class Orchestrator:
                 config.serving_requirements,
                 tuning,
                 extra_args=shlex.split(config.server_args or ""),
+                gpu_count=(config.gpu_count or 1) if config.gguf_artifact is not None else None,
             )
             config.n_gpu_layers = None
             if config.placement_assessment is not None:
@@ -560,17 +604,25 @@ class Orchestrator:
             return
 
         if config.provider == ComputeProvider.PRIME:
-            yield from self.deploy_prime_only(config)
-            return
-        if config.provider == ComputeProvider.VAST:
+            stream = self.deploy_prime_only(config)
+        elif config.provider == ComputeProvider.VAST:
             if self._vast_backend is not None:
-                yield from self._vast_backend.deploy(config)
-                return
-            from .provider_adapters import provider_adapter
+                stream = self._vast_backend.deploy(config)
+            else:
+                from .provider_adapters import provider_adapter
 
-            yield from provider_adapter(ComputeProvider.VAST).deploy(config)
-            return
-        yield from self.deploy_modal_only(config)
+                stream = provider_adapter(ComputeProvider.VAST).deploy(config)
+        else:
+            stream = self.deploy_modal_only(config)
+        # Prime and Vast can report a failed server load before warmup starts.
+        recorder = FitCalibrationRecorder(config.placement_assessment)
+        try:
+            for event in stream:
+                if isinstance(event, LogEvent):
+                    recorder.observe(event.line)
+                yield event
+        finally:
+            stream.close()
 
     def deploy_modal_only(self, config: DeploymentConfig) -> EventStream:
         """Execute the Modal-specific deploy step."""
@@ -639,9 +691,8 @@ class Orchestrator:
         target GGUF carries NextN heads and the pinned runtime advertises the
         architecture. Only ``allow_speculative_decoding=False`` suppresses it.
 
-        Evidence is re-read here even when the catalog already recommended a
-        configuration, because the catalog snapshot can predate both the model
-        revision and the runtime pin.
+        Catalog plans already inspected the exact immutable file; other
+        deployments inspect the selected target here.
         """
 
         requested = config.speculative_decoding
@@ -666,7 +717,7 @@ class Orchestrator:
                 operation=OperationType.DEPLOY,
             )
             return
-        if requested is None and config.placement_assessment is not None:
+        if requested is None and (config.placement_assessment is not None or config.gguf_artifact is not None):
             # A certified placement budgeted memory for exactly the configuration
             # it was assessed against. Turning MTP on here would add a
             # speculative buffer that certificate never counted, so a certified
@@ -680,21 +731,26 @@ class Orchestrator:
         )
 
         try:
-            metadata = fetch_gguf_quant_metadata(
-                config.repo_id or "",
-                revision=config.revision,
-                inspect_mtp=True,
-                mtp_quant=config.quant,
-                force_refresh=True,
-            )
-            capability = metadata.mtp
-            layers = (
-                capability.nextn_predict_layers
-                if capability is not None
-                and capability.status == GgufMtpStatus.SUPPORTED
-                else None
-            )
-            architecture = metadata.architecture or config.gguf_architecture
+            capability = None
+            architecture = config.gguf_architecture
+            if config.gguf_artifact is not None and requested is not None:
+                # Profile creation inspected this exact immutable header.
+                layers = requested.nextn_predict_layers
+            else:
+                metadata = fetch_gguf_quant_metadata(
+                    config.repo_id or "",
+                    revision=config.revision,
+                    inspect_mtp=True,
+                    mtp_quant=config.quant,
+                    force_refresh=True,
+                )
+                capability = metadata.mtp
+                layers = (
+                    capability.nextn_predict_layers
+                    if capability is not None and capability.status == GgufMtpStatus.SUPPORTED
+                    else None
+                )
+                architecture = metadata.architecture or architecture
             decision = evaluate_llamacpp_mtp(
                 architecture,
                 layers,
@@ -867,6 +923,10 @@ class Orchestrator:
             runtime_id=runtime_id,
             phase_timer=phase_timer,
             price_per_hour_usd=price_per_hour_usd,
+            vast_log_reader=(
+                lambda: self.vast_backend.logs(pod_id, tail=2000)
+                if pod_id is not None else []
+            ) if provider == ComputeProvider.VAST and pod_id and placement_assessment else None,
         )
         try:
             for event in warmup_stream:

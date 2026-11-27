@@ -8,11 +8,15 @@ import math
 import re
 import time
 from dataclasses import dataclass, replace
+from functools import lru_cache
+from pathlib import PurePosixPath
 from typing import Any, Literal
 
-from ..gguf_files import is_target_gguf
+from ..gguf_files import GGUF_SHARD_RE, is_target_gguf
+from ..protocol.models import GgufArtifact
 from .coerce import optional_str, positive_int
 from .diagnostics import log_debug
+from .hf_budget import HubLookupIncomplete
 from .gguf_metadata import (
     GgufMtpCapability,
     GgufMtpStatus,
@@ -69,6 +73,7 @@ class GgufQuantMetadata:
     # Set when the weight-size table could not be read. Its presence means the
     # sizes are unknown, never that the model publishes none.
     weight_size_error: str | None = None
+    artifacts_by_quant: dict[str, GgufArtifact] | None = None
 
 
 @dataclass(frozen=True)
@@ -93,7 +98,7 @@ _DEFAULT_CONTEXT_TOKENS = 8192
 _MEMORY_OVERHEAD_FRACTION = 0.20
 _CACHE: dict[tuple[str, str, int], tuple[float, list[ModelCandidate]]] = {}
 _GGUF_QUANT_METADATA_CACHE: dict[
-    tuple[str, str, str, bool, bool], tuple[float, GgufQuantMetadata]
+    tuple[str, str, str, bool, bool, bool], tuple[float, GgufQuantMetadata]
 ] = {}
 _VLLM_MEMORY_CACHE: dict[tuple[int, str, str, int], tuple[float, VllmMemoryBreakdown]] = {}
 _HF_JSON_FILE_CACHE: dict[tuple[str, str, str], tuple[float, dict[str, Any] | None]] = {}
@@ -116,8 +121,11 @@ _QUANT_PATTERN = re.compile(
     r"(?i)(?<![a-z0-9])((?:UD[-_])?(?:IQ[1-4]_(?:XXS|XS|S|M|NL)|Q[2-8]_(?:K(?:_[MSXL]+)?|0|1)))(?![a-z0-9])"
 )
 _HARDWARE_QUANT_LABEL_RE = re.compile(
-    r"(?i)(?<![a-z0-9])((?:DSPARK\s+)?(?:(?:UD[-_])?(?:IQ[1-4]_(?:XXS|XS|S|M|NL)|Q[2-8]_(?:K(?:_[MSXL]+)?|0|1))|MXFP4(?:_MOE)?|BF16|F16))(?![a-z0-9])"
+    r"(?i)(?<![a-z0-9])((?:DSPARK\s+)?(?:(?:UD[-_])?"
+    r"(?:IQ[1-4]_(?:XXS|XS|S|M|NL)|Q[2-8]_(?:K(?:_[MSXL]+)?|0(?:_L)?|1)|TQ[12]_0)"
+    r"|MXFP4(?:_MOE)?|BF16|F16|F32))(?![a-z0-9])"
 )
+_EMBEDDED_MTP_LABEL = re.compile(r"(?i)(?:^|[-_])mtp(?:[-_./]|$)")
 _MEMORY_PATTERN = re.compile(r"(?i)^\s*([0-9]+(?:\.[0-9]+)?)\s*([KMGTP]?I?B)?\s*$")
 _MEMORY_SEARCH_PATTERN = re.compile(r"(?i)([0-9]+(?:\.[0-9]+)?)\s*([KMGTP]?I?B)")
 _MEMORY_HINTS = ("memory", "vram", "ram", "require", "required", "footprint", "size")
@@ -468,6 +476,8 @@ def _call_model_info(
     repo_id: str,
     revision: str | None,
     expand: list[str] | None = None,
+    *,
+    files_metadata: bool = False,
 ) -> Any:
     if is_shutting_down():
         raise RuntimeError("Shutdown requested")
@@ -477,6 +487,8 @@ def _call_model_info(
     }
     if expand is not None:
         kwargs["expand"] = expand
+    if files_metadata:
+        kwargs["files_metadata"] = True
     try:
         return api.model_info(timeout=_HF_REQUEST_TIMEOUT_SECONDS, **kwargs)
     except TypeError:
@@ -531,11 +543,8 @@ def fetch_gguf_quant_metadata(
 ) -> GgufQuantMetadata:
     """Return detected GGUF quantizations and per-quant VRAM estimates in GB.
 
-    Weight sizes come from the model page, which can be throttled or
-    unreachable while the Hub API answers normally. Callers that only want the
-    architecture get the metadata anyway, with ``weight_size_error`` set;
-    ``require_weight_sizes=True`` raises ``HubModelPageUnavailable`` instead,
-    for callers whose whole answer depends on the sizes.
+    Catalog callers requiring both serving metadata and weight sizes get exact,
+    revision-pinned Hub file sizes. Other callers can use the model-page hints.
     """
     if is_shutting_down():
         return GgufQuantMetadata(quantizations=[], vram_gb_by_quant={})
@@ -544,26 +553,11 @@ def fetch_gguf_quant_metadata(
         return GgufQuantMetadata(quantizations=[], vram_gb_by_quant={})
     revision_key = (revision or "").strip()
     quant_key = (mtp_quant or "").strip().casefold()
-    cache_key = (normalized_repo, revision_key, quant_key, inspect_mtp, inspect_serving)
+    cache_key = (normalized_repo, revision_key, quant_key, inspect_mtp, inspect_serving, require_weight_sizes)
     now = time.time()
     cached = _GGUF_QUANT_METADATA_CACHE.get(cache_key)
     if not force_refresh and cached and (now - cached[0]) < _CACHE_TTL_SECONDS:
-        cached_metadata = cached[1]
-        return GgufQuantMetadata(
-            quantizations=list(cached_metadata.quantizations),
-            vram_gb_by_quant=dict(cached_metadata.vram_gb_by_quant),
-            architecture=cached_metadata.architecture,
-            mtp=cached_metadata.mtp,
-            context_length=cached_metadata.context_length,
-            block_count=cached_metadata.block_count,
-            embedding_length=cached_metadata.embedding_length,
-            attention_head_count=cached_metadata.attention_head_count,
-            attention_head_count_kv=cached_metadata.attention_head_count_kv,
-            attention_key_length=cached_metadata.attention_key_length,
-            attention_value_length=cached_metadata.attention_value_length,
-            serving_metadata=cached_metadata.serving_metadata,
-            weight_size_error=cached_metadata.weight_size_error,
-        )
+        return _copy_gguf_quant_metadata(cached[1])
 
     try:
         from huggingface_hub import HfApi
@@ -575,6 +569,27 @@ def fetch_gguf_quant_metadata(
     api = HfApi()
     if is_shutting_down():
         return GgufQuantMetadata(quantizations=[], vram_gb_by_quant={})
+    if inspect_serving and require_weight_sizes:
+        info = _call_model_info(api, normalized_repo, revision_key or None, files_metadata=True)
+        artifacts = _gguf_artifacts(getattr(info, "siblings", None), getattr(info, "sha", None))
+        quants = sorted(artifacts, key=_quant_sort_key)
+        metadata = GgufQuantMetadata(
+            quantizations=quants,
+            vram_gb_by_quant={quant: artifact.size_bytes / 1e9 for quant, artifact in artifacts.items()},
+            artifacts_by_quant=artifacts,
+        )
+        representative = _normalize_quant_label(mtp_quant) if mtp_quant else next(iter(quants), "")
+        if representative in artifacts:
+            try:
+                metadata = gguf_metadata_for_artifact(normalized_repo, metadata, artifacts[representative])
+            except Exception:
+                if mtp_quant:
+                    raise
+                # Keep the file listing so the catalog can retry this header
+                # and still size other quantizations if the retry fails.
+                return metadata
+        _GGUF_QUANT_METADATA_CACHE[cache_key] = (now, metadata)
+        return _copy_gguf_quant_metadata(metadata)
     info = _call_model_info(
         api=api,
         repo_id=normalized_repo,
@@ -720,23 +735,100 @@ def fetch_gguf_quant_metadata(
         # cache window, including the retries meant to recover from it.
         _GGUF_QUANT_METADATA_CACHE[cache_key] = (now, metadata)
         if inspect_serving and not inspect_mtp and mtp is not None:
-            mtp_key = (normalized_repo, revision_key, quant_key, True, True)
+            mtp_key = (normalized_repo, revision_key, quant_key, True, True, require_weight_sizes)
             _GGUF_QUANT_METADATA_CACHE[mtp_key] = (now, replace(metadata, mtp=mtp))
-    return GgufQuantMetadata(
+    return _copy_gguf_quant_metadata(metadata)
+
+
+def _copy_gguf_quant_metadata(metadata: GgufQuantMetadata) -> GgufQuantMetadata:
+    return replace(
+        metadata,
         quantizations=list(metadata.quantizations),
         vram_gb_by_quant=dict(metadata.vram_gb_by_quant),
-        architecture=metadata.architecture,
-        mtp=metadata.mtp,
-        context_length=metadata.context_length,
-        block_count=metadata.block_count,
-        embedding_length=metadata.embedding_length,
-        attention_head_count=metadata.attention_head_count,
-        attention_head_count_kv=metadata.attention_head_count_kv,
-        attention_key_length=metadata.attention_key_length,
-        attention_value_length=metadata.attention_value_length,
-        serving_metadata=metadata.serving_metadata,
-        weight_size_error=metadata.weight_size_error,
+        artifacts_by_quant=None if metadata.artifacts_by_quant is None else dict(metadata.artifacts_by_quant),
     )
+
+
+def _gguf_artifacts(siblings: Any, revision: str | None) -> dict[str, GgufArtifact]:
+    """Resolve one complete target shard set per unambiguous quant label."""
+    if not revision or not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise HubLookupIncomplete("Hugging Face did not report the GGUF repository's commit SHA.")
+    groups: dict[str, dict[tuple[str, int], dict[int, tuple[str, int | None]]]] = {}
+    for sibling in siblings or ():
+        name = getattr(sibling, "rfilename", "")
+        if not isinstance(name, str) or not is_target_gguf(name):
+            continue
+        labels = _HARDWARE_QUANT_LABEL_RE.findall(PurePosixPath(name).stem)
+        if not labels:
+            labels = _HARDWARE_QUANT_LABEL_RE.findall(PurePosixPath(name).parent.name)
+        if not labels:
+            continue
+        quant = _normalize_quant_label(labels[-1])
+        split = GGUF_SHARD_RE.fullmatch(name)
+        key = (split[1], int(split[3])) if split else (name, 1)
+        index = int(split[2]) if split else 1
+        parts = groups.setdefault(quant, {}).setdefault(key, {})
+        parts[index] = (name, getattr(sibling, "size", None) if index not in parts else None)
+    artifacts: dict[str, GgufArtifact] = {}
+    for quant, variants in groups.items():
+        # Some publishers ship both a plain target and multiple MTP variants
+        # under the same quant label. Prefer the unique plain artifact in
+        # that case; arbitrary variants with the same label stay ambiguous.
+        plain = [key for key in variants if not _EMBEDDED_MTP_LABEL.search(key[0])]
+        candidates = plain or list(variants)
+        if len(candidates) != 1:
+            continue
+        key = candidates[0]
+        _, count = key
+        parts = variants[key]
+        if not parts or len(parts) != count or min(parts) != 1 or max(parts) != count:
+            continue
+        files = tuple(parts[index] for index in sorted(parts))
+        if any(not isinstance(size, int) or size <= 0 for _, size in files):
+            continue
+        try:
+            artifacts[quant] = GgufArtifact(
+                revision, tuple((name, size) for name, size in files if size is not None),
+            )
+        except ValueError:
+            continue
+    return artifacts
+
+
+def gguf_metadata_for_artifact(
+    repo_id: str, metadata: GgufQuantMetadata, artifact: GgufArtifact,
+) -> GgufQuantMetadata:
+    """Read the selected shard header at the same immutable revision as its size."""
+    layout = metadata.serving_metadata
+    if layout is not None and layout.source_file == artifact.entrypoint:
+        return metadata
+    layout = _pinned_gguf_header(repo_id, artifact.revision, artifact.entrypoint)
+    layers = layout.nextn_predict_layers
+    return replace(
+        metadata,
+        architecture=layout.architecture,
+        mtp=GgufMtpCapability(
+            status=GgufMtpStatus.SUPPORTED if layers else GgufMtpStatus.UNSUPPORTED,
+            nextn_predict_layers=layers,
+            source_file=layout.source_file,
+        ),
+        context_length=layout.context_length,
+        block_count=layout.block_count,
+        embedding_length=layout.embedding_length,
+        attention_head_count=layout.attention_head_count,
+        attention_head_count_kv=layout.attention_head_count_kv,
+        attention_key_length=layout.attention_key_length,
+        attention_value_length=layout.attention_value_length,
+        serving_metadata=layout,
+    )
+
+
+@lru_cache(maxsize=512)
+def _pinned_gguf_header(repo_id: str, revision: str, filename: str) -> GgufServingMetadata:
+    layout = fetch_gguf_serving_metadata(repo_id, None, revision=revision, filename=filename, strict=True)
+    if layout is None or not layout.architecture:
+        raise HubLookupIncomplete(f"Could not read the serving layout of {filename}.")
+    return layout
 
 
 def _fetch_candidates(mode: ModelRankMode, limit: int, target: ModelDiscoveryTarget) -> list[ModelCandidate]:

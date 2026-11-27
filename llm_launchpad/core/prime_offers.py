@@ -16,6 +16,8 @@ from ..protocol.enums import BackendType, QuoteAvailability
 from ..protocol.models import ComputeOffer, DeploymentConfig
 from .coerce import optional_float
 from .deployment_preflight import price_cap_finding
+from .llamacpp_planner import device_capacity_bytes, gib_to_bytes
+from .modal_gpu import modal_gpu_capacity_gib
 from .runtime_support import load_llamacpp_support_manifest, llamacpp_build_recipe
 
 PRIME_DEFAULT_BOOTSTRAP_IMAGE = "ubuntu_22_cuda_12"
@@ -213,12 +215,15 @@ def prime_offer_gpu_memory_gb(offer: ComputeOffer) -> float | None:
     )
     count = max(1, int(offer.gpu_count or 1))
     if named is not None:
-        if reported is None:
+        if reported is None or (count > 1 and abs(reported - named * count) < 1.0):
             return named
-        if abs(reported - named) < 1.0 or abs(reported - named * count) < 1.0:
-            return named
-        return named
+        return min(named, reported)
     return reported
+
+
+def prime_gpu_capacity_gib(gpu_type: str, reported_gib: float) -> float:
+    """Bound nominal marketplace figures by known framebuffer capacities."""
+    return min(reported_gib, modal_gpu_capacity_gib(gpu_type) or reported_gib)
 
 
 def is_prime_gpu_offer(offer: ComputeOffer) -> bool:
@@ -349,12 +354,17 @@ def prime_offer_matches_location(offer: ComputeOffer, location: str | None) -> b
 def prime_offer_satisfies_vram(
     offer: ComputeOffer,
     required_vram_gb: float | None,
+    *,
+    per_device_required_gib: float | None = None,
 ) -> bool:
-    """Check aggregate GPU memory with the catalog's safety headroom."""
+    """Check an assessed per-device budget, or the legacy aggregate estimate."""
 
     per_gpu_memory = prime_offer_gpu_memory_gb(offer)
     if not is_prime_gpu_offer(offer) or per_gpu_memory is None:
         return False
+    if per_device_required_gib is not None:
+        capacity = prime_gpu_capacity_gib(offer.gpu_type, per_gpu_memory)
+        return gib_to_bytes(per_device_required_gib) <= device_capacity_bytes(capacity)
     if required_vram_gb is None or required_vram_gb <= 0:
         return True
     available_vram = per_gpu_memory * offer.gpu_count
@@ -387,6 +397,7 @@ def select_prime_offer(
     gpu_count: int | None = None,
     region: str | None = None,
     required_vram_gb: float | None = None,
+    per_device_required_gib: float | None = None,
     max_hourly_cost_usd: float | None = None,
     required_image: str = PRIME_DEFAULT_BOOTSTRAP_IMAGE,
 ) -> ComputeOffer:
@@ -408,7 +419,11 @@ def select_prime_offer(
             raise ValueError(f"Prime offer {offer_id} does not match the requested region.")
         if not is_prime_gpu_offer(match):
             raise ValueError(f"Prime offer {offer_id} is not a GPU instance.")
-        if not prime_offer_satisfies_vram(match, required_vram_gb):
+        if not prime_offer_satisfies_vram(match, required_vram_gb, per_device_required_gib=per_device_required_gib):
+            if per_device_required_gib is not None:
+                raise ValueError(
+                    f"Prime offer {offer_id} cannot provide {per_device_required_gib:.1f} GiB per GPU."
+                )
             required = float(required_vram_gb or 0) * PRIME_VRAM_HEADROOM_FACTOR
             raise ValueError(
                 f"Prime offer {offer_id} does not provide the required "
@@ -446,7 +461,9 @@ def select_prime_offer(
     if region:
         matches = [row for row in matches if prime_offer_matches_location(row, region)]
     matches = [
-        row for row in matches if prime_offer_satisfies_vram(row, required_vram_gb)
+        row for row in matches if prime_offer_satisfies_vram(
+            row, required_vram_gb, per_device_required_gib=per_device_required_gib,
+        )
     ]
     matches = [row for row in matches if not is_prime_offer_unavailable(row.stock_status)]
     if not matches:

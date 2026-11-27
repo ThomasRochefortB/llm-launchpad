@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 import re
 from statistics import median
+from tempfile import NamedTemporaryFile
 import time
 from typing import Any
 from collections.abc import Callable, Sequence
@@ -35,9 +36,17 @@ from .hf_models import (
     ModelCandidate,
     fetch_gguf_quant_metadata,
     fetch_model_max_context,
+    gguf_metadata_for_artifact,
     list_llamacpp_candidates,
 )
-from .modal_gpu import MODAL_GPU_MEMORY_GB as _GPU_MEMORY_GB, ModalGpuSpec, fetch_modal_gpu_catalog, modal_gpu_count_options, modal_gpu_supports_fast_deploy
+from .modal_gpu import (
+    MODAL_GPU_MEMORY_GB as _GPU_MEMORY_GB,
+    ModalGpuSpec,
+    fetch_modal_gpu_catalog,
+    modal_gpu_capacity_gib,
+    modal_gpu_count_options,
+    modal_gpu_supports_fast_deploy,
+)
 from .hf_budget import (
     DEFAULT_BUDGET,
     METADATA_REQUEST_COST,
@@ -52,9 +61,9 @@ from .quant_quality import quant_bits
 from .quick_deploy import QuickDeployCatalogInfo, QuickDeployProfile
 from .llamacpp_planner import (
     attention_head_count,
-    device_capacity_bytes,
-    gib_to_bytes,
-    per_device_requirements,
+    bytes_to_gib,
+    memory_fits_device,
+    memory_on_topology,
     tuning_for_architecture,
     tuning_for_attention_scratch,
     compile_server_args,
@@ -70,6 +79,7 @@ from .runtime_support import (
 from ..protocol.enums import ServingObjective, SpeculativeDecodingMethod
 from ..protocol.models import (
     CatalogExclusion,
+    GgufArtifact,
     MemoryEstimate,
     RuntimeTuning,
     ServingRequirements,
@@ -126,13 +136,7 @@ def _is_transient_hub_error(exc: BaseException) -> bool:
 
 
 def _fetch_serving_metadata(repo_id: str) -> GgufQuantMetadata:
-    """Fetch GGUF serving metadata, retrying transient Hub failures.
-
-    The catalog cannot size a model without its weight-size table, so an
-    unreadable one is a failed lookup here rather than a model that publishes
-    no weights -- otherwise a throttled page is written down as a fact about
-    the model and drops it from Fast Deploy until the next rebuild.
-    """
+    """Fetch the Hub's GGUF file listing, retrying transient lookup failures."""
 
     delay = _HUB_RETRY_BASE_SECONDS
     for attempt in range(1, _HUB_FETCH_ATTEMPTS + 1):
@@ -157,8 +161,8 @@ def _quick_deploy_catalog_cache_path() -> Path:
 
 
 QUICK_DEPLOY_CATALOG_CACHE_TTL = timedelta(hours=6)
-# Older profiles could treat auxiliary GGUFs as main-model weights.
-QUICK_DEPLOY_CATALOG_CACHE_SCHEMA_VERSION = 14
+# Older profiles used the model-page size table and lacked exact weight sets.
+QUICK_DEPLOY_CATALOG_CACHE_SCHEMA_VERSION = 15
 _MODEL_SIZE_LABELS: dict[ModelSizeBucket, str] = {
     "compact": "Compact ≤40B",
     "medium": "Medium 40–150B",
@@ -374,7 +378,9 @@ def build_live_quick_deploy_catalog(
             exclusions=tuple(exclusions), is_live=True,
         ), ())
     else:
-        fallback = (replace(fallback[0], exclusions=tuple(exclusions)), fallback[1])
+        fallback = _retained_catalog_for(fallback[1], exclusions) or (
+            replace(fallback[0], exclusions=tuple(exclusions)), fallback[1],
+        )
     _write_quick_deploy_catalog_cache(fallback[0], fallback[1])
     return fallback
 
@@ -429,12 +435,17 @@ def _retained_catalog_for(
         return None
     by_id = {row.model_id: row for row in previous_info.exclusions}
     by_id.update((row.model_id, row) for row in exclusions)
-    verified = {p.aa_model_id for p in profiles}
     blocked = {row.model_id for row in exclusions if not row.unchecked}
-    kept = tuple(p for p in previous_profiles if p.aa_model_id not in blocked)
-    by_id = {key: row for key, row in by_id.items() if key not in verified}
+    kept = tuple(p for p in previous_profiles if (p.aa_model_id or p.repo_id) not in blocked)
+    checked = {p.aa_model_id or p.repo_id for p in profiles}
+    incomplete = {row.model_id for row in exclusions if row.unchecked}
+    by_id = {key: row for key, row in by_id.items() if key not in checked or key in incomplete}
     new_ids = {p.id for p in profiles}
-    combined = _with_unique_ids([*profiles, *(p for p in kept if p.id not in new_ids)])
+    new_quants = {(p.repo_id.casefold(), _quant_key(p.quant)) for p in profiles}
+    combined = _with_unique_ids([
+        *profiles, *(p for p in kept if p.id not in new_ids and
+                     (p.repo_id.casefold(), _quant_key(p.quant)) not in new_quants),
+    ])
     return replace(previous_info, error=reason, exclusions=tuple(by_id.values())), combined
 
 
@@ -444,11 +455,7 @@ def _models_lost_to_unchecked(
 ) -> list[str]:
     """Name the models this rebuild could not check but the last one resolved."""
 
-    known = {
-        profile.aa_model_id
-        for profile in previous_profiles
-        if profile.aa_model_id
-    }
+    known = {profile.aa_model_id or profile.repo_id for profile in previous_profiles}
     if not known:
         return []
     lost: dict[str, str] = {}
@@ -540,6 +547,7 @@ def _quick_deploy_profile_to_dict(profile: QuickDeployProfile) -> dict[str, Any]
         "parameter_count_b": profile.parameter_count_b,
         "active_parameter_count_b": profile.active_parameter_count_b,
         "serving_metadata": asdict(profile.serving_metadata) if profile.serving_metadata else None,
+        "gguf_artifact": asdict(profile.gguf_artifact) if profile.gguf_artifact else None,
         "backend": profile.backend.value,
         "model_name": profile.model_name,
         "gguf_architecture": profile.gguf_architecture,
@@ -593,6 +601,7 @@ def _quick_deploy_profile_to_dict(profile: QuickDeployProfile) -> dict[str, Any]
                 "total_layer_count": memory.total_layer_count,
                 "recurrent_gb": memory.recurrent_gb,
                 "recurrent_state_copies": memory.recurrent_state_copies,
+                "layer_cache_bytes": list(memory.layer_cache_bytes),
             }
             if memory is not None
             else None
@@ -640,11 +649,19 @@ def _quick_deploy_profile_from_dict(payload: Any) -> QuickDeployProfile | None:
     try:
         if isinstance(layout, dict):
             fields: dict[str, Any] = dict(layout)
-            fields["attention_head_count_kv_by_layer"] = tuple(fields.get("attention_head_count_kv_by_layer") or ())
+            for name in (
+                "attention_head_count_kv_by_layer", "recurrent_layers",
+                "sliding_window_pattern", "feed_forward_length_by_layer",
+            ):
+                fields[name] = tuple(fields.get(name) or ())
             layout = GgufServingMetadata(**fields)
         else:
             layout = None
+        artifact = payload.get("gguf_artifact")
         return QuickDeployProfile(
+            gguf_artifact=GgufArtifact(
+                artifact["revision"], tuple((name, size) for name, size in artifact["files"])
+            ) if isinstance(artifact, dict) else None,
             serving_metadata=layout,
             context_known=payload.get("context_known") is not False,
             parameter_count_b=float(payload["parameter_count_b"]) if payload.get("parameter_count_b") else None,
@@ -700,7 +717,7 @@ def _quick_deploy_profile_from_dict(payload: Any) -> QuickDeployProfile | None:
             runtime_tuning=tuning,
             memory_estimate=memory,
         )
-    except (ValueError, TypeError):
+    except (KeyError, ValueError, TypeError):
         return None
 
 
@@ -767,6 +784,7 @@ def _memory_estimate_from_dict(payload: Any) -> MemoryEstimate | None:
             source=str(payload.get("source") or "estimated"),
             recurrent_gb=float(payload.get("recurrent_gb", 0.0)),
             recurrent_state_copies=int(payload.get("recurrent_state_copies", 1)),
+            layer_cache_bytes=tuple(int(value) for value in payload.get("layer_cache_bytes", ())),
             total_layer_count=(
                 int(payload["total_layer_count"])
                 if payload.get("total_layer_count") is not None
@@ -831,13 +849,22 @@ def _write_quick_deploy_catalog_cache(
         "profiles": [_quick_deploy_profile_to_dict(profile) for profile in profiles],
     }
     path = cache_path or _quick_deploy_catalog_cache_path()
+    temporary_path = None
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = path.with_suffix(f"{path.suffix}.tmp")
-        temporary_path.write_text(json.dumps(envelope, indent=2) + "\n", encoding="utf-8")
+        with NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as output:
+            temporary_path = Path(output.name)
+            json.dump(envelope, output, indent=2)
+            output.write("\n")
         temporary_path.replace(path)
     except Exception:
         return
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _read_quick_deploy_catalog_cache(
@@ -1108,10 +1135,7 @@ def _build_resolved_aa_model(
     exclusions: list[CatalogExclusion] | None = None,
     budget: HubRequestBudget | None = None,
 ) -> _ResolvedAAModel | None:
-    # Metadata was the unbudgeted half of a build. Reading it past the ceiling
-    # gets the whole session throttled, and a throttled read returns an empty
-    # weight-size table -- which then reads as "this model's size cannot be
-    # determined" rather than as the rate limit it is.
+    # Reserve discovery budget before querying the repository's file listing.
     if budget is not None and not budget.spend(METADATA_REQUEST_COST):
         _record_exclusion(exclusions, candidate, repo_id, UNCHECKED_BUDGET_REASON, unchecked=True)
         return None
@@ -1126,11 +1150,12 @@ def _build_resolved_aa_model(
     if size_bucket is None:
         size_bucket = _size_bucket_from_gguf_metadata(metadata)
     compatibility = evaluate_llamacpp_architecture(metadata.architecture)
-    if not compatibility.is_supported:
+    if metadata.artifacts_by_quant is None and not compatibility.is_supported:
         _record_exclusion(exclusions, candidate, repo_id, compatibility.message)
         return None
     model = ModelCandidate(repo_id=repo_id)
     reasons: list[str] = []
+    unchecked: list[str] = []
     profiles = _profiles_for_model(
         model,
         modal_gpu_catalog,
@@ -1139,10 +1164,14 @@ def _build_resolved_aa_model(
         size_bucket=size_bucket,
         rejected=reasons,
         budget=budget,
+        unchecked=unchecked,
     )
+    if unchecked:
+        _record_exclusion(exclusions, candidate, repo_id, " ".join(dict.fromkeys(unchecked)), unchecked=True)
     if not profiles:
-        reason = " ".join(dict.fromkeys(reasons)) or "No GGUF quantization has a usable weight-size estimate."
-        _record_exclusion(exclusions, candidate, repo_id, reason)
+        if not unchecked:
+            reason = " ".join(dict.fromkeys(reasons)) or "No GGUF quantization has a complete weight set."
+            _record_exclusion(exclusions, candidate, repo_id, reason)
         return None
     return _ResolvedAAModel(
         candidate=candidate,
@@ -1254,20 +1283,30 @@ def _build_trending_fallback_catalog(
                 reason = "Hugging Face serving metadata could not be read. Refresh the catalog to retry."
             else:
                 compatibility = evaluate_llamacpp_architecture(metadata.architecture)
-                if not compatibility.is_supported:
+                if metadata.artifacts_by_quant is None and not compatibility.is_supported:
                     reason = compatibility.message
             if reason:
                 if exclusions is not None:
                     exclusions.append(CatalogExclusion(model.repo_id, _display_name(model.repo_id), model.repo_id,
                                                        reason, unchecked=metadata is None))
                 continue
+            unchecked: list[str] = []
+            rejected: list[str] = []
             group = _profiles_for_model(
                 model,
                 modal_gpu_catalog,
                 metadata=metadata,
                 skip_context_lookup=True,
                 prefer_mtp=not skip_repos,
+                unchecked=unchecked,
+                rejected=rejected,
             )
+            if exclusions is not None and (unchecked or not group):
+                exclusions.append(CatalogExclusion(
+                    model.repo_id, _display_name(model.repo_id), model.repo_id,
+                    " ".join(dict.fromkeys(unchecked or rejected)) or "No GGUF quantization has a complete weight set.",
+                    unchecked=bool(unchecked),
+                ))
             if group:
                 profiles_by_repo[model.repo_id] = group
                 if on_partial is not None and len(profiles_by_repo) > published_repos:
@@ -1653,10 +1692,10 @@ def _fetch_modal_gpu_catalog_or_fallback() -> tuple[tuple[ModalGpuSpec, ...], bo
 def _safe_fetch_gguf_metadata(repo_id: str) -> GgufQuantMetadata | None:
     """Resolve the native context before sizing any trending-model profiles."""
     try:
-        metadata = fetch_gguf_quant_metadata(repo_id, inspect_serving=True, require_weight_sizes=True)
+        metadata = _fetch_serving_metadata(repo_id)
     except Exception:
         return None
-    if metadata.context_length is None and metadata.vram_gb_by_quant:
+    if metadata.artifacts_by_quant is None and metadata.context_length is None and metadata.vram_gb_by_quant:
         return replace(metadata, context_length=_safe_fetch_model_max_context(repo_id))
     return metadata
 
@@ -1689,7 +1728,10 @@ def attach_quick_deploy_mtp_recommendations(
     until the probes land.
     """
 
-    pending = [profile for profile in profiles if profile.speculative_decoding is None]
+    pending = [
+        profile for profile in profiles
+        if profile.speculative_decoding is None and profile.gguf_artifact is None
+    ]
     if not pending:
         return tuple(profiles)
     metadata_by_repo: dict[str, GgufQuantMetadata | None] = {}
@@ -1711,7 +1753,7 @@ def attach_quick_deploy_mtp_recommendations(
                 metadata_by_repo[futures[future]] = None
     upgraded: list[QuickDeployProfile] = []
     for profile in profiles:
-        if profile.speculative_decoding is not None:
+        if profile.speculative_decoding is not None or profile.gguf_artifact is not None:
             upgraded.append(profile)
             continue
         metadata = metadata_by_repo.get(profile.repo_id)
@@ -1796,6 +1838,10 @@ def _verified_mtp_variant(
         quants = _selected_quants(variant)
         if not quants:
             return None
+        if variant.artifacts_by_quant is not None:
+            # Profile creation inspects the header of every pinned quant and
+            # excludes variants without embedded heads.
+            return variant_repo, variant
         for quant in quants:
             if not request_budget.spend(METADATA_REQUEST_COST):
                 return None
@@ -1825,6 +1871,7 @@ def _profiles_for_model(
     rejected: list[str] | None = None,
     budget: HubRequestBudget | None = None,
     prefer_mtp: bool = True,
+    unchecked: list[str] | None = None,
 ) -> list[QuickDeployProfile]:
     if metadata is None:
         try:
@@ -1834,6 +1881,7 @@ def _profiles_for_model(
     variant = _verified_mtp_variant(model.repo_id, metadata, budget) if prefer_mtp else None
     if variant is not None:
         variant_repo, variant_metadata = variant
+        unchecked_variant: list[str] = []
         accelerated = _profiles_for_model(
             ModelCandidate(repo_id=variant_repo),
             modal_gpu_catalog,
@@ -1843,18 +1891,22 @@ def _profiles_for_model(
             skip_context_lookup=skip_context_lookup,
             budget=budget,
             prefer_mtp=False,
+            unchecked=unchecked_variant,
         )
-        placed = [profile for profile in accelerated if profile.gpu_count > 0]
-        if placed:
+        placed = [
+            profile for profile in accelerated
+            if profile.gpu_count > 0 and profile.speculative_decoding is not None
+        ]
+        if placed and not unchecked_variant:
             return placed
     compatibility = evaluate_llamacpp_architecture(metadata.architecture)
-    if not compatibility.is_supported:
+    if metadata.artifacts_by_quant is None and not compatibility.is_supported:
         return []
     quants = _selected_quants(metadata)
     if not quants:
         return []
     max_context_tokens = metadata.context_length
-    if max_context_tokens is None and not skip_context_lookup:
+    if metadata.artifacts_by_quant is None and max_context_tokens is None and not skip_context_lookup:
         try:
             max_context_tokens = fetch_model_max_context(model.repo_id)
         except Exception:
@@ -1876,24 +1928,50 @@ def _profiles_for_model(
         attention_key_length=metadata.attention_key_length, attention_value_length=metadata.attention_value_length,
     )
     for quant in quants:
+        artifact = (metadata.artifacts_by_quant or {}).get(_quant_key(quant))
+        quant_metadata = metadata
+        if artifact is not None and (
+            not layout.source_file or layout.source_file != artifact.entrypoint
+        ):
+            try:
+                quant_metadata = _fetch_quant_layout(model.repo_id, metadata, artifact)
+            except Exception as exc:
+                if unchecked is not None:
+                    unchecked.append(_hf_failure_reason(exc, f"read the {quant} GGUF header"))
+                continue
+        quant_compatibility = (
+            compatibility if quant_metadata is metadata
+            else evaluate_llamacpp_architecture(quant_metadata.architecture)
+        )
+        if not quant_compatibility.is_supported:
+            if rejected is not None:
+                rejected.append(f"{quant}: {quant_compatibility.message}")
+            continue
+        if artifact is not None and quant_metadata.context_length is None:
+            if rejected is not None:
+                rejected.append(f"{quant}: the selected GGUF does not declare its context length.")
+            continue
+        quant_context = quant_metadata.context_length or context_tokens
         built = _profiles_for_quant(
             repo_id=model.repo_id,
             display_name=display_name,
             slug_hint=slug_hint,
-            context_tokens=context_tokens,
+            context_tokens=quant_context,
             quant=quant,
-            metadata=metadata,
+            metadata=quant_metadata,
             modal_gpu_catalog=modal_gpu_catalog,
             aa_candidate=aa_candidate,
             size_bucket=size_bucket,
-            llamacpp_runtime_id=compatibility.runtime_id,
-            speculative_decoding=_mtp_recommendation(metadata),
+            llamacpp_runtime_id=quant_compatibility.runtime_id,
+            speculative_decoding=_mtp_recommendation(quant_metadata),
             rejected=rejected,
             include_unplaced=True,
         )
         for profile in built:
             profile = replace(
-                profile, context_known=max_context_tokens is not None, serving_metadata=layout,
+                profile, context_known=quant_metadata.context_length is not None or (
+                    artifact is None and max_context_tokens is not None
+                ), serving_metadata=quant_metadata.serving_metadata or layout, gguf_artifact=artifact,
                 parameter_count_b=aa_candidate.parameter_count_b if aa_candidate else None,
                 active_parameter_count_b=aa_candidate.active_parameter_count_b if aa_candidate else None,
             )
@@ -1908,6 +1986,21 @@ def _profiles_for_model(
         seen_unplaced.add(key)
         profiles.append(profile)
     return profiles
+
+
+def _fetch_quant_layout(
+    repo_id: str, metadata: GgufQuantMetadata, artifact: GgufArtifact,
+) -> GgufQuantMetadata:
+    delay = _HUB_RETRY_BASE_SECONDS
+    for attempt in range(_HUB_FETCH_ATTEMPTS):
+        try:
+            return gguf_metadata_for_artifact(repo_id, metadata, artifact)
+        except Exception as exc:
+            if attempt + 1 == _HUB_FETCH_ATTEMPTS or not _is_transient_hub_error(exc):
+                raise
+            time.sleep(delay)
+            delay *= 2
+    raise RuntimeError(f"Unreachable GGUF retry loop for {repo_id}")
 
 
 def _selected_quants(metadata: GgufQuantMetadata) -> list[str]:
@@ -1979,7 +2072,8 @@ def _profiles_for_quant(
     rejected: list[str] | None = None,
     include_unplaced: bool = False,
 ) -> list[QuickDeployProfile]:
-    weights_gb = _required_vram_for_quant(metadata, quant)
+    artifact = (metadata.artifacts_by_quant or {}).get(_quant_key(quant))
+    weights_gb = bytes_to_gib(artifact.size_bytes) if artifact else _required_vram_for_quant(metadata, quant)
     if weights_gb is None:
         return []
     requirements = serving_requirements(
@@ -2007,9 +2101,6 @@ def _profiles_for_quant(
             rejected.append("Hybrid attention memory layout is incomplete; GPU fit cannot be verified. Refresh model metadata to retry.")
         return []
     required_vram_gb = memory_estimate.total_gb
-    per_device_overhead_gb = (
-        memory_estimate.compute_gb + memory_estimate.attention_scratch_gb
-    )
     # An unplaced recipe must reflect genuinely missing capacity, not a
     # fallback GPU list invented for display: without this, an empty catalog
     # could never produce one because the static fallback always fits.
@@ -2021,8 +2112,7 @@ def _profiles_for_quant(
                 quant,
                 required_vram_gb,
                 modal_gpu_catalog,
-                per_device_overhead_gb=per_device_overhead_gb,
-                layer_count=memory_estimate.total_layer_count,
+                memory_estimate=memory_estimate,
                 allow_fallback_gpus=allow_fallback_gpus,
             ),
         ),
@@ -2033,8 +2123,7 @@ def _profiles_for_quant(
                 required_vram_gb,
                 modal_gpu_catalog,
                 gpu_type="RTX-PRO-6000",
-                per_device_overhead_gb=per_device_overhead_gb,
-                layer_count=memory_estimate.total_layer_count,
+                memory_estimate=memory_estimate,
                 allow_fallback_gpus=allow_fallback_gpus,
             ),
         ),
@@ -2045,8 +2134,7 @@ def _profiles_for_quant(
                 required_vram_gb,
                 modal_gpu_catalog,
                 gpu_type="B200",
-                per_device_overhead_gb=per_device_overhead_gb,
-                layer_count=memory_estimate.total_layer_count,
+                memory_estimate=memory_estimate,
                 allow_fallback_gpus=allow_fallback_gpus,
             ),
         ),
@@ -2098,7 +2186,7 @@ def _profiles_for_quant(
                 ),
                 server_args=compile_server_args(requirements, runtime_tuning),
                 required_vram_gb=round(selection.required_vram_gb, 1),
-                gpu_memory_gb=_GPU_MEMORY_GB.get(selection.gpu_type),
+                gpu_memory_gb=modal_gpu_capacity_gib(selection.gpu_type),
                 source_label=(
                     "Artificial Analysis"
                     if aa_candidate is not None
@@ -2150,7 +2238,7 @@ def _profiles_for_quant(
             )
         elif rejected is not None:
             reason = (
-                f"{quant}: estimated {required_vram_gb:,.0f} GB at {context_tokens:,} tokens "
+                f"{quant}: estimated {required_vram_gb:,.0f} GiB at {context_tokens:,} tokens "
                 "does not fit any priced catalog topology (maximum 8 GPUs)."
             )
             if not runtime_tuning.flash_attention and memory_estimate.attention_scratch_gb >= 1.0:
@@ -2158,7 +2246,7 @@ def _profiles_for_quant(
                 # GPUs cannot share, so the shortfall does not look like one more
                 # card would close it.
                 reason += (
-                    f" {memory_estimate.attention_scratch_gb:,.0f} GB of that is attention"
+                    f" {memory_estimate.attention_scratch_gb:,.0f} GiB of that is attention"
                     " scratch every GPU needs in full, because this architecture's"
                     " runtime requires flash attention off."
                 )
@@ -2265,37 +2353,30 @@ def _select_gpu_shape(
     per_device_overhead_gb: float = 0.0,
     layer_count: int | None = None,
     allow_fallback_gpus: bool = True,
+    memory_estimate: MemoryEstimate | None = None,
 ) -> _GpuSelection | None:
     prices = _price_by_gpu(modal_gpu_catalog)
     available = _available_gpu_types(
         modal_gpu_catalog, allow_fallback=allow_fallback_gpus
     )
-    # Graph memory is replicated on every device, so only the remainder of the
-    # requirement gets smaller as GPUs are added. Dividing the whole figure
-    # would keep offering a placement that llama.cpp then refuses at startup.
-    shardable_gb = max(0.0, required_vram_gb - per_device_overhead_gb)
+    memory = memory_estimate or MemoryEstimate(
+        weights_gb=max(0.0, required_vram_gb - per_device_overhead_gb),
+        kv_cache_gb=0.0,
+        compute_gb=per_device_overhead_gb,
+        speculative_gb=0.0,
+        reserve_gb=0.0,
+        total_gb=required_vram_gb,
+        total_layer_count=layer_count,
+    )
     candidates: list[tuple[float, int, float, str]] = []
     for candidate_gpu in available:
         if gpu_type is not None and candidate_gpu != gpu_type:
             continue
-        memory_gb = _GPU_MEMORY_GB.get(candidate_gpu)
+        memory_gb = modal_gpu_capacity_gib(candidate_gpu)
         if memory_gb is None:
             continue
         for gpu_count in modal_gpu_count_options(candidate_gpu):
-            reserve_per_gpu = max(2.0, memory_gb * 0.05)
-            # The busiest device is the one that has to fit, and layers are
-            # indivisible, so an uneven split is sized on its larger half.
-            # The comparison runs in whole bytes so a GB/GiB rounding boundary
-            # cannot admit a shape the byte-exact assessment then rejects.
-            busiest = max(
-                per_device_requirements(
-                    shardable_gb=shardable_gb,
-                    per_device_gb=per_device_overhead_gb + reserve_per_gpu,
-                    gpu_count=gpu_count,
-                    layer_count=layer_count,
-                )
-            )
-            if gib_to_bytes(busiest) > device_capacity_bytes(memory_gb):
+            if not memory_fits_device(memory_on_topology(memory, gpu_count, memory_gb), memory_gb):
                 continue
             cost = prices.get(
                 candidate_gpu,

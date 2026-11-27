@@ -339,10 +339,17 @@ class VastDeploymentBackend:
             if assessment
             else (config.required_vram_gb or 0) * 1.05 / max(1, offer.gpu_count)
         )
-        if required > offer.gpu_memory_gib:
+        from .llamacpp_planner import device_capacity_bytes, gib_to_bytes
+
+        capacity = offer.gpu_memory_gib
+        if config.gguf_artifact is not None:
+            from .vast_comparison import vast_gpu_capacity_gib
+
+            capacity = vast_gpu_capacity_gib(offer)
+        if gib_to_bytes(required) > device_capacity_bytes(capacity):
             raise ValueError(
                 f"The selected Vast GPU no longer fits the model's memory requirements: "
-                f"{required:.1f} GiB required per GPU, {offer.gpu_memory_gib:.1f} GiB "
+                f"{required:.1f} GiB required per GPU, {capacity:.1f} GiB "
                 f"available on each of {offer.gpu_count} GPUs."
             )
         return account, offer, required, price
@@ -581,7 +588,13 @@ class VastDeploymentBackend:
                 or "none reported"
             )
         )
-        verify_gpu_topology(devices, gpu_count=offer.gpu_count, per_device_required_gb=required)
+        assessment = config.placement_assessment
+        verify_gpu_topology(
+            devices, gpu_count=offer.gpu_count, per_device_required_gb=required,
+            requirements_by_device=(
+                assessment.memory.per_device_required_gb if assessment and config.gguf_artifact else ()
+            ),
+        )
         ssh.run(
             instance,
             f"umask 077; mkdir -p {VAST_RUNTIME_DIR}; cat > {VAST_RUNTIME_DIR}/runtime.sh",
@@ -634,7 +647,11 @@ class VastDeploymentBackend:
         while not endpoint_healthy(url, record.endpoint_api_key):
             if cancellation.is_set() or is_shutting_down():
                 raise RuntimeError("Vast deployment cancelled.")
-            if time.monotonic() >= deadline or not ssh.connected(instance):
+            connected = ssh.connected(instance)
+            if time.monotonic() >= deadline or not connected:
+                if connected and config.gguf_artifact is not None:
+                    for line in self._failure_log(record, instance, (), include_fit=True):
+                        yield LogEvent(line=f"Vast runtime log: {line}")
                 raise RuntimeError("Vast model startup timed out or its SSH tunnel disconnected.")
             if time.monotonic() - startup_reported >= VAST_STARTUP_HEARTBEAT_SECONDS:
                 interval = time.monotonic() - startup_reported
@@ -680,7 +697,7 @@ class VastDeploymentBackend:
                 if runtime_gone_streak >= 2 and not endpoint_healthy(
                     url, record.endpoint_api_key
                 ):
-                    for line in self._failure_log(record, instance, log_tail):
+                    for line in self._failure_log(record, instance, log_tail, include_fit=config.gguf_artifact is not None):
                         yield LogEvent(line=f"Vast runtime log: {line}")
                     raise RuntimeError(
                         "The Vast runtime exited before the endpoint came up: "
@@ -932,14 +949,16 @@ class VastDeploymentBackend:
         return re.sub(r"(Bearer\s+)\S+", r"\1[redacted]", output, flags=re.IGNORECASE)
 
     def _failure_log(
-        self, record: Any, instance: Any, fallback: tuple[str, ...]
+        self, record: Any, instance: Any, fallback: tuple[str, ...], *, include_fit: bool = False,
     ) -> tuple[str, ...]:
         """Re-read enough of the runtime log to carry a whole traceback."""
         api_key = getattr(record, "endpoint_api_key", "") or ""
         try:
-            output = VastSsh(self.state.directory(record.name)).run(
-                instance, VAST_FAILURE_LOG_COMMAND
-            )
+            command = VAST_FAILURE_LOG_COMMAND
+            if include_fit:
+                # The native projection precedes the model metadata and tensor logs.
+                command = f"head -n 200 {VAST_RUNTIME_DIR}/server.log 2>/dev/null; {command}"
+            output = VastSsh(self.state.directory(record.name)).run(instance, command)
         except Exception:
             log_exception(f"Could not read the Vast runtime log for {record.name}")
             return tuple(self._redact_log_text(line, api_key) for line in fallback)
@@ -951,12 +970,14 @@ class VastDeploymentBackend:
         )
         return lines or tuple(self._redact_log_text(line, api_key) for line in fallback)
 
-    def logs(self, instance_id: str) -> list[str]:
+    def logs(self, instance_id: str, *, tail: int = 200) -> list[str]:
         record = self._record(None, instance_id)
         self._account(record)
         instance = self._instance(record)
         if instance is None:
             raise ValueError("The Vast instance no longer exists.")
-        output = VastSsh(self.state.directory(record.name)).run(instance, f"tail -n 200 {VAST_RUNTIME_DIR}/server.log")
+        output = VastSsh(self.state.directory(record.name)).run(
+            instance, f"tail -n {max(1, int(tail))} {VAST_RUNTIME_DIR}/server.log",
+        )
         output = self._redact_log_text(output, record.endpoint_api_key or "")
         return ["".join(char for char in line if char.isprintable()) for line in output.splitlines()]

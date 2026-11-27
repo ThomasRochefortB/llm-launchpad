@@ -20,6 +20,7 @@ from ..protocol.models import (
     CatalogExclusion,
     DeploymentConfig,
     DeploymentRequest,
+    GgufArtifact,
     InferencePlan,
     InferenceRecipe,
     LlamacppRequestOptions,
@@ -47,7 +48,6 @@ from .naming import build_deployment_name, infer_instance_from_app_name, slugify
 from .llamacpp_planner import (
     tuning_for_architecture,
     estimate_memory,
-    attention_head_count,
     tuning_for_attention_scratch,
     assess_memory_placement,
     compile_server_args,
@@ -96,6 +96,7 @@ class QuickDeployProfile:
     context_known: bool = True
     parameter_count_b: float | None = None
     active_parameter_count_b: float | None = None
+    gguf_artifact: GgufArtifact | None = None
 
 
 @dataclass(frozen=True)
@@ -272,6 +273,9 @@ def quick_deploy_recipe(profile: QuickDeployProfile) -> InferenceRecipe:
             *profile.server_args,
         )
     )
+    if profile.gguf_artifact is not None:
+        artifact = profile.gguf_artifact
+        fingerprint += f"\0{artifact.revision}\0{artifact.entrypoint}"
     digest = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:10]
     recipe_id = f"{slugify_instance_name(profile.display_name)}-{profile.backend.value}-{digest}"
     return InferenceRecipe(
@@ -290,6 +294,7 @@ def quick_deploy_recipe(profile: QuickDeployProfile) -> InferenceRecipe:
         quality_rank=profile.aa_rank,
         serving_requirements=profile.serving_requirements,
         runtime_tuning=profile.runtime_tuning,
+        gguf_artifact=profile.gguf_artifact,
     )
 
 
@@ -357,6 +362,22 @@ def list_quick_deploy_models(
     return tuple(models)
 
 
+def quick_deploy_memory_for_tuning(
+    profile: QuickDeployProfile, requirements: ServingRequirements, tuning: RuntimeTuning,
+) -> MemoryEstimate | None:
+    """Recompute memory when context, cache type, slots or speculation change."""
+    layout, memory = profile.serving_metadata, profile.memory_estimate
+    if layout is None or memory is None:
+        return memory
+    if requirements.context_tokens == profile.max_context_tokens and tuning == profile.runtime_tuning:
+        return memory
+    metadata = GgufQuantMetadata(
+        [], {}, architecture=layout.architecture or profile.gguf_architecture,
+        block_count=layout.block_count, serving_metadata=layout,
+    )
+    return estimate_memory(metadata, weights_gb=memory.weights_gb, requirements=requirements, tuning=tuning)
+
+
 def model_for_context(model: QuickDeployModel, tokens: int) -> QuickDeployModel | None:
     """Replan an explicit context using the GGUF layout and original weight size."""
     if tokens == model.max_context_tokens:
@@ -372,20 +393,16 @@ def model_for_context(model: QuickDeployModel, tokens: int) -> QuickDeployModel 
             continue
         if not layout or not req or not tuning or not memory or tokens > req.context_tokens:
             continue
-        metadata = GgufQuantMetadata([], {}, serving_metadata=layout, **{
-            name: getattr(layout, name) for name in (
-                "architecture", "block_count", "embedding_length", "attention_head_count",
-                "attention_head_count_kv", "attention_key_length", "attention_value_length",
-            )
-        })
         req = replace(req, context_tokens=tokens)
         base_ubatch = tuning_for_objective(
             req.objective, speculative_decoding=tuning.speculative_decoding
         ).ubatch_size
         base_tuning = replace(tuning, ubatch_size=max(tuning.ubatch_size, base_ubatch))
-        tuning = tuning_for_attention_scratch(base_tuning, context_tokens=tokens, attention_head_count=attention_head_count(metadata))
-        memory = estimate_memory(metadata, weights_gb=memory.weights_gb, requirements=req, tuning=tuning)
-        if memory.source == "conservative-fallback":
+        tuning = tuning_for_attention_scratch(
+            base_tuning, context_tokens=tokens, attention_head_count=layout.attention_head_count,
+        )
+        memory = quick_deploy_memory_for_tuning(profile, req, tuning)
+        if memory is None or memory.source == "conservative-fallback":
             continue
         profiles.append(replace(profile, serving_requirements=req, runtime_tuning=tuning,
                                 memory_estimate=memory, required_vram_gb=memory.total_gb,
@@ -500,9 +517,10 @@ def retune_quick_deploy_plan(
         server_args=compile_server_args(requirements, tuning),
     )
     assessment = plan.assessment
-    if profile.memory_estimate is not None and plan.quote.gpu_memory_gb is not None:
+    memory = quick_deploy_memory_for_tuning(profile, requirements, tuning)
+    if memory is not None and plan.quote.gpu_memory_gb is not None:
         assessment = assess_memory_placement(
-            profile.memory_estimate,
+            memory,
             model_id=recipe.model_id,
             revision=None,
             quant=recipe.quant,
@@ -513,6 +531,8 @@ def retune_quick_deploy_plan(
             gpu_count=plan.quote.gpu_count,
             gpu_memory_gb=plan.quote.gpu_memory_gb,
             price_per_hour_usd=plan.quote.price_per_hour_usd,
+            artifact=profile.gguf_artifact,
+            provider=plan.quote.provider,
         )
     single_tps = None
     if assessment is not None:
@@ -687,6 +707,7 @@ def request_from_config(config: DeploymentConfig) -> DeploymentRequest:
             dspark=config.dspark,
             dspark_repo=config.dspark_repo,
             dspark_file=config.dspark_file,
+            gguf_artifact=config.gguf_artifact,
         ),
         vllm=VllmRequestOptions(
             model_name=config.model_name,
@@ -734,7 +755,7 @@ def config_from_request(
     config.preset = llamacpp.preset
     config.repo_id = llamacpp.repo_id
     config.quant = llamacpp.quant
-    config.revision = llamacpp.revision
+    config.revision = llamacpp.gguf_artifact.revision if llamacpp.gguf_artifact else llamacpp.revision
     config.preload = llamacpp.preload
     config.server_args = llamacpp.server_args
     config.host = llamacpp.host
@@ -748,6 +769,7 @@ def config_from_request(
     config.dspark = llamacpp.dspark
     config.dspark_repo = llamacpp.dspark_repo
     config.dspark_file = llamacpp.dspark_file
+    config.gguf_artifact = llamacpp.gguf_artifact
     vllm = request.vllm
     config.model_name = vllm.model_name
     config.model_revision = vllm.model_revision
@@ -803,6 +825,9 @@ def build_quick_deploy_config(
     if profile.backend == BackendType.LLAMACPP:
         config.repo_id = profile.repo_id
         config.quant = profile.quant
+        config.gguf_artifact = profile.gguf_artifact
+        if profile.gguf_artifact is not None:
+            config.revision = profile.gguf_artifact.revision
         config.gguf_architecture = profile.gguf_architecture
         config.llamacpp_runtime_id = profile.llamacpp_runtime_id
         config.server_args = shlex.join(
@@ -853,25 +878,17 @@ def build_quick_deploy_config(
                 else profile.speculative_decoding
             )
         elif config.runtime_tuning is not None:
-            config.runtime_tuning = RuntimeTuning(
-                parallel_slots=config.runtime_tuning.parallel_slots,
-                batch_size=config.runtime_tuning.batch_size,
-                ubatch_size=config.runtime_tuning.ubatch_size,
-                cache_type_k=config.runtime_tuning.cache_type_k,
-                cache_type_v=config.runtime_tuning.cache_type_v,
-                flash_attention=config.runtime_tuning.flash_attention,
-                gpu_layers=config.runtime_tuning.gpu_layers,
-                fit_target_mib=config.runtime_tuning.fit_target_mib,
-                speculative_decoding=None,
-            )
+            config.runtime_tuning = replace(config.runtime_tuning, speculative_decoding=None)
             if (
                 config.serving_requirements is not None
-                and profile.memory_estimate is not None
                 and plan is not None
                 and plan.quote.gpu_memory_gb is not None
+                and (memory := quick_deploy_memory_for_tuning(
+                    profile, config.serving_requirements, config.runtime_tuning,
+                )) is not None
             ):
                 config.placement_assessment = assess_memory_placement(
-                    profile.memory_estimate,
+                    memory,
                     model_id=plan.recipe.model_id,
                     revision=None,
                     quant=plan.recipe.quant,
@@ -882,6 +899,8 @@ def build_quick_deploy_config(
                     gpu_count=plan.quote.gpu_count,
                     gpu_memory_gb=plan.quote.gpu_memory_gb,
                     price_per_hour_usd=plan.quote.price_per_hour_usd,
+                    artifact=profile.gguf_artifact,
+                    provider=provider,
                 )
         if config.serving_requirements is not None and config.runtime_tuning is not None:
             config.server_args = shlex.join(

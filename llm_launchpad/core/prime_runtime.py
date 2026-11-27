@@ -226,6 +226,9 @@ def _llamacpp_docker_command(
         PRIME_API_KEY_PLACEHOLDER,
         gguf_exec_command,
         gguf_stage_command,
+        llamacpp_fit_marker,
+        pinned_gguf_directory,
+        stage_pinned_gguf,
     )
 
     options = prime_provider_options(config)
@@ -240,21 +243,29 @@ def _llamacpp_docker_command(
         if config.engram_table is not None and config.engram_table.replaced_shard
         else None
     )
-    stage_setup, hf_file_flag = gguf_stage_command(
-        repo_id=repo,
-        revision=None,
-        quant=quant,
-        dest_dir=f"{stage_root}/staged",
-        cache_dir=f"{stage_root}/staged/hf-hub",
-        exclude_files=excluded_shards,
-    )
-    llama_args = [
-        "/app/llama-server",
-        "--hf-repo",
-        hf_repo,
-        hf_file_flag[0],
-        GGUF_FILE_PLACEHOLDER,
-    ]
+    artifact = config.gguf_artifact
+    if artifact is not None:
+        stage_setup, model_path = stage_pinned_gguf(
+            repo, artifact, root=stage_root,
+            excluded_shard=excluded_shards[0] if excluded_shards else None,
+        )
+        model_args = ["--model", model_path]
+        weights_args_path = None
+        command.extend([
+            "--env",
+            f"LLM_LAUNCHPAD_GGUF_CACHE={stage_root}/{pinned_gguf_directory(repo, artifact)}",
+        ])
+    else:
+        stage_setup, (_, weights_args_path) = gguf_stage_command(
+            repo_id=repo,
+            revision=None,
+            quant=quant,
+            dest_dir=f"{stage_root}/staged",
+            cache_dir=f"{stage_root}/staged/hf-hub",
+            exclude_files=excluded_shards,
+        )
+        model_args = ["--hf-repo", hf_repo, "--hf-file", GGUF_FILE_PLACEHOLDER]
+    llama_args = ["/app/llama-server", *model_args]
     if config.n_gpu_layers is not None:
         llama_args.extend(["--n-gpu-layers", str(config.n_gpu_layers)])
     server_extra_args = shlex.split(config.server_args or "")
@@ -272,10 +283,7 @@ def _llamacpp_docker_command(
     )
     fit_args = [
         "/app/llama-fit-params",
-        "--hf-repo",
-        hf_repo,
-        hf_file_flag[0],
-        GGUF_FILE_PLACEHOLDER,
+        *model_args,
         "--verbosity",
         str(LLAMACPP_FIT_LOG_VERBOSITY),
         *llamacpp_fit_relevant_args(server_extra_args),
@@ -301,24 +309,26 @@ def _llamacpp_docker_command(
         "echo LLM_LAUNCHPAD_ATTESTATION_JSON_END; "
     )
     fit_guard = ""
-    if config.placement_assessment is not None:
+    if weights_args_path is not None and config.placement_assessment is not None:
         joined_fit = shlex.join(fit_args).replace(
             shlex.quote(GGUF_FILE_PLACEHOLDER),
             f'"${PRIME_FIT_FILE_VARIABLE}"',
         )
         fit_guard = (
             f"{PRIME_FIT_FILE_VARIABLE}="
-            f"$(cat {shlex.quote(hf_file_flag[1])} 2>/dev/null || true); "
+            f"$(cat {shlex.quote(weights_args_path)} 2>/dev/null || true); "
             f"if [ -x /app/llama-fit-params ] && "
             f"[ -n \"${PRIME_FIT_FILE_VARIABLE}\" ]; then {joined_fit} "
             "|| exit $?; fi; "
             f"{attestation_marker}"
         )
-    inner = projector_setup + fit_guard + gguf_exec_command(
-        [*llama_args, "--api-key", PRIME_API_KEY_PLACEHOLDER],
-        weights_args_path=hf_file_flag[1],
-    ).replace(
-        shlex.quote(PRIME_API_KEY_PLACEHOLDER), '"$LLAMA_ARG_API_KEY"'
+    llama_args.extend(["--api-key", PRIME_API_KEY_PLACEHOLDER])
+    execute = (
+        gguf_exec_command(llama_args, weights_args_path=weights_args_path)
+        if weights_args_path is not None else "exec " + shlex.join(llama_args)
+    )
+    inner = projector_setup + fit_guard + llamacpp_fit_marker(config) + execute.replace(
+        shlex.quote(PRIME_API_KEY_PLACEHOLDER), '"$LLAMA_ARG_API_KEY"',
     )
     if not options.disk_id:
         command.extend(["-v", "llm-launchpad-llama-cache:/root/.cache/llama.cpp"])
@@ -519,6 +529,11 @@ def redact_runtime_log(value: str) -> str:
 
 def expected_model_bytes(config: DeploymentConfig) -> int:
     """Bytes the pod will actually download, for model-load percentages."""
+    if artifact := config.gguf_artifact:
+        table = config.engram_table
+        if table is not None:
+            return sum(size for name, size in artifact.files if name != table.replaced_shard) + table.size_bytes
+        return artifact.size_bytes
     assessment = config.placement_assessment
     memory = getattr(assessment, "memory", None)
     weights_gb = getattr(memory, "weights_gb", None)

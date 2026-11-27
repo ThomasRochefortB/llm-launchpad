@@ -39,6 +39,8 @@ from llm_launchpad.protocol.enums import (
 )
 from llm_launchpad.protocol.models import (
     DeploymentConfig,
+    GgufArtifact,
+    LLAMACPP_FIT_START_MARKER,
     MemoryEstimate,
     PlacementAssessment,
     PrimeProviderOptions,
@@ -52,6 +54,8 @@ REPO = "acme/model-GGUF"
 QUANT = "UD-Q2_K_XL"
 # A space is the case a shell splits when the variable is referenced unquoted.
 SHARD = f"{QUANT}/Model One-00001-of-00002.gguf"
+SECOND_SHARD = SHARD.replace("00001", "00002")
+PINNED = GgufArtifact("f" * 40, ((SHARD, 4), (SECOND_SHARD, 4)))
 
 
 def _vast_llamacpp(**overrides: Any) -> DeploymentConfig:
@@ -208,6 +212,18 @@ class _Host:
             "raise SystemExit('pip is not usable in this image')", encoding="utf-8"
         )
 
+    def pinned_downloads(self, data: bytes) -> None:
+        curl = self.bin / "curl"
+        curl.write_text(
+            f"#!{self._python}\n"
+            "import json, sys\nfrom pathlib import Path\n"
+            f"with open({str(self.records / 'curl.jsonl')!r}, 'a') as log:\n"
+            "    log.write(json.dumps({'argv': sys.argv[1:]}) + '\\n')\n"
+            f"Path(sys.argv[-1]).write_bytes({data!r})\n",
+            encoding="utf-8",
+        )
+        curl.chmod(0o755)
+
     def run(
         self, shell: str, script: str, *, env: dict[str, str] | None = None
     ) -> subprocess.CompletedProcess[str]:
@@ -294,6 +310,27 @@ class VastScriptExecutionTests(unittest.TestCase):
         self.assertNotIn("--hf-file", argv)
         self.assertEqual(_flag(argv, "--hf-repo"), f"{REPO}:{QUANT}")
         self.assertEqual(_flag(argv, "--host"), "127.0.0.1")
+
+    def test_pinned_script_refuses_a_truncated_shard_before_serving(self) -> None:
+        self.host.pinned_downloads(b"GG")
+        self.host.recorder("llama-server")
+        config = _vast_llamacpp(gguf_artifact=PINNED, revision=PINNED.revision)
+        script = self._localise(vast_runtime_script(config))
+
+        failed = self.host.run("sh", script)
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("Downloaded GGUF did not match", failed.stderr)
+        self.assertEqual(self.host.calls("llama-server"), [])
+        self.assertEqual(list(self.host.root.rglob("*.incomplete")), [])
+
+        self.host.pinned_downloads(b"GGUF")
+        succeeded = self.host.run("sh", script)
+        self.assertEqual(succeeded.returncode, 0, succeeded.stderr)
+        (server,) = self.host.calls("llama-server")
+        self.assertNotIn("--hf-repo", server["argv"])
+        model_path = Path(_flag(server["argv"], "--model"))
+        self.assertTrue(model_path.as_posix().endswith(SHARD))
+        self.assertEqual((model_path.parent / Path(SECOND_SHARD).name).read_bytes(), b"GGUF")
 
     def test_vllm_script_serves_with_stated_limits_and_the_key_in_the_environment(
         self,
@@ -396,6 +433,37 @@ class PrimeScriptExecutionTests(unittest.TestCase):
 
         self.assertEqual(completed.returncode, 3)
         self.assertEqual(self.host.calls("llama-server"), [])
+
+    def test_pinned_container_reuses_exact_shards_and_checks_fit_in_llama_server(self) -> None:
+        self.host.pinned_downloads(b"GGUF")
+        self.host.recorder("llama-fit-params", exit_code=3)
+        self.host.recorder("llama-server")
+        config = _prime_llamacpp()
+        config.gguf_artifact = PINNED
+        config.revision = PINNED.revision
+        assert config.placement_assessment is not None
+        config.placement_assessment = replace(config.placement_assessment, calibration_key="pinned-test")
+        run, env = self._bootstrap(config)
+
+        started = self._container(run, env)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        self.assertEqual(self.host.calls("llama-fit-params"), [])
+        self.assertIn(f"{LLAMACPP_FIT_START_MARKER} fingerprint-under-test", started.stdout)
+        urls = [call["argv"][-3] for call in self.host.calls("curl")]
+        self.assertEqual(len(urls), 2)
+        for url, shard in zip(urls, (SHARD, SECOND_SHARD), strict=True):
+            self.assertIn(f"/{REPO}/resolve/{PINNED.revision}/{shard.replace(' ', '%20')}", url)
+        (server,) = self.host.calls("llama-server")
+        self.assertNotIn("--hf-repo", server["argv"])
+        model_path = Path(_flag(server["argv"], "--model"))
+        self.assertEqual(model_path.read_bytes(), b"GGUF")
+
+        second_path = model_path.parent / Path(SECOND_SHARD).name
+        second_path.write_bytes(b"fake")
+        restarted = self._container(run, env)
+        self.assertEqual(restarted.returncode, 0, restarted.stderr)
+        self.assertEqual(second_path.read_bytes(), b"GGUF")
+        self.assertEqual([call["argv"][-3] for call in self.host.calls("curl")], [*urls, urls[-1]])
 
     def test_llamacpp_container_falls_back_without_huggingface_hub(self) -> None:
         self.host.hub_missing()

@@ -180,7 +180,15 @@ def _render_profile_details(profile: QuickDeployProfile, plan: InferencePlan) ->
         else profile.required_vram_gb
     )
     if required_memory:
-        lines.append(_summary_row("VRAM", f"{required_memory:.0f} GB required"))
+        if plan.assessment is not None and plan.assessment.memory.per_device_required_gb:
+            memory = plan.assessment.memory
+            busiest = max(memory.per_device_required_gb)
+            detail = f"{busiest:.1f} GiB on busiest GPU" if plan.quote.gpu_count > 1 else f"{busiest:.1f} GiB"
+            source = "runtime projection" if memory.source == "runtime-projection" else "estimate"
+            lines.append(_summary_row("VRAM", f"{detail} incl. headroom ({source})"))
+        else:
+            unit = "GiB" if profile.gguf_artifact is not None else "GB"
+            lines.append(_summary_row("VRAM", f"{required_memory:.0f} {unit} required"))
     requirements = plan.recipe.serving_requirements
     if requirements is not None:
         lines.append(

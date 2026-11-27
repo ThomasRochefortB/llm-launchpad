@@ -86,6 +86,21 @@ class GgufServingMetadata:
     indexer_key_length: int | None = None
     indexer_kpool: int | None = None
     nextn_predict_layers: int = 0
+    full_attention_interval: int | None = None
+    recurrent_layers: tuple[bool, ...] = ()
+    ssm_inner_size: int | None = None
+    ssm_state_size: int | None = None
+    ssm_group_count: int | None = None
+    sliding_window: int | None = None
+    sliding_window_pattern: tuple[bool, ...] = ()
+    sliding_window_interval: int | None = None
+    shared_kv_layers: int = 0
+    attention_key_length_swa: int | None = None
+    attention_value_length_swa: int | None = None
+    expert_count: int = 0
+    feed_forward_length: int | None = None
+    feed_forward_length_by_layer: tuple[int, ...] = ()
+    shortconv_cache_length: int | None = None
 
 
 @dataclass(frozen=True)
@@ -301,6 +316,19 @@ def parse_gguf_serving_metadata(
         "attention.indexer.key_length": "indexer_key_length",
         "attention.indexer.kpool": "indexer_kpool",
         "nextn_predict_layers": "nextn_predict_layers",
+        "full_attention_interval": "full_attention_interval",
+        "attention.recurrent_layers": "recurrent_layers",
+        "ssm.inner_size": "ssm_inner_size",
+        "ssm.state_size": "ssm_state_size",
+        "ssm.group_count": "ssm_group_count",
+        "attention.sliding_window": "sliding_window",
+        "attention.sliding_window_pattern": "sliding_window_interval",
+        "attention.shared_kv_layers": "shared_kv_layers",
+        "attention.key_length_swa": "attention_key_length_swa",
+        "attention.value_length_swa": "attention_value_length_swa",
+        "expert_count": "expert_count",
+        "feed_forward_length": "feed_forward_length",
+        "shortconv.l_cache": "shortconv_cache_length",
     }
     offset = 24
     for _ in range(metadata_count):
@@ -326,23 +354,37 @@ def parse_gguf_serving_metadata(
 
     # Only the target architecture may supply these fields (not a vision tower).
     scalars: dict[str, int] = {}
-    kv_by_layer: tuple[int, ...] = ()
+    layer_sizes: dict[str, tuple[int, ...]] = {}
+    patterns: dict[str, tuple[bool, ...]] = {}
     for suffix, field in suffixes.items():
         fallback = None if field == "nextn_predict_layers" else values.get(suffix)
         value = values.get(f"{architecture}.{suffix}", fallback)
         if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-            if value > 0 or field in {"attention_head_count_kv", "nextn_predict_layers"}:
+            if field != "recurrent_layers" and (
+                value > 0 or field in {
+                    "attention_head_count_kv", "feed_forward_length", "nextn_predict_layers", "sliding_window_interval",
+                }
+            ):
                 scalars[field] = value
         elif (
-            field == "attention_head_count_kv" and isinstance(value, tuple)
+            field in {"attention_head_count_kv", "feed_forward_length"} and isinstance(value, tuple)
             and value and all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in value)
         ):
-            kv_by_layer = value
+            layer_sizes[field] = value
+        elif (
+            field in {"recurrent_layers", "sliding_window_interval"}
+            and isinstance(value, tuple) and value
+            and all(isinstance(entry, bool) for entry in value)
+        ):
+            patterns[field] = value
 
     return GgufServingMetadata(
         architecture=architecture,
         **scalars,
-        attention_head_count_kv_by_layer=kv_by_layer,
+        recurrent_layers=patterns.get("recurrent_layers", ()),
+        sliding_window_pattern=patterns.get("sliding_window_interval", ()),
+        attention_head_count_kv_by_layer=layer_sizes.get("attention_head_count_kv", ()),
+        feed_forward_length_by_layer=layer_sizes.get("feed_forward_length", ()),
         source_file=source_file,
     )
 
@@ -353,12 +395,14 @@ def fetch_gguf_serving_metadata(
     *,
     revision: str | None = None,
     quant: str | None = None,
+    filename: str | None = None,
     chunk_bytes: int = GGUF_METADATA_CHUNK_BYTES,
     max_bytes: int = GGUF_METADATA_MAX_BYTES,
+    strict: bool = False,
 ) -> GgufServingMetadata | None:
     """Fetch and parse bounded GGUF header ranges for memory planning."""
 
-    filename = select_target_gguf_file(siblings, quant=quant)
+    filename = filename or select_target_gguf_file(siblings, quant=quant)
     if filename is None or chunk_bytes <= 0 or max_bytes <= 0:
         return None
     payload = bytearray()
@@ -384,7 +428,8 @@ def fetch_gguf_serving_metadata(
                 next_chunk_bytes *= 2
                 continue
     except Exception:
-        return None
+        if strict:
+            raise
     return None
 
 

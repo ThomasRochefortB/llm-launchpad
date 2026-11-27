@@ -23,8 +23,9 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
-from collections.abc import Generator, Iterable
+from collections.abc import Callable, Generator, Iterable
 from urllib.parse import urlsplit
 
 from ..gguf_files import is_target_gguf
@@ -56,12 +57,14 @@ if TYPE_CHECKING:
     from .runtime_evidence import LlamacppRuntimeEvidence
 
 from .llamacpp_planner import (
+    bytes_to_gib,
     attestation_now,
     load_runtime_attestation,
     save_runtime_attestation,
 )
 from .naming import legacy_app_name
 from .prime_backend import PrimeBackend
+from .runtime_evidence import parse_offload_report
 
 EventStream = Generator[BaseEvent, None, None]
 
@@ -528,7 +531,7 @@ def _verify_gpu_residency(
         runtime_evidence.offload_evidence if observed_residency is not None else None
     )
     if backend == BackendType.LLAMACPP and serving_requirements.gpu_only:
-        if observed_residency is None:
+        if observed_residency is None and not placement_assessment.calibration_key:
             # The live tail can lose the offload report to a burst upstream, so
             # look again before concluding the runtime never said anything.
             recovered = LlamacppRuntimeEvidence()
@@ -610,6 +613,7 @@ def _certify_serving_requirements(
     provider: ComputeProvider = ComputeProvider.MODAL,
     pod_id: str | None = None,
     prime_backend: Any | None = None,
+    cache_attestation: bool = True,
 ) -> Generator[BaseEvent, None, RuntimeAttestation | None]:
     """Verify full-context GPU residency and throughput for a ready endpoint.
 
@@ -719,6 +723,7 @@ def _certify_serving_requirements(
             residency_evidence=residency_evidence,
             performance=performance,
             runtime_id=runtime_id,
+            cache_attestation=cache_attestation,
         )
     )
 
@@ -734,8 +739,9 @@ def _record_certified_attestation(
     residency_evidence: EvidenceLevel | None,
     performance: tuple[PerformancePoint, ...],
     runtime_id: str | None,
+    cache_attestation: bool = True,
 ) -> Generator[BaseEvent, None, RuntimeAttestation]:
-    """Persist and announce a verified runtime attestation."""
+    """Persist and announce runtime context, residency, and throughput evidence."""
     total_layers = max(1, placement_assessment.memory.total_layer_count or 0)
     observed_gpu_layers = runtime_evidence.gpu_layers
     observed_total_layers = runtime_evidence.total_layers
@@ -756,13 +762,14 @@ def _record_certified_attestation(
         runtime_id=runtime_id,
         residency_evidence=residency_evidence,
     )
-    try:
-        save_runtime_attestation(attestation)
-    except Exception as exc:
-        yield LogEvent(
-            line=f"Warning: could not cache serving certificate: {exc}",
-            operation=OperationType.WARMUP,
-        )
+    if cache_attestation and residency_evidence != EvidenceLevel.PREDICTED:
+        try:
+            save_runtime_attestation(attestation)
+        except Exception as exc:
+            yield LogEvent(
+                line=f"Warning: could not cache serving certificate: {exc}",
+                operation=OperationType.WARMUP,
+            )
     best_single = max(
         (point.output_tokens_per_second or 0.0 for point in performance if point.concurrency == 1),
         default=0.0,
@@ -774,10 +781,14 @@ def _record_certified_attestation(
     metric = ""
     if best_single > 0:
         metric = f" · {best_single:.1f} tok/s single, {best_aggregate:.1f} tok/s aggregate"
+    residency = (
+        f"{gpu_layers}/{total_layers} layers observed on GPU"
+        if residency_evidence == EvidenceLevel.OBSERVED else "GPU residency unverified"
+    )
     yield LogEvent(
         line=(
             f"Configured {effective_context:,}-token context with "
-            f"{gpu_layers}/{total_layers} layers observed on GPU"
+            f"{residency}"
             f"{metric}."
         ),
         operation=OperationType.WARMUP,
@@ -806,6 +817,7 @@ class WarmupRequest:
     vision: VisionCapabilities | None = None
     phase_timer: StartupPhaseTimer | None = None
     price_per_hour_usd: float | None = None
+    vast_log_reader: Callable[[], list[str]] | None = None
 
 
 class _WarmupSession:
@@ -891,13 +903,12 @@ class _WarmupSession:
                     self.unrecoverable = _LLAMACPP_AUXILIARY_MODEL_FAILURE
             if self.unrecoverable is None:
                 self.unrecoverable = terminal_startup_failure(line)
-            measured = self.calibration.observe(line)
-            if measured is not None:
+            projection = self.calibration.observe(line)
+            if projection is not None:
                 yield LogEvent(
                     line=(
-                        "Recorded llama.cpp's own measurement: "
-                        f"{measured.graph_gb:.1f} GB of graph memory per GPU "
-                        f"(measured on {measured.gpu_count}x {measured.gpu_type})."
+                        "Recorded llama.cpp's memory projection: "
+                        f"{bytes_to_gib(max(projection.per_device_bytes)):.1f} GiB on the busiest GPU, before headroom."
                     ),
                     operation=OperationType.WARMUP,
                 )
@@ -913,16 +924,45 @@ class _WarmupSession:
             yield from self.log_tail.attach()
 
     def _fail_if_unrecoverable(self) -> Generator[BaseEvent, None, bool]:
-        if self.unrecoverable is None:
+        if not self.unrecoverable and not self.calibration.headroom_shortfall_mib:
             return False
+        if self.unrecoverable and not self.calibration.topology_verified:
+            self._read_retained_fit_logs()
+        detail = self.unrecoverable
+        if shortfall := self.calibration.headroom_shortfall_mib:
+            detail = (
+                f"llama.cpp's exact placement needs {shortfall:,} MiB more free VRAM "
+                "on its busiest GPU to retain the requested headroom."
+            )
         self._stop_log_tail("on unrecoverable startup failure")
         yield from fail_operation(
             OperationType.WARMUP,
-            self.unrecoverable,
+            detail or "",
             recoverable=False,
-            detail=self.unrecoverable,
+            detail=detail,
         )
         return True
+
+    def _read_retained_fit_logs(self) -> list[str]:
+        assessment = self.req.placement_assessment
+        if assessment is None or not assessment.calibration_key:
+            return []
+        try:
+            if self.req.vast_log_reader is not None:
+                lines = self.req.vast_log_reader()
+            elif self.req.provider == ComputeProvider.PRIME and self.req.pod_id and self.req.prime_backend:
+                lines = self.req.prime_backend.get_pod_logs(self.req.pod_id, tail=2000)
+            elif self.req.provider == ComputeProvider.MODAL:
+                since = datetime.fromtimestamp(self.start, UTC).isoformat(timespec="seconds")
+                lines = _retained_modal_logs(self.target_app_name, "--since", since, "--tail", "2000").splitlines()
+            else:
+                return []
+            for line in lines:
+                self.calibration.observe(line)
+            return lines
+        except Exception:
+            log_exception("Could not read the serving runtime's memory projection")
+            return []
 
     def _maybe_check_system_scheduling(self, now: float) -> EventStream:
         if (
@@ -974,18 +1014,16 @@ class _WarmupSession:
                     return None, None, True
                 now = time.time()
                 if now - self.start > self.req.timeout:
-                    self._stop_log_tail("on timeout")
-                    yield from fail_operation(
-                        OperationType.WARMUP,
-                        self._timeout_message(
-                            self.last_err or f"Read timed out while probing {self.probe_url}"
-                        ),
+                    yield from self._report_timeout(
+                        self.last_err or f"Read timed out while probing {self.probe_url}",
                     )
                     return None, None, True
                 yield from self._maybe_check_system_scheduling(now)
 
     def _handle_ready_endpoint(self, requests_module: Any) -> EventStream:
         """Certify residency/vision, emit the curl hint, and finish healthy."""
+        if self.tail_modal_logs:
+            yield from self._drain_live_logs()
         self._stop_log_tail("after readiness")
         if self.req.phase_timer is not None:
             self.req.phase_timer.ready()
@@ -997,6 +1035,14 @@ class _WarmupSession:
                 if ordered_lines is not None
                 else sorted(self.log_tail.seen_lines)
             )
+            assessment = self.req.placement_assessment
+            runtime_log_text = "\n".join(runtime_log_lines)
+            if assessment and assessment.calibration_key and (
+                not self.calibration.topology_verified or parse_offload_report(runtime_log_text)[1] is None
+            ):
+                runtime_log_text = "\n".join([*runtime_log_lines, *self._read_retained_fit_logs()])
+            if (yield from self._fail_if_unrecoverable()):
+                return
             attestation = yield from _certify_serving_requirements(
                 requests_module,
                 backend=self.req.backend,
@@ -1008,11 +1054,12 @@ class _WarmupSession:
                 runtime_id=self.req.runtime_id,
                 phase_timer=self.req.phase_timer,
                 price_per_hour_usd=self.req.price_per_hour_usd,
-                runtime_log_text="\n".join(runtime_log_lines),
+                runtime_log_text=runtime_log_text,
                 app_name=self.target_app_name or "",
                 provider=self.req.provider,
                 pod_id=self.req.pod_id,
                 prime_backend=self.req.prime_backend,
+                cache_attestation=not (assessment and assessment.calibration_key) or self.calibration.topology_verified,
             )
             if attestation is None:
                 return
@@ -1095,8 +1142,15 @@ class _WarmupSession:
             if chunk > 0:
                 shutdown_event().wait(timeout=chunk)
             yield from self._drain_live_logs()
-            if self.unrecoverable is not None:
+            if self.unrecoverable is not None or self.calibration.headroom_shortfall_mib:
                 break
+
+    def _report_timeout(self, detail: str | None) -> EventStream:
+        if not self.calibration.topology_verified:
+            self._read_retained_fit_logs()
+        if not (yield from self._fail_if_unrecoverable()):
+            self._stop_log_tail("on timeout")
+            yield from fail_operation(OperationType.WARMUP, self._timeout_message(detail))
 
     def run(self) -> EventStream:
         """Execute the readiness probe loop and certification steps."""
@@ -1144,11 +1198,7 @@ class _WarmupSession:
 
                 elapsed = time.time() - self.start
                 if elapsed > self.req.timeout:
-                    self._stop_log_tail("on timeout")
-                    yield from fail_operation(
-                        OperationType.WARMUP,
-                        self._timeout_message(self.last_err),
-                    )
+                    yield from self._report_timeout(self.last_err)
                     return
 
                 probe_timeout = _probe_timeout_seconds(
@@ -1219,6 +1269,7 @@ class WarmupRunner:
         vision: VisionCapabilities | None = None,
         phase_timer: StartupPhaseTimer | None = None,
         price_per_hour_usd: float | None = None,
+        vast_log_reader: Callable[[], list[str]] | None = None,
     ) -> EventStream:
         """Probe endpoint readiness and optionally tail logs."""
         yield from self.run_request(
@@ -1239,6 +1290,7 @@ class WarmupRunner:
                 vision=vision,
                 phase_timer=phase_timer,
                 price_per_hour_usd=price_per_hour_usd,
+                vast_log_reader=vast_log_reader,
             )
         )
 
@@ -1558,23 +1610,26 @@ def _refetched_log_evidence(app_name: str) -> LlamacppRuntimeEvidence:
     one CLI call against logs the provider already stored.
     """
 
-    from .runtime_evidence import LlamacppRuntimeEvidence, runtime_log_evidence
+    from .runtime_evidence import runtime_log_evidence
 
+    return runtime_log_evidence(_retained_modal_logs(app_name))
+
+
+def _retained_modal_logs(app_name: str, *options: str) -> str:
     if not app_name.strip():
-        return LlamacppRuntimeEvidence()
+        return ""
     try:
         result = subprocess.run(
-            ModalBackend._resolve_command(["modal", "app", "logs", app_name]),
+            ModalBackend._resolve_command(["modal", "app", "logs", app_name, *options]),
             capture_output=True,
             text=True,
             timeout=20,
             env={**os.environ, "PYTHONUNBUFFERED": "1"},
         )
-        text = result.stdout or ""
+        return result.stdout or ""
     except Exception:
         log_exception(f"Failed to re-read retained logs for {app_name}")
-        return LlamacppRuntimeEvidence()
-    return runtime_log_evidence(text)
+        return ""
 
 
 def fetch_historical_logs(

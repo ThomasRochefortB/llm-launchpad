@@ -341,6 +341,49 @@ class LlamacppDownloadProgressTests(unittest.TestCase):
         fake_cache.commit.assert_not_called()
         mock_snapshot.assert_not_called()
 
+    def test_pinned_download_ignores_other_revisions_and_commits_only_complete_shards(self) -> None:
+        @contextmanager
+        def fake_lease(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+            yield lambda: None
+
+        revision = "a" * 40
+        names = ["Q4/model-00001-of-00002.gguf", "Q4/model-00002-of-00002.gguf"]
+        expected_sizes = dict.fromkeys(names, 4)
+        fake_cache = SimpleNamespace(commit=Mock(), reload=Mock())
+        with tempfile.TemporaryDirectory() as directory:
+            hub = Path(directory) / "hub"
+            snapshots = hub / "models--acme--pinned" / "snapshots"
+            pinned = snapshots / revision
+            old = snapshots / ("b" * 40)
+            for name in names:
+                (old / name).parent.mkdir(parents=True, exist_ok=True)
+                (old / name).write_bytes(b"GGUF")
+            (pinned / names[0]).parent.mkdir(parents=True)
+            (pinned / names[0]).write_bytes(b"GGUF")
+            with (
+                patch.object(modal_llamacpp_app, "cache_dir", directory),
+                patch.object(modal_llamacpp_app, "HF_HUB_DIR", hub),
+                patch.object(modal_llamacpp_app, "_acquire_download_lease", fake_lease),
+                patch.object(modal_llamacpp_app, "model_cache", fake_cache),
+                patch.object(modal_llamacpp_app, "_snapshot_download_with_keepalive") as snapshot,
+            ):
+                def download():
+                    return modal_llamacpp_app._download_model_files(
+                        "acme/pinned", names, revision, expected_sizes=expected_sizes,
+                    )
+
+                with self.assertRaisesRegex(RuntimeError, "pinned shards are missing"):
+                    download()
+                fake_cache.commit.assert_not_called()
+                self.assertEqual(snapshot.call_args.kwargs["expected_sizes"], expected_sizes)
+                self.assertFalse(snapshot.call_args.kwargs["force_download"])
+                snapshot.side_effect = lambda **_: (pinned / names[1]).write_bytes(b"GGUF")
+                result = download()
+                self.assertEqual(result, [str((pinned / name).relative_to(directory)) for name in names])
+                self.assertEqual(download(), result)
+                self.assertEqual(snapshot.call_count, 2)
+                fake_cache.commit.assert_called_once()
+
     def test_download_model_files_forces_redownload_when_cached_sizes_are_invalid(self) -> None:
         @contextmanager
         def fake_lease(*_args, **_kwargs):  # type: ignore[no-untyped-def]

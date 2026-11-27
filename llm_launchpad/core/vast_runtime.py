@@ -15,6 +15,7 @@ from typing import Any
 
 from ..protocol.enums import BackendType
 from ..protocol.models import DeploymentConfig
+from .llamacpp_planner import gib_to_bytes
 from .runtime_support import load_llamacpp_support_manifest
 from .serving_runtime import (
     GGUF_FILE_PLACEHOLDER,
@@ -40,7 +41,7 @@ VAST_MIN_COMPUTE_CAPABILITY = 5.0
 VAST_MAX_GPU_COUNT = 8
 
 GPU_INVENTORY_COMMAND = (
-    "nvidia-smi --query-gpu=index,name,memory.total,memory.used "
+    "nvidia-smi --query-gpu=index,name,memory.total,memory.used,memory.free,pci.bus_id "
     "--format=csv,noheader,nounits"
 )
 
@@ -73,7 +74,7 @@ _VAST_RUNTIME_PROCESS_PATTERNS = ("[r]untime[.]sh", "[l]lama-server", "[v]llm")
 VAST_STARTUP_PROBE_COMMAND = rf"""
 cd {VAST_RUNTIME_DIR} 2>/dev/null || exit 0
 find . \( -name '*.downloadInProgress' -o -name '*.incomplete' \) -printf '%s\n' 2>/dev/null | awk '{{ total += $1 }} END {{ printf "BYTES %d\n", total }}'
-find gguf/hf-hub models hf/hub -type f \( -path '*/blobs/*' -o -name '*.gguf' -o -name '*.downloadInProgress' -o -name '*.incomplete' \) -printf 'FILE %s %b %p\n' 2>/dev/null
+find gguf/hf-hub gguf/pinned models hf/hub -type f \( -path '*/blobs/*' -o -name '*.gguf' -o -name '*.downloadInProgress' -o -name '*.incomplete' \) -printf 'FILE %s %b %p\n' 2>/dev/null
 tail -c 8000 server.log 2>/dev/null | tr '\r' '\n' | grep -v '^[[:space:]]*$' | tail -n {VAST_STARTUP_LOG_LINES} | cut -c1-200 | sed 's|^|LOG |'
 if grep -lsa {" ".join(f"-e '{pattern}'" for pattern in _VAST_RUNTIME_PROCESS_PATTERNS)} /proc/[0-9]*/cmdline >/dev/null 2>&1; then echo 'RUNTIME 1'; else echo 'RUNTIME 0'; fi
 """
@@ -137,10 +138,13 @@ class GpuDevice:
     name: str
     memory_total_mib: int
     memory_used_mib: int
+    memory_free_mib: int | None = None
+    pci_bus_id: str = ""
 
     @property
     def memory_free_gib(self) -> float:
-        return max(0, self.memory_total_mib - self.memory_used_mib) / 1024
+        free = self.memory_free_mib
+        return max(0, free if free is not None else self.memory_total_mib - self.memory_used_mib) / 1024
 
 
 def parse_gpu_inventory(output: str) -> tuple[GpuDevice, ...]:
@@ -148,7 +152,7 @@ def parse_gpu_inventory(output: str) -> tuple[GpuDevice, ...]:
     devices: list[GpuDevice] = []
     for line in output.splitlines():
         fields = [field.strip() for field in line.split(",")]
-        if len(fields) != 4:
+        if len(fields) not in {4, 5, 6}:
             continue
         try:
             devices.append(
@@ -157,6 +161,8 @@ def parse_gpu_inventory(output: str) -> tuple[GpuDevice, ...]:
                     name=fields[1],
                     memory_total_mib=int(fields[2]),
                     memory_used_mib=int(fields[3]),
+                    memory_free_mib=int(fields[4]) if len(fields) >= 5 else None,
+                    pci_bus_id=fields[5] if len(fields) == 6 else "",
                 )
             )
         except ValueError:
@@ -165,7 +171,8 @@ def parse_gpu_inventory(output: str) -> tuple[GpuDevice, ...]:
 
 
 def verify_gpu_topology(
-    devices: Sequence[GpuDevice], *, gpu_count: int, per_device_required_gb: float
+    devices: Sequence[GpuDevice], *, gpu_count: int, per_device_required_gb: float,
+    requirements_by_device: tuple[float, ...] = (),
 ) -> None:
     """Refuse a rental whose real devices do not match the approved placement.
 
@@ -186,13 +193,15 @@ def verify_gpu_topology(
         raise ValueError(
             f"This Vast host mixes GPU models ({listed}); the memory plan assumes identical devices."
         )
-    if per_device_required_gb > 0:
-        starved = min(devices, key=lambda device: device.memory_free_gib)
-        if starved.memory_free_gib < per_device_required_gb:
+    requirements = requirements_by_device or (per_device_required_gb,) * gpu_count
+    # Match CUDA_DEVICE_ORDER in the llama.cpp script.
+    ordered = sorted(devices, key=lambda device: (device.pci_bus_id, device.index))
+    for device, required in zip(ordered, requirements, strict=True):
+        if gib_to_bytes(device.memory_free_gib) < gib_to_bytes(required):
             raise ValueError(
-                f"GPU {starved.index} has {starved.memory_free_gib:.1f} GiB free of "
-                f"{starved.memory_total_mib / 1024:.1f} GiB; the plan needs "
-                f"{per_device_required_gb:.1f} GiB per device."
+                f"GPU {device.index} has {device.memory_free_gib:.1f} GiB free of "
+                f"{device.memory_total_mib / 1024:.1f} GiB; the plan needs "
+                f"{required:.1f} GiB on that GPU."
             )
 
 
@@ -300,7 +309,7 @@ def vast_runtime_image(config: DeploymentConfig) -> str:
 
 def vast_runtime_script(config: DeploymentConfig) -> str:
     """Build a private startup script; callers transfer it only over SSH stdin."""
-    from .serving_runtime import gguf_stage_command
+    from .serving_runtime import gguf_stage_command, llamacpp_fit_marker, stage_pinned_gguf
 
     vast_runtime_image(config)
     if not config.endpoint_api_key:
@@ -316,22 +325,27 @@ def vast_runtime_script(config: DeploymentConfig) -> str:
         if config.engram_table is not None and config.engram_table.replaced_shard
         else None
     )
-    stage_setup, hf_file_flag = gguf_stage_command(
-        repo_id=repo,
-        revision=None,
-        quant=quant,
-        # llama.cpp resolves LLAMA_CACHE first; keep the Hub cache inside the
-        # staged dir rather than fighting its layout.
-        dest_dir=f"{VAST_RUNTIME_DIR}/gguf",
-        cache_dir=f"{VAST_RUNTIME_DIR}/gguf/hf-hub",
-        exclude_files=excluded_shards,
-    )
+    artifact = config.gguf_artifact
+    if artifact is not None:
+        stage_setup, model_path = stage_pinned_gguf(
+            repo, artifact, root=f"{VAST_RUNTIME_DIR}/gguf",
+            excluded_shard=excluded_shards[0] if excluded_shards else None,
+        )
+        model_args = ["--model", model_path]
+        weights_args_path = None
+    else:
+        stage_setup, (_, weights_args_path) = gguf_stage_command(
+            repo_id=repo,
+            revision=None,
+            quant=quant,
+            # llama.cpp resolves LLAMA_CACHE first; keep the Hub cache inside the staged dir.
+            dest_dir=f"{VAST_RUNTIME_DIR}/gguf",
+            cache_dir=f"{VAST_RUNTIME_DIR}/gguf/hf-hub",
+            exclude_files=excluded_shards,
+        )
+        model_args = ["--hf-repo", f"{repo}:{quant}", "--hf-file", GGUF_FILE_PLACEHOLDER]
     arguments = [
-        "/app/llama-server", "--hf-repo", f"{repo}:{quant}",
-        # Pin the exact staged shard: same repo listing, no quant guessing.
-        # The name is spliced in after the join; see gguf_exec_command.
-        hf_file_flag[0],
-        GGUF_FILE_PLACEHOLDER,
+        "/app/llama-server", *model_args,
         *shlex.split(config.server_args or ""),
         # Serve /metrics so the fleet can read tokens and throughput off the
         # runtime itself, as Modal already does.
@@ -355,6 +369,7 @@ def vast_runtime_script(config: DeploymentConfig) -> str:
         arguments.extend(["--n-gpu-layers", str(config.n_gpu_layers)])
     env = {
         "LLAMA_API_KEY": config.endpoint_api_key,
+        "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
         # Staging uses HF_HUB_CACHE explicitly, but the server resolves
         # LLAMA_CACHE first for its own listing; point both at the staged dir.
         "LLAMA_CACHE": f"{VAST_RUNTIME_DIR}/gguf/hf-hub",
@@ -375,7 +390,12 @@ def vast_runtime_script(config: DeploymentConfig) -> str:
     lines.extend(f"export {name}={shlex.quote(value)}" for name, value in env.items())
     if setup:
         lines.append(setup)
-    lines.append(gguf_exec_command(arguments, weights_args_path=hf_file_flag[1]))
+    if marker := llamacpp_fit_marker(config):
+        lines.append(marker)
+    lines.append(
+        gguf_exec_command(arguments, weights_args_path=weights_args_path)
+        if weights_args_path is not None else "exec " + shlex.join(arguments)
+    )
     return "\n".join(lines) + "\n"
 
 

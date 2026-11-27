@@ -202,6 +202,10 @@ def matching_disk_offer(
 
 def _model_weights_gb(config: DeploymentConfig) -> float:
     """Return the planner's weight size for this deploy, or 0 when unknown."""
+    if config.gguf_artifact is not None:
+        from .prime_runtime import expected_model_bytes
+
+        return expected_model_bytes(config) / 1e9
     assessment = config.placement_assessment
     memory = getattr(assessment, "memory", None)
     weights_gb = getattr(memory, "weights_gb", None)
@@ -281,7 +285,7 @@ def _select_kwargs(
     options: PrimeProviderOptions,
     required_image: str,
 ) -> dict[str, Any]:
-    return {
+    values = {
         "offer_id": options.offer_id,
         "max_hourly_cost_usd": options.max_hourly_cost_usd,
         "gpu_type": config.gpu_type,
@@ -290,6 +294,11 @@ def _select_kwargs(
         "required_vram_gb": config.required_vram_gb,
         "required_image": required_image,
     }
+    if config.placement_assessment is not None:
+        memory = config.placement_assessment.memory
+        if memory.per_device_required_gb:
+            values["per_device_required_gib"] = max(memory.per_device_required_gb)
+    return values
 
 
 def _disk_fits_model(stored: StoredPrimeDisk, config: DeploymentConfig) -> bool:

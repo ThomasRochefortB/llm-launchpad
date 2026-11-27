@@ -14,14 +14,14 @@ from unittest.mock import patch
 
 from dataclasses import replace
 
-from llm_launchpad.core.gguf_metadata import GgufMtpCapability, GgufMtpStatus
+from llm_launchpad.core.gguf_metadata import GgufMtpCapability, GgufMtpStatus, GgufServingMetadata
 from llm_launchpad.core.hf_models import (
     GgufQuantMetadata,
     HubModelPageUnavailable,
     ModelCandidate,
 )
 from llm_launchpad.core.modal_gpu import ModalGpuSpec
-from llm_launchpad.core.quick_deploy import QuickDeployProfile
+from llm_launchpad.core.quick_deploy import QuickDeployCatalogInfo, QuickDeployProfile
 from llm_launchpad.protocol.enums import SpeculativeDecodingMethod
 from llm_launchpad.protocol.models import CatalogExclusion
 from llm_launchpad.core.artificial_analysis import (
@@ -1128,6 +1128,63 @@ class TransientHubFailureTests(unittest.TestCase):
             self.assertIs(_fetch_serving_metadata("org/model"), metadata)
 
         self.assertEqual(len(calls), 3)
+
+    def test_unreadable_preferred_quant_keeps_other_pinned_profiles_and_marks_refresh_partial(self) -> None:
+        repo = "org/partial-headers-GGUF"
+        revision = "7" * 40
+        q4 = "model-UD-Q4_K_XL.gguf"
+        q8 = "model-Q8_0.gguf"
+        sizes = {q4: 4_000_000_000, q8: 7_000_000_000}
+        listing = SimpleNamespace(
+            sha=revision,
+            siblings=[SimpleNamespace(rfilename=name, size=size) for name, size in sizes.items()],
+        )
+        layout = GgufServingMetadata(
+            source_file=q8, architecture="llama", context_length=32_768, block_count=32,
+            attention_head_count_kv_by_layer=(8,) * 32, attention_key_length=128, attention_value_length=128,
+        )
+        calls: list[str] = []
+
+        def read_header(repo_id: str, _: object, *, revision: str, filename: str, strict: bool) -> GgufServingMetadata:
+            self.assertEqual((repo_id, revision, strict), (repo, listing.sha, True))
+            calls.append(filename)
+            if filename == q4 or calls.count(q8) == 1:
+                raise _HubStatusError(503)
+            return layout
+
+        exclusions: list[CatalogExclusion] = []
+        with (
+            patch("llm_launchpad.core.hf_models._call_model_info", return_value=listing) as lookup,
+            patch("llm_launchpad.core.hf_models.fetch_gguf_serving_metadata", side_effect=read_header),
+            patch("llm_launchpad.core.quick_deploy_refresh.time.sleep"),
+        ):
+            resolved = _build_resolved_aa_model(
+                _aa_candidate("Partial headers", 8.0, 75),
+                (ModalGpuSpec("L40S", 1.95),), repo, exclusions=exclusions,
+            )
+
+        lookup.assert_called_once()
+        self.assertTrue(lookup.call_args.kwargs["files_metadata"])
+        self.assertGreater(calls.count(q4), 1)
+        self.assertEqual(calls.count(q8), 2)
+        assert resolved is not None
+        (profile,) = resolved.profiles
+        assert profile.gguf_artifact is not None and profile.memory_estimate is not None
+        self.assertEqual(profile.gguf_artifact.files, ((q8, sizes[q8]),))
+        self.assertEqual(profile.max_context_tokens, 32_768)
+        self.assertEqual(len(profile.memory_estimate.layer_cache_bytes), 32)
+        (exclusion,) = exclusions
+        self.assertTrue(exclusion.unchecked)
+        self.assertIn("UD-Q4_K_XL", exclusion.reason)
+        info = QuickDeployCatalogInfo(
+            source_label="test", generated_at=datetime.now(UTC).isoformat(), exclusions=(exclusion,),
+        )
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "catalog.json"
+            _write_quick_deploy_catalog_cache(info, resolved.profiles, cache_path=path)
+            restored = _read_quick_deploy_catalog_cache(path)
+        self.assertEqual(restored, (info, resolved.profiles))
+        self.assertFalse(is_fresh_cached_quick_deploy_catalog(info))
 
     def test_an_unreadable_weight_table_is_retried_like_any_hub_failure(self) -> None:
         metadata = GgufQuantMetadata(quantizations=["Q4_K_M"], vram_gb_by_quant={"Q4_K_M": 4.7})
