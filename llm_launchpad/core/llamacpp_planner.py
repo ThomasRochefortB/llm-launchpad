@@ -452,33 +452,10 @@ def compile_server_args_string(
     return shlex.join(compile_server_args(requirements, tuning, extra_args=extra_args, gpu_count=gpu_count))
 
 
-def per_device_requirements(
-    *,
-    shardable_gb: float,
-    per_device_gb: float,
-    gpu_count: int,
-    layer_count: int | None,
-) -> tuple[float, ...]:
-    """Split a requirement the way llama.cpp actually assigns it.
-
-    Layers are indivisible, so a model that does not divide evenly leaves one
-    device carrying the remainder: 45 layers over two GPUs is 23 and 22, a
-    51/49 split rather than 50/50. Assuming an even one understates the
-    busiest device, which is the only one that has to fit -- a measured
-    GLM-5.3-Flash plan put 78,810 MiB on CUDA0 against 74,738 MiB on CUDA1
-    and was rejected for the difference while the total had room to spare.
-    """
-
-    return tuple(
-        bytes_to_gib(value) for value in _distribute_uniform_bytes(
-            gib_to_bytes(shardable_gb), gib_to_bytes(per_device_gb), gpu_count, layer_count,
-        )
-    )
-
-
 def _distribute_uniform_bytes(
     shardable_bytes: int, fixed_bytes: int, gpu_count: int, layer_count: int | None,
 ) -> tuple[int, ...]:
+    """Split whole layers across GPUs, replicating fixed bytes on each GPU."""
     count = max(1, gpu_count)
     layers = max(count, layer_count or 0)
     base, extra = divmod(layers, count)

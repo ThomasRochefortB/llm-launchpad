@@ -686,11 +686,6 @@ Button.-error:focus {
     margin: 0 2 0 0;
 }
 
-#quick-deploy-profile-title {
-    color: $primary;
-    padding: 0 0 1 0;
-}
-
 #quick-deploy-profile-body {
     color: $text;
     text-wrap: wrap;
@@ -735,15 +730,10 @@ Button.-error:focus {
     padding-top: 0;
 }
 
-#quick-fulfillment,
-#quick-fulfillment-note {
+#quick-fulfillment {
     width: 100%;
     height: auto;
     margin: 0 0 1 0;
-}
-
-#quick-fulfillment-note {
-    color: $text-muted;
 }
 
 /* ---- Deploy form ---- */
@@ -1329,18 +1319,10 @@ MonitorScreen.connection-ready DeploymentProgressWidget #deploy-progress-next {
     margin-bottom: 1;
 }
 
-#storage-layout,
 #storage-scroll {
     width: 100%;
     height: 1fr;
     padding: 1 2;
-}
-
-/* VerticalScroll owns the screen scroll, so the table sizes itself against
-   the viewport rather than the full content height; the responsive fit test
-   holds non-scrolling widgets to the viewport. */
-#storage-layout {
-    min-height: 100%;
 }
 
 #storage-title,
@@ -1720,8 +1702,7 @@ MonitorScreen.connection-ready DeploymentProgressWidget #deploy-progress-next {
 }
 
 .viewport-constrained #fast-deploy-subtitle,
-.viewport-constrained #fast-deploy-status,
-.viewport-constrained #quick-deploy-subtitle {
+.viewport-constrained #fast-deploy-status {
     padding-bottom: 0;
 }
 
@@ -1953,7 +1934,6 @@ MonitorScreen.connection-ready.viewport-short #connection-card,
 
 .viewport-short .form-hint,
 .viewport-short .form-section-subtitle,
-.viewport-short #quick-deploy-subtitle,
 .viewport-short #storage-hint {
     display: none;
 }

@@ -107,7 +107,6 @@ from .clipboard import (
 )
 from .deploy_session import run_tui_deploy_lifecycle, tail_persistent_job
 from .fleet_discovery import (
-    listing_error_text,
     query_configured_providers,
     record_provider_listings,
 )
@@ -116,10 +115,6 @@ from .storage_cache import (
     load_persisted_storage_snapshot,
     persist_deploy_connection_cache,
     persist_storage_snapshot,
-    storage_snapshot_from_dict,
-    storage_snapshot_to_dict,
-    stored_model_from_dict,
-    stored_model_to_dict,
 )
 from .visual import (
     LAUNCHPAD_THEMES,
@@ -1875,10 +1870,6 @@ class TuiApp(App):
             pass
         return discovery
 
-    @staticmethod
-    def _listing_error_text(provider: ComputeProvider, exc: Exception) -> str:
-        return listing_error_text(provider, exc)
-
     def _record_provider_listings(
         self,
         configured: tuple[ComputeProvider, ...],
@@ -2205,22 +2196,6 @@ class TuiApp(App):
         snapshot, cached_at = load_persisted_storage_snapshot(self._storage_cache_path)
         self._storage_snapshot_cache = snapshot
         self._storage_snapshot_cached_at_epoch = cached_at
-
-    @staticmethod
-    def _model_to_dict(model: StoredModelInfo) -> dict[str, object]:
-        return stored_model_to_dict(model)
-
-    @staticmethod
-    def _model_from_dict(payload: dict[str, object]) -> StoredModelInfo | None:
-        return stored_model_from_dict(payload)
-
-    @classmethod
-    def _snapshot_to_dict(cls, snapshot: StorageSnapshot) -> dict[str, object]:
-        return storage_snapshot_to_dict(snapshot)
-
-    @classmethod
-    def _snapshot_from_dict(cls, payload: dict[str, object]) -> StorageSnapshot | None:
-        return storage_snapshot_from_dict(payload)
 
     # ------------------------------------------------------------------
     # vLLM model discovery
