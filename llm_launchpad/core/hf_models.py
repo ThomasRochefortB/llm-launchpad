@@ -7,10 +7,14 @@ import json
 import math
 import re
 import time
-from dataclasses import dataclass, replace
-from functools import lru_cache
-from pathlib import PurePosixPath
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import asdict, dataclass, replace
+from pathlib import Path, PurePosixPath
+from tempfile import NamedTemporaryFile
+from threading import Event, Lock
 from typing import Any, Literal
+from collections.abc import Generator
 
 from ..gguf_files import GGUF_SHARD_RE, is_target_gguf
 from ..protocol.models import GgufArtifact
@@ -540,6 +544,7 @@ def fetch_gguf_quant_metadata(
     mtp_quant: str | None = None,
     force_refresh: bool = False,
     require_weight_sizes: bool = False,
+    hf_api: Any | None = None,
 ) -> GgufQuantMetadata:
     """Return detected GGUF quantizations and per-quant VRAM estimates in GB.
 
@@ -559,14 +564,15 @@ def fetch_gguf_quant_metadata(
     if not force_refresh and cached and (now - cached[0]) < _CACHE_TTL_SECONDS:
         return _copy_gguf_quant_metadata(cached[1])
 
-    try:
-        from huggingface_hub import HfApi
-    except Exception as exc:
-        raise RuntimeError(
-            "huggingface_hub is required for model discovery. Install with: pip install huggingface_hub"
-        ) from exc
-
-    api = HfApi()
+    api = hf_api
+    if api is None:
+        try:
+            from huggingface_hub import HfApi
+        except Exception as exc:
+            raise RuntimeError(
+                "huggingface_hub is required for model discovery. Install with: pip install huggingface_hub"
+            ) from exc
+        api = HfApi()
     if is_shutting_down():
         return GgufQuantMetadata(quantizations=[], vram_gb_by_quant={})
     if inspect_serving and require_weight_sizes:
@@ -823,12 +829,207 @@ def gguf_metadata_for_artifact(
     )
 
 
-@lru_cache(maxsize=512)
+_GGUF_HEADER_CACHE_SCHEMA_VERSION = 1
+_GGUF_HEADER_CACHE_MAX_ENTRIES = 2048
+_PINNED_HEADER_MEMORY_MAX_ENTRIES = 1024
+_PINNED_HEADER_LOCK = Lock()
+_PINNED_HEADER_CACHE: dict[tuple[str, str, str], GgufServingMetadata] = {}
+_PINNED_HEADER_FLIGHTS: dict[tuple[str, str, str], tuple[Event, list[Any]]] = {}
+_ACTIVE_GGUF_HEADER_CACHE: ContextVar[GgufHeaderCache | None] = ContextVar(
+    "_ACTIVE_GGUF_HEADER_CACHE", default=None
+)
+
+
+def _gguf_header_cache_path() -> Path:
+    from .config import SETTINGS_DIR as current_settings_dir
+
+    return current_settings_dir / "gguf_header_cache.json"
+
+
+def _serving_metadata_from_dict(payload: Any) -> GgufServingMetadata | None:
+    if not isinstance(payload, dict):
+        return None
+    try:
+        fields: dict[str, Any] = dict(payload)
+        for name in (
+            "attention_head_count_kv_by_layer",
+            "recurrent_layers",
+            "sliding_window_pattern",
+            "feed_forward_length_by_layer",
+        ):
+            fields[name] = tuple(fields.get(name) or ())
+        layout = GgufServingMetadata(**fields)
+    except (TypeError, ValueError):
+        return None
+    return layout if layout.architecture else None
+
+
+class GgufHeaderCache:
+    """Load-once, save-once disk cache of immutable revision-pinned GGUF headers."""
+
+    def __init__(self, entries: dict[str, GgufServingMetadata] | None = None) -> None:
+        self._entries: dict[str, GgufServingMetadata] = dict(entries or {})
+        self._dirty = False
+        self._lock = Lock()
+
+    @staticmethod
+    def _key(repo_id: str, revision: str, filename: str) -> str:
+        return f"{repo_id}\0{revision}\0{filename}"
+
+    @classmethod
+    def load(cls, *, path: Path | None = None) -> GgufHeaderCache:
+        target = path or _gguf_header_cache_path()
+        try:
+            envelope = json.loads(target.read_text(encoding="utf-8"))
+        except Exception:
+            return cls()
+        if (
+            not isinstance(envelope, dict)
+            or envelope.get("schema_version") != _GGUF_HEADER_CACHE_SCHEMA_VERSION
+        ):
+            return cls()
+        raw_entries = envelope.get("entries")
+        if not isinstance(raw_entries, dict):
+            return cls()
+        entries: dict[str, GgufServingMetadata] = {}
+        for key, raw in raw_entries.items():
+            if not isinstance(key, str):
+                continue
+            layout = _serving_metadata_from_dict(raw)
+            if layout is not None:
+                entries[key] = layout
+        return cls(entries)
+
+    def get(self, repo_id: str, revision: str, filename: str) -> GgufServingMetadata | None:
+        key = self._key(repo_id, revision, filename)
+        with self._lock:
+            return self._entries.get(key)
+
+    def record(
+        self,
+        repo_id: str,
+        revision: str,
+        filename: str,
+        layout: GgufServingMetadata,
+        *,
+        mark_dirty: bool = True,
+    ) -> None:
+        if not layout.architecture or not re.fullmatch(r"[0-9a-f]{40}", revision):
+            return
+        key = self._key(repo_id, revision, filename)
+        with self._lock:
+            existing = self._entries.get(key)
+            if existing == layout:
+                return
+            self._entries[key] = layout
+            if len(self._entries) > _GGUF_HEADER_CACHE_MAX_ENTRIES:
+                excess = len(self._entries) - _GGUF_HEADER_CACHE_MAX_ENTRIES
+                for stale_key in list(self._entries)[:excess]:
+                    self._entries.pop(stale_key, None)
+            if mark_dirty:
+                self._dirty = True
+
+    def save(self, *, path: Path | None = None) -> None:
+        with self._lock:
+            if not self._dirty:
+                return
+            snapshot = dict(self._entries)
+        if len(snapshot) > _GGUF_HEADER_CACHE_MAX_ENTRIES:
+            trimmed_keys = list(snapshot)[- _GGUF_HEADER_CACHE_MAX_ENTRIES :]
+            snapshot = {key: snapshot[key] for key in trimmed_keys}
+        envelope = {
+            "schema_version": _GGUF_HEADER_CACHE_SCHEMA_VERSION,
+            "entries": {key: asdict(layout) for key, layout in snapshot.items()},
+        }
+        target = path or _gguf_header_cache_path()
+        temporary_path: Path | None = None
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=target.parent, delete=False
+            ) as output:
+                temporary_path = Path(output.name)
+                json.dump(envelope, output)
+            temporary_path.replace(target)
+            with self._lock:
+                self._dirty = False
+        except Exception as exc:
+            log_debug(f"Could not persist GGUF header cache: {exc}")
+        finally:
+            if temporary_path is not None:
+                try:
+                    temporary_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+
+@contextmanager
+def active_gguf_header_cache(cache: GgufHeaderCache) -> Generator[None, None, None]:
+    """Bind a persistent GGUF header cache for the duration of a catalog build."""
+    token = _ACTIVE_GGUF_HEADER_CACHE.set(cache)
+    try:
+        yield
+    finally:
+        _ACTIVE_GGUF_HEADER_CACHE.reset(token)
+
+
 def _pinned_gguf_header(repo_id: str, revision: str, filename: str) -> GgufServingMetadata:
-    layout = fetch_gguf_serving_metadata(repo_id, None, revision=revision, filename=filename, strict=True)
-    if layout is None or not layout.architecture:
+    key = (repo_id, revision, filename)
+    disk_cache = _ACTIVE_GGUF_HEADER_CACHE.get()
+    with _PINNED_HEADER_LOCK:
+        cached = _PINNED_HEADER_CACHE.get(key)
+        if cached is not None:
+            return cached
+        if disk_cache is not None:
+            disk_hit = disk_cache.get(repo_id, revision, filename)
+            if disk_hit is not None:
+                _PINNED_HEADER_CACHE[key] = disk_hit
+                return disk_hit
+        flight = _PINNED_HEADER_FLIGHTS.get(key)
+        if flight is None:
+            flight = (Event(), [])
+            _PINNED_HEADER_FLIGHTS[key] = flight
+            is_leader = True
+        else:
+            is_leader = False
+
+    if not is_leader:
+        flight[0].wait()
+        outcome = flight[1]
+        if outcome and isinstance(outcome[0], GgufServingMetadata):
+            return outcome[0]
+        if outcome and isinstance(outcome[0], BaseException):
+            raise outcome[0]
         raise HubLookupIncomplete(f"Could not read the serving layout of {filename}.")
-    return layout
+
+    try:
+        layout = fetch_gguf_serving_metadata(repo_id, None, revision=revision, filename=filename, strict=True)
+        if layout is None or not layout.architecture:
+            raise HubLookupIncomplete(f"Could not read the serving layout of {filename}.")
+    except BaseException as exc:
+        flight[1].append(exc)
+        raise
+    else:
+        flight[1].append(layout)
+        if disk_cache is not None:
+            disk_cache.record(repo_id, revision, filename, layout)
+        with _PINNED_HEADER_LOCK:
+            if len(_PINNED_HEADER_CACHE) >= _PINNED_HEADER_MEMORY_MAX_ENTRIES:
+                _PINNED_HEADER_CACHE.pop(next(iter(_PINNED_HEADER_CACHE)))
+            _PINNED_HEADER_CACHE[key] = layout
+        return layout
+    finally:
+        with _PINNED_HEADER_LOCK:
+            _PINNED_HEADER_FLIGHTS.pop(key, None)
+        flight[0].set()
+
+
+def _clear_pinned_gguf_header_cache() -> None:
+    with _PINNED_HEADER_LOCK:
+        _PINNED_HEADER_CACHE.clear()
+
+
+_pinned_gguf_header.cache_clear = _clear_pinned_gguf_header_cache  # type: ignore[attr-defined]
 
 
 def _fetch_candidates(mode: ModelRankMode, limit: int, target: ModelDiscoveryTarget) -> list[ModelCandidate]:

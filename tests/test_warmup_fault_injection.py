@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import types
 import unittest
 from unittest.mock import patch
@@ -57,6 +58,12 @@ class WarmupFaultInjectionTests(unittest.TestCase):
         release_first_probe = threading.Event()
         self.addCleanup(release_first_probe.set)
         calls = {"n": 0}
+        now = 0.0
+
+        def advance_retry_clock(*, timeout: float) -> bool:
+            nonlocal now
+            now += timeout
+            return False
 
         def _post(*_args: object, **_kwargs: object) -> _Response:
             calls["n"] += 1
@@ -91,8 +98,12 @@ class WarmupFaultInjectionTests(unittest.TestCase):
             patch.dict("sys.modules", {"requests": types.SimpleNamespace(post=_post)}),
             patch("llm_launchpad.core.warmup._ModalLogTail", _StreamingTail),
             patch(
+                "llm_launchpad.core.warmup.time",
+                types.SimpleNamespace(time=lambda: now, monotonic=time.monotonic),
+            ),
+            patch(
                 "llm_launchpad.core.warmup.shutdown_event",
-                return_value=types.SimpleNamespace(wait=lambda **_kwargs: False),
+                return_value=types.SimpleNamespace(wait=advance_retry_clock),
             ),
             patch("llm_launchpad.core.warmup.ModalBackend.test_curl_command", return_value="curl ok"),
         ):

@@ -621,42 +621,6 @@ def _friendly_count_line(rows: list[EndpointInfo]) -> list[str]:
     return [f"{fleet_summary_line(rows)}  [dim]· {' · '.join(backend_parts)}[/dim]", ""]
 
 
-def _wrap_url_for_panel(value: str, width: int = 44) -> list[str]:
-    """Pre-wrap long URLs so they remain readable in the narrow status panel."""
-    text = (value or "").strip()
-    if not text:
-        return []
-    if len(text) <= width:
-        return [text]
-
-    # Keep separators attached to the preceding chunk so we don't end up
-    # with visual artifacts like a line containing only "-".
-    tokens: list[str] = []
-    current = ""
-    for char in text:
-        current += char
-        if char in {"/", "-"}:
-            tokens.append(current)
-            current = ""
-    if current:
-        tokens.append(current)
-
-    lines: list[str] = []
-    line = ""
-    for token in tokens:
-        if not line:
-            line = token
-            continue
-        if len(line) + len(token) <= width:
-            line += token
-            continue
-        lines.append(line)
-        line = token
-    if line:
-        lines.append(line)
-    return lines or [text]
-
-
 # Each provider names its unit of compute differently, and a row that calls a
 # Vast rental a "Prime Intellect pod" sends the reader looking for it in the
 # wrong console.

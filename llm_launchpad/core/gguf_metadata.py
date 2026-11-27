@@ -2,13 +2,20 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import Enum
 import math
 import re
 import struct
+from threading import Lock
 from typing import Any
+from collections.abc import Generator
 from urllib.parse import quote
+
+import requests as _requests_mod
+from requests.adapters import HTTPAdapter
 
 from ..gguf_files import is_target_gguf
 
@@ -40,6 +47,78 @@ _GGUF_SCALAR_SIZES = {
 _GGUF_STRING = 8
 _GGUF_ARRAY = 9
 _CONTENT_RANGE_RE = re.compile(r"^bytes\s+(\d+)-(\d+)/(?:\d+|\*)$", re.IGNORECASE)
+_ORIGINAL_REQUESTS_GET = _requests_mod.get
+_HF_RANGE_SESSION_LOCK = Lock()
+_HF_RANGE_SESSION: _requests_mod.Session | None = None
+_SCOPED_HF_TOKEN: ContextVar[str | None] = ContextVar("_SCOPED_HF_TOKEN", default=None)
+
+_SERVING_SUFFIXES: dict[str, str] = {
+    "context_length": "context_length",
+    "block_count": "block_count",
+    "embedding_length": "embedding_length",
+    "attention.head_count": "attention_head_count",
+    "attention.head_count_kv": "attention_head_count_kv",
+    "attention.key_length": "attention_key_length",
+    "attention.value_length": "attention_value_length",
+    "attention.key_length_mla": "attention_key_length_mla",
+    "attention.value_length_mla": "attention_value_length_mla",
+    "attention.kv_lora_rank": "attention_kv_lora_rank",
+    "kda.head_dim": "kda_head_dim",
+    "ssm.conv_kernel": "ssm_conv_kernel",
+    "attention.indexer.key_length": "indexer_key_length",
+    "attention.indexer.kpool": "indexer_kpool",
+    "nextn_predict_layers": "nextn_predict_layers",
+    "full_attention_interval": "full_attention_interval",
+    "attention.recurrent_layers": "recurrent_layers",
+    "ssm.inner_size": "ssm_inner_size",
+    "ssm.state_size": "ssm_state_size",
+    "ssm.group_count": "ssm_group_count",
+    "attention.sliding_window": "sliding_window",
+    "attention.sliding_window_pattern": "sliding_window_interval",
+    "attention.shared_kv_layers": "shared_kv_layers",
+    "attention.key_length_swa": "attention_key_length_swa",
+    "attention.value_length_swa": "attention_value_length_swa",
+    "expert_count": "expert_count",
+    "feed_forward_length": "feed_forward_length",
+    "shortconv.l_cache": "shortconv_cache_length",
+}
+
+
+def _hf_range_session() -> _requests_mod.Session:
+    """Return a shared HTTP keep-alive session for bounded HF range reads."""
+    global _HF_RANGE_SESSION
+    with _HF_RANGE_SESSION_LOCK:
+        if _HF_RANGE_SESSION is None:
+            session = _requests_mod.Session()
+            adapter = HTTPAdapter(pool_connections=32, pool_maxsize=32)
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+            _HF_RANGE_SESSION = session
+        return _HF_RANGE_SESSION
+
+
+@contextmanager
+def scoped_hf_token(token: str | None) -> Generator[None, None, None]:
+    """Reuse an already-resolved HF token across range reads in a catalog build."""
+    normalized = (token or "").strip()
+    reset = _SCOPED_HF_TOKEN.set(normalized)
+    try:
+        yield
+    finally:
+        _SCOPED_HF_TOKEN.reset(reset)
+
+
+def _match_serving_suffix(key: str) -> str | None:
+    matched = _SERVING_SUFFIXES.get(key)
+    if matched is not None:
+        return matched
+    dot = key.find(".")
+    while dot != -1:
+        matched = _SERVING_SUFFIXES.get(key[dot + 1 :])
+        if matched is not None:
+            return matched
+        dot = key.find(".", dot + 1)
+    return None
 
 
 class GgufMtpStatus(str, Enum):
@@ -166,69 +245,140 @@ def select_target_gguf_file(siblings: Any, quant: str | None = None) -> str | No
     return min(candidates, key=_sort_key)
 
 
+class _IncrementalMetadataCursor:
+    """Resume GGUF metadata table scanning across range chunks without reparsing."""
+
+    def __init__(self) -> None:
+        self.header_parsed = False
+        self.metadata_count = 0
+        self.entry_index = 0
+        self.offset = 24
+        self.pending_string_array_remaining = 0
+
+    def ensure_header(self, data: bytes | bytearray | memoryview) -> None:
+        if self.header_parsed:
+            return
+        if len(data) < 24:
+            raise _NeedMoreData
+        if bytes(data[:4]) != _GGUF_MAGIC:
+            raise _InvalidGguf("Missing GGUF magic")
+        version = _unpack(data, 4, "<I")[0]
+        if version not in {2, 3}:
+            raise _InvalidGguf(f"Unsupported GGUF version {version}")
+        metadata_count = _unpack(data, 16, "<Q")[0]
+        if metadata_count > 10_000_000:
+            raise _InvalidGguf("Implausible GGUF metadata count")
+        self.metadata_count = metadata_count
+        self.header_parsed = True
+
+    def finish_pending_string_array(self, data: bytes | bytearray | memoryview) -> None:
+        if self.pending_string_array_remaining <= 0:
+            return
+        remaining = self.pending_string_array_remaining
+        offset = self.offset
+        available = len(data)
+        unpack_length = _STRING_LENGTH.unpack_from
+        while remaining > 0:
+            if offset + 8 > available:
+                self.offset = offset
+                self.pending_string_array_remaining = remaining
+                raise _NeedMoreData
+            size, = unpack_length(data, offset)
+            if size > GGUF_METADATA_MAX_BYTES:
+                raise _InvalidGguf("GGUF string exceeds the metadata inspection limit")
+            next_offset = offset + 8 + size
+            if next_offset > available:
+                self.offset = offset
+                self.pending_string_array_remaining = remaining
+                raise _NeedMoreData
+            offset = next_offset
+            remaining -= 1
+        self.offset = offset
+        self.pending_string_array_remaining = 0
+        self.entry_index += 1
+
+
+class _MtpMetadataReader(_IncrementalMetadataCursor):
+    """Incremental reader for embedded MTP metadata."""
+
+    def __init__(self, source_file: str | None = None) -> None:
+        super().__init__()
+        self.source_file = source_file
+        self.architecture: str | None = None
+        self.nextn_by_architecture: dict[str, int] = {}
+
+    def feed(self, data: bytes | bytearray | memoryview) -> GgufMtpCapability:
+        self.ensure_header(data)
+        self.finish_pending_string_array(data)
+        while self.entry_index < self.metadata_count:
+            entry_start = self.offset
+            try:
+                key, offset = _read_string(data, entry_start, max_length=1024 * 1024)
+                if key is None:
+                    raise _InvalidGguf("GGUF metadata key could not be decoded")
+                value_type = _unpack(data, offset, "<I")[0]
+                offset += 4
+                capture = key == "general.architecture" or key.endswith(
+                    ".nextn_predict_layers"
+                )
+                if value_type == _GGUF_ARRAY:
+                    element_type = _unpack(data, offset, "<I")[0]
+                    length = _unpack(data, offset + 4, "<Q")[0]
+                    if length > 100_000_000:
+                        raise _InvalidGguf("Implausible GGUF array length")
+                    if element_type == _GGUF_STRING:
+                        self.offset = offset + 12
+                        self.pending_string_array_remaining = length
+                        self.finish_pending_string_array(data)
+                        continue
+                value, offset = _read_value(data, offset, value_type, capture=capture)
+            except _NeedMoreData:
+                if self.pending_string_array_remaining == 0:
+                    self.offset = entry_start
+                raise
+            self.offset = offset
+            self.entry_index += 1
+            if key == "general.architecture" and isinstance(value, str):
+                self.architecture = value.strip().casefold() or None
+            elif key.endswith(".nextn_predict_layers"):
+                prefix = key[: -len(".nextn_predict_layers")].strip().casefold()
+                if prefix and isinstance(value, int) and not isinstance(value, bool):
+                    self.nextn_by_architecture[prefix] = value
+
+            layers = self.nextn_by_architecture.get(self.architecture or "")
+            if self.architecture and layers is not None and layers > 0:
+                return GgufMtpCapability(
+                    status=GgufMtpStatus.SUPPORTED,
+                    nextn_predict_layers=layers,
+                    source_file=self.source_file,
+                    message=(
+                        f"{self.architecture}.nextn_predict_layers={layers} is embedded in "
+                        "the target GGUF."
+                    ),
+                )
+
+        layers = self.nextn_by_architecture.get(self.architecture or "")
+        if layers is not None and layers > 0:
+            return GgufMtpCapability(
+                status=GgufMtpStatus.SUPPORTED,
+                nextn_predict_layers=layers,
+                source_file=self.source_file,
+            )
+        return GgufMtpCapability(
+            status=GgufMtpStatus.UNSUPPORTED,
+            nextn_predict_layers=0,
+            source_file=self.source_file,
+            message="The complete GGUF metadata table has no embedded MTP heads.",
+        )
+
+
 def parse_gguf_mtp_metadata(data: bytes, source_file: str | None = None) -> GgufMtpCapability:
     """Parse enough GGUF metadata to prove embedded MTP support or absence.
 
     ``_NeedMoreData`` is intentionally raised for a valid prefix so callers can
     fetch another bounded range without conflating truncation with absence.
     """
-
-    if len(data) < 24:
-        raise _NeedMoreData
-    if data[:4] != _GGUF_MAGIC:
-        raise _InvalidGguf("Missing GGUF magic")
-    version = _unpack(data, 4, "<I")[0]
-    if version not in {2, 3}:
-        raise _InvalidGguf(f"Unsupported GGUF version {version}")
-    metadata_count = _unpack(data, 16, "<Q")[0]
-    if metadata_count > 10_000_000:
-        raise _InvalidGguf("Implausible GGUF metadata count")
-
-    offset = 24
-    architecture: str | None = None
-    nextn_by_architecture: dict[str, int] = {}
-    for _ in range(metadata_count):
-        key, offset = _read_string(data, offset, max_length=1024 * 1024)
-        if key is None:
-            raise _InvalidGguf("GGUF metadata key could not be decoded")
-        value_type = _unpack(data, offset, "<I")[0]
-        offset += 4
-        capture = key == "general.architecture" or key.endswith(
-            ".nextn_predict_layers"
-        )
-        value, offset = _read_value(data, offset, value_type, capture=capture)
-        if key == "general.architecture" and isinstance(value, str):
-            architecture = value.strip().casefold() or None
-        elif key.endswith(".nextn_predict_layers"):
-            prefix = key[: -len(".nextn_predict_layers")].strip().casefold()
-            if prefix and isinstance(value, int) and not isinstance(value, bool):
-                nextn_by_architecture[prefix] = value
-
-        layers = nextn_by_architecture.get(architecture or "")
-        if architecture and layers is not None and layers > 0:
-            return GgufMtpCapability(
-                status=GgufMtpStatus.SUPPORTED,
-                nextn_predict_layers=layers,
-                source_file=source_file,
-                message=(
-                    f"{architecture}.nextn_predict_layers={layers} is embedded in "
-                    "the target GGUF."
-                ),
-            )
-
-    layers = nextn_by_architecture.get(architecture or "")
-    if layers is not None and layers > 0:
-        return GgufMtpCapability(
-            status=GgufMtpStatus.SUPPORTED,
-            nextn_predict_layers=layers,
-            source_file=source_file,
-        )
-    return GgufMtpCapability(
-        status=GgufMtpStatus.UNSUPPORTED,
-        nextn_predict_layers=0,
-        source_file=source_file,
-        message="The complete GGUF metadata table has no embedded MTP heads.",
-    )
+    return _MtpMetadataReader(source_file=source_file).feed(data)
 
 
 def fetch_gguf_mtp_capability(
@@ -252,6 +402,7 @@ def fetch_gguf_mtp_capability(
 
     payload = bytearray()
     next_chunk_bytes = chunk_bytes
+    reader = _MtpMetadataReader(source_file=filename)
     try:
         while len(payload) < max_bytes:
             end = min(len(payload) + next_chunk_bytes, max_bytes) - 1
@@ -266,7 +417,7 @@ def fetch_gguf_mtp_capability(
                 break
             payload.extend(chunk)
             try:
-                return parse_gguf_mtp_metadata(bytes(payload), source_file=filename)
+                return reader.feed(memoryview(payload))
             except _NeedMoreData:
                 # Large tokenizers need several MiB. Grow geometrically to
                 # avoid fetching and reparsing the table one MiB at a time.
@@ -281,112 +432,93 @@ def fetch_gguf_mtp_capability(
     )
 
 
+class _ServingMetadataReader(_IncrementalMetadataCursor):
+    """Incremental reader for complete GGUF serving metadata."""
+
+    def __init__(self, source_file: str | None = None) -> None:
+        super().__init__()
+        self.source_file = source_file
+        self.architecture: str | None = None
+        self.values: dict[str, Any] = {}
+
+    def feed(self, data: bytes | bytearray | memoryview) -> GgufServingMetadata:
+        self.ensure_header(data)
+        self.finish_pending_string_array(data)
+        while self.entry_index < self.metadata_count:
+            entry_start = self.offset
+            try:
+                key, offset = _read_string(data, entry_start, max_length=1024 * 1024)
+                if key is None:
+                    raise _InvalidGguf("GGUF metadata key could not be decoded")
+                value_type = _unpack(data, offset, "<I")[0]
+                offset += 4
+                matched = _match_serving_suffix(key)
+                capture = key == "general.architecture" or matched is not None
+                if value_type == _GGUF_ARRAY:
+                    element_type = _unpack(data, offset, "<I")[0]
+                    length = _unpack(data, offset + 4, "<Q")[0]
+                    if length > 100_000_000:
+                        raise _InvalidGguf("Implausible GGUF array length")
+                    if element_type == _GGUF_STRING:
+                        self.offset = offset + 12
+                        self.pending_string_array_remaining = length
+                        self.finish_pending_string_array(data)
+                        continue
+                value, offset = _read_value(data, offset, value_type, capture=capture)
+            except _NeedMoreData:
+                if self.pending_string_array_remaining == 0:
+                    self.offset = entry_start
+                raise
+            self.offset = offset
+            self.entry_index += 1
+            if key == "general.architecture" and isinstance(value, str):
+                self.architecture = value.strip().casefold() or None
+            elif matched is not None:
+                self.values[key.casefold()] = value
+
+        # Only the target architecture may supply these fields (not a vision tower).
+        scalars: dict[str, int] = {}
+        layer_sizes: dict[str, tuple[int, ...]] = {}
+        patterns: dict[str, tuple[bool, ...]] = {}
+        for suffix, field in _SERVING_SUFFIXES.items():
+            fallback = None if field == "nextn_predict_layers" else self.values.get(suffix)
+            value = self.values.get(f"{self.architecture}.{suffix}", fallback)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                if field != "recurrent_layers" and (
+                    value > 0 or field in {
+                        "attention_head_count_kv", "feed_forward_length", "nextn_predict_layers", "sliding_window_interval",
+                    }
+                ):
+                    scalars[field] = value
+            elif (
+                field in {"attention_head_count_kv", "feed_forward_length"} and isinstance(value, tuple)
+                and value and all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in value)
+            ):
+                layer_sizes[field] = value
+            elif (
+                field in {"recurrent_layers", "sliding_window_interval"}
+                and isinstance(value, tuple) and value
+                and all(isinstance(entry, bool) for entry in value)
+            ):
+                patterns[field] = value
+
+        return GgufServingMetadata(
+            architecture=self.architecture,
+            **scalars,
+            recurrent_layers=patterns.get("recurrent_layers", ()),
+            sliding_window_pattern=patterns.get("sliding_window_interval", ()),
+            attention_head_count_kv_by_layer=layer_sizes.get("attention_head_count_kv", ()),
+            feed_forward_length_by_layer=layer_sizes.get("feed_forward_length", ()),
+            source_file=self.source_file,
+        )
+
+
 def parse_gguf_serving_metadata(
     data: bytes,
     source_file: str | None = None,
 ) -> GgufServingMetadata:
     """Parse the complete GGUF metadata table for serving-relevant scalars."""
-
-    if len(data) < 24:
-        raise _NeedMoreData
-    if data[:4] != _GGUF_MAGIC:
-        raise _InvalidGguf("Missing GGUF magic")
-    version = _unpack(data, 4, "<I")[0]
-    if version not in {2, 3}:
-        raise _InvalidGguf(f"Unsupported GGUF version {version}")
-    metadata_count = _unpack(data, 16, "<Q")[0]
-    if metadata_count > 10_000_000:
-        raise _InvalidGguf("Implausible GGUF metadata count")
-
-    values: dict[str, Any] = {}
-    architecture: str | None = None
-    suffixes = {
-        "context_length": "context_length",
-        "block_count": "block_count",
-        "embedding_length": "embedding_length",
-        "attention.head_count": "attention_head_count",
-        "attention.head_count_kv": "attention_head_count_kv",
-        "attention.key_length": "attention_key_length",
-        "attention.value_length": "attention_value_length",
-        "attention.key_length_mla": "attention_key_length_mla",
-        "attention.value_length_mla": "attention_value_length_mla",
-        "attention.kv_lora_rank": "attention_kv_lora_rank",
-        "kda.head_dim": "kda_head_dim",
-        "ssm.conv_kernel": "ssm_conv_kernel",
-        "attention.indexer.key_length": "indexer_key_length",
-        "attention.indexer.kpool": "indexer_kpool",
-        "nextn_predict_layers": "nextn_predict_layers",
-        "full_attention_interval": "full_attention_interval",
-        "attention.recurrent_layers": "recurrent_layers",
-        "ssm.inner_size": "ssm_inner_size",
-        "ssm.state_size": "ssm_state_size",
-        "ssm.group_count": "ssm_group_count",
-        "attention.sliding_window": "sliding_window",
-        "attention.sliding_window_pattern": "sliding_window_interval",
-        "attention.shared_kv_layers": "shared_kv_layers",
-        "attention.key_length_swa": "attention_key_length_swa",
-        "attention.value_length_swa": "attention_value_length_swa",
-        "expert_count": "expert_count",
-        "feed_forward_length": "feed_forward_length",
-        "shortconv.l_cache": "shortconv_cache_length",
-    }
-    offset = 24
-    for _ in range(metadata_count):
-        key, offset = _read_string(data, offset, max_length=1024 * 1024)
-        if key is None:
-            raise _InvalidGguf("GGUF metadata key could not be decoded")
-        value_type = _unpack(data, offset, "<I")[0]
-        offset += 4
-        matched = next(
-            (
-                field
-                for suffix, field in suffixes.items()
-                if key == suffix or key.endswith(f".{suffix}")
-            ),
-            None,
-        )
-        capture = key == "general.architecture" or matched is not None
-        value, offset = _read_value(data, offset, value_type, capture=capture)
-        if key == "general.architecture" and isinstance(value, str):
-            architecture = value.strip().casefold() or None
-        elif matched is not None:
-            values[key.casefold()] = value
-
-    # Only the target architecture may supply these fields (not a vision tower).
-    scalars: dict[str, int] = {}
-    layer_sizes: dict[str, tuple[int, ...]] = {}
-    patterns: dict[str, tuple[bool, ...]] = {}
-    for suffix, field in suffixes.items():
-        fallback = None if field == "nextn_predict_layers" else values.get(suffix)
-        value = values.get(f"{architecture}.{suffix}", fallback)
-        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
-            if field != "recurrent_layers" and (
-                value > 0 or field in {
-                    "attention_head_count_kv", "feed_forward_length", "nextn_predict_layers", "sliding_window_interval",
-                }
-            ):
-                scalars[field] = value
-        elif (
-            field in {"attention_head_count_kv", "feed_forward_length"} and isinstance(value, tuple)
-            and value and all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in value)
-        ):
-            layer_sizes[field] = value
-        elif (
-            field in {"recurrent_layers", "sliding_window_interval"}
-            and isinstance(value, tuple) and value
-            and all(isinstance(entry, bool) for entry in value)
-        ):
-            patterns[field] = value
-
-    return GgufServingMetadata(
-        architecture=architecture,
-        **scalars,
-        recurrent_layers=patterns.get("recurrent_layers", ()),
-        sliding_window_pattern=patterns.get("sliding_window_interval", ()),
-        attention_head_count_kv_by_layer=layer_sizes.get("attention_head_count_kv", ()),
-        feed_forward_length_by_layer=layer_sizes.get("feed_forward_length", ()),
-        source_file=source_file,
-    )
+    return _ServingMetadataReader(source_file=source_file).feed(data)
 
 
 def fetch_gguf_serving_metadata(
@@ -407,6 +539,7 @@ def fetch_gguf_serving_metadata(
         return None
     payload = bytearray()
     next_chunk_bytes = chunk_bytes
+    reader = _ServingMetadataReader(source_file=filename)
     try:
         while len(payload) < max_bytes:
             end = min(len(payload) + next_chunk_bytes, max_bytes) - 1
@@ -421,7 +554,7 @@ def fetch_gguf_serving_metadata(
                 break
             payload.extend(chunk)
             try:
-                return parse_gguf_serving_metadata(bytes(payload), source_file=filename)
+                return reader.feed(memoryview(payload))
             except _NeedMoreData:
                 # Large tokenizers need several MiB. Grow geometrically to
                 # avoid fetching and reparsing the table one MiB at a time.
@@ -541,16 +674,23 @@ def _fetch_hf_file_range(
         f"/resolve/{quote(selected_revision, safe='')}/{quote(filename, safe='/')}"
     )
     headers = {"Range": f"bytes={start}-{end}", "Accept-Encoding": "identity"}
-    try:
-        from huggingface_hub import get_token
+    scoped_token = _SCOPED_HF_TOKEN.get()
+    if scoped_token is not None:
+        token = scoped_token
+    else:
+        try:
+            from huggingface_hub import get_token
 
-        token = (get_token() or "").strip()
-    except Exception:
-        token = ""
+            token = (get_token() or "").strip()
+        except Exception:
+            token = ""
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
-    response = requests.get(headers=headers, stream=True, timeout=15.0, url=url)
+    if requests.get is _ORIGINAL_REQUESTS_GET:
+        response = _hf_range_session().get(url, headers=headers, stream=True, timeout=15.0)
+    else:
+        response = requests.get(headers=headers, stream=True, timeout=15.0, url=url)
     try:
         response.raise_for_status()
         if response.status_code != 206:
@@ -581,7 +721,7 @@ def _fetch_hf_file_range(
 
 
 def _read_value(
-    data: bytes,
+    data: bytes | bytearray | memoryview,
     offset: int,
     value_type: int,
     *,
@@ -656,7 +796,7 @@ def _read_value(
 
 
 def _read_string(
-    data: bytes,
+    data: bytes | bytearray | memoryview,
     offset: int,
     *,
     max_length: int,
@@ -670,18 +810,18 @@ def _read_string(
     if not decode:
         return None, next_offset
     try:
-        return data[offset:next_offset].decode("utf-8"), next_offset
+        return bytes(data[offset:next_offset]).decode("utf-8"), next_offset
     except UnicodeDecodeError as exc:
         raise _InvalidGguf("GGUF metadata contains invalid UTF-8") from exc
 
 
-def _advance(data: bytes, offset: int, length: int) -> int:
+def _advance(data: bytes | bytearray | memoryview, offset: int, length: int) -> int:
     if length < 0 or offset < 0 or offset + length > len(data):
         raise _NeedMoreData
     return offset + length
 
 
-def _unpack(data: bytes, offset: int, format_string: str) -> tuple[Any, ...]:
+def _unpack(data: bytes | bytearray | memoryview, offset: int, format_string: str) -> tuple[Any, ...]:
     size = struct.calcsize(format_string)
     if offset < 0 or offset + size > len(data):
         raise _NeedMoreData

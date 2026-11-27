@@ -19,6 +19,7 @@ import json
 import re
 
 import requests
+from requests.adapters import HTTPAdapter
 
 from .artificial_analysis_auth import resolve_artificial_analysis_api_key
 from .coerce import clean_string, optional_float
@@ -36,6 +37,21 @@ AA_CACHE_TTL = timedelta(hours=24)
 AA_ATTRIBUTION = "Benchmark data sourced from Artificial Analysis: https://artificialanalysis.ai/"
 
 _AA_CACHE_LOCK = Lock()
+_ORIGINAL_REQUESTS_GET = requests.get
+_AA_SESSION_LOCK = Lock()
+_AA_SESSION: requests.Session | None = None
+
+
+def _aa_http_session() -> requests.Session:
+    global _AA_SESSION
+    with _AA_SESSION_LOCK:
+        if _AA_SESSION is None:
+            session = requests.Session()
+            adapter = HTTPAdapter(pool_connections=4, pool_maxsize=4)
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
+            _AA_SESSION = session
+        return _AA_SESSION
 
 ModelSizeBucket = Literal["compact", "medium", "large"]
 
@@ -155,12 +171,14 @@ def _load_aa_rankings(
     api_key: str,
     cache_path: Path,
     now: datetime | None = None,
+    verify_key: bool = True,
 ) -> _AARankings | None:
     with _AA_CACHE_LOCK:
         return _load_aa_rankings_locked(
             api_key=api_key,
             cache_path=cache_path,
             now=now,
+            verify_key=verify_key,
         )
 
 def _load_aa_rankings_locked(
@@ -168,6 +186,7 @@ def _load_aa_rankings_locked(
     api_key: str,
     cache_path: Path,
     now: datetime | None = None,
+    verify_key: bool = True,
 ) -> _AARankings | None:
     current_time = now or datetime.now(UTC)
     cached = _read_aa_cache(cache_path)
@@ -177,10 +196,10 @@ def _load_aa_rankings_locked(
             api_key
             and _AA_CACHE_OWNER_BY_PATH.get(cache_path) == api_key
         )
-        if cache_is_fresh and (not api_key or cache_matches_key):
+        if cache_is_fresh and (not api_key or cache_matches_key or not verify_key):
             candidates = normalize_aa_model_candidates(cached.payload)
             if candidates:
-                if api_key:
+                if api_key and cache_matches_key:
                     _AA_AUTH_STATUS_BY_KEY[api_key] = (
                         ArtificialAnalysisAuthStatus(
                             authenticated=True,
@@ -268,8 +287,9 @@ def _fetch_aa_pages(url: str, api_key: str, *, timeout: float) -> dict[str, Any]
     rows: list[Any] = []
     page = 1
     first_payload: dict[str, Any] | None = None
+    http_get = _aa_http_session().get if requests.get is _ORIGINAL_REQUESTS_GET else requests.get
     while page <= 20:
-        response = requests.get(
+        response = http_get(
             url,
             headers={"x-api-key": api_key, "Accept": "application/json"},
             params={"page": page},

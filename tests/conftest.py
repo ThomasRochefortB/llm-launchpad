@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
 import os
 from pathlib import Path
 import subprocess
@@ -16,6 +17,16 @@ from llm_launchpad.core.modal_auth import ModalAuthStatus
 from llm_launchpad.core.modal_gpu import ModalGpuSpec
 from llm_launchpad.core.prime_auth import PrimeAuthStatus
 from llm_launchpad.core.hf_models import GgufQuantMetadata
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _shorten_textual_idle_poll() -> Iterator[None]:
+    """Poll for idle sooner while keeping Pilot's message and animation waits."""
+    from textual import _wait
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(_wait, "SLEEP_GRANULARITY", min(_wait.SLEEP_GRANULARITY, 0.005))
+        yield
 
 
 @pytest.fixture(autouse=True)

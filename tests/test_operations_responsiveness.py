@@ -31,9 +31,9 @@ class OperationsApp(App):
         self.push_screen(OperationsScreen())
 
 
-def record(job_id: str) -> SimpleNamespace:
+def record(job_id: str, *, outcome: str = "running") -> SimpleNamespace:
     return SimpleNamespace(
-        id=job_id, app_name=job_id, outcome="running",
+        id=job_id, app_name=job_id, outcome=outcome,
         config=SimpleNamespace(provider=SimpleNamespace(display_name="Modal")),
     )
 
@@ -160,9 +160,11 @@ class OperationsResponsivenessTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(options.option_count, 2)
             self.assertIn("Showing last saved results", str(screen.query_one("#operations-status", Static).content))
             store.fail = False
-            store.rows = [record("new"), record("one"), record("two")]
+            store.rows = [record("new", outcome="cancelled"), record("one"), record("two")]
             screen._refresh_jobs()
             await app.workers.wait_for_complete()
             await pilot.pause()
             self.assertEqual(options.highlighted_option.id, "persistent:two")
             self.assertEqual(str(screen.query_one("#operations-status", Static).content), "")
+            self.assertIn("◌", str(options.get_option_at_index(0).prompt))
+            self.assertIn("2 active", str(screen.query_one("#operations-summary", Static).content))

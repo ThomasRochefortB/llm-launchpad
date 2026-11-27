@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from concurrent.futures import Future, ThreadPoolExecutor, as_completed
-from collections import deque
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, as_completed, wait
+from contextlib import contextmanager
+from contextvars import ContextVar, copy_context
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, UTC
 from difflib import SequenceMatcher
@@ -12,9 +13,10 @@ from pathlib import Path
 import re
 from statistics import median
 from tempfile import NamedTemporaryFile
+from threading import Lock
 import time
-from typing import Any
-from collections.abc import Callable, Sequence
+from typing import Any, TypeVar
+from collections.abc import Callable, Generator, Sequence
 from urllib.parse import urlparse
 
 from .artificial_analysis import (
@@ -29,11 +31,13 @@ from .artificial_analysis import (
 from .artificial_analysis_auth import resolve_artificial_analysis_api_key
 from .coerce import clean_string
 from .diagnostics import log_debug
-from .gguf_metadata import GgufMtpStatus, GgufServingMetadata
+from .gguf_metadata import GgufMtpStatus, GgufServingMetadata, scoped_hf_token
 from .hf_models import (
+    GgufHeaderCache,
     GgufQuantMetadata,
     HubModelPageUnavailable,
     ModelCandidate,
+    active_gguf_header_cache,
     fetch_gguf_quant_metadata,
     fetch_model_max_context,
     gguf_metadata_for_artifact,
@@ -135,12 +139,179 @@ def _is_transient_hub_error(exc: BaseException) -> bool:
     )
 
 
+_T = TypeVar("_T")
+_UNSLOTH_INDEX_TTL_SECONDS = 600.0
+_QUANT_HEADER_WORKERS = 6
+
+
+@dataclass(frozen=True)
+class _UnslothGgufIndex:
+    """In-memory index of published ``unsloth/*-GGUF`` repositories."""
+
+    repos: tuple[str, ...]
+    repos_lower: frozenset[str]
+    entries: tuple[tuple[str, str], ...]
+    by_model_key: dict[str, tuple[str, ...]]
+
+
+_UNSLOTH_INDEX_LOCK = Lock()
+_UNSLOTH_INDEX_CACHE: tuple[float, _UnslothGgufIndex] | None = None
+_ACTIVE_UNSLOTH_GGUF_INDEX: ContextVar[_UnslothGgufIndex | None] = ContextVar(
+    "_ACTIVE_UNSLOTH_GGUF_INDEX", default=None
+)
+_ACTIVE_SHARED_HF_API: ContextVar[Any | None] = ContextVar(
+    "_ACTIVE_SHARED_HF_API", default=None
+)
+_ORIGINAL_FETCH_GGUF_QUANT_METADATA = fetch_gguf_quant_metadata
+
+
+def _submit_with_context(
+    executor: ThreadPoolExecutor,
+    fn: Callable[..., _T],
+    /,
+    *args: Any,
+    **kwargs: Any,
+) -> Future[_T]:
+    """Submit work to a thread pool while propagating active ContextVars."""
+    ctx = copy_context()
+
+    def _run() -> _T:
+        return ctx.run(fn, *args, **kwargs)
+
+    return executor.submit(_run)
+
+
+@contextmanager
+def _active_unsloth_gguf_index(index: _UnslothGgufIndex | None) -> Generator[None, None, None]:
+    token = _ACTIVE_UNSLOTH_GGUF_INDEX.set(index)
+    try:
+        yield
+    finally:
+        _ACTIVE_UNSLOTH_GGUF_INDEX.reset(token)
+
+
+@contextmanager
+def _active_shared_hf_api(api: Any | None) -> Generator[None, None, None]:
+    token = _ACTIVE_SHARED_HF_API.set(api)
+    try:
+        yield
+    finally:
+        _ACTIVE_SHARED_HF_API.reset(token)
+
+
+def _reset_unsloth_repo_index_cache() -> None:
+    """Clear the process-local Unsloth repository index cache."""
+    global _UNSLOTH_INDEX_CACHE
+    with _UNSLOTH_INDEX_LOCK:
+        _UNSLOTH_INDEX_CACHE = None
+
+
+def _build_unsloth_gguf_index(repos: Sequence[str]) -> _UnslothGgufIndex:
+    unique: list[str] = []
+    seen: set[str] = set()
+    by_key_lists: dict[str, list[str]] = {}
+    entries: list[tuple[str, str]] = []
+    for raw in repos:
+        repo_id = clean_string(raw)
+        lowered = repo_id.casefold()
+        if (
+            not repo_id
+            or lowered in seen
+            or not lowered.startswith("unsloth/")
+            or not lowered.endswith("-gguf")
+        ):
+            continue
+        seen.add(lowered)
+        unique.append(repo_id)
+        repo_key = _model_key(_repo_model_name(repo_id))
+        entries.append((repo_id, repo_key))
+        if repo_key:
+            by_key_lists.setdefault(repo_key, []).append(repo_id)
+    return _UnslothGgufIndex(
+        repos=tuple(unique),
+        repos_lower=frozenset(seen),
+        entries=tuple(entries),
+        by_model_key={key: tuple(values) for key, values in by_key_lists.items()},
+    )
+
+
+def _load_unsloth_gguf_index(hf_api: Any | None) -> _UnslothGgufIndex | None:
+    """Fetch all ``unsloth/*-GGUF`` repo IDs once and reuse them across matches."""
+    global _UNSLOTH_INDEX_CACHE
+    now = time.monotonic()
+    with _UNSLOTH_INDEX_LOCK:
+        if (
+            _UNSLOTH_INDEX_CACHE is not None
+            and now - _UNSLOTH_INDEX_CACHE[0] <= _UNSLOTH_INDEX_TTL_SECONDS
+        ):
+            return _UNSLOTH_INDEX_CACHE[1]
+    api = hf_api
+    if api is None:
+        try:
+            from huggingface_hub import HfApi
+
+            api = HfApi()
+        except Exception:
+            return None
+    try:
+        # Omit the ``gguf`` tag filter so brand-new untagged Unsloth GGUF repos
+        # are still indexed, and omit ``expand`` so responses stay minimal.
+        rows = api.list_models(author="unsloth")
+        repo_ids = [_repo_id_from_hf_row(row) for row in rows]
+    except Exception as exc:
+        log_debug(f"Could not prefetch Unsloth repository index: {exc}")
+        return None
+    index = _build_unsloth_gguf_index(repo_ids)
+    if not index.repos:
+        return None
+    with _UNSLOTH_INDEX_LOCK:
+        _UNSLOTH_INDEX_CACHE = (time.monotonic(), index)
+    return index
+
+
+def _seed_header_cache_from_profiles(
+    cache: GgufHeaderCache,
+    profiles: Sequence[QuickDeployProfile],
+) -> None:
+    for profile in profiles:
+        artifact = profile.gguf_artifact
+        layout = profile.serving_metadata
+        if (
+            artifact is None
+            or layout is None
+            or not layout.architecture
+            or not profile.repo_id
+        ):
+            continue
+        if layout.source_file and layout.source_file != artifact.entrypoint:
+            continue
+        cache.record(
+            profile.repo_id,
+            artifact.revision,
+            artifact.entrypoint,
+            layout,
+            mark_dirty=False,
+        )
+
+
 def _fetch_serving_metadata(repo_id: str) -> GgufQuantMetadata:
     """Fetch the Hub's GGUF file listing, retrying transient lookup failures."""
 
+    shared_api = _ACTIVE_SHARED_HF_API.get()
+    use_shared_api = (
+        shared_api is not None
+        and fetch_gguf_quant_metadata is _ORIGINAL_FETCH_GGUF_QUANT_METADATA
+    )
     delay = _HUB_RETRY_BASE_SECONDS
     for attempt in range(1, _HUB_FETCH_ATTEMPTS + 1):
         try:
+            if use_shared_api:
+                return fetch_gguf_quant_metadata(
+                    repo_id,
+                    inspect_serving=True,
+                    require_weight_sizes=True,
+                    hf_api=shared_api,
+                )
             return fetch_gguf_quant_metadata(
                 repo_id, inspect_serving=True, require_weight_sizes=True
             )
@@ -263,126 +434,186 @@ def build_live_quick_deploy_catalog(
         normalized_model_limit,
         int(candidate_limit),
     )
-    previous_cached = (
-        _read_quick_deploy_catalog_cache(_quick_deploy_catalog_cache_path())
-        if on_partial is not None
-        else None
-    )
+    previous_cached = _read_quick_deploy_catalog_cache(_quick_deploy_catalog_cache_path())
     previous_profiles: tuple[QuickDeployProfile, ...] = (
         previous_cached[1] if previous_cached is not None else ()
     )
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        rankings_future = executor.submit(
-            _load_aa_rankings,
-            api_key=resolve_artificial_analysis_api_key(),
-            cache_path=AA_CACHE_PATH,
-        )
-        gpu_future = executor.submit(_fetch_modal_gpu_catalog_or_fallback)
-        rankings = rankings_future.result()
-        modal_gpu_catalog, has_live_modal_pricing = gpu_future.result()
-
-    exclusions: list[CatalogExclusion] = []
-    if rankings is not None:
-        tier_suffix = f", {rankings.tier} tier" if rankings.tier else ""
-        aa_source_label = (
-            "Artificial Analysis top open models "
-            f"({rankings.freshness}{tier_suffix}) + "
-            f"{'live' if has_live_modal_pricing else 'fallback'} Modal pricing"
-        )
-        aa_attribution = (
-            f"{AA_ATTRIBUTION} Model metadata sourced from Hugging Face; "
-            "GPU pricing sourced from Modal."
-        )
-
-        def publish_aa_partial(
-            partial_profiles: tuple[QuickDeployProfile, ...],
-            partial_exclusions: tuple[CatalogExclusion, ...],
-        ) -> None:
-            if on_partial is None or not partial_profiles:
-                return
-            merged = _merge_partial_catalog_profiles(partial_profiles, previous_profiles)
-            if not merged:
-                return
-            partial_info = QuickDeployCatalogInfo(
-                source_label=aa_source_label,
-                generated_at=_utc_now_iso(),
-                attribution=aa_attribution,
-                is_live=True,
-                ready=True,
-                refreshing=True,
-                exclusions=tuple(sorted(partial_exclusions, key=lambda row: row.rank or 10**9)),
-            )
-            on_partial(partial_info, merged)
-
-        profiles = _profiles_from_aa_rankings(
-            rankings.candidates,
-            modal_gpu_catalog,
-            model_limit=normalized_model_limit,
-            overall_model_limit=max(0, int(overall_model_limit)),
-            candidate_limit=normalized_candidate_limit,
-            exclusions=exclusions,
-            on_partial=publish_aa_partial if on_partial is not None else None,
-        )
-        if profiles:
-            publish_aa_partial(profiles, tuple(exclusions))
-            try:
-                _, trending = _build_trending_fallback_catalog(
-                    model_limit=_FALLBACK_TRENDING_LIMIT, modal_gpu_catalog=modal_gpu_catalog,
-                    has_live_modal_pricing=has_live_modal_pricing,
-                    exclusions=exclusions,
-                    skip_repos={p.repo_id.casefold() for p in profiles} | {row.repo_id.casefold() for row in exclusions},
-                )
-            except Exception as exc:
-                log_debug(f"Trending discovery unavailable: {exc}")
-                trending = ()
-            profiles = _with_unique_ids([*profiles, *trending])
-            info = QuickDeployCatalogInfo(
-                source_label=aa_source_label,
-                generated_at=_utc_now_iso(),
-                attribution=aa_attribution,
-                is_live=True,
-                exclusions=tuple(sorted(exclusions, key=lambda row: row.rank or 10**9)),
-            )
-            retained = _retained_catalog_for(profiles, exclusions)
-            if retained is not None:
-                _write_quick_deploy_catalog_cache(*retained)
-                return retained
-            _write_quick_deploy_catalog_cache(info, profiles)
-            return (info, profiles)
-
-    def publish_trending_partial(
-        partial_info: QuickDeployCatalogInfo,
-        partial_profiles: tuple[QuickDeployProfile, ...],
-    ) -> None:
-        if on_partial is None or not partial_profiles:
-            return
-        merged = _merge_partial_catalog_profiles(partial_profiles, previous_profiles)
-        if not merged:
-            return
-        on_partial(replace(partial_info, refreshing=True), merged)
+    header_cache = GgufHeaderCache.load()
+    _seed_header_cache_from_profiles(header_cache, previous_profiles)
 
     try:
-        fallback = _build_trending_fallback_catalog(
-            model_limit=max(normalized_model_limit, overall_model_limit),
-            modal_gpu_catalog=modal_gpu_catalog,
-            has_live_modal_pricing=has_live_modal_pricing,
-            exclusions=exclusions,
-            on_partial=publish_trending_partial if on_partial is not None else None,
-        )
-    except RuntimeError:
-        if not exclusions:
-            raise
-        retained = _retained_catalog_for((), exclusions)
-        fallback = retained or (QuickDeployCatalogInfo(
-            source_label="Model availability", generated_at=_utc_now_iso(),
-            exclusions=tuple(exclusions), is_live=True,
-        ), ())
-    else:
-        fallback = _retained_catalog_for(fallback[1], exclusions) or (
-            replace(fallback[0], exclusions=tuple(exclusions)), fallback[1],
-        )
-    _write_quick_deploy_catalog_cache(fallback[0], fallback[1])
-    return fallback
+        from huggingface_hub import HfApi, get_token
+
+        shared_hf_api: Any | None = HfApi()
+        resolved_hf_token: str | None = (get_token() or "").strip()
+    except Exception:
+        shared_hf_api = None
+        resolved_hf_token = None
+
+    should_prefetch_index = (
+        _find_unsloth_gguf_match is _DEFAULT_FIND_UNSLOTH_GGUF_MATCH
+        and fetch_gguf_quant_metadata is _ORIGINAL_FETCH_GGUF_QUANT_METADATA
+        and _fetch_serving_metadata is _DEFAULT_FETCH_SERVING_METADATA
+    )
+
+    def _safe_list_trending() -> tuple[list[ModelCandidate] | None, BaseException | None]:
+        try:
+            return list_llamacpp_candidates(mode="trending", limit=_FALLBACK_TRENDING_LIMIT), None
+        except BaseException as exc:
+            return None, exc
+
+    try:
+        with (
+            active_gguf_header_cache(header_cache),
+            scoped_hf_token(resolved_hf_token),
+            _active_shared_hf_api(shared_hf_api),
+        ):
+            with ThreadPoolExecutor(max_workers=4) as startup_executor:
+                rankings_future = _submit_with_context(
+                    startup_executor,
+                    _load_aa_rankings,
+                    api_key=resolve_artificial_analysis_api_key(),
+                    cache_path=AA_CACHE_PATH,
+                    verify_key=False,
+                )
+                gpu_future = _submit_with_context(
+                    startup_executor,
+                    _fetch_modal_gpu_catalog_or_fallback,
+                )
+                index_future = (
+                    _submit_with_context(
+                        startup_executor,
+                        _load_unsloth_gguf_index,
+                        shared_hf_api,
+                    )
+                    if should_prefetch_index
+                    else None
+                )
+                trending_future = _submit_with_context(
+                    startup_executor,
+                    _safe_list_trending,
+                )
+                rankings = rankings_future.result()
+                modal_gpu_catalog, has_live_modal_pricing = gpu_future.result()
+                unsloth_index = index_future.result() if index_future is not None else None
+
+            with _active_unsloth_gguf_index(unsloth_index):
+                exclusions: list[CatalogExclusion] = []
+                if rankings is not None:
+                    tier_suffix = f", {rankings.tier} tier" if rankings.tier else ""
+                    aa_source_label = (
+                        "Artificial Analysis top open models "
+                        f"({rankings.freshness}{tier_suffix}) + "
+                        f"{'live' if has_live_modal_pricing else 'fallback'} Modal pricing"
+                    )
+                    aa_attribution = (
+                        f"{AA_ATTRIBUTION} Model metadata sourced from Hugging Face; "
+                        "GPU pricing sourced from Modal."
+                    )
+
+                    def publish_aa_partial(
+                        partial_profiles: tuple[QuickDeployProfile, ...],
+                        partial_exclusions: tuple[CatalogExclusion, ...],
+                    ) -> None:
+                        if on_partial is None or not partial_profiles:
+                            return
+                        merged = _merge_partial_catalog_profiles(partial_profiles, previous_profiles)
+                        if not merged:
+                            return
+                        partial_info = QuickDeployCatalogInfo(
+                            source_label=aa_source_label,
+                            generated_at=_utc_now_iso(),
+                            attribution=aa_attribution,
+                            is_live=True,
+                            ready=True,
+                            refreshing=True,
+                            exclusions=tuple(sorted(partial_exclusions, key=lambda row: row.rank or 10**9)),
+                        )
+                        on_partial(partial_info, merged)
+
+                    profiles = _profiles_from_aa_rankings(
+                        rankings.candidates,
+                        modal_gpu_catalog,
+                        model_limit=normalized_model_limit,
+                        overall_model_limit=max(0, int(overall_model_limit)),
+                        candidate_limit=normalized_candidate_limit,
+                        exclusions=exclusions,
+                        on_partial=publish_aa_partial if on_partial is not None else None,
+                    )
+                    if profiles:
+                        publish_aa_partial(profiles, tuple(exclusions))
+                        prefetched_trending, trending_err = trending_future.result()
+                        if trending_err is not None:
+                            log_debug(f"Trending discovery unavailable: {trending_err}")
+                            trending: tuple[QuickDeployProfile, ...] = ()
+                        else:
+                            try:
+                                _, trending = _build_trending_fallback_catalog(
+                                    model_limit=_FALLBACK_TRENDING_LIMIT,
+                                    modal_gpu_catalog=modal_gpu_catalog,
+                                    has_live_modal_pricing=has_live_modal_pricing,
+                                    exclusions=exclusions,
+                                    skip_repos={p.repo_id.casefold() for p in profiles}
+                                    | {row.repo_id.casefold() for row in exclusions},
+                                    prefetched_models=prefetched_trending,
+                                )
+                            except Exception as exc:
+                                log_debug(f"Trending discovery unavailable: {exc}")
+                                trending = ()
+                        profiles = _with_unique_ids([*profiles, *trending])
+                        info = QuickDeployCatalogInfo(
+                            source_label=aa_source_label,
+                            generated_at=_utc_now_iso(),
+                            attribution=aa_attribution,
+                            is_live=True,
+                            exclusions=tuple(sorted(exclusions, key=lambda row: row.rank or 10**9)),
+                        )
+                        retained = _retained_catalog_for(profiles, exclusions)
+                        if retained is not None:
+                            _write_quick_deploy_catalog_cache(*retained)
+                            return retained
+                        _write_quick_deploy_catalog_cache(info, profiles)
+                        return (info, profiles)
+
+                def publish_trending_partial(
+                    partial_info: QuickDeployCatalogInfo,
+                    partial_profiles: tuple[QuickDeployProfile, ...],
+                ) -> None:
+                    if on_partial is None or not partial_profiles:
+                        return
+                    merged = _merge_partial_catalog_profiles(partial_profiles, previous_profiles)
+                    if not merged:
+                        return
+                    on_partial(replace(partial_info, refreshing=True), merged)
+
+                prefetched_trending, trending_err = trending_future.result()
+                try:
+                    if trending_err is not None:
+                        raise trending_err
+                    fallback = _build_trending_fallback_catalog(
+                        model_limit=max(normalized_model_limit, overall_model_limit),
+                        modal_gpu_catalog=modal_gpu_catalog,
+                        has_live_modal_pricing=has_live_modal_pricing,
+                        exclusions=exclusions,
+                        on_partial=publish_trending_partial if on_partial is not None else None,
+                        prefetched_models=prefetched_trending,
+                    )
+                except RuntimeError:
+                    if not exclusions:
+                        raise
+                    retained = _retained_catalog_for((), exclusions)
+                    fallback = retained or (QuickDeployCatalogInfo(
+                        source_label="Model availability", generated_at=_utc_now_iso(),
+                        exclusions=tuple(exclusions), is_live=True,
+                    ), ())
+                else:
+                    fallback = _retained_catalog_for(fallback[1], exclusions) or (
+                        replace(fallback[0], exclusions=tuple(exclusions)), fallback[1],
+                    )
+                _write_quick_deploy_catalog_cache(fallback[0], fallback[1])
+                return fallback
+    finally:
+        header_cache.save()
 
 
 def _retained_catalog_for(
@@ -947,19 +1178,20 @@ def _profiles_from_aa_rankings(
             unknown.append(candidate)
     # Recheck identified open weights before spending requests on speculative matches.
     window = known + list(_aa_candidate_window(unknown, candidate_limit))
-    seen_repos: set[str] = set()
-    profiles: list[QuickDeployProfile] = []
+    resolved_by_repo: dict[str, _ResolvedAAModel] = {}
     repo_by_model_key: dict[str, str] = {}
     budget = HubRequestBudget(hub_request_budget)
-    try:
-        from huggingface_hub import HfApi
+    shared_hf_api = _ACTIVE_SHARED_HF_API.get()
+    if shared_hf_api is None:
+        try:
+            from huggingface_hub import HfApi
 
-        shared_hf_api: Any | None = HfApi()
-    except Exception:
-        shared_hf_api = None
+            shared_hf_api = HfApi()
+        except Exception:
+            shared_hf_api = None
 
     remaining = iter(window)
-    pending: deque[tuple[AAModelCandidate, Future[_ResolvedAAModel | None], list[CatalogExclusion]]] = deque()
+    pending: dict[Future[_ResolvedAAModel | None], tuple[AAModelCandidate, list[CatalogExclusion]]] = {}
     executor = ThreadPoolExecutor(max_workers=_AA_RESOLUTION_WORKERS)
 
     def fill_pending() -> None:
@@ -974,7 +1206,8 @@ def _profiles_from_aa_rankings(
             # Workers own their diagnostics. Cancelled/unused lookahead must
             # not mutate an already-published catalog after this call returns.
             reasons: list[CatalogExclusion] = []
-            future = executor.submit(
+            future = _submit_with_context(
+                executor,
                 _resolve_aa_model,
                 candidate,
                 modal_gpu_catalog,
@@ -984,29 +1217,45 @@ def _profiles_from_aa_rankings(
                 match_store=match_store,
                 budget=budget,
             )
-            pending.append((candidate, future, reasons))
+            pending[future] = (candidate, reasons)
+
+    def current_profiles() -> list[QuickDeployProfile]:
+        ordered = sorted(
+            resolved_by_repo.values(),
+            key=lambda item: item.candidate.rank or 10**9,
+        )
+        collected: list[QuickDeployProfile] = []
+        for item in ordered:
+            collected.extend(item.profiles)
+        return collected
 
     try:
         fill_pending()
         last_published_at = 0.0
-        published_count = 0
+        published_repos = 0
         while pending:
-            candidate, future, reasons = pending.popleft()
-            resolved = future.result()
-            if exclusions is not None:
-                exclusions.extend(reasons)
-            if resolved is not None and resolved.repo_id and resolved.repo_id not in seen_repos:
-                seen_repos.add(resolved.repo_id)
-                profiles.extend(resolved.profiles)
-                if on_partial is not None and len(profiles) > published_count:
-                    now = time.monotonic()
-                    if published_count == 0 or now - last_published_at >= _PARTIAL_PUBLISH_INTERVAL_SECONDS:
-                        snapshot = _with_unique_ids(
-                            sorted(profiles, key=lambda profile: profile.aa_rank or 10**9)
-                        )
-                        on_partial(snapshot, tuple(exclusions or ()))
-                        last_published_at = now
-                        published_count = len(profiles)
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                _candidate, reasons = pending.pop(future)
+                resolved = future.result()
+                if exclusions is not None:
+                    exclusions.extend(reasons)
+                if resolved is not None and resolved.repo_id:
+                    existing = resolved_by_repo.get(resolved.repo_id)
+                    if existing is None or (resolved.candidate.rank or 10**9) < (
+                        existing.candidate.rank or 10**9
+                    ):
+                        resolved_by_repo[resolved.repo_id] = resolved
+                        if on_partial is not None:
+                            now = time.monotonic()
+                            if (
+                                published_repos == 0
+                                or now - last_published_at >= _PARTIAL_PUBLISH_INTERVAL_SECONDS
+                            ):
+                                snapshot = _with_unique_ids(current_profiles())
+                                on_partial(snapshot, tuple(exclusions or ()))
+                                last_published_at = now
+                                published_repos = len(resolved_by_repo)
             fill_pending()
     finally:
         executor.shutdown(wait=False, cancel_futures=True)
@@ -1018,6 +1267,7 @@ def _profiles_from_aa_rankings(
         match = match_store.get(_model_key(candidate.name) or _model_key(candidate.slug))
         _record_exclusion(exclusions, candidate, (match.repo_id if match else "") or "",
                           UNCHECKED_BUDGET_REASON, unchecked=True)
+    profiles = current_profiles()
     profiles.sort(key=lambda profile: profile.aa_rank or 10**9)
     return _with_unique_ids(profiles)
 
@@ -1236,8 +1486,13 @@ def _build_trending_fallback_catalog(
     skip_repos: set[str] | None = None,
     exclusions: list[CatalogExclusion] | None = None,
     on_partial: Callable[[QuickDeployCatalogInfo, tuple[QuickDeployProfile, ...]], None] | None = None,
+    prefetched_models: Sequence[ModelCandidate] | None = None,
 ) -> tuple[QuickDeployCatalogInfo, tuple[QuickDeployProfile, ...]]:
-    models = list_llamacpp_candidates(mode="trending", limit=_FALLBACK_TRENDING_LIMIT)
+    models = (
+        list(prefetched_models)
+        if prefetched_models is not None
+        else list_llamacpp_candidates(mode="trending", limit=_FALLBACK_TRENDING_LIMIT)
+    )
     if skip_repos:
         models = [m for m in models if m.repo_id.casefold() not in skip_repos]
     if not models:
@@ -1267,46 +1522,61 @@ def _build_trending_fallback_catalog(
                 break
         return ordered
 
+    def resolve_trending_model(
+        model: ModelCandidate,
+    ) -> tuple[list[QuickDeployProfile], CatalogExclusion | None]:
+        metadata = _safe_fetch_gguf_metadata(model.repo_id)
+        reason = ""
+        if metadata is None:
+            reason = "Hugging Face serving metadata could not be read. Refresh the catalog to retry."
+        else:
+            compatibility = evaluate_llamacpp_architecture(metadata.architecture)
+            if metadata.artifacts_by_quant is None and not compatibility.is_supported:
+                reason = compatibility.message
+        if reason:
+            return [], CatalogExclusion(
+                model.repo_id,
+                _display_name(model.repo_id),
+                model.repo_id,
+                reason,
+                unchecked=metadata is None,
+            )
+        unchecked: list[str] = []
+        rejected: list[str] = []
+        group = _profiles_for_model(
+            model,
+            modal_gpu_catalog,
+            metadata=metadata,
+            skip_context_lookup=True,
+            prefer_mtp=not skip_repos,
+            unchecked=unchecked,
+            rejected=rejected,
+        )
+        exclusion = None
+        if unchecked or not group:
+            exclusion = CatalogExclusion(
+                model.repo_id,
+                _display_name(model.repo_id),
+                model.repo_id,
+                " ".join(dict.fromkeys(unchecked or rejected))
+                or "No GGUF quantization has a complete weight set.",
+                unchecked=bool(unchecked),
+            )
+        return group, exclusion
+
     profiles_by_repo: dict[str, list[QuickDeployProfile]] = {}
     last_published_at = 0.0
     published_repos = 0
     with ThreadPoolExecutor(max_workers=min(8, len(models))) as executor:
-        metadata_futures = {
-            executor.submit(_safe_fetch_gguf_metadata, model.repo_id): model
+        model_futures = {
+            _submit_with_context(executor, resolve_trending_model, model): model
             for model in models
         }
-        for metadata_future in as_completed(metadata_futures):
-            model = metadata_futures[metadata_future]
-            metadata = metadata_future.result()
-            reason = ""
-            if metadata is None:
-                reason = "Hugging Face serving metadata could not be read. Refresh the catalog to retry."
-            else:
-                compatibility = evaluate_llamacpp_architecture(metadata.architecture)
-                if metadata.artifacts_by_quant is None and not compatibility.is_supported:
-                    reason = compatibility.message
-            if reason:
-                if exclusions is not None:
-                    exclusions.append(CatalogExclusion(model.repo_id, _display_name(model.repo_id), model.repo_id,
-                                                       reason, unchecked=metadata is None))
-                continue
-            unchecked: list[str] = []
-            rejected: list[str] = []
-            group = _profiles_for_model(
-                model,
-                modal_gpu_catalog,
-                metadata=metadata,
-                skip_context_lookup=True,
-                prefer_mtp=not skip_repos,
-                unchecked=unchecked,
-                rejected=rejected,
-            )
-            if exclusions is not None and (unchecked or not group):
-                exclusions.append(CatalogExclusion(
-                    model.repo_id, _display_name(model.repo_id), model.repo_id,
-                    " ".join(dict.fromkeys(unchecked or rejected)) or "No GGUF quantization has a complete weight set.",
-                    unchecked=bool(unchecked),
-                ))
+        for model_future in as_completed(model_futures):
+            model = model_futures[model_future]
+            group, exclusion = model_future.result()
+            if exclusion is not None and exclusions is not None:
+                exclusions.append(exclusion)
             if group:
                 profiles_by_repo[model.repo_id] = group
                 if on_partial is not None and len(profiles_by_repo) > published_repos:
@@ -1413,6 +1683,64 @@ def _size_bucket_from_gguf_metadata(
     return _size_bucket_for_parameters(_total_parameters_b(metadata))
 
 
+def _match_candidate_in_unsloth_index(
+    candidate: AAModelCandidate,
+    index: _UnslothGgufIndex,
+) -> str | None:
+    candidate_keys = tuple(
+        key
+        for key in dict.fromkeys(
+            (
+                _model_key(candidate.name),
+                _model_key(candidate.slug),
+                _model_key(
+                    _repo_model_name(
+                        _repo_id_from_huggingface_url(candidate.huggingface_url) or ""
+                    )
+                ),
+            )
+        )
+        if key
+    )
+    if not candidate_keys:
+        return None
+    scored: list[tuple[float, str]] = []
+    seen: set[str] = set()
+    for key in candidate_keys:
+        for repo_id in index.by_model_key.get(key, ()):
+            lowered = repo_id.casefold()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            score = _aa_hf_match_score(candidate, repo_id)
+            if score >= 90.0:
+                scored.append((score, repo_id))
+    if not scored:
+        key_lengths = [(ck, len(ck)) for ck in candidate_keys]
+        for repo_id, repo_key in index.entries:
+            if not repo_key:
+                continue
+            repo_len = len(repo_key)
+            could_match = False
+            for ck, ck_len in key_lengths:
+                if ck in repo_key or repo_key in ck:
+                    could_match = True
+                    break
+                # SequenceMatcher.ratio() >= 0.9 requires 2*min/(a+b) >= 0.9 => min/max >= 9/11.
+                if min(ck_len, repo_len) * 11 >= max(ck_len, repo_len) * 9:
+                    could_match = True
+                    break
+            if not could_match:
+                continue
+            score = _aa_hf_match_score(candidate, repo_id)
+            if score >= 90.0:
+                scored.append((score, repo_id))
+    if not scored:
+        return None
+    best = min(scored, key=lambda item: _aa_hf_match_rank_key(candidate, item[1]))
+    return best[1]
+
+
 def _find_unsloth_gguf_match(
     candidate: AAModelCandidate,
     hf_api: Any,
@@ -1422,6 +1750,10 @@ def _find_unsloth_gguf_match(
     direct_repo = _repo_id_from_huggingface_url(candidate.huggingface_url)
     if direct_repo and direct_repo.casefold().endswith("-gguf"):
         return direct_repo
+
+    unsloth_index = _ACTIVE_UNSLOTH_GGUF_INDEX.get()
+    if unsloth_index is not None:
+        return _match_candidate_in_unsloth_index(candidate, unsloth_index)
 
     # A probe that errors is skipped, but skipping every probe is not the
     # same answer as checking them and finding nothing.
@@ -1582,7 +1914,6 @@ def _list_unsloth_gguf_search(hf_api: Any, search: str) -> list[Any]:
         "author": "unsloth",
         "search": search,
         "limit": _HF_SEARCH_LIMIT,
-        "expand": ["siblings"],
     }
     try:
         return list(hf_api.list_models(**kwargs))
@@ -1817,19 +2148,36 @@ def _verified_mtp_variant(
     ):
         return None
     variant_repo = f"{repo_id[:-5]}-MTP-GGUF"
+    unsloth_index = _ACTIVE_UNSLOTH_GGUF_INDEX.get()
+    if unsloth_index is not None and variant_repo.casefold() not in unsloth_index.repos_lower:
+        return None
     request_budget = budget if budget is not None else UnlimitedBudget()
     try:
         if not request_budget.spend(METADATA_REQUEST_COST):
             return None
-        variant = fetch_gguf_quant_metadata(
-            variant_repo,
-            inspect_serving=True,
-            inspect_mtp=True,
-            # The variant is only usable if its own quantizations can be
-            # sized, so an unreadable weight table is a failed probe to log
-            # rather than a variant that offers nothing.
-            require_weight_sizes=True,
+        shared_api = _ACTIVE_SHARED_HF_API.get()
+        use_shared_api = (
+            shared_api is not None
+            and fetch_gguf_quant_metadata is _ORIGINAL_FETCH_GGUF_QUANT_METADATA
         )
+        if use_shared_api:
+            variant = fetch_gguf_quant_metadata(
+                variant_repo,
+                inspect_serving=True,
+                inspect_mtp=True,
+                require_weight_sizes=True,
+                hf_api=shared_api,
+            )
+        else:
+            variant = fetch_gguf_quant_metadata(
+                variant_repo,
+                inspect_serving=True,
+                inspect_mtp=True,
+                # The variant is only usable if its own quantizations can be
+                # sized, so an unreadable weight table is a failed probe to log
+                # rather than a variant that offers nothing.
+                require_weight_sizes=True,
+            )
         if (
             variant.architecture != metadata.architecture
             or _mtp_recommendation(variant) is None
@@ -1927,18 +2275,72 @@ def _profiles_for_model(
         attention_head_count=metadata.attention_head_count, attention_head_count_kv=metadata.attention_head_count_kv,
         attention_key_length=metadata.attention_key_length, attention_value_length=metadata.attention_value_length,
     )
-    for quant in quants:
-        artifact = (metadata.artifacts_by_quant or {}).get(_quant_key(quant))
-        quant_metadata = metadata
-        if artifact is not None and (
-            not layout.source_file or layout.source_file != artifact.entrypoint
-        ):
+    verified_layout = metadata.serving_metadata
+    has_verified_repo_layout = (
+        verified_layout is not None
+        and bool(verified_layout.architecture)
+        and metadata.context_length is not None
+    )
+    # Within one immutable commit of a GGUF repo, architecture/context/KV layout
+    # are shared across quants; per-quant header reads are only needed when no
+    # verified header was loaded yet or when MTP heads can vary per quant.
+    needs_per_quant_headers = (
+        not has_verified_repo_layout
+        or model.repo_id.casefold().endswith("-mtp-gguf")
+        or _mtp_recommendation(metadata) is not None
+        or evaluate_llamacpp_mtp(metadata.architecture, 1).is_supported
+    )
+
+    quant_artifacts = [
+        (quant, (metadata.artifacts_by_quant or {}).get(_quant_key(quant)))
+        for quant in quants
+    ]
+    fetched_by_quant: dict[str, tuple[GgufQuantMetadata | None, Exception | None]] = {}
+    if needs_per_quant_headers:
+        to_fetch = [
+            (quant, artifact)
+            for quant, artifact in quant_artifacts
+            if artifact is not None
+            and (not layout.source_file or layout.source_file != artifact.entrypoint)
+        ]
+        if len(to_fetch) > 1:
+            with ThreadPoolExecutor(
+                max_workers=min(_QUANT_HEADER_WORKERS, len(to_fetch))
+            ) as header_executor:
+                future_by_quant = {
+                    quant: _submit_with_context(
+                        header_executor,
+                        _fetch_quant_layout,
+                        model.repo_id,
+                        metadata,
+                        artifact,
+                    )
+                    for quant, artifact in to_fetch
+                }
+                for quant, future in future_by_quant.items():
+                    try:
+                        fetched_by_quant[quant] = (future.result(), None)
+                    except Exception as exc:
+                        fetched_by_quant[quant] = (None, exc)
+        elif len(to_fetch) == 1:
+            quant, artifact = to_fetch[0]
             try:
-                quant_metadata = _fetch_quant_layout(model.repo_id, metadata, artifact)
+                fetched_by_quant[quant] = (
+                    _fetch_quant_layout(model.repo_id, metadata, artifact),
+                    None,
+                )
             except Exception as exc:
-                if unchecked is not None:
-                    unchecked.append(_hf_failure_reason(exc, f"read the {quant} GGUF header"))
+                fetched_by_quant[quant] = (None, exc)
+
+    for quant, artifact in quant_artifacts:
+        quant_metadata = metadata
+        if quant in fetched_by_quant:
+            fetched_meta, fetch_exc = fetched_by_quant[quant]
+            if fetch_exc is not None or fetched_meta is None:
+                if unchecked is not None and fetch_exc is not None:
+                    unchecked.append(_hf_failure_reason(fetch_exc, f"read the {quant} GGUF header"))
                 continue
+            quant_metadata = fetched_meta
         quant_compatibility = (
             compatibility if quant_metadata is metadata
             else evaluate_llamacpp_architecture(quant_metadata.architecture)
@@ -2509,3 +2911,7 @@ def _utc_now_iso() -> str:
         .isoformat()
         .replace("+00:00", "Z")
     )
+
+
+_DEFAULT_FIND_UNSLOTH_GGUF_MATCH = _find_unsloth_gguf_match
+_DEFAULT_FETCH_SERVING_METADATA = _fetch_serving_metadata

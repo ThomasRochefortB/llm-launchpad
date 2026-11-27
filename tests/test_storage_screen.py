@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 
 from textual.content import Content
 from textual.app import App
 from textual.coordinate import Coordinate
+from textual.pilot import Pilot
 from textual.screen import Screen
 from textual.widgets import Button, DataTable, Input, Select, Static
 
@@ -133,6 +135,18 @@ class _DeferredRefreshApp(_TestApp):
     def deliver_snapshot(self) -> None:
         assert self._refresh_receiver is not None
         self._refresh_receiver.post_message(StorageLoaded(snapshot=_sample_snapshot()))
+
+
+async def _storage_after_initial_focus(pilot: Pilot[None]) -> StorageScreen:
+    """Wait for the snapshot's refresh and the focus callback it schedules."""
+    await pilot.pause()
+    screen = pilot.app.screen
+    assert isinstance(screen, StorageScreen)
+    refreshed = asyncio.Event()
+    screen.call_after_refresh(refreshed.set)
+    await asyncio.wait_for(refreshed.wait(), timeout=5)
+    await pilot.pause()
+    return screen
 
 
 class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
@@ -278,9 +292,7 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
         app = _TestApp()
         async with app.run_test(size=(100, 35)) as pilot:
             app.push_screen(StorageScreen(initial_backend=BackendType.VLLM))
-            await pilot.pause()
-            screen = app.screen
-            assert isinstance(screen, StorageScreen)
+            screen = await _storage_after_initial_focus(pilot)
             provider_filter = screen.query_one("#storage-provider-filter", Select)
             filter_input = screen.query_one("#storage-filter", Input)
             # Provider scope comes first; the text filter carries the backend.
@@ -293,9 +305,7 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
         app = _TestApp()
         async with app.run_test(size=(100, 35)) as pilot:
             app.push_screen(StorageScreen())
-            await pilot.pause()
-            screen = app.screen
-            assert isinstance(screen, StorageScreen)
+            screen = await _storage_after_initial_focus(pilot)
             filter_input = screen.query_one("#storage-filter", Input)
             table = screen.query_one("#storage-table", DataTable)
 
@@ -310,9 +320,7 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
         app = _TestApp()
         async with app.run_test(size=(100, 35)) as pilot:
             app.push_screen(StorageScreen())
-            await pilot.pause()
-            screen = app.screen
-            assert isinstance(screen, StorageScreen)
+            screen = await _storage_after_initial_focus(pilot)
             filter_input = screen.query_one("#storage-filter", Input)
             table = screen.query_one("#storage-table", DataTable)
 
@@ -327,9 +335,7 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
         app = _TestApp()
         async with app.run_test() as pilot:
             app.push_screen(StorageScreen())
-            await pilot.pause()
-            screen = app.screen
-            assert isinstance(screen, StorageScreen)
+            screen = await _storage_after_initial_focus(pilot)
             table = screen.query_one("#storage-table", DataTable)
             search = screen.query_one("#storage-filter", Input)
 
@@ -352,9 +358,7 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
         app = _TestApp()
         async with app.run_test(size=(100, 35)) as pilot:
             app.push_screen(StorageScreen())
-            await pilot.pause()
-            screen = app.screen
-            assert isinstance(screen, StorageScreen)
+            screen = await _storage_after_initial_focus(pilot)
             table = screen.query_one("#storage-table", DataTable)
             filter_input = screen.query_one("#storage-filter", Input)
 
@@ -370,9 +374,7 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
         app = _TestApp()
         async with app.run_test(size=(100, 24)) as pilot:
             app.push_screen(StorageScreen())
-            await pilot.pause()
-            screen = app.screen
-            assert isinstance(screen, StorageScreen)
+            screen = await _storage_after_initial_focus(pilot)
             provider_filter = screen.query_one("#storage-provider-filter", Select)
             filter_input = screen.query_one("#storage-filter", Input)
 
@@ -386,9 +388,7 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
         app = _TestApp()
         async with app.run_test(size=(100, 24)) as pilot:
             app.push_screen(StorageScreen())
-            await pilot.pause()
-            screen = app.screen
-            assert isinstance(screen, StorageScreen)
+            screen = await _storage_after_initial_focus(pilot)
             table = screen.query_one("#storage-table", DataTable)
             search = screen.query_one("#storage-filter", Input)
 
@@ -417,8 +417,7 @@ class StorageScreenTests(unittest.IsolatedAsyncioTestCase):
             provider_filter = screen.query_one("#storage-provider-filter", Select)
 
             app.deliver_snapshot()
-            await pilot.pause()
-            await pilot.pause()
+            await _storage_after_initial_focus(pilot)
 
             self.assertEqual(table.row_count, 2)
             self.assertTrue(provider_filter.has_focus)

@@ -16,7 +16,6 @@ from .shutdown import is_shutting_down, shutdown_event
 from dataclasses import replace
 import os
 from pathlib import Path
-import re
 import shlex
 import time
 from typing import Any
@@ -87,11 +86,6 @@ from .warmup import modal_gpu_scheduling_hint as _modal_gpu_scheduling_hint
 from .warmup import probe_response_is_ready as _probe_response_is_ready
 from .warmup import status_probe_url as _status_probe_url
 
-# A wait this long with one log line reads as a hang. Vast already reports at
-# this cadence while a host provisions; Prime downloads are just as slow and
-# just as silent.
-_PRIME_PROGRESS_REPORT_SECONDS = 30.0
-
 
 # Defined where the summary mapper reads it back, so the two spellings of a
 # heartbeat duration cannot drift apart.
@@ -100,12 +94,6 @@ _format_elapsed = format_elapsed
 
 # Type alias for event generators
 EventStream = Generator[BaseEvent, None, None]
-
-_GGUF_QUANT_RE = re.compile(r"(Q\d(?:_[A-Z0-9]+)+|IQ\d+_[A-Z0-9_]+)", flags=re.IGNORECASE)
-_SIZE_TOKEN_RE = re.compile(r"^\s*(?P<num>\d+(?:\.\d+)?)\s*(?P<unit>[A-Za-z]+)?\s*$")
-_LLAMACPP_MIN_PLAUSIBLE_GGUF_BYTES = 1024 * 1024
-_LLAMACPP_STORAGE_JSON_BEGIN = "LLM_LAUNCHPAD_STORAGE_JSON_BEGIN"
-_LLAMACPP_STORAGE_JSON_END = "LLM_LAUNCHPAD_STORAGE_JSON_END"
 
 
 def _configured_llamacpp_image(config: DeploymentConfig) -> str:
@@ -159,32 +147,6 @@ def _tag_operation(events: EventStream, operation: OperationType) -> EventStream
             yield event
 
 
-def _prime_endpoint_info(
-    config: DeploymentConfig,
-    pod_id: str,
-    endpoint: str,
-) -> EndpointInfo:
-    """Build the OpenCode-facing endpoint descriptor for a Prime pod."""
-
-    return EndpointInfo(
-        name=config.app_name or "",
-        app_id=pod_id,
-        state="running",
-        backend=config.backend,
-        instance_name=config.instance_name,
-        web_url=endpoint,
-        served_model_name=config.served_model_name,
-        model_name=config.model_name,
-        repo_id=config.repo_id,
-        quant=config.quant,
-        provider=ComputeProvider.PRIME,
-        endpoint_api_key=config.endpoint_api_key,
-        max_context_tokens=config.max_context_tokens,
-        max_output_tokens=config.max_output_tokens,
-        reasoning=config.reasoning,
-    )
-
-
 def _is_historical_modal_app_state(state: str) -> bool:
     """Return True for terminal/inactive Modal app rows that commonly accumulate."""
     return is_terminal_deployment_state(state)
@@ -224,17 +186,6 @@ def _dedupe_launchpad_apps(rows: list[EndpointInfo]) -> list[EndpointInfo]:
         deduped.append(row)
 
     return deduped
-
-
-def _prime_launch_requirement_error(config: DeploymentConfig) -> str | None:
-    """Return why this config cannot launch on Prime, or ``None`` when it can."""
-    if config.backend == BackendType.VLLM and not (config.model_name or "").strip():
-        return "Prime vLLM deployment requires --model-name."
-    if config.backend == BackendType.LLAMACPP and not (config.repo_id or "").strip():
-        return "Prime llama.cpp deployment requires --repo-id."
-    if config.backend == BackendType.LLAMACPP and (config.revision or "").strip():
-        return "Prime llama.cpp currently supports only the default Hugging Face revision."
-    return None
 
 
 def _prime_pod_disk_ids(pod: object) -> list[str]:
@@ -821,35 +772,9 @@ class Orchestrator:
         """Poll until the Prime pod reports ACTIVE with SSH reachable."""
         return (yield from self._prime_runner().await_pod_active(pod_id, created))
 
-    def _establish_prime_endpoint(
-        self,
-        config: DeploymentConfig,
-        pod: dict[str, Any],
-        pod_id: str,
-        options: Any,
-    ) -> Generator[BaseEvent, None, tuple[str, EndpointInfo | None]]:
-        """Publish the pod's endpoint and wait for the runtime to serve it."""
-        return (
-            yield from self._prime_runner().establish_endpoint(
-                config, pod, pod_id, options
-            )
-        )
-
     def _await_prime_public_endpoint(self, endpoint: str, api_key: str) -> None:
         """Block until the published URL answers, raising ``PrimeApiError`` on timeout."""
         self._prime_runner().await_public_endpoint(endpoint, api_key)
-
-    def _cleanup_failed_prime_pod(
-        self, pod_id: str, options: Any, message: str
-    ) -> Generator[BaseEvent, None, tuple[str, dict[str, object] | None]]:
-        """Drain the failed pod's logs and release it."""
-        return (
-            yield from self._prime_runner().cleanup_failed_pod(pod_id, options, message)
-        )
-
-    def _deploy_prime(self, config: DeploymentConfig) -> EventStream:
-        """Provision a Prime pod and resolve its public inference endpoint."""
-        yield from self._prime_runner().deploy(config)
 
     def _deploy_vllm(
         self, config: DeploymentConfig, env: dict[str, str]
@@ -1483,39 +1408,12 @@ class Orchestrator:
             vllm_volume=self._VLLM_STORAGE_VOLUME,
         )
 
-    def _list_llamacpp_models(self) -> list[StoredModelInfo]:
-        from .modal_storage import list_llamacpp_models
-
-        return list_llamacpp_models(llamacpp_volume=self._LLAMACPP_STORAGE_VOLUME)
-
     def _list_llamacpp_models_via_backend(self) -> list[StoredModelInfo] | None:
         from .modal_storage import list_llamacpp_models_via_backend
 
         return list_llamacpp_models_via_backend(
             llamacpp_volume=self._LLAMACPP_STORAGE_VOLUME
         )
-
-    def _list_llamacpp_models_from_volume(self) -> list[StoredModelInfo]:
-        from .modal_storage import list_llamacpp_models_from_volume
-
-        return list_llamacpp_models_from_volume(
-            llamacpp_volume=self._LLAMACPP_STORAGE_VOLUME
-        )
-
-    def _list_vllm_models(self) -> list[StoredModelInfo]:
-        from .modal_storage import list_vllm_models
-
-        return list_vllm_models(vllm_volume=self._VLLM_STORAGE_VOLUME)
-
-    def _walk_volume_files(
-        self,
-        volume_name: str,
-        root: str,
-        recursive: bool = True,
-    ) -> list[dict[str, Any]]:
-        from .modal_storage import walk_volume_files
-
-        return walk_volume_files(volume_name, root, recursive=recursive)
 
     def _storage_delete_targets(
         self, model: StoredModelInfo
@@ -1527,30 +1425,6 @@ class Orchestrator:
             llamacpp_volume=self._LLAMACPP_STORAGE_VOLUME,
             vllm_volume=self._VLLM_STORAGE_VOLUME,
         )
-
-    @staticmethod
-    def _entry_value(row: dict[str, Any], *keys: str) -> Any:
-        from .modal_storage import entry_value
-
-        return entry_value(row, *keys)
-
-    @staticmethod
-    def _volume_entry_path(parent: str, row: dict[str, Any]) -> str:
-        from .modal_storage import volume_entry_path
-
-        return volume_entry_path(parent, row)
-
-    @staticmethod
-    def _volume_entry_is_dir(row: dict[str, Any], path: str) -> bool:
-        from .modal_storage import volume_entry_is_dir
-
-        return volume_entry_is_dir(row, path)
-
-    @staticmethod
-    def _parse_size_bytes(value: Any) -> int:
-        from .modal_storage import parse_size_bytes
-
-        return parse_size_bytes(value)
 
     # ------------------------------------------------------------------
     # Stop
