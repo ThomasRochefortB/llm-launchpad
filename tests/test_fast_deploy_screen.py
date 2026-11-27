@@ -249,6 +249,8 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotEqual(app.quick_deploy_calls[-1][0].quote.id, selected)
 
     async def test_partial_placement_is_selectable_and_stays_highlighted(self) -> None:
+        from llm_launchpad.core.deploy_log_summary import SUMMARY_SPINNER_FRAMES
+
         model = _model((_profile("fits", required_vram_gb=8.0),))
         modal_catalog = [ModalGpuSpec("L4", price_per_hour_usd=0.8)]
         initial = aggregate_compute_availability(modal_catalog=modal_catalog)
@@ -288,6 +290,10 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(screen.check_action("choose_selected", ()))
                     status = screen.query_one("#fast-deploy-status", Static)
                     self.assertIn("Checking offers: Prime Intellect", str(status.content))
+                    # Tick while the partial placements are visible and Prime is still pending.
+                    next_index = (screen._catalog_spinner_index + 1) % len(SUMMARY_SPINNER_FRAMES)
+                    screen._tick_catalog_spinner()
+                    self.assertIn(SUMMARY_SPINNER_FRAMES[next_index], str(status.content))
                     options = screen.query_one("#fast-deploy-list", OptionList)
                     selected = options.highlighted_option.id
                     await pilot.press("enter")
@@ -1579,6 +1585,11 @@ class FastDeployScreenTests(unittest.IsolatedAsyncioTestCase):
             self.assertIs(screen._prices.get(first_model_id), first_price)
             status_after = str(screen.query_one("#fast-deploy-status", Static).render())
             self.assertNotIn("Refreshing model catalog…", status_after)
+            self.assertIsNone(screen._catalog_spinner_timer)
+            # A timer tick already queued when the refresh finished must do nothing.
+            final_index = screen._catalog_spinner_index
+            screen._tick_catalog_spinner()
+            self.assertEqual(screen._catalog_spinner_index, final_index)
             self.assertIsNone(screen._catalog_spinner_timer)
 
             screen.action_refresh_availability()

@@ -57,6 +57,7 @@ class StaleRefreshTests(unittest.IsolatedAsyncioTestCase):
     async def test_stale_cache_renders_refreshing_not_refreshed(self) -> None:
         from textual.app import App
 
+        from llm_launchpad.core.deploy_log_summary import SUMMARY_SPINNER_FRAMES
         from llm_launchpad.tui.screens.manage import ManageScreen
         from llm_launchpad.tui.workers import EndpointsLoaded
 
@@ -79,6 +80,9 @@ class StaleRefreshTests(unittest.IsolatedAsyncioTestCase):
             status = screen.query_one("#manage-status", Static)
             self.assertIn("Refreshing", str(status.renderable))
             self.assertIn("cached", str(status.renderable))
+            next_index = (screen._refresh_spinner_index + 1) % len(SUMMARY_SPINNER_FRAMES)
+            screen._tick_refresh_spinner()
+            self.assertIn(SUMMARY_SPINNER_FRAMES[next_index], str(status.renderable))
 
             # The live pass clears the refreshing state.
             screen.post_message(EndpointsLoaded(rows=[row], is_stale=False))
@@ -88,6 +92,10 @@ class StaleRefreshTests(unittest.IsolatedAsyncioTestCase):
             status = screen.query_one("#manage-status", Static)
             self.assertNotIn("Refreshing", str(status.renderable))
             self.assertIn("1 endpoint", str(status.renderable))
+            final_index = screen._refresh_spinner_index
+            screen._tick_refresh_spinner()
+            self.assertEqual(screen._refresh_spinner_index, final_index)
+            self.assertIsNone(screen._refresh_spinner_timer)
 
     async def test_failed_refresh_clears_refreshing_state(self) -> None:
         from textual.app import App
