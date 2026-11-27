@@ -264,6 +264,28 @@ class HFModelsTests(unittest.TestCase):
             self.assertEqual(read_header.call_count, 2)
             probe.assert_not_called()
 
+    def test_artifacts_keep_complete_main_weights_and_do_not_match_quant_prefixes(self) -> None:
+        revision = "c1ac76e99d5513b141e8adde7288b85c3f9c32ec"
+        names_and_sizes = (
+            ("gemma-4-31B-it-Q8_0.gguf", 32_635_677_632),
+            ("mtp/mtp-gemma-4-31B-it-Q8_0.gguf", 514_687_104),
+            ("model-Q8_0_L.gguf", 33_000_000_000),
+            ("Q4/model-UD-Q4_K_XL-00002-of-00002.gguf", 8_822_970_304),
+            ("Q4/model-UD-Q4_K_XL-00001-of-00002.gguf", 10_000_000_000),
+            ("Q6/model-Q6_K-00001-of-00002.gguf", 10_000_000_000),
+            ("v1/model-Q5_K_M-mtp.gguf", 21_000_000_000),
+            ("v2/model-Q5_K_M-mtp.gguf", 22_000_000_000),
+        )
+        files = [SimpleNamespace(rfilename=name, size=size) for name, size in names_and_sizes]
+        artifacts = hf_models._gguf_artifacts(files, revision)
+
+        self.assertEqual(set(artifacts), {"UD-Q4_K_XL", "Q8_0", "Q8_0_L"})
+        self.assertEqual(artifacts["Q8_0"].files, (names_and_sizes[0],))
+        q4 = artifacts["UD-Q4_K_XL"]
+        self.assertEqual(q4.revision, revision)
+        self.assertEqual(q4.files, (names_and_sizes[4], names_and_sizes[3]))
+        self.assertEqual(q4.size_bytes, 18_822_970_304)
+
     def test_parse_memory_to_gb_supports_gb_tb_and_bytes(self) -> None:
         self.assertAlmostEqual(hf_models._parse_memory_to_gb("4.66 GB") or 0, 4.66, places=2)
         self.assertAlmostEqual(hf_models._parse_memory_to_gb("1.5 TB") or 0, 1500.0, places=1)

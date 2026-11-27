@@ -206,6 +206,21 @@ class TopologyVerificationTests(unittest.TestCase):
                 per_device_required_gb=20.0,
             )
 
+    def test_an_uneven_plan_uses_free_memory_in_cuda_pci_order(self) -> None:
+        devices = parse_gpu_inventory(
+            "0, NVIDIA L40S, 46068, 100, 43000, 00000000:81:00.0\n"
+            "1, NVIDIA L40S, 46068, 100, 45000, 00000000:21:00.0"
+        )
+        verify_gpu_topology(
+            devices, gpu_count=2, per_device_required_gb=43.0,
+            requirements_by_device=(43.0, 41.0),
+        )
+        with self.assertRaisesRegex(ValueError, "GPU 0 has"):
+            verify_gpu_topology(
+                devices, gpu_count=2, per_device_required_gb=43.0,
+                requirements_by_device=(41.0, 43.0),
+            )
+
 
 class VastVllmRuntimeTests(unittest.TestCase):
     def vllm(self, **overrides: object) -> DeploymentConfig:

@@ -14,8 +14,9 @@ import shlex
 from typing import Any
 from collections.abc import Iterable
 
-from ..protocol.enums import CertificationState, EvidenceLevel, ServingObjective
+from ..protocol.enums import CertificationState, ComputeProvider, EvidenceLevel, ServingObjective
 from ..protocol.models import (
+    GgufArtifact,
     MemoryEstimate,
     PerformancePoint,
     PlacementAssessment,
@@ -27,10 +28,11 @@ from ..protocol.models import (
 from .config import SETTINGS_DIR
 from .coerce import optional_float
 from .fit_calibration import calibration_key, load_memory_calibration
+from .gguf_metadata import GgufServingMetadata
 from .hf_models import GgufQuantMetadata
 
 
-PLANNER_SCHEMA_VERSION = 2
+PLANNER_SCHEMA_VERSION = 4
 CERTIFICATE_CACHE_PATH = SETTINGS_DIR / "serving_certificates.json"
 
 # Conservative relative decode capacity. The values only rank unmeasured
@@ -61,16 +63,25 @@ _GPU_TYPE_ALIASES = {
     "RTX-PRO-6000": ("RTX PRO 6000", "RTXPRO6000", "RTX-PRO6000"),
 }
 
-_CACHE_BYTES = {
-    "f32": 4.0,
-    "f16": 2.0,
-    "bf16": 2.0,
-    "q8_0": 1.0625,
-    "q5_0": 0.6875,
-    "q5_1": 0.75,
-    "q4_0": 0.5625,
-    "q4_1": 0.625,
+_CACHE_BLOCKS = {
+    "f32": (1, 4),
+    "f16": (1, 2),
+    "bf16": (1, 2),
+    "q8_0": (32, 34),
+    "q5_0": (32, 22),
+    "q5_1": (32, 24),
+    "q4_0": (32, 18),
+    "q4_1": (32, 20),
 }
+_RECURRENT_QWEN_ARCHITECTURES = frozenset({"qwen35", "qwen35moe", "qwen3next", "qwen4exp"})
+_NEMOTRON_HYBRID_ARCHITECTURES = frozenset({"nemotron_h", "nemotron_h_moe"})
+_SSM_HYBRID_ARCHITECTURES = _RECURRENT_QWEN_ARCHITECTURES | _NEMOTRON_HYBRID_ARCHITECTURES
+_MLA_HYBRID_ARCHITECTURES = frozenset({"kimi-k3", "kimi-linear", "glm5next", "glm5-next"})
+# Known users of the standard dual sliding-window/full cache in b12464.
+_SWA_ARCHITECTURES = frozenset({
+    "beam", "cohere2", "cohere2moe", "gemma2", "gemma3", "gemma4",
+    "gpt-oss", "inkling2", "muse-glimmer", "muse-spark",
+})
 
 _MANAGED_FLAGS_WITH_VALUES = {
     "-c",
@@ -102,7 +113,10 @@ _MANAGED_STANDALONE_FLAGS = {
     "--kv-unified",
     "-no-kvu",
     "--no-kv-unified",
+    "--swa-full",
 }
+
+_PLACEMENT_FLAGS_WITH_VALUES = {"-sm", "--split-mode", "-ts", "--tensor-split", "-lv", "--verbosity"}
 
 
 def serving_requirements(
@@ -158,6 +172,7 @@ def tuning_for_objective(
 # bytes once keeps GB/GiB/MiB boundaries explicit instead of scattering
 # ``/ 1000`` and ``/ 1024`` through every comparison.
 _GIB_TO_BYTES = 1024**3
+_MIB_TO_BYTES = 1024**2
 
 
 def gib_to_bytes(gib: float) -> int:
@@ -165,9 +180,25 @@ def gib_to_bytes(gib: float) -> int:
     return int(round(max(0.0, float(gib)) * _GIB_TO_BYTES))
 
 
+def bytes_to_gib(size: int) -> float:
+    return size / _GIB_TO_BYTES
+
+
 def device_capacity_bytes(capacity_gib: float) -> int:
     """Return the usable bytes of one device quoted in planner GiB."""
     return gib_to_bytes(capacity_gib)
+
+
+def _gpu_reserve_mib(capacity_bytes: int) -> int:
+    return max(2048, (capacity_bytes + 20 * _MIB_TO_BYTES - 1) // (20 * _MIB_TO_BYTES))
+
+
+def _ceil_div(size: int, divisor: int) -> int:
+    return (size + divisor - 1) // divisor
+
+
+def _align(size: int, quantum: int) -> int:
+    return _ceil_div(size, quantum) * quantum
 
 
 # A graph built without flash attention reserves its attention scores in full,
@@ -249,7 +280,7 @@ def tuning_for_attention_scratch(
     # Only the scores matter for this trade: they are the plane count that
     # makes a long context unservable, and they scale with the batch exactly
     # as the masks do.
-    per_token_gb = context_tokens * (attention_head_count + 1) * 4 / 1_000_000_000.0
+    per_token_gb = bytes_to_gib(_align(context_tokens, 256) * (attention_head_count + 1) * 4)
     ubatch = ubatch_for_attention_scratch(per_token_gb, max_ubatch=tuning.ubatch_size)
     return replace(tuning, ubatch_size=ubatch)
 
@@ -331,32 +362,30 @@ def memory_for_cache_type(
 
     source_key = from_cache_type.strip().casefold()
     target_key = to_cache_type.strip().casefold()
-    source_bytes = _CACHE_BYTES.get(source_key)
-    target_bytes = _CACHE_BYTES.get(target_key)
-    if source_bytes is None or source_bytes <= 0:
+    if source_key not in _CACHE_BLOCKS:
         raise ValueError(f"Unknown source cache type: {from_cache_type!r}")
-    if target_bytes is None or target_bytes <= 0:
+    if target_key not in _CACHE_BLOCKS:
         raise ValueError(f"Unknown target cache type: {to_cache_type!r}")
-    if memory.source != "gguf-metadata":
+    if memory.source != "gguf-metadata" or memory.recurrent_gb > 0 or memory.speculative_gb > 0:
         raise ValueError(
             "Only a metadata-derived estimate can be rescaled; the fallback "
-            "heuristic does not model cache precision."
+            "heuristic and recurrent or draft state do not model this cache precision change."
         )
-    kv_gb = memory.kv_cache_gb * (target_bytes / source_bytes)
+    source_width, source_bytes = _CACHE_BLOCKS[source_key]
+    target_width, target_bytes = _CACHE_BLOCKS[target_key]
+    numerator = target_bytes * source_width
+    denominator = source_bytes * target_width
+    layers = tuple(_ceil_div(value * numerator, denominator) for value in memory.layer_cache_bytes)
+    kv_bytes = (
+        sum(layers) if layers else _ceil_div(gib_to_bytes(memory.kv_cache_gb) * numerator, denominator)
+    )
+    kv_gb = bytes_to_gib(kv_bytes)
     count = max(1, len(memory.per_device_required_gb))
-    total = (
-        memory.weights_gb
-        + kv_gb
-        + memory.speculative_gb
-        + (memory.compute_gb + memory.attention_scratch_gb) * count
-        + memory.reserve_gb
+    retuned = replace(memory, kv_cache_gb=kv_gb, layer_cache_bytes=layers)
+    per_device = _estimate_device_requirements(
+        retuned, gpu_count=count, reserve_bytes=gib_to_bytes(memory.reserve_gb / count),
     )
-    return replace(
-        memory,
-        kv_cache_gb=round(kv_gb, 3),
-        total_gb=round(total, 3),
-        per_device_required_gb=tuple(round(total / count, 3) for _ in range(count)),
-    )
+    return replace(retuned, total_gb=sum(per_device), per_device_required_gb=per_device)
 
 
 def compile_server_args(
@@ -364,10 +393,11 @@ def compile_server_args(
     tuning: RuntimeTuning,
     *,
     extra_args: Iterable[str] = (),
+    gpu_count: int | None = None,
 ) -> tuple[str, ...]:
     """Compile canonical llama.cpp arguments, stripping managed duplicates."""
 
-    extras = _without_managed_args(tuple(extra_args))
+    extras = _without_managed_args(tuple(extra_args), pinned_topology=gpu_count is not None)
     arguments = [
         "--ctx-size",
         str(requirements.context_tokens),
@@ -391,11 +421,8 @@ def compile_server_args(
         "--kv-unified",
         "--kv-unified-per-slot",
         str(requirements.context_tokens),
-        # The runtime fitter may tune unspecified values, but context and GPU
-        # layers below are explicit hard constraints. A plan that cannot retain
-        # the 2 GiB per-device margin therefore fails instead of silently
-        # shrinking context or spilling layers to CPU. The topology-specific
-        # compiler raises this margin to 5% on larger accelerators.
+        # Keep context and layer count explicit; the runtime projection is
+        # checked separately because llama-server may start after a refused fit.
         "--fit",
         "on",
         "--fit-target",
@@ -403,6 +430,12 @@ def compile_server_args(
     ]
     if requirements.gpu_only:
         arguments.extend(["--n-gpu-layers", tuning.gpu_layers or "all"])
+    if gpu_count is not None:
+        arguments.extend(["--verbosity", "4", "--split-mode", "layer"])
+        if gpu_count > 1:
+            # Match the planner's contiguous equal split. Without this flag
+            # llama.cpp assigns layers in proportion to each GPU's free VRAM.
+            arguments.extend(["--tensor-split", ",".join(["1"] * gpu_count)])
     arguments.extend(extras)
     return tuple(arguments)
 
@@ -412,10 +445,11 @@ def compile_server_args_string(
     tuning: RuntimeTuning,
     *,
     extra_args: Iterable[str] = (),
+    gpu_count: int | None = None,
 ) -> str:
     """Return shell-safe canonical llama.cpp server arguments."""
 
-    return shlex.join(compile_server_args(requirements, tuning, extra_args=extra_args))
+    return shlex.join(compile_server_args(requirements, tuning, extra_args=extra_args, gpu_count=gpu_count))
 
 
 def per_device_requirements(
@@ -435,14 +469,66 @@ def per_device_requirements(
     and was rejected for the difference while the total had room to spare.
     """
 
+    return tuple(
+        bytes_to_gib(value) for value in _distribute_uniform_bytes(
+            gib_to_bytes(shardable_gb), gib_to_bytes(per_device_gb), gpu_count, layer_count,
+        )
+    )
+
+
+def _distribute_uniform_bytes(
+    shardable_bytes: int, fixed_bytes: int, gpu_count: int, layer_count: int | None,
+) -> tuple[int, ...]:
     count = max(1, gpu_count)
-    layers = layer_count if layer_count and layer_count > 0 else 0
-    if layers < count:
-        shares = [1.0 / count] * count
+    layers = max(count, layer_count or 0)
+    base, extra = divmod(layers, count)
+    return tuple(
+        _ceil_div(shardable_bytes * (base + (index < extra)), layers) + fixed_bytes
+        for index in range(count)
+    )
+
+
+def _estimate_device_requirements(
+    memory: MemoryEstimate, *, gpu_count: int, reserve_bytes: int,
+) -> tuple[float, ...]:
+    count = max(1, gpu_count)
+    workspace = gib_to_bytes(memory.compute_gb) + gib_to_bytes(memory.attention_scratch_gb)
+    fixed = workspace + reserve_bytes
+    weights = gib_to_bytes(memory.weights_gb)
+    cache = gib_to_bytes(memory.kv_cache_gb)
+    draft_workspace = gib_to_bytes(memory.speculative_gb)
+    if not memory.layer_cache_bytes:
+        assigned = _distribute_uniform_bytes(weights + cache + draft_workspace, fixed, count, memory.total_layer_count)
     else:
-        base, remainder = divmod(layers, count)
-        shares = [(base + (1 if index < remainder else 0)) / layers for index in range(count)]
-    return tuple(shardable_gb * share + per_device_gb for share in shares)
+        # The layer split is contiguous. Include the output layer when
+        # estimating the weight split; it has no KV cache of its own.
+        layers = (*memory.layer_cache_bytes, 0)
+        block_weights = _ceil_div(weights, len(layers))
+        assigned_bytes = [fixed + draft_workspace] * count
+        for index, layer_bytes in enumerate(layers):
+            device = (index * count) // len(layers)
+            assigned_bytes[device] += block_weights + layer_bytes
+        assigned = tuple(assigned_bytes)
+    return tuple(bytes_to_gib(value) for value in assigned)
+
+
+def memory_on_topology(
+    memory: MemoryEstimate, gpu_count: int, gpu_memory_gb: float | None,
+) -> MemoryEstimate:
+    """Rebase memory on a topology using the same margin as the runtime."""
+    reserve_bytes = _gpu_reserve_mib(device_capacity_bytes(gpu_memory_gb)) * _MIB_TO_BYTES if gpu_memory_gb else 0
+    per_device = _estimate_device_requirements(memory, gpu_count=gpu_count, reserve_bytes=reserve_bytes)
+    return replace(
+        memory,
+        per_device_required_gb=per_device,
+        total_gb=sum(per_device),
+        reserve_gb=bytes_to_gib(reserve_bytes * len(per_device)),
+    )
+
+
+def memory_fits_device(memory: MemoryEstimate, capacity_gib: float) -> bool:
+    """Compare before rounding for display."""
+    return max(map(gib_to_bytes, memory.per_device_required_gb), default=gib_to_bytes(memory.total_gb)) <= device_capacity_bytes(capacity_gib)
 
 
 def estimate_memory(
@@ -456,13 +542,13 @@ def estimate_memory(
 ) -> MemoryEstimate:
     """Estimate full-context llama.cpp memory using GGUF architecture metadata."""
 
-    weights = max(0.0, float(weights_gb))
-    context = max(1, requirements.context_tokens)
-    kv_gb, metadata_complete = _kv_cache_gb(
+    weights = gib_to_bytes(weights_gb)
+    context = _align(max(1, requirements.context_tokens), 256)
+    allocation = _cache_allocation(
         metadata,
         context,
         tuning,
-        weights_gb=weights,
+        weights_bytes=weights,
     )
 
     # Compute graphs, CUDA workspaces, and allocations outside the model/KV
@@ -470,48 +556,48 @@ def estimate_memory(
     # replaces this estimate. Every device builds the whole graph for the
     # layers it holds, so this is a per-device cost that extra GPUs replicate
     # rather than divide.
-    compute_gb = max(1.5, min(16.0, weights * 0.08 + tuning.batch_size / 4096.0))
-    scratch_gb, scratch_known = _attention_scratch_gb(metadata, context, tuning)
-    speculative_gb = (
-        max(0.5, weights * 0.04)
+    compute = max(3 * _GIB_TO_BYTES // 2, min(
+        16 * _GIB_TO_BYTES,
+        _ceil_div(weights * 8, 100) + _ceil_div(tuning.batch_size * _GIB_TO_BYTES, 4096),
+    ))
+    layout = metadata.serving_metadata
+    if (
+        metadata.architecture == "gemma4" and layout is not None and not layout.expert_count
+        and allocation.complete and tuning.flash_attention and tuning.ubatch_size <= 512
+        and tuning.batch_size <= 2048
+    ):
+        # At these batches, b12464's dense Gemma 4 graphs reserve under 0.6 GiB
+        # beyond the attention masks (E4B and 31B, native CUDA fit). Keep a
+        # 1 GiB allowance for activations and workspace independent of quant.
+        compute = _GIB_TO_BYTES
+    scratch, scratch_known = _attention_scratch_bytes(metadata, context, tuning)
+    speculative = (
+        max(_GIB_TO_BYTES // 2, _ceil_div(weights * 4, 100))
         if tuning.speculative_decoding is not None
-        else 0.0
+        else 0
     )
-    count = max(1, int(gpu_count))
-    reserve_per_device = (
-        max(2.0, float(gpu_memory_gb) * 0.05)
-        if gpu_memory_gb is not None and gpu_memory_gb > 0
-        else 0.0
-    )
-    reserve_gb = reserve_per_device * count
-    hybrid = metadata.architecture in {"kimi-k3", "kimi-linear", "glm5next", "glm5-next"}
+    hybrid = metadata.architecture in _MLA_HYBRID_ARCHITECTURES | _SSM_HYBRID_ARCHITECTURES
     source = "gguf-hybrid-metadata" if hybrid else "gguf-metadata"
-    nextn = metadata.serving_metadata.nextn_predict_layers if metadata.serving_metadata else 0
-    layer_count = (metadata.block_count - nextn) if metadata.block_count else None
-    per_device = per_device_requirements(
-        shardable_gb=weights + kv_gb + speculative_gb,
-        per_device_gb=compute_gb + scratch_gb + reserve_per_device,
-        gpu_count=count,
-        layer_count=layer_count,
-    )
-    total = sum(per_device)
-    recurrent = _hybrid_recurrent_gb(metadata, tuning) if hybrid and metadata_complete else 0.0
-    complete = metadata_complete and scratch_known
-    return MemoryEstimate(
-        weights_gb=round(weights, 3),
-        kv_cache_gb=round(kv_gb, 3),
-        compute_gb=round(compute_gb, 3),
-        attention_scratch_gb=round(scratch_gb, 3),
-        speculative_gb=round(speculative_gb, 3),
-        reserve_gb=round(reserve_gb, 3),
-        total_gb=round(total, 3),
-        per_device_required_gb=tuple(round(value, 3) for value in per_device),
+    nextn = layout.nextn_predict_layers if layout else 0
+    layers = metadata.block_count or (layout.block_count if layout else None)
+    layer_count = layers - nextn if layers else None
+    complete = allocation.complete and scratch_known
+    memory = MemoryEstimate(
+        weights_gb=bytes_to_gib(weights),
+        kv_cache_gb=bytes_to_gib(allocation.total_bytes),
+        compute_gb=bytes_to_gib(compute),
+        attention_scratch_gb=bytes_to_gib(scratch),
+        speculative_gb=bytes_to_gib(speculative),
+        reserve_gb=0.0,
+        total_gb=0.0,
         confidence=0.82 if complete else 0.55,
         source=source if complete else "conservative-fallback",
         total_layer_count=layer_count,
-        recurrent_gb=round(recurrent, 6),
+        recurrent_gb=bytes_to_gib(allocation.recurrent_bytes),
         recurrent_state_copies=_recurrent_state_copies(tuning),
+        layer_cache_bytes=allocation.layer_bytes,
     )
+    return memory_on_topology(memory, gpu_count, gpu_memory_gb)
 
 
 def serving_variants(
@@ -580,16 +666,10 @@ def serving_variants(
         )
         candidates.append((base_requirements, tuned, f"batch {batch}"))
     variants: list[ServingVariant] = []
-    seen: set[str] = set()
+    seen: set[tuple[ServingRequirements, RuntimeTuning]] = set()
     for requirements, tuning, label in candidates:
-        key = calibration_key(
-            model_id=model_id,
-            revision=revision,
-            quant=quant,
-            runtime_id=runtime_id,
-            requirements=requirements,
-            tuning=tuning,
-        )
+        tuning = tuning_for_gpu_memory(tuning, gpu_memory_gb)
+        key = (requirements, tuning)
         if key in seen:
             continue
         seen.add(key)
@@ -601,8 +681,8 @@ def serving_variants(
             gpu_count=gpu_count,
             gpu_memory_gb=gpu_memory_gb,
         )
-        assessment = assess_placement(
-            metadata,
+        assessment = _assess_with_evidence(
+            memory=memory,
             model_id=model_id,
             revision=revision,
             quant=quant,
@@ -650,6 +730,8 @@ def _assess_with_evidence(
     gpu_memory_gb: float,
     price_per_hour_usd: float | None,
     weights_gb: float,
+    artifact: GgufArtifact | None = None,
+    provider: ComputeProvider | None = None,
 ) -> PlacementAssessment:
     """Apply one evidence rule to a computed requirement vector.
 
@@ -665,8 +747,8 @@ def _assess_with_evidence(
     decision; the human-readable rejection keeps GiB for continuity.
     """
     count = max(1, int(gpu_count))
-    capacity = device_capacity_bytes(gpu_memory_gb)
-    fits = all(gib_to_bytes(value) <= capacity for value in memory.per_device_required_gb)
+    entrypoint = artifact.entrypoint if artifact is not None else None
+    capacity_bytes = device_capacity_bytes(gpu_memory_gb) if artifact is not None else None
     fingerprint = serving_fingerprint(
         model_id=model_id,
         revision=revision,
@@ -676,6 +758,9 @@ def _assess_with_evidence(
         tuning=tuning,
         gpu_type=gpu_type,
         gpu_count=count,
+        entrypoint=entrypoint,
+        provider=provider if artifact is not None else None,
+        capacity_bytes=capacity_bytes,
     )
     measured_key = calibration_key(
         model_id=model_id,
@@ -684,18 +769,33 @@ def _assess_with_evidence(
         runtime_id=runtime_id,
         requirements=requirements,
         tuning=tuning,
-    )
+        gpu_type=_normalized_gpu(gpu_type),
+        gpu_count=count,
+        entrypoint=entrypoint,
+        provider=provider,
+        capacity_bytes=capacity_bytes,
+    ) if artifact is not None else ""
+    measured = load_memory_calibration(measured_key)
+    projected = measured is not None and len(measured.per_device_bytes) == count
+    if measured is not None and projected:
+        reserve_per_device = gib_to_bytes(memory.reserve_gb) // count
+        per_device = tuple(bytes_to_gib(value + reserve_per_device) for value in measured.per_device_bytes)
+        memory = replace(
+            memory, source="runtime-projection", total_gb=sum(per_device), per_device_required_gb=per_device,
+        )
+    fits = memory_fits_device(memory, gpu_memory_gb)
     cached = load_runtime_attestation(fingerprint)
-    certified = (
+    attested = (
         cached is not None
         and cached.gpu_resident
         and cached.effective_context_tokens >= requirements.context_tokens
     )
-    if cached is not None and not certified:
+    if cached is not None and not attested:
         return PlacementAssessment(
             fingerprint=fingerprint,
             calibration_key=measured_key,
             runtime_id=runtime_id,
+            gpu_type=gpu_type,
             memory=memory,
             tuning=tuning,
             performance=cached.performance,
@@ -704,6 +804,12 @@ def _assess_with_evidence(
             gpu_resident=False,
             rejection_reason="Cached runtime attestation does not satisfy full-context GPU residency.",
         )
+    certified = bool(
+        cached is not None and attested and (fits or not projected)
+        and (cached.residency_evidence == EvidenceLevel.OBSERVED if artifact else
+             cached.residency_evidence != EvidenceLevel.PREDICTED)
+    )
+    eligible = fits or (certified and artifact is None)
     performance = (
         cached.performance
         if certified and cached is not None and cached.performance
@@ -723,20 +829,23 @@ def _assess_with_evidence(
         fingerprint=fingerprint,
         calibration_key=measured_key,
         runtime_id=runtime_id,
-        memory=cached.memory if certified and cached.memory is not None else memory,
+        gpu_type=gpu_type,
+        # A serving certificate can establish residency, but its attached
+        # memory is the old plan's estimate, not an allocator observation.
+        memory=memory,
         tuning=tuning,
         performance=performance,
         certification=(
             CertificationState.CERTIFIED if certified else CertificationState.ESTIMATED
         ),
-        fits=fits or certified,
-        gpu_resident=(fits or certified) and requirements.gpu_only,
+        fits=eligible,
+        gpu_resident=eligible and requirements.gpu_only,
         rejection_reason=(
             None
-            if fits or certified
+            if eligible
             else (
                 f"Full-context plan needs {max(memory.per_device_required_gb, default=memory.total_gb):.1f} "
-                f"GB per GPU; {gpu_type} provides {gpu_memory_gb:.1f} GB."
+                f"GiB per GPU; {gpu_type} provides {gpu_memory_gb:.1f} GiB."
             )
         ),
     )
@@ -796,67 +905,30 @@ def assess_memory_placement(
     gpu_count: int,
     gpu_memory_gb: float,
     price_per_hour_usd: float | None = None,
+    artifact: GgufArtifact | None = None,
+    provider: ComputeProvider | None = None,
 ) -> PlacementAssessment:
     """Assess a topology from a catalog's model/KV/compute breakdown."""
 
     count = max(1, int(gpu_count))
-    state_copies = _recurrent_state_copies(tuning)
-    recurrent = base_memory.recurrent_gb * state_copies / max(1, base_memory.recurrent_state_copies)
-    state_delta = recurrent - base_memory.recurrent_gb
-    reserve_per_device = max(2.0, float(gpu_memory_gb) * 0.05)
-    # Rebase the estimate onto this topology: only the model, cache and
-    # speculative buffers shard, so the graph memory is re-multiplied by the
-    # device count this placement actually uses instead of being carried over
-    # from the count the catalog estimate was built at.
-    base_count = max(1, len(base_memory.per_device_required_gb))
-    per_device_graph = base_memory.compute_gb + base_memory.attention_scratch_gb
-    shardable = max(
-        0.0,
-        base_memory.total_gb - base_memory.reserve_gb - per_device_graph * base_count,
-    )
-    reserve = reserve_per_device * count
-    measured_key = calibration_key(
-        model_id=model_id,
-        revision=revision,
-        quant=quant,
-        runtime_id=runtime_id,
-        requirements=requirements,
-        tuning=tuning,
-    )
-    # A runtime measurement of this exact graph outranks the formula that
-    # predicted it. The formula reconstructs ggml's allocator from outside
-    # and has been wrong in both directions; llama.cpp reports the real
-    # figure before every serve, and one report sizes every topology.
-    measured = load_memory_calibration(measured_key)
-    if measured is not None:
-        per_device = tuple(
-            value + reserve_per_device
-            for value in measured.per_device_gb(
-                shardable_gb=shardable + state_delta,
-                gpu_count=count,
-                layer_count=base_memory.total_layer_count,
-            )
+    if artifact is not None:
+        tuning = tuning_for_gpu_memory(tuning, gpu_memory_gb)
+    if not base_memory.layer_cache_bytes:
+        # Older aggregate estimates can still resize recurrent state without
+        # a GGUF layout. New block-level estimates are retuned from metadata.
+        state_copies = _recurrent_state_copies(tuning)
+        recurrent = base_memory.recurrent_gb * state_copies / max(1, base_memory.recurrent_state_copies)
+        base_memory = replace(
+            base_memory,
+            kv_cache_gb=base_memory.kv_cache_gb - base_memory.recurrent_gb + recurrent,
+            recurrent_gb=recurrent,
+            recurrent_state_copies=state_copies,
         )
-    else:
-        per_device = per_device_requirements(
-            shardable_gb=shardable + state_delta,
-            per_device_gb=per_device_graph + reserve_per_device,
-            gpu_count=count,
-            layer_count=base_memory.total_layer_count,
-        )
-    memory = replace(
-        base_memory,
-        kv_cache_gb=round(base_memory.kv_cache_gb + state_delta, 3),
-        recurrent_gb=round(recurrent, 6),
-        recurrent_state_copies=state_copies,
-        reserve_gb=round(reserve, 3),
-        total_gb=round(sum(per_device), 3),
-        per_device_required_gb=tuple(round(value, 3) for value in per_device),
-    )
+    memory = memory_on_topology(base_memory, count, gpu_memory_gb)
     return _assess_with_evidence(
         memory=memory,
         model_id=model_id,
-        revision=revision,
+        revision=artifact.revision if artifact is not None else revision,
         quant=quant,
         runtime_id=runtime_id,
         requirements=requirements,
@@ -866,6 +938,8 @@ def assess_memory_placement(
         gpu_memory_gb=gpu_memory_gb,
         price_per_hour_usd=price_per_hour_usd,
         weights_gb=base_memory.weights_gb,
+        artifact=artifact,
+        provider=provider,
     )
 
 
@@ -877,7 +951,7 @@ def tuning_for_gpu_memory(
 
     if gpu_memory_gb is None or gpu_memory_gb <= 0:
         return tuning
-    target_mib = math.ceil(max(2.0, gpu_memory_gb * 0.05) * 1024.0)
+    target_mib = _gpu_reserve_mib(device_capacity_bytes(gpu_memory_gb))
     return replace(tuning, fit_target_mib=target_mib)
 
 
@@ -951,6 +1025,9 @@ def serving_fingerprint(
     tuning: RuntimeTuning,
     gpu_type: str,
     gpu_count: int,
+    entrypoint: str | None = None,
+    provider: ComputeProvider | None = None,
+    capacity_bytes: int | None = None,
 ) -> str:
     """Return a stable identifier for all serving-affecting inputs."""
 
@@ -969,6 +1046,9 @@ def serving_fingerprint(
         "tuning": _jsonable(asdict(tuning)),
         "gpu_type": _normalized_gpu(gpu_type),
         "gpu_count": max(1, int(gpu_count)),
+        "entrypoint": entrypoint,
+        "provider": provider,
+        "capacity_bytes": capacity_bytes,
     }
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -1112,12 +1192,12 @@ def attestation_now(
     )
 
 
-def _attention_scratch_gb(
+def _attention_scratch_bytes(
     metadata: GgufQuantMetadata,
     context_tokens: int,
     tuning: RuntimeTuning,
-) -> tuple[float, bool]:
-    """Return the per-device attention scratch of a non-flash-attention graph.
+) -> tuple[int, bool]:
+    """Return per-device scratch for attention masks and any materialized scores.
 
     Flash attention never materializes the scores, so its working set is small
     and context-independent. Without it llama.cpp builds the full
@@ -1138,11 +1218,18 @@ def _attention_scratch_gb(
 
     heads = attention_head_count(metadata)
     if heads is None and not tuning.flash_attention:
-        return 0.0, False
+        return 0, False
     # llama.cpp reserves the graph one physical batch at a time.
     tokens = max(1, min(context_tokens, tuning.ubatch_size))
     planes = _attention_plane_bytes(metadata, tuning, heads)
-    return (context_tokens * tokens * planes / 1_000_000_000.0, True)
+    scratch = context_tokens * tokens * planes
+    layout = metadata.serving_metadata
+    if layout is not None and metadata.architecture in _SWA_ARCHITECTURES:
+        window = _sliding_window(metadata.architecture, layout)
+        if window:
+            # Full and sliding-window masks can coexist in the same graph.
+            scratch += _sliding_cache_tokens(context_tokens, window, tuning) * tokens * planes
+    return scratch, True
 
 
 def attention_head_count(metadata: GgufQuantMetadata) -> int | None:
@@ -1183,7 +1270,9 @@ def _attention_plane_bytes(
     mask_bytes = 2 if tuning.flash_attention else 4
     planes = 1
     layout = metadata.serving_metadata
-    if layout is not None and layout.indexer_key_length and layout.indexer_kpool:
+    if layout is not None and layout.indexer_key_length and (
+        layout.indexer_kpool or metadata.architecture in {"qwen4exp", "glm-dsa", "mistral-large4"}
+    ):
         planes += _SPARSE_ATTENTION_MASK_PLANES
     total = planes * mask_bytes
     if not tuning.flash_attention and heads:
@@ -1191,58 +1280,235 @@ def _attention_plane_bytes(
     return total
 
 
-def _kv_cache_gb(
+@dataclass(frozen=True)
+class _CacheAllocation:
+    total_bytes: int
+    recurrent_bytes: int = 0
+    layer_bytes: tuple[int, ...] = ()
+    complete: bool = True
+
+
+def _cache_allocation(
     metadata: GgufQuantMetadata,
     context_tokens: int,
     tuning: RuntimeTuning,
     *,
-    weights_gb: float,
-) -> tuple[float, bool]:
+    weights_bytes: int,
+) -> _CacheAllocation:
     layout = metadata.serving_metadata
-    hybrid = metadata.architecture in {"kimi-k3", "kimi-linear", "glm5next", "glm5-next"}
-    if hybrid:
-        estimate = _hybrid_cache_gb(metadata, context_tokens, tuning)
-        if estimate is not None:
-            return estimate, True
+    fallback_bytes = max(_GIB_TO_BYTES, _ceil_div(context_tokens * weights_bytes, 32768 * 10))
+    fallback = _CacheAllocation(fallback_bytes, complete=False)
+    if metadata.architecture in _MLA_HYBRID_ARCHITECTURES:
         # Never interpret missing hybrid arrays as dense multi-head attention.
-        return _fallback_cache_gb(context_tokens, weights_gb), False
+        return _mla_hybrid_cache(metadata, context_tokens, tuning) or fallback
 
-    layers = metadata.block_count
-    embedding = metadata.embedding_length
-    heads = metadata.attention_head_count
+    layers = metadata.block_count or (layout.block_count if layout else None) or 0
+    heads = attention_head_count(metadata)
+    embedding = metadata.embedding_length or (layout.embedding_length if layout else None)
     kv_heads = metadata.attention_head_count_kv
+    if kv_heads is None and layout is not None:
+        kv_heads = layout.attention_head_count_kv
     if kv_heads is None:
-        kv_heads = heads
-    key_length = metadata.attention_key_length
-    value_length = metadata.attention_value_length
-    if key_length is None and embedding and heads:
-        key_length = max(1, embedding // heads)
-    if value_length is None:
-        value_length = key_length
+        kv_heads = heads or 0
+    heads_by_layer = (layout.attention_head_count_kv_by_layer if layout else ()) or (kv_heads,) * layers
+    key_length = metadata.attention_key_length or (layout.attention_key_length if layout else None)
+    key_length = key_length or (max(1, embedding // heads) if embedding and heads else 0)
+    value_length = metadata.attention_value_length or (layout.attention_value_length if layout else None) or key_length
+    if not layers or len(heads_by_layer) != layers or not key_length or not value_length:
+        return fallback
 
-    if layers and kv_heads and key_length and value_length:
-        head_sum = layers * kv_heads
-        if layout and layout.attention_head_count_kv_by_layer:
-            per_layer = layout.attention_head_count_kv_by_layer
-            if len(per_layer) != layers or 0 in per_layer:
-                return _fallback_cache_gb(context_tokens, weights_gb), False
-            head_sum = sum(per_layer)
-        mla = bool(layout and layout.attention_key_length_mla and layout.attention_value_length_mla)
-        k_elements = head_sum * key_length * context_tokens
-        # llama.cpp stores the absorbed MLA latent once, in K; V aliases it.
-        v_elements = 0 if mla else head_sum * value_length * context_tokens
-        k_bytes = _cache_bytes(tuning.cache_type_k)
-        v_bytes = _cache_bytes(tuning.cache_type_v)
-        return ((k_elements * k_bytes + v_elements * v_bytes) / 1_000_000_000.0, True)
+    if metadata.architecture in _SSM_HYBRID_ARCHITECTURES and layout is not None:
+        recurrent = _ssm_hybrid_cache(
+            layout, heads_by_layer, key_length, value_length, context_tokens, tuning,
+        )
+        if recurrent is not None:
+            return recurrent
+    window = None
+    if metadata.architecture in _SWA_ARCHITECTURES and layout is not None:
+        window = _sliding_window(metadata.architecture, layout)
+        if window:
+            sliding = _sliding_cache(
+                metadata.architecture, layout, heads_by_layer,
+                key_length, value_length, context_tokens, window, tuning,
+            )
+            if sliding is not None:
+                return sliding
+    if 0 in heads_by_layer:
+        return fallback
 
-    return _fallback_cache_gb(context_tokens, weights_gb), False
+    # The absorbed MLA latent is stored once. Without a verified specialized
+    # layout, budget every known attention layer at the full context.
+    mla = bool(layout and layout.attention_key_length_mla and layout.attention_value_length_mla)
+    value_width = 0 if mla else max(heads_by_layer) * value_length
+    trunk = layers - (layout.nextn_predict_layers if layout else 0)
+    index_width = (layout.indexer_key_length or 0) if layout and metadata.architecture in {
+        "glm-dsa", "mistral-large4",
+    } else 0
+    kv = []
+    for index, count in enumerate(heads_by_layer):
+        if index >= trunk and tuning.speculative_decoding is None:
+            kv.append(0)
+            continue
+        key_type = tuning.cache_type_k if index < trunk else "f16"
+        value_type = tuning.cache_type_v if index < trunk else "f16"
+        value = count * value_length if tuning.flash_attention and not mla else value_width
+        kv.append(context_tokens * (
+            _cache_row_bytes(count * key_length, key_type)
+            + _cache_row_bytes(value, value_type)
+            + _cache_row_bytes(index_width, key_type)
+        ))
+    full_bytes = sum(kv)
+    if window is not None or metadata.architecture in _SSM_HYBRID_ARCHITECTURES or metadata.architecture == "gemma4":
+        return _CacheAllocation(max(full_bytes, fallback_bytes), complete=False)
+    return _CacheAllocation(full_bytes, layer_bytes=tuple(kv))
 
 
-def _hybrid_cache_gb(
+def _sliding_window(architecture: str | None, layout: GgufServingMetadata) -> int | None:
+    return layout.sliding_window or (4096 if architecture == "gemma2" else None)
+
+
+def _sliding_cache_tokens(context_tokens: int, window: int, tuning: RuntimeTuning) -> int:
+    # b12464's unified cache accounts for each slot's sliding window and
+    # one physical batch, then pads to 256 cells.
+    ubatch = min(context_tokens, tuning.batch_size, tuning.ubatch_size)
+    return min(context_tokens, _align(window * max(1, tuning.parallel_slots) + ubatch, 256))
+
+
+def _sliding_cache(
+    architecture: str | None,
+    layout: GgufServingMetadata,
+    heads_by_layer: tuple[int, ...],
+    key_length: int,
+    value_length: int,
+    context_tokens: int,
+    window: int,
+    tuning: RuntimeTuning,
+) -> _CacheAllocation | None:
+    layers = len(heads_by_layer)
+    pattern = layout.sliding_window_pattern
+    if not pattern:
+        interval = layout.sliding_window_interval
+        if interval is None:
+            interval = {
+                "gemma2": 2, "gemma3": 6, "gpt-oss": 2, "muse-glimmer": 4, "cohere2": 4, "cohere2moe": 4,
+            }.get(architecture or "")
+        if interval is None:
+            return None
+        dense_first = architecture == "cohere2moe"
+        pattern = tuple(interval == 0 or (index + (not dense_first)) % interval != 0 for index in range(layers))
+    owned_layers = layers - layout.shared_kv_layers
+    if len(pattern) != layers or owned_layers <= 0 or 0 in heads_by_layer[:owned_layers]:
+        return None
+    if architecture == "gemma4" and not (layout.attention_key_length_swa and layout.attention_value_length_swa):
+        return None
+    swa_tokens = _sliding_cache_tokens(context_tokens, window, tuning)
+    k_swa = layout.attention_key_length_swa or key_length
+    v_swa = layout.attention_value_length_swa or value_length
+    max_value_width = max(count * (v_swa if sliding else value_length)
+                          for count, sliding in zip(heads_by_layer, pattern, strict=True))
+    per_layer_state = 0
+    if architecture == "inkling2":
+        conv = layout.shortconv_cache_length
+        if not conv or not layout.embedding_length:
+            return None
+        channels = 2 * (max(heads_by_layer) * key_length + layout.embedding_length)
+        per_layer_state = channels * (conv - 1) * 4 * max(1, tuning.parallel_slots)
+
+    trunk = layers - layout.nextn_predict_layers
+    cache = []
+    for index, (count, sliding) in enumerate(zip(heads_by_layer, pattern, strict=True)):
+        if index >= owned_layers or (index >= trunk and tuning.speculative_decoding is None):
+            cache.append(0)
+            continue
+        if index >= trunk:
+            cache.append(_attention_cache_bytes(count, key_length, value_length, context_tokens, "f16", "f16"))
+            continue
+        k_width = count * (k_swa if sliding else key_length)
+        v_width = count * (v_swa if sliding else value_length) if tuning.flash_attention else max_value_width
+        tokens = swa_tokens if sliding else context_tokens
+        cache.append(per_layer_state + tokens * (
+            _cache_row_bytes(k_width, tuning.cache_type_k) + _cache_row_bytes(v_width, tuning.cache_type_v)
+        ))
+    return _CacheAllocation(sum(cache), per_layer_state * trunk, tuple(cache))
+
+
+def _ssm_hybrid_cache(
+    layout: GgufServingMetadata,
+    heads_by_layer: tuple[int, ...],
+    key_length: int,
+    value_length: int,
+    context_tokens: int,
+    tuning: RuntimeTuning,
+) -> _CacheAllocation | None:
+    layers = len(heads_by_layer)
+    trunk = layers - layout.nextn_predict_layers
+    conv, inner, state, groups = (
+        layout.ssm_conv_kernel, layout.ssm_inner_size, layout.ssm_state_size, layout.ssm_group_count,
+    )
+    if trunk <= 0 or not conv or not inner or not state or not groups:
+        return None
+    if layout.architecture in _NEMOTRON_HYBRID_ARCHITECTURES:
+        feed_forward = layout.feed_forward_length_by_layer
+        if not feed_forward and layout.feed_forward_length is not None:
+            feed_forward = (layout.feed_forward_length,) * layers
+        if len(feed_forward) != layers:
+            return None
+        recurrent = tuple(not heads and not ffn for heads, ffn in zip(heads_by_layer, feed_forward, strict=True))
+        attended = tuple(bool(heads) and not ffn for heads, ffn in zip(heads_by_layer, feed_forward, strict=True))
+    else:
+        recurrent = layout.recurrent_layers
+        interval = layout.full_attention_interval or 4
+        if not recurrent:
+            recurrent = tuple(index < trunk and (index + 1) % interval != 0 for index in range(layers))
+        attended = tuple(not uses_state for uses_state in recurrent)
+    if len(recurrent) != layers or any(attended[index] and not heads_by_layer[index] for index in range(trunk)):
+        return None
+    if tuning.speculative_decoding is not None and 0 in heads_by_layer[trunk:]:
+        return None
+    # n_embd_r() + n_embd_s(), both f32, including optional rollback copies.
+    state_bytes = ((conv - 1) * (inner + 2 * groups * state) + inner * state) * 4
+    copies = max(1, tuning.parallel_slots) if layout.architecture == "qwen3next" else _recurrent_state_copies(tuning)
+    per_layer_state = state_bytes * copies
+    index_width = 0
+    if layout.architecture == "qwen4exp" and layout.indexer_key_length:
+        # Raw and pooled keys are side by side when compression is enabled.
+        # Its compression pattern varies by layer; the two-row bound covers both.
+        index_width = 2 * layout.indexer_key_length
+    index_bytes = context_tokens * _cache_row_bytes(index_width, tuning.cache_type_k)
+    kv = tuple(
+        per_layer_state if recurrent[index] else index_bytes + _attention_cache_bytes(
+            heads_by_layer[index], key_length, value_length, context_tokens,
+            tuning.cache_type_k, tuning.cache_type_v,
+        ) if attended[index] else 0
+        for index in range(trunk)
+    )
+    # The native draft shares model weights but allocates its own f16 context.
+    draft = tuple(
+        index_width * context_tokens * 2 + _attention_cache_bytes(
+            count, key_length, value_length, context_tokens, "f16", "f16",
+        )
+        if tuning.speculative_decoding is not None else 0
+        for count in heads_by_layer[trunk:]
+    )
+    return _CacheAllocation(sum(kv) + sum(draft), sum(recurrent[:trunk]) * per_layer_state, kv + draft)
+
+
+def _attention_cache_bytes(
+    heads: int, key_length: int, value_length: int, tokens: int, key_type: str, value_type: str,
+) -> int:
+    return tokens * (_cache_row_bytes(heads * key_length, key_type) + _cache_row_bytes(heads * value_length, value_type))
+
+
+def _cache_row_bytes(elements: int, cache_type: str) -> int:
+    block, size = _CACHE_BLOCKS.get(cache_type.strip().casefold(), (1, 2))
+    return _ceil_div(elements, block) * size
+
+
+def _mla_hybrid_cache(
     metadata: GgufQuantMetadata,
     context_tokens: int,
     tuning: RuntimeTuning,
-) -> float | None:
+) -> _CacheAllocation | None:
     """Account for KDA state, absorbed MLA cache, and GLM's pooled indexer.
 
     Mirrors llama-hparams.cpp, llama-kv-cache.cpp and llama-memory-hybrid.cpp;
@@ -1268,15 +1534,21 @@ def _hybrid_cache_gb(
         return None
     # Cache dimensions in GGUF already describe the compressed latent, not
     # the expanded query-head projections. Zero heads identify recurrent layers.
-    cache_bytes = sum(trunk) * layout.attention_key_length * context_tokens * _cache_bytes(tuning.cache_type_k)
+    indexer_row_bytes = 0
     if metadata.architecture in {"glm5next", "glm5-next"}:
         if not layout.indexer_key_length or not layout.indexer_kpool:
             return None
         # Full per-token key, compressor gate, and pooled key. The indexer is
         # never below f16 precision even when the target cache is quantized.
-        index_bytes = max(2.0, _cache_bytes(tuning.cache_type_k))
-        cache_bytes += attention_layers * 3 * layout.indexer_key_length * context_tokens * index_bytes
-    return cache_bytes / 1_000_000_000.0 + _hybrid_recurrent_gb(metadata, tuning)
+        index_width = layout.indexer_key_length
+        indexer_row_bytes = 3 * max(index_width * 2, _cache_row_bytes(index_width, tuning.cache_type_k))
+    state_per_layer = _mla_recurrent_bytes(layout, tuning)
+    layer_bytes = tuple(
+        context_tokens * (_cache_row_bytes(count * layout.attention_key_length, tuning.cache_type_k) + indexer_row_bytes)
+        if count else state_per_layer
+        for count in trunk
+    ) + (0,) * layout.nextn_predict_layers
+    return _CacheAllocation(sum(layer_bytes), state_per_layer * recurrent_layers, layer_bytes)
 
 
 def _recurrent_state_copies(tuning: RuntimeTuning) -> int:
@@ -1284,31 +1556,15 @@ def _recurrent_state_copies(tuning: RuntimeTuning) -> int:
     return max(1, tuning.parallel_slots) * (1 + rollback)
 
 
-def _hybrid_recurrent_gb(metadata: GgufQuantMetadata, tuning: RuntimeTuning) -> float:
-    layout = metadata.serving_metadata
-    if not layout or not layout.block_count or not layout.kda_head_dim or not layout.attention_head_count:
-        return 0.0
-    layers = layout.block_count - layout.nextn_predict_layers
-    recurrent_layers = layout.attention_head_count_kv_by_layer[:layers].count(0)
-    head_dim = layout.kda_head_dim
-    heads = layout.attention_head_count
+def _mla_recurrent_bytes(layout: GgufServingMetadata, tuning: RuntimeTuning) -> int:
+    head_dim = layout.kda_head_dim or 0
+    heads = layout.attention_head_count or 0
     conv_elements = 3 * ((layout.ssm_conv_kernel or 4) - 1) * heads * head_dim
     state_elements = heads * head_dim * head_dim
-    return recurrent_layers * (conv_elements + state_elements) * 4 * _recurrent_state_copies(tuning) / 1_000_000_000.0
+    return (conv_elements + state_elements) * 4 * _recurrent_state_copies(tuning)
 
 
-def _fallback_cache_gb(context_tokens: int, weights_gb: float) -> float:
-    # The fallback intentionally grows aggressively with context. It prevents
-    # the old failure mode where only the weight file size influenced fit.
-    context_units = context_tokens / 32768.0
-    return max(1.0, context_units * 0.10 * max(1.0, weights_gb))
-
-
-def _cache_bytes(cache_type: str) -> float:
-    return _CACHE_BYTES.get(cache_type.strip().casefold(), 2.0)
-
-
-def _without_managed_args(tokens: tuple[str, ...]) -> tuple[str, ...]:
+def _without_managed_args(tokens: tuple[str, ...], *, pinned_topology: bool) -> tuple[str, ...]:
     filtered: list[str] = []
     index = 0
     while index < len(tokens):
@@ -1317,7 +1573,7 @@ def _without_managed_args(tokens: tuple[str, ...]) -> tuple[str, ...]:
         if key in _MANAGED_STANDALONE_FLAGS:
             index += 1
             continue
-        if key in _MANAGED_FLAGS_WITH_VALUES:
+        if key in _MANAGED_FLAGS_WITH_VALUES or (pinned_topology and key in _PLACEMENT_FLAGS_WITH_VALUES):
             index += 1 if "=" in token else 2
             continue
         filtered.append(token)

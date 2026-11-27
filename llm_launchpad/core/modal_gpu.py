@@ -61,6 +61,28 @@ MODAL_GPU_MEMORY_GB: dict[str, float] = {
     "B300": 288.0,
 }
 
+# Whole-card framebuffer totals reported by nvidia-smi, with ECC enabled
+# where applicable. Host reservations and other use are checked at runtime.
+# https://docs.nvidia.com/deploy/nvidia-smi/#fb-memory-usage
+_GPU_FRAMEBUFFER_MIB = {
+    "T4": 15360,
+    "L4": 23034,
+    "A10": 23028,
+    "A100-80GB": 81152,
+    "L40S": 46068,
+    "RTX-PRO-6000": 97887,
+    "B200": 183359,
+}
+
+
+def modal_gpu_capacity_gib(gpu_type: str) -> float | None:
+    """Return planning capacity in GiB, distinct from the advertised SKU size."""
+    name = gpu_type.strip().upper().replace("_", "-").replace(" ", "-")
+    framebuffer = _GPU_FRAMEBUFFER_MIB.get(name)
+    if framebuffer is None and name.endswith("GB"):
+        framebuffer = _GPU_FRAMEBUFFER_MIB.get(name.rsplit("-", 1)[0])
+    return framebuffer / 1024 if framebuffer is not None else MODAL_GPU_MEMORY_GB.get(name)
+
 
 def modal_gpu_supports_fast_deploy(gpu_type: str) -> bool:
     """The pinned runtimes do not guarantee the CUDA 13.1 required for a B300."""

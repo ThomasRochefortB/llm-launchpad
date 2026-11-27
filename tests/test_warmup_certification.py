@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import types
 import unittest
 from unittest.mock import patch
 
 from llm_launchpad.core.orchestrator import Orchestrator
+from llm_launchpad.core.fit_calibration import load_memory_calibration
+from llm_launchpad.core.runtime_support import load_llamacpp_support_manifest
 from llm_launchpad.core.warmup import (
     StartupPhaseTimer,
     _calibration_is_acceptable,
@@ -28,6 +33,7 @@ from llm_launchpad.protocol.events import (
     StateChangeEvent,
 )
 from llm_launchpad.protocol.models import (
+    LLAMACPP_FIT_START_MARKER,
     MemoryEstimate,
     PerformancePoint,
     PlacementAssessment,
@@ -184,7 +190,11 @@ class WarmupCertificationTests(unittest.TestCase):
         self.assertEqual(attestation.gpu_layers, 32)
         self.assertTrue(attestation.gpu_resident)
 
-    def _warmup_without_tail_evidence(self, **patches: object) -> list[object]:
+    def _warmup_without_tail_evidence(
+        self, *, refetched: LlamacppRuntimeEvidence | None = None,
+        remembered: RuntimeAttestation | None = None, assessment: PlacementAssessment | None = None,
+        retained: str = "",
+    ) -> list[object]:
         """Run a GPU-only warmup whose live log tail captured no offload report."""
 
         requirements = ServingRequirements(context_tokens=131_072)
@@ -198,9 +208,6 @@ class WarmupCertificationTests(unittest.TestCase):
                 {"default_generation_settings": {"n_ctx": 131_072}},
             ),
         )
-        recovered = patches.get("refetched", LlamacppRuntimeEvidence())
-        remembered = patches.get("remembered")
-
         with (
             patch.dict("sys.modules", {"requests": fake_requests}),
             patch(
@@ -218,8 +225,9 @@ class WarmupCertificationTests(unittest.TestCase):
             ),
             patch(
                 "llm_launchpad.core.warmup._refetched_log_evidence",
-                return_value=recovered,
+                return_value=refetched or LlamacppRuntimeEvidence(),
             ),
+            patch("llm_launchpad.core.warmup._retained_modal_logs", return_value=retained),
             patch(
                 "llm_launchpad.core.warmup.load_runtime_attestation",
                 return_value=remembered,
@@ -242,7 +250,7 @@ class WarmupCertificationTests(unittest.TestCase):
                     timeout=10,
                     tail_logs=False,
                     serving_requirements=requirements,
-                    placement_assessment=_assessment(),
+                    placement_assessment=assessment or _assessment(),
                     runtime_id="llama.cpp-b10689-cuda12",
                 )
             )
@@ -291,6 +299,7 @@ class WarmupCertificationTests(unittest.TestCase):
                 total_layers=32,
                 gpu_resident=True,
                 verified_at="2026-09-15T16:15:16+00:00",
+                residency_evidence=EvidenceLevel.OBSERVED,
             )
         )
 
@@ -328,6 +337,29 @@ class WarmupCertificationTests(unittest.TestCase):
                 for event in events
             )
         )
+
+    def test_pinned_warmup_checks_the_native_fit_even_if_the_server_started(self) -> None:
+        runtime = load_llamacpp_support_manifest()
+        assessment = replace(
+            _assessment(), calibration_key="pinned-warmup", runtime_id=runtime.runtime_id, gpu_type="L4",
+        )
+        retained = "\n".join((
+            f"{LLAMACPP_FIT_START_MARKER} {assessment.fingerprint}",
+            f"common_params_print_info: build 12464 ({runtime.source_revision[:9]})",
+            "- CUDA0 : NVIDIA L4 (23034 MiB, 20000 MiB free)",
+            "common_params_fit_impl: projected to use 19000 MiB of device memory vs. 20000 MiB of free device memory",
+            _OFFLOAD_LOG,
+        ))
+        with TemporaryDirectory() as directory, patch(
+            "llm_launchpad.core.fit_calibration.CALIBRATION_CACHE_PATH", Path(directory),
+        ):
+            events = self._warmup_without_tail_evidence(assessment=assessment, retained=retained)
+            projection = load_memory_calibration(assessment.calibration_key)
+        completion = self._warmup_completion(events)
+        self.assertFalse(completion.success)
+        self.assertIn("free VRAM", completion.detail)
+        assert projection is not None
+        self.assertEqual(projection.per_device_bytes, (19_001 * 1024**2,))
 
     def test_a_partially_offloaded_runtime_is_rejected(self) -> None:
         """An observed 30/32 offload report fails a GPU-only request."""

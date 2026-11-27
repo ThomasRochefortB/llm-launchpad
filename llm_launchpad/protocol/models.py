@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
+import re
 from typing import Any
 
+from ..gguf_files import GGUF_SHARD_RE
 from .enums import (
     AttemptDisposition,
     BackendType,
@@ -23,6 +26,8 @@ from .enums import (
     ServingObjective,
     SpeculativeDecodingMethod,
 )
+
+LLAMACPP_FIT_START_MARKER = "LLM_LAUNCHPAD_MEMORY_FIT"
 
 
 @dataclass(frozen=True)
@@ -225,14 +230,51 @@ class RuntimeTuning:
 
 
 @dataclass(frozen=True)
+class GgufArtifact:
+    """The exact Hub revision and complete shard set selected for serving."""
+
+    revision: str
+    files: tuple[tuple[str, int], ...]
+
+    def __post_init__(self) -> None:
+        if not re.fullmatch(r"[0-9a-f]{40}", self.revision) or not self.files:
+            raise ValueError("A GGUF artifact requires a commit SHA and weight files.")
+        for name, size in self.files:
+            path = PurePosixPath(name)
+            if (
+                path.is_absolute() or path.as_posix() != name or ".." in path.parts
+                or path.suffix.casefold() != ".gguf" or any(c in name for c in "*?[]\r\n\0")
+                or type(size) is not int or size <= 0
+            ):
+                raise ValueError(f"Invalid GGUF artifact file: {name!r}.")
+        split = GGUF_SHARD_RE.fullmatch(self.entrypoint)
+        if len(self.files) == 1 and split is None:
+            return
+        # The local llama.cpp loader derives the remaining shard paths from
+        # the first filename. Validate their order and completeness on input.
+        if split is None or int(split[3]) != len(self.files) or any(
+            name != f"{split[1]}-{index:05d}-of-{split[3]}.gguf"
+            for index, (name, _) in enumerate(self.files, start=1)
+        ):
+            raise ValueError("A split GGUF artifact requires every shard in loader order.")
+
+    @property
+    def size_bytes(self) -> int:
+        return sum(size for _, size in self.files)
+
+    @property
+    def entrypoint(self) -> str:
+        return self.files[0][0]
+
+
+@dataclass(frozen=True)
 class MemoryEstimate:
     """Topology-aware memory requirement for one serving configuration.
 
-    Weights, KV cache and speculative buffers shard across the devices of a
-    placement. ``compute_gb`` and ``attention_scratch_gb`` do not: every device
-    builds its own graph, so each one pays them in full. ``total_gb`` already
-    counts them once per device, which keeps ``total_gb / gpu_count`` the
-    per-device requirement.
+    Legacy ``*_gb`` fields carry GiB. Use ``per_device_required_gb`` for fit:
+    whole layers and their caches may land unevenly, and graph workspace is
+    reserved on every participating device. ``weights_gb`` is an upper-bound
+    estimate of resident weights; the artifact separately records file bytes.
     """
 
     weights_gb: float
@@ -245,14 +287,16 @@ class MemoryEstimate:
     confidence: float = 0.0
     source: str = "estimated"
     total_layer_count: int | None = None
-    # Scores and mask of a graph built without flash attention. Zero whenever
-    # flash attention is on, and linear in the advertised context when it is
-    # off, which is the term that decides whether a long context is servable.
+    # Per-device attention masks, plus the materialized scores if flash
+    # attention is off. Both are modeled for the chosen context and ubatch.
     attention_scratch_gb: float = 0.0
     # Recurrent state is included in kv_cache_gb; retain its contribution so
     # changing concurrency can resize state without scaling the token cache.
     recurrent_gb: float = 0.0
     recurrent_state_copies: int = 1
+    # Allocation by repeating block, in bytes. Empty for older estimates and
+    # layouts whose block-level memory cannot be established offline.
+    layer_cache_bytes: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -420,10 +464,10 @@ class PlacementAssessment:
     fits: bool = False
     gpu_resident: bool = False
     rejection_reason: str | None = None
-    # Identifies this plan's compute graph without the hardware under it, so
-    # one runtime measurement can size every topology that serves it.
+    # Projections are reusable only for the same artifact, runtime and topology.
     calibration_key: str = ""
     runtime_id: str | None = None
+    gpu_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -616,6 +660,7 @@ class DeploymentConfig:
     # durable worker snapshots the ladder before running, so clearing it could
     # not stop an already-planned next rental.
     retry_allowed: bool = True
+    gguf_artifact: GgufArtifact | None = None
 
 
 @dataclass(frozen=True)
@@ -639,6 +684,7 @@ class LlamacppRequestOptions:
     dspark: bool = False
     dspark_repo: str | None = None
     dspark_file: str | None = None
+    gguf_artifact: GgufArtifact | None = None
 
 
 @dataclass(frozen=True)
@@ -795,6 +841,7 @@ class InferenceRecipe:
     quality_rank: int | None = None
     serving_requirements: ServingRequirements | None = None
     runtime_tuning: RuntimeTuning | None = None
+    gguf_artifact: GgufArtifact | None = None
 
 
 @dataclass(frozen=True)
@@ -1192,7 +1239,7 @@ VAST_RAW_MIB = MemoryUnits(id="vast-raw-mib", display_name="Vast raw MiB", gib_p
 VAST_DISPLAY_GB = MemoryUnits(
     id="vast-display-gb", display_name="Vast display GB", gib_per_unit=1000.0 / 1024.0
 )
-#: Hugging Face file sizes and Modal catalog capacities are decimal GB.
+#: Hugging Face reports file bytes; transfer and file-size displays use decimal GB.
 DECIMAL_GB = MemoryUnits(id="gb", display_name="GB", gib_per_unit=1.0 / 1.073741824)
 #: Runtime measurements and planner reserves are binary GiB.
 BINARY_GIB = MemoryUnits(id="gib", display_name="GiB", gib_per_unit=1.0)

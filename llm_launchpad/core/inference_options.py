@@ -30,6 +30,7 @@ from .prime_backend import (
     prime_offer_gpu_memory_gb,
     prime_offer_matches_location,
 )
+from .prime_offers import prime_gpu_capacity_gib
 
 
 # Qwen 3.5 and 3.8 carry a minor version in the name, which the plain
@@ -204,7 +205,7 @@ class PrimeInferenceAdapter:
                 continue
             if not is_compatible_prime_offer(
                 offer,
-                recipe.required_vram_gb,
+                None if recipe.gguf_artifact is not None else recipe.required_vram_gb,
                 required_image=required_image,
             ):
                 continue
@@ -213,6 +214,8 @@ class PrimeInferenceAdapter:
             # Prime sometimes reports aggregate node memory. Planner placement
             # math is per-device, so quotes always carry the per-GPU size.
             per_gpu_memory_gb = prime_offer_gpu_memory_gb(offer)
+            if recipe.gguf_artifact is not None and per_gpu_memory_gb is not None:
+                per_gpu_memory_gb = prime_gpu_capacity_gib(offer.gpu_type, per_gpu_memory_gb)
             quotes.append(
                 ProviderQuote(
                     id=f"prime:{recipe.id}:{offer.id}",
@@ -623,4 +626,3 @@ def _plan_monthly_cost_sort_key(plan: InferencePlan) -> tuple[int, int, float, s
         monthly_cost if monthly_cost is not None else float("inf"),
         plan.quote.id,
     )
-

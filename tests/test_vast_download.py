@@ -11,7 +11,7 @@ from unittest.mock import patch
 from llm_launchpad.core.vast_download import DownloadFile, fetch_download_files, measure_download
 from llm_launchpad.core.vast_runtime import VAST_RUNTIME_DIR, VAST_STARTUP_PROBE_COMMAND
 from llm_launchpad.protocol.enums import BackendType
-from llm_launchpad.protocol.models import DeploymentConfig
+from llm_launchpad.protocol.models import DeploymentConfig, GgufArtifact
 
 
 def sibling(name: str, size: int | None, oid: str) -> SimpleNamespace:
@@ -115,5 +115,28 @@ class DownloadAccountingTests(unittest.TestCase):
                 capture_output=True, text=True, check=True,
             )
         progress = measure_download(result.stdout, self.files)
+        assert progress is not None
+        self.assertEqual((progress.downloaded, progress.total, progress.active), (1500, 3000, True))
+
+    def test_pinned_probe_counts_final_and_partial_shards_toward_exact_total(self) -> None:
+        artifact = GgufArtifact(
+            "3" * 40,
+            (("Q4/model one-00001-of-00002.gguf", 1000), ("Q4/model one-00002-of-00002.gguf", 2000)),
+        )
+        with patch("llm_launchpad.core.vast_download.HfApi") as api:
+            first, second = files = fetch_download_files(DeploymentConfig(
+                backend=BackendType.LLAMACPP, repo_id="acme/model", gguf_artifact=artifact,
+            ))
+        api.assert_not_called()
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / first.path).parent.mkdir(parents=True)
+            (root / first.path).write_bytes(b"x" * 1000)
+            (root / (second.path + ".r4nd0m.incomplete")).write_bytes(b"x" * 500)
+            result = subprocess.run(
+                ["sh", "-c", VAST_STARTUP_PROBE_COMMAND.replace(VAST_RUNTIME_DIR, shlex.quote(directory))],
+                capture_output=True, text=True, check=True,
+            )
+        progress = measure_download(result.stdout, files)
         assert progress is not None
         self.assertEqual((progress.downloaded, progress.total, progress.active), (1500, 3000, True))

@@ -26,10 +26,9 @@ HF_REQUESTS_PER_WINDOW = 1000
 # down, so the next one starts where this one stopped.
 DEFAULT_BUDGET = 500
 
-# Reading a repository's serving metadata is several requests, not one: the
-# model record, the model page the weight-size table is scraped from, and the
-# GGUF header range reads. Charged as a block so the ceiling covers what a
-# build actually spends rather than only the matching half of it.
+# Reserve room for discovery and retries around a model's Hub API record.
+# Pinned GGUF header ranges use /resolve, which has a separate rate limit:
+# https://huggingface.co/docs/hub/rate-limits
 METADATA_REQUEST_COST = 4
 
 

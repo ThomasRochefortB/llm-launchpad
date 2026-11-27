@@ -58,8 +58,8 @@ class HybridModelSupportTests(unittest.TestCase):
     def test_kimi_cache_uses_24_compressed_layers_and_69_recurrent_layers(self) -> None:
         metadata = metadata_fixture("Kimi-K3")
         memory = estimate_memory(metadata, weights_gb=861.0, requirements=serving_requirements(1048576), tuning=self.tuning)
-        token_cache = 24 * 576 * 1048576 * 2 / 1e9
-        recurrent = 69 * (3 * 3 * 96 * 128 + 96 * 128 * 128) * 4 * 4 / 1e9
+        token_cache = 24 * 576 * 1048576 * 2 / 1024**3
+        recurrent = 69 * (3 * 3 * 96 * 128 + 96 * 128 * 128) * 4 * 4 / 1024**3
         self.assertAlmostEqual(memory.kv_cache_gb, token_cache + recurrent, places=3)
         self.assertEqual(memory.source, "gguf-hybrid-metadata")
         self.assertLess(memory.total_gb, 1000)
@@ -74,8 +74,8 @@ class HybridModelSupportTests(unittest.TestCase):
     def test_glm_cache_excludes_nextn_and_includes_pooling_indexer(self) -> None:
         metadata = metadata_fixture("GLM-5.3-Flash")
         memory = estimate_memory(metadata, weights_gb=109.0, requirements=serving_requirements(1048576), tuning=self.tuning)
-        token_cache = 11 * (512 + 3 * 128) * 1048576 * 2 / 1e9
-        recurrent = 34 * (3 * 3 * 64 * 128 + 64 * 128 * 128) * 4 * 4 / 1e9
+        token_cache = 11 * (512 + 3 * 128) * 1048576 * 2 / 1024**3
+        recurrent = 34 * (3 * 3 * 64 * 128 + 64 * 128 * 128) * 4 * 4 / 1024**3
         self.assertAlmostEqual(memory.kv_cache_gb, token_cache + recurrent, places=3)
         self.assertEqual(memory.total_layer_count, 45)
         profiles = self.profiles("GLM-5.3-Flash")

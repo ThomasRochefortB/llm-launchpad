@@ -24,6 +24,7 @@ from ..protocol.models import (
     ComputePlacement,
     InferencePlan,
     InferenceRecipe,
+    MemoryEstimate,
     ModalProviderOptions,
     PlacementAssessment,
     PrimeProviderOptions,
@@ -35,20 +36,19 @@ from .inference_options import (
     COST_SCENARIO_WORKDAY,
     evaluate_quote_cost,
 )
-from .fit_calibration import MemoryCalibration, calibration_key, load_memory_calibration
 from .llamacpp_planner import (
     assess_memory_placement,
     assessment_score,
     compile_server_args,
-    device_capacity_bytes,
-    gib_to_bytes,
-    per_device_requirements,
+    memory_fits_device,
+    memory_on_topology,
     tuning_for_gpu_memory,
 )
 from .modal_cli import resolve_modal_cli_path
 from .modal_gpu import (
     MODAL_GPU_MEMORY_GB,
     ModalGpuSpec,
+    modal_gpu_capacity_gib,
     fetch_modal_gpu_catalog,
     modal_gpu_count_limit,
     modal_gpu_count_options,
@@ -64,6 +64,7 @@ from .prime_backend import (
     prime_offer_gpu_memory_gb,
     supports_prime_image,
 )
+from .prime_offers import prime_gpu_capacity_gib
 from .quick_deploy import QuickDeployProfile, quick_deploy_recipe
 from .vast_auth import VastCredentials, resolve_vast_credentials
 from .vast_backend import VastBackend
@@ -243,7 +244,9 @@ def canonical_gpu_identity(value: str, memory_gb: float) -> tuple[str, str]:
     """Return a stable cross-provider ID and concise display label."""
 
     normalized = re.sub(r"[^A-Z0-9]+", "-", value.strip().upper()).strip("-")
-    memory_label = gpu_memory_label(memory_gb)
+    # Keep the product label stable when ECC lowers the reported framebuffer.
+    nominal = MODAL_GPU_MEMORY_GB.get(normalized)
+    memory_label = gpu_memory_label(nominal if nominal and 0.93 * nominal <= memory_gb <= nominal else memory_gb)
     # Strip the capacity the name already carries, using the same rounded label
     # that is about to be appended; deriving it with int() truncation left
     # "RTX A2000 6GB" reading "RTX A2000 6GB 6GB".
@@ -303,12 +306,7 @@ def recipe_for_placement(
     recipe: InferenceRecipe,
     gpu_memory_gb: float | None,
 ) -> InferenceRecipe:
-    """Re-cut one recipe for the device it will actually run on.
-
-    Only the runtime margin depends on the device, and it is deliberately not
-    part of the calibration key, so a re-cut recipe still matches measurements
-    taken on any other topology of the same plan.
-    """
+    """Set the runtime's free-memory target for the selected device."""
 
     tuning = recipe.runtime_tuning
     requirements = recipe.serving_requirements
@@ -352,22 +350,7 @@ def assessed_plans_for_compute_profile(
         return (), ()
     if recipe.required_vram_gb is None:
         recipe = replace(recipe, required_vram_gb=required_vram_gb)
-    # The topology picker and the assessment below have to agree on how much
-    # memory the plan needs. If the picker sized on the formula while the
-    # assessment used a runtime measurement, it would propose shapes the
-    # assessment then rejected and the model would end up with no plan at all.
-    measured = None
-    if recipe.serving_requirements is not None and recipe.runtime_tuning is not None:
-        measured = load_memory_calibration(
-            calibration_key(
-                model_id=recipe.model_id,
-                revision=None,
-                quant=recipe.quant,
-                runtime_id=profile.llamacpp_runtime_id,
-                requirements=recipe.serving_requirements,
-                tuning=recipe.runtime_tuning,
-            )
-        )
+    memory = profile.memory_estimate
     plans: list[InferencePlan] = []
     evaluated: list[PlacementAssessment] = []
     for placement in configuration.placements:
@@ -387,57 +370,40 @@ def assessed_plans_for_compute_profile(
                         f"{recipe.backend.value} backend."
                     )
             continue
-        gpu_count = _placement_gpu_count(
-            placement,
-            required_vram_gb,
-            memory_estimate=profile.memory_estimate,
-            calibration=measured,
-        )
-        if gpu_count is None:
-            if rejected is not None:
-                rejected.append(
-                    f"{placement.gpu_type} has no topology large enough for the "
-                    "full-context plan."
-                )
-            continue
-        price = placement.price_per_hour_usd
-        if price is not None and placement.price_is_per_gpu:
-            price *= gpu_count
-        # The catalog is built before any GPU is chosen, so its runtime margin
-        # is the 2 GiB floor. The margin the memory model actually promises is
-        # 5% of the device, and that only becomes computable here. Leaving the
-        # floor in place shipped a plan that packed a 180 GB B200 to within
-        # 2 GiB and then had nothing left for llama.cpp's compute graphs: five
-        # GLM-5.3-Flash deploys died in graph_reserve, and the one that
-        # survived differed from them in this argument alone (9216 vs 2048).
-        placement_recipe = recipe_for_placement(recipe, placement.gpu_memory_gb)
+        capacity = placement.gpu_memory_gb
+        if placement.provider == ComputeProvider.PRIME and recipe.gguf_artifact is not None:
+            capacity = prime_gpu_capacity_gib(placement.gpu_type, capacity)
+        placement_recipe = recipe_for_placement(recipe, capacity)
         assessment = None
         if (
-            profile.memory_estimate is not None
+            memory is not None
             and placement_recipe.serving_requirements is not None
             and placement_recipe.runtime_tuning is not None
         ):
-            assessment = assess_memory_placement(
-                profile.memory_estimate,
-                model_id=placement_recipe.model_id,
-                revision=None,
-                quant=placement_recipe.quant,
-                runtime_id=profile.llamacpp_runtime_id,
-                requirements=placement_recipe.serving_requirements,
-                tuning=placement_recipe.runtime_tuning,
-                gpu_type=placement.gpu_type,
-                gpu_count=gpu_count,
-                gpu_memory_gb=placement.gpu_memory_gb,
-                price_per_hour_usd=price,
-            )
-            evaluated.append(assessment)
-            if not assessment.fits or not assessment.gpu_resident:
-                if rejected is not None:
-                    rejected.append(
-                        assessment.rejection_reason
-                        or f"{placement.gpu_type} cannot hold the full context on GPU."
-                    )
-                continue
+            gpu_count = None
+            for candidate in _placement_gpu_counts(placement):
+                assessment = assess_memory_placement(
+                    memory, model_id=placement_recipe.model_id, revision=None,
+                    quant=placement_recipe.quant, runtime_id=profile.llamacpp_runtime_id,
+                    requirements=placement_recipe.serving_requirements, tuning=placement_recipe.runtime_tuning,
+                    gpu_type=placement.gpu_type, gpu_count=candidate, gpu_memory_gb=capacity,
+                    price_per_hour_usd=_placement_price(placement, candidate),
+                    artifact=recipe.gguf_artifact, provider=placement.provider,
+                )
+                evaluated.append(assessment)
+                if assessment.fits and assessment.gpu_resident:
+                    gpu_count = candidate
+                    break
+        else:
+            gpu_count = _placement_gpu_count(placement, required_vram_gb, memory_estimate=memory)
+        if gpu_count is None:
+            if rejected is not None:
+                rejected.append(
+                    (assessment.rejection_reason if assessment is not None else None)
+                    or f"{placement.gpu_type} has no topology large enough for the full-context plan."
+                )
+            continue
+        price = _placement_price(placement, gpu_count)
         single_tps = None
         if assessment is not None:
             single_tps = max(
@@ -457,7 +423,7 @@ def assessed_plans_for_compute_profile(
             gpu_count=gpu_count,
             price_per_hour_usd=price,
             billing_model=placement.billing_model,
-            gpu_memory_gb=placement.gpu_memory_gb,
+            gpu_memory_gb=capacity,
             availability=placement.availability,
             region=placement.region,
             security=placement.security,
@@ -520,7 +486,7 @@ def _modal_placements(catalog: Sequence[ModalGpuSpec]) -> list[ComputePlacement]
     placements = []
     for spec in catalog:
         gpu_type = spec.value.strip().upper()
-        memory_gb = _modal_gpu_memory_gb(gpu_type)
+        memory_gb = modal_gpu_capacity_gib(gpu_type) or _modal_gpu_memory_gb(gpu_type)
         if not gpu_type or memory_gb is None:
             continue
         placements.append(
@@ -595,62 +561,36 @@ def _modal_gpu_memory_gb(gpu_type: str) -> float | None:
     return float(match.group(1)) if match is not None else None
 
 
-def _placement_gpu_count(
-    placement: ComputePlacement,
-    required_vram_gb: float,
-    *,
-    memory_estimate: object | None = None,
-    calibration: MemoryCalibration | None = None,
-) -> int | None:
+def _placement_price(placement: ComputePlacement, gpu_count: int) -> float | None:
+    price = placement.price_per_hour_usd
+    return price * gpu_count if price is not None and placement.price_is_per_gpu else price
+
+
+def _placement_gpu_counts(placement: ComputePlacement) -> tuple[int, ...]:
     if placement.provider == ComputeProvider.MODAL:
-        candidates = tuple(
+        return tuple(
             candidate
             for candidate in modal_gpu_count_options(placement.gpu_type)
             if placement.gpu_count_min <= candidate <= placement.gpu_count_max
         )
-    else:
-        candidates = tuple(range(placement.gpu_count_min, placement.gpu_count_max + 1))
+    return tuple(range(placement.gpu_count_min, placement.gpu_count_max + 1))
+
+
+def _placement_gpu_count(
+    placement: ComputePlacement,
+    required_vram_gb: float,
+    *,
+    memory_estimate: MemoryEstimate | None = None,
+) -> int | None:
+    candidates = _placement_gpu_counts(placement)
     if not candidates:
         return None
     if memory_estimate is not None:
-        total_gb = float(getattr(memory_estimate, "total_gb", 0.0)) - float(
-            getattr(memory_estimate, "reserve_gb", 0.0)
-        )
-        # Graph memory is replicated on every device, so it stays out of the
-        # division. Sharding it here proposed topologies that the placement
-        # assessment then rejected, leaving the model with no plan at all
-        # rather than the larger topology that does hold it.
-        base_count = max(1, len(getattr(memory_estimate, "per_device_required_gb", ()) or ()))
-        per_device_graph = float(getattr(memory_estimate, "compute_gb", 0.0)) + float(
-            getattr(memory_estimate, "attention_scratch_gb", 0.0)
-        )
-        shardable_gb = max(0.0, total_gb - per_device_graph * base_count)
-        layer_count = getattr(memory_estimate, "total_layer_count", None)
-        capacity = device_capacity_bytes(placement.gpu_memory_gb)
-        for candidate in candidates:
-            reserve_per_gpu = max(2.0, placement.gpu_memory_gb * 0.05)
-            # Layers are indivisible: size on the device that ends up with the
-            # remainder, not on the average.
-            if calibration is not None:
-                busiest = max(
-                    calibration.per_device_gb(
-                        shardable_gb=shardable_gb,
-                        gpu_count=candidate,
-                        layer_count=layer_count,
-                    )
-                ) + reserve_per_gpu
-            else:
-                busiest = max(
-                    per_device_requirements(
-                        shardable_gb=shardable_gb,
-                        per_device_gb=per_device_graph + reserve_per_gpu,
-                        gpu_count=candidate,
-                        layer_count=layer_count,
-                    )
-                )
-            if gib_to_bytes(busiest) <= capacity:
-                return candidate
-        return None
+        capacity = placement.gpu_memory_gb
+        return next((
+            candidate for candidate in candidates
+            if memory_fits_device(memory_on_topology(memory_estimate, candidate, capacity), capacity)
+        ), None)
     if required_vram_gb > 0:
         needed = max(
             placement.gpu_count_min,

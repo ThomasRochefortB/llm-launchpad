@@ -66,7 +66,7 @@ def prime_launch_requirement_error(config: DeploymentConfig) -> str | None:
         return "Prime vLLM deployment requires --model-name."
     if config.backend == BackendType.LLAMACPP and not (config.repo_id or "").strip():
         return "Prime llama.cpp deployment requires --repo-id."
-    if config.backend == BackendType.LLAMACPP and (config.revision or "").strip():
+    if config.backend == BackendType.LLAMACPP and (config.revision or "").strip() and config.gguf_artifact is None:
         return "Prime llama.cpp currently supports only the default Hugging Face revision."
     return None
 
@@ -292,13 +292,13 @@ class PrimeDeploymentRunner:
             )
 
     def cleanup_failed_pod(
-        self, pod_id: str, options: Any, message: str
+        self, pod_id: str, options: Any, message: str, *, pinned_fit: bool = False,
     ) -> Generator[BaseEvent, None, tuple[str, dict[str, object] | None]]:
         """Drain the failed pod's logs and release it."""
         rollback: dict[str, object] | None = None
         if pod_id:
             try:
-                for line in self.prime_backend.get_pod_logs(pod_id):
+                for line in self.prime_backend.get_pod_logs(pod_id, tail=2000 if pinned_fit else 200):
                     yield LogEvent(line=line, operation=OperationType.DEPLOY)
             except Exception:
                 log_exception(f"Could not read logs from failed Prime pod {pod_id}")
@@ -520,7 +520,8 @@ class PrimeDeploymentRunner:
         except Exception as exc:
             cleaned_up = True
             message, rollback = yield from self.cleanup_failed_pod(
-                pod_id, options, str(exc)
+                pod_id, options, str(exc),
+                pinned_fit=bool(config.placement_assessment and config.placement_assessment.calibration_key),
             )
             yield from fail_operation(
                 OperationType.DEPLOY,

@@ -27,9 +27,8 @@ class DeploymentCapabilities:
     backends: frozenset[BackendType]
     max_gpu_count: int
     supports_vision: bool
-    # Pinning an HF revision is a runtime property, not a provider one:
-    # llama.cpp's `--hf-repo owner/repo:quant` cannot carry a revision, while
-    # vLLM's `--revision` can.
+    # Backends that can pin a manually specified revision. Fast Deploy
+    # llama.cpp also supports a revision with a complete local GGUF manifest.
     pinned_revision_backends: frozenset[BackendType] = frozenset()
     supports_preload_only: bool = True
     supports_smoke_test_only: bool = True

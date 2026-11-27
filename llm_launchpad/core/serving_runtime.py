@@ -9,9 +9,10 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 import hashlib
+from pathlib import PurePosixPath
 import shlex
 
-from ..protocol.models import DeploymentConfig
+from ..protocol.models import LLAMACPP_FIT_START_MARKER, DeploymentConfig, GgufArtifact
 from .coerce import positive_int
 from .hf_download import hf_download_env
 
@@ -166,6 +167,54 @@ def gguf_stage_command(
         + " || true; "
     )
     return setup, ("--hf-file", f"{dest}/weights.args")
+
+
+def pinned_gguf_directory(repo_id: str, artifact: GgufArtifact) -> PurePosixPath:
+    """A cache directory shared by launches of the same immutable artifact."""
+    identity = hashlib.sha256(f"{repo_id}@{artifact.revision}/{artifact.entrypoint}".encode()).hexdigest()
+    return PurePosixPath("pinned") / identity
+
+
+def stage_pinned_gguf(
+    repo_id: str, artifact: GgufArtifact, *, root: str, excluded_shard: str | None = None,
+) -> tuple[str, str]:
+    """Stage a complete immutable artifact for llama.cpp's local model loader."""
+    from huggingface_hub import hf_hub_url
+
+    directory = PurePosixPath(root) / pinned_gguf_directory(repo_id, artifact)
+    # curl is available even in the upstream runtime image without hf-xet.
+    # Concurrent launches can share the immutable destination, never a partial.
+    setup = r"""
+llp_stage_gguf() (
+    path=$1 size=$2 url=$3
+    if [ "$(stat -c %s "$path" 2>/dev/null)" = "$size" ] && [ "$(head -c 4 "$path")" = GGUF ]; then exit 0; fi
+    mkdir -p "$(dirname "$path")" || exit $?
+    tmp=$(mktemp --suffix=.incomplete "$path.XXXXXX") || exit $?
+    trap 'rm -f "$tmp"' EXIT
+    set -- --fail --location --retry 3 --connect-timeout 20 --silent --show-error
+    if [ -n "${HF_TOKEN:-}" ]; then set -- "$@" --header "Authorization: Bearer $HF_TOKEN"; fi
+    curl "$@" "$url" -o "$tmp" || exit $?
+    if [ "$(stat -c %s "$tmp")" != "$size" ] || [ "$(head -c 4 "$tmp")" != GGUF ]; then
+        printf 'Downloaded GGUF did not match the planned artifact: %s\n' "$path" >&2
+        exit 1
+    fi
+    mv -f "$tmp" "$path"
+)
+"""
+    for filename, size in artifact.files:
+        if filename == excluded_shard:
+            continue
+        url = hf_hub_url(repo_id, filename, revision=artifact.revision)
+        setup += shlex.join(["llp_stage_gguf", str(directory / filename), str(size), url]) + " || exit $?;\n"
+    return setup, str(directory / artifact.entrypoint)
+
+
+def llamacpp_fit_marker(config: DeploymentConfig) -> str:
+    """Bind the native server's projection to the selected placement."""
+    assessment = config.placement_assessment
+    if config.gguf_artifact is None or assessment is None or not assessment.calibration_key:
+        return ""
+    return shlex.join(["echo", f"{LLAMACPP_FIT_START_MARKER} {assessment.fingerprint}"]) + "\n"
 
 
 _GGUF_STAGE_PROGRAM = r"""

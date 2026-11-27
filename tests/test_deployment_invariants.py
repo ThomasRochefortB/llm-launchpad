@@ -114,17 +114,13 @@ class ModalPlacementInvariantTests(unittest.TestCase):
         for weights_gb, context_tokens, layers in sweep:
             profile = _synthetic_profile(weights_gb, context_tokens, layers)
             assert profile.memory_estimate is not None
-            per_dev_overhead = (
-                profile.memory_estimate.compute_gb + profile.memory_estimate.attention_scratch_gb
-            )
 
             # Catalog selection invariant.
             selected = _select_gpu_shape(
                 profile.quant,
                 profile.memory_estimate.total_gb,
                 _FULL_MODAL_CATALOG,
-                per_device_overhead_gb=per_dev_overhead,
-                layer_count=layers,
+                memory_estimate=profile.memory_estimate,
             )
             if selected is not None:
                 self.assertTrue(modal_gpu_supports_fast_deploy(selected.gpu_type))
@@ -193,9 +189,6 @@ class ModalPlacementInvariantTests(unittest.TestCase):
         ):
             profile = _synthetic_profile(weights_gb, context_tokens, layers)
             assert profile.memory_estimate is not None
-            per_dev_overhead = (
-                profile.memory_estimate.compute_gb + profile.memory_estimate.attention_scratch_gb
-            )
             for gpu_type, placement in placements_by_gpu.items():
                 if not modal_gpu_supports_fast_deploy(gpu_type):
                     continue
@@ -204,8 +197,7 @@ class ModalPlacementInvariantTests(unittest.TestCase):
                     profile.memory_estimate.total_gb,
                     _FULL_MODAL_CATALOG,
                     gpu_type=gpu_type,
-                    per_device_overhead_gb=per_dev_overhead,
-                    layer_count=layers,
+                    memory_estimate=profile.memory_estimate,
                 )
                 live_count = _placement_gpu_count(
                     placement,

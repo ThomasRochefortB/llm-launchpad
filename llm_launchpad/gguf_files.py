@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import re
+
+GGUF_SHARD_RE = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$", re.IGNORECASE)
 _AUXILIARY_GGUF_MARKERS = ("mmproj", "imatrix", "dspark", "draft", "eagle")
 _AUXILIARY_GGUF_DIRS = ("mtp", "mtp-*", "engram")
 
@@ -28,6 +31,9 @@ def is_target_gguf(filename: str) -> bool:
     return (
         lowered.endswith(".gguf")
         and not is_engram_table_file(filename)
+        # Leading "mtp-" names standalone drafters. Trailing "-mtp" can
+        # instead be a full target with an embedded NextN block.
+        and not parts[-1].startswith("mtp-")
         and not any(marker in lowered for marker in _AUXILIARY_GGUF_MARKERS)
         and not any(part in ("mtp", "engram") or part.startswith("mtp-") for part in parts[:-1])
     )
@@ -41,4 +47,5 @@ def auxiliary_gguf_ignore_patterns() -> list[str]:
     patterns = [f"*{marker}*" for marker in (*_AUXILIARY_GGUF_MARKERS, "engram")]
     for directory in _AUXILIARY_GGUF_DIRS:
         patterns.extend((f"{directory}/*", f"*/{directory}/*"))
+    patterns.extend(("mtp-*.gguf", "*/mtp-*.gguf"))
     return [case_insensitive(pattern) for pattern in patterns]
